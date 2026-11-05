@@ -29,6 +29,13 @@ env:
 jobs:
   gate:
     name: gate
+    environment:
+      name: staging
+      deployment: false
+    concurrency:
+      group: ${{ github.workflow }}-gate-${{ github.ref }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -54,6 +61,12 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Push-to-main staging record: this lane deploys the staging Tail worker,
+    # so its deployment record lands in `staging` with the other staging
+    # lanes (no rules, no secrets on the environment).
+    environment:
+      name: staging
+      url: https://staging.nntune.com
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

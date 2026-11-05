@@ -28,11 +28,41 @@
  * accepted, and only up to MAX_ALLOWED_SKIPS of them:
  *   - "ingested track carries recording_mbids": test.fixme in
  *     e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending).
+ *   - nine parked legs (TWO-1635): every journey leg that needs a
+ *     user-uploaded track skips by name in both modes — user NZB ingest is
+ *     retired (TWO-1630) and the assertions return via admin-ingested tracks
+ *     once admin ingest can seed a curated track on staging.
+ *   - the capped stream leg ("over-limit staging account is refused with a
+ *     plan-limit status"): it needs a pre-seeded streamable track, and
+ *     since the secret-held real-NZB staging leg retired under the
+ *     CC0-only fixture rule (docs/fixture-audio-licences.md) nothing stages
+ *     one. Parked by name with the same reseed condition as above.
+ *
+ * Real-NZB mode (REAL_NZB_MODE=true): dormant. No workflow sets it since
+ * the secret-held real-NZB staging leg retired under the CC0-only fixture
+ * rule — staging stages and ingests no NZB. The mode and its extended
+ * list stay only so the parked specs' matching skips keep their
+ * mode-specific reasons until the legs un-park or are deleted with the
+ * dormant fixture helper. When it was live, the legs below skipped by
+ * name because the RAR set could feed no completable ingest (the pipeline
+ * has no RAR read) and hence no streamable track until RAR read lands
+ * (one upload is one library row until the per-file manifest lands).
+ * The extended allow-list is fixed here (each entry still binds to its owning
+ * spec file and is consumed once), and the effective budget becomes the
+ * extended list's length — MAX_ALLOWED_SKIPS keeps governing the non-staged
+ * (offline) mode. Any failure, or any skip outside the active list, still
+ * fails the gate in both modes. The provider 430 control is never allow-
+ * listed: it must run.
  *
  * Environment:
  *   JUNIT_PATH            junit evidence to parse (default: test-results/junit.xml,
  *                         relative to the e2e/ working directory in CI).
- *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 1, the fixme above).
+ *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 11, the fixme,
+ *                         the nine parked legs and the capped stream leg
+ *                         below; standard mode only — real-NZB mode budgets
+ *                         the extended allow-list below instead).
+ *   REAL_NZB_MODE         dormant: 'true' when a run staged the secret-held
+ *                         real NZB. No workflow sets it anymore (see above).
  *   REQUIRE_QA_AUTH_TOKEN 'true' requires QA_AUTH_TOKEN to be set (journey job only;
  *                         the synthetic smoke does not use the account seam).
  *   QA_AUTH_TOKEN         checked for presence only — its value is never read,
@@ -46,7 +76,8 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const JUNIT_PATH = process.env.JUNIT_PATH ?? 'test-results/junit.xml';
-const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '1');
+const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '11');
+const REAL_NZB_MODE = (process.env.REAL_NZB_MODE ?? '') === 'true';
 const REQUIRE_QA_AUTH_TOKEN = (process.env.REQUIRE_QA_AUTH_TOKEN ?? '') === 'true';
 const SUMMARY_PATH = process.env.GITHUB_STEP_SUMMARY || null;
 
@@ -55,13 +86,156 @@ const TAG = '[journey-gate]';
 // Allow-list: every skipped test's "classname name" must contain one entry's
 // owning spec file AND match string, and each entry is consumed at most
 // once. Reasons live next to the entries so the budget is auditable.
+// TWO-1635 parked legs: user NZB ingest is retired (TWO-1630), so every leg
+// that needs a user-uploaded track skips by name in both modes (the specs
+// carry the matching guard). Un-park (remove the spec guard and the entry
+// here) once admin ingest can seed a curated track on staging.
+const USER_NZB_RETIRED_REASON =
+  'user NZB ingest retired; reseeds when admin ingest can seed a curated track on staging';
+
 const ALLOWED_SKIPS = [
   {
     file: 'ingest-play-meter.spec.ts',
     match: 'ingested track carries recording_mbids',
     reason: 'test.fixme in e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending)',
   },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'ingested library persists across reload without re-import',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'streaming answers byte Ranges with 206 + Content-Range',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'usage meter increases after streaming and shows plan metadata',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'ingested audio actually plays in the browser',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'player UI seek moves the active audio position and playback continues',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'Media Session metadata reflects the playing ingested track',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'player queue advances in library-selection order',
+    reason: USER_NZB_RETIRED_REASON,
+  },
+  {
+    // The capped stream leg needs a pre-seeded streamable track; the
+    // secret-held real-NZB staging leg that used to park it in real-NZB
+    // mode is retired (CC0-only fixture rule), so it parks by name in
+    // standard mode too, with the same reseed condition.
+    file: 'ingest-play-meter.spec.ts',
+    match: 'over-limit staging account is refused with a plan-limit status',
+    reason: USER_NZB_RETIRED_REASON,
+  },
 ];
+
+// Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
+// completable ingest until RAR read lands — the pipeline fails an RAR-only
+// subset permanent at transcode before any library row — hence no
+// streamable track either; one upload is one library row until the per-file
+// manifest lands). Active only when REAL_NZB_MODE=true.
+const REAL_NZB_ALLOWED_SKIPS = [
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason:
+      'real-NZB mode: RAR set cannot complete ingest (no RAR read in the pipeline) until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'ingested library persists across reload without re-import',
+    reason: 'real-NZB mode: no completable ingest means no library row to reload',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'streaming answers byte Ranges with 206 + Content-Range',
+    reason: 'real-NZB mode: RAR set yields no streamable track until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'usage meter increases after streaming and shows plan metadata',
+    reason: 'real-NZB mode: meter needs the deterministic stream the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'ingested audio actually plays in the browser',
+    reason: 'real-NZB mode: no decodable staged audio until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'player UI seek moves the active audio position and playback continues',
+    reason: 'real-NZB mode: player seek needs the playback the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'Media Session metadata reflects the playing ingested track',
+    reason: 'real-NZB mode: metadata read runs during playback the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'over-limit staging account is refused with a plan-limit status',
+    reason:
+      'real-NZB mode: capped stream leg needs a pre-seeded streamable track ' +
+      '(the ingest-refusal leg retired with user ingest itself)',
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'player queue advances in library-selection order',
+    reason: 'real-NZB mode: queue order needs 2+ tracks; the RAR set stages one row',
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason: 'real-NZB mode: its ingest leg cannot complete either (no RAR read)',
+  },
+];
+
+// Union: the standard list already covers every same-titled RAR-set leg
+// (the capped-stream leg parks in standard mode too since the real-NZB
+// staging leg retired), so the dormant real-NZB entries extend nothing —
+// every skip title stays consumable exactly once (11 entries: the fixme,
+// the nine parked legs, and the capped-stream leg).
+const ACTIVE_ALLOWED_SKIPS = REAL_NZB_MODE
+  ? [
+      ...ALLOWED_SKIPS,
+      ...REAL_NZB_ALLOWED_SKIPS.filter(
+        (extra) =>
+          !ALLOWED_SKIPS.some(
+            (base) => base.file === extra.file && base.match === extra.match,
+          ),
+      ),
+    ]
+  : ALLOWED_SKIPS;
+
+// Standard mode budgets MAX_ALLOWED_SKIPS; real-NZB mode budgets the full
+// extended allow-list (each entry still consumed at most once below).
+const EFFECTIVE_BUDGET = REAL_NZB_MODE ? ACTIVE_ALLOWED_SKIPS.length : MAX_ALLOWED_SKIPS;
 
 function fail(message) {
   process.stdout.write(`${TAG} FAIL: ${message}\n`);
@@ -202,7 +376,7 @@ const skippedNames = parseSkippedNames(xml);
 // and one entry cannot cover two skips.
 const consumedAllowances = new Set();
 const unknownSkips = skippedNames.filter((title) => {
-  const idx = ALLOWED_SKIPS.findIndex(
+  const idx = ACTIVE_ALLOWED_SKIPS.findIndex(
     (entry, i) => !consumedAllowances.has(i) && title.includes(entry.file) && title.includes(entry.match),
   );
   if (idx === -1) return true;
@@ -219,8 +393,8 @@ summaryLines = [
     ? `Skipped (${skippedNames.length} listed in junit evidence):\n${skippedNames.map((n) => `- ${n}`).join('\n')}`
     : 'Skipped: none listed in junit evidence.',
   '',
-  `Skip budget: at most ${MAX_ALLOWED_SKIPS} from the documented allow-list ` +
-    `(${ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
+  `Skip budget (${REAL_NZB_MODE ? 'real-NZB mode' : 'standard mode'}): at most ${EFFECTIVE_BUDGET} ` +
+    `from the documented allow-list (${ACTIVE_ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
   '',
   ...(tokenMissing ? [tokenLine, ''] : []),
 ];
@@ -236,9 +410,9 @@ if (tests === 0) fail('zero journeys ran (no test cases in junit evidence).');
 if (ran === 0) {
   fail(`every journey skipped (0 ran, ${skipped} skipped) — staging evidence is empty.`);
 }
-if (skipped > MAX_ALLOWED_SKIPS) {
+if (skipped > EFFECTIVE_BUDGET) {
   fail(
-    `skip count ${skipped} is above the allow-list budget of ${MAX_ALLOWED_SKIPS} ` +
+    `skip count ${skipped} is above the allow-list budget of ${EFFECTIVE_BUDGET} ` +
       '(every extra skip needs a documented reason).',
   );
 }

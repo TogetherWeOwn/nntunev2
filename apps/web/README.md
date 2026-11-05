@@ -28,13 +28,14 @@ system libraries Chromium links against; see `playwright.config.ts`.
 
 ## Bundle budget
 
-CI fails `web-build` when total client JS exceeds **337,920 B (330 KiB)**,
+CI fails `web-build` when total client JS exceeds **368,640 B (360 KiB)**,
 measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
 (`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
-procedure — that script is the single source of truth. Baseline was 306,065 B
-(~299 KiB, 37 files) on 2026-10-27, leaving ~10% headroom for the next
+procedure — that script is the single source of truth. Baseline was 339,150 B
+(~331 KiB, 52 files) on 2026-11-03 for the W10 app shell (shell routes and
+furniture plus review-fix logic, PR #907), leaving ~8% headroom for the next
 first-party features while catching heavy additions (a charting or date
 library typically adds 50+ KiB).
 
@@ -50,14 +51,24 @@ To update the budget deliberately, in its own PR: rebuild, confirm the growth
 is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
 with a comment citing the reason, and update the number in this paragraph.
 Never bump it just to make a red build green. Wasm/script size gates are out
-of scope here (tracked separately as Wasm enforcement).
+of scope here (tracked separately as Wasm enforcement). Before adding code
+that spends a visible share of the remaining headroom, follow the per-route
+splitting rules in [`docs/web-code-splitting-plan.md`](../../docs/web-code-splitting-plan.md).
+
+## Accessibility gate
+
+`tests/accessibility-axe.spec.ts` runs axe (`@axe-core/playwright`) over
+every route and fails on any serious or critical violation. It runs in CI
+as the `web-a11y` job and as part of the full Playwright suite; run it
+alone with `pnpm test:e2e:a11y`. Minor/moderate findings are attached to
+the test report as warnings, not failures.
 
 ## Deploy
 
 The tracked Wrangler config is [`wrangler.toml`](wrangler.toml) in this
 directory (staging/production names, no backend bindings or secret values).
 [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs
-`staging-web` on pushes to `main` and `preview-web` on pull requests. Its
+`staging-web` on pushes to `main` (no per-PR preview deploys). Its
 `gate` job checks for `CLOUDFLARE_API_TOKEN`; deploys also require the
 `CLOUDFLARE_ACCOUNT_ID` secret (names only; the full account ID stays private).
 `post-deploy-e2e` follows a successful `staging-web`, not `staging-api`.

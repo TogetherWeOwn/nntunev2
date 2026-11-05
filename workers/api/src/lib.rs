@@ -13,24 +13,33 @@
 //! (`migrations/0023_subsonic_clients.sql`).
 
 pub mod account_deletion;
+pub mod admin;
+pub mod admin_ingest;
 pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+pub mod billing_reconcile;
+mod field_envelope;
 pub mod handlers;
 pub mod ingest_grant;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
 mod magic_redemption;
+pub mod meter_sink;
 pub mod native_rest;
+pub mod original_source;
 pub mod plan_limits;
+pub mod play_grant;
+pub mod playback;
 pub mod providers;
 pub mod random;
 pub mod rate_limit;
 pub mod rotation;
 pub mod session;
 pub mod session_retry_store;
+pub mod stripe;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;

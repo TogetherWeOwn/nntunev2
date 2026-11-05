@@ -37,10 +37,8 @@ describe('resolveStreamUrl', () => {
 });
 
 // Builder-owned exact pins for the library player wiring, via the same Vite
-// raw-glob seam as the acceptance source pin. The acceptance pin in
-// `import-validation.test.ts` is intentionally loose (it only requires
-// `src={`) and that file is acceptance-owned, so the exact binding and the
-// helper derivation are pinned here instead.
+// raw-glob seam as the other route-markup pins. The exact binding and the
+// helper derivation are pinned here.
 const routeSources = import.meta.glob('../../routes/**/*.svelte', {
 	query: '?raw',
 	import: 'default',

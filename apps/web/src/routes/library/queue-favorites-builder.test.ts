@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import ts from 'typescript';
 import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
@@ -26,7 +27,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback',
-		'resetRestartOnSourceChange'
+		'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
@@ -47,6 +48,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
@@ -71,6 +73,8 @@ test('queues shelf favorites in star order, not library/title order, with displa
 		], currentIndex: 0
 	});
 	expect(page.read().announcement).toMatch(/queued 3.*0 already queued/i);
+	expect(readMiniPlayerHint()?.trackId).toBe('mike');
+	expect(readMiniPlayerHint()?.title).toBe('Mike Song');
 });
 
 test('keeps already queued tracks in place and preserves a non-first current selection', () => {

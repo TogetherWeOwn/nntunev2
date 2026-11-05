@@ -28,12 +28,12 @@ describe('LevelingToggle accessible contract', () => {
 			expect(tag).not.toBeNull();
 			expect(tag).toMatch(/^<button\b/);
 			expect(tag).toContain(`aria-pressed="${enabled ? 'true' : 'false'}"`);
-			expect(tag).toMatch(/aria-label="Loudness leveling"/);
+			expect(tag).toContain(`aria-label="Loudness leveling: ${enabled ? 'On' : 'Off'}"`);
 		}
 	});
 
 	it('shows the on/off state as visible text', () => {
-		expect(toggleText(true)).toContain('Leveling: On');
-		expect(toggleText(false)).toContain('Leveling: Off');
+		expect(toggleText(true)).toContain('Loudness leveling: On');
+		expect(toggleText(false)).toContain('Loudness leveling: Off');
 	});
 });

@@ -13,7 +13,6 @@ import {
   isAuthStartRequest,
   isStagingOrigin,
   qaAuthHeader,
-  syntheticNntpEndpoint,
   type WallProbe,
 } from './access.js';
 
@@ -21,16 +20,76 @@ export interface TestAccount {
   email: string;
   /**
    * Opaque session for the minted account, when the seam provisions one.
-   * Contract (owned by the auth card): the staging API accepts it as
-   * `Authorization: Bearer <session>`. Account-specific assertions require
-   * this per-account credential; QA_AUTH_TOKEN is seam-setup-only and never
-   * substitutes for it. Absent is a setup-only result.
-   * If the auth card implements cookie sessions instead, update
-   * accountHeaders/applyAccountToPage together with the specs.
+   * Browser pages present it as the `__Host-` session cookie (planted by
+   * applyAccountToPage — the only credential session routes accept);
+   * account-specific API calls present it as `Authorization: Bearer`.
+   * QA_AUTH_TOKEN is seam-setup-only and never substitutes for it. Absent
+   * is a setup-only result.
+   * If the auth card changes the session presentation again, update
+   * browserSessionCookie/applyAccountToPage together with the specs.
    */
   session?: string;
   /** True when minted via the API seam (skip the UI signup form). */
   viaApi: boolean;
+}
+
+/**
+ * Name of the web session cookie the staging API authenticates session
+ * routes with. Mirrors `COOKIE_NAME` in `workers/api/src/session.rs`: the
+ * `__Host-` prefix locks the cookie to `Path=/`, `Secure`, no `Domain`
+ * (host-only) by construction — the browser rejects any plant that
+ * deviates, so the plant below pins exactly those attributes. Cookie
+ * sessions are the only credential session routes (`POST /v1/vault/*`,
+ * `/v1/session/*`, …) accept; the `Authorization` bearer is ignored there
+ * (see security-sign-out-everywhere.spec.ts). Names only — never a value.
+ */
+export const SESSION_COOKIE_NAME = '__Host-nntune-session';
+
+/**
+ * A session-cookie plant for `BrowserContext.addCookies`, scoped to the
+ * staging origin. Pure (no browser needed) so offline self-tests pin the
+ * scope without launching Chromium.
+ */
+export interface BrowserSessionCookie {
+  name: string;
+  value: string;
+  url: string;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: 'Lax';
+}
+
+/**
+ * Build the session-cookie plant for a browser page identity, or null when
+ * no plant applies. A plant needs a nonblank session on an https origin:
+ * `__Host-` cookies are Secure-only, so planting on a non-https origin (the
+ * offline http test doubles) would be rejected by the browser — those
+ * origins keep the header-only identity and get no plant. Staging is always
+ * https (see stagingBaseUrl), so live runs always plant. An unparseable
+ * baseURL also yields null instead of throwing: the route setup below owns
+ * URL validation for live callers.
+ */
+export function browserSessionCookie(
+  session: string | undefined,
+  baseURL: string,
+): BrowserSessionCookie | null {
+  const token = nonblankString(session);
+  if (!token) return null;
+  let origin: string;
+  try {
+    origin = new URL(baseURL).origin;
+  } catch {
+    return null;
+  }
+  if (!origin.startsWith('https://')) return null;
+  return {
+    name: SESSION_COOKIE_NAME,
+    value: token,
+    url: `${origin}/`,
+    secure: true,
+    httpOnly: true,
+    sameSite: 'Lax',
+  };
 }
 
 /**
@@ -152,6 +211,27 @@ function throwOnRedirect(status: number, headers: Record<string, string>, contex
 }
 
 /**
+ * Playwright transport/setup errors include request URLs and header values.
+ * Replace the whole error, never its message/stack/cause, before it reaches
+ * a textual failure reporter. Method is a fixed label; even caller context
+ * is excluded here. Redirect errors are checked outside this boundary so
+ * their existing value-free diagnostics stay intact. Traces remain off:
+ * this only protects propagated errors, not Playwright's internal API steps.
+ */
+async function credentialedTransport(
+  method: 'GET' | 'POST' | 'OPTIONS',
+  send: () => Promise<APIResponse>,
+): Promise<APIResponse> {
+  try {
+    return await send();
+  } catch {
+    throw new Error(
+      `[api] credentialed ${method} request transport failed (names only — no values logged).`,
+    );
+  }
+}
+
+/**
  * Credentialed GET that never follows redirects with headers.
  * Fetches with maxRedirects: 0 so a staging 302 to another origin is
  * returned as-is (foreign origin receives zero requests); a 3xx throws
@@ -164,11 +244,13 @@ export async function apiGet(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.get(url, {
-    headers,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('GET', () =>
+    request.get(url, {
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
@@ -185,12 +267,14 @@ export async function apiPost(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.post(url, {
-    headers,
-    data: data as Record<string, unknown>,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('POST', () =>
+    request.post(url, {
+      headers,
+      data: data as Record<string, unknown>,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
@@ -209,12 +293,14 @@ export async function apiOptions(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.fetch(url, {
-    method: 'OPTIONS',
-    headers,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('OPTIONS', () =>
+    request.fetch(url, {
+      method: 'OPTIONS',
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
@@ -318,16 +404,29 @@ export async function anonymousGet(
 
 /**
  * Authenticate a browser page as a minted account. Call BEFORE the first
- * navigation: the route applies to subsequent loads, never past ones.
+ * navigation: the route applies to subsequent loads, never past ones, and
+ * the session cookie must be planted before the first request carries it.
  *
- * Headers are attached ONLY to the staging origin via a context route:
- * `extraHTTPHeaders`/`setExtraHTTPHeaders` would also send the Access
- * service token and session bearer to cross-origin subresources (fonts,
- * analytics, stream/store URLs, payment redirects). Anything off-origin
- * continues unmodified. Staging requests are fetched with maxRedirects: 0
- * and fulfilled back to the browser, so a 302 to another origin is followed
+ * Two credentials are installed for a session account. First, the minted
+ * session is planted as the `__Host-` session cookie (see
+ * browserSessionCookie): session routes (`POST /v1/vault/*` for the BYOP
+ * wizard's test/save, `/v1/session/*`, …) authenticate by cookie only and
+ * ignore the bearer, so without this plant every wizard test-connection
+ * fails closed as unauthenticated. When no plant applies (a null account,
+ * or a non-https offline double) any previously planted session cookie is
+ * cleared instead, so a re-applied page is anonymous and cookieless rather
+ * than leaking the earlier identity. Second, headers are attached ONLY to
+ * the staging origin via a context route: `extraHTTPHeaders`/
+ * `setExtraHTTPHeaders` would also send the Access service token and
+ * session bearer to cross-origin subresources (fonts, analytics,
+ * stream/store URLs, payment redirects). Anything off-origin continues
+ * unmodified. Staging requests are fetched with maxRedirects: 0 and
+ * fulfilled back to the browser, so a 302 to another origin is followed
  * WITHOUT the credential headers — the follow-up request is evaluated fresh
- * by this handler. Re-entrant: replaces any previous scope routing.
+ * by this handler. The browser attaches the planted cookie to same-origin
+ * navigations and fetches itself, and the route handler forwards it with
+ * the merged request headers. Re-entrant: replaces any previous scope
+ * routing. Null accounts plant nothing and stay cookieless.
  */
 export async function applyAccountToPage(
   page: Page,
@@ -346,6 +445,14 @@ export async function applyAccountToPage(
         'QA seam token cannot stand in for an account identity (names only — no values logged).',
     );
   }
+  // Cookie-first: session routes ignore the bearer, so the minted session
+  // must ride as the `__Host-` cookie before any navigation or wizard fetch.
+  // Null accounts (and non-https offline doubles) get no plant — any cookie
+  // a previous apply planted is cleared instead, so the page stays
+  // anonymous and cookieless even when identities are re-applied.
+  const cookie = browserSessionCookie(session, baseURL);
+  if (cookie) await page.context().addCookies([cookie]);
+  else await page.context().clearCookies();
   const stagingHeaders: Record<string, string> = { ...accessHeaders() };
   if (session) stagingHeaders.Authorization = `Bearer ${session}`;
   // Anonymous pages put the QA bearer on auth-start POSTs only, so the
@@ -491,81 +598,6 @@ export async function waitForHydration(page: Page, context: string): Promise<voi
   ).toBeAttached({ timeout: 30_000 });
 }
 
-/**
- * Complete the BYOP wizard for the current page identity: point it at the
- * synthetic NNTP endpoint and save. Every identity that ingests runs this
- * first — the ingest worker probes through the user's authenticated provider
- * connection, so an account that never ran the wizard cannot ingest. Fails
- * closed when SYNTHETIC_NNTP_PASS is missing (no default, never logged).
- */
-export async function completeByopWizard(page: Page, baseURL: string): Promise<void> {
-  const endpoint = syntheticNntpEndpoint();
-  const password = process.env.SYNTHETIC_NNTP_PASS;
-  if (!password) {
-    throw new Error(
-      '[byop] SYNTHETIC_NNTP_PASS is not set. The wizard must point at the hosted ' +
-        'synthetic endpoint or test provider — refusing to submit an empty credential. ' +
-        'See e2e/README.md.',
-    );
-  }
-  await page.goto(`${baseURL}/onboarding/byop`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30_000,
-  });
-  await waitForHydration(page, 'byop');
-  await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
-  await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
-  await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
-  await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
-  await page.getByTestId(TESTIDS.byopPass).fill(password);
-  // Fail closed on transport fidelity: explicitly set AND verify the TLS
-  // checkbox's requested state. A missing, unusable or un-settable control
-  // must stop the wizard here — never submit test/save with whatever
-  // transport the page happened to default to.
-  const tlsToggle = page.getByTestId(TESTIDS.byopTls);
-  const tlsMatches = await tlsToggle.count();
-  if (tlsMatches !== 1) {
-    throw new Error(
-      `[byop] expected exactly one TLS checkbox (${TESTIDS.byopTls}) on the BYOP page, ` +
-        `found ${tlsMatches}: cannot verify the requested transport — refusing to test ` +
-        'or save. The page contract may have drifted (names only — no values logged).',
-    );
-  }
-  const tlsType = await tlsToggle.getAttribute('type').catch(() => null);
-  if (tlsType?.toLowerCase() !== 'checkbox') {
-    throw new Error(
-      '[byop] the BYOP TLS control is not a checkbox — cannot set or verify the ' +
-        'requested TLS state; refusing to test or save (names only — no values logged).',
-    );
-  }
-  // endpoint.tls is always true (TLS-off is rejected in syntheticNntpEndpoint),
-  // so the requested state is unconditionally checked.
-  try {
-    await tlsToggle.check();
-    await expect(tlsToggle).toBeChecked();
-  } catch {
-    // The underlying Playwright error can carry page detail; replace it with
-    // a names-only diagnostic instead of letting it propagate.
-    throw new Error(
-      '[byop] could not set and verify the BYOP TLS checkbox to checked: ' +
-        'refusing to test or save with an unverified transport (names only — no values logged).',
-    );
-  }
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await page.getByTestId(TESTIDS.byopTest).click();
-  const status = page.getByTestId(TESTIDS.byopStatus);
-  await expect(status, 'BYOP test-connection gave no status').toBeVisible({ timeout: 60_000 });
-  await expect(status, 'BYOP test-connection to the synthetic endpoint failed').toContainText(
-    /success|connected|ok/i,
-    { timeout: 60_000 },
-  );
-  await page.getByTestId(TESTIDS.byopSave).click();
-  await expect(page, 'BYOP save did not reach the library').toHaveURL(/\/library/, {
-    timeout: 30_000,
-  });
-}
-
 /** Path the signup form posts to first (`registerStart` in the web client). */
 const REGISTER_START_PATH = '/v1/auth/passkey/register/start';
 
@@ -639,10 +671,11 @@ export async function awaitSignupOutcome(
  * the reachable first step of the real two-step flow: submit starts
  * registration (`registerStart`) and the page renders the emailed-code form
  * (`input[name="magic_code"]`, "Finish creating account"). Navigation to the
- * BYOP wizard happens only after the emailed code plus a passkey finish
+ * billing plan picker happens only after the emailed code plus a passkey finish
  * (`registerFinish`), which needs a staging-only code-retrieval seam and a
- * WebAuthn virtual authenticator that do not exist yet — so this helper
- * must NOT assert the wizard, or every configured run goes red. It never
+ * WebAuthn virtual authenticator (covered separately by
+ * `submitPublicUiSignupToBilling`) — so this helper must NOT assert billing
+ * arrival, or every configured run goes red. It never
  * touches the test-account seam, so it proves public UI form submission even
  * when the seam is configured. Callers authenticate the page first (a null
  * identity via applyAccountToPage gives the anonymous, Access-only starting
@@ -718,7 +751,7 @@ export async function retrieveStagedSignupCode(
     throw new Error(
       `[code-seam] POST /api/test-codes failed: HTTP ${status} (seam absent or outage — ` +
         'names only, no values logged). The staging code-retrieval seam must ' +
-        'return the issued code for example.test mailboxes; without it the wizard-arrival ' +
+        'return the issued code for example.test mailboxes; without it the signup-arrival ' +
         'spec fails here. See e2e/README.md.',
     );
   }
@@ -769,7 +802,7 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
   } catch {
     throw new Error(
       '[webauthn] could not enable the virtual authenticator (names only — no values logged). ' +
-        'The wizard-arrival spec requires a Chromium virtual authenticator; refusing to ' +
+        'The signup-arrival spec requires a Chromium virtual authenticator; refusing to ' +
         'submit the passkey ceremony without one.',
     );
   }
@@ -777,15 +810,15 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
 
 /**
  * Submit the public `/signup` form as a fresh synthetic identity and carry
- * the real two-step flow all the way to the BYOP wizard: submit starts
+ * the real two-step flow all the way to the billing plan picker: submit starts
  * registration (`registerStart`), the emailed-code step is filled with the
  * code from the staging-only retrieval seam (`retrieveStagedSignupCode`),
  * and the passkey finish (`registerFinish`) runs against a WebAuthn virtual
  * authenticator (`enableVirtualAuthenticator`), after which the page
- * navigates to `/onboarding/byop`.
+ * navigates to `/account/billing`.
  *
  * Unlike `submitPublicUiSignup` (which stops at the `magic_code` step so
- * every configured run stays green), this helper asserts wizard arrival and
+ * every configured run stays green), this helper asserts billing arrival and
  * therefore requires the seam: without it the code-retrieval POST fails with
  * the documented `[code-seam]` signature. It never touches the test-account
  * mint seam, so the account it creates comes only from the public form. Call
@@ -794,7 +827,7 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
  * identity; it and the code value are never interpolated into an assertion
  * message or diagnostic here.
  */
-export async function submitPublicUiSignupToByopWizard(
+export async function submitPublicUiSignupToBilling(
   page: Page,
   request: APIRequestContext,
   baseURL: string,
@@ -817,11 +850,11 @@ export async function submitPublicUiSignupToByopWizard(
   });
   // Staging-only seam: the issued code for this synthetic mailbox, without
   // minting. Absent seam (or absent QA_AUTH_TOKEN) fails here by name —
-  // never by asserting the wizard on a code that was never issued.
+  // never by asserting the library on a code that was never issued.
   const code = await retrieveStagedSignupCode(request, baseURL, email);
   if (!code) {
     throw new Error(
-      '[code-seam] no staged signup code: this wizard-arrival step requires QA_AUTH_TOKEN ' +
+      '[code-seam] no staged signup code: this billing-arrival step requires QA_AUTH_TOKEN ' +
         'plus the staging code-retrieval seam for example.test mailboxes ' +
         '(names only — no values logged). See e2e/README.md.',
     );
@@ -831,20 +864,23 @@ export async function submitPublicUiSignupToByopWizard(
   await enableVirtualAuthenticator(page);
   await codeField.fill(code);
   await page.getByRole('button', { name: 'Finish creating account' }).click();
-  // The page navigates to the BYOP wizard only after the emailed code plus
+  // The page navigates to billing only after the emailed code plus
   // the passkey finish succeed server-side. The regex waits for the
   // navigation; the plain-string read below names the arrival path verbatim
   // (kept as a pinnable contract string, never a value).
-  await expect(page, 'public UI signup did not reach the BYOP wizard').toHaveURL(
-    /\/onboarding\/byop/,
-    { timeout: 30_000 },
-  );
-  expect(page.url(), 'public UI signup did not land on the BYOP wizard').toContain(
-    '/onboarding/byop',
-  );
+  await expect(page, 'public UI signup did not reach billing').toHaveURL(/\/account\/billing/, {
+    timeout: 30_000,
+  });
+  expect(page.url(), 'public UI signup did not land on billing').toContain('/account/billing');
+  await waitForHydration(page, 'signup-arrival');
   await expect(
-    page.getByTestId(TESTIDS.byopHost),
-    'BYOP wizard not reachable after public UI signup',
+    page.getByRole('heading', { level: 1 }),
+    'billing heading not visible after public UI signup',
+  ).toContainText('Billing', { timeout: 15_000 });
+  await expect(page.getByText('to see your billing.', { exact: false })).toHaveCount(0);
+  await expect(
+    page.getByRole('link', { name: 'See plans', exact: true }),
+    'authenticated billing action not visible after public UI signup',
   ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
 }

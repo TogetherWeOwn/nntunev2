@@ -45,6 +45,17 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * targets; changed keyboard order or invisible focus; unvalidated or
  * non-enum persistence; storage-failure banners/throws; density lost
  * across find/order/favorites; appearance preference disturbed.
+ *
+ * App-shell renegotiation (test-author, design spec v1): the Density
+ * native select stays on the library page view-options toolbar, so every
+ * DEN case above keeps unchanged — DEN-02's geometry assertions compare
+ * the same rows before and after the switch, so they re-baseline onto
+ * the new row heights on their own. The one addition is DEN-09 below
+ * (`test.fixme`, activates with the app shell build): the left rail's
+ * "Sort & view" menu may offer the same Comfortable/Compact choice as
+ * menu radios writing the same `nntune:density:v1` raw enum, but it
+ * must never create a second combobox named "Density"; the page select
+ * stays the single combobox and reflects whichever writer chose last.
  */
 
 const DENSITY_KEY = 'nntune:density:v1';
@@ -264,8 +275,9 @@ test('DEN-00 control: real page, rows, queue, find/order/appearance controls and
 	const { writes } = await openLibrary(page);
 	await queueTwo(page);
 	await expectRowTextsVisible(page);
-	await expect(page.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }))).toBeVisible();
+	// Page main only: the app-shell top bar carries its own Search field.
+	await expect(page.getByRole('main').getByRole('searchbox', { name: /find|search/i })
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }))).toBeVisible();
 	await expect(page.getByRole('combobox', { name: /order|sort/i })).toBeVisible();
 	await expect(page.getByRole('combobox', { name: 'Appearance', exact: true })).toBeVisible();
 	expect(targetSizeViolations(await rowTargets(page)),
@@ -472,8 +484,9 @@ test('DEN-08 views: Compact persists across find, ordering and favorites use on 
 	await expectRowHeightBelow(row(page, 'den-alpha'), comfortableLibrary, 'Compact applies before view changes');
 
 	// Find: filtered rows stay compact and readable.
-	const find = page.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+	// Page main only: the app-shell top bar carries its own Search field.
+	const find = page.getByRole('main').getByRole('searchbox', { name: /find|search/i })
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }));
 	await find.fill('Alpha');
 	await expect(row(page, 'den-beta')).toBeHidden();
 	await expect(row(page, 'den-alpha')).toBeVisible();
@@ -498,3 +511,59 @@ test('DEN-08 views: Compact persists across find, ordering and favorites use on 
 	await expectRowHeightBelow(queueRow(page, 'den-zulu'), comfortableQueue, 'queue rows must stay Compact after starring');
 	await expect(density(page)).toHaveValue('compact');
 });
+
+// [gate: app shell] Renegotiated with the nav contract (see header note):
+// the rail's Sort & view menu radios are a SECOND writer of the same
+// device-local enum, never a second combobox named "Density".
+test.fixme(
+	'DEN-09 rail sort & view radios write the same key; the page select stays the only Density combobox',
+	async ({ page }) => {
+		await openLibrary(page);
+		await expectDensityControl(page, 'comfortable');
+		const firstRow = row(page, ITEMS[0]!.id);
+		const comfortableHeight = await rowHeight(firstRow);
+
+		const rail = page.getByTestId('shell-rail');
+		await expect(
+			rail,
+			'expected the app-shell left rail. Builder (app shell): the rail carries the ' +
+				'"Sort & view" menu; see the v2 contract in app-shell-navigation.spec.ts.'
+		).toBeVisible();
+		await rail.getByRole('button', { name: /sort & view/i }).click();
+		await expect(
+			density(page),
+			'expected exactly ONE combobox named "Density" even with the rail menu open'
+		).toHaveCount(1);
+
+		const compactRadio = page
+			.getByRole('menuitemradio', { name: 'Compact' })
+			.or(page.getByRole('radio', { name: 'Compact' }))
+			.first();
+		await expect(
+			compactRadio,
+			'expected the rail "Sort & view" menu to offer a Compact radio. ' +
+				'Builder: render the view-density choice as menu radios, not a second select.'
+		).toBeVisible();
+		await compactRadio.click();
+
+		await expect
+			.poll(
+				() => page.evaluate((key) => localStorage.getItem(key), DENSITY_KEY),
+				{
+					message:
+						'expected the rail radio to persist the raw enum under nntune:density:v1'
+				}
+			)
+			.toBe('compact');
+		await expect(
+			density(page),
+			'expected the page Density select to reflect the rail choice (one shared enum)'
+		).toHaveValue('compact');
+		await expectRowHeightBelow(
+			firstRow,
+			comfortableHeight,
+			'expected rows to shrink when Compact is chosen from the rail menu'
+		);
+		await expectLibraryTextsVisible(page);
+	}
+);

@@ -1,13 +1,15 @@
 # NNTune v2
 
-Serverless BYO-Usenet-provider music streaming on Cloudflare.
+Serverless music streaming on Cloudflare, from a shared curated catalogue.
 
-## Vision: BYOP
+## Vision
 
-Users **bring their own Usenet provider** — NNTune v2 never bundles or
-resells Usenet access. You connect your existing provider account; we provide
-the music experience on top: search, streaming, library management and
-offline-friendly caching.
+Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,
+admin-curated catalogue: playback is fetched through service-owned backend
+provider accounts (ADR 0014), and tracks proven popular by real plays are
+served from a shared R2 popularity cache (ADR 0013). We provide the music
+experience on top: search, streaming and library management. There are no
+user provider accounts to connect and no offline downloads.
 
 ## Plans
 
@@ -133,11 +135,10 @@ Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
 - Pushing to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
   `staging-web` deploys `apps/web`, then `post-deploy-e2e` sequences the full
   Playwright journey after both that web deploy and the `staging-api` job
-  succeed. Pull requests use
-  `preview-web` for web previews. The `gate` job checks for
+  succeed. Pull requests get no preview deploy; PR CI (lint/test/build)
+  stays. The `gate` job checks for
   `CLOUDFLARE_API_TOKEN`; deploys also require `CLOUDFLARE_ACCOUNT_ID`.
-  Without the token, deploy/preview jobs skip, so fork PRs get neither a
-  deploy nor a staging PASS.
+  Without the token, deploy jobs skip.
 - The same push also runs the staging-only API Worker lane, `staging-api`,
   behind the same token gate. Its deploy steps skip if any public Actions
   variable is missing: `HYPERDRIVE_ID_STAGING`, `API_RP_ID_STAGING` or

@@ -44,9 +44,7 @@ const PLAN = {
 	priceCents: 1200,
 	streamHoursMonth: 100,
 	maxConcurrentStreams: 2,
-	maxLibraryTracks: 5000,
-	ingestJobsDay: 20,
-	cachePriority: 'standard'
+	selectable: true
 };
 
 /** Valid plans envelope padded (extra fields are allowed) to exact bytes. */

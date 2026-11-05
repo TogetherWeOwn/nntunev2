@@ -1,6 +1,6 @@
 //! Reason-code literal and row-mapping pins for `mb-validate`.
 //!
-//! `src/lib.rs:65-77` defines eleven `reason::` poison codes copied verbatim
+//! `src/lib.rs` defines thirteen `reason::` poison codes copied verbatim
 //! into the dead-letter table. The in-module tests use those constants
 //! symbolically, and the `exit_code_matrix` suite pins exit codes only
 //! ("never message wording"), so a renamed literal would stay green. This
@@ -34,8 +34,12 @@ fn valid_artist() -> String {
     artist(MBID, "The Band", "US", TS)
 }
 
+fn valid_release_group() -> String {
+    format!("{MBID}\tA Group\t{MBID2}\tAlbum\t{TS}")
+}
+
 fn valid_release() -> String {
-    format!("{MBID2}\t{MBID}\tAlbum Title\tAlbum\t2024\t\\N\t{TS}")
+    format!("{MBID2}\t{MBID}\tAlbum Title\tAlbum\t2024\t\\N\t{MBID}\t{TS}")
 }
 
 fn valid_recording() -> String {
@@ -44,6 +48,26 @@ fn valid_recording() -> String {
 
 fn valid_track() -> String {
     format!("{MBID2}\t{MBID}\t2\t0\t{TS}")
+}
+
+fn valid_url() -> String {
+    format!("{MBID}\thttps://example.test/a\t{TS}")
+}
+
+fn valid_artist_url() -> String {
+    format!("{MBID}\t{MBID2}\tyoutube\t{TS}")
+}
+
+fn valid_recording_url() -> String {
+    format!("{MBID}\t{MBID2}\tfree streaming\ttrue\t{TS}")
+}
+
+fn valid_recording_music_video() -> String {
+    format!("{MBID}\t{MBID2}\t{TS}")
+}
+
+fn valid_recording_isrc() -> String {
+    format!("{MBID}\tUSABC2400001\t{TS}")
 }
 
 #[test]
@@ -58,6 +82,8 @@ fn reason_literal_values() {
     assert_eq!(reason::BAD_COUNTRY, "bad_country");
     assert_eq!(reason::NEGATIVE_DURATION, "negative_duration");
     assert_eq!(reason::NEGATIVE_POSITION, "negative_position");
+    assert_eq!(reason::BAD_ISRC, "bad_isrc");
+    assert_eq!(reason::BAD_BOOL, "bad_bool");
     assert_eq!(reason::INVALID_ENCODING, "invalid_encoding");
 }
 
@@ -87,10 +113,28 @@ fn bad_uuid_row_maps_to_literal() {
 #[test]
 fn bad_int_row_maps_to_literal() {
     // Release year outside the i16 schema bound.
-    let raw = format!("{MBID2}\t\\N\tT\tAlbum\t40000\t\\N\t{TS}");
+    let raw = format!("{MBID2}\t\\N\tT\tAlbum\t40000\t\\N\t\\N\t{TS}");
     assert_eq!(
         validate_line(Table::Release, 12, &raw),
         Err(("bad_int", 12))
+    );
+}
+
+#[test]
+fn bad_isrc_row_maps_to_literal() {
+    let raw = format!("{MBID}\tBOGUS\t{TS}");
+    assert_eq!(
+        validate_line(Table::RecordingIsrc, 19, &raw),
+        Err(("bad_isrc", 19))
+    );
+}
+
+#[test]
+fn bad_bool_row_maps_to_literal() {
+    let raw = format!("{MBID}\t{MBID2}\tfree streaming\tyes\t{TS}");
+    assert_eq!(
+        validate_line(Table::RecordingUrl, 20, &raw),
+        Err(("bad_bool", 20))
     );
 }
 
@@ -153,9 +197,15 @@ fn negative_position_row_maps_to_literal() {
 fn valid_row_per_table_passes_with_line_no_appended() {
     for (table, raw) in [
         (Table::Artist, valid_artist()),
+        (Table::ReleaseGroup, valid_release_group()),
         (Table::Release, valid_release()),
         (Table::Recording, valid_recording()),
         (Table::Track, valid_track()),
+        (Table::Url, valid_url()),
+        (Table::ArtistUrl, valid_artist_url()),
+        (Table::RecordingUrl, valid_recording_url()),
+        (Table::RecordingMusicVideo, valid_recording_music_video()),
+        (Table::RecordingIsrc, valid_recording_isrc()),
     ] {
         let want = format!("{raw}\t21");
         assert_eq!(validate_line(table, 21, &raw), Ok(want), "{table:?}");

@@ -1,5 +1,5 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
-//! DNS-over-HTTPS resolution, pinned-address socket probing, and the
+//! DNS-over-HTTPS resolution, vetted-peer socket probing, and the
 //! magic-link mailer webhook. Request security decisions live in
 //! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
 //! caching-disabled attestation below) live here and refuse to serve
@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::types::Type;
@@ -21,13 +22,18 @@ use worker::{
     Result as WorkerResult,
 };
 
+use crate::admin_ingest::{
+    self, AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome,
+    StoredAdminIngestJob,
+};
 use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseClaim,
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
-    QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
+    self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
+    ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
+    QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord, VaultRow,
 };
 use crate::providers::{
     insert_provider_sql, prune_superseded_providers_sql, purge_unreferenced_providers_sql,
@@ -267,6 +273,37 @@ fn config_from_env(env: &Env) -> Option<Config> {
         }
         (None, Some(_)) | (Some(_), None) => return None,
     };
+    // Stripe test-mode secrets (Checkout-shape slice): both optional at
+    // startup — unprovisioned paths fail closed per-request (the webhook
+    // 500s so Stripe retries it; purchases refuse without a Stripe call)
+    // while every other route keeps serving. A staged bearer must be a
+    // test-mode key: `sk_live_` or any other shape refuses the whole
+    // startup before any traffic is served. Blank reads as absent.
+    let stripe_secret = env_string(env, "STRIPE_SECRET_KEY");
+    if let Some(key) = stripe_secret.as_deref() {
+        if !crate::stripe::valid_secret_key(key) {
+            return None;
+        }
+    }
+    let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
+    let config = config.with_stripe(stripe_secret, stripe_webhook);
+    // Play-grant signing secret, shared with the stream Worker: raw
+    // string bytes, never base64-decoded (see the helper). Absent (or
+    // the minter's minimum length not met at issue time) fails the
+    // play routes closed per-request; every other route keeps serving.
+    let config = match play_grant_secret_from_lookup(|name| env_string(env, name)) {
+        Some(secret) => config.with_play_grant_secret(secret),
+        None => config,
+    };
+    // Meter-sink HMAC key, shared with the stream Worker the same
+    // raw-bytes way (see the helper). Absent (or under the sink's
+    // minimum length at verify time) fails the internal endpoint
+    // closed per-request; the stream DO keeps windows pending and
+    // retries on its alarm.
+    let config = match meter_sink_secret_from_lookup(|name| env_string(env, name)) {
+        Some(secret) => config.with_meter_sink_secret(secret),
+        None => config,
+    };
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -281,6 +318,25 @@ const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
     "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
     "VAULT_TEST_IP_RATE_LIMIT_MAX",
 ];
+
+/// Play-grant secret overlay: the RAW STRING BYTES of the env value.
+/// This is the one secret never base64-decoded here — the stream
+/// Worker keys its HMAC with the raw bytes of the same string, so
+/// decoding would silently desynchronize the two sides and refuse
+/// every grant stream-side. Pure over a lookup so the no-decode rule
+/// is unit-pinned below.
+fn play_grant_secret_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
+    get(crate::play_grant::PLAY_GRANT_SECRET_VAR).map(String::into_bytes)
+}
+
+/// Meter-sink secret overlay: same raw-string-bytes rule as the
+/// play-grant secret — the stream Worker's sink signer keys its HMAC
+/// with the raw bytes of the same env string, so decoding here would
+/// silently refuse every flush. Unit-pinned below alongside the
+/// play-grant probe.
+fn meter_sink_secret_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
+    get(crate::meter_sink::METER_SINK_SECRET_VAR).map(String::into_bytes)
+}
 
 /// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
 /// the lookup resolves and hand them to `from_vars`, which fails safe
@@ -421,6 +477,36 @@ fn u32_of(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError)
 }
 
+/// The user's `playback_leases` row, if any: shared by the lease read
+/// and the acquire-refusal path (which reads the surviving holder for
+/// the 429's `Retry-After`). More than one row is impossible (user PK)
+/// and errors rather than picking one.
+async fn query_playback_lease_row(
+    client: &impl GenericClient,
+    user_id: &str,
+) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+    let rows = client
+        .query_typed(
+            crate::playback::playback_lease_select_statement(),
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    match rows.first() {
+        None => Ok(None),
+        Some(row) => Ok(Some(crate::playback::LeaseRow {
+            session_id: row.try_get("session_id").map_err(|_| StoreError)?,
+            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+            play_id: row.try_get("play_id").map_err(|_| StoreError)?,
+            epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+            expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+        })),
+    }
+}
+
 /// Durable-slot budgets are bounded: a zero limit/window admits
 /// nothing, and the slot scan is capped at
 /// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
@@ -446,6 +532,25 @@ async fn delete_expired_rate_limit_slots(
     Ok(())
 }
 
+/// Claimed-slot attempts per [`claim_rate_limit_slot`] call. Each attempt
+/// is one statement; a retry only happens when a concurrent claim stole
+/// the selected slot between our snapshot and the insert (the conflict
+/// clause then matches nothing). Past this bound the caller fails closed
+/// as exhausted, so a contended pool degrades to denials, never to a
+/// hung gate: every attempt shares the caller's `TOTAL_TIMEOUT_MS`
+/// deadline via `Self::bounded`.
+const RATE_LIMIT_CLAIM_ATTEMPTS: u32 = 4;
+
+/// Per-attempt dispersal for [`claim_rate_limit_slot`]: successive attempts
+/// start their free-slot search at successive offsets, so K overlapping
+/// claims on one scope (parallel page loads sharing an IP budget on a
+/// fresh hourly pool) aim at K distinct slots instead of all colliding on
+/// slot 0 and spending the [`RATE_LIMIT_CLAIM_ATTEMPTS`] budget on each
+/// other. Monotonic, not random: decorrelation is all the anti-join
+/// needs, and a 32-bit counter keeps wasm32 (no OS RNG at this layer)
+/// and unit fakes deterministic.
+static CLAIM_DISPERSAL: AtomicU32 = AtomicU32::new(0);
+
 /// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
 /// claimed slot index (the pair path needs it for its compensating
 /// release), `Ok(None)` is an exhausted budget. Caller has already
@@ -460,10 +565,8 @@ async fn claim_rate_limit_slot(
     // O(1) fast-fail on the exhausted path (single source of truth:
     // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
     // test): without this guard every denied request pays one DELETE
-    // plus `limit` conflicting upserts (~101 statements with 100 row
-    // locks for the 100-slot finish lookup budget). The slot loop below
-    // still claims atomically, so a concurrent race that passes this
-    // snapshot simply fails closed there.
+    // plus a full-pool anti-join claim that finds nothing. A concurrent
+    // race that passes this snapshot simply fails closed below.
     let exhausted = client
         .query_typed(
             handlers::RATE_LIMIT_EXHAUSTED_SQL,
@@ -482,12 +585,30 @@ async fn claim_rate_limit_slot(
     if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
         return Ok(None);
     }
-    for slot in 0..budget.limit {
-        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+    // One statement per attempt, never one per occupied slot: the
+    // `generate_series` anti-join selects a free-or-expired slot pool-wide
+    // from a per-attempt rotated start, so an admitted request costs O(1)
+    // round trips no matter how full the pool is. A sequential per-slot
+    // loop would make the Nth admitted request pay N conflicting upserts
+    // inside one transaction (up to ~3300 for the bearer pair near the
+    // hourly cap), hitting the store deadline as a 404 before the budget
+    // is used up.
+    let limit_hi = i32::try_from(budget.limit.saturating_sub(1)).map_err(|_| StoreError)?;
+    for _ in 0..RATE_LIMIT_CLAIM_ATTEMPTS {
+        // Fresh offset per attempt, not per call: a loser re-enters at a
+        // different start instead of queueing behind the winner's slot.
+        // Masked to the budget so the modulo below always lands in range
+        // (the exhausted fast-fail above already returned for limit 0).
+        let start =
+            u64::from(CLAIM_DISPERSAL.fetch_add(1, Ordering::Relaxed)) % budget.limit.max(1);
+        let start_i = i64_of(start)?;
         let rows = client
             .query_typed(
                 "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                 VALUES ($1, $2, $3, $4) \
+                 SELECT $1, $2, s, $3 FROM generate_series(0, $4) AS s \
+                 LEFT JOIN auth_rate_limit_slots AS t \
+                 ON t.scope_key = $1 AND t.action = $2 AND t.slot = s AND t.expires_at > $5 \
+                 WHERE t.slot IS NULL ORDER BY ((s::BIGINT + $6) % ($4::BIGINT + 1)) LIMIT 1 \
                  ON CONFLICT (scope_key, action, slot) DO UPDATE \
                  SET expires_at = EXCLUDED.expires_at \
                  WHERE auth_rate_limit_slots.expires_at <= $5 \
@@ -495,15 +616,16 @@ async fn claim_rate_limit_slot(
                 &[
                     (&budget.scope_key, Type::TEXT),
                     (&budget.action, Type::TEXT),
-                    (&slot, Type::INT4),
                     (&expires_at, Type::INT8),
+                    (&limit_hi, Type::INT4),
                     (&now_i, Type::INT8),
+                    (&start_i, Type::INT8),
                 ],
             )
             .await
             .map_err(|_| StoreError)?;
-        if !rows.is_empty() {
-            return Ok(Some(slot));
+        if let Some(row) = rows.first() {
+            return Ok(Some(row.try_get::<_, i32>(0).map_err(|_| StoreError)?));
         }
     }
     Ok(None)
@@ -557,6 +679,21 @@ pub fn session_retry_store_for_postgres_test(
         env: None,
         trace_id: "postgres-refresh-test".into(),
         test_client: std::cell::RefCell::new(Some(client)),
+    }
+}
+
+/// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
+/// code only, never the message/detail (which can carry host/role strings).
+/// `tokio_postgres::Error` extracts the real code; test stubs return fixed
+/// shapes so the leak-proof test can feed hostile strings through the same
+/// path production uses.
+trait DriverErrorCode {
+    fn sqlstate(&self) -> Option<String>;
+}
+
+impl DriverErrorCode for tokio_postgres::Error {
+    fn sqlstate(&self) -> Option<String> {
+        PgStore::sqlstate_of(self.code())
     }
 }
 
@@ -638,9 +775,36 @@ impl PgStore {
         )
         .await;
         if connected.is_err() {
-            let _ = Self::db_failure(reached.get(), &self.trace_id, &build_sha_from_env(env));
+            let _ = Self::db_failure(
+                reached.get(),
+                &self.trace_id,
+                &build_sha_from_env(env),
+                None,
+            );
         }
         connected
+    }
+
+    /// Map one `billing_operations` row to its single-flight shape: the
+    /// payload fields parse tolerantly (a corrupt payload degrades to no
+    /// reuse, never to a blocked flight).
+    fn checkout_op_from_row(
+        row: &tokio_postgres::Row,
+    ) -> Result<crate::billing_reconcile::StoredCheckoutOp, StoreError> {
+        let payload: String = row.try_get("request_payload").map_err(|_| StoreError)?;
+        let (price_id, session_id) =
+            crate::billing_reconcile::parse_checkout_operation_payload(&payload);
+        let subscription: Option<String> = row
+            .try_get("stripe_subscription_id")
+            .map_err(|_| StoreError)?;
+        Ok(crate::billing_reconcile::StoredCheckoutOp {
+            id: row.try_get("id").map_err(|_| StoreError)?,
+            user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+            state: row.try_get("state").map_err(|_| StoreError)?,
+            price_id,
+            session_id,
+            subscription_id: subscription,
+        })
     }
 
     /// Opaque `StoreError` for a failed statement, after an
@@ -651,8 +815,17 @@ impl PgStore {
             .as_ref()
             .map(build_sha_from_env)
             .unwrap_or_else(|| crate::logging::BUILD_SHA_UNKNOWN.to_string());
-        let _ = Self::db_failure(event, &self.trace_id, &build_sha);
+        let _ = Self::db_failure(event, &self.trace_id, &build_sha, None);
         StoreError
+    }
+
+    /// Fixed-shape Postgres error class for a dead driver task: the 5-char
+    /// `SqlState` code only, never the message/detail (which can carry host,
+    /// role or other identifiers). Anything that is not exactly five ASCII
+    /// alphanumerics maps to `None` so only the fixed shape can reach logs.
+    fn sqlstate_of(code: Option<&tokio_postgres::error::SqlState>) -> Option<String> {
+        let code = code?.code().to_string();
+        (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
     }
 
     async fn connection_diagnostic<F, E>(
@@ -662,24 +835,34 @@ impl PgStore {
     ) -> Option<String>
     where
         F: std::future::Future<Output = Result<(), E>>,
+        E: DriverErrorCode,
     {
-        if connection.await.is_err() {
-            Self::db_failure("api.db.connection_error", trace_id, build_sha)
-        } else {
-            None
+        match connection.await {
+            Ok(()) => None,
+            Err(err) => Self::db_failure(
+                "api.db.connection_error",
+                trace_id,
+                build_sha,
+                err.sqlstate(),
+            ),
         }
     }
 
     /// The one database-failure record shape. No detail in logs: driver
     /// errors can carry host/role strings, so only the fixed event name
-    /// says where it failed.
-    fn db_failure(event: &str, trace_id: &str, build_sha: &str) -> Option<String> {
-        emit_record(
-            crate::logging::Level::Error,
-            event,
-            trace_id,
-            serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
-        )
+    /// says where it failed, plus the optional fixed-shape `sqlstate`
+    /// 5-char code (never message/detail).
+    fn db_failure(
+        event: &str,
+        trace_id: &str,
+        build_sha: &str,
+        sqlstate: Option<String>,
+    ) -> Option<String> {
+        let mut fields = serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha});
+        if let Some(code) = sqlstate {
+            fields["sqlstate"] = serde_json::Value::String(code);
+        }
+        emit_record(crate::logging::Level::Error, event, trace_id, fields)
     }
 
     /// Fenced vault-upsert statement (ADR 0002 rule 3), shared by
@@ -705,6 +888,39 @@ fn user_from_row(row: &tokio_postgres::Row) -> Result<UserRecord, StoreError> {
         created_at: u64_of(row.try_get("created_at").map_err(|_| StoreError)?)?,
     })
 }
+
+/// One `invite_codes` row (migration 0033). Expects the extended
+/// column set; `issuer_email` is present only in the by-hash lookup's
+/// join, so a missing column mappers to `None` there.
+fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError> {
+    let opt_u64 = |name: &str| -> Result<Option<u64>, StoreError> {
+        row.try_get::<_, Option<i64>>(name)
+            .map_err(|_| StoreError)?
+            .map(u64_of)
+            .transpose()
+    };
+    Ok(InviteRecord {
+        id: row.try_get("id").map_err(|_| StoreError)?,
+        code_hash: row.try_get("code_hash").map_err(|_| StoreError)?,
+        used: row.try_get("used").map_err(|_| StoreError)?,
+        created_at: u64_of(row.try_get("created_at").map_err(|_| StoreError)?)?,
+        issued_by: row.try_get("issued_by").map_err(|_| StoreError)?,
+        kind: row.try_get("kind").map_err(|_| StoreError)?,
+        email: row.try_get("email").map_err(|_| StoreError)?,
+        expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+        redeemed_by: row.try_get("redeemed_by").map_err(|_| StoreError)?,
+        redeemed_at: opt_u64("redeemed_at")?,
+        revoked_at: opt_u64("revoked_at")?,
+        revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
+        window_id: row.try_get("window_id").map_err(|_| StoreError)?,
+        issuer_email: row.try_get("issuer_email").ok().flatten(),
+    })
+}
+
+const INVITE_COLUMNS: &str = "invite_codes.id, invite_codes.code_hash, invite_codes.used, \
+    invite_codes.created_at, invite_codes.issued_by, invite_codes.kind, invite_codes.email, \
+    invite_codes.expires_at, invite_codes.redeemed_by, invite_codes.redeemed_at, \
+    invite_codes.revoked_at, invite_codes.revoked_by, invite_codes.window_id";
 
 fn credential_from_row(row: &tokio_postgres::Row) -> Result<PasskeyCredential, StoreError> {
     Ok(PasskeyCredential {
@@ -793,7 +1009,20 @@ async fn claim_single_use_on(
             client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Invite { record } => {
-            let params: [Param<'_>; 1] = [(&record.code_hash, Type::TEXT)];
+            // The spend stamps come from `prepare_invite_redemption`;
+            // a record without them was never prepared and must not
+            // claim (bind would otherwise spend as user "" at 0).
+            let (Some(redeemed_by), Some(redeemed_at)) =
+                (record.redeemed_by.as_deref(), record.redeemed_at)
+            else {
+                return Err(StoreError);
+            };
+            let redeemed_at = i64_of(redeemed_at).map_err(|_| StoreError)?;
+            let params: [Param<'_>; 3] = [
+                (&record.code_hash, Type::TEXT),
+                (&redeemed_by, Type::TEXT),
+                (&redeemed_at, Type::INT8),
+            ];
             client.query_typed(statement, &params[..]).await
         }
     }
@@ -824,6 +1053,7 @@ async fn complete_registration_on(
     challenge: &PasskeyChallenge,
     magic: &MagicLinkRecord,
     invite: Option<&InviteRecord>,
+    invite_audit: Option<&AuditEvent>,
     credential: &PasskeyCredential,
     now: u64,
 ) -> Result<(), StoreError> {
@@ -855,6 +1085,45 @@ async fn complete_registration_on(
         if claim_single_use_on(&transaction, claim).await? != 1 {
             return Err(StoreError);
         }
+    }
+    if let Some(record) = invite {
+        // Stamp the invite tree on the new account and write the
+        // `invite.redeemed` audit in this same transaction: an audit
+        // failure rolls the claims back, leaving the invite unspent
+        // and the signup retryable. `invited_by` is read from the
+        // CLAIMED invite row inside this transaction, never from the
+        // pre-claim snapshot: if the issuer was deleted after
+        // `invite_by_hash`, the row's `issued_by` is already NULL
+        // (ON DELETE SET NULL), while the snapshot still names the
+        // deleted user and the `users.invited_by` FK would reject it,
+        // rolling back an otherwise valid enrollment forever.
+        transaction
+            .query_typed(
+                "UPDATE users SET invited_by = (SELECT issued_by FROM invite_codes WHERE code_hash = $2), invite_code_hash = $2 WHERE id = $1",
+                &[
+                    (&credential.user_id, Type::TEXT),
+                    (&record.code_hash, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        let audit = invite_audit.ok_or(StoreError)?;
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+                &[
+                    (&audit.user_id, Type::TEXT),
+                    (&audit.action, Type::TEXT),
+                    (&audit.ok, Type::BOOL),
+                    (&audit.source_ip, Type::TEXT),
+                    (&i64_of(audit.at)?, Type::INT8),
+                    (&audit.subject_user_id, Type::TEXT),
+                    (&audit.details, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
     }
     insert_credential_on(&transaction, credential).await?;
     // Any earlier error or deadline drops the transaction and rolls back
@@ -932,6 +1201,739 @@ async fn prune_expired_challenges_on(
         .await
         .map_err(|_| StoreError)?;
     Ok(())
+}
+
+/// Admin role write (migration 0028): serialize every admin write,
+/// re-read the actor's role locked, lock the subject row, then the
+/// UPDATE and its extended audit row commit together or not at all.
+/// The subject lock is what makes the audited old value the value
+/// actually replaced: a concurrent writer either committed before the
+/// lock (and the locked read sees its value) or waits behind it.
+///
+/// The actor re-check closes the guard race: the handler's fresh role
+/// read happened outside this transaction, so two admins could pass
+/// the guard concurrently and demote each other to zero admins. The
+/// shared `admin_writes` advisory lock runs admin writes one at a
+/// time in a fixed lock order (serialization, then actor row, then
+/// subject row — settings writes take their per-key lock last), so
+/// opposing demotions cannot deadlock: the first commits, and the
+/// second then re-reads its actor role as `member` and applies
+/// nothing. The actor row lock additionally fences against any other
+/// writer of the actor's role until commit. A missing subject writes
+/// and audits nothing, and so does a subject scheduled for deletion:
+/// ADR 0002 rule 3 fences every writer once `deleting_at` is set, and
+/// a role granted here would stay effective (the admin guard reads
+/// the role fresh per request) until erasure.
+async fn admin_set_user_role_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    subject_user_id: &str,
+    new_role: &str,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminWriteOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminWriteOutcome::ActorNotAdmin);
+    }
+    let locked = transaction
+        .query_typed(
+            "SELECT role, deleting_at IS NOT NULL AS deleting \
+             FROM users WHERE id = $1 FOR UPDATE",
+            &[(&subject_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(previous) = locked
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?
+    else {
+        return Ok(AdminWriteOutcome::SubjectMissing);
+    };
+    // The fence is read under the subject row lock, so a deletion
+    // scheduled concurrently either committed first (and is seen
+    // here) or waits behind this transaction.
+    if locked[0]
+        .try_get::<_, bool>("deleting")
+        .map_err(|_| StoreError)?
+    {
+        return Ok(AdminWriteOutcome::AccountDeleting);
+    }
+    transaction
+        .query_typed(
+            "UPDATE users SET role = $2 WHERE id = $1",
+            &[(&subject_user_id, Type::TEXT), (&new_role, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, $5, jsonb_build_object('old', $6, 'new', $7))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::admin::ROLE_CHANGED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&subject_user_id, Type::TEXT),
+                (&previous, Type::TEXT),
+                (&new_role, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminWriteOutcome::Applied(Some(previous)))
+}
+
+/// Admin settings write (migration 0028): one transaction, like the
+/// role write, under the same fixed lock order — the shared
+/// `admin_writes` serialization lock first (so a demotion committed
+/// before this write holds the lock is visible to the actor re-check,
+/// and any later demotion queues behind this commit), then the actor
+/// row, then the per-key advisory lock. That per-key lock serializes
+/// writers of the same key — including concurrent first writes of an
+/// absent key, where there is no row for `FOR UPDATE` to serialize
+/// on — so the subsequent locked read returns the value this write
+/// actually replaces (including a just-committed one) for the audit
+/// row and the response. An actor demoted before the re-check writes
+/// and audits nothing.
+async fn admin_set_app_setting_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    key: &str,
+    new_value: &str,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminWriteOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminWriteOutcome::ActorNotAdmin);
+    }
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('app_settings:' || $1))",
+            &[(&key, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let locked = transaction
+        .query_typed(
+            "SELECT value FROM app_settings WHERE key = $1 FOR UPDATE",
+            &[(&key, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let previous: Option<String> = locked
+        .first()
+        .map(|row| row.try_get::<_, String>("value").map_err(|_| StoreError))
+        .transpose()?;
+    transaction
+        .query_typed(
+            "INSERT INTO app_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, \
+               updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by",
+            &[
+                (&key, Type::TEXT),
+                (&new_value, Type::TEXT),
+                (&i64_of(now)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('key', $5, 'old', $6, 'new', $7))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::admin::SETTINGS_CHANGED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&key, Type::TEXT),
+                (&previous, Type::TEXT),
+                (&new_value, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminWriteOutcome::Applied(previous))
+}
+
+/// Read one stored admin job row (migration 0034) from a locked SELECT:
+/// `None` for unknown ids and pipeline rows (the readers fence on
+/// `source = 'admin'`, so the pipeline ledger never leaks through).
+/// `file_count`/`segment_count` are INTEGER columns, so they decode as
+/// `i32` — tokio-postgres rejects an INT4 column for `i64`, even on
+/// NULL, which would fail every accepted-job read closed.
+fn stored_admin_ingest_job_from(
+    row: &tokio_postgres::Row,
+    has_original: bool,
+) -> Result<StoredAdminIngestJob, StoreError> {
+    let file_count: Option<i64> = row
+        .try_get::<_, Option<i32>>("file_count")
+        .map_err(|_| StoreError)?
+        .map(i64::from);
+    let segment_count: Option<i64> = row
+        .try_get::<_, Option<i32>>("segment_count")
+        .map_err(|_| StoreError)?
+        .map(i64::from);
+    Ok(StoredAdminIngestJob {
+        job_id: row.try_get("id").map_err(|_| StoreError)?,
+        db_status: row.try_get("status").map_err(|_| StoreError)?,
+        accepted_at: u64_of(row.try_get("accepted_at").map_err(|_| StoreError)?)?,
+        nzb_bytes: u64_of(row.try_get("nzb_bytes").map_err(|_| StoreError)?)?,
+        file_count: file_count.map(u64_of).transpose()?,
+        segment_count: segment_count.map(u64_of).transpose()?,
+        failure_reason: row.try_get("failure_reason").map_err(|_| StoreError)?,
+        has_original,
+        uploader_user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+    })
+}
+
+/// Admin ingest upload (migration 0034): one transaction, like the role
+/// and settings writes, under the same fixed lock order — the shared
+/// `admin_writes` serialization lock first (so a demotion committed
+/// before this upload holds the lock is visible to the actor re-check,
+/// and concurrent same-content uploads serialize instead of racing),
+/// then the actor row. The content-derived id converges duplicates:
+/// the locked re-select finds the pre-existing row, so the replay
+/// writes nothing new except its own audit row; only the first attempt
+/// inserts the job, the original and the accepted audit shape.
+async fn admin_ingest_upload_on(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    // The actor row locks here so a deletion scheduled concurrently
+    // either committed first (and is seen below) or waits behind this
+    // transaction. ADR 0002 rule 3 fences every writer of user-owned
+    // state: the upload's job/original rows carry the actor's id under
+    // an ON DELETE RESTRICT FK, so a deleting actor is refused like any
+    // other fenced writer (typed 409, nothing written or audited),
+    // exactly like the role write fences its deleting subject.
+    let actor = transaction
+        .query_typed(
+            "SELECT role, deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
+            &[(&attempt.actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminIngestUploadOutcome::ActorNotAdmin);
+    }
+    if actor
+        .first()
+        .map(|row| row.try_get::<_, bool>("deleting"))
+        .transpose()
+        .map_err(|_| StoreError)?
+        .unwrap_or(false)
+    {
+        return Ok(AdminIngestUploadOutcome::AccountDeleting);
+    }
+    let existing = transaction
+        .query_typed(
+            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+             failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            &[(&attempt.job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if existing.len() > 1 {
+        return Err(StoreError);
+    }
+    // The audit outcome for this attempt: fresh acceptances and
+    // rejections name themselves, replays converge. A duplicate of a
+    // rejected upload re-attaches the stored reason below.
+    let outcome: &str = match (&attempt.failure, existing.first()) {
+        (None, None) => "accepted",
+        (Some(_), None) => "rejected",
+        (_, Some(_)) => "duplicate",
+    };
+    if let Some(row) = existing.first() {
+        let has_original = transaction
+            .query_typed(
+                "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                &[(&attempt.job_id, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        let job = stored_admin_ingest_job_from(row, !has_original.is_empty())?;
+        let reason_code = job.failure_reason.as_deref();
+        if let Some(reason) = reason_code {
+            transaction
+                .query_typed(
+                    "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                     VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6, 'reason_code', $7))",
+                    &[
+                        (&attempt.actor_user_id, Type::TEXT),
+                        (
+                            &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                            Type::TEXT,
+                        ),
+                        (
+                            &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                            Type::TEXT,
+                        ),
+                        (&i64_of(attempt.now)?, Type::INT8),
+                        (&attempt.job_id, Type::TEXT),
+                        (&outcome, Type::TEXT),
+                        (&reason, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        } else {
+            transaction
+                .query_typed(
+                    "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                     VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6))",
+                    &[
+                        (&attempt.actor_user_id, Type::TEXT),
+                        (
+                            &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                            Type::TEXT,
+                        ),
+                        (
+                            &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                            Type::TEXT,
+                        ),
+                        (&i64_of(attempt.now)?, Type::INT8),
+                        (&attempt.job_id, Type::TEXT),
+                        (&outcome, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        }
+        transaction.commit().await.map_err(|_| StoreError)?;
+        return Ok(AdminIngestUploadOutcome::Stored {
+            job,
+            deduplicated: true,
+        });
+    }
+    let db_status = if attempt.failure.is_some() {
+        "failed"
+    } else {
+        "queued"
+    };
+    // INTEGER columns bind `i32` (like every other INTEGER write in
+    // this file, e.g. the KEK version below): an `i64` param against an
+    // INTEGER column depends on assignment-cast tolerance the reads
+    // above already refuse, so both sides speak the column width.
+    let file_count = attempt
+        .file_count
+        .map(|v| i32::try_from(v).map_err(|_| StoreError))
+        .transpose()?;
+    let segment_count = attempt
+        .segment_count
+        .map(|v| i32::try_from(v).map_err(|_| StoreError))
+        .transpose()?;
+    let failure_reason = attempt.failure.map(|reason| reason.as_str().to_string());
+    transaction
+        .query_typed(
+            "INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status, \
+             source, content_sha256, nzb_bytes, file_count, segment_count, failure_reason) \
+             VALUES ($1, $2, $3, $4, $5, 'admin', $6, $7, $8, $9, $10)",
+            &[
+                (&attempt.job_id, Type::TEXT),
+                (&attempt.actor_user_id, Type::TEXT),
+                (&attempt.idempotency_key, Type::TEXT),
+                (&i64_of(attempt.now)?, Type::INT8),
+                (&db_status, Type::TEXT),
+                (&attempt.content_sha256_hex, Type::TEXT),
+                (&i64_of(attempt.nzb_bytes)?, Type::INT8),
+                (&file_count, Type::INT4),
+                (&segment_count, Type::INT4),
+                (&failure_reason, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if let Some(envelope) = &attempt.original {
+        transaction
+            .query_typed(
+                "INSERT INTO ingest_originals (job_id, content_sha256, nzb_bytes, \
+                 nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, \
+                 nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, \
+                 nzb_ref_payload_format, created_at) \
+                 VALUES ($1, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9)",
+                &[
+                    (&attempt.job_id, Type::TEXT),
+                    (&attempt.content_sha256_hex, Type::TEXT),
+                    (&i64_of(attempt.nzb_bytes)?, Type::INT8),
+                    (&envelope.ciphertext.as_slice(), Type::BYTEA),
+                    (
+                        &i32::try_from(attempt.kek_version).map_err(|_| StoreError)?,
+                        Type::INT4,
+                    ),
+                    (&envelope.dek_wrapped_nonce.as_slice(), Type::BYTEA),
+                    (&envelope.dek_wrapped.as_slice(), Type::BYTEA),
+                    (&envelope.payload_nonce.as_slice(), Type::BYTEA),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
+    if let Some(reason) = failure_reason.as_deref() {
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6, 'reason_code', $7))",
+                &[
+                    (&attempt.actor_user_id, Type::TEXT),
+                    (
+                        &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                        Type::TEXT,
+                    ),
+                    (
+                        &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                        Type::TEXT,
+                    ),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                    (&attempt.job_id, Type::TEXT),
+                    (&outcome, Type::TEXT),
+                    (&reason, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    } else {
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6))",
+                &[
+                    (&attempt.actor_user_id, Type::TEXT),
+                    (
+                        &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                        Type::TEXT,
+                    ),
+                    (
+                        &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                        Type::TEXT,
+                    ),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                    (&attempt.job_id, Type::TEXT),
+                    (&outcome, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
+    let stored = transaction
+        .query_typed(
+            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+             failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            &[(&attempt.job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if stored.len() != 1 {
+        return Err(StoreError);
+    }
+    let job = stored_admin_ingest_job_from(&stored[0], attempt.original.is_some())?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminIngestUploadOutcome::Stored {
+        job,
+        deduplicated: false,
+    })
+}
+
+/// Store-level admin ingest delete (migration 0034, no route serves
+/// it): the original goes first, then the job, under the actor
+/// re-check — the `RESTRICT` order. A second delete of the same id
+/// reports `Missing`; a re-upload afterwards lands a fresh row. No
+/// audit row: deletion writes no new observable state.
+async fn admin_ingest_delete_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    job_id: &str,
+) -> Result<AdminIngestDeleteOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminIngestDeleteOutcome::ActorNotAdmin);
+    }
+    transaction
+        .query_typed(
+            "DELETE FROM ingest_originals WHERE job_id IN \
+             (SELECT id FROM ingest_jobs WHERE id = $1 AND source = 'admin')",
+            &[(&job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    // `RETURNING id`: a DELETE without RETURNING yields no result
+    // rows, so the emptiness check below would always report Missing
+    // even when the transaction just removed the job.
+    let deleted = transaction
+        .query_typed(
+            "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin' RETURNING id",
+            &[(&job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if deleted.len() > 1 {
+        return Err(StoreError);
+    }
+    transaction.commit().await.map_err(|_| StoreError)?;
+    if deleted.is_empty() {
+        return Ok(AdminIngestDeleteOutcome::Missing);
+    }
+    Ok(AdminIngestDeleteOutcome::Deleted)
+}
+/// Re-read the actor's role under the admin-write serialization lock;
+/// shared first step of every admin write transaction. The actor row
+/// lock fences against any other writer of the actor's role until
+/// commit (see `admin_set_user_role_on` for the full lock order).
+async fn admin_actor_locked(
+    transaction: &tokio_postgres::Transaction<'_>,
+    actor_user_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    Ok(crate::admin::is_admin_role(actor_role.as_deref()))
+}
+
+/// Admin invite issue (migration 0033): the INSERT and its
+/// `invite.issued` audit row commit together under the shared
+/// admin-write locks. The audit row references the invite by the
+/// returned row id only — code plaintext and hash never appear in it.
+async fn admin_issue_invite_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    record: &InviteRecord,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminInviteIssueOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    if !admin_actor_locked(&transaction, actor_user_id).await? {
+        return Ok(AdminInviteIssueOutcome::ActorNotAdmin);
+    }
+    let rows = transaction
+        .query_typed(
+            "INSERT INTO invite_codes (code_hash, used, created_at, issued_by, kind, email, expires_at) \
+             VALUES ($1, FALSE, $2, $3, $4, $5, $6) RETURNING id",
+            &[
+                (&record.code_hash, Type::TEXT),
+                (&i64_of(record.created_at)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+                (&record.kind, Type::TEXT),
+                (&record.email, Type::TEXT),
+                (&i64_of(record.expires_at)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() != 1 {
+        return Err(StoreError);
+    }
+    let invite_id: i64 = rows[0].try_get("id").map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, \
+               jsonb_build_object('invite_id', $5, 'kind', $6, 'email_bound', $7, 'expires_at', $8))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::auth::INVITE_ISSUED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&invite_id, Type::INT8),
+                (&record.kind, Type::TEXT),
+                (&record.email.is_some(), Type::BOOL),
+                (&i64_of(record.expires_at)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminInviteIssueOutcome::Issued(invite_id))
+}
+
+/// Admin invite revoke (migration 0033): the conditional UPDATE and
+/// its `invite.revoked` audit row commit together. The invite row is
+/// locked first, so a redemption claim executing concurrently either
+/// committed first (and the locked read sees the spend) or waits and
+/// then loses to the committed `revoked_at` — revocation wins the
+/// race whenever it commits before the claim's UPDATE.
+async fn admin_revoke_invite_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    invite_id: i64,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminInviteRevokeOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    if !admin_actor_locked(&transaction, actor_user_id).await? {
+        return Ok(AdminInviteRevokeOutcome::ActorNotAdmin);
+    }
+    let locked = transaction
+        .query_typed(
+            "SELECT used, redeemed_at, revoked_at FROM invite_codes WHERE id = $1 FOR UPDATE",
+            &[(&invite_id, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(row) = locked.first() else {
+        return Ok(AdminInviteRevokeOutcome::Missing);
+    };
+    let used: bool = row.try_get("used").map_err(|_| StoreError)?;
+    let redeemed_at: Option<i64> = row.try_get("redeemed_at").map_err(|_| StoreError)?;
+    let revoked_at: Option<i64> = row.try_get("revoked_at").map_err(|_| StoreError)?;
+    if used || redeemed_at.is_some() {
+        return Ok(AdminInviteRevokeOutcome::AlreadyRedeemed);
+    }
+    if revoked_at.is_some() {
+        return Ok(AdminInviteRevokeOutcome::AlreadyRevoked);
+    }
+    transaction
+        .query_typed(
+            "UPDATE invite_codes SET revoked_at = $2, revoked_by = $3 WHERE id = $1",
+            &[
+                (&invite_id, Type::INT8),
+                (&i64_of(now)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('invite_id', $5))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::auth::INVITE_REVOKED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&invite_id, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminInviteRevokeOutcome::Revoked)
 }
 
 impl Store for PgStore {
@@ -1068,14 +2070,23 @@ impl Store for PgStore {
         challenge: &PasskeyChallenge,
         magic: &MagicLinkRecord,
         invite: Option<&InviteRecord>,
+        invite_audit: Option<&AuditEvent>,
         credential: &PasskeyCredential,
         now: u64,
     ) -> Result<(), StoreError> {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                complete_registration_on(&mut client, challenge, magic, invite, credential, now)
-                    .await
+                complete_registration_on(
+                    &mut client,
+                    challenge,
+                    magic,
+                    invite,
+                    invite_audit,
+                    credential,
+                    now,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1263,14 +2274,24 @@ impl Store for PgStore {
         .await
     }
 
-    async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
+    async fn ingest_jobs_today(&self, user_id: &str, now: u64) -> Result<u64, StoreError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Daily count derived from accepted `ingest_jobs` rows
+                // (the daily fold table was dropped in migration 0026).
+                // `accepted_at` is BIGINT epoch seconds (the 0022 converged
+                // shape), so the UTC day is epoch/86400 — exactly the
+                // fake's epoch-day key; no local-time skew is possible.
+                // Pipeline rows only: admin-upload rows (migration 0034)
+                // carry the uploading admin's id for the FK/fence, and
+                // counting them here would burn the ordinary daily
+                // intake allowance on admin activity.
                 let rows = client
                     .query_typed(
-                        "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
-                        &[(&code_hash, Type::TEXT)],
+                        "SELECT COUNT(*)::BIGINT AS ingest_jobs FROM ingest_jobs WHERE user_id = $1 \
+                         AND accepted_at / 86400 = $2 / 86400 AND source = 'pipeline'",
+                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -1278,15 +2299,537 @@ impl Store for PgStore {
                 if rows.len() > 1 {
                     return Err(StoreError);
                 }
-                rows.first()
+                match rows.first() {
+                    None => Ok(0),
+                    Some(row) => u64_of(row.try_get("ingest_jobs").map_err(|_| StoreError)?),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn seed_qa_ingest_usage(
+        &self,
+        user_id: &str,
+        now: u64,
+        ingest_jobs: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Seed as synthetic accepted `ingest_jobs` rows for the day (the
+                // count above derives from them): deterministic QA idempotency
+                // keys make a reseed a no-op that never lowers the count.
+                client
+                    .query_typed(
+                        "INSERT INTO ingest_jobs (user_id, idempotency_key, accepted_at, status) \
+                 SELECT $1, 'qa-seed:' || g, $2, 'done' FROM generate_series(1, $3) AS g \
+                 ON CONFLICT (user_id, idempotency_key) DO NOTHING",
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                            (&i64_of(ingest_jobs)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn plans(&self) -> Result<Vec<PlanRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(crate::billing::plans_select_statement(), &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                rows.iter()
                     .map(|r| {
-                        Ok(InviteRecord {
-                            code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
-                            used: r.try_get("used").map_err(|_| StoreError)?,
-                            created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                        let price_cents: i32 = r.try_get("price_cents").map_err(|_| StoreError)?;
+                        let stream_hours: i32 =
+                            r.try_get("stream_hours_month").map_err(|_| StoreError)?;
+                        let concurrent: i32 = r
+                            .try_get("max_concurrent_streams")
+                            .map_err(|_| StoreError)?;
+                        Ok(PlanRow {
+                            id: r.try_get("id").map_err(|_| StoreError)?,
+                            price_cents: u64_of(i64::from(price_cents))?,
+                            stream_hours_month: u64_of(i64::from(stream_hours))?,
+                            max_concurrent_streams: u64_of(i64::from(concurrent))?,
                         })
                     })
-                    .transpose()
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn subscription_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<(Option<SubscriptionRow>, bool), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // `query_opt`'s rule: the live-slot partial unique allows
+                // at most one row; more is an error, never a guess.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let live = rows
+                    .first()
+                    .map(|r| {
+                        Ok::<SubscriptionRow, StoreError>(SubscriptionRow {
+                            plan_id: r.try_get("plan_id").map_err(|_| StoreError)?,
+                            status: r.try_get("status").map_err(|_| StoreError)?,
+                            cancel_at_period_end: r
+                                .try_get("cancel_at_period_end")
+                                .map_err(|_| StoreError)?,
+                            paid_through_at_unix: r
+                                .try_get("paid_through_at_unix")
+                                .map_err(|_| StoreError)?,
+                            grace_until_unix: r
+                                .try_get("grace_until_unix")
+                                .map_err(|_| StoreError)?,
+                            current_period_end_unix: r
+                                .try_get("current_period_end_unix")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .transpose()?;
+                // The ever-existed probe only matters when the live slot
+                // is empty (a live row already proves history), so skip
+                // the second query for subscribed users.
+                let ever = if live.is_some() {
+                    true
+                } else {
+                    let any = client
+                        .query_typed(
+                            crate::billing::subscription_any_select_statement(),
+                            &[(&user_id, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    !any.is_empty()
+                };
+                Ok((live, ever))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn live_subscription(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The live-slot partial unique guarantees at most one
+                // row; more is a schema violation, never "pick one".
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    None => Ok(None),
+                    Some(row) => Ok(Some(crate::playback::SubscriptionRow {
+                        plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                        status: row.try_get("status").map_err(|_| StoreError)?,
+                        cancel_at_period_end: row
+                            .try_get("cancel_at_period_end")
+                            .map_err(|_| StoreError)?,
+                        paid_through_at_unix: row
+                            .try_get("paid_through_at_unix")
+                            .map_err(|_| StoreError)?,
+                        grace_until_unix: row
+                            .try_get("grace_until_unix")
+                            .map_err(|_| StoreError)?,
+                        current_period_end_unix: row
+                            .try_get("current_period_end_unix")
+                            .map_err(|_| StoreError)?,
+                    })),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_ever_paid_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("ever_paid").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn plan_caps(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<crate::plan_limits::PlanCaps>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::plan_limits::plan_caps_select_statement(),
+                        &[(&plan_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    None => Ok(None),
+                    Some(row) => {
+                        let hours = u64::try_from(
+                            row.try_get::<_, i32>("stream_hours_month")
+                                .map_err(|_| StoreError)?,
+                        )
+                        .map_err(|_| StoreError)?;
+                        let concurrent = u32::try_from(
+                            row.try_get::<_, i32>("max_concurrent_streams")
+                                .map_err(|_| StoreError)?,
+                        )
+                        .map_err(|_| StoreError)?;
+                        Ok(Some(crate::plan_limits::caps_from_plan_row(
+                            hours, concurrent,
+                        )))
+                    }
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn stream_seconds_month(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_monthly_total_statement(),
+                        &[(&user_id, Type::TEXT), (&period_month, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The aggregate always yields exactly one row (COALESCE 0).
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                u64_of(rows[0].try_get("stream_seconds").map_err(|_| StoreError)?)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn monthly_stream_seconds(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_monthly_total_statement(),
+                        &[(&user_id, Type::TEXT), (&period_month, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The aggregate always yields exactly one row (COALESCE 0).
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                u64_of(rows[0].try_get("stream_seconds").map_err(|_| StoreError)?)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn playback_lease(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = query_playback_lease_row(&client, user_id).await?;
+                Ok(row)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn acquire_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::playback::playback_lease_acquire_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&track_id, Type::TEXT),
+                            (&play_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                            (&takeover, Type::BOOL),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
+                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+                    }),
+                    // Zero rows: another session holds a live lease.
+                    // Read it (same connection, same budget) so the
+                    // 429 carries its real remaining TTL. A vanished
+                    // row (deleted mid-race) reads as retry-now.
+                    None => {
+                        let retry_after_secs =
+                            match query_playback_lease_row(&client, user_id).await? {
+                                Some(row) => row.retry_after_secs(now),
+                                None => 0,
+                            };
+                        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
+                    }
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn touch_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::playback::playback_lease_touch_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&play_id, Type::TEXT),
+                            (&i64_of(epoch)?, Type::INT8),
+                            (&i64_of(expires_at)?, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn track_meter_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+    ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+        // A non-UUID track has no `tracks` row to read (and the cast
+        // would fail the query besides): meter it on the fallback
+        // rung via the all-None meta, without a database round trip.
+        if !crate::meter_sink::is_uuid_shaped(track_id) {
+            return Ok(crate::meter_sink::TrackMeterMeta::default());
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::meter_sink::track_meter_meta_statement(),
+                        &[(&track_id, Type::TEXT), (&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let Some(row) = rows.first() else {
+                    return Ok(crate::meter_sink::TrackMeterMeta::default());
+                };
+                let u64_of_i32 = |v: Option<i32>| v.and_then(|v| u64::try_from(v).ok());
+                let u64_of_i64 = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+                Ok(crate::meter_sink::TrackMeterMeta {
+                    track_duration_ms: u64_of_i32(
+                        row.try_get("track_duration_ms").map_err(|_| StoreError)?,
+                    ),
+                    mb_duration_ms: u64_of_i32(
+                        row.try_get("mb_duration_ms").map_err(|_| StoreError)?,
+                    ),
+                    bitrate_kbps: u64_of_i32(row.try_get("bitrate_kbps").map_err(|_| StoreError)?),
+                    file_bytes: u64_of_i64(row.try_get("file_bytes").map_err(|_| StoreError)?),
+                })
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn record_play_window(
+        &self,
+        window: &crate::ledger::PlayWindow,
+    ) -> Result<crate::meter_sink::PlayWindowOutcome, StoreError> {
+        use crate::meter_sink::PlayWindowOutcome;
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let file_bytes = window.file_bytes.map(i64_of).transpose()?;
+                let duration_ms = window.duration_ms.map(i64_of).transpose()?;
+                let affected = client
+                    .execute(
+                        crate::ledger::ledger_play_window_upsert_statement(),
+                        &[
+                            &window.idempotency_key,
+                            &window.user_id,
+                            &window.track_id,
+                            &window.period_month,
+                            &i64_of(window.stream_seconds)?,
+                            &i64_of(window.bytes_served)?,
+                            &i64_of(window.recorded_at)?,
+                            &file_bytes,
+                            &duration_ms,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if affected == 1 {
+                    return Ok(PlayWindowOutcome::Written);
+                }
+                if affected > 1 {
+                    return Err(StoreError);
+                }
+                // Zero rows is ambiguous by design (statement docs):
+                // a stored row already covering this union is a
+                // convergent duplicate; anything else means the writer
+                // fence refused the write (deleting/nonexistent user)
+                // — terminal for the sink, never retried behind a
+                // deletion. Disambiguate with the select-by-key probe
+                // the statement contract prescribes.
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_select_by_key_statement(),
+                        &[(&window.idempotency_key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    Some(row) => {
+                        let stored_bytes: i64 =
+                            row.try_get("bytes_served").map_err(|_| StoreError)?;
+                        if u64_of(stored_bytes)? >= window.bytes_served {
+                            Ok(PlayWindowOutcome::Covered)
+                        } else {
+                            Ok(PlayWindowOutcome::Fenced)
+                        }
+                    }
+                    None => Ok(PlayWindowOutcome::Fenced),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // The issuer's current email rides along so the pure
+                // prepare can refuse self-invites before any claim.
+                let statement = format!(
+                    "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
+                     FROM invite_codes \
+                     LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
+                     WHERE invite_codes.code_hash = $1"
+                );
+                let rows = client
+                    .query_typed(&statement, &[(&code_hash, Type::TEXT)])
+                    .await
+                    .map_err(|_| StoreError)?;
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(invite_from_row).transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -2017,24 +3560,776 @@ impl Store for PgStore {
         .await
     }
 
+    async fn claim_webhook_event(&self, event_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // First claim wins: one row on insert, none on a retried
+                // delivery (`ON CONFLICT DO NOTHING`), so duplicates ack
+                // 200 with no state change.
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::claim_webhook_event_statement(),
+                        &[(&event_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.claim_webhook_event")
+                    })?;
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn release_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Best-effort release of a claim whose handling failed
+                // mid-reconcile: deleting the row lets the retried delivery
+                // reprocess instead of acking 200 on a consumed claim.
+                client
+                    .query_typed(
+                        crate::billing_reconcile::release_webhook_event_statement(),
+                        &[(&event_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.release_webhook_event")
+                    })?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn load_reconcile_input(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+        Self::bounded(
+            async {
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.load_reconcile_input");
+                let client = self.connect().await?;
+                let account_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_account_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if account_rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let stripe_customer_id = account_rows
+                    .first()
+                    .map(|row| {
+                        row.try_get::<_, Option<String>>("stripe_customer_id")
+                            .map_err(|_| StoreError)
+                    })
+                    .transpose()?
+                    .flatten();
+                let live_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if live_rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let live = live_rows
+                    .first()
+                    .map(|row| {
+                        Ok::<_, StoreError>(crate::billing_reconcile::LiveRow {
+                            stripe_subscription_id: row
+                                .try_get("stripe_subscription_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_customer_id: row
+                                .try_get("stripe_customer_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_item_id: row
+                                .try_get("stripe_subscription_item_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_price_id: row
+                                .try_get("stripe_price_id")
+                                .map_err(|_| StoreError)?,
+                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                            status: row.try_get("status").map_err(|_| StoreError)?,
+                            paid_through_unix: row
+                                .try_get::<_, Option<i64>>("paid_through_unix")
+                                .map_err(|_| StoreError)?,
+                            paid_invoice_id: row
+                                .try_get::<_, Option<String>>("paid_invoice_id")
+                                .map_err(|_| StoreError)?,
+                            grace_until_unix: row
+                                .try_get::<_, Option<i64>>("grace_until_unix")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .transpose()?;
+                let binding_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::price_bindings_select_statement(),
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let bindings = binding_rows
+                    .iter()
+                    .map(|row| {
+                        Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
+                            price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
+                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                            selectable: row.try_get("selectable").map_err(|_| StoreError)?,
+                            livemode: row.try_get("livemode").map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(crate::billing_reconcile::ReconcileInput {
+                    stripe_customer_id,
+                    live,
+                    bindings,
+                })
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn user_for_stripe_customer(
+        &self,
+        customer_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_user_by_customer_select_statement(),
+                        &[(&customer_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.user_for_stripe_customer")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // UNIQUE on `stripe_customer_id` says this never happens).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("user_id").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| failed())?;
+                // One transaction under the per-user advisory lock: coverage
+                // advances monotonically while history inserts converge on
+                // the invoice id — duplicates and out-of-order replays land
+                // the same stored state.
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_lock_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let row = &outcome.row;
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::store_reconciled_subscription_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&row.stripe_subscription_id, Type::TEXT),
+                            (&row.stripe_customer_id, Type::TEXT),
+                            (&row.stripe_item_id, Type::TEXT),
+                            (&row.stripe_price_id, Type::TEXT),
+                            (&row.plan_id, Type::TEXT),
+                            (&row.status, Type::TEXT),
+                            (&row.current_period_end_unix, Type::INT8),
+                            (&row.cancel_at_period_end, Type::BOOL),
+                            (&row.paid_through_unix, Type::INT8),
+                            (&row.paid_invoice_id, Type::TEXT),
+                            (&row.grace_until_unix, Type::INT8),
+                            (&outcome.read_anchor, Type::TEXT),
+                            (&outcome.read_plan, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                for history in &outcome.history {
+                    transaction
+                        .query_typed(
+                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&history.stripe_invoice_id, Type::TEXT),
+                                (&history.stripe_subscription_id, Type::TEXT),
+                                (&history.plan_id, Type::TEXT),
+                                (&history.period_start_unix, Type::INT8),
+                                (&history.period_end_unix, Type::INT8),
+                                (&history.amount_cents, Type::INT8),
+                                (&history.currency, Type::TEXT),
+                                (&history.paid_at_unix, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                }
+                transaction.commit().await.map_err(|_| failed())?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_checkout_operation(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::open_checkout_operation_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.open_checkout_operation")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // partial unique admits at most one open flight per user).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(Self::checkout_op_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn create_checkout_operation(
+        &self,
+        op_id: &str,
+        user_id: &str,
+        price_id: &str,
+        customer_id: Option<&str>,
+    ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.create_checkout_operation");
+                let client = self.connect().await?;
+                // The operation id is its own request key (fresh UUID per
+                // attempt, never reused across attempts); the partial
+                // unique — not this key — arbitrates the race.
+                let payload = crate::billing_reconcile::checkout_operation_payload(price_id, None);
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::create_checkout_operation_statement(),
+                        &[
+                            (&op_id, Type::TEXT),
+                            (&user_id, Type::TEXT),
+                            (&op_id, Type::TEXT),
+                            (&payload, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if rows.len() == 1 {
+                    // Winner: bind the Stripe customer to the account, but
+                    // only when unbound — an existing binding is never
+                    // overwritten by a racing second customer create.
+                    if let Some(customer) = customer_id {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::bind_account_customer_statement(),
+                                &[(&user_id, Type::TEXT), (&customer, Type::TEXT)],
+                            )
+                            .await
+                            .map_err(|_| failed())?;
+                    }
+                    return Ok(crate::billing_reconcile::CreateOpOutcome::Created(
+                        crate::billing_reconcile::StoredCheckoutOp {
+                            id: op_id.to_string(),
+                            user_id: user_id.to_string(),
+                            state: "pending".to_string(),
+                            price_id: Some(price_id.to_string()),
+                            session_id: None,
+                            subscription_id: None,
+                        },
+                    ));
+                }
+                // Loser: converge on the winner's row (same operation id,
+                // hence the same Stripe idempotency key) instead of
+                // minting a second subscription.
+                let winner = client
+                    .query_typed(
+                        crate::billing_reconcile::open_checkout_operation_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if winner.len() > 1 {
+                    return Err(StoreError);
+                }
+                winner
+                    .first()
+                    .map(Self::checkout_op_from_row)
+                    .transpose()?
+                    .map(crate::billing_reconcile::CreateOpOutcome::Existing)
+                    .ok_or(StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn checkout_operation_by_id(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::checkout_operation_by_id_select_statement(),
+                        &[(&op_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.checkout_operation_by_id")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // operation id is the primary key).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(Self::checkout_op_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn update_checkout_operation(
+        &self,
+        op_id: &str,
+        state: &str,
+        price_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Conditional mark (the statement only touches unresolved
+                // rows): a mark that lands after a deliberate supersede
+                // reports `false` instead of resurrecting the retired row.
+                // The session already exists under the operation's
+                // idempotency key, so a lost mark only costs a retrieve on
+                // the next attempt — never a duplicate.
+                let payload =
+                    crate::billing_reconcile::checkout_operation_payload(price_id, session_id);
+                let subscription: Option<String> = None;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::update_checkout_operation_statement(),
+                        &[
+                            (&op_id, Type::TEXT),
+                            (&state, Type::TEXT),
+                            (&payload, Type::TEXT),
+                            (&subscription, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.update_checkout_operation")
+                    })?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // One EXISTS probe over the same established states
+                // the reaper protects (`unverified_user_filter`):
+                // credential, any session row (a completed sign-in
+                // leaves one, revoked or not), vault, or a promoted
+                // (non-member) role. A missing user row is simply
+                // never-admitted.
+                let sql = format!(
+                    "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
+                    member = crate::admin::ROLE_MEMBER
+                );
+                let rows = client
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("admitted").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
         client
             .query_typed(
-                "INSERT INTO audit_log (user_id, action, ok, source_ip, at) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
                 &[
                     (&event.user_id, Type::TEXT),
                     (&event.action, Type::TEXT),
                     (&event.ok, Type::BOOL),
                     (&event.source_ip, Type::TEXT),
                     (&i64_of(event.at)?, Type::INT8),
+                    (&event.subject_user_id, Type::TEXT),
+                    (&event.details, Type::TEXT),
                 ],
             )
             .await
             .map_err(|_| StoreError)?;
         Ok(())
         }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn user_role(&self, user_id: &str) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT role FROM users WHERE id = $1",
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.user_role"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("role").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_set_user_role(
+        &self,
+        actor_user_id: &str,
+        subject_user_id: &str,
+        new_role: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminWriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_set_user_role_on(
+                    &mut client,
+                    actor_user_id,
+                    subject_user_id,
+                    new_role,
+                    source_ip,
+                    now,
+                )
+                .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn app_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed("SELECT key, value FROM app_settings", &[])
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.app_settings"))?;
+                rows.iter()
+                    .map(|row| {
+                        Ok((
+                            row.try_get("key").map_err(|_| StoreError)?,
+                            row.try_get("value").map_err(|_| StoreError)?,
+                        ))
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_set_app_setting(
+        &self,
+        actor_user_id: &str,
+        key: &str,
+        new_value: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminWriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_set_app_setting_on(&mut client, actor_user_id, key, new_value, source_ip, now)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_upload(
+        &self,
+        attempt: &AdminIngestAttempt,
+    ) -> Result<AdminIngestUploadOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_ingest_upload_on(&mut client, attempt).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_get(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredAdminIngestJob>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                         failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+                        &[(&job_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.admin_ingest_get"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let Some(row) = rows.first() else {
+                    return Ok(None);
+                };
+                let originals = client
+                    .query_typed(
+                        "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                        &[(&job_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.admin_ingest_get"))?;
+                stored_admin_ingest_job_from(row, !originals.is_empty()).map(Some)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_list(
+        &self,
+        status: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<StoredAdminIngestJob>, StoreError> {
+        // The handler bounds the window; the store re-clamps
+        // defensively so a direct caller cannot page unboundedly.
+        let limit = limit.clamp(1, admin_ingest::LIST_MAX_LIMIT);
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = match status {
+                    None => client
+                        .query_typed(
+                            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                             failure_reason, user_id FROM ingest_jobs WHERE source = 'admin' \
+                             ORDER BY accepted_at DESC, id ASC LIMIT $1 OFFSET $2",
+                            &[
+                                (&i64_of(limit)?, Type::INT8),
+                                (&i64_of(offset)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?,
+                    Some(status) => client
+                        .query_typed(
+                            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                             failure_reason, user_id FROM ingest_jobs \
+                             WHERE source = 'admin' AND status = $1 \
+                             ORDER BY accepted_at DESC, id ASC LIMIT $2 OFFSET $3",
+                            &[
+                                (&status, Type::TEXT),
+                                (&i64_of(limit)?, Type::INT8),
+                                (&i64_of(offset)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?,
+                };
+                let mut jobs = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let job_id: String = row.try_get("id").map_err(|_| StoreError)?;
+                    let originals = client
+                        .query_typed(
+                            "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                            &[(&job_id, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?;
+                    jobs.push(stored_admin_ingest_job_from(row, !originals.is_empty())?);
+                }
+                Ok(jobs)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_delete(
+        &self,
+        actor_user_id: &str,
+        job_id: &str,
+    ) -> Result<AdminIngestDeleteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_ingest_delete_on(&mut client, actor_user_id, job_id).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn admin_issue_invite(
+        &self,
+        actor_user_id: &str,
+        record: &InviteRecord,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminInviteIssueOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_issue_invite_on(&mut client, actor_user_id, record, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_list_invites(
+        &self,
+        issuer: Option<&str>,
+        status: Option<&str>,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<InviteRecord>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // The status filter mirrors `InviteRecord::status`
+                // exactly (redeemed > revoked > expired > active).
+                let status_predicate = match status {
+                    Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
+                    Some("revoked") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)"
+                    }
+                    Some("expired") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
+                    }
+                    Some("active") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
+                    }
+                    _ => "TRUE",
+                };
+                let statement = format!(
+                    "SELECT {INVITE_COLUMNS} FROM invite_codes \
+                     WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate} \
+                     ORDER BY id DESC LIMIT $3"
+                );
+                let rows = client
+                    .query_typed(
+                        &statement,
+                        &[
+                            (&issuer, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                            (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.admin_list_invites")
+                    })?;
+                rows.iter().map(invite_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_revoke_invite(
+        &self,
+        actor_user_id: &str,
+        invite_id: i64,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminInviteRevokeOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_revoke_invite_on(&mut client, actor_user_id, invite_id, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn reserve_rate_limit(
@@ -2323,23 +4618,42 @@ impl AsyncDns for DohDns {
     }
 }
 
-// --- Pinned-address dialer ----------------------------------------------------------------------
-
+// --- Hostname dialer ----------------------------------------------------------------------------------
+///
+/// The probe dials the validated hostname (never a second DNS lookup of
+/// our own): the runtime resolves it for routing and uses the same name
+/// for TLS SNI and certificate verification. Dialing a vetted IP literal
+/// instead verifies the certificate against the address, so a
+/// hostname-only certificate fails closed (`ok:false`) against every
+/// real provider.
+///
+/// There is deliberately no connected-peer check: workerd reports the
+/// dial string itself as `SocketInfo.remote_address` for outbound
+/// sockets, so a hostname dial can never yield a peer IP to vet. SSRF
+/// containment is the handler's fresh dial-time validation (resolve ALL
+/// DNS records, reject non-public ranges) immediately before this probe,
+/// the allowlisted port, the dial/total timeouts, and no application
+/// bytes ever exchanged. A validate-to-dial DNS flip is an accepted
+/// residual (threat model §3). See the threat model §3 pinning note.
 struct SocketDialer;
 
-async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
+/// The dial host for one probe attempt: the validated hostname — never
+/// an IP literal (TLS would verify the certificate against the address).
+/// A seam so tests pin the root-cause line: the `connect` target must be
+/// the hostname.
+fn probe_dial_host(target: &ValidatedTarget) -> &str {
+    target.host()
+}
+
+async fn probe_attempt(host: &str, port: u16, tls: bool) -> bool {
     let secure = if tls {
         worker::SecureTransport::On
     } else {
         worker::SecureTransport::Off
     };
-    // Dial the vetted IP literal only — the runtime must not re-resolve
-    // the hostname. With TLS on, the runtime validates the certificate
-    // against the dialed address; a hostname-only certificate therefore
-    // fails closed (`ok:false`) rather than bypassing the pin.
     let mut socket = match worker::Socket::builder()
         .secure_transport(secure)
-        .connect(addr.to_string(), port)
+        .connect(host, port)
     {
         Ok(socket) => socket,
         Err(_) => return false,
@@ -2368,10 +4682,16 @@ impl Dialer for SocketDialer {
         // The dialed port is the validated target's own allowlisted port —
         // never a caller-supplied substitute.
         let port = target.port();
+        let host = probe_dial_host(target);
         let mut deadline = std::pin::pin!(Delay::from(Duration::from_millis(TOTAL_TIMEOUT_MS)));
         let mut attempts = std::pin::pin!(async {
-            for addr in target.addresses().iter().take(MAX_DIAL_ADDRESSES) {
-                if probe_one(*addr, port, tls).await {
+            // Bounded attempts: each dial lets the runtime resolve the
+            // validated hostname fresh (routing plus TLS SNI/verify, with
+            // runtime address fallback across answers). No application
+            // bytes are ever exchanged — the probe proves TCP+TLS
+            // reachability only.
+            for _ in 0..MAX_DIAL_ADDRESSES {
+                if probe_attempt(host, port, tls).await {
                     return true;
                 }
             }
@@ -2463,39 +4783,274 @@ impl Mailer for WebhookMailer {
     }
 }
 
+// --- Stripe transport ----------------------------------------------------------------------------------
+
+// Stripe HTTPS transport over `worker::Fetch`: bearer test secret plus
+// the pinned `Stripe-Version` on every call, `Idempotency-Key` on the two
+// creations (derived from the billing operation id, so retried creations
+// replay instead of duplicating). Unprovisioned (no secret configured)
+// every call fails closed to a transport error — the handlers map that to
+// the same generic 500 as any store outage, never to an entitlement
+// change. Secret material rides the `Authorization` header only; nothing
+// here logs header values or response bodies.
+struct WorkerStripeTransport {
+    secret_key: Option<String>,
+}
+
+impl WorkerStripeTransport {
+    async fn send<T>(&self, req: &crate::stripe::StripeRequest) -> crate::stripe::StripeResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        use crate::stripe::{StripeError, STRIPE_API_BASE, STRIPE_API_VERSION};
+        let key = self
+            .secret_key
+            .as_deref()
+            .ok_or_else(StripeError::transport)?;
+        let headers = Headers::new();
+        headers
+            .set("Authorization", &format!("Bearer {key}"))
+            .map_err(|_| StripeError::transport())?;
+        headers
+            .set("Stripe-Version", STRIPE_API_VERSION)
+            .map_err(|_| StripeError::transport())?;
+        if let Some(idempotency) = req.idempotency_key.as_deref() {
+            headers
+                .set("Idempotency-Key", idempotency)
+                .map_err(|_| StripeError::transport())?;
+        }
+        let method = match req.method {
+            "POST" => Method::Post,
+            "DELETE" => Method::Delete,
+            _ => Method::Get,
+        };
+        if req.method == "POST" {
+            headers
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .map_err(|_| StripeError::transport())?;
+        }
+        let url = format!("{STRIPE_API_BASE}{}", req.path);
+        let mut init = RequestInit::new();
+        init.with_method(method).with_headers(headers);
+        if req.method == "POST" {
+            init.with_body(Some(req.body.clone().into()));
+        }
+        let request = Request::new_with_init(&url, &init).map_err(|_| StripeError::transport())?;
+        let mut response = Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|_| StripeError::transport())?;
+        let status = response.status_code();
+        let body = response
+            .text()
+            .await
+            .map_err(|_| StripeError::transport())?;
+        if (200..300).contains(&status) {
+            serde_json::from_str(&body).map_err(|_| StripeError::transport())
+        } else {
+            Err(StripeError::parse(status, body.as_bytes()))
+        }
+    }
+}
+
+impl crate::stripe::StripeTransport for WorkerStripeTransport {
+    fn create_customer(
+        &self,
+        req: crate::stripe::CreateCustomer,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Customer>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::create_customer_request(
+                &req.operation_id,
+                req.user_id.as_deref(),
+                req.test_clock.as_deref(),
+            ))
+            .await
+        })
+    }
+    fn create_checkout_session(
+        &self,
+        req: crate::stripe::CreateCheckoutSession,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::create_checkout_session_request(
+                &req.operation_id,
+                &req.customer_id,
+                &req.price_id,
+                &req.success_url,
+                &req.cancel_url,
+            ))
+            .await
+        })
+    }
+    fn retrieve_checkout_session(
+        &self,
+        session_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_checkout_session_request(
+                &session_id,
+            ))
+            .await
+        })
+    }
+    fn expire_checkout_session(
+        &self,
+        session_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::expire_checkout_session_request(&session_id))
+                .await
+        })
+    }
+    fn retrieve_subscription(
+        &self,
+        subscription_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_subscription_request(
+                &subscription_id,
+            ))
+            .await
+        })
+    }
+    fn retrieve_invoice(
+        &self,
+        invoice_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_invoice_request(&invoice_id))
+                .await
+        })
+    }
+    fn list_invoice_lines(
+        &self,
+        invoice_id: String,
+        starting_after: Option<String>,
+        limit: u8,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::list_invoice_lines_request(
+                &invoice_id,
+                starting_after.as_deref(),
+                limit,
+            ))
+            .await
+        })
+    }
+    fn list_invoices(
+        &self,
+        req: crate::stripe::ListInvoices,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
+    > {
+        Box::pin(async move {
+            // An unfiltered list is never issued: without a customer or a
+            // subscription the builder refuses, and the transport fails
+            // closed instead of listing the account's invoices. The
+            // endpoint returns a list envelope (`object: "list"`), never a
+            // bare array, and reconciliation needs every page: follow
+            // `has_more` with `starting_after` until exhausted.
+            let mut invoices = Vec::new();
+            let mut cursor: Option<String> = req.starting_after.clone();
+            loop {
+                let request = crate::stripe::list_invoices_request(
+                    req.customer_id.as_deref(),
+                    req.subscription_id.as_deref(),
+                    req.paid_only,
+                    req.limit,
+                    cursor.as_deref(),
+                )
+                .ok_or_else(crate::stripe::StripeError::transport)?;
+                let page: crate::stripe::InvoiceList = self.send(&request).await?;
+                let last = page.data.last().map(|invoice| invoice.id.clone());
+                invoices.extend(page.data);
+                if !page.has_more {
+                    break;
+                }
+                // A `has_more` page with no cursor to continue from cannot
+                // advance: fail closed rather than loop on the same page.
+                cursor = last;
+                if cursor.is_none() {
+                    return Err(crate::stripe::StripeError::transport());
+                }
+            }
+            Ok(invoices)
+        })
+    }
+    fn cancel_subscription(
+        &self,
+        subscription_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::cancel_subscription_request(
+                &subscription_id,
+            ))
+            .await
+        })
+    }
+}
+
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
 fn render_header_pairs(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
     trace_id: &str,
-) -> Vec<(&'static str, String)> {
+) -> Vec<(String, String)> {
     let mut pairs = vec![
         (
-            "content-type",
+            "content-type".to_string(),
             "application/json; charset=utf-8".to_string(),
         ),
         (
-            "content-security-policy",
+            "content-security-policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string(),
         ),
-        ("cache-control", "no-store".to_string()),
-        ("x-content-type-options", "nosniff".to_string()),
-        (crate::logging::TRACE_HEADER, trace_id.to_string()),
+        ("cache-control".to_string(), "no-store".to_string()),
+        ("x-content-type-options".to_string(), "nosniff".to_string()),
+        (
+            crate::logging::TRACE_HEADER.to_string(),
+            trace_id.to_string(),
+        ),
     ];
     if let Some(cookie) = &response.set_cookie {
-        pairs.push(("set-cookie", cookie.clone()));
+        pairs.push(("set-cookie".to_string(), cookie.clone()));
     }
     if let Some(retry_after) = response.retry_after {
         pairs.push((
-            crate::rate_limit::RETRY_AFTER_HEADER,
+            crate::rate_limit::RETRY_AFTER_HEADER.to_string(),
             crate::rate_limit::retry_after_header_value(retry_after),
         ));
+    }
+    // Caller-supplied extra headers (plan-limit denials): rendered
+    // verbatim after the security set, so they can neither suppress nor
+    // precede it.
+    for (name, value) in &response.extra_headers {
+        pairs.push((name.clone(), value.clone()));
     }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
-    pairs.extend(cors.iter().cloned());
+    pairs.extend(
+        cors.iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone())),
+    );
     pairs
 }
 
@@ -2506,7 +5061,7 @@ fn render(
 ) -> WorkerResult<Response> {
     let headers = Headers::new();
     for (name, value) in render_header_pairs(response, cors, trace_id) {
-        headers.append(name, &value)?;
+        headers.append(&name, &value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -2521,6 +5076,7 @@ fn internal_response() -> handlers::Response {
         body: r#"{"error":"internal error"}"#.to_string(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -2601,9 +5157,11 @@ where
     }
 }
 
-/// Collect one request body with the existing hard cap
-/// (`handlers::MAX_BODY_BYTES`, the single source of truth — no second
-/// size constant). Rules:
+/// Collect one request body with an explicit byte cap. The default-cap
+/// wrapper below is the single source of truth for API routes
+/// (`handlers::MAX_BODY_BYTES`); per-route overrides (the NZB intake)
+/// pass their own cap so the collection seam and the in-handler gate
+/// stay on the same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
 ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 ///   stream is not polled at all.
@@ -2628,7 +5186,20 @@ pub async fn collect_body<S: BodyChunkStream>(
     declared_len: Option<usize>,
     source: BodySource<S>,
 ) -> CollectedBody {
-    if declared_len.is_some_and(|len| len > handlers::MAX_BODY_BYTES) {
+    collect_body_with_cap(declared_len, source, handlers::MAX_BODY_BYTES).await
+}
+
+/// [`collect_body`] with a caller-chosen cap: the entry passes the
+/// per-route bound (`handlers::max_body_bytes`), so document-upload
+/// routes accept their documents while API routes keep the pinned
+/// default. Behavior is otherwise identical; the default-cap suite
+/// pins `collect_body` unchanged.
+pub async fn collect_body_with_cap<S: BodyChunkStream>(
+    declared_len: Option<usize>,
+    source: BodySource<S>,
+    cap_bytes: usize,
+) -> CollectedBody {
+    if declared_len.is_some_and(|len| len > cap_bytes) {
         return CollectedBody::Oversized;
     }
     let mut stream = match source {
@@ -2648,9 +5219,9 @@ pub async fn collect_body<S: BodyChunkStream>(
             }
             Some(Err(BodyReadError)) => return CollectedBody::TransportFailure,
             Some(Ok(chunk)) => {
-                // `body.len() <= MAX` is invariant, so this never overflows
+                // `body.len() <= cap` is invariant, so this never overflows
                 // and never buffers past the cap.
-                if chunk.len() > handlers::MAX_BODY_BYTES - body.len() {
+                if chunk.len() > cap_bytes - body.len() {
                     return CollectedBody::Oversized;
                 }
                 body.extend_from_slice(&chunk);
@@ -2665,9 +5236,15 @@ pub async fn collect_body<S: BodyChunkStream>(
 /// uniform pre-routing rejection (`handlers::invalid_request`: status
 /// 400, body `{"code":"invalid_request","message":"invalid request",
 /// "retryable":false}`, no `set_cookie`), so the
-/// gate can never drift from it. The Worker entry passes a handler that
-/// calls `handlers::handle`, so a rejected body can cause no store,
-/// mailer, DNS, or dialer side effect.
+/// gate can never drift from it. Oversized answers stay route-blind on
+/// purpose: this seam runs before authentication and cannot tell an
+/// admin from a probe, so a route-distinctive 413 here would disclose
+/// the admin ingest path to unauthenticated callers (a bare
+/// Content-Length suffices — the stream is never polled). The route's
+/// own 413 (`admin_ingest_oversized`) lives only in the in-handler
+/// pre-gate, for direct-handle callers that reach it. The Worker
+/// entry passes a handler that calls `handlers::handle`, so a rejected
+/// body can cause no store, mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
     collected: CollectedBody,
     mut request: handlers::Request,
@@ -2865,7 +5442,15 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    let collected = collect_body(declared_len, source).await;
+    // Per-route collection bound (the NZB intake accepts documents; API
+    // routes keep the pinned default): the in-handler gate re-checks the
+    // same bound as defense in depth, so the two cannot drift apart.
+    let collected = collect_body_with_cap(
+        declared_len,
+        source,
+        handlers::max_body_bytes(req.method().as_ref(), &req.path()),
+    )
+    .await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -2877,15 +5462,43 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
+    // The runtime path strips the query string everywhere; the admin
+    // ingest list route needs its `?status=&limit=&offset=` filters in
+    // production, so the entry reattaches the raw query for exactly
+    // `GET /v1/admin/ingest` (non-empty query only). Every other route
+    // keeps the bare path, so no new query surface appears elsewhere.
+    let bare_path = req.path();
+    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+        match req.url().ok().and_then(|url| {
+            url.query()
+                .filter(|query| !query.is_empty())
+                .map(|query| format!("{bare_path}?{query}"))
+        }) {
+            Some(with_query) => with_query,
+            None => bare_path,
+        }
+    } else {
+        bare_path
+    };
     let request = handlers::Request {
         method: req.method().to_string(),
-        path: req.path(),
+        path: handler_path,
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
+        // Raw Stripe signature for the billing webhook carve-out (header
+        // keys are lowercased above): the signature IS the webhook's auth,
+        // so it rides its own field, never the bearer gate.
+        stripe_signature: headers_map.get("stripe-signature").cloned(),
         // Template only: the gate replaces this with the collected bytes
         // on `Complete` and never dispatches it otherwise.
         body: Vec::new(),
+    };
+    // Stripe transport for this request: the provisioned test secret, or
+    // fail-closed per call when unprovisioned (the handlers gate on the
+    // same config before any Stripe call).
+    let stripe = WorkerStripeTransport {
+        secret_key: config.stripe_secret_key.clone(),
     };
     let ctx = handlers::Ctx {
         cfg: &config,
@@ -2902,6 +5515,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         },
         dialer: &SocketDialer,
         dns: &DohDns,
+        stripe: &stripe,
         now: worker::Date::now().as_millis() / 1000,
         source_ip: client_source_ip(&headers_map),
     };
@@ -2963,9 +5577,31 @@ mod tests {
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
+    /// Test-only driver errors: the hostile string models a driver error
+    /// whose message/detail carries identifiers (never logged — no code to
+    /// extract), while the coded stub models one with a fixed-shape code.
+    impl DriverErrorCode for &str {
+        fn sqlstate(&self) -> Option<String> {
+            None
+        }
+    }
+
+    impl DriverErrorCode for () {
+        fn sqlstate(&self) -> Option<String> {
+            None
+        }
+    }
+
+    struct CodedDriverError;
+    impl DriverErrorCode for CodedDriverError {
+        fn sqlstate(&self) -> Option<String> {
+            Some("53300".to_string())
+        }
+    }
+
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 8] = [
+    const DB_FAILURE_EVENTS: [&str; 17] = [
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -2974,6 +5610,15 @@ mod tests {
         "api.db.statement_failed.user_by_email",
         "api.db.statement_failed.insert_user",
         "api.db.statement_failed.insert_session",
+        "api.db.statement_failed.claim_webhook_event",
+        "api.db.statement_failed.release_webhook_event",
+        "api.db.statement_failed.load_reconcile_input",
+        "api.db.statement_failed.user_for_stripe_customer",
+        "api.db.statement_failed.store_reconcile_outcome",
+        "api.db.statement_failed.open_checkout_operation",
+        "api.db.statement_failed.create_checkout_operation",
+        "api.db.statement_failed.checkout_operation_by_id",
+        "api.db.statement_failed.update_checkout_operation",
     ];
 
     #[test]
@@ -2993,12 +5638,14 @@ mod tests {
                     body: r#"{"ok":true}"#.to_string(),
                     set_cookie: Some("session=synthetic; HttpOnly".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 },
                 handlers::Response {
                     status: 401,
                     body: r#"{"error":"unauthorized"}"#.to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 },
                 handlers::invalid_request(),
                 handlers::preflight_response(),
@@ -3017,10 +5664,14 @@ mod tests {
                         .count(),
                     1
                 );
-                assert!(pairs.contains(&(crate::logging::TRACE_HEADER, trace_id.clone())));
-                assert!(cors.iter().all(|pair| pairs.contains(pair)));
+                assert!(
+                    pairs.contains(&(crate::logging::TRACE_HEADER.to_string(), trace_id.clone()))
+                );
+                assert!(cors.iter().all(|pair| pairs
+                    .iter()
+                    .any(|(name, value)| name == pair.0 && value == &pair.1)));
                 if let Some(cookie) = &response.set_cookie {
-                    assert!(pairs.contains(&("set-cookie", cookie.clone())));
+                    assert!(pairs.contains(&("set-cookie".to_string(), cookie.clone())));
                 }
                 assert!(!format!("{pairs:?}").contains(hostile));
             }
@@ -3059,6 +5710,30 @@ mod tests {
             );
             assert!(!line.contains("private-"));
             assert!(!line.contains(hostile));
+            // A coded driver failure logs the fixed-shape code and nothing
+            // else: exact field equality proves no message/detail leaked.
+            let line = PgStore::connection_diagnostic(
+                std::future::ready(Err::<(), _>(CodedDriverError)),
+                &trace_id,
+                "unknown",
+            )
+            .now_or_never()
+            .expect("synthetic driver is ready")
+            .expect("failure emits a record");
+            let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(record["event"], "api.db.connection_error");
+            assert_eq!(
+                record["fields"],
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown", "release": "unknown", "sqlstate": "53300"})
+            );
+            assert!(!line.contains(hostile));
+            // The code gate keeps only the 5-char shape: a real SqlState
+            // constant passes, anything else (or nothing) maps to no field.
+            assert_eq!(
+                PgStore::sqlstate_of(Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)),
+                Some("23505".to_string())
+            );
+            assert_eq!(PgStore::sqlstate_of(None), None);
             assert!(PgStore::connection_diagnostic(
                 std::future::ready(Ok::<(), ()>(())),
                 &trace_id,
@@ -3068,7 +5743,7 @@ mod tests {
             .unwrap()
             .is_none());
             for event in DB_FAILURE_EVENTS {
-                let line = PgStore::db_failure(event, &trace_id, "unknown")
+                let line = PgStore::db_failure(event, &trace_id, "unknown", None)
                     .expect("every db failure event must pass the event validator");
                 let record: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(record["event"], event);
@@ -3099,7 +5774,7 @@ mod tests {
             .expect("a closing brace must bound connect")
             .0;
         assert!(
-            connect_body.contains("Self::db_failure(reached.get()"),
+            connect_body.contains("Self::db_failure(") && connect_body.contains("reached.get()"),
             "a failed connect must emit the phase it reached"
         );
         for event in DB_FAILURE_EVENTS {
@@ -3117,6 +5792,9 @@ mod tests {
                 .expect("db failure events are api.db.<kind>.<operation>");
             let method = production
                 .split_once(&format!("async fn {operation}(&self"))
+                .or_else(|| {
+                    production.split_once(&format!("async fn {operation}(\n        &self,"))
+                })
                 .unwrap_or_else(|| panic!("store method {operation} must exist"))
                 .1
                 .split_once("\n    async fn ")
@@ -3232,6 +5910,139 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "/v1/vault");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+    }
+
+    /// Drive one ready future to completion on a noop waker (the gate
+    /// answers without awaiting: the handler runs inline on `Complete`
+    /// and never runs otherwise).
+    fn drive_gate<F: Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let mut future = Box::pin(future);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the dispatch gate must answer without awaiting"),
+        }
+    }
+
+    fn gate_request(method: &str, path: &str) -> handlers::Request {
+        handlers::Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dispatch_gate_answers_oversize_uniformly_without_dispatching() {
+        // The handler must never run on a rejected body: reaching it
+        // would let a truncated upload act.
+        let probe = |collected: CollectedBody, method: &str, path: &str| {
+            drive_gate(dispatch_collected(
+                collected,
+                gate_request(method, path),
+                |_| async { panic!("rejected bodies never dispatch") },
+            ))
+        };
+        // Oversized stays route-blind: the seam runs before
+        // authentication, so a route-distinctive 413 for the admin
+        // ingest path would disclose it to unauthenticated callers.
+        // The route's own 413 lives only in the in-handler pre-gate,
+        // for direct-handle callers that reach it.
+        let admin = probe(CollectedBody::Oversized, "POST", "/v1/admin/ingest");
+        assert_eq!(admin.status, 400);
+        assert_eq!(
+            admin.body,
+            r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
+        );
+        // Every other oversized route answers the same generic 400, and
+        // a transport failure is never an upload-shaped answer.
+        let other = probe(CollectedBody::Oversized, "POST", "/api/ingest");
+        assert_eq!(other.status, 400);
+        assert_eq!(other.body, admin.body);
+        let failed = probe(CollectedBody::TransportFailure, "POST", "/v1/admin/ingest");
+        assert_eq!(failed.status, 400);
+        assert_eq!(failed.body, other.body);
+        // A complete body still dispatches with the bytes in place.
+        let seen = drive_gate(dispatch_collected(
+            CollectedBody::Complete(vec![1, 2, 3]),
+            gate_request("POST", "/v1/admin/ingest"),
+            |request| async move {
+                assert_eq!(request.body, vec![1, 2, 3]);
+                handlers::invalid_request()
+            },
+        ));
+        assert_eq!(seen.status, 400);
+    }
+
+    #[test]
+    fn admin_ingest_pg_statements_hold_their_contracts() {
+        // The FakeStore route suite cannot see these Postgres-only
+        // faults, so pin the statement shapes the same way the fence
+        // tests pin theirs: slice the pre-test source so this test's
+        // own literals cannot satisfy it.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        // INTEGER columns decode as `i32`: tokio-postgres rejects an
+        // INT4 column for `i64` (even NULL), which failed every
+        // accepted-job read, and the insert binds the same width.
+        for column in ["file_count", "segment_count"] {
+            assert!(
+                production.contains(&format!("try_get::<_, Option<i32>>(\"{column}\")")),
+                "{column} must decode as i32"
+            );
+        }
+        assert!(
+            !production.contains("Option<i64> = row.try_get(\"file_count\")"),
+            "file_count must not decode as i64"
+        );
+        assert!(
+            !production.contains("Option<i64> = row.try_get(\"segment_count\")"),
+            "segment_count must not decode as i64"
+        );
+        // A DELETE without RETURNING yields no result rows, so the
+        // emptiness check would always report Missing.
+        assert!(
+            production.contains(
+                "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin' RETURNING id"
+            ),
+            "the admin job delete must RETURN its id"
+        );
+        // Admin-upload rows carry the uploading admin's id for the
+        // FK/fence; counting them would burn the ordinary daily intake
+        // allowance on admin activity.
+        let today_body = production
+            .split_once("async fn ingest_jobs_today(")
+            .expect("ingest_jobs_today must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("a closing brace must bound ingest_jobs_today")
+            .0;
+        assert!(
+            today_body.contains("AND source = 'pipeline'"),
+            "the daily intake count must fence out admin-source rows"
+        );
+        // The upload writes user-owned rows under a RESTRICT FK, so
+        // ADR 0002 rule 3 fences a deleting actor like every other
+        // writer — the locked actor re-select must read the marker.
+        let upload_body = production
+            .split_once("async fn admin_ingest_upload_on(")
+            .expect("admin_ingest_upload_on must exist")
+            .1
+            .split_once("async fn admin_ingest_delete_on(")
+            .expect("the delete fn must bound the upload fn")
+            .0;
+        assert!(
+            upload_body.contains("deleting_at IS NOT NULL AS deleting"),
+            "the upload actor re-check must read the deletion marker"
+        );
     }
 
     #[test]
@@ -3409,11 +6220,11 @@ mod tests {
         // wasm-bindgen Response accessors cannot run on native targets.
         let headers = render_header_pairs(response, &[], REQUEST_TRACE);
         assert!(headers.contains(&(
-            "content-security-policy",
+            "content-security-policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string()
         )));
-        assert!(headers.contains(&("x-content-type-options", "nosniff".to_string())));
-        assert!(headers.contains(&("cache-control", "no-store".to_string())));
+        assert!(headers.contains(&("x-content-type-options".to_string(), "nosniff".to_string())));
+        assert!(headers.contains(&("cache-control".to_string(), "no-store".to_string())));
     }
 
     #[test]
@@ -3423,11 +6234,12 @@ mod tests {
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&response, &[], REQUEST_TRACE);
 
         assert!(headers.contains(&(
-            "content-type",
+            "content-type".to_string(),
             "application/json; charset=utf-8".to_string()
         )));
         assert_render_security_headers(&response);
@@ -3440,6 +6252,7 @@ mod tests {
             body: r#"{"error":"invalid request"}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
 
         assert_render_security_headers(&response);
@@ -3464,14 +6277,19 @@ mod tests {
             body: r#"{"error":"rate_limited"}"#.to_string(),
             set_cookie: None,
             retry_after: Some(3600),
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&throttled, &[], REQUEST_TRACE);
-        assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
+        assert!(headers.contains(&(
+            crate::rate_limit::RETRY_AFTER_HEADER.to_string(),
+            "3600".to_string()
+        )));
         let plain = handlers::Response {
             status: 200,
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&plain, &[], REQUEST_TRACE);
         assert!(!headers
@@ -3968,6 +6786,44 @@ mod tests {
     }
 
     #[test]
+    fn play_grant_secret_overlay_keeps_the_raw_string_bytes() {
+        // Absent stays absent (the play routes fail closed per-request).
+        assert_eq!(play_grant_secret_from_lookup(|_| None), None);
+        // The probe value IS valid base64 of different bytes: if the
+        // overlay ever grows a decode (copying the other secrets), the
+        // output changes and every grant would fail stream-side
+        // verification. Raw bytes must come back byte-identical.
+        let probe = crate::b64::encode(b"synthetic-secret-material-012345");
+        assert!(
+            crate::b64::decode(&probe).is_ok(),
+            "probe must be valid base64"
+        );
+        let got = play_grant_secret_from_lookup(|key| {
+            (key == crate::play_grant::PLAY_GRANT_SECRET_VAR).then(|| probe.clone())
+        });
+        assert_eq!(got.as_deref(), Some(probe.as_bytes()));
+    }
+
+    #[test]
+    fn meter_sink_secret_overlay_keeps_the_raw_string_bytes() {
+        // Absent stays absent (the sink fails closed per-request and
+        // the stream DO retries behind its alarm).
+        assert_eq!(meter_sink_secret_from_lookup(|_| None), None);
+        // Valid-base64 probe, same as the play-grant test: a decode in
+        // this overlay would refuse every stream flush. Raw bytes
+        // must come back byte-identical.
+        let probe = crate::b64::encode(b"synthetic-meter-sink-material-01");
+        assert!(
+            crate::b64::decode(&probe).is_ok(),
+            "probe must be valid base64"
+        );
+        let got = meter_sink_secret_from_lookup(|key| {
+            (key == crate::meter_sink::METER_SINK_SECRET_VAR).then(|| probe.clone())
+        });
+        assert_eq!(got.as_deref(), Some(probe.as_bytes()));
+    }
+
+    #[test]
     fn rate_limit_overlay_maps_each_var_name_to_its_field() {
         // The overlay is the only link between operator [vars] and the
         // live budgets: a renamed or typo'd key must fail here, not
@@ -4019,6 +6875,37 @@ mod tests {
         // Every name in the const list is one of the five pinned above:
         // growing the list without a field pin fails this count.
         assert_eq!(RATE_LIMIT_VAR_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn bearer_lookup_budgets_pass_the_store_admissibility_gate() {
+        // Regression: the bearer gate's hardcoded pools (300/min, 3000/hr)
+        // once exceeded MAX_BUDGET_SLOTS (then 100), so the production
+        // pair claim denied EVERY bearer before any credential lookup —
+        // uniform 404, never the 403 the scope check returns — while the
+        // FakeStore-based unit tests (no cap) stayed green and staging
+        // showed mint-201 plus all-404 bearers. Pin the real gate against
+        // the real consts so the two can never drift apart again.
+        let min = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_min",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+            window_secs: crate::handlers::BEARER_LOOKUP_WINDOW_SECS,
+        };
+        let hour = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_hour",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR,
+            window_secs: crate::handlers::BEARER_LOOKUP_HOUR_WINDOW_SECS,
+        };
+        assert!(rate_limit_budget_admissible(&min));
+        assert!(rate_limit_budget_admissible(&hour));
+        // And the cap still bounds the slot scan: the largest live budget
+        // is the hourly pool above.
+        assert_eq!(
+            u64::from(crate::rate_limit::MAX_BUDGET_SLOTS),
+            crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR
+        );
     }
 
     #[test]
@@ -4116,6 +7003,41 @@ mod tests {
         assert!(
             body.contains("trim().is_empty()"),
             "config_from_env must reject whitespace-only QA bearer values"
+        );
+    }
+
+    #[test]
+    fn config_from_env_refuses_non_test_stripe_keys_at_load() {
+        // The bearer gate (`valid_secret_key`) is unit-tested pure, but the
+        // load path that enforces it needs a wasm Env — so pin the call
+        // site the same way the KEK/overlay tests pin theirs: slice ONLY
+        // the `config_from_env` body out of the pre-test source, so this
+        // test's own literals cannot satisfy the assertions. Dropping the
+        // gate (or reading the key without validating) fails here, and a
+        // staged `sk_live_` key would then reach traffic.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("STRIPE_SECRET_KEY"),
+            "config_from_env must read the Stripe bearer secret"
+        );
+        assert!(
+            body.contains("valid_secret_key(key)"),
+            "config_from_env must validate the staged bearer through the test-mode gate"
+        );
+        assert!(
+            body.contains("return None"),
+            "config_from_env must refuse startup when the staged key fails validation"
         );
     }
 
@@ -4667,6 +7589,39 @@ mod tests {
         assert!(
             !compensated.get(),
             "expiry drops the future: in-future compensation never runs"
+        );
+    }
+
+    #[test]
+    fn probe_dials_the_validated_hostname_not_an_ip_literal() {
+        // Root-cause pin: the `connect` target must be the validated
+        // hostname (runtime SNI/verify), never a vetted IP literal (TLS
+        // would verify the certificate against the address and fail every
+        // hostname-only certificate). A peer-IP check is impossible here:
+        // workerd reports the dial string itself as
+        // `SocketInfo.remote_address`, so it can never vet the peer.
+        struct ListDns(Vec<IpAddr>);
+        impl crate::vault::DnsResolver for ListDns {
+            fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+                self.0.clone()
+            }
+        }
+        let target = crate::vault::ProviderConfig {
+            host: "news.example.com".into(),
+            port: 563,
+            tls: true,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+            allow_insecure_plaintext: false,
+        }
+        .validate(&ListDns(vec!["93.184.216.34".parse().unwrap()]))
+        .expect("public fixture address validates");
+        let host = probe_dial_host(&target);
+        assert_eq!(host, "news.example.com");
+        assert!(
+            host.parse::<IpAddr>().is_err(),
+            "dial target must stay a hostname, never an IP literal"
         );
     }
 }

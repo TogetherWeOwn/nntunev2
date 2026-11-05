@@ -28,7 +28,7 @@
 # survive, URI options (sslmode, sslrootcert, connect_timeout,
 # application_name) must reach psql's effective configuration, and the
 # scripts' exit behavior (import success, already-complete skip, FK
-# orphan routing, replication fail-closed exit 2, gap refusal exit 1)
+# orphan routing, replication retired exit 2)
 # must be unchanged.
 set -uo pipefail
 
@@ -368,12 +368,19 @@ assert_no_leftover_secret_files() { # scenario-dir
 }
 
 # ---------------------------------------------------------------- harness
-make_dump() { # dump-dir : 2 valid rows per table
+make_dump() { # dump-dir : 3 valid rows per table (three recordings, so the
+  # music-video file holds one row per unordered recording pair)
   local d="$1"; mkdir -p "$d"
-  printf '00000000-0000-0000-0000-000000000001\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000002\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n' >"$d/mbdump-artist.tsv"
-  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000000001\tAlbum 1\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000000002\tAlbum 2\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n' >"$d/mbdump-release.tsv"
-  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000010001\tTrack 1\t1\t180000\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000010002\tTrack 2\t1\t180000\t2024-05-03T00:00:00Z\n' >"$d/mbdump-recording.tsv"
-  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000020001\t1\t1\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000020002\t1\t1\t2024-05-03T00:00:00Z\n' >"$d/mbdump-track.tsv"
+  printf '00000000-0000-0000-0000-000000000001\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000002\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000003\tBand 3\t3, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n' >"$d/mbdump-artist.tsv"
+  printf '00000000-0000-0000-0000-000000010001\tGroup 1\t00000000-0000-0000-0000-000000000001\tAlbum\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000010002\tGroup 2\t00000000-0000-0000-0000-000000000002\tAlbum\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000010003\tGroup 3\t00000000-0000-0000-0000-000000000003\tAlbum\t2024-05-01T12:00:00Z\n' >"$d/mbdump-release_group.tsv"
+  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000000001\tAlbum 1\tAlbum\t2024\t\\N\t00000000-0000-0000-0000-000000010001\t2024-05-02T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000000002\tAlbum 2\tAlbum\t2024\t\\N\t00000000-0000-0000-0000-000000010002\t2024-05-02T00:00:00Z\n00000000-0000-0000-0000-000000010003\t00000000-0000-0000-0000-000000000003\tAlbum 3\tAlbum\t2024\t\\N\t00000000-0000-0000-0000-000000010003\t2024-05-02T00:00:00Z\n' >"$d/mbdump-release.tsv"
+  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000010001\tTrack 1\t1\t180000\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000010002\tTrack 2\t1\t180000\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000020003\t00000000-0000-0000-0000-000000010001\tTrack 3\t2\t180000\t2024-05-03T00:00:00Z\n' >"$d/mbdump-recording.tsv"
+  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000020001\t1\t1\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000020002\t1\t1\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000020003\t1\t2\t2024-05-03T00:00:00Z\n' >"$d/mbdump-track.tsv"
+  printf '00000000-0000-0000-0000-000000030001\thttps://example.test/a\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000030002\thttps://example.test/b\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000030003\thttps://example.test/c\t2024-05-04T00:00:00Z\n' >"$d/mbdump-url.tsv"
+  printf '00000000-0000-0000-0000-000000000001\t00000000-0000-0000-0000-000000030001\tyoutube\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000000002\t00000000-0000-0000-0000-000000030002\tyoutube music\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000000003\t00000000-0000-0000-0000-000000030003\tstreaming\t2024-05-04T00:00:00Z\n' >"$d/mbdump-artist_url.tsv"
+  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000030001\tfree streaming\ttrue\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000030002\tfree streaming\tfalse\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000020003\t00000000-0000-0000-0000-000000030003\tfree streaming\ttrue\t2024-05-04T00:00:00Z\n' >"$d/mbdump-recording_url.tsv"
+  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020002\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020003\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000020003\t2024-05-05T00:00:00Z\n' >"$d/mbdump-recording_music_video.tsv"
+  printf '00000000-0000-0000-0000-000000020001\tUSABC2400001\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020002\tUSABC2400002\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020003\tUSABC2400003\t2024-05-05T00:00:00Z\n' >"$d/mbdump-recording_isrc.tsv"
 }
 
 # run_import <name> ; scenario knobs via FAKE_* / DUMP_SEQ in the caller env
@@ -418,6 +425,24 @@ common_post_checks() {
   assert_no_sentinels_in_file "script output [$url_case]" "$scenario_dir/stderr"
   assert_no_leftover_secret_files "$scenario_dir"
 }
+retired_post_checks() { # scenario-dir capture-dir
+  # replicate.sh is retired: it must spawn NO child (no psql state read,
+  # no curl fetch, no python/mb-validate), so the argv/psql assertions —
+  # which require at least one captured invocation — do not apply. The
+  # retirement is verified by absence: an empty capture directory.
+  local dir="$1" cap="$2"
+  shopt -s nullglob
+  local -a argv_files=("$cap"/*.argv)
+  shopt -u nullglob
+  if (( ${#argv_files[@]} == 0 )); then
+    ok "replicate retired: no child process spawned (no psql/curl/python/mb-validate)"
+  else
+    bad "replicate retired: unexpected child invocations captured: ${argv_files[*]}"
+  fi
+  assert_no_sentinels_in_file "script output [$url_case]" "$dir/stdout"
+  assert_no_sentinels_in_file "script output [$url_case]" "$dir/stderr"
+  assert_no_leftover_secret_files "$dir"
+}
 
 # ------------------------------------------- harness positive control
 echo "=== harness self-check: fake psql capture actually records argv ==="
@@ -447,22 +472,19 @@ for case_name in plain encoded; do
   if [[ -s "$capture_dir/validate.count" ]]; then ok "import full [$case_name]: validator child ran"; else bad "import full [$case_name]: validator child never ran"; fi
   common_post_checks
 
-  echo "=== [$case_name] replicate: fail-closed pending-apply exit ==="
-  prep_scenario "replicate-pending-$case_name"
+  echo "=== [$case_name] replicate: retired, refuses before secrets/network/state ==="
+  prep_scenario "replicate-retired-$case_name"
   FAKE_LAST_PACKET=41 run_replicate 42
-  check_eq "replicate pending [$case_name]: exit" "2" "$run_exit"
-  check_file_contains "replicate pending [$case_name]: NOT applied reported" "$scenario_dir/stderr" "NOT applied"
-  check_sql_at_least "replicate pending [$case_name]: state read ran" "$capture_dir" "SELECT last_packet FROM mb_import_state" 1
-  check_eq "replicate pending [$case_name]: no state write" "0" "$(count_sql "$capture_dir" "UPDATE mb_import_state")"
-  check_file_contains "replicate pending [$case_name]: curl fetched the packet URL" "$capture_dir/curl.001.argv" "https://example.invalid/packet-42.tar.gz"
-  common_post_checks
+  check_eq "replicate retired [$case_name]: exit" "2" "$run_exit"
+  check_file_contains "replicate retired [$case_name]: retirement reported" "$scenario_dir/stderr" "retired"
+  retired_post_checks "$scenario_dir" "$capture_dir"
 done
 
 set_url_case plain
 
 echo "=== already-complete import: skip path, older DUMP_SEQ never rewinds ==="
 prep_scenario "import-complete-plain"
-run_import FAKE_LINES_DONE=2 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=7 FAKE_FK_BAD= DUMP_SEQ=5
+run_import FAKE_LINES_DONE=3 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=7 FAKE_FK_BAD= DUMP_SEQ=5
 check_eq "import complete: exit" "0" "$run_exit"
 check_file_contains "import complete: skip reported" "$scenario_dir/stdout" "already complete"
 check_file_contains "import complete: older seed leaves state untouched" "$scenario_dir/stderr" "leaving state untouched"
@@ -483,12 +505,12 @@ check_file_not_contains "import fk: no DUMP_SEQ seed claimed" "$scenario_dir/std
 if [[ -s "$capture_dir/python.count" ]]; then ok "import fk: python3 FK-split child ran (argv captured)"; else bad "import fk: python3 FK-split child never ran"; fi
 common_post_checks
 
-echo "=== replicate: sequence gap refused ==="
+echo "=== replicate: retired for out-of-sequence packets too (no sequence gate) ==="
 prep_scenario "replicate-gap-plain"
 FAKE_LAST_PACKET=41 run_replicate 99
-check_eq "replicate gap: exit" "1" "$run_exit"
-check_file_contains "replicate gap: refusal reported" "$scenario_dir/stderr" "refusing packet 99 (expected 42"
-common_post_checks
+check_eq "replicate gap: exit" "2" "$run_exit"
+check_file_contains "replicate gap: retirement reported" "$scenario_dir/stderr" "retired"
+retired_post_checks "$scenario_dir" "$capture_dir"
 
 echo
 echo "test-argv-hygiene: $passes passed, $failures failed"

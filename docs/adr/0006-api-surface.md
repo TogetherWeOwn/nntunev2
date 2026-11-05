@@ -216,11 +216,18 @@ least-privilege credential.
 - Deprecating any Subsonic endpoint needs a new ADR.
 - **Implementation alignment:** the Subsonic compatibility implementation
   drops `u+p` (including `p=enc:`), adds generated `subsonic_username` for
-  `t`/`s`, adopts versioned HMAC lookup and token envelopes, and reads cache
-  bytes only with per-user `track_media` + `user_cache_grants` (ADR 0003).
+  `t`/`s`, adopts versioned HMAC lookup and token envelopes, and serves
+  collection audio only behind a verified, track-bound signed stream
+  grant — minted at the API issuance gate after entitlement checks —
+  through the global `track_media` mapping (ADR 0013). This supersedes
+  the per-user `track_media` + `user_cache_grants` own-provider rule this
+  bullet originally adopted from ADR 0003, retired 2026-11-03 with the
+  BYOP model; cache presence is never authorization.
   This is an acceptance contract, not a claim that the code has migrated.
   Already merged changes need additive follow-up migrations; do not edit an
   applied migration or rely on `CREATE TABLE IF NOT EXISTS` to change it.
   Tests include dual-pepper lookup, dormant-key retirement refusal,
   wrong-user/credential/field envelope swaps, auth-mode/scope checks, and
-  cache grants. Compatibility credentials cannot authenticate native REST.
+  stream-grant verification (forged, expired and wrong-track grants
+  refused before any source contact). Compatibility credentials cannot
+  authenticate native REST.

@@ -6,11 +6,24 @@
 # staging/prod parity. `staging` / `prod` name the expected ops-inventory
 # resource (a resource name, or the KV/Hyperdrive id for id-typed
 # bindings); omit them where the ops inventory has no provisioned
-# counterpart yet, and presence + parity are still enforced.
+# counterpart yet, and presence + parity are still enforced. A binding may
+# instead declare `absent_in = ["staging"]` (or `"prod"`) when the binding
+# must NOT exist in that environment — e.g. a service binding whose target
+# Worker is not deployed there, where Cloudflare would fail the deploy.
+# Absence is enforced strictly in both directions: the config must omit the
+# binding in the listed environments and must declare it in the others, and
+# the staging/prod skew check ignores exactly those declared absences. A
+# binding with an `absent_in` entry must not name an expected resource for
+# an environment it is absent in.
 #
-# Intentionally unmapped inventory: the reserved archive R2 buckets and
-# the config KV namespaces in docs/ops.md have no worker consumer yet,
-# so no binding below claims them.
+# Intentionally unmapped inventory: the reserved archive R2 buckets in
+# docs/ops.md have no worker consumer yet, so no binding below claims
+# them. The reserved config KV namespaces ARE claimed: INGEST_STATE,
+# INGEST_PAYLOADS (ingest) and MB_CACHE (mb) share the single reserved
+# namespace per env (staging 1d4f21508a214ebfa8ff7b594989d6f6, prod
+# 9664ceed71464521bb6baae2d9374006). Keys are disjoint by prefix
+# (ingest:checkpoint:/ingest:verify:, nzb:sha256:, mb:lookup:/
+# mb:release-recordings:); see docs/ops.md Worker bindings KV row.
 #
 # [[known_drift]] entries record pre-existing resource-name drift whose
 # value fix is owned by the reconciliation work in docs/ops.md. Each
@@ -29,7 +42,7 @@ prod = "d38a229748f6452bb417c6d33d277a8d"
 
 [[worker]]
 name = "ingest"
-config = "workers/ingest/wrangler.toml.example"
+config = "workers/ingest/wrangler.toml"
 
 [[worker.binding]]
 binding = "INGEST_QUEUE"
@@ -38,8 +51,22 @@ staging = "nntunev2-ingest-staging"
 prod = "nntunev2-ingest-prod"
 
 [[worker.binding]]
+binding = "consumer:nntunev2-ingest-staging"
+type = "queue_consumer"
+staging = "nntunev2-ingest-staging"
+absent_in = ["prod"]
+
+[[worker.binding]]
+binding = "consumer:nntunev2-ingest-prod"
+type = "queue_consumer"
+prod = "nntunev2-ingest-prod"
+absent_in = ["staging"]
+
+[[worker.binding]]
 binding = "INGEST_DLQ"
 type = "queue_producer"
+staging = "nntunev2-ingest-dlq-staging"
+prod = "nntunev2-ingest-dlq-prod"
 
 [[worker.binding]]
 binding = "LIBRARY_DB"
@@ -50,14 +77,19 @@ prod = "d38a229748f6452bb417c6d33d277a8d"
 [[worker.binding]]
 binding = "INGEST_STATE"
 type = "kv"
+staging = "1d4f21508a214ebfa8ff7b594989d6f6"
+prod = "9664ceed71464521bb6baae2d9374006"
 
 [[worker.binding]]
 binding = "NNTP_POOL"
 type = "durable_object"
+absent_in = ["staging"]
 
 [[worker.binding]]
 binding = "INGEST_PAYLOADS"
 type = "kv"
+staging = "1d4f21508a214ebfa8ff7b594989d6f6"
+prod = "9664ceed71464521bb6baae2d9374006"
 
 [[worker.binding]]
 binding = "INGEST_METER"
@@ -66,10 +98,12 @@ type = "analytics_engine"
 [[worker.binding]]
 binding = "REPAIR_CONTAINER"
 type = "service"
+absent_in = ["staging"]
 
 [[worker.binding]]
 binding = "TRANSCODE_CONTAINER"
 type = "service"
+absent_in = ["staging"]
 
 [[worker.binding]]
 binding = "INGEST_SCRATCH"
@@ -89,7 +123,7 @@ type = "service"
 
 [[worker]]
 name = "mb"
-config = "workers/mb/wrangler.toml.example"
+config = "workers/mb/wrangler.toml"
 
 # The MusicBrainz Hyperdrive config is one shared read mirror for both
 # environments (docs/ops.md), so staging and prod expect the same id.
@@ -102,6 +136,8 @@ prod = "1c6460d5112448888031973c87f671bc"
 [[worker.binding]]
 binding = "MB_CACHE"
 type = "kv"
+staging = "1d4f21508a214ebfa8ff7b594989d6f6"
+prod = "9664ceed71464521bb6baae2d9374006"
 
 [[worker.binding]]
 binding = "ART_CACHE"
@@ -126,6 +162,10 @@ prod = "nntunev2-audio-prod"
 [[worker.binding]]
 binding = "METER"
 type = "analytics_engine"
+
+[[worker.binding]]
+binding = "API"
+type = "service"
 
 [[worker]]
 name = "repair"
@@ -194,22 +234,6 @@ type = "durable_object"
 
 # --- Pre-existing value drift (fix owned by the docs/ops.md ---
 # --- reconciliation work; delete each entry when its value lands) ---
-
-[[known_drift]]
-worker = "ingest"
-env = "staging"
-binding = "INGEST_QUEUE"
-actual = "nntune-ingest-jobs"
-expected = "nntunev2-ingest-staging"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
-
-[[known_drift]]
-worker = "ingest"
-env = "prod"
-binding = "INGEST_QUEUE"
-actual = "nntune-ingest-jobs"
-expected = "nntunev2-ingest-prod"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
 
 [[known_drift]]
 worker = "mb"

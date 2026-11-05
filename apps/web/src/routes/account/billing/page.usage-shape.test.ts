@@ -10,26 +10,24 @@ import type { PageData } from './$types';
  */
 
 const ACTIVE_SUBSCRIPTION = {
+	state: 'active',
 	planId: 'plus',
 	status: 'active',
 	currentPeriodEnd: null,
-	trialEndsAt: null
+	graceUntil: null,
+	cancelAtPeriodEnd: false
 };
 
 const VALID_USAGE = {
 	period: '2026-10',
 	streamSecondsMonth: 3600,
-	concurrentNow: 0,
-	libraryTracks: 10,
-	ingestToday: 0
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 
 const ZERO_USAGE = {
 	period: '2026-10',
 	streamSecondsMonth: 0,
-	concurrentNow: 0,
-	libraryTracks: 0,
-	ingestToday: 0
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 
 function mockFetch(
@@ -69,9 +67,11 @@ describe('billing loader with malformed successful usage', () => {
 	it.each([
 		['empty object', {}],
 		['null', null],
-		['missing libraryTracks', { period: '2026-10', streamSecondsMonth: 0, concurrentNow: 0, ingestToday: 0 }],
+		['missing resetsAt', { period: '2026-10', streamSecondsMonth: 0 }],
+		['missing streamSecondsMonth', { period: '2026-10', resetsAt: '2026-11-01T00:00:00Z' }],
+		['garbage resetsAt', { ...VALID_USAGE, resetsAt: 'garbage' }],
 		['string streamSecondsMonth', { ...VALID_USAGE, streamSecondsMonth: '3600' }],
-		['negative libraryTracks', { ...VALID_USAGE, libraryTracks: -1 }],
+		['negative streamSecondsMonth', { ...VALID_USAGE, streamSecondsMonth: -1 }],
 		['bad period', { ...VALID_USAGE, period: '2026-13' }]
 	])(
 		'treats %s as a recoverable usage failure, never as scored usage',
@@ -101,8 +101,8 @@ describe('billing loader with malformed successful usage', () => {
 		expect(body).not.toContain('Usage for');
 	});
 
-	it('renders the notice and Retry without NaN for a wrong-typed libraryTracks', async () => {
-		const body = await renderPage(fetchWithUsage({ ...VALID_USAGE, libraryTracks: 'many' }));
+	it('renders the notice and Retry without NaN for a wrong-typed streamSecondsMonth', async () => {
+		const body = await renderPage(fetchWithUsage({ ...VALID_USAGE, streamSecondsMonth: 'many' }));
 
 		expect(body).toContain('Could not load usage.');
 		expect(body).toContain('Retry');

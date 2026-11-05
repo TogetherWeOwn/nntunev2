@@ -12,15 +12,18 @@
 //! probe through the user's pool DO → par2 verify (Container batch repair
 //! when needed) → tag/fingerprint + MusicBrainz match (`workers/mb`) →
 //! library rows. Routes validate the contract, persist upload bytes to the
-//! payload KV, enqueue to `nntune-ingest-jobs`, and write the initial job
-//! checkpoint for every real admission. The Queue consumer
+//! payload KV, enqueue through the `INGEST_QUEUE` producer (per-environment
+//! queue names live in `wrangler.toml`; the legacy single-name Rust consts
+//! are pinned by unit tests and are not the deploy contract), and write the
+//! initial job checkpoint for every real admission. The Queue consumer
 //! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
 //! validates messages and checkpoints and executes the upload
 //! parse + pool-probe + verify steps, the repair step (through the
 //! `REPAIR_CONTAINER` service binding, fed by verify's staged inputs)
-//! and match/write, but its search boundary is not executable yet, so
-//! the consumer/workflow entries stay commented out in
-//! `wrangler.toml.example` until it lands.
+//! and match/write, but its search boundary is not executable yet, so the
+//! staging deploy lane must stay operator-disabled until TWO-1660 closes
+//! search intake (the `[[queues.consumers]]` stanza in `wrangler.toml` is
+//! live config and the consumer goes live on deploy).
 //! See `README.md`.
 
 use futures_util::StreamExt;
@@ -138,7 +141,7 @@ fn inbound_trace_id(req: &Request) -> String {
 }
 
 /// Read a deploy-time plain var, ignoring empty values. `BUILD_SHA` is
-/// public build identity (see `wrangler.toml.example`): a secret binding
+/// public build identity (see `wrangler.toml`): a secret binding
 /// is tried first so an operator-supplied value wins, then a plain var,
 /// mirroring the api worker's reader.
 fn env_string(env: &Env, name: &str) -> Option<String> {

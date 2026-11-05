@@ -55,6 +55,58 @@ Pool semantics (`pool.rs`):
   segment fails that one play (`ArticleMissing` / `Decode`) and returns the
   healthy connection. Breaker values are documented below.
 
+## Public play route (`GET /play/{track_id}`, play_route.rs)
+
+The Worker's only public route. Everything else — any other method or path,
+including the Durable Object paths — is the deliberate `404`
+(`routes::decide_public_route`). The portable core (`play_route::serve_play`
+over `play.rs`) is fixture-proven end to end in
+`tests/play_route_acceptance.rs`; the wasm32 adapter (`runtime.rs`) renders
+the same decisions against R2.
+
+- **No grant, no bytes.** The grant travels in `Authorization: Bearer <v2
+  grant>`, never the query string. It is verified (signature, expiry, TTL
+  cap, track binding, `v2` play id) before any source is touched; an
+  absent/forged/expired/over-long/`v1` grant is refused `401
+  unauthorized`, a valid grant for another track `403 forbidden`, an
+  unknown track `404 not_found`, an unsatisfiable range `416
+  range_not_satisfiable` — all in the shared error envelope
+  (`docs/api-errors.md`) with zero body bytes, and the provider is never
+  dialed for an authorization failure. The track id itself must pass the
+  ledger field rule or the path does not route.
+- **Ranges/seek** resolve through `range.rs` (single `bytes=` ranges,
+  `200`/`206`, `Content-Range`, `Accept-Ranges: bytes`, content type
+  `audio/flac`). Segment metadata comes from the R2 object
+  `track/<track_id>/manifest.json`, so this Worker keeps **no
+  Hyperdrive/DB binding** — plan and subscription decisions stay at grant
+  issuance in the api Worker.
+- **Delivered = written.** Per completed range response the route emits
+  one interval `(play_id, [start, end))` of bytes actually pulled by the
+  response writer (`delivered.rs`; a mid-range abort truncates the span).
+  Prefetch and the `finalize` cache-fill drain deliver nothing and emit
+  nothing, and the route always passes `up_next: None`: the M1 player does
+  no speculative next-track preload, because delivered-bytes metering
+  would bill unplayed audio. Intervals are reported to the per-user
+  `NntpPool` Durable Object (`POST /delivered`, owner-checked, `202`);
+  union-merging, persistence, and the ledger flush land behind that
+  envelope in the enforcement and meter card, and duplicate reports are
+  safe by union design.
+- **Wasm runtime status.** The deployed fetch serves the R2-hit path
+  (pointer `track/<id>` → `audio/<sha256>` ranged GET, byte-tallied so the
+  reported interval is what the client actually pulled). An R2 miss
+  answers `502 upstream_unavailable`: `play.rs`'s NNTP client is blocking
+  `std::net` and cannot run on wasm32, so the async Durable Object play
+  adapter (plus operator provider config) is the follow-up card; the NNTP
+  route itself is proven in the portable core by the acceptance tests.
+  Grant-rejection meter signals on the wasm path are deferred to that
+  same follow-up: the wasm fetch has no `Meter` sink yet, so an
+  authenticated rejection there emits nothing (the portable core emits
+  exactly one per “Grant-rejection meter signals” below).
+- **Secret.** Grant verification reads the `PLAY_GRANT_SECRET` secret
+  binding (`wrangler secret put PLAY_GRANT_SECRET` per environment; the
+  api Worker signs with the same value). Missing or empty fails closed:
+  `500 internal_error`, no bytes.
+
 ## Upstream timeouts and circuit breaker
 
 A dead upstream must fail fast with a `503`, never hang playback
@@ -179,8 +231,19 @@ behaviour.
 
 ## Play grants: TTL cap and clock skew (grant.rs)
 
-Play grants (`v1.<payload>.<hmac-sha256>`) are short-lived bearer tokens:
-a captured grant must stop replaying soon after issuance.
+Play grants (`v1.<payload>.<hmac-sha256>`, payload `user_id|track_id|exp_unix`)
+are short-lived bearer tokens: a captured grant must stop replaying soon
+after issuance. The public play route requires the `v2` payload
+(`user_id|track_id|play_id|lease_epoch|exp_unix`): the play id keys the
+delivered-byte intervals the route reports, and the lease epoch is carried
+for the enforcement card, which mints grants at the api Worker's
+issuance gate). `grant.rs` is the byte-exact format definition both sides
+share; a well-formed `v1` grant verifies but is refused by the route — it
+has no play id to meter against. Every `v2` identity field must pass the
+persisted-ledger field rule (`[A-Za-z0-9_-]`; `user_id` 1..=128 bytes,
+`track_id`/`play_id` 1..=512 bytes) or verification rejects the token
+as `Malformed`, so a grant that verifies can always be metered. The TTL cap
+below applies identically to both versions.
 
 - `MAX_GRANT_TTL` = 900 s (15 min): the maximum grant lifetime.
 - `CLOCK_SKEW_SECS` = 60 s: bounded clock-skew allowance. An issuer whose
@@ -313,10 +376,13 @@ as the Rust library artifact. Wrangler's build command runs `worker-build
 --release` to generate the `build/worker/shim.mjs` entry configured below.
 The wasm32-only `runtime` exports the `NntpPool` Durable Object. Its probe
 route currently fails closed with `503 provider_unavailable` until provider
-configuration is wired from the account vault; the Worker's public fetch path
-remains `404` until the play path is connected to Cloudflare's R2 and metering
-adapters. This is a buildable runtime entrypoint, not a production playback
-deployment.
+configuration is wired from the account vault. The Worker's public fetch
+serves `GET /play/{track_id}` from the R2 popularity cache with grant
+verification and delivered-byte reporting (see “Public play route” above for
+the wasm miss-path boundary); everything else stays `404`. A production
+playback deployment still needs the operator-provisioned `PLAY_GRANT_SECRET`,
+the api-side `v2` issuance gate, and the async NNTP play adapter
+follow-up.
 
 ## Metering reconciliation (portable-core model)
 

@@ -22,18 +22,18 @@ const SUB_URL = '/v1/me/subscription';
 const USAGE_URL = '/v1/me/usage';
 
 const SUBSCRIPTION = {
+	state: 'active',
 	planId: 'plus',
 	status: 'active',
 	currentPeriodEnd: null,
-	trialEndsAt: null
+	graceUntil: null,
+	cancelAtPeriodEnd: false
 };
 
 const USAGE = {
 	period: '2026-10',
 	streamSecondsMonth: 90 * 3600,
-	concurrentNow: 0,
-	libraryTracks: 10,
-	ingestToday: 0
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 
 interface PendingCall {

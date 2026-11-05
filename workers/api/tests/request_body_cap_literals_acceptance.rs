@@ -177,6 +177,7 @@ fn template_request(method: &str, path: &str) -> handlers::Request {
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body: Vec::new(),
     }
 }
@@ -198,6 +199,7 @@ fn at_cap_body_dispatches_through_the_public_gate() {
                     body: format!(r#"{{"ok":true,"body_len":{len}}}"#),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -228,6 +230,7 @@ fn cap_plus_one_body_fails_closed_through_the_public_gate() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -349,6 +352,7 @@ fn handle_with_body_len(body_len: usize) -> handlers::Response {
         dns: &dns,
         now: 1_700_000_000,
         source_ip: "198.51.100.9".to_string(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
     };
     let request = handlers::Request {
         method: "GET".to_string(),
@@ -356,6 +360,7 @@ fn handle_with_body_len(body_len: usize) -> handlers::Response {
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body: vec![0x61; body_len],
     };
     block_on(handlers::handle(&ctx, &request))

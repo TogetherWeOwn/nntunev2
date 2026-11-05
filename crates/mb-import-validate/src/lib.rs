@@ -7,10 +7,17 @@
 //! database: `import.sh` drives it as the `mb-validate` binary.
 //!
 //! Curated column contracts (see `containers/mb-import/import.sh`):
-//! - artist:    mbid, name, sort_name, type, country, updated_at
-//! - release:   mbid, artist_mbid, title, release_type, year, caa_url, updated_at
-//! - recording: mbid, release_mbid, title, track_no, duration_ms, updated_at
-//! - track:     release_mbid, recording_mbid, medium_no, track_no, updated_at
+//! - artist:               mbid, name, sort_name, type, country, updated_at
+//! - release_group:        mbid, name, artist_mbid, group_type, updated_at
+//! - release: mbid, artist_mbid, title, release_type, year, caa_url,
+//!   release_group_mbid, updated_at
+//! - recording:            mbid, release_mbid, title, track_no, duration_ms, updated_at
+//! - track:                release_mbid, recording_mbid, medium_no, track_no, updated_at
+//! - url:                  mbid, url, updated_at
+//! - artist_url:           artist_mbid, url_mbid, link_name, updated_at
+//! - recording_url:         recording_mbid, url_mbid, link_name, is_video, updated_at
+//! - recording_music_video: recording_a_mbid, recording_b_mbid, updated_at
+//! - recording_isrc:        recording_mbid, isrc, updated_at
 //!
 //! Normalization: empty nullable fields are rewritten to the `COPY` null
 //! marker `\N`; typed columns are validated on their COPY-decoded value
@@ -26,9 +33,15 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
     Artist,
+    ReleaseGroup,
     Release,
     Recording,
     Track,
+    Url,
+    ArtistUrl,
+    RecordingUrl,
+    RecordingMusicVideo,
+    RecordingIsrc,
 }
 
 impl Table {
@@ -36,9 +49,15 @@ impl Table {
     pub fn parse(raw: &str) -> Option<Table> {
         match raw {
             "artist" => Some(Table::Artist),
+            "release_group" => Some(Table::ReleaseGroup),
             "release" => Some(Table::Release),
             "recording" => Some(Table::Recording),
             "track" => Some(Table::Track),
+            "url" => Some(Table::Url),
+            "artist_url" => Some(Table::ArtistUrl),
+            "recording_url" => Some(Table::RecordingUrl),
+            "recording_music_video" => Some(Table::RecordingMusicVideo),
+            "recording_isrc" => Some(Table::RecordingIsrc),
             _ => None,
         }
     }
@@ -47,9 +66,15 @@ impl Table {
     pub fn fields(self) -> usize {
         match self {
             Table::Artist => 6,
-            Table::Release => 7,
+            Table::ReleaseGroup => 5,
+            Table::Release => 8,
             Table::Recording => 6,
             Table::Track => 5,
+            Table::Url => 3,
+            Table::ArtistUrl => 4,
+            Table::RecordingUrl => 5,
+            Table::RecordingMusicVideo => 3,
+            Table::RecordingIsrc => 3,
         }
     }
 
@@ -57,9 +82,15 @@ impl Table {
     pub fn as_str(self) -> &'static str {
         match self {
             Table::Artist => "artist",
+            Table::ReleaseGroup => "release_group",
             Table::Release => "release",
             Table::Recording => "recording",
             Table::Track => "track",
+            Table::Url => "url",
+            Table::ArtistUrl => "artist_url",
+            Table::RecordingUrl => "recording_url",
+            Table::RecordingMusicVideo => "recording_music_video",
+            Table::RecordingIsrc => "recording_isrc",
         }
     }
 }
@@ -77,6 +108,8 @@ pub mod reason {
     pub const BAD_COUNTRY: &str = "bad_country";
     pub const NEGATIVE_DURATION: &str = "negative_duration";
     pub const NEGATIVE_POSITION: &str = "negative_position";
+    pub const BAD_ISRC: &str = "bad_isrc";
+    pub const BAD_BOOL: &str = "bad_bool";
     pub const INVALID_ENCODING: &str = "invalid_encoding";
 }
 
@@ -107,6 +140,13 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             (FieldKind::Country, false),
             (FieldKind::Timestamp, true),
         ],
+        Table::ReleaseGroup => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Uuid, false),
+            (FieldKind::Text, false),
+            (FieldKind::Timestamp, true),
+        ],
         Table::Release => &[
             (FieldKind::Uuid, true),
             (FieldKind::Uuid, false),
@@ -114,6 +154,7 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             (FieldKind::Text, false),
             (FieldKind::Smallint, false),
             (FieldKind::Text, false),
+            (FieldKind::Uuid, false),
             (FieldKind::Timestamp, true),
         ],
         Table::Recording => &[
@@ -129,6 +170,34 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             (FieldKind::Uuid, true),
             (FieldKind::Position, true),
             (FieldKind::Position, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::Url => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::ArtistUrl => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::RecordingUrl => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Bool, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::RecordingMusicVideo => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::RecordingIsrc => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Isrc, true),
             (FieldKind::Timestamp, true),
         ],
     };
@@ -190,6 +259,8 @@ enum FieldKind {
     Country,
     Duration,
     Position,
+    Bool,
+    Isrc,
     Text,
 }
 
@@ -232,6 +303,10 @@ impl FieldKind {
                     FieldKind::Smallint | FieldKind::Duration | FieldKind::Position => {
                         Err(reason::BAD_INT)
                     }
+                    // An empty NOT NULL bool or ISRC has no empty meaning:
+                    // poison with the kind's own code.
+                    FieldKind::Bool => Err(reason::BAD_BOOL),
+                    FieldKind::Isrc => Err(reason::BAD_ISRC),
                     _ => Ok(String::new()),
                 };
             }
@@ -273,6 +348,25 @@ impl FieldKind {
                     Ok(escape_copy_text(&decoded))
                 } else {
                     Err(reason::BAD_COUNTRY)
+                }
+            }
+            // `is_video` is always the literal `true` or `false` the ETL
+            // emits; anything else (including `1`, `t`, `TRUE`) is poison
+            // so the dump stays explicit.
+            FieldKind::Bool => match decoded.as_str() {
+                "true" | "false" => Ok(decoded),
+                _ => Err(reason::BAD_BOOL),
+            },
+            // ISRCs canonicalize to uppercase whatever the dump spelling,
+            // mirroring UUIDs: the mirror CHECK requires the 12-character
+            // uppercase form `CCOOOYYYYYYY` (2-letter country, 3-char
+            // registrant, 7-digit year/designation).
+            FieldKind::Isrc => {
+                let canonical = decoded.to_ascii_uppercase();
+                if is_isrc(&canonical) {
+                    Ok(canonical)
+                } else {
+                    Err(reason::BAD_ISRC)
                 }
             }
             FieldKind::Duration => match decoded.parse::<i32>() {
@@ -413,6 +507,23 @@ fn is_uuid(value: &str) -> bool {
         .iter()
         .zip(GROUPS)
         .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Canonical 12-character ISRC `CCOOOYYYYYYY`: 2-letter country, 3-character
+/// registrant, 7-digit year/designation. Already uppercased by the caller.
+fn is_isrc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 12 {
+        return false;
+    }
+    let country = &bytes[..2];
+    let registrant = &bytes[2..5];
+    let designation = &bytes[5..];
+    country.iter().all(|b| b.is_ascii_uppercase())
+        && registrant
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && designation.iter().all(|b| b.is_ascii_digit())
 }
 
 /// Timestamps COPY accepts for `timestamptz`: date, or date + time, with an
@@ -577,7 +688,10 @@ mod tests {
 
     #[test]
     fn valid_release_and_recording_shapes() {
-        let rel = format!("{}\t{}\tAlbum Title\tAlbum\t2024\t\\N\t{}", MBID2, MBID, TS);
+        let rel = format!(
+            "{}\t{}\tAlbum Title\tAlbum\t2024\t\\N\t{}\t{}",
+            MBID2, MBID, MBID, TS
+        );
         assert_eq!(
             validate_line(Table::Release, 7, &rel),
             Ok(format!("{rel}\t7"))
@@ -587,6 +701,103 @@ mod tests {
             validate_line(Table::Recording, 9, &rec),
             Ok(format!("{rec}\t9"))
         );
+    }
+
+    #[test]
+    fn valid_new_table_shapes() {
+        assert_eq!(Table::parse("release_group"), Some(Table::ReleaseGroup));
+        assert_eq!(Table::ReleaseGroup.as_str(), "release_group");
+        let group = format!("{}\tA release group\t{}\tAlbum\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ReleaseGroup, 1, &group),
+            Ok(format!("{group}\t1"))
+        );
+        let url = format!("{}\thttps://example.test/x\t{}", MBID, TS);
+        assert_eq!(validate_line(Table::Url, 2, &url), Ok(format!("{url}\t2")));
+        let artist_url = format!("{}\t{}\tyoutube\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ArtistUrl, 3, &artist_url),
+            Ok(format!("{artist_url}\t3"))
+        );
+        let rec_url = format!("{}\t{}\tfree streaming\ttrue\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::RecordingUrl, 4, &rec_url),
+            Ok(format!("{rec_url}\t4"))
+        );
+        let mv = format!("{}\t{}\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::RecordingMusicVideo, 5, &mv),
+            Ok(format!("{mv}\t5"))
+        );
+        let isrc = format!("{}\tUSABC2400001\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::RecordingIsrc, 6, &isrc),
+            Ok(format!("{isrc}\t6"))
+        );
+        for (table, str) in [
+            (Table::Url, "url"),
+            (Table::ArtistUrl, "artist_url"),
+            (Table::RecordingUrl, "recording_url"),
+            (Table::RecordingMusicVideo, "recording_music_video"),
+            (Table::RecordingIsrc, "recording_isrc"),
+        ] {
+            assert_eq!(Table::parse(str), Some(table));
+            assert_eq!(table.as_str(), str);
+        }
+    }
+
+    #[test]
+    fn isrc_canonicalizes_and_bad_codes_are_poison() {
+        // Lowercase dump spellings canonicalize to the uppercase mirror form.
+        let raw = format!("{}\tusabc2400001\t{}", MBID, TS);
+        let want = format!("{}\tUSABC2400001\t{}\t1", MBID, TS);
+        assert_eq!(validate_line(Table::RecordingIsrc, 1, &raw), Ok(want));
+        for bad in [
+            "USABC240001",   // 11 chars
+            "USABC24000012", // 13 chars
+            "12ABC2400001",  // digits in the country
+            "USABC240000x",  // letter in the designation
+            "USABC24000",    // 10 chars
+        ] {
+            let raw = format!("{}\t{}\t{}", MBID, bad, TS);
+            assert_eq!(
+                validate_line(Table::RecordingIsrc, 1, &raw),
+                Err((reason::BAD_ISRC, 1)),
+                "{bad:?}"
+            );
+        }
+        // An empty NOT NULL ISRC is poison with the kind's own code.
+        let raw = format!("{}\t\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::RecordingIsrc, 1, &raw),
+            Err((reason::BAD_ISRC, 1))
+        );
+        // Raw `\N` in the NOT NULL ISRC column is poison, not NULL.
+        let raw = format!("{}\t\\N\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::RecordingIsrc, 1, &raw),
+            Err((reason::NULL_IN_NOT_NULL, 1))
+        );
+    }
+
+    #[test]
+    fn bool_accepts_only_true_false() {
+        for good in ["true", "false"] {
+            let raw = format!("{}\t{}\tfree streaming\t{}\t{}", MBID, MBID2, good, TS);
+            assert_eq!(
+                validate_line(Table::RecordingUrl, 1, &raw),
+                Ok(format!("{raw}\t1")),
+                "{good:?}"
+            );
+        }
+        for bad in ["1", "0", "TRUE", "True", "yes", ""] {
+            let raw = format!("{}\t{}\tfree streaming\t{}\t{}", MBID, MBID2, bad, TS);
+            assert_eq!(
+                validate_line(Table::RecordingUrl, 1, &raw),
+                Err((reason::BAD_BOOL, 1)),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -624,23 +835,32 @@ mod tests {
 
     #[test]
     fn empty_nullable_fk_becomes_copy_null() {
-        let raw = format!("{}\t\tAlbum Title\tAlbum\t\t\t{}", MBID2, TS);
-        let want = format!("{}\t\\N\tAlbum Title\tAlbum\t\\N\t\\N\t{}\t1", MBID2, TS);
+        let raw = format!("{}\t\tAlbum Title\tAlbum\t\t\t\t{}", MBID2, TS);
+        let want = format!(
+            "{}\t\\N\tAlbum Title\tAlbum\t\\N\t\\N\t\\N\t{}\t1",
+            MBID2, TS
+        );
         assert_eq!(validate_line(Table::Release, 1, &raw), Ok(want));
     }
 
     #[test]
     fn bad_year_is_poison_year_bounds_accepted() {
-        let raw = format!("{}\t\\N\tT\tAlbum\t40000\t\\N\t{}", MBID2, TS);
+        let raw = format!("{}\t\\N\tT\tAlbum\t40000\t\\N\t\\N\t{}", MBID2, TS);
         assert_eq!(
             validate_line(Table::Release, 1, &raw),
             Err((reason::BAD_INT, 1))
         );
         // i16 bounds are the schema bounds (SMALLINT).
-        let raw = format!("{}\t\\N\tT\tAlbum\t32767\t\\N\t{}", MBID2, TS);
+        let raw = format!("{}\t\\N\tT\tAlbum\t32767\t\\N\t\\N\t{}", MBID2, TS);
         assert!(validate_line(Table::Release, 1, &raw).is_ok());
-        let raw = format!("{}\t\\N\tT\tAlbum\t-32768\t\\N\t{}", MBID2, TS);
+        let raw = format!("{}\t\\N\tT\tAlbum\t-32768\t\\N\t\\N\t{}", MBID2, TS);
         assert!(validate_line(Table::Release, 1, &raw).is_ok());
+        // A bad release-group UUID is poison, not a silent NULL.
+        let raw = format!("{}\t\\N\tT\tAlbum\t2024\t\\N\tnot-a-uuid\t{}", MBID2, TS);
+        assert_eq!(
+            validate_line(Table::Release, 1, &raw),
+            Err((reason::BAD_UUID, 1))
+        );
     }
 
     #[test]

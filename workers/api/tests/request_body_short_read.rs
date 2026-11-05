@@ -122,6 +122,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
             cookie: None,
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: b"template".to_vec(),
         },
         move |_request| async move {
@@ -131,6 +132,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
                 body: "{}".to_string(),
                 set_cookie: None,
                 retry_after: None,
+                extra_headers: Vec::new(),
             }
         },
     ));

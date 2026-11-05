@@ -266,13 +266,7 @@ impl handlers::Store for FakeStore {
         panic!("auth-start must not delete a vault")
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
-        self.audits.borrow_mut().push(vault::AuditEvent {
-            user_id: event.user_id.clone(),
-            action: event.action.clone(),
-            ok: event.ok,
-            source_ip: event.source_ip.clone(),
-            at: event.at,
-        });
+        self.audits.borrow_mut().push(event.clone());
         Ok(())
     }
 }
@@ -389,6 +383,7 @@ impl Harness {
             dns: &NoNetwork,
             now,
             source_ip: ip.into(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         };
         let request = handlers::Request {
             method: "POST".into(),
@@ -401,6 +396,7 @@ impl Harness {
             cookie: None,
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: json!({"email": email}).to_string().into_bytes(),
         };
         let attempts_before = self.mailer.attempts.borrow().len();

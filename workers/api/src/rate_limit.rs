@@ -58,11 +58,14 @@ pub const VAULT_TEST_WINDOW_SECS: u64 = crate::vault::TEST_CONNECTION_WINDOW_SEC
 /// NAT-shared address (same sizing rule as the auth-start IP budget).
 pub const VAULT_TEST_IP_MAX_ATTEMPTS: u32 = VAULT_TEST_MAX_ATTEMPTS * 5;
 
-/// Largest budget the durable slot store will scan/claim. Configured
+/// Largest budget the durable slot store will scan/claim. This must admit
+/// the largest live in-tree budget — the bearer-lookup hourly pool (3000)
+/// — or that surface's gate degrades to a silent deny-all in production
+/// (the store's admissibility gate rejects; unit fakes do not). Configured
 /// maxima clamp to this at parse time ([`RateLimitConfig::from_vars`])
 /// so an over-large operator value can never turn into a deny-all at
 /// the store's admissibility gate.
-pub const MAX_BUDGET_SLOTS: u32 = 100;
+pub const MAX_BUDGET_SLOTS: u32 = 3000;
 
 /// HTTP status for a throttled response.
 pub const RATE_LIMIT_STATUS: u16 = 429;
@@ -340,9 +343,11 @@ mod tests {
     #[test]
     fn configured_max_above_store_cap_clamps_instead_of_denying_all() {
         // The durable slot store rejects budgets over MAX_BUDGET_SLOTS,
-        // so an unclamped 200 here would make every auth start and
+        // so an unclamped 5000 here would make every auth start and
         // vault test a silent deny. from_vars must clamp to the cap.
-        for raw in ["101", "200", &u32::MAX.to_string()] {
+        // (200 passes through now: the cap admits the 3000-slot bearer
+        // hourly pool, so only values above the cap clamp.)
+        for raw in ["3001", "5000", &u32::MAX.to_string()] {
             let cfg = RateLimitConfig::from_vars(&vars(&[
                 ("AUTH_RATE_LIMIT_MAX", raw),
                 ("VAULT_TEST_RATE_LIMIT_MAX", raw),
@@ -355,6 +360,12 @@ mod tests {
         // At-or-under values pass through untouched.
         let cfg = RateLimitConfig::from_vars(&vars(&[("AUTH_RATE_LIMIT_MAX", "100")]));
         assert_eq!(cfg.auth_max_attempts, 100);
+        let cfg = RateLimitConfig::from_vars(&vars(&[("AUTH_RATE_LIMIT_MAX", "200")]));
+        assert_eq!(cfg.auth_max_attempts, 200);
+        // The cap itself is a legal budget, not an over-large one: the
+        // bearer hourly pool needs exactly this value to stay admissible.
+        let cfg = RateLimitConfig::from_vars(&vars(&[("AUTH_RATE_LIMIT_MAX", "3000")]));
+        assert_eq!(cfg.auth_max_attempts, MAX_BUDGET_SLOTS);
     }
 
     #[test]
@@ -378,6 +389,10 @@ mod tests {
         assert_eq!(cfg.vault_test_max_attempts, 10);
         assert_eq!(cfg.vault_test_ip_max_attempts, 50);
         let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_RATE_LIMIT_MAX", "30")]));
+        assert_eq!(cfg.vault_test_ip_max_attempts, 150);
+        // The 5x fallback clamps at the store cap, not at the old 100:
+        // a 1000-slot account cap scales to 5000, which clamps to 3000.
+        let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_RATE_LIMIT_MAX", "1000")]));
         assert_eq!(cfg.vault_test_ip_max_attempts, MAX_BUDGET_SLOTS);
         // An explicit IP var still wins over the scaled fallback.
         let cfg = RateLimitConfig::from_vars(&vars(&[

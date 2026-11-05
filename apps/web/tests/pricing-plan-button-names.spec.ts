@@ -5,15 +5,15 @@ import { expect, test, type Page } from '@playwright/test';
  *
  * Each plan action must expose a distinct accessible name that names its
  * plan, so screen-reader and voice-control users can tell the paid tiers
- * apart. The free tier stays a link ("Start trial"); every paid tier is a
- * button whose name includes the plan ("Choose Plus", …) and whose pending
- * state keeps the plan ("Starting Plus…").
+ * apart. The reserved free row renders no action at all; every selectable
+ * tier is a button whose name includes the plan ("Choose Plus", …) and
+ * whose pending state keeps the plan ("Starting Plus…").
  *
  * All checkout traffic is intercepted and fulfilled locally; no live
  * checkout request ever leaves the page.
  */
 
-const EXPECTED_PAID_NAMES = ['Choose Plus', 'Choose Pro 5x', 'Choose Pro 20x'] as const;
+const EXPECTED_PAID_NAMES = ['Choose Plus', 'Choose Pro', 'Choose Max'] as const;
 
 /** Rendered accessible name per paid-plan button, in table order. */
 async function paidButtonAccessibleNames(page: Page): Promise<string[]> {
@@ -49,8 +49,9 @@ test('each paid plan button exposes a distinct accessible name', async ({ page }
 	}
 	await expect(page.getByRole('button', { name: 'Choose', exact: true })).toHaveCount(0);
 
-	// Free tier stays a single distinct link.
-	await expect(page.getByRole('link', { name: 'Start trial', exact: true })).toHaveCount(1);
+	// The reserved free row renders no row or action at all.
+	await expect(page.getByRole('link', { name: 'Start trial', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('row', { name: /No plan/ })).toHaveCount(0);
 });
 
 test('pending plan button keeps a distinct accessible name', async ({ page }, testInfo) => {
@@ -80,8 +81,8 @@ test('pending plan button keeps a distinct accessible name', async ({ page }, te
 		pendingNames.length
 	);
 	await expect(page.getByRole('button', { name: 'Starting Plus…', exact: true })).toHaveCount(1);
-	await expect(page.getByRole('button', { name: 'Choose Pro 5x', exact: true })).toHaveCount(1);
-	await expect(page.getByRole('button', { name: 'Choose Pro 20x', exact: true })).toHaveCount(1);
+	await expect(page.getByRole('button', { name: 'Choose Pro', exact: true })).toHaveCount(1);
+	await expect(page.getByRole('button', { name: 'Choose Max', exact: true })).toHaveCount(1);
 	await expect(page.getByRole('button', { name: 'Starting…', exact: true })).toHaveCount(0);
 
 	openGate();

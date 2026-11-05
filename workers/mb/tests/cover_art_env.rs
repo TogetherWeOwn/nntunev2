@@ -141,7 +141,7 @@ fn no_bare_art_bucket_reference_remains() {
     let files = [
         "workers/mb/src/lib.rs",
         "workers/mb/README.md",
-        "workers/mb/wrangler.toml.example",
+        "workers/mb/wrangler.toml",
         "docs/adr/0007-mb-mirror.md",
     ];
     let bare = "nntunev2-art";
@@ -180,14 +180,16 @@ fn no_bare_art_bucket_reference_remains() {
     );
 }
 
-/// The deploy example must bind the env-specific buckets, not the bare name.
+/// The real deploy config must bind the env-specific buckets, not the bare
+/// name. Production still binds the staging bucket on purpose: the prod
+/// override is owned by the MB art-cache activation (docs/ops.md R2
+/// reconciliation table; `[[known_drift]]` in binding_manifest.toml).
 /// Parses per-env sections and per-block bindings so a swapped `bucket_name`
 /// (M2), a deleted `ART_CACHE` block, a swapped `MB_DB`/`MB_CACHE` binding,
 /// or a deleted per-env `MB_DB` block fails instead of passing silently.
 ///
-/// The example's env sections are commented lines (`# [[env.staging...`),
-/// so headers are matched without the leading `# ` (sections are sliced at
-/// the first `[[`, which drops the `# ` prefix on the opening header).
+/// Env sections are real TOML tables here (sections are sliced at the
+/// first `[env.` header of the other environment).
 fn block_for<'a>(section: &'a str, header: &str) -> &'a str {
     let start = section
         .find(header)
@@ -195,7 +197,7 @@ fn block_for<'a>(section: &'a str, header: &str) -> &'a str {
     let after = start + header.len();
     let rest = &section[after..];
     let mut end = rest.len();
-    for marker in ["\n# [[", "\n# ["] {
+    for marker in ["\n[[", "\n["] {
         if let Some(idx) = rest.find(marker) {
             end = end.min(idx);
         }
@@ -204,15 +206,15 @@ fn block_for<'a>(section: &'a str, header: &str) -> &'a str {
 }
 
 #[test]
-fn wrangler_example_uses_env_specific_buckets() {
-    let path = manifest_dir().join("wrangler.toml.example");
-    let text = std::fs::read_to_string(&path).expect("read wrangler.toml.example");
+fn wrangler_config_uses_env_specific_buckets() {
+    let path = manifest_dir().join("wrangler.toml");
+    let text = std::fs::read_to_string(&path).expect("read wrangler.toml");
     let staging_start = text
-        .find("[[env.staging")
-        .expect("wrangler example must define a staging env section");
+        .find("[env.staging]\n")
+        .expect("wrangler config must define a staging env section");
     let production_start = text
-        .find("[[env.production")
-        .expect("wrangler example must define a production env section");
+        .find("[env.production]\n")
+        .expect("wrangler config must define a production env section");
     assert!(
         staging_start < production_start,
         "staging env section must precede production env section"
@@ -229,11 +231,14 @@ fn wrangler_example_uses_env_specific_buckets() {
             "nntunev2-art-prod",
         ),
         (
+            // Prod override pending: the prod section must keep binding
+            // exactly the staging bucket until the owning MB art-cache
+            // activation lands and removes the known-drift entry.
             "production",
             production_section,
             "production",
-            "nntunev2-art-prod",
             "nntunev2-art-staging",
+            "nntunev2-art-prod",
         ),
     ] {
         let hyperdrive_header = format!("[[env.{short}.hyperdrive]]");

@@ -2056,7 +2056,7 @@
 						disabled={index === 0}
 						onclick={() => moveQueuedTrack(index, 0)}
 					>
-						Move to top
+						Top
 					</button>
 					<button
 						type="button"
@@ -2064,7 +2064,7 @@
 						disabled={index === queue.tracks.length - 1}
 						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
 					>
-						Move to bottom
+						Bottom
 					</button>
 					<button
 						type="button"
@@ -2074,7 +2074,7 @@
 						disabled={radio !== null}
 						onclick={(event) => void playNextAt(index, event.currentTarget)}
 					>
-						Play next
+						Next
 					</button>
 				</li>
 			{/each}

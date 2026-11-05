@@ -14,6 +14,8 @@
  * enforces both limits.
  */
 
+import { clearUsageWarnings } from '../billing/usageWarnings.js';
+
 export interface LibraryItem {
 	id: string;
 	title?: string;
@@ -261,8 +263,10 @@ function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | n
 /**
  * Cross an auth boundary: drop this tab's snapshots (current session-scoped
  * and the legacy shared localStorage copy) and its device-local favorites,
- * and tell other tabs to do the same. Never throws, so it is safe to call
- * right after a credential exchange succeeds.
+ * clear the billing usage-warning flags (keyed period+threshold with no
+ * account identity, so they must not survive into the next account on a
+ * shared browser), and tell other tabs to do the same. Never throws, so
+ * it is safe to call right after a credential exchange succeeds.
  */
 export function invalidateLibraryCache(): void {
 	const session = browserStorage('session');
@@ -278,6 +282,7 @@ export function invalidateLibraryCache(): void {
 	const local = browserStorage('local');
 	clearSnapshot(local);
 	clearFavoritesKeys(local, context);
+	clearUsageWarnings();
 	broadcastAuthTransition(local);
 }
 

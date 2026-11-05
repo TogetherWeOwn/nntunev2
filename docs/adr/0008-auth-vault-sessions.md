@@ -6,7 +6,7 @@
 ## Status note — 2026-10-19: slice 2 shipped
 
 Slice 2 is implemented at `origin/main`: the Worker HTTP entry
-(`workers/api/src/worker_entry.rs:1869`, `pub async fn dispatch`,
+(`workers/api/src/worker_entry.rs:1888`, `pub async fn dispatch`,
 reachable from the `#[worker::event(fetch)]` entry in
 `workers/api/src/lib.rs`) serves auth traffic over the Hyperdrive
 Postgres store, and WebAuthn signature verification is live via
@@ -86,6 +86,8 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
   handling in CI (synthetic fixtures only).
 - The follow-up slice added the Worker HTTP entry, Hyperdrive queries
   (parameterized only), WebAuthn signature verification, and the bounded
-  direct-socket `test connection` probe (`SocketDialer`, vetted IP literals
-  only — not routed through the stream pool; all shipped in slice 2 — see
-  status note); it re-requests CISO review as a vault/auth-touching PR.
+  direct-socket `test connection` probe (`SocketDialer`, validated-hostname
+  dial (no peer-IP pin: workerd reports the dial string as
+  SocketInfo.remote_address) — not routed through the stream pool; all
+  shipped in slice 2 — see status note); it re-requests CISO review as a
+  vault/auth-touching PR.

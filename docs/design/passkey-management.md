@@ -65,7 +65,7 @@ All routes below are POST. Binary values are unpadded base64url. Finish request
 structs reject unknown fields. Browser credential objects are flattened by the
 client; transports, attachment, extensions and userHandle are not finish fields.
 Sources: `workers/api/src/handlers.rs:1416-1444`,
-`apps/web/src/lib/api/client.ts:287-324`, `apps/web/src/lib/webauthn.ts:36-54`.
+`apps/web/src/lib/api/client.ts:158-195`, `apps/web/src/lib/webauthn.ts:36-54`.
 
 | Route | Request | Success |
 | --- | --- | --- |
@@ -81,7 +81,7 @@ Sources: `workers/api/src/handlers.rs:1467-1501`,
 `workers/api/src/handlers.rs:1928-1986`,
 `workers/api/src/handlers.rs:2083-2099`,
 `workers/api/src/handlers.rs:2233-2240`,
-`apps/web/src/lib/api/client.ts:471-546`.
+`apps/web/src/lib/api/client.ts:342-417`.
 
 Registration is initial enrollment only. An existing account with any passkey
 receives the same-shaped stand-in/unusable challenge; finish also rejects it.
@@ -113,7 +113,7 @@ presented at finish, not necessarily the one used at start. Sources:
   `https://staging.nntune.com`. These are config-file observations, not live
   settings. RP ID must exactly equal the canonical origin host; one configured
   origin, not a multi-origin list. HTTPS except explicitly enabled loopback dev.
-  Sources: `workers/api/src/worker_entry.rs:186-187`, `config/prod.json:6-7`,
+  Sources: `workers/api/src/worker_entry.rs:187-188`, `config/prod.json:6-7`,
   `config/staging.json:6-7`, `workers/api/src/auth.rs:185-203`.
 - Verifier checks client-data type/challenge/exact origin, rejects crossOrigin,
   verifies RP-ID hash and requires UP plus UV. ES256 and EdDSA are accepted;
@@ -159,7 +159,7 @@ explicitly does not record BE/BS. Sources: `migrations/0002_auth_vault.sql:17-35
 **No passkey list, remove, rename or authenticated add route exists** in the
 dispatcher. `/v1/credentials` is the separate native-REST bearer surface.
 Sources: `workers/api/src/handlers.rs:3341-3375`,
-`apps/web/src/lib/api/client.ts:449-467`.
+`apps/web/src/lib/api/client.ts:320-338`.
 
 The registry uses `{code,message,retryable}`, not `error_code/next_action`.
 Relevant registered codes are invalid_request (400), unauthorized and
@@ -174,14 +174,14 @@ Reachable auth handlers also return legacy generic 401
 Do not promise a uniform structured envelope for old routes. Freshness failure
 is structured reauth_required. The frontend validates start-success shapes
 before opening a ceremony. Sources: `workers/api/src/handlers.rs:906-969`,
-`apps/web/src/lib/api/client.ts:223-277`.
+`apps/web/src/lib/api/client.ts:94-148`.
 
 Session created_at is the fresh-auth timestamp: 600 seconds inclusive. Refresh
 preserves it; no method-specific proof receipt is in session claims. Existing
 reauth replaces only the current session, atomically revoking its predecessor
 and inserting the replacement. Sources: `workers/api/src/session.rs:19-26`,
 `workers/api/src/session.rs:67-79`, `workers/api/src/session.rs:358-416`,
-`workers/api/src/worker_entry.rs:1079-1125`.
+`workers/api/src/worker_entry.rs:1098-1144`.
 
 Revoke-all authenticates cookie plus Origin, without freshness; revokes native
 REST credentials and all account sessions via separate sweeps; does not delete
@@ -192,11 +192,12 @@ boundaries, not permission to change session semantics. Sources:
 `apps/web/src/routes/account/security/+page.svelte:18-102`.
 
 Security UI has sign-out and sign-out-everywhere only. **It is not SSR:** its
-load explicitly sets ssr=false and checks session via GET vault; 401 clears
-cached identity and redirects, other failures expose a warning. Do not claim
+load explicitly sets ssr=false and checks session via GET /v1/me/subscription,
+a single account snapshot even without a subscription; it never reads credential
+history. A 401 clears cached identity and redirects; other failures expose a warning. Do not claim
 server-rendered authenticated inventory or add private data to HTML. Sources:
 `apps/web/src/routes/account/security/+page.svelte:105-135`,
-`apps/web/src/routes/account/security/+page.ts:8-26`.
+`apps/web/src/routes/account/security/+page.ts:8-28`.
 
 ## 3. Proposed management contract — not implemented
 

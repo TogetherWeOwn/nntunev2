@@ -235,6 +235,7 @@ fn throttled_register_start(admission: PairAdmission, email: &str) -> handlers::
         dns: &dns,
         now: NOW,
         source_ip: SOURCE_IP.to_string(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
     };
     let request = handlers::Request {
         method: "POST".to_string(),
@@ -242,6 +243,7 @@ fn throttled_register_start(admission: PairAdmission, email: &str) -> handlers::
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body: serde_json::json!({"email": email}).to_string().into_bytes(),
     };
     let response = block_on(handlers::handle(&ctx, &request));

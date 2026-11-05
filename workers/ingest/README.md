@@ -64,19 +64,19 @@ NZB upload ───────────────┘                     
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-44`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:35`). No ingest route
+  `src/lib.rs:38`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
   model behavior only (`tests/indexer_fetch_ssrf_guard.rs`). The separate `workers/api` vault validator
-  (`IndexerConfig::validate` in `workers/api/src/vault.rs:361`) still checks the indexer URL at
+  (`IndexerConfig::validate` in `workers/api/src/vault.rs:372`) still checks the indexer URL at
   save/validate time; it is not an indexer fetch transport either.
 
 ## Indexer fetch policy library — no runtime indexer fetching
 
 `src/indexer_fetch.rs` is a **library-only policy guard and buffered
 model**, not delivered outbound fetching. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:35`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:38`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:497-649`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:394`) or
@@ -188,7 +188,7 @@ be wired to a live transport as if it were approved policy.
 
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**,
 not a live SSRF boundary (module at `src/nzb_fetch.rs:1-68`, exported as
-`pub mod nzb_fetch` in `src/lib.rs:42`). No ingest route calls it
+`pub mod nzb_fetch` in `src/lib.rs:45`). No ingest route calls it
 (`fetch_nzb` at `src/nzb_fetch.rs:408` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
@@ -295,8 +295,11 @@ stub whose NZB references fixture message-ids.
 - Queue wiring (`src/dispatch.rs`): routes build a `QueueMsg` carrying the
   full job input (search params, or a content-addressed `INGEST_PAYLOADS`
   handle for upload bytes written before enqueue) with a user-bound
-  idempotency key, and `send` it to `nntune-ingest-jobs` (`worker` `queue`
-  feature; bindings in `wrangler.toml.example`). Search keys bind query +
+  idempotency key, and `send` it through the `INGEST_QUEUE` producer
+  (`worker` `queue` feature; per-environment queue names in the real
+  `workers/ingest/wrangler.toml`: `nntunev2-ingest-staging` /
+  `nntunev2-ingest-prod`; the legacy single-name Rust consts are pinned by
+  unit tests and are not the deploy contract). Search keys bind query +
   indexer + categories + limit + page, so no request is silently dropped.
   Success is 202 `queued`; a missing/failing binding or payload store is 503
   with `Retry-After` (never 202). The Queue handler exists
@@ -306,11 +309,12 @@ stub whose NZB references fixture message-ids.
   key waits out the window and retries that write once in-invocation —
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
   a failed send, shared-parser upload validation, and the pool-DO segment
-  probe for uploads), but the consumer entry stays commented out in
-  `wrangler.toml.example` until three blockers clear: the search step is
-  not wired (enabling the consumer would burn search jobs' retry budget
-  against an unavailable boundary and quarantine them), the library schema
-  is missing, and the repair re-verify loop is still open (both below).
+  probe for uploads), and the `[[queues.consumers]]` stanza in
+  `workers/ingest/wrangler.toml` is live: the consumer goes live the moment
+  this environment deploys, so the staging deploy lane must stay
+  operator-disabled until TWO-1660 closes search intake (a search job would
+  burn its retry budget against the unwired search boundary and
+  quarantine). The library-schema and repair re-verify gates below remain.
 - Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
   `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
   scoped `ingest:write` that the `api` Worker mints for the session user,
@@ -332,19 +336,19 @@ stub whose NZB references fixture message-ids.
   feedback loop is still open. After a repair round, `Verifying` re-runs
   the verify driver over the pool body route (`src/queue_consumer.rs:701-704`,
   `PoolBodySource::fetch_body` via `call_pool_body` at
-  `src/queue_consumer.rs:897`) and does not yet consume the repair
+  `src/queue_consumer.rs:900`) and does not yet consume the repair
   round's `out/` objects (the repair Worker streams outputs back to `out/`
   per `workers/repair/README.md:23-28`; key shapes in
   `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
   not be exercised live until that consumption lands
-  (`src/queue_consumer.rs:257-265`). The consumer stays disabled meanwhile:
-  the `[[queues.consumers]]` entry stays commented out
-  (`workers/ingest/wrangler.toml.example:30-31`,
-  `workers/ingest/wrangler.toml.example:58-59`), and ingest stays unable
-  to finish a `Repairing` job (`workers/repair/README.md:40-44`) — this
-  is one gate alongside the search step, which is also not wired yet, so
-  enabling the consumer now would burn search jobs' retry budget
-  (`workers/ingest/wrangler.toml.example:52-56`).
+  (`src/queue_consumer.rs:257-265`). The consumer stays gated meanwhile:
+  `[[queues.consumers]]` is live in `workers/ingest/wrangler.toml`
+  (top-level `:76-82`, staging `:177-181`, production `:241-245`), and
+  ingest stays unable to finish a `Repairing` job
+  (`workers/repair/README.md:40-44`) — this is one gate alongside the
+  search step, which is also not wired yet, so enabling the lane now would
+  burn search jobs' retry budget (per-env `max_retries = 4` in the same
+  stanza).
   A checkpoint reaching `Repairing` without a recorded `par2_set_id` is a
   permanent failure — there is nothing a redelivery could add
   (`src/queue_consumer.rs:258-266`; the missing-inputs arm at
@@ -471,17 +475,20 @@ invocation is claimed here.
   `src/queue_consumer.rs` retries after `UNPERSISTED_RETRY_SECS = 5 s`);
   merely skipping `ack()` and returning
   implicitly acknowledges it. Each retry also spends one of the four native
-  `max_retries` slots (`max_retries = 4` in `wrangler.toml.example`,
-  still commented while the consumer stays disabled), after which
+  `max_retries` slots (live `max_retries = 4` in the per-environment
+  `[[queues.consumers]]` stanzas in `workers/ingest/wrangler.toml`), after which
   Cloudflare moves the raw body to its native
   DLQ if `dead_letter_queue` is configured; otherwise Cloudflare drops it. A
   successful send followed by an ack failure may create a duplicate DLQ
   entry (a `Failed` redelivery re-quarantines the recorded failure, which
   is also how a DLQ-send failure retries the send), so DLQ processing
   must be idempotent by `job_id`.
-- DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
-  `nntune-ingest-dlq` (`DLQ_QUEUE_NAME` via the `INGEST_DLQ` binding,
-  `DLQ_QUEUE_BINDING`, both in `src/retry.rs`) — the original `QueueMsg` plus
+- DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to the
+  per-environment DLQ (`nntunev2-ingest-dlq-staging` /
+  `nntunev2-ingest-dlq-prod` via the `INGEST_DLQ` binding,
+  `DLQ_QUEUE_BINDING`, in `src/retry.rs`; the legacy single-name
+  `DLQ_QUEUE_NAME` const is pinned by unit tests and is not the deploy
+  contract) — the original `QueueMsg` plus
   machine-readable `error_code` / `attempts` fields in the serialized DLQ
   body (`reason` redacted via `redact_api_key` and bounded to
   `MAX_DLQ_DETAIL_CHARS = 512` by `bounded_redacted_detail` in
@@ -496,7 +503,10 @@ invocation is claimed here.
 
 1. On **Workers Paid**, the Cloudflare DLQ defaults to **4 days retention**
    (345,600 s); configure up to 14 days with
-   `npx wrangler queues update nntune-ingest-dlq --message-retention-period-secs 1209600`
+   `npx wrangler queues update nntunev2-ingest-dlq-staging --message-retention-period-secs 1209600`
+   (use the per-environment DLQ name: `nntunev2-ingest-dlq-staging` /
+   `nntunev2-ingest-dlq-prod` per `docs/ops.md`; never the legacy
+   single-name const)
    (60–1,209,600 seconds). On **Workers Free**, retention is fixed at 24 hours
    and cannot be configured. (Per the official Queues
    [limits](https://developers.cloudflare.com/queues/platform/limits/):

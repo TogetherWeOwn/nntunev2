@@ -46,9 +46,9 @@ jobs:
     if: github.event_name == 'pull_request' || inputs.pr_number != ''
     permissions:
       contents: read
-      issues: write
-      pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+      issues: write # Create and apply the advisory size labels.
+      pull-requests: write # Label the selected pull request with its advisory size.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # No repo-specific generated paths: the script's built-in exclusions
@@ -63,6 +63,6 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
     permissions:
       contents: read
-      issues: read
-      pull-requests: read
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+      issues: read # Resolve advisory size labels for the weekly tally.
+      pull-requests: read # List pull requests for the read-only weekly tally.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0

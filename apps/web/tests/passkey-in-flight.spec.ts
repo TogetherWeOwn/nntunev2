@@ -142,7 +142,7 @@ test('login: re-clicking while a passkey ceremony is in flight is a no-op, never
 
 	// The original ceremony was not poisoned: releasing it signs in.
 	await page.evaluate(() => window.__releasePasskey?.());
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(traffic.startPosts).toBe(1);
 	expect(traffic.finishPosts).toBe(1);
 });
@@ -196,7 +196,7 @@ test('login: after the empty-email prompt, entering an email and retrying signs 
 
 	await page.locator('input[type="email"]').fill('alice@example.com');
 	await button.click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 
 	expect(traffic.startPosts).toBe(1);
 	expect(traffic.finishPosts).toBe(1);

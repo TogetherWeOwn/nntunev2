@@ -1,25 +1,48 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import {
-		listPlans,
+		listSelectablePlans,
+		planFromDTO,
 		formatPricePerMonth,
-		formatCacheBudget,
-		formatCacheRetention,
-		planButtonName
+		planButtonName,
+		type Plan
 	} from '#lib/billing/plans.js';
 	import {
 		BillingApiError,
+		fetchPlans,
 		startCheckout,
 		signupUrlForCheckoutFailure
 	} from '#lib/billing/billingClient.js';
 
-	const plans = listPlans();
+	// Static fallback mirror first (signed-out visitors have no session for
+	// GET /v1/plans); signed-in visitors hydrate from plan data on mount so
+	// prices/caps render from the plans table, never a second copy here.
+	let plans = $state<Plan[]>(listSelectablePlans());
+	// The server-rendered buttons cannot start checkout until this component
+	// mounts, so keep them disabled instead of silently dropping an early click.
+	let mounted = $state(false);
 	let checkoutError: string | null = $state(null);
 	let pendingPlan: string | null = $state(null);
 	let alive = true;
 	onDestroy(() => {
 		alive = false;
+	});
+
+	onMount(async () => {
+		mounted = true;
+		try {
+			const dtos = await fetchPlans();
+			if (!alive) return;
+			const hydrated = dtos
+				.map((dto) => planFromDTO(dto))
+				.filter((plan): plan is Plan => plan !== undefined && plan.selectable);
+			// An empty or unrecognized response never blanks the page: the
+			// static fallback mirror stays.
+			if (hydrated.length > 0) plans = hydrated;
+		} catch {
+			/* signed-out 401 or backend unreachable: static fallback stays */
+		}
 	});
 
 	async function choose(planId: string) {
@@ -60,15 +83,17 @@
 	<title>Plans and pricing — NNTune v2</title>
 	<meta
 		name="description"
-		content="NNTune v2 plans: 14-day free trial, Plus, Pro 5x and Pro 20x. No overage bills — streams degrade gracefully past the cap."
+		content="NNTune v2 plans: Plus, Pro and Max. Every plan includes the full catalogue and lossless audio — plans differ in monthly listening hours. No overage bills, ever."
 	/>
 </svelte:head>
 
 <main>
 	<h1>Plans and pricing</h1>
 	<p>
-		NNTune never bundles Usenet access — you bring your own provider, and plans meter
-		<em>our</em> service (streaming hours, concurrent streams, library size, ingest).
+		NNTune is an invite-only, curated listening service. Every plan includes the full
+		catalogue and lossless audio — plans differ only in how many hours a month you can
+		listen. Browsing, search and your library are always available; a plan is what turns
+		on playback.
 	</p>
 
 	{#if checkoutError}
@@ -76,18 +101,13 @@
 	{/if}
 
 	<table>
-		<caption>Monthly plans. Free is a 14-day trial, not a forever tier.</caption>
+		<caption>Monthly plans. Every plan includes the full catalogue; plans differ in listening hours.</caption>
 		<thead>
 			<tr>
 				<th scope="col">Plan</th>
 				<th scope="col">Price</th>
 				<th scope="col">Stream hrs/mo</th>
 				<th scope="col">Concurrent</th>
-				<th scope="col">Library</th>
-				<th scope="col">Ingest/day</th>
-				<th scope="col">Cache budget</th>
-				<th scope="col">Cache retention</th>
-				<th scope="col">Cache priority</th>
 				<th scope="col"><span class="visually-hidden">Action</span></th>
 			</tr>
 		</thead>
@@ -95,53 +115,34 @@
 			{#each plans as plan (plan.id)}
 				<tr>
 					<th scope="row">{plan.name}<br /><small>{plan.blurb}</small></th>
-					<td>{formatPricePerMonth(plan)}</td>
-					<td>{plan.streamHoursMonth}</td>
-					<td>{plan.maxConcurrentStreams}</td>
-					<td>{plan.maxLibraryTracks.toLocaleString()}</td>
 					<!-- Trailing {' '} keeps cell values separated in textContent (Svelte
 						strips inter-element whitespace, so without it text extraction
-						jams cells as e.g. "52 GiB7 dayslow" and word-boundary matching
-						on the cache values fails). Rendered output is unchanged:
-						HTML collapses the spaces. -->
-					<td>{plan.ingestJobsDay}{' '}</td>
-					<td>{formatCacheBudget(plan)}{' '}</td>
-					<td>{formatCacheRetention(plan)}{' '}</td>
-					<td>{plan.cachePriority}{' '}</td>
+						jams cells and word-boundary matching on the values fails).
+						Rendered output is unchanged: HTML collapses the spaces. -->
+					<td>{formatPricePerMonth(plan)}{' '}</td>
+					<td>{plan.streamHoursMonth}{' '}</td>
+					<td>{plan.maxConcurrentStreams}{' '}</td>
 					<td>
-						{#if plan.id === 'free'}
-							<a href="/signup?plan=free">Start trial</a>
-						{:else}
-							<button
-								aria-label={planButtonName(plan, pendingPlan)}
-								disabled={pendingPlan !== null}
-								onclick={() => choose(plan.id)}
-							>
-								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
-							</button>
-						{/if}
+						<button
+							aria-label={planButtonName(plan, pendingPlan)}
+							disabled={!mounted || pendingPlan !== null}
+							onclick={() => choose(plan.id)}
+						>
+							{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
+						</button>
 					</td>
 				</tr>
 			{/each}
 		</tbody>
 	</table>
 
-	<section aria-labelledby="cache">
-		<h2 id="cache">About the plan cache</h2>
+	<section aria-labelledby="cap">
+		<h2 id="cap">What happens at the cap</h2>
 		<p>
-			Cached audio is a reclaimable allowance, not permanent storage. It is not durable
-			storage, not an offline guarantee, and not extra provider storage — entries may be
-			reclaimed to make room. The budgets above are the approved design allowance; cache
-			enforcement is planned and not yet enforced.
-		</p>
-	</section>
-
-	<section aria-labelledby="overage">
-		<h2 id="overage">What happens past the cap</h2>
-		<p>
-			No overage bills, ever. Streams past your monthly hours continue at a lower bitrate until the
-			next period; artwork stays full quality. Concurrent, library and ingest limits reset on their
-			natural cadence — upgrade any time for 5x / 20x headroom.
+			No overage bills, ever. When you reach your monthly hours, new playback pauses
+			until your hours reset (the 1st, 00:00 UTC) or you upgrade — a track already
+			playing finishes. Every plan plays one stream at a time; starting playback on a
+			second device hands over from the first.
 		</p>
 		<p><a href="/account/billing">Check your current usage</a></p>
 	</section>

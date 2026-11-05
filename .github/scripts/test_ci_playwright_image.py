@@ -67,7 +67,9 @@ class TestPlaywrightImage(unittest.TestCase):
         self.assertNotIn("apt-get", self.job)
         self.assertIn("npm run typecheck", self.job)
         self.assertIn("npm run e2e:list", self.job)
-        self.assertIn("node fixtures/two-track-self-check.mjs", self.job)
+        # No checked-in NZB fixtures (TWO-1169): the retired two-track
+        # self-check must not reappear in e2e-lint.
+        self.assertNotIn("two-track-self-check", self.job)
         aggregate = split_jobs(self.workflow)["ci-ok"]
         self.assertIn("e2e-lint", step_field(aggregate, "needs"))
         self.assertEqual(step_field(aggregate, "if"), "${{ always() }}")

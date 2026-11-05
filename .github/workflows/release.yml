@@ -1,0 +1,177 @@
+name: release
+
+# Release on production promote, with calendar versions (vYYYY.MDD.P).
+# deploy-production calls this after a successful production deploy with the
+# exact deployed SHA. ci/release-request.cjs proves the promotion from its
+# receipt, then the shared releaser (TogetherWeOwn/.github actions/calver,
+# policy production-promotion) allocates the version from tag history, tags
+# that commit and publishes a GitHub Release, Latest, whose notes group the
+# Conventional Commit subjects since the previous stable tag by
+# release-please-config.json changelog-sections. No release commit or PR.
+# A re-promote of a tagged commit or a rollback skips green without a tag.
+# Manual dispatch dry-runs a release or repairs a missing one for a deployed
+# SHA; it needs the same promotion evidence.
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Deployed commit to tag
+        type: string
+        required: true
+      promotion_run_id:
+        description: Untrusted producing workflow run selector; verified against GitHub
+        type: string
+        required: false
+      promotion_run_attempt:
+        description: Untrusted producing attempt selector; verified against GitHub
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-hex commit on main that is live in production
+        type: string
+        required: true
+      promotion_run_id:
+        description: Producing production workflow run ID (optional selector, not proof)
+        type: string
+        required: false
+      promotion_run_attempt:
+        description: Producing attempt number (required with run ID, not proof)
+        type: string
+        required: false
+      dry_run:
+        description: Run every check and print the version without publishing
+        type: boolean
+        default: false
+      repair:
+        description: Create the missing GitHub Release for a tag this run attempt already published
+        type: boolean
+        default: false
+
+# Least privilege: no workflow-wide token; the job grants only its own.
+permissions: {}
+
+jobs:
+  tag:
+    name: tag-release
+    permissions:
+      actions: read # Read only this repository's promotion evidence.
+      contents: write # Create the tag and its GitHub Release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One release at a time; a queued promote waits instead of racing the tag.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # Full history: the receipt check proves the run's head and the
+          # deployed SHA are on main.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the production promotion
+        id: request
+        run: node ci/release-request.cjs
+        env:
+          RELEASE_SHA: ${{ inputs.sha }}
+          PROMOTION_RUN_ID: ${{ inputs.promotion_run_id }}
+          PROMOTION_RUN_ATTEMPT: ${{ inputs.promotion_run_attempt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+      # Plan and publish run in this one serialized job, pinned to the same
+      # reviewed TogetherWeOwn/.github commit. Plan is read-only.
+      - name: Plan the CalVer release
+        id: plan
+        continue-on-error: true
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        with:
+          request: ${{ steps.request.outputs.request }}
+          runs-on-json: '"ubuntu-latest"'
+      # One in-job retry after a short wait: the releaser's GitHub client makes
+      # each API call once, so a single transient fetch failure would
+      # otherwise strand a deployed commit untagged. A failed-jobs rerun
+      # cannot recover it (the promotion proof binds the original attempt),
+      # but retrying inside this attempt changes no trust decision: plan is
+      # read-only, and publish re-verifies its frozen plan before any write.
+      # The publish retry runs in repair mode for its own plan (unless this is
+      # a dry run, which never wrote), so a first attempt that created the tag
+      # but died before its Release completes that Release instead of
+      # refusing on the partial state it left behind.
+      - name: Wait before retrying the plan
+        if: ${{ !cancelled() && steps.plan.outcome == 'failure' }}
+        run: sleep 20
+      - name: Plan the CalVer release (retry)
+        id: plan-retry
+        if: ${{ !cancelled() && steps.plan.outcome == 'failure' }}
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        with:
+          request: ${{ steps.request.outputs.request }}
+          runs-on-json: '"ubuntu-latest"'
+      - name: Select the planned release
+        id: planned
+        if: ${{ !cancelled() && (steps.plan.outcome == 'success' || steps.plan-retry.outcome == 'success') }}
+        run: |
+          node -e '
+            const retry = process.env.PLAN_RETRY_OUTCOME === "success";
+            const plan = retry ? process.env.PLAN_RETRY : process.env.PLAN;
+            const skipped = retry ? process.env.SKIPPED_RETRY : process.env.SKIPPED;
+            require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `plan=${plan}\nskipped=${skipped}\n`);
+          '
+        env:
+          PLAN: ${{ steps.plan.outputs.plan }}
+          PLAN_RETRY: ${{ steps.plan-retry.outputs.plan }}
+          PLAN_RETRY_OUTCOME: ${{ steps.plan-retry.outcome }}
+          SKIPPED: ${{ steps.plan.outputs.skipped }}
+          SKIPPED_RETRY: ${{ steps.plan-retry.outputs.skipped }}
+      - name: Refuse when no CalVer plan succeeded
+        if: ${{ !cancelled() && steps.request.outcome == 'success' && steps.plan.outcome != 'success' && steps.plan-retry.outcome != 'success' }}
+        run: |
+          echo "::error::CalVer plan failed on both attempts; not publishing"
+          exit 1
+      - name: Build the publish request
+        id: publish-request
+        if: ${{ !cancelled() && steps.planned.outcome == 'success' && steps.planned.outputs.skipped != 'true' }}
+        run: |
+          node -e '
+            const request = { phase: "publish", plan: JSON.parse(process.env.PLAN),
+              dryRun: process.env.DRY_RUN === "true", repair: process.env.REPAIR === "true" };
+            require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `request=${JSON.stringify(request)}\n`);
+          '
+        env:
+          PLAN: ${{ steps.planned.outputs.plan }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
+          REPAIR: ${{ inputs.repair == true }}
+      - name: Tag the deployed commit and publish its release
+        id: publish
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.publish-request.outcome == 'success' }}
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        with:
+          request: ${{ steps.publish-request.outputs.request }}
+          runs-on-json: '"ubuntu-latest"'
+      - name: Build the publish retry request
+        id: publish-retry-request
+        if: ${{ !cancelled() && steps.publish.outcome == 'failure' }}
+        run: |
+          sleep 20
+          node -e '
+            const dryRun = process.env.DRY_RUN === "true";
+            const request = { phase: "publish", plan: JSON.parse(process.env.PLAN),
+              dryRun, repair: process.env.REPAIR === "true" || !dryRun };
+            require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `request=${JSON.stringify(request)}\n`);
+          '
+        env:
+          PLAN: ${{ steps.planned.outputs.plan }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
+          REPAIR: ${{ inputs.repair == true }}
+      - name: Tag the deployed commit and publish its release (retry)
+        id: publish-retry
+        if: ${{ !cancelled() && steps.publish.outcome == 'failure' && steps.publish-retry-request.outcome == 'success' }}
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        with:
+          request: ${{ steps.publish-retry-request.outputs.request }}
+          runs-on-json: '"ubuntu-latest"'

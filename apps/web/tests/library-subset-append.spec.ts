@@ -438,9 +438,11 @@ test('[SUB-B-10] a filter discloses its hidden-selected count; without one nothi
 	// if) a library filter control lands independently. The queue filter
 	// (#queue-filter-input, "Filter queue") is a searchbox too, so it is
 	// excluded: filling it cannot hide library rows.
-	const candidates = page
+	// Page main only: the app-shell top bar carries its own Search field.
+	const main = page.getByRole('main');
+	const candidates = main
 		.getByRole('searchbox')
-		.or(page.getByLabel(/filter|search/i))
+		.or(main.getByLabel(/filter|search/i))
 		.and(page.locator(':not(#queue-filter-input)'));
 	if ((await candidates.count()) > 0) {
 		const filter = candidates.first();

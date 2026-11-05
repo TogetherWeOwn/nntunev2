@@ -65,7 +65,7 @@
 //! this repo slice: the `TRANSCODE_CONTAINER` service binding, the
 //! `AUDIO_PUBLISH` audio-bucket binding plus the `AUDIO_BUCKET_NAME`
 //! var (a deliberate, documented exception to the "never bind the
-//! audio-cache buckets here" rule in `wrangler.toml.example`, which
+//! audio-cache buckets here" rule in `wrangler.toml`, which
 //! predates the e2e spec's §4.2 publication assignment), and the
 //! deployed Container image + front Worker (both live in-repo under
 //! `containers/transcode` and `workers/transcode`; deploy itself is
@@ -109,7 +109,7 @@ pub const TRANSCODE_CALL_DEADLINE_MS: u64 = 660_000;
 /// R2 binding carrying artifact publication: the environment's audio
 /// bucket (wrangler `[[r2_buckets]]`). A deliberate, documented
 /// exception to the "never bind the audio-cache buckets here" rule in
-/// `wrangler.toml.example`, assigned by the e2e spec's §4.2
+/// `wrangler.toml`, assigned by the e2e spec's §4.2
 /// publication step; the bucket name rides
 /// [`AUDIO_BUCKET_NAME_VAR`].
 pub const AUDIO_PUBLISH_BINDING: &str = "AUDIO_PUBLISH";

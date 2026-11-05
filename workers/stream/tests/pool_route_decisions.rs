@@ -2,9 +2,9 @@
 //!
 //! Pins `decide_pool_action` over method x path x owner-name: wrong method,
 //! unknown path, owner-less right route (refused before any dial), and the
-//! two named-route successes (`POST /probe` -> `RunProbe`,
-//! `POST /body` -> `RunBody`). Every refusal yields `Respond(..)` and never
-//! `RunProbe`/`RunBody`; the three `ProbeDecision` renderings (status/body)
+//! three named-route successes (`POST /probe` -> `RunProbe`,
+//! `POST /body` -> `RunBody`, `POST /delivered` -> `RunDelivered`). Every
+//! refusal yields `Respond(..)` and never `RunProbe`/`RunBody`/`RunDelivered`; the three `ProbeDecision` renderings (status/body)
 //! are pinned so a swapped matrix or a `503 -> 200` mutant turns this suite
 //! red. Pure calls only: no sockets, providers, or Durable Objects.
 
@@ -33,6 +33,12 @@ fn matrix() -> Vec<Cell> {
             has_owner: true,
             expected: PoolAction::RunBody,
         },
+        Cell {
+            method: "POST",
+            path: "/delivered",
+            has_owner: true,
+            expected: PoolAction::RunDelivered,
+        },
         // Owner-less right route: refused before any dial.
         Cell {
             method: "POST",
@@ -43,6 +49,12 @@ fn matrix() -> Vec<Cell> {
         Cell {
             method: "POST",
             path: "/body",
+            has_owner: false,
+            expected: PoolAction::Respond(ProbeDecision::OwnerMissing),
+        },
+        Cell {
+            method: "POST",
+            path: "/delivered",
             has_owner: false,
             expected: PoolAction::Respond(ProbeDecision::OwnerMissing),
         },
@@ -70,6 +82,18 @@ fn matrix() -> Vec<Cell> {
         Cell {
             method: "GET",
             path: "/body",
+            has_owner: false,
+            expected: PoolAction::Respond(ProbeDecision::NotFound),
+        },
+        Cell {
+            method: "GET",
+            path: "/delivered",
+            has_owner: true,
+            expected: PoolAction::Respond(ProbeDecision::NotFound),
+        },
+        Cell {
+            method: "GET",
+            path: "/delivered",
             has_owner: false,
             expected: PoolAction::Respond(ProbeDecision::NotFound),
         },
@@ -130,6 +154,12 @@ fn matrix() -> Vec<Cell> {
         },
         Cell {
             method: "POST",
+            path: "/delivered/",
+            has_owner: true,
+            expected: PoolAction::Respond(ProbeDecision::NotFound),
+        },
+        Cell {
+            method: "POST",
             path: "/PROBE",
             has_owner: true,
             expected: PoolAction::Respond(ProbeDecision::NotFound),
@@ -137,6 +167,12 @@ fn matrix() -> Vec<Cell> {
         Cell {
             method: "POST",
             path: "/BODY",
+            has_owner: true,
+            expected: PoolAction::Respond(ProbeDecision::NotFound),
+        },
+        Cell {
+            method: "POST",
+            path: "/DELIVERED",
             has_owner: true,
             expected: PoolAction::Respond(ProbeDecision::NotFound),
         },
@@ -169,11 +205,15 @@ fn refusals_yield_respond_never_run() {
             ),
             PoolAction::RunProbe => assert_eq!(action, PoolAction::RunProbe),
             PoolAction::RunBody => assert_eq!(action, PoolAction::RunBody),
+            PoolAction::RunDelivered => assert_eq!(action, PoolAction::RunDelivered),
         }
-        // No refusal cell may select either run variant.
+        // No refusal cell may select any run variant.
         if matches!(cell.expected, PoolAction::Respond(_)) {
             assert!(
-                !matches!(action, PoolAction::RunProbe | PoolAction::RunBody),
+                !matches!(
+                    action,
+                    PoolAction::RunProbe | PoolAction::RunBody | PoolAction::RunDelivered
+                ),
                 "{} {} owner={}: refusal must never run",
                 cell.method,
                 cell.path,
@@ -189,7 +229,7 @@ fn owner_less_right_route_is_refused_before_any_dial() {
     // nothing to dial with. Model the gate the adapter must honor: the dial
     // closure panics if it is ever called for a refusal.
     let dial = || panic!("refused request must never dial");
-    for path in ["/probe", "/body"] {
+    for path in ["/probe", "/body", "/delivered"] {
         let action = decide_pool_action("POST", path, false);
         assert_eq!(
             action,
@@ -201,7 +241,7 @@ fn owner_less_right_route_is_refused_before_any_dial() {
                 assert_eq!(decision.status(), 400);
                 assert_eq!(decision.body(), r#"{"error":"bad_request"}"#);
             }
-            PoolAction::RunProbe | PoolAction::RunBody => dial(),
+            PoolAction::RunProbe | PoolAction::RunBody | PoolAction::RunDelivered => dial(),
         }
     }
 }

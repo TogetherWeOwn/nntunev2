@@ -280,6 +280,7 @@ fn handle(body: Vec<u8>) -> handlers::Response {
         dns: &dns,
         now: 1_700_000_000,
         source_ip: "198.51.100.9".to_string(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
     };
     let request = handlers::Request {
         method: "GET".to_string(),
@@ -287,6 +288,7 @@ fn handle(body: Vec<u8>) -> handlers::Response {
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body,
     };
     block_on(handlers::handle(&ctx, &request))
@@ -336,6 +338,7 @@ fn template_request() -> handlers::Request {
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body: canary_body(64),
     }
 }
@@ -354,6 +357,7 @@ fn dispatch_rejection(collected: CollectedBody) -> handlers::Response {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: Some("must-never-appear".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -412,6 +416,7 @@ fn complete_body_still_dispatches_through_the_gate() {
                     body: format!(r#"{{"body_len":{body_len}}}"#),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },

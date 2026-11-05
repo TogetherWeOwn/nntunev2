@@ -1,108 +1,101 @@
-# ADR 0004: Plan Matrix (Base / 5x / 20x)
+# ADR 0004: Plan Matrix (Plus / Pro / Max)
 
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Revised:** 2026-10-15 — concrete cache budgets, atomic stream accounting,
-  payment-conditional trial conversion and bounded renewal settlement.
+- **Revised:** 2026-11-03 — owner product model (TWO-1629): no trial, no free tier,
+  stream-hour caps with hard stop, 1 concurrent stream; ingest/library/cache
+  plan dimensions removed.
 - **Revised:** 2026-10-18 — slice-1 per-play precursor: stream usage accrues in
   `stream_play_ledger` (one row per billed play window, deterministic `play:` keys,
-  monthly folds). The daily `usage_ledger` aggregation (sum daily rows in the UTC
-  calendar month) is built in a later slice by folding these windows; no daily table
-  exists yet and no writer assumes its `(user_id, period)` upsert.
-- **Revised:** 2026-10-18 — enforcement wire: over-cap
-  ingest-write (daily) and library additions refuse `402 plan_limit_exceeded`;
-  concurrent-stream exhaustion refuses `429 rate_limited`, with `x-plan-limit` /
+  monthly folds).
+- **Revised:** 2026-10-18 — enforcement wire: refusals carry `x-plan-limit` /
   `x-plan-reset` headers (`retry-after` on 429) and an `upgrade_url: /pricing`
-  body pointer. Monthly stream-hour exhaustion never refuses: playback past
-  the cap continues at the lower-bitrate degraded mode until the next calendar
-  month (the stream path guards only concurrency). Pure decision in
-  `workers/api/src/plan_limits.rs`; DB wiring (subscriptions + usage reads)
-  follows in a later slice.
+  body pointer. Pure decision in `workers/api/src/plan_limits.rs`; DB wiring
+  (subscriptions + usage reads) follows in a later slice.
 
 ## Context
 
-A base paid tier and 5x / 20x stream allowances cover different usage levels.
-NNTune never bundles Usenet access (BYOP): plans cover our service, not a
-provider account. Prices are launch proposals for infrastructure cost recovery,
-not a claim of revenue or permission to activate live billing.
+NNTune is an invite-only curated collection: playback is paywalled, and the
+only differentiator between plans is stream hours per month. Every plan gets
+the full catalogue, FLAC playback, YouTube fallback + music video, and
+1 concurrent stream. Prices are launch proposals for infrastructure cost
+recovery, not a claim of revenue or permission to activate live billing.
 
 ## Decision
 
-| Plan | USD/mo | Stream hrs/mo | Concurrent streams | Library tracks | Ingest jobs/day | Cache budget (GiB) | Cache retention (days) | Cache priority |
-|---|---|---|---|---|---|---|---|---|
-| Free (trial, 14d) | $0 | 10 | 1 | 1,000 | 5 | 2 | 7 | low |
-| Plus | $8 | 100 | 2 | 25,000 | 25 | 20 | 30 | standard |
-| Pro 5x | $30 | 500 | 4 | 100,000 | 100 | 100 | 90 | high |
-| Pro 20x | $100 | 2,000 | 8 | 500,000 | 400 | 400 | 90 | highest |
+| Plan | USD/mo | Stream hrs/mo | Concurrent streams |
+|---|---|---|---|
+| Free (reserved, non-selectable) | $0 | 0 | 1 |
+| Plus | $8 | 100 | 1 |
+| Pro | $15 | 300 | 1 |
+| Max | $25 | 750 | 1 |
 
-Store `cache_bytes_budget` as an integer number of bytes: GiB means
-1,073,741,824 bytes, so the four budgets are 2,147,483,648; 21,474,836,480;
-107,374,182,400; and 429,496,729,600. `cache_retention_days` and
-`cache_priority` are separate plan columns. These are reclaimable server-side
-cache allowances, not durable storage promises.
+Three paid plans. No free tier, no trial. The `free` plan id is retained as
+a reserved, non-selectable row (0 h) so "unknown plan fails closed" logic and
+a future free tier have somewhere to land; it confers no playback. 750 h is
+the physical ceiling for 1 concurrent stream (31 days × 24 h = 744 h); Max
+may be marketed as "unlimited listening" but the stored cap stays 750 so the
+meter, abuse detection, and cost model keep a real bound, and copy must not
+promise "unlimited" without the 750 h figure available on the pricing page.
+
+Dropped plan dimensions: library-track cap, ingest-jobs/day cap, per-user
+cache budget/retention/priority (superseded by the shared popularity cache).
+Library size and playlist counts are uncapped at launch (metadata only;
+revisit only on measured abuse). User ingest keeps a fixed, non-plan daily
+rate-limit constant until the user-ingest retirement removes that path; it is
+never silently uncapped by a billing change.
+
+Monthly billing only at launch. Prices are **proposals only**: before any
+live activation, a `Money:` owner card must carry a per-hour cost estimate
+and confirm prices there. Nothing here authorises live billing.
 
 ### Measurement and enforcement
 
 | Dimension | Authority and writer | Aggregation / enforcement |
 |---|---|---|
-| Stream hours | Stream worker inserts immutable `(event_id, played_at)` events and increments `usage_ledger.stream_seconds` from inserted rows in the **same transaction** (ADR 0002) | Sum daily rows in the UTC calendar month; cached plays count equally; duplicate delivery adds zero |
-| Ingest jobs | API accept transaction inserts `ingest_jobs` and increments `usage_ledger.ingest_jobs` once per idempotency key | Current UTC day's row; queue retries do not count as new jobs |
-| Cache bytes | Live join of `user_cache_grants` with `cache_objects.byte_size`; stream publication / GC change the grants | Gauge, never a monthly sum: count each hash once per user; compare with `plans.cache_bytes_budget` |
-| Library tracks | `library_tracks` written at ingest `write` stage and on library edits | Count distinct tracks across that user's libraries |
-| Concurrent streams | Per-user pool Durable Object owns active leases | Enforce at acquisition; release on completion/disconnect and expire abandoned leases |
+| Stream hours | Stream worker play windows in `stream_play_ledger` (deterministic `play:` keys; seconds from delivered bytes at the track's mean byte rate) | Fold of play windows for the UTC `period_month`; cached plays count equally; YouTube-sourced playback excluded; duplicate delivery adds zero |
+| Concurrent streams | Per-user lease at grant issuance in the API worker | Enforce at acquisition (1 per user); release on completion/disconnect and expire abandoned leases |
 
-`usage_ledger` stores **flows only** (stream seconds and accepted job counts).
-It has no `cache_bytes` field. Analytics Engine is sampled observability, never
-an enforcement or billing authority. A shared object counts in each granted
-user's gauge, but only once for that user even if several tracks reference it.
-ADR 0003 defines eviction and the grant deletion order.
+Monthly usage for enforcement/display = the indexed `SUM(user, period_month)`
+over `stream_play_ledger` — the single authority. There is no daily fold
+table. Analytics Engine is sampled observability, never an enforcement or
+billing authority.
 
-**Overage:** no usage-based bill. Stream-hour exhaustion uses the advertised
-lower-bitrate degraded mode until the next calendar month; it does not bypass
-concurrency, trial expiry or the payment gate. Cache pressure evicts least-recently
-served grants within the plan budget; tracks and refetch sources remain. Library
-and daily ingest limits reject new additions/jobs without deleting existing data.
-A downgrade preserves library metadata, blocks additions over the new limit, and
-makes excess cache grants eligible for eviction.
+**Overage:** no usage-based bill. When monthly usage reaches the cap,
+starting any new playback is refused `402 plan_limit_exceeded` (hard stop,
+no degraded mode); a track already playing plays to its end, and seeking
+within it stays allowed. Upgrading mid-month lifts the stop as soon as the
+higher plan is payment-confirmed; usage carries over and never resets on a
+plan change. A downgrade applies at renewal; if month-to-date usage already
+exceeds the new cap when it takes effect, playback stops until the UTC reset.
 
-**Enforcement wire (2026-10-18):** at the API boundary, new acquisition over
-cap is refused: daily ingest jobs and library tracks refuse with
-`402 plan_limit_exceeded` (`retryable: false`); concurrent-stream exhaustion
-refuses with `429 rate_limited` (`retryable: true` plus `Retry-After`).
-Every refusal carries `x-plan-limit` / `x-plan-reset` headers and an
+**Enforcement wire:** refusals are the subscription gate (no active paid
+coverage → paywall), the hour cap (402 above), and concurrency
+(`429 rate_limited`, `retryable: true` plus `Retry-After`). Every refusal
+carries `x-plan-limit` / `x-plan-reset` headers and an
 `upgrade_url: /pricing` body pointer, names-only with no PII, and never a
-500. Monthly stream-hour exhaustion never refuses: playback past the cap
-continues at the lower-bitrate degraded mode above until the next calendar
-month (the stream path guards only concurrency). Checks are `>=` (at-cap
-denies); unknown plan ids fail closed to the free caps.
+500. Checks are `>=` (at-cap denies); unknown plan ids fail closed to the
+reserved 0-hour `free` row (no playback).
 
-### Trial and payment gate
+### Payment gate
 
-Free is a **single 14-day Stripe-native trial**, not a forever tier. ADR 0005 is
-the normative lifecycle: a real Stripe subscription id precedes entitlement;
-there is no provisional `trialing` DB row with a NULL Stripe id.
+There is no trial and no free tier. Browsing the catalogue, search,
+library/playlist management, and account pages work without an active
+subscription; only **playback** is paywalled. The first purchase goes through
+Stripe Checkout Sessions (`mode=subscription`); ADR 0005 is the normative
+lifecycle: a real Stripe subscription id precedes entitlement, and paid caps
+require a price resolved through the environment's relational `plan_prices`
+mapping plus confirmed paid invoice coverage — not a redirect. The gate is
+evaluated server-side at signed-grant issuance in the API worker.
 
-- The trial subscription uses the $0 trial price, `trial_end`,
-  `trial_settings.end_behavior.missing_payment_method = cancel`, and
-  `cancel_at_period_end = true`. Its single item's period end must equal
-  `trial_end`. The scheduled cancellation applies **with or without a card**;
-  saving a payment method is not selecting a paid plan.
-- Trial caps apply only while `status='trialing' AND now() < trial_end`.
-  `active` on the free price is never entitled. A late webhook therefore
-  cannot extend free access. After expiry the result is a hard paywall.
-- A paid choice submits a `pending_if_incomplete` update of the **same** Stripe
-  subscription/item, ending the trial only on successful payment. Unpaid or
-  abandoned confirmation preserves the original trial deadline/cancellation;
-  the pending invoice expires within Stripe's bounded window (ADR 0005). It
-  never creates a competing subscription. Paid caps require consent, a price
-  resolved through the environment's relational `plan_prices` mapping, and
-  confirmed paid invoice coverage, not a redirect or the $0 trial invoice.
-- Active paid renewals retain the last confirmed plan/cache budget for the fixed
-  **3-hour settlement allowance** in ADR 0002, excluding scheduled cancellation.
-  Only failed **renewals of an already paid subscription** get seven days of
-  grace. No first-payment allowance or paid access. Neither deadline slides on
-  retries or permits a second billable subscription.
-- Trial requires a BYOP provider. Resubscription does not reset trial history.
+- Active paid renewals retain the last confirmed plan for the fixed
+  **3-hour settlement allowance** in ADR 0002, excluding scheduled
+  cancellation. Only failed **renewals of an already paid subscription** get
+  seven days of grace. No first-payment allowance or paid access. Neither
+  deadline slides on retries or permits a second billable subscription.
+- Cancellation is `cancel_at_period_end` self-serve via the billing portal;
+  access runs until `paid_through_at`, then lapses. Resubscription reuses the
+  confirmed-terminal-then-create path (ADR 0005).
 
 Prices and quotas are plan data, not code. Changes to advertised prices still
 need the normal product/billing review; data-driven configuration is not
@@ -113,11 +106,10 @@ permission to change existing customer commitments.
 - Cap and entitlement decisions read fresh authoritative state via Hyperdrive;
   connection pooling is not permission to serve stale revocations or counters.
   The effective plan is derived, never copied to `users.plan_id` (ADR 0002).
-- Ingest is already merged: its Analytics Engine-only metering needs an additive
-  implementation follow-up for the idempotent `ingest_jobs` accept transaction
-  and daily ledger. This document does not claim that writer exists today.
-- Stream/cache follow-up implements the live gauge, retention and byte budgets;
-  frontend billing displays the same values and the trial/payment states.
-- Acceptance must cover two users sharing a hash, multiple mappings for one
-  user's hash, downgrade eviction, a month boundary (no sum of cache snapshots),
-  duplicate queue delivery, and every trial/payment case in ADR 0005.
+  The API gate reads the `plans` row (a missing row fails closed to the
+  reserved 0-hour `free`); the `PlanId` enum caps remain as the parity-test
+  mirror of this table.
+- Frontend billing displays the same values and the payment states.
+- Acceptance must cover the plan table parity (ADR ↔ seed ↔ enum caps), the
+  at-cap hard stop, unknown-plan fail-closed, a month boundary, duplicate
+  queue delivery, and every payment case in ADR 0005 (see TWO-1632 §10).
