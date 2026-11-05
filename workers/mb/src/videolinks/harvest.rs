@@ -1,16 +1,22 @@
-//! Bounded read-only candidate pages from the CC0 MusicBrainz mirror.
+//! Bounded candidate pages from the CC0 MusicBrainz mirror and app admission.
 //!
-//! No live source API, app-side write, route or schedule is activated here.
-//! A cursor belongs to an unchanged recording selection and mirror snapshot;
-//! callers must restart after an import and admit pages idempotently.
+//! No live source API, route or schedule is activated here. A cursor belongs
+//! to an unchanged recording selection and mirror snapshot; callers must
+//! restart after an import and admit pages idempotently.
 
+use super::storage::PgCandidateStore;
 use super::{canonical_mbid, dedupe_candidates, extract_video_id, Candidate, VideoSource};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::task::Poll;
+use std::time::Duration;
 use tokio_postgres::Client;
 
 pub const MAX_RECORDINGS_PER_HARVEST: usize = 50;
 pub const MAX_MIRROR_ROWS_PER_PAGE: usize = 200;
+pub const MAX_MIRROR_PAGES_PER_RUN: usize = 4;
 const MAX_SOURCE_URL_BYTES: usize = 2048;
+const HARVEST_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarvestError {
@@ -31,6 +37,109 @@ pub struct MirrorPage {
     pub candidates: Vec<Candidate>,
     pub scanned_rows: usize,
     pub next_cursor: Option<MirrorCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorHarvestError {
+    InvalidInput,
+    Mirror,
+    Admission,
+    Deadline,
+}
+
+/// Counts acknowledge committed pages only; changed rows are inserts/provenance
+/// upgrades, not coverage or distinct candidates across the whole scan.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MirrorHarvestReport {
+    pub committed_pages: usize,
+    pub scanned_rows: usize,
+    pub candidate_pairs: usize,
+    pub changed_rows: u64,
+    pub next_cursor: Option<MirrorCursor>,
+    pub complete: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MirrorHarvestFailure {
+    pub error: MirrorHarvestError,
+    pub progress: MirrorHarvestReport,
+}
+
+/// Admit up to four mirror pages (800 raw edges) for one fixed selection. The
+/// caller supplies separate mirror/app connections; neither is opened here.
+/// Only advance the checkpoint after the app transaction acknowledges commit,
+/// including when a raw page has no usable candidates. No retries in this run.
+///
+/// On failure, resume from `progress.next_cursor` with the SAME selection and
+/// unchanged mirror snapshot, or restart idempotently after an import. A failed
+/// or cancelled commit can have an unknown outcome: replay is safe, not exactly
+/// once. `complete` distinguishes exhaustion from a start cursor of `None`.
+/// The checkpoint is caller-owned, not durable until the caller saves it.
+pub async fn admit_mirror_pages(
+    source: &mut PgMirrorSource<'_>,
+    store: &mut PgCandidateStore<'_>,
+    recording_mbids: &[String],
+    after: Option<&MirrorCursor>,
+) -> Result<MirrorHarvestReport, MirrorHarvestFailure> {
+    let (mbids, after) =
+        checked_selection(recording_mbids, after).map_err(|_| MirrorHarvestFailure {
+            error: MirrorHarvestError::InvalidInput,
+            progress: MirrorHarvestReport::default(),
+        })?;
+    let mut progress = MirrorHarvestReport {
+        next_cursor: after,
+        ..MirrorHarvestReport::default()
+    };
+    let result = harvest_deadline(HARVEST_DEADLINE, async {
+        if mbids.is_empty() {
+            progress.complete = true;
+            return Ok(());
+        }
+        for _ in 0..MAX_MIRROR_PAGES_PER_RUN {
+            let page = source
+                .candidate_page(&mbids, progress.next_cursor.as_ref())
+                .await
+                .map_err(|_| MirrorHarvestError::Mirror)?;
+            let changed_rows = store
+                .admit_external_candidates(&page.candidates)
+                .await
+                .map_err(|_| MirrorHarvestError::Admission)?;
+            progress.committed_pages += 1;
+            progress.scanned_rows += page.scanned_rows;
+            progress.candidate_pairs += page.candidates.len();
+            progress.changed_rows += changed_rows;
+            progress.next_cursor = page.next_cursor;
+            if progress.next_cursor.is_none() {
+                progress.complete = true;
+                break;
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(()) => Ok(progress),
+        Err(error) => Err(MirrorHarvestFailure { error, progress }),
+    }
+}
+
+async fn harvest_deadline<T>(
+    budget: Duration,
+    operation: impl Future<Output = Result<T, MirrorHarvestError>>,
+) -> Result<T, MirrorHarvestError> {
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(budget);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(budget);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut operation = std::pin::pin!(operation);
+    std::future::poll_fn(|cx| {
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(MirrorHarvestError::Deadline));
+        }
+        operation.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Reads W6b's public mirror tables only. The caller connects/drives the mirror
@@ -198,6 +307,35 @@ mod tests {
             },
             url,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn deadline_drops_pending_work_and_retains_acknowledged_progress() {
+        struct DropGuard<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for DropGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = std::cell::Cell::new(false);
+        let mut progress = MirrorHarvestReport::default();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(harvest_deadline(Duration::from_millis(5), async {
+                let _guard = DropGuard(&dropped);
+                progress.committed_pages = 1;
+                progress.scanned_rows = MAX_MIRROR_ROWS_PER_PAGE;
+                progress.next_cursor = Some(edge(199, None).key);
+                std::future::pending::<Result<(), MirrorHarvestError>>().await
+            }));
+        assert_eq!(result, Err(MirrorHarvestError::Deadline));
+        assert!(dropped.get());
+        assert_eq!(progress.committed_pages, 1);
+        assert_eq!(progress.next_cursor, Some(edge(199, None).key));
+        assert!(!progress.complete);
     }
 
     #[test]

@@ -13,8 +13,9 @@ runner** and an **app-side PostgreSQL store adapter**, not an activated
 curation service. `validation/http.rs` supplies an inactive Worker HTTP
 client requiring a runtime Secret. `storage.rs` supplies bounded external
 candidate admission and fresh-link database reads. `harvest.rs` supplies a
-read-only paged MusicBrainz mirror source. No route, schedule or database
-binding calls these adapters yet.
+read-only paged MusicBrainz mirror source and a bounded runner that admits
+its pages into the app store. No route, schedule or database binding calls
+these adapters yet.
 
 `refresh_due` purges expired API-returned fields before contacting the
 validation client, requests at most 200 distinct IDs in four 50-ID batches,
@@ -145,9 +146,46 @@ Three native fixtures cover selection/cursor policy, invalid-page progress,
 lookahead, deduplication and URL bounds. The existing disposable PostgreSQL
 contract adds actual reader SQL against minimal W6b reader-column fixtures
 (not a full mirror migration/apply), symmetric pairing, non-video exclusion,
-pagination/replay across recordings and lock timeout/recovery. Execution of
-this source increment awaits exact-head Actions; no local test or live
-source verification is claimed.
+pagination/replay across recordings and lock timeout/recovery. The
+[MB Rust](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42015850006/job/127206647588)
+and [PostgreSQL](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42015850006/job/127206647282)
+jobs passed at `1a0122a0fdabb4b4eee9fc134eff19061009df74`. This is reader
+fixture evidence, not a full mirror apply or live source verification.
+
+### Mirror-to-app admission boundary
+
+`admit_mirror_pages` connects the two adapters when explicitly called with
+separate mirror/app connections. One invocation reads at most four pages
+(800 raw edges plus page lookaheads), under a 20-second total deadline.
+Each page's candidates are admitted atomically; an empty candidate page
+still advances on its raw edges. It never calls YouTube or validates an ID.
+
+Reports carry acknowledged page/raw-edge/candidate counts, changed app rows,
+a resume cursor and an explicit completion flag. Candidate counts are
+page-local sums, not whole-scan unique counts or coverage. The resume cursor
+advances **only after admission succeeds**. A source/write failure or
+deadline returns earlier progress and does not retry in the invocation;
+earlier commits survive. A failed/cancelled commit can have an unknown
+outcome, so replay is deliberately idempotent rather than exactly-once.
+Dropping the waiter is not a guarantee of server-side cancellation; the
+adapters retain their 1.5-second statement timeouts.
+
+The caller owns persisting the checkpoint and retaining the same recording
+selection and unchanged mirror snapshot; separate page transactions do not
+establish a snapshot. Restart idempotently after an import. There is no
+runtime binding, schedule, durable scan queue or automatic restart policy
+yet, and the runner is not activated by adding it to the module. No schema,
+dependency, workflow, credential, route or deployment changes accompany it.
+
+A native deadline fixture checks cancellation and retained progress. The
+expanded disposable-PostgreSQL contract covers four-page bounds plus a
+final page, duplicate relations and symmetric pairs across page boundaries,
+an invalid-only first page, idempotent replay, source timeout and a later
+atomic admission failure with earlier commits retained and cursor-based
+recovery. The two test connections share the disposable database only to
+supply both fixtures; that is not evidence of deployed connection isolation.
+Execution of this runner increment awaits exact-head Actions; no local
+test/build or live verification is claimed.
 
 ### PostgreSQL acceptance boundary
 
@@ -177,9 +215,9 @@ checkout or changing workspace membership.
 
 Still required before feature acceptance:
 
-- Wire the mirror reader, remaining source readers, the runner's app-side
-  connection and a bounded schedule. Keep the real PostgreSQL acceptance
-  target green at each head.
+- Wire the mirror admission runner, remaining source readers, app-side
+  connections and a bounded schedule with durable checkpoints. Keep the real
+  PostgreSQL acceptance target green at each head.
 - Exercise the inactive HTTP adapter in the Worker runtime: fixed official
   HTTPS endpoint, no redirects, capped streaming body, cancellation on drop
   and sanitized failures. Native policy fixtures do not prove live fetch or

@@ -2,7 +2,8 @@
 //! Explicit feature/config required; never a live API request or staging apply.
 
 use nntune_mb::videolinks::harvest::{
-    HarvestError, MirrorCursor, PgMirrorSource, MAX_MIRROR_ROWS_PER_PAGE,
+    admit_mirror_pages, HarvestError, MirrorCursor, MirrorHarvestError, PgMirrorSource,
+    MAX_MIRROR_PAGES_PER_RUN, MAX_MIRROR_ROWS_PER_PAGE,
 };
 use nntune_mb::videolinks::storage::{
     CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
@@ -891,6 +892,44 @@ async fn mirror_harvest_contract(db: &mut Client, config: &Config) {
         Err(HarvestError::Store)
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+    let mut app = connect(config).await;
+    let failure = admit_mirror_pages(
+        &mut PgMirrorSource::new(db),
+        &mut PgCandidateStore::new(&mut app),
+        &selected,
+        first.next_cursor.as_ref(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure.error, MirrorHarvestError::Mirror);
+    assert_eq!(failure.progress.committed_pages, 0);
+    assert_eq!(failure.progress.next_cursor, first.next_cursor);
+    assert!(!failure.progress.complete);
+    assert!(states(&app).await.is_empty());
+    // Empty/invalid selections never touch the locked source or app tables.
+    assert!(
+        admit_mirror_pages(
+            &mut PgMirrorSource::new(db),
+            &mut PgCandidateStore::new(&mut app),
+            &[],
+            None,
+        )
+        .await
+        .unwrap()
+        .complete
+    );
+    assert_eq!(
+        admit_mirror_pages(
+            &mut PgMirrorSource::new(db),
+            &mut PgCandidateStore::new(&mut app),
+            &["invalid".into()],
+            None,
+        )
+        .await
+        .unwrap_err()
+        .error,
+        MirrorHarvestError::InvalidInput
+    );
     lock.rollback().await.unwrap();
     assert_eq!(
         PgMirrorSource::new(db)
@@ -899,6 +938,127 @@ async fn mirror_harvest_contract(db: &mut Client, config: &Config) {
             .unwrap(),
         first
     );
+}
+
+async fn mirror_admission_contract(db: &mut Client, config: &Config) {
+    reset_candidates(db).await;
+    db.batch_execute(
+        "DELETE FROM public.mb_recording_music_video;
+         DELETE FROM public.mb_recording_url;
+         DELETE FROM public.mb_url;
+         INSERT INTO public.mb_url
+         SELECT ('10000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+                CASE WHEN i <= 200 THEN 'https://other.example.test/not-a-video'
+                     ELSE 'https://youtu.be/v' || lpad(i::text, 10, '0') END
+         FROM generate_series(1, 403) AS i;
+         INSERT INTO public.mb_recording_url
+         SELECT '00000000-0000-0000-0000-000000000001', mbid, label, true
+         FROM public.mb_url CROSS JOIN unnest(ARRAY['stream', 'duplicate']) AS label;
+         INSERT INTO public.mb_recording_music_video VALUES (
+             '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002')",
+    )
+    .await
+    .unwrap();
+    let a = "00000000-0000-0000-0000-000000000001".to_owned();
+    let b = "00000000-0000-0000-0000-000000000002".to_owned();
+    let selected = [b.clone(), a.clone(), a.clone()];
+    let mut mirror = connect(config).await;
+    let first = admit_mirror_pages(
+        &mut PgMirrorSource::new(&mut mirror),
+        &mut PgCandidateStore::new(db),
+        &selected,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.committed_pages, MAX_MIRROR_PAGES_PER_RUN);
+    assert_eq!(first.scanned_rows, 800);
+    assert_eq!(first.candidate_pairs, 400);
+    assert_eq!(first.changed_rows, 400);
+    assert!(!first.complete);
+    assert_eq!(
+        first.next_cursor,
+        Some(MirrorCursor {
+            recording_mbid: b.clone(),
+            url_mbid: "10000000-0000-0000-0000-000000000397".into(),
+        })
+    );
+    let last = admit_mirror_pages(
+        &mut PgMirrorSource::new(&mut mirror),
+        &mut PgCandidateStore::new(db),
+        &selected,
+        first.next_cursor.as_ref(),
+    )
+    .await
+    .unwrap();
+    assert!(last.complete);
+    assert_eq!(last.next_cursor, None);
+    assert_eq!(last.committed_pages, 1);
+    assert_eq!(last.scanned_rows, 6);
+    assert_eq!(last.candidate_pairs, 6);
+    assert_eq!(last.changed_rows, 6);
+    assert_eq!(states(db).await.len(), 406);
+    let replay = admit_mirror_pages(
+        &mut PgMirrorSource::new(&mut mirror),
+        &mut PgCandidateStore::new(db),
+        &selected,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.changed_rows, 0);
+    assert_eq!(replay.next_cursor, first.next_cursor);
+    assert_eq!(states(db).await.len(), 406);
+
+    reset_candidates(db).await;
+    db.batch_execute(
+        "ALTER TABLE public.video_link_candidates ADD CONSTRAINT fail_paired_admission
+         CHECK (recording_mbid <> '00000000-0000-0000-0000-000000000002'::uuid)",
+    )
+    .await
+    .unwrap();
+    let failure = admit_mirror_pages(
+        &mut PgMirrorSource::new(&mut mirror),
+        &mut PgCandidateStore::new(db),
+        &selected,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure.error, MirrorHarvestError::Admission);
+    assert_eq!(failure.progress.committed_pages, 3);
+    assert_eq!(failure.progress.scanned_rows, 600);
+    assert_eq!(failure.progress.candidate_pairs, 203);
+    assert_eq!(failure.progress.changed_rows, 203);
+    assert!(!failure.progress.complete);
+    assert_eq!(
+        failure.progress.next_cursor,
+        Some(MirrorCursor {
+            recording_mbid: b,
+            url_mbid: "10000000-0000-0000-0000-000000000197".into(),
+        })
+    );
+    let rows = states(db).await;
+    assert_eq!(rows.len(), 203, "earlier app commits survive a failed page");
+    assert!(rows.iter().all(|(_, status, _, _, _)| status == "pending"));
+    db.batch_execute(
+        "ALTER TABLE public.video_link_candidates DROP CONSTRAINT fail_paired_admission",
+    )
+    .await
+    .unwrap();
+    let resumed = admit_mirror_pages(
+        &mut PgMirrorSource::new(&mut mirror),
+        &mut PgCandidateStore::new(db),
+        &selected,
+        failure.progress.next_cursor.as_ref(),
+    )
+    .await
+    .unwrap();
+    assert!(resumed.complete);
+    assert_eq!(resumed.committed_pages, 2);
+    assert_eq!(resumed.scanned_rows, 206);
+    assert_eq!(resumed.changed_rows, 203);
+    assert_eq!(states(db).await.len(), 406);
 }
 
 #[test]
@@ -939,6 +1099,7 @@ fn postgres_validation_store_contract() {
                 candidate_admission_contract(&mut db).await;
                 fresh_link_read_contract(&mut db).await;
                 mirror_harvest_contract(&mut db, &config).await;
+                mirror_admission_contract(&mut db, &config).await;
             })
             .await
             .expect("bounded PostgreSQL acceptance");
