@@ -1,10 +1,10 @@
-//! Off-route catalogue/account supplier. Inherent methods only until the shared
-//! async library lands; no second reader, HTTP writer or delivered-byte meter.
+//! Off-route catalogue/account supplier for the shared async reader. No second
+//! reader, HTTP writer or delivered-byte meter is implemented here.
 
 use std::{future::Future, task::Poll};
 
 use futures_util::{future::Shared, FutureExt};
-use nntune_core::original_source::{OriginalSource, SourceError};
+use nntune_core::original_source::{reader::AsyncArticleSource, OriginalSource, SourceError};
 
 use super::{control::RequestControl, control::Signal, OriginalCatalogue};
 use crate::{
@@ -143,6 +143,12 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
             .await?;
         self.serving_accounts.push(provider_id);
         Ok(bytes)
+    }
+}
+
+impl<R: RegistrySource, A: AccountSource> AsyncArticleSource for ArticleSupplier<'_, R, A> {
+    async fn open(&mut self, index: usize, reference: &str) -> Result<Vec<u8>, SourceError> {
+        ArticleSupplier::open(self, index, reference).await
     }
 }
 

@@ -1,6 +1,6 @@
 //! Shared request authority for the off-route article supplier and response
-//! control. No async reader/response traits are duplicated here: their reviewed
-//! library landing can forward to these inherent methods. No runtime caller.
+//! control. The shared reader/response traits forward to this same authority;
+//! no second clock, timer or cancellation state is constructed. No runtime caller.
 
 use std::{
     cell::{Cell, RefCell},
@@ -11,7 +11,11 @@ use std::{
 };
 
 use futures_util::{future::Shared, FutureExt};
-use nntune_core::original_source::{canonical_track_id, reader::ReadControl, SourceError};
+use nntune_core::original_source::{
+    canonical_track_id,
+    reader::{AsyncReadControl, ReadControl},
+    SourceError,
+};
 
 use crate::grant;
 
@@ -147,7 +151,7 @@ impl<'a> RequestControl<'a> {
         Ok(())
     }
 
-    /// Inherent forwarding seam for the separately owned AsyncReadControl.
+    /// Shared implementation behind the reader/response cancellation seam.
     /// Signals win ties, are never re-polled after completion, and are checked
     /// alongside the clock even if one pending signal advances it while polled.
     pub fn poll_cancel(&self, cx: &mut Context<'_>) -> Poll<SourceError> {
@@ -202,6 +206,18 @@ impl<'a> RequestControl<'a> {
 impl ReadControl for RequestControl<'_> {
     fn check(&mut self) -> Result<(), SourceError> {
         self.check_live()
+    }
+}
+
+impl AsyncReadControl for RequestControl<'_> {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
+        RequestControl::poll_cancel(self, cx)
+    }
+}
+
+impl crate::original_play::OriginalControl for RequestControl<'_> {
+    fn now_unix(&self) -> u64 {
+        RequestControl::now_unix(self)
     }
 }
 

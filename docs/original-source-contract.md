@@ -205,14 +205,14 @@ I/O and does not revoke authority. `check` is a synchronous boundary check;
 `poll_cancel` supplies the wakeable seam. `now_unix` returns the last checked
 clock observation and must only be used after checking authority.
 
-This preparation implements the existing `ReadControl` only. Its inherent
-`poll_cancel` and `now_unix` methods are intended for thin forwarding after the
-separately reviewed async source/control library lands; no draft traits or
-competing reader/response implementation are copied here. No account supplier,
-source lookup, HTTP driver or runtime caller is installed by this primitive.
-A future supplier must still bind source index/reference to its validated
-catalogue and enforce its own at-most-20-second operation timer. Local revocation
-never proves physical account closure, releases capacity or records delivery.
+This authority implements the shared `ReadControl`, `AsyncReadControl` and
+`OriginalControl` traits. Async cancellation and observed time forward directly
+to its inherent methods: the supplier and response use clones of the SAME
+checked authority, not another clock watermark, request timer or cancellation
+controller. The supplier still binds source index/reference to its validated
+catalogue and enforces its own at-most-20-second operation timer. No runtime
+caller is installed by this forwarding. Local revocation never proves physical
+account closure, releases capacity or records delivery.
 
 ## Catalogue/account article supplier (off-route)
 
@@ -241,12 +241,14 @@ open yields a bounded encoded article, not verified media. Successful serving
 identities (including proof articles) are internal telemetry only: no public
 metadata, cache authority, entitlement or delivered-byte meter is created.
 
-These are inherent methods, not a copied async trait or another range reader.
-Thin forwarding to the separately reviewed async library remains to be added
-once that library lands. There is no Worker supplier/timer installation, HTTP
-response, writer, public caller or newly enabled route in this increment. Native
-generated fixtures do not qualify actual Worker abort, timers or physical close;
-dialing/ingress gates, full-slice security and curated staging remain mandatory.
+`AsyncArticleSource::open` forwards directly to this same inherent operation.
+It can feed the shared `AsyncRangeReader` and off-route `OriginalPlay` response
+without a second reader, writer or meter. The request control passed to that
+response must be a clone of the supplier's already checked authority. There is
+no Worker supplier/timer installation, public caller or newly enabled route in
+this increment. Native generated fixtures do not qualify actual Worker abort,
+timers or physical close; dialing/ingress gates, full-slice security and curated
+staging remain mandatory.
 
 ## Internal catalogue transport (off-route)
 
