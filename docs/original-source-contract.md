@@ -225,12 +225,23 @@ means sink acceptance, not proof of remote TCP receipt. The caller must return
 the response concurrently with pumping, provide a wakeable request/grant control
 and persist delivered reports; no public runtime caller or account supplier is installed.
 
-`prepare_owned` uses the same checked response plan as `prepare`, but takes
-ownership of the validated source. Its `OwnedOriginalPlay::pump` constructs the
-single shared reader inside the enclosing task rather than borrowing the fetch
-handler's stack or resolving/cloning the source a second time. It uses the same
-writer guard and acknowledged-prefix settlement, including unpolled-task drop.
-Expiry is rechecked on first output work after scheduling.
+`prepare_owned` uses the same checked response plan as `prepare`, but retains
+an immutable `Rc<OriginalSource>`. It accepts either a validated source value
+(allocated once) or the supplier's existing request-local `Rc` (no deep clone or
+second lookup). Its `OwnedOriginalPlay::pump` constructs the single shared reader
+inside the enclosing task. `pump_owned` also retains the transport, request
+control and delivered sink, installing the writer abort guard **before** the
+scheduler wraps the future. Even an unpolled task drop therefore aborts the
+writer with no article/write/close I/O or interval. Both entry points use the
+same pump and acknowledged-prefix settlement; expiry is rechecked on first
+output work after scheduling.
+
+Shared source ownership does not make borrowed pool inputs static. The existing
+pool owner must still supply owned registry/accounts/channel keys/clock/signals
+and operation timer, retaining the same request authority through task cleanup.
+Synthetic retained-input fixtures cover source-allocation retention, refusal
+release, unpolled drop and pending article/write/close drop/cancellation with one
+ACK-prefix interval. They are not production pool-task or actual Worker proof.
 
 The off-route wasm `schedule_response` creates the fixed-length channel, moves
 the source/supplier/control/writer into a `Context::wait_until` task, and returns

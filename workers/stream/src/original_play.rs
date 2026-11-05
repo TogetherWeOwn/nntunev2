@@ -9,6 +9,7 @@
 use std::{
     future::{poll_fn, Future},
     pin::pin,
+    rc::Rc,
     task::{Context, Poll},
 };
 
@@ -167,12 +168,16 @@ impl OriginalAuthorization {
     /// Prepare a response whose source can move into a request-lifetime task.
     /// No article is opened until its pump is polled. Metadata and range checks
     /// are shared with the borrowed response, not repeated after scheduling.
+    /// Accept a source value or the supplier's existing request-local `Rc`:
+    /// sharing preserves the validated allocation without a deep clone/relookup.
+    /// Transport and control dependencies must still be owned by the task.
     pub fn prepare_owned<C: OriginalControl>(
         self,
-        source: OriginalSource,
+        source: impl Into<Rc<OriginalSource>>,
         range_header: Option<&str>,
         control: &mut C,
     ) -> Result<OwnedOriginalPlay, PlayRouteRefusal> {
+        let source = source.into();
         let plan = self.plan(&source, range_header, control)?;
         Ok(OwnedOriginalPlay { source, plan })
     }
@@ -257,11 +262,11 @@ impl OriginalPlan {
     }
 }
 
-/// Owned source and checked response plan; no self-referential reader or
-/// second source lookup. Move this into a task after returning its channel.
-/// Dropping an unstarted plan performs no I/O and reports no delivery.
+/// Retained immutable source and checked response plan; no self-referential
+/// reader or second source lookup. Move this into a task after returning its
+/// channel. Dropping an unstarted plan performs no I/O and reports no delivery.
 pub struct OwnedOriginalPlay {
-    source: OriginalSource,
+    source: Rc<OriginalSource>,
     plan: OriginalPlan,
 }
 
@@ -293,17 +298,60 @@ impl OwnedOriginalPlay {
         C: OriginalControl + 'p,
         W: OriginalWriter + 'p,
     {
+        self.pump_guard(
+            transport,
+            control,
+            sink,
+            ResponseWriter {
+                inner: writer,
+                closed: false,
+            },
+        )
+    }
+
+    /// Retain every request input before scheduling, including an abort guard
+    /// for an unpolled task. Shared source ownership alone is not sufficient:
+    /// callers must supply owned transport/control dependencies for a static task.
+    pub fn pump_owned<T, C, W, S>(
+        self,
+        mut transport: T,
+        mut control: C,
+        mut sink: S,
+        writer: W,
+    ) -> impl Future<Output = Result<(), SourceError>>
+    where
+        T: AsyncArticleSource,
+        C: OriginalControl,
+        W: OriginalWriter,
+        S: DeliveredSink,
+    {
         let writer = ResponseWriter {
             inner: writer,
             closed: false,
         };
         async move {
-            let play = self
-                .plan
-                .bind(&self.source, sink)
-                .map_err(|_| SourceError::Bounds)?;
-            play.pump_guard(transport, control, writer).await
+            self.pump_guard(&mut transport, &mut control, &mut sink, writer)
+                .await
         }
+    }
+
+    async fn pump_guard<T, C, W>(
+        self,
+        transport: &mut T,
+        control: &mut C,
+        sink: &mut dyn DeliveredSink,
+        writer: ResponseWriter<W>,
+    ) -> Result<(), SourceError>
+    where
+        T: AsyncArticleSource,
+        C: OriginalControl,
+        W: OriginalWriter,
+    {
+        let play = self
+            .plan
+            .bind(&self.source, sink)
+            .map_err(|_| SourceError::Bounds)?;
+        play.pump_guard(transport, control, writer).await
     }
 }
 
