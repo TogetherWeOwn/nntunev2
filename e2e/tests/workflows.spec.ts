@@ -1617,6 +1617,7 @@ staging = "dummy-hyperdrive-staging"
             { pattern: 'staging.nntune.com/api/ingest', zone_name: 'nntune.com' },
           ],
           vars: {
+            ENVIRONMENT: 'staging',
             RP_ID: 'staging.nntune.com',
             RP_ORIGIN: 'https://staging.nntune.com',
             SESSION_TTL_SECS: '86400',
@@ -1878,14 +1879,14 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(section).toMatch(
       /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
     );
-    // Public vars parity: the generated staging config must carry all four
-    // public [env.staging.vars] lines (RP pair from repo vars, session TTL
-    // literal, cache-disabled attestation). A dropped SESSION_TTL_SECS falls
+    // Public vars parity: the generated staging config must carry the explicit
+    // environment label, RP pair from repo vars, session TTL literal and
+    // cache-disabled attestation in [env.staging.vars]. A dropped SESSION_TTL_SECS falls
     // back to a compiled default and a dropped HYPERDRIVE_CACHING_DISABLED
     // refuses traffic — both merge green without this pin. Names plus
     // ${...}/literal shape only, never secret values.
     expect(section).toMatch(
-      /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n(?:[ \t]*#.*\n)*[ \t]+QA_CODE_SEAM = "1"\n/m,
+      /^[ \t]*\[env\.staging\.vars\]\n[ \t]+ENVIRONMENT = "staging"\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n(?:[ \t]*#.*\n)*[ \t]+QA_CODE_SEAM = "1"\n/m,
     );
     // Same-host routes: the generated staging config must serve /v1/*,
     // /healthz, plus the staging-only /api/test-codes and
@@ -2326,8 +2327,17 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       '          [env.staging.observability]\n',
       '          # [env.staging.observability]\n',
     );
-    // Generated staging vars mutants: dropping any one of the four public
-    // vars lines must trip the pin above.
+    // Generated staging vars mutants: missing or incorrect environment labels
+    // and dropping any required public vars line must trip the pin above.
+    const droppedEnvironmentMutant = jobsBody.replace('          ENVIRONMENT = "staging"\n', '');
+    const wrongEnvironmentMutant = jobsBody.replace(
+      '          ENVIRONMENT = "staging"\n',
+      '          ENVIRONMENT = "production"\n',
+    );
+    const commentedEnvironmentMutant = jobsBody.replace(
+      '          ENVIRONMENT = "staging"\n',
+      '          # ENVIRONMENT = "staging"\n',
+    );
     const droppedRpIdMutant = jobsBody.replace('          RP_ID = "${API_RP_ID_STAGING}"\n', '');
     const droppedRpOriginMutant = jobsBody.replace(
       '          RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"\n',
@@ -2529,6 +2539,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(() => assertStagingApi(zeroSamplingMutant)).toThrow();
     expect(() => assertStagingApi(droppedSamplingMutant)).toThrow();
     expect(() => assertStagingApi(commentedHeaderMutant)).toThrow();
+    expect(() => assertStagingApi(droppedEnvironmentMutant)).toThrow();
+    expect(() => assertStagingApi(wrongEnvironmentMutant)).toThrow();
+    expect(() => assertStagingApi(commentedEnvironmentMutant)).toThrow();
     expect(() => assertStagingApi(droppedRpIdMutant)).toThrow();
     expect(() => assertStagingApi(droppedRpOriginMutant)).toThrow();
     expect(() => assertStagingApi(droppedSessionTtlMutant)).toThrow();

@@ -5131,87 +5131,6 @@ fn scheduled_retention_outcome(
     }
 }
 
-#[cfg(test)]
-mod scheduled_retention_tests {
-    use super::*;
-    use crate::logging::Level;
-    use crate::videolinks::jobs::{JobError, RetentionTick};
-    use crate::videolinks::retention::{
-        CleanupError, CleanupFailure, CleanupReport, MetadataBacklog,
-    };
-    use crate::videolinks::scheduled::ScheduleError;
-
-    fn report(backlog: Option<MetadataBacklog>) -> CleanupReport {
-        CleanupReport {
-            evaluated_at: 1_800_000_000,
-            safety_window_s: 86400,
-            batches: 1,
-            purged_rows: 0,
-            backlog,
-        }
-    }
-
-    #[test]
-    fn suppression_backlog_and_missing_audit_never_log_healthy_cleanup() {
-        assert_eq!(
-            scheduled_retention_outcome(&Ok(RetentionTick::Suppressed)),
-            (Level::Info, "suppressed")
-        );
-        for (due, expired, expected) in [
-            (0, 0, (Level::Info, "drained")),
-            (1, 0, (Level::Warn, "due_backlog")),
-            (1, 1, (Level::Error, "expired_backlog")),
-        ] {
-            let tick = RetentionTick::Recorded(Ok(report(Some(MetadataBacklog {
-                retained_rows: due,
-                due_rows: due,
-                expired_rows: expired,
-                oldest_due_validated_at: (due > 0).then_some(1),
-                oldest_expired_validated_at: (expired > 0).then_some(1),
-            }))));
-            assert_eq!(scheduled_retention_outcome(&Ok(tick)), expected);
-        }
-        assert_eq!(
-            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Ok(report(None))))),
-            (Level::Error, "missing_audit")
-        );
-        assert_eq!(
-            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Err(CleanupFailure {
-                error: CleanupError::Store,
-                progress: report(None),
-            })))),
-            (Level::Error, "cleanup_failed")
-        );
-    }
-
-    #[test]
-    fn failures_use_fixed_loggable_labels_only() {
-        for (error, label) in [
-            (ScheduleError::UnknownCron, "unknown_cron"),
-            (ScheduleError::InvalidTime, "invalid_time"),
-            (ScheduleError::Configuration, "configuration"),
-            (ScheduleError::Connect, "connection_failed"),
-            (ScheduleError::Job(JobError::Store), "job_failed"),
-            (ScheduleError::Deadline, "invocation_deadline"),
-        ] {
-            let (level, outcome) = scheduled_retention_outcome(&Err(error));
-            assert_eq!((level, outcome), (Level::Error, label));
-            let line = emit_record(
-                level,
-                "api.video_retention.outcome",
-                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
-                serde_json::json!({
-                    "outcome": outcome,
-                    "build_sha": "0123456789abcdef0123456789abcdef01234567",
-                    "release": "0123456789abcdef0123456789abcdef01234567",
-                }),
-            )
-            .expect("fixed sanitized scheduled log is accepted");
-            assert!(line.contains(label));
-        }
-    }
-}
-
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
@@ -5396,6 +5315,87 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
 /// (`vault::sanitize_source_ip`). `headers` keys are lowercased.
 fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
+}
+
+#[cfg(test)]
+mod scheduled_retention_tests {
+    use super::*;
+    use crate::logging::Level;
+    use crate::videolinks::jobs::{JobError, RetentionTick};
+    use crate::videolinks::retention::{
+        CleanupError, CleanupFailure, CleanupReport, MetadataBacklog,
+    };
+    use crate::videolinks::scheduled::ScheduleError;
+
+    fn report(backlog: Option<MetadataBacklog>) -> CleanupReport {
+        CleanupReport {
+            evaluated_at: 1_800_000_000,
+            safety_window_s: 86400,
+            batches: 1,
+            purged_rows: 0,
+            backlog,
+        }
+    }
+
+    #[test]
+    fn suppression_backlog_and_missing_audit_never_log_healthy_cleanup() {
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Suppressed)),
+            (Level::Info, "suppressed")
+        );
+        for (due, expired, expected) in [
+            (0, 0, (Level::Info, "drained")),
+            (1, 0, (Level::Warn, "due_backlog")),
+            (1, 1, (Level::Error, "expired_backlog")),
+        ] {
+            let tick = RetentionTick::Recorded(Ok(report(Some(MetadataBacklog {
+                retained_rows: due,
+                due_rows: due,
+                expired_rows: expired,
+                oldest_due_validated_at: (due > 0).then_some(1),
+                oldest_expired_validated_at: (expired > 0).then_some(1),
+            }))));
+            assert_eq!(scheduled_retention_outcome(&Ok(tick)), expected);
+        }
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Ok(report(None))))),
+            (Level::Error, "missing_audit")
+        );
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Err(CleanupFailure {
+                error: CleanupError::Store,
+                progress: report(None),
+            })))),
+            (Level::Error, "cleanup_failed")
+        );
+    }
+
+    #[test]
+    fn failures_use_fixed_loggable_labels_only() {
+        for (error, label) in [
+            (ScheduleError::UnknownCron, "unknown_cron"),
+            (ScheduleError::InvalidTime, "invalid_time"),
+            (ScheduleError::Configuration, "configuration"),
+            (ScheduleError::Connect, "connection_failed"),
+            (ScheduleError::Job(JobError::Store), "job_failed"),
+            (ScheduleError::Deadline, "invocation_deadline"),
+        ] {
+            let (level, outcome) = scheduled_retention_outcome(&Err(error));
+            assert_eq!((level, outcome), (Level::Error, label));
+            let line = emit_record(
+                level,
+                "api.video_retention.outcome",
+                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+                serde_json::json!({
+                    "outcome": outcome,
+                    "build_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "release": "0123456789abcdef0123456789abcdef01234567",
+                }),
+            )
+            .expect("fixed sanitized scheduled log is accepted");
+            assert!(line.contains(label));
+        }
+    }
 }
 
 #[cfg(test)]
