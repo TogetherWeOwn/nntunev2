@@ -54,6 +54,7 @@ struct ControlState {
     waker: Option<Waker>,
 }
 
+#[derive(Clone)]
 struct Control {
     now: Rc<Cell<u64>>,
     state: Rc<RefCell<ControlState>>,
@@ -797,6 +798,145 @@ fn owned_static_task_settles_success_error_and_drop_prefixes_once() {
             );
         }
         assert_eq!(log.borrow().len(), [3, 1, 2, 3, 3, 2][mode]);
+    }
+}
+
+#[test]
+fn shared_source_plan_retains_the_same_allocation_and_releases_refusals() {
+    for range in [None, Some("bytes=2-6"), Some("bytes=9-"), Some("bytes=-0")] {
+        let (source, articles) = fixture();
+        let source = Rc::new(source);
+        let mut control = Control::new();
+        let mut sink = VecDeliveredSink::default();
+        let borrowed = authorize_original(&request(range), SECRET, NOW)
+            .unwrap()
+            .prepare(&source, range, &mut control, &mut sink);
+        let owned = authorize_original(&request(range), SECRET, NOW)
+            .unwrap()
+            .prepare_owned(source.clone(), range, &mut control);
+        match (borrowed, owned) {
+            (Ok(borrowed), Ok(owned)) => {
+                assert_eq!(Rc::strong_count(&source), 2);
+                assert_eq!(
+                    (owned.status(), owned.body_len()),
+                    (borrowed.status, borrowed.body_len)
+                );
+                assert_eq!(owned.headers(), borrowed.headers);
+                drop(owned);
+            }
+            (Err(borrowed), Err(owned)) => {
+                assert_eq!(
+                    (owned.status, owned.content_range),
+                    (borrowed.status, borrowed.content_range)
+                );
+            }
+            _ => panic!("shared and borrowed plans disagree"),
+        }
+        assert_eq!(Rc::strong_count(&source), 1);
+        assert!(articles.opened.is_empty());
+        assert!(sink.0.is_empty());
+    }
+}
+
+// Synthetic retained-input transport only; not the production account supplier.
+struct RetainedArticles {
+    source: Rc<OriginalSource>,
+    control: Control,
+    inner: Articles,
+}
+impl AsyncArticleSource for RetainedArticles {
+    async fn open(&mut self, index: usize, reference: &str) -> Result<Vec<u8>, SourceError> {
+        self.control.check()?;
+        assert_eq!(self.source.article(index)?.reference(), reference);
+        self.inner.open(index, reference).await
+    }
+}
+
+#[test]
+fn shared_source_owned_inputs_release_on_unpolled_and_pending_task_drop_or_cancel() {
+    async fn scheduled<F: Future<Output = Result<(), SourceError>>>(
+        pump: F,
+    ) -> Result<(), SourceError> {
+        pump.await
+    }
+    for cancel in [false, true] {
+        // Unpolled, pending article, pending write, pending close, success.
+        for phase in 0..5 {
+            let (source, mut articles) = fixture();
+            let source = Rc::new(source);
+            let weak = Rc::downgrade(&source);
+            let log = articles.log.clone();
+            let mut control = Control::new();
+            let observed_control = control.clone();
+            let owned = authorize_original(&request(Some("bytes=1-7")), SECRET, NOW)
+                .unwrap()
+                .prepare_owned(source.clone(), Some("bytes=1-7"), &mut control)
+                .unwrap();
+            let st = shared([]);
+            match phase {
+                1 => articles.pending = Some(2),
+                2 => st.borrow_mut().script = [Step::Accept(1), Step::Block].into(),
+                3 => st.borrow_mut().close_block = true,
+                _ => {}
+            }
+            let transport = RetainedArticles {
+                source: source.clone(),
+                control: control.clone(),
+                inner: articles,
+            };
+            assert_eq!(Rc::strong_count(&source), 3);
+            drop(source);
+            let reports = Rc::new(RefCell::new(Vec::new()));
+            // Own the guard and every input before the scheduler wraps the task.
+            let task = scheduled(owned.pump_owned(
+                transport,
+                control,
+                ReportSink(reports.clone()),
+                Writer(st.clone()),
+            ));
+            fn require_static(_: &(impl Future<Output = Result<(), SourceError>> + 'static)) {}
+            require_static(&task);
+            let mut future = Box::pin(task);
+            let wake = Arc::new(Wakes::default());
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            if phase != 0 {
+                let result = future.as_mut().poll(&mut cx);
+                if phase == 4 {
+                    assert_eq!(result, Poll::Ready(Ok(())));
+                } else {
+                    assert!(result.is_pending());
+                    assert_eq!(weak.strong_count(), 2);
+                    if cancel {
+                        ControlEvent::Cancel.fire(&observed_control.now, &observed_control.state);
+                        assert!(wake.0.load(Ordering::SeqCst) > 0);
+                        assert_eq!(
+                            future.as_mut().poll(&mut cx),
+                            Poll::Ready(Err(SourceError::Cancelled))
+                        );
+                    }
+                }
+            }
+            drop(future);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(Rc::strong_count(&observed_control.state), 1);
+            assert_eq!(Rc::strong_count(&observed_control.now), 1);
+            let st = st.borrow();
+            let expected = [0, 0, 1, 7, 7][phase];
+            assert_eq!(st.got, (1..1 + expected as u8).collect::<Vec<_>>());
+            assert_eq!(st.aborts, usize::from(phase != 4));
+            assert_eq!(st.closes, usize::from(phase >= 3));
+            assert_eq!(st.write_polls, [0, 0, 2, 3, 3][phase]);
+            assert_eq!(log.borrow().len(), [0, 1, 2, 3, 3][phase]);
+            let reports = reports.borrow();
+            assert_eq!(reports.len(), usize::from(expected != 0));
+            if expected != 0 {
+                assert_eq!(
+                    (reports[0].start, reports[0].end, reports[0].file_bytes),
+                    (1, 1 + expected, Some(9))
+                );
+            }
+        }
     }
 }
 
