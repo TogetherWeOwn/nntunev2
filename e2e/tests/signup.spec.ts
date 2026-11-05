@@ -8,7 +8,7 @@ import {
   waitForHydration,
 } from '../helpers/accounts.js';
 
-// Golden path part 1: signup → library. Each run mints a fresh account so
+// Golden path part 1: signup → library (API-minted account) or billing (public form). Each run mints a fresh account so
 // reruns never collide. The seam-absent fallback submits the real /signup
 // form and asserts the emailed-code step (the full code-plus-passkey finish
 // needs a staging code-retrieval seam plus a WebAuthn virtual authenticator,
@@ -61,7 +61,7 @@ test.describe.serial('signup → library', () => {
 // /signup submission on every configured-staging run — including seam-backed
 // ones, where the first test takes the API path. Playwright gives each test
 // a fresh context, so no session from an earlier test can leak into this
-// one. The helper asserts the emailed-code step, not library arrival: the
+// one. The helper asserts the emailed-code step, not billing arrival: the
 // code-plus-passkey finish needs a staging code-retrieval seam plus a
 // WebAuthn virtual authenticator (covered separately by
 // signup-arrival.spec.ts; see row 1 of docs/m1-exit-traceability.md). The

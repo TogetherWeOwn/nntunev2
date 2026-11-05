@@ -254,7 +254,7 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Form-to-library arrival is asserted by `signup-arrival.spec.ts`: the
+  Form-to-billing arrival is asserted by `signup-arrival.spec.ts`: the
   code-plus-passkey finish retrieves the code from the staging-only
   `POST /api/test-codes` seam, which is live on staging
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is

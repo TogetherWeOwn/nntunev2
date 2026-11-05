@@ -3,8 +3,8 @@ import { expect, test, type Page } from '@playwright/test';
 /**
  * Auth-transition acceptance: a qualifying security result (logout or
  * revoke-all fulfilled success, or a typed HTTP401) purges this tab's
- * accessible auth state and resets every mounted consumer — library,
- * provider and BYOP — even when the security route was abandoned first.
+ * accessible auth state and resets every mounted consumer — library and
+ * account views — even when the security route was abandoned first.
  * The abandoned route itself stays silent: no navigation, error, message
  * or busy-state writes. Non-qualifying results notify nothing.
  *
@@ -15,20 +15,16 @@ import { expect, test, type Page } from '@playwright/test';
  * only negative observation, never race outcomes. All API destinations are
  * local fixtures, never live services.
  *
- * Breaks caught: an abandoned qualifying result that leaves snapshots,
- * identity labels or drafts behind; a late library/provider response that
- * repopulates a reset view; a stale BYOP test/save/reauth continuation
- * that runs after reset; a retained paywall retry that resubmits; a new
- * paywall published by a late response; a rebroadcast/request loop; a
- * storage denial that suppresses the local reset or throws.
+ * Breaks caught: an abandoned qualifying result that leaves snapshots or
+ * identity labels behind; a late library response that repopulates a reset
+ * view; a retained paywall retry that resubmits; a new paywall published
+ * by a late response; a rebroadcast/request loop; a storage denial that
+ * suppresses the local reset or throws.
  */
 const SNAPSHOT = 'nntune.library.snapshot.v1';
 const AUTH_CONTEXT = 'nntune.library.auth-context.v1';
 const TRANSITION = 'nntune.library.auth-transition.v1';
 const EMAIL = 'nntune:signed-in-email';
-const RESTART_NOTICE =
-	'This setup was reset after an authentication change. Sign in and start setup again; ' +
-	're-enter and retest your credentials. Requests already submitted may still complete.';
 
 interface HeldRequest {
 	method: string;
@@ -60,8 +56,8 @@ type HoldRule = string | { path: string; methods?: string[]; passFirst?: number 
  * a stray request cannot hide behind a benign fixture.
  *
  * A rule can narrow by HTTP method and can pass the first N matches
- * through (the security page load probes GET /v1/vault before any held
- * action runs, so a vault hold must not swallow that probe).
+ * through (the security page load probes GET /v1/me/subscription before any
+ * held action runs, so a subscription hold must not swallow that probe).
  */
 async function fixtures(page: Page, holds: HoldRule[]) {
 	const normalized = holds.map((rule) =>
@@ -246,23 +242,22 @@ async function release(page: Page, path: string, status: number, body: unknown) 
 	);
 }
 
-/** Fill the BYOP wizard to step 3 with distinct probe secrets. */
-async function fillByopDraft(page: Page, tag: string) {
-	await page.getByLabel('Hostname').fill(`news.${tag}.example.test`);
-	await page.getByLabel('Username').fill(`${tag}-reader`);
-	await page.getByLabel('Password', { exact: true }).fill(`${tag}-probe-password`);
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByLabel('Indexer URL').fill(`https://indexer.${tag}.example.test`);
-	await page.getByLabel('Indexer API key').fill(`${tag}-probe-indexer-key`);
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await expect(page.getByRole('region', { name: 'Test the connection' })).toBeVisible();
-}
-
 /** A second tab in the same context performs a real live logout. */
 async function actorLogout(page: Page) {
 	const actor = await page.context().newPage();
-	await actor.route('**/v1/vault', (route) =>
-		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
+	await actor.route('**/v1/me/subscription', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				state: 'no_subscription',
+				planId: null,
+				status: null,
+				currentPeriodEnd: null,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
+			})
+		})
 	);
 	await actor.route('**/v1/session/logout', (route) =>
 		route.fulfill({
@@ -345,19 +340,14 @@ test('abandoned logout success resets the same-window replacement library and fe
 	expect.soft(observed.navigations, 'no late navigation').toEqual([]);
 });
 
-test('abandoned revoke-all success resets the same-window replacement provider and fences its late summary', async ({
+test('abandoned revoke-all success resets the same-window replacement library and fences its late response', async ({
 	page
 }) => {
-	const observed = await fixtures(page, [
-		'/v1/session/revoke-all',
-		// The security load probes GET /v1/vault first; hold only the later
-		// provider summary read.
-		{ path: '/v1/vault', methods: ['GET'], passFirst: 1 }
-	]);
+	const observed = await fixtures(page, ['/v1/session/revoke-all', '/api/library']);
 	const endpoint = await beginSecurity(page, 'revoke-all');
-	await clientNavigate(page, '/account/provider');
-	await expect(page.getByText('Loading saved-provider status…')).toBeVisible();
-	await expect.poll(() => requestCount(page, '/v1/vault')).toBe(1);
+	await clientNavigate(page, '/library');
+	await expect(page.getByText('Loading your library…')).toBeVisible();
+	await expect.poll(() => requestCount(page, '/api/library')).toBe(1);
 	observed.navigations.length = 0;
 	await page.evaluate(() => {
 		window.__transition.writes.length = 0;
@@ -366,13 +356,10 @@ test('abandoned revoke-all success resets the same-window replacement provider a
 
 	await release(page, endpoint, 200, { ok: true });
 
-	// The existing expired presentation is preserved; the summary is gone.
-	await expect(page.getByText('Your session has expired or changed.')).toBeVisible();
-	await expect(page.getByRole('link', { name: 'Sign in again' })).toHaveAttribute(
-		'href',
-		'/login'
-	);
-	await expect(page.getByText('Saved provider configured')).toHaveCount(0);
+	// The purge landed and the mounted replacement reset to sign-in-required.
+	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await expect(page.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/login');
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
 	expect(await storedState(page)).toEqual({
 		areas: [
 			{ context: null, scoped: null, legacy: null },
@@ -381,19 +368,16 @@ test('abandoned revoke-all success resets the same-window replacement provider a
 		email: null
 	});
 	expect.soft(observed.navigations, 'no event-driven navigation').toEqual([]);
-	expect.soft(new URL(page.url()).pathname).toBe('/account/provider');
+	expect.soft(new URL(page.url()).pathname).toBe('/library');
 	expect(await requestCount(page, endpoint)).toBe(1);
 
-	// The held summary response cannot repaint the expired view or refetch.
-	await release(page, '/v1/vault', 200, {
-		provider_configured: true,
-		indexer_configured: false,
-		updated_at: 1
-	});
+	// The library response that was already in flight cannot repopulate the
+	// reset view, retry the fetch, or rebroadcast the transition.
+	await release(page, '/api/library', 200, [{ id: 'late-track', title: 'Late arrival' }]);
 	await page.waitForTimeout(350);
-	await expect(page.getByText('Your session has expired or changed.')).toBeVisible();
-	await expect(page.getByText('Saved provider configured')).toHaveCount(0);
-	expect(await requestCount(page, '/v1/vault')).toBe(1);
+	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	expect(await requestCount(page, '/api/library')).toBe(1);
 	const probe = await probeSnapshot(page);
 	expect(probe.writes.filter((entry) => entry === `setItem:${TRANSITION}`)).toHaveLength(1);
 	expect.soft(probe.broadcasts, 'no BroadcastChannel relay').toEqual([]);
@@ -657,239 +641,3 @@ for (const denied of [['setItem', 'removeItem'], ['getItem']] as const) {
 		expect.soft(observed.pageErrors, 'no page error').toEqual([]);
 	});
 }
-
-test('abandoned logout resets the same-window BYOP draft and fences its pending test', async ({
-	page
-}) => {
-	const observed = await fixtures(page, ['/v1/session/logout', '/v1/vault/test']);
-	let saves = 0;
-	let reauthPosts = 0;
-	await page.route('**/v1/vault', async (route) => {
-		if (route.request().method() === 'PUT') saves += 1;
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({ ok: true })
-		});
-	});
-	await page.route('**/v1/session/reauthenticate/**', async (route) => {
-		reauthPosts += 1;
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({ ok: true })
-		});
-	});
-	const endpoint = await beginSecurity(page, 'logout');
-	await clientNavigate(page, '/onboarding/byop');
-	await expect(page.getByText('Signed in as')).toBeVisible();
-	await fillByopDraft(page, 'fence');
-	await page.getByTestId('byop-test-connection').click();
-	await expect.poll(() => requestCount(page, '/v1/vault/test')).toBe(1);
-	observed.navigations.length = 0;
-
-	await release(page, endpoint, 200, { ok: true });
-
-	// Fail-closed restart: neutral notice with an explicit sign-in link, no
-	// redirect; identity, secrets and tested state cleared to step-1 defaults.
-	const notice = page.getByText(RESTART_NOTICE);
-	await expect(notice).toBeVisible();
-	await expect(page.locator('a[href="/login"]')).toHaveCount(1);
-	await expect(page.getByText('Signed in as')).toHaveCount(0);
-	await expect(page.getByText('Step 1 of 3')).toBeVisible();
-	await expect(page.getByLabel('Hostname')).toHaveValue('');
-	await expect(page.getByLabel('Username')).toHaveValue('');
-	await expect(page.getByLabel('Password', { exact: true })).toHaveValue('');
-	expect(await readEmail(page)).toBeNull();
-	expect(await requestCount(page, '/v1/vault/test')).toBe(1);
-	expect(saves).toBe(0);
-	expect(reauthPosts).toBe(0);
-	expect.soft(observed.navigations, 'no event-driven navigation').toEqual([]);
-	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
-
-	// The held test response cannot restore tested state, identity, status
-	// or secrets, publish a paywall, or chain another request.
-	await release(page, '/v1/vault/test', 200, { ok: true, latencyMs: 5 });
-	await page.waitForTimeout(350);
-	await expect(notice).toBeVisible();
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
-	await expect(page.getByText(/checks passed/i)).toHaveCount(0);
-	await expect(page.getByRole('dialog')).toHaveCount(0);
-	expect(await requestCount(page, '/v1/vault/test')).toBe(1);
-	expect(saves).toBe(0);
-	expect(reauthPosts).toBe(0);
-
-	// A post-reset refill to step 3 renders the test control disabled, and
-	// force-activating the rendered handler dispatches nothing: the entry
-	// guard — not just the missing button — fences stale submits. A
-	// synthetic dispatch bypasses the disabled activation gate, so this
-	// reaches the handler a dispatch on the unrendered step-1 controls
-	// could not.
-	await fillByopDraft(page, 'refill');
-	await expect(page.getByTestId('byop-test-connection')).toBeDisabled();
-	await page.evaluate(() => {
-		document
-			.querySelector('[data-testid="byop-test-connection"]')
-			?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-	});
-	await page.waitForTimeout(350);
-	expect(await requestCount(page, '/v1/vault/test')).toBe(1);
-	expect(saves).toBe(0);
-	expect(reauthPosts).toBe(0);
-	await expect(notice).toBeVisible();
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
-	await expect(page.getByRole('button', { name: 'Reauthenticate and save' })).toHaveCount(0);
-	const probe = await probeSnapshot(page);
-	expect.soft(probe.rejections).toEqual([]);
-	expect.soft(observed.pageErrors).toEqual([]);
-	expect.soft(observed.navigations, 'no late navigation').toEqual([]);
-});
-
-test('abandoned logout clears tested state and fences an already-dispatched save', async ({
-	page
-}) => {
-	const observed = await fixtures(page, [
-		'/v1/session/logout',
-		// Only the save PUT is held; the security load probes GET /v1/vault
-		// and must fail fast through the catch-all instead of hanging.
-		{ path: '/v1/vault', methods: ['PUT'] }
-	]);
-	let tests = 0;
-	await page.route('**/v1/vault/test', async (route) => {
-		tests += 1;
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({ ok: true, latencyMs: 5 })
-		});
-	});
-	const endpoint = await beginSecurity(page, 'logout');
-	await clientNavigate(page, '/onboarding/byop');
-	await fillByopDraft(page, 'save');
-	await page.getByTestId('byop-test-connection').click();
-	await expect(page.getByTestId('byop-save')).toBeEnabled();
-	await page.getByTestId('byop-save').click();
-	await expect.poll(() => requestCount(page, '/v1/vault')).toBe(1);
-	observed.navigations.length = 0;
-
-	await release(page, endpoint, 200, { ok: true });
-
-	const notice = page.getByText(RESTART_NOTICE);
-	await expect(notice).toBeVisible();
-	await expect(page.locator('a[href="/login"]')).toHaveCount(1);
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
-	expect(await readEmail(page)).toBeNull();
-
-	// The save was already dispatched exactly once and may still complete
-	// server-side; locally it must settle to nothing: no success UI, no
-	// navigation, no replay, no chained request.
-	await release(page, '/v1/vault', 200, { ok: true });
-	await page.waitForTimeout(350);
-	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
-	expect.soft(observed.navigations, 'no event-driven navigation').toEqual([]);
-	await expect(notice).toBeVisible();
-	await expect(page.getByText(/credentials are sealed/i)).toHaveCount(0);
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
-	expect(await requestCount(page, '/v1/vault')).toBe(1);
-	expect(await requestCount(page, endpoint)).toBe(1);
-
-	// A post-reset refill to step 3 renders the test control disabled, and
-	// force-activating the rendered handler dispatches no new test and
-	// replays no save. A synthetic dispatch bypasses the disabled
-	// activation gate, so this reaches the handler a dispatch on the
-	// unrendered step-1 controls could not.
-	await fillByopDraft(page, 'refill');
-	await expect(page.getByTestId('byop-test-connection')).toBeDisabled();
-	await page.evaluate(() => {
-		document
-			.querySelector('[data-testid="byop-test-connection"]')
-			?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-	});
-	await page.waitForTimeout(350);
-	expect(tests).toBe(1);
-	expect(await requestCount(page, '/v1/vault')).toBe(1);
-	const probe = await probeSnapshot(page);
-	expect.soft(probe.rejections).toEqual([]);
-	expect.soft(observed.pageErrors).toEqual([]);
-});
-
-test('abandoned logout suppresses the late limit paywall for an already-dispatched save', async ({
-	page
-}) => {
-	const observed = await fixtures(page, [
-		'/v1/session/logout',
-		// Only the save PUT is held; the security load probes GET /v1/vault
-		// and must fail fast through the catch-all instead of hanging.
-		{ path: '/v1/vault', methods: ['PUT'] }
-	]);
-	await page.route('**/v1/vault/test', (route) =>
-		route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({ ok: true, latencyMs: 5 })
-		})
-	);
-	const endpoint = await beginSecurity(page, 'logout');
-	await clientNavigate(page, '/onboarding/byop');
-	await fillByopDraft(page, 'savepaywall');
-	await page.getByTestId('byop-test-connection').click();
-	await expect(page.getByTestId('byop-save')).toBeEnabled();
-	await page.getByTestId('byop-save').click();
-	await expect.poll(() => requestCount(page, '/v1/vault')).toBe(1);
-	observed.navigations.length = 0;
-
-	await release(page, endpoint, 200, { ok: true });
-
-	const notice = page.getByText(RESTART_NOTICE);
-	await expect(notice).toBeVisible();
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
-
-	// The late limit response for the dispatched save must not publish the
-	// global paywall: the reset aborted the caller's signal and the client
-	// checks it before publication. The held transport deliberately
-	// ignores abort.
-	await release(page, '/v1/vault', 429, { code: 'rate_limited', message: 'limit reached' });
-	await page.waitForTimeout(350);
-	await expect(page.getByRole('dialog')).toHaveCount(0);
-	await expect(notice).toBeVisible();
-	expect(await requestCount(page, '/v1/vault')).toBe(1);
-	expect(await requestCount(page, endpoint)).toBe(1);
-	const probe = await probeSnapshot(page);
-	expect.soft(probe.rejections).toEqual([]);
-	expect.soft(observed.pageErrors).toEqual([]);
-});
-
-test('abandoned security failure leaves the BYOP draft and tested state alone', async ({
-	page
-}) => {
-	const observed = await fixtures(page, ['/v1/session/logout']);
-	await page.route('**/v1/vault/test', (route) =>
-		route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({ ok: true, latencyMs: 5 })
-		})
-	);
-	const endpoint = await beginSecurity(page, 'logout');
-	await clientNavigate(page, '/onboarding/byop');
-	await fillByopDraft(page, 'intact');
-	await page.getByTestId('byop-test-connection').click();
-	await expect(page.getByTestId('byop-save')).toBeEnabled();
-	const before = await storedState(page);
-
-	await release(page, endpoint, 500, { code: 'internal_error', message: 'held fixture failure' });
-	await page.waitForTimeout(350);
-
-	// Non-qualifying: no reset, no notice, tested state and typed draft
-	// survive, storage is preserved.
-	await expect(page.getByTestId('byop-save')).toBeEnabled();
-	await expect(page.getByText(/reset after an authentication change/i)).toHaveCount(0);
-	await page.getByRole('button', { name: 'Back' }).click();
-	await page.getByRole('button', { name: 'Back' }).click();
-	await expect(page.getByLabel('Password', { exact: true })).toHaveValue('intact-probe-password');
-	expect(await storedState(page)).toEqual(before);
-	expect(await requestCount(page, endpoint)).toBe(1);
-	const probe = await probeSnapshot(page);
-	expect.soft(probe.rejections).toEqual([]);
-	expect.soft(observed.pageErrors).toEqual([]);
-});
