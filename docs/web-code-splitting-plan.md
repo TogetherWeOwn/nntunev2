@@ -59,10 +59,13 @@ sets no `manualChunks`.
    and preload side effects. Revisit only if a shared chunk exceeds the
    Svelte runtime chunk (~42 KB) and rules 1–3 cannot shrink it; any
    change needs a before/after measurement in the pull request.
-5. **Measure in the pull request.** Run `pnpm build` in `apps/web`, then
-   `python3 .github/scripts/check_web_bundle_budget.py`, and record the
-   new total and headroom. A change that halves the remaining headroom
-   needs a splitting note like this one.
+5. **Measure in the pull request.** Push the PR branch (draft while
+   incomplete) and use the exact-head Actions `web-build` job, which runs
+   the build and `check_web_bundle_budget.py`. Link the job and record the
+   new total and headroom; do not mirror the build gate locally. Follow
+   [verification policy](../CONTRIBUTING.md#verification-github-actions-first).
+   A change that halves the remaining headroom needs a splitting note like
+   this one.
 
 ## Order of work when headroom runs low
 

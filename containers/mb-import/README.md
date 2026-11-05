@@ -203,23 +203,21 @@ a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:111-665` (suites 1-12);
 `.github/workflows/ci.yml:746-790`.)
 
-Run it in the shipped image, as CI does (the image carries `mb-validate`):
-
-```sh
-docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
-docker run --rm --network host \
-  -e DATABASE_URL=<scratch-url> -e ALLOW_TEST_TRUNCATE=1 \
-  -v "$PWD/containers/mb-import/test-import.sh:/job/test-import.sh:ro" \
-  mb-import:ci bash /job/test-import.sh
-```
+The shipped CI image carries `mb-validate`.
+The Docker build and import test suite run in the GitHub Actions
+[`mb-import` job](../../.github/workflows/ci.yml); push the PR branch and
+open a draft PR while incomplete. Do not mirror this database/container
+suite on the shared host. The validator's unit tests run in the workflow's
+`rust-test` workspace job, not as a local workspace checklist. Record
+exact-head Actions run/job links as verification evidence.
 
 The suite truncates all ten mirror tables, so `ALLOW_TEST_TRUNCATE=1` is
 mandatory and the target must be scratch — never staging or production.
 (Sources: `test-import.sh:11-15` (refusal guard), `:47-51` (truncate + state
-reset).) Unit tests for the validator run with the workspace: `cargo test`.
-(Sources: `Cargo.toml:2` (workspace member);
-`crates/mb-import-validate/src/lib.rs:667-1155` (unit tests);
-`.github/workflows/ci.yml:51` (`cargo test --workspace`).)
+reset).) Local work is limited to one failing test or crate under the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only);
+heavy work uses guarded Boat, never a raw-host fallback. This does not
+authorize database access or bypass scratch-target guards.
 
 ## Secrets
 
