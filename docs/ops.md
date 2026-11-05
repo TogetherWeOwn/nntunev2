@@ -780,7 +780,7 @@ environment exists on this repo.
   (`.github/workflows/deploy-production.yml:233-241` runs
   `ci/check-production-secrets-shape.mjs`, which refuses any
   `[env.production]` table beyond `name`). Same-checker CI coverage
-  (`.github/workflows/ci.yml:824-842`) is not promotion evidence on its
+  (`.github/workflows/ci.yml:830-848`) is not promotion evidence on its
   own; require the deploy-production job's pass on the exact head being
   promoted.
 - [ ] Staging deploy evidence: record the successful push-triggered

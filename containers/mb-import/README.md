@@ -201,7 +201,7 @@ resume — suites 1-12 cover all ten tables, including the relationship/ISRC
 generators and the newer/older-changed-dump and split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:111-665` (suites 1-12);
-`.github/workflows/ci.yml:746-790`.)
+`.github/workflows/ci.yml:752-796`.)
 
 Run it in the shipped image, as CI does (the image carries `mb-validate`):
 

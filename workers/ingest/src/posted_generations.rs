@@ -1,0 +1,720 @@
+//! Short PostgreSQL transactions for immutable posted-file custody.
+//!
+//! Preparation only: migration 0037 retains the unique hash constraint, so
+//! replacement is refused until the legacy writer/publication rollout is
+//! complete. No queue, NNTP, KV or pointer caller is wired here. An admitted
+//! bundle is custody, NOT verification, registry promotion or serving authority.
+//! No transaction may span a network POST. Commit errors are ambiguous and
+//! require operation-identity recovery, never a remint or optimistic POST.
+//!
+//! The sealed manifest is the durable article/checkpoint plan. `plan_sha256`
+//! identifies its canonical required slot order, including recovery articles;
+//! plaintext article identities never reach this store. Existing posted_files
+//! envelopes and their hash-bound AAD remain unchanged.
+
+use crate::posted_files::{validate_posted_file_params, PostedFileParams};
+use crate::two_spool::SpoolCopyState;
+use std::fmt;
+use tokio_postgres::{Client, Row, Transaction};
+
+const LEASE_SECONDS: i64 = 300;
+
+/// Static, redacted errors. Never surface PostgreSQL errors: their detail may
+/// include a failing row containing encrypted custody or pool configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreError {
+    InvalidInput,
+    Database,
+    CommitUnknown,
+    Inconsistent,
+}
+
+fn database_error(_: tokio_postgres::Error) -> StoreError {
+    StoreError::Database
+}
+
+fn identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Persisted attempt authority, minted only by `acquire_attempt`. Queue-carried
+/// attempt numbers do not construct this handle and are never sufficient.
+#[derive(Clone)]
+pub struct AttemptHandle {
+    job_id: String,
+    owner_id: String,
+    attempt: i64,
+    token: String,
+}
+
+impl fmt::Debug for AttemptHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AttemptHandle([REDACTED])")
+    }
+}
+
+#[derive(Debug)]
+pub enum AttemptOutcome {
+    Acquired(AttemptHandle),
+    Busy,
+    StaleOrMissing,
+}
+
+/// A read snapshot is only an expected CAS value, never posting authority.
+#[derive(Clone)]
+pub struct Observation {
+    hash: String,
+    revision: i64,
+    selected: Option<String>,
+    health_revision: Option<i64>,
+}
+
+impl fmt::Debug for Observation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Observation([REDACTED])")
+    }
+}
+
+/// The one current admission fence. Fields stay private so only a committed
+/// adapter result can construct a handle. No Debug/Display exposes tokens.
+#[derive(Clone)]
+pub struct GenerationHandle {
+    attempt: AttemptHandle,
+    operation: String,
+    generation: String,
+    claim_token: String,
+    registry_revision: i64,
+    predecessor: Option<String>,
+    predecessor_health_revision: Option<i64>,
+    health_revision: i64,
+    round: i64,
+    round_token: String,
+}
+
+impl fmt::Debug for GenerationHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GenerationHandle([REDACTED])")
+    }
+}
+
+impl GenerationHandle {
+    pub fn generation_id(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation
+    }
+}
+
+/// Exact stored custody, not a locally minted key paired with a hash lookup.
+/// The row is deliberately private and has no derived Debug implementation.
+pub struct StoredGeneration {
+    row: Row,
+}
+
+impl fmt::Debug for StoredGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StoredGeneration([REDACTED])")
+    }
+}
+
+impl StoredGeneration {
+    pub fn generation_id(&self) -> &str {
+        self.row.get("id")
+    }
+
+    pub fn plan_sha256(&self) -> &str {
+        self.row.get("plan_sha256")
+    }
+
+    pub fn custody(&self) -> Result<PostedFileParams<'_>, StoreError> {
+        let r = &self.row;
+        let result = PostedFileParams {
+            plaintext_sha256: r.try_get("plaintext_sha256").map_err(database_error)?,
+            backbone_post: r.try_get("backbone_post").map_err(database_error)?,
+            backbone_verify: r.try_get("backbone_verify").map_err(database_error)?,
+            article_count: r.try_get("article_count").map_err(database_error)?,
+            verified_count: r.try_get("verified_count").map_err(database_error)?,
+            original_nzb_sha256: r.try_get("original_nzb_sha256").map_err(database_error)?,
+            post_copy: crate::posted_files::parse_spool_copy_state(
+                r.try_get("post_copy").map_err(database_error)?,
+            )
+            .map_err(|_| StoreError::Inconsistent)?,
+            verify_copy: crate::posted_files::parse_spool_copy_state(
+                r.try_get("verify_copy").map_err(database_error)?,
+            )
+            .map_err(|_| StoreError::Inconsistent)?,
+            two_spool_verified: r.try_get("two_spool_verified").map_err(database_error)?,
+            repost_exhausted: r.try_get("repost_exhausted").map_err(database_error)?,
+            plaintext_size: r.try_get("plaintext_size").map_err(database_error)?,
+            article_payload_size: r.try_get("article_payload_size").map_err(database_error)?,
+            header_nonce: r.try_get("header_nonce").map_err(database_error)?,
+            file_key_encrypted: r.try_get("file_key_encrypted").map_err(database_error)?,
+            file_key_kek_version: r.try_get("file_key_kek_version").map_err(database_error)?,
+            file_key_dek_wrapped_nonce: r
+                .try_get("file_key_dek_wrapped_nonce")
+                .map_err(database_error)?,
+            file_key_dek_wrapped: r.try_get("file_key_dek_wrapped").map_err(database_error)?,
+            file_key_payload_nonce: r
+                .try_get("file_key_payload_nonce")
+                .map_err(database_error)?,
+            file_key_payload_format: r
+                .try_get("file_key_payload_format")
+                .map_err(database_error)?,
+            manifest_encrypted: r.try_get("manifest_encrypted").map_err(database_error)?,
+            manifest_kek_version: r.try_get("manifest_kek_version").map_err(database_error)?,
+            manifest_dek_wrapped_nonce: r
+                .try_get("manifest_dek_wrapped_nonce")
+                .map_err(database_error)?,
+            manifest_dek_wrapped: r.try_get("manifest_dek_wrapped").map_err(database_error)?,
+            manifest_payload_nonce: r
+                .try_get("manifest_payload_nonce")
+                .map_err(database_error)?,
+            manifest_payload_format: r
+                .try_get("manifest_payload_format")
+                .map_err(database_error)?,
+        };
+        validate_posted_file_params(&result).map_err(|_| StoreError::Inconsistent)?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+pub enum AdmissionOutcome {
+    Admitted(GenerationHandle, StoredGeneration),
+    ResumedSameCandidate(GenerationHandle, StoredGeneration),
+    ReusedUsableWinner(StoredGeneration),
+    ClaimBusy,
+    StaleOrDiverged,
+    InconsistentOrMissing,
+}
+
+/// Caller-minted, complete sealed custody. Replay uses `recover`, not a new
+/// mint. The two envelopes still use the existing v2 AAD contract.
+pub struct CandidateMint<'a> {
+    pub operation_id: &'a str,
+    pub generation_id: &'a str,
+    pub plan_sha256: &'a str,
+    pub custody: PostedFileParams<'a>,
+}
+
+impl fmt::Debug for CandidateMint<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CandidateMint([REDACTED])")
+    }
+}
+
+impl CandidateMint<'_> {
+    fn validate(&self) -> Result<(), StoreError> {
+        if !identity(self.operation_id)
+            || !identity(self.generation_id)
+            || !crate::two_spool::validate_plaintext_sha256(self.plan_sha256)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        validate_posted_file_params(&self.custody).map_err(|_| StoreError::InvalidInput)?;
+        if self.custody.verified_count != 0
+            || self.custody.post_copy != SpoolCopyState::Unknown
+            || self.custody.verify_copy != SpoolCopyState::Unknown
+            || self.custody.two_spool_verified
+            || self.custody.repost_exhausted
+            || self.custody.manifest_encrypted.len() < 16
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+/// Acquire a new DB-clock-bounded attempt. A caller may only advance the exact
+/// expired attempt it observed. Job status/owner are locked through commit.
+pub async fn acquire_attempt(
+    client: &mut Client,
+    job_id: &str,
+    owner_id: &str,
+    expected_attempt: i64,
+) -> Result<AttemptOutcome, StoreError> {
+    if !identity(job_id) || !identity(owner_id) || expected_attempt < 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    if tx
+        .query_opt(
+            "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",
+            &[&job_id, &owner_id],
+        )
+        .await
+        .map_err(database_error)?
+        .is_none()
+    {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
+    let old = tx
+        .query_opt(
+            "SELECT attempt, lease_until > extract(epoch FROM clock_timestamp())::bigint AS active \
+             FROM posted_file_job_attempts WHERE job_id = $1 FOR UPDATE",
+            &[&job_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if let Some(row) = old {
+        if row.get::<_, i64>("attempt") != expected_attempt {
+            return Ok(AttemptOutcome::StaleOrMissing);
+        }
+        if row.get::<_, bool>("active") {
+            return Ok(AttemptOutcome::Busy);
+        }
+    } else if expected_attempt != 0 {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
+    let next = expected_attempt
+        .checked_add(1)
+        .ok_or(StoreError::InvalidInput)?;
+    let row = tx
+        .query_one(
+            "INSERT INTO posted_file_job_attempts (job_id, attempt, token, lease_until) \
+             VALUES ($1, $2, gen_random_uuid()::text, \
+                     extract(epoch FROM clock_timestamp())::bigint + $3) \
+             ON CONFLICT (job_id) DO UPDATE SET attempt = EXCLUDED.attempt, \
+                 token = EXCLUDED.token, lease_until = EXCLUDED.lease_until RETURNING token",
+            &[&job_id, &next, &LEASE_SECONDS],
+        )
+        .await
+        .map_err(database_error)?;
+    let handle = AttemptHandle {
+        job_id: job_id.to_owned(),
+        owner_id: owner_id.to_owned(),
+        attempt: next,
+        token: row.get("token"),
+    };
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AttemptOutcome::Acquired(handle))
+}
+
+async fn lock_attempt(tx: &Transaction<'_>, a: &AttemptHandle) -> Result<bool, StoreError> {
+    Ok(tx
+        .query_opt(
+            "SELECT j.id FROM ingest_jobs j JOIN posted_file_job_attempts a ON a.job_id = j.id \
+             WHERE j.id = $1 AND j.user_id = $2 AND j.status = 'running' \
+             AND a.attempt = $3 AND a.token = $4 \
+             AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint FOR UPDATE OF j, a",
+            &[&a.job_id, &a.owner_id, &a.attempt, &a.token],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some())
+}
+
+pub async fn observe(client: &Client, hash: &str) -> Result<Observation, StoreError> {
+    if !crate::two_spool::validate_plaintext_sha256(hash) {
+        return Err(StoreError::InvalidInput);
+    }
+    let row = client
+        .query_opt(
+            "SELECT r.revision, r.selected_generation, h.revision AS health_revision \
+             FROM posted_file_registry r LEFT JOIN posted_file_health h \
+             ON h.generation_id = r.selected_generation WHERE r.plaintext_sha256 = $1",
+            &[&hash],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(match row {
+        None => Observation {
+            hash: hash.to_owned(),
+            revision: 0,
+            selected: None,
+            health_revision: None,
+        },
+        Some(r) => Observation {
+            hash: hash.to_owned(),
+            revision: r.get("revision"),
+            selected: r.get("selected_generation"),
+            health_revision: r.get("health_revision"),
+        },
+    })
+}
+
+async fn stored(tx: &Transaction<'_>, id: &str) -> Result<StoredGeneration, StoreError> {
+    let row = tx
+        .query_opt("SELECT * FROM posted_files WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::Inconsistent)?;
+    let value = StoredGeneration { row };
+    value.custody()?;
+    let plan: Option<&str> = value.row.get("plan_sha256");
+    if plan.is_none() {
+        return Err(StoreError::Inconsistent);
+    }
+    Ok(value)
+}
+
+async fn read_handle(
+    tx: &Transaction<'_>,
+    attempt: &AttemptHandle,
+    operation: &str,
+) -> Result<Option<GenerationHandle>, StoreError> {
+    let row = tx
+        .query_opt(
+            "SELECT o.generation_id, o.claim_token, o.registry_revision, o.predecessor, \
+             o.predecessor_health_revision, h.revision, h.round, h.round_token \
+             FROM posted_file_operations o \
+             JOIN posted_file_registry r ON r.plaintext_sha256 = o.plaintext_sha256 \
+             JOIN posted_file_health h ON h.generation_id = o.generation_id \
+             WHERE o.id = $1 AND o.job_id = $2 AND o.attempt = $3 AND o.attempt_token = $4 \
+             AND o.state = 'pending' AND r.pending_operation = o.id \
+             AND r.revision = o.registry_revision \
+             AND r.selected_generation IS NOT DISTINCT FROM o.predecessor \
+             AND o.lease_until > extract(epoch FROM clock_timestamp())::bigint",
+            &[
+                &operation,
+                &attempt.job_id,
+                &attempt.attempt,
+                &attempt.token,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(row.map(|r| GenerationHandle {
+        attempt: attempt.clone(),
+        operation: operation.to_owned(),
+        generation: r.get("generation_id"),
+        claim_token: r.get("claim_token"),
+        registry_revision: r.get("registry_revision"),
+        predecessor: r.get("predecessor"),
+        predecessor_health_revision: r.get("predecessor_health_revision"),
+        health_revision: r.get("revision"),
+        round: r.get("round"),
+        round_token: r.get("round_token"),
+    }))
+}
+
+/// Atomic absent-hash admission. The preparation schema deliberately refuses
+/// terminal-predecessor replacement until the complete rollout fence lands.
+/// A zero-row insert is never interpreted as admission of the caller's mint.
+pub async fn admit(
+    client: &mut Client,
+    attempt: &AttemptHandle,
+    expected: &Observation,
+    mint: &CandidateMint<'_>,
+) -> Result<AdmissionOutcome, StoreError> {
+    mint.validate()?;
+    if expected.hash != mint.custody.plaintext_sha256 {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_attempt(&tx, attempt).await? {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    tx.execute(
+        "INSERT INTO posted_file_registry (plaintext_sha256, selected_generation) \
+         SELECT $1, (SELECT id FROM posted_files WHERE plaintext_sha256 = $1) \
+         ON CONFLICT (plaintext_sha256) DO NOTHING",
+        &[&expected.hash],
+    )
+    .await
+    .map_err(database_error)?;
+    let registry = tx
+        .query_one(
+            "SELECT selected_generation, revision, pending_operation FROM posted_file_registry \
+             WHERE plaintext_sha256 = $1 FOR UPDATE",
+            &[&expected.hash],
+        )
+        .await
+        .map_err(database_error)?;
+    if let Some(operation) = registry.get::<_, Option<String>>("pending_operation") {
+        if operation != mint.operation_id {
+            return Ok(AdmissionOutcome::ClaimBusy);
+        }
+        let Some(handle) = read_handle(&tx, attempt, &operation).await? else {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        };
+        let bundle = stored(&tx, &handle.generation).await?;
+        if bundle.generation_id() != mint.generation_id
+            || bundle.plan_sha256() != mint.plan_sha256
+            || bundle.custody()? != mint.custody
+        {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        }
+        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+        return Ok(AdmissionOutcome::ResumedSameCandidate(handle, bundle));
+    }
+    let selected: Option<String> = registry.get("selected_generation");
+    if registry.get::<_, i64>("revision") != expected.revision || selected != expected.selected {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    if let Some(id) = selected {
+        let Some(health) = tx
+            .query_opt(
+                "SELECT state, revision FROM posted_file_health WHERE generation_id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .await
+            .map_err(database_error)?
+        else {
+            return Ok(AdmissionOutcome::InconsistentOrMissing);
+        };
+        if Some(health.get::<_, i64>("revision")) != expected.health_revision {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        }
+        return Ok(match health.get::<_, &str>("state") {
+            // The complete reuse/publication lease is not implemented in this
+            // preparation slice. Do not return an unfenced reusable bundle.
+            "usable" | "terminal_failed" => AdmissionOutcome::InconsistentOrMissing,
+            _ => AdmissionOutcome::ClaimBusy,
+        });
+    }
+    if expected.health_revision.is_some() {
+        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    }
+    let p = &mint.custody;
+    let inserted = tx
+        .execute(
+            "INSERT INTO posted_files (id, generation_operation, plan_sha256, plaintext_sha256, \
+             backbone_post, backbone_verify, article_count, original_nzb_sha256, plaintext_size, \
+             article_payload_size, header_nonce, file_key_encrypted, file_key_envelope_version, \
+             file_key_kek_version, file_key_dek_wrapped_nonce, file_key_dek_wrapped, \
+             file_key_payload_nonce, file_key_payload_format, manifest_encrypted, \
+             manifest_envelope_version, manifest_kek_version, manifest_dek_wrapped_nonce, \
+             manifest_dek_wrapped, manifest_payload_nonce, manifest_payload_format) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,2,$13,$14,$15,$16,$17,$18,2,$19,$20,$21,$22,$23) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &mint.generation_id,
+                &mint.operation_id,
+                &mint.plan_sha256,
+                &p.plaintext_sha256,
+                &p.backbone_post,
+                &p.backbone_verify,
+                &p.article_count,
+                &p.original_nzb_sha256,
+                &p.plaintext_size,
+                &p.article_payload_size,
+                &p.header_nonce,
+                &p.file_key_encrypted,
+                &p.file_key_kek_version,
+                &p.file_key_dek_wrapped_nonce,
+                &p.file_key_dek_wrapped,
+                &p.file_key_payload_nonce,
+                &p.file_key_payload_format,
+                &p.manifest_encrypted,
+                &p.manifest_kek_version,
+                &p.manifest_dek_wrapped_nonce,
+                &p.manifest_dek_wrapped,
+                &p.manifest_payload_nonce,
+                &p.manifest_payload_format,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if inserted != 1 {
+        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    }
+    let revision = expected
+        .revision
+        .checked_add(1)
+        .ok_or(StoreError::Inconsistent)?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO posted_file_operations (id, plaintext_sha256, generation_id, job_id, \
+             attempt, attempt_token, claim_token, lease_until, registry_revision) \
+             SELECT $1,$2,$3,a.job_id,a.attempt,a.token,gen_random_uuid()::text,a.lease_until,$7 \
+             FROM posted_file_job_attempts a WHERE a.job_id = $4 AND a.attempt = $5 AND a.token = $6 \
+             AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint ON CONFLICT DO NOTHING",
+            &[
+                &mint.operation_id,
+                &p.plaintext_sha256,
+                &mint.generation_id,
+                &attempt.job_id,
+                &attempt.attempt,
+                &attempt.token,
+                &revision,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if inserted != 1 {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    tx.execute(
+        "INSERT INTO posted_file_health (generation_id) VALUES ($1)",
+        &[&mint.generation_id],
+    )
+    .await
+    .map_err(database_error)?;
+    tx.execute(
+        "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+         VALUES ('in_flight', $1, $2, $3)",
+        &[&mint.operation_id, &mint.generation_id, &p.plaintext_sha256],
+    )
+    .await
+    .map_err(database_error)?;
+    let updated = tx
+        .execute(
+            "UPDATE posted_file_registry SET pending_operation = $2, revision = $3 \
+             WHERE plaintext_sha256 = $1 AND revision = $4 AND selected_generation IS NULL \
+             AND pending_operation IS NULL",
+            &[
+                &expected.hash,
+                &mint.operation_id,
+                &revision,
+                &expected.revision,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated != 1 {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    let handle = read_handle(&tx, attempt, mint.operation_id)
+        .await?
+        .ok_or(StoreError::Inconsistent)?;
+    let bundle = stored(&tx, mint.generation_id).await?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AdmissionOutcome::Admitted(handle, bundle))
+}
+
+/// Revalidate immediately before a network request, without holding locks
+/// across that request. A request may complete externally after expiry; this
+/// check does not authorize its later callback to bypass the same fence.
+pub async fn posting_fence_is_current(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<bool, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_attempt(&tx, &handle.attempt).await? {
+        return Ok(false);
+    }
+    let registry = tx
+        .query_opt(
+            "SELECT r.revision FROM posted_file_registry r
+             JOIN posted_file_operations o ON o.plaintext_sha256 = r.plaintext_sha256
+             WHERE o.id = $1 AND r.pending_operation = o.id AND r.revision = $2
+             AND r.selected_generation IS NOT DISTINCT FROM $3::text FOR UPDATE OF r",
+            &[
+                &handle.operation,
+                &handle.registry_revision,
+                &handle.predecessor,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if registry.is_none() {
+        return Ok(false);
+    }
+    let current = tx
+        .query_opt(
+            "SELECT o.id FROM posted_file_operations o
+             JOIN posted_file_health h ON h.generation_id = o.generation_id
+             WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3
+             AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6
+             AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text
+             AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint
+             AND h.revision = $10 AND h.round = $11 AND h.round_token = $12
+             AND h.state IN ('unknown', 'verifying') AND o.state = 'pending'
+             AND o.lease_until > extract(epoch FROM clock_timestamp())::bigint FOR UPDATE OF o, h",
+            &[
+                &handle.operation,
+                &handle.generation,
+                &handle.claim_token,
+                &handle.attempt.job_id,
+                &handle.attempt.attempt,
+                &handle.attempt.token,
+                &handle.registry_revision,
+                &handle.predecessor,
+                &handle.predecessor_health_revision,
+                &handle.health_revision,
+                &handle.round,
+                &handle.round_token,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some();
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(current)
+}
+
+/// Lost admission acknowledgment: reread by durable operation identity before
+/// any POST. This never inserts, changes a plan, rotates a token or resets a
+/// counter. An expired handle needs explicit fenced takeover, not this method.
+pub async fn recover(
+    client: &mut Client,
+    attempt: &AttemptHandle,
+    hash: &str,
+    operation: &str,
+) -> Result<AdmissionOutcome, StoreError> {
+    if !identity(operation) || !crate::two_spool::validate_plaintext_sha256(hash) {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_attempt(&tx, attempt).await? {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    let exists = tx
+        .query_opt(
+            "SELECT revision FROM posted_file_registry WHERE plaintext_sha256 = $1 FOR UPDATE",
+            &[&hash],
+        )
+        .await
+        .map_err(database_error)?;
+    if exists.is_none() {
+        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    }
+    let Some(handle) = read_handle(&tx, attempt, operation).await? else {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    };
+    let bundle = stored(&tx, &handle.generation).await?;
+    if bundle.custody()?.plaintext_sha256 != hash {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AdmissionOutcome::ResumedSameCandidate(handle, bundle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_is_bounded_and_has_no_control_characters() {
+        assert!(identity("operation_1-2"));
+        for invalid in ["", "a b", "a/b", "a\n", "é"] {
+            assert!(!identity(invalid));
+        }
+        assert!(!identity(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn handles_never_debug_tokens_or_identities() {
+        let attempt = AttemptHandle {
+            job_id: "private-job".into(),
+            owner_id: "private-owner".into(),
+            attempt: 3,
+            token: "private-attempt-token".into(),
+        };
+        let handle = GenerationHandle {
+            attempt: attempt.clone(),
+            operation: "private-operation".into(),
+            generation: "private-generation".into(),
+            claim_token: "private-claim-token".into(),
+            registry_revision: 2,
+            predecessor: None,
+            predecessor_health_revision: None,
+            health_revision: 0,
+            round: 0,
+            round_token: "private-round-token".into(),
+        };
+        assert_eq!(format!("{attempt:?}"), "AttemptHandle([REDACTED])");
+        assert_eq!(format!("{handle:?}"), "GenerationHandle([REDACTED])");
+        assert_eq!(
+            format!("{:?}", AttemptOutcome::Acquired(attempt)),
+            "Acquired(AttemptHandle([REDACTED]))"
+        );
+    }
+}

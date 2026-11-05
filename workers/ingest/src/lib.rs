@@ -52,6 +52,7 @@ pub mod pool_body;
 pub mod pool_deadline;
 pub mod pool_probe;
 pub mod posted_files;
+pub mod posted_generations;
 pub mod probe;
 pub mod queue;
 pub mod queue_consumer;

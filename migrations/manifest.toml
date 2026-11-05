@@ -273,3 +273,8 @@ old_path = "migrations/0035_posted_files_crypto.sql"
 new_path = "migrations/0036_posted_files_crypto.sql"
 old_sha256 = "f9ed9bc2398fc19f56ab2688715c391606595c5b8296431e7f97b6594dcc9fd7"
 new_sha256 = "2eda914417a2111d0d799261d570348c2e41d3bdc981d338235f63cf8682e8bc"
+
+[[migration]]
+file = "0037_posted_file_generations.sql"
+target = "app"
+sha256 = "095a66b31f9aa15b93f1b5987f2f86f04cd49f92e457d414066282616a2658ab"
