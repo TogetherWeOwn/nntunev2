@@ -160,24 +160,22 @@ B8 feeds the signed-URL vectors to staging and compares the wire verdicts
 against the matrix expectations. Vector ids (`botgrant-NNN`, `boturl-NNN`,
 `botmx-NNN`) are stable and citable; fixtures name secrets only.
 
-## Run locally
+## Run in GitHub Actions
 
-```sh
-cd e2e
-npm ci
-npx playwright install --with-deps chromium
-STAGING_BASE_URL=https://staging.example \
-  CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
-  CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
-  SYNTHETIC_NNTP_HOST='<synthetic fixture host>' \
-  SYNTHETIC_NNTP_PORT='563' \
-  SYNTHETIC_NNTP_USER='<test user>' \
-  SYNTHETIC_NNTP_PASS='<from ~/secure-drop>' \
-  npm run e2e:staging
-```
+Push the PR branch and open a draft PR while work is incomplete. The
+`e2e-lint` job in [CI](../.github/workflows/ci.yml) runs harness typechecking,
+offline self-tests and spec discovery as part of `ci-ok`; these are not a
+local CI-mirror checklist. Full staging journeys run only through the
+post-deploy Actions path described below, not from a local shell.
 
-Smoke only: `npm run e2e:smoke`. Validate without staging: `npm run typecheck`,
-`npm run test:unit`, and `npm run e2e:list`.
+Local tests are limited to focused reproduction of one failing test from
+an Actions job. Select that test explicitly rather than invoking the full
+`test:unit`, `e2e:staging` or smoke suite. Heavy focused reproduction must
+use the guarded `boat` PATH wrapper with `--no-env`, source-only export and
+verified cleanup; do not forward staging or host credentials. A fallback
+cannot authorize a full suite or heavy raw-host run. If the reproduction
+cannot meet these limits, use Actions or route its actual prerequisite.
+See [verification policy](../CONTRIBUTING.md#verification-github-actions-first).
 
 If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
@@ -254,7 +252,7 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Form-to-library arrival is asserted by `signup-arrival.spec.ts`: the
+  Form-to-billing arrival is asserted by `signup-arrival.spec.ts`: the
   code-plus-passkey finish retrieves the code from the staging-only
   `POST /api/test-codes` seam, which is live on staging
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
@@ -374,6 +372,13 @@ How the suite uses them:
   enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
+
+For PR CI, record the full reviewed head SHA plus exact-head Actions run
+and `e2e-lint`/`ci-ok` job URLs and conclusions, following
+[the evidence contract](../CONTRIBUTING.md#evidence-for-review-and-release).
+Reviewers and the Release Manager accept those links as CI evidence, not
+local full-suite transcripts. They do not replace the same-deployed-build
+journey, authorized production promotion, migration or rollback gates.
 
 On failure CI sanitizes then uploads `test-results/` only (7 days, junit).
 Raw traces and screenshots are disabled: tracing records request

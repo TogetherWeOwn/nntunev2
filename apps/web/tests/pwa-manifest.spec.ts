@@ -7,7 +7,7 @@ import { expect, test } from '@playwright/test';
 //   192px + 512px icons.
 // - App head links the manifest and sets a matching theme-color meta.
 // - Manifest description, home meta description, and the landing paragraph
-//   disclose all four unwired capabilities and point to signup or BYOP setup.
+//   disclose all four unwired capabilities and point to signup and account plans.
 // Theme color #0b0d12 matches --nt-bg (dark default) in
 // src/lib/design/tokens.css. Name "NNTune" matches the landing heading.
 
@@ -43,8 +43,10 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 		}
 	}
 
-	expect(text, `${surface} should point to signup or bring-your-own-provider setup`).toMatch(
-		/\b(?:sign[ -]?up|bring[- ]your[- ]own[- ]providers?|BYOP)\b/i
+	expect(text, `${surface} should point to signup`).toMatch(/\bsign[ -]?up\b/i);
+	expect(text, `${surface} should point to account plans`).toMatch(/\bplans?\b/i);
+	expect(text, `${surface} must not promise retired provider setup`).not.toMatch(
+		/\b(?:providers?|Usenet|BYOP)\b/i
 	);
 }
 
@@ -54,7 +56,7 @@ test('rejects the old streams headline prepended to otherwise honest copy', asyn
 	// streaming pattern must catch every stream verb form (streams,
 	// streaming, streamed) while honest copy still passes.
 	const honest =
-		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up to choose an account plan.';
 	const mutant = `NNTune streams your music on Cloudflare. ${honest}`;
 
 	expect(() => expectHonestPublicCopy(honest, 'regression control')).not.toThrow();
@@ -79,7 +81,7 @@ for (const [capability, wording, claim] of [
 ] as const) {
 	test(`rejects affirmative ${wording} beside otherwise honest copy`, async () => {
 		const honest =
-			'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+			'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up to choose an account plan.';
 
 		expect(() => expectHonestPublicCopy(honest, 'sibling control')).not.toThrow();
 		expect(() => expectHonestPublicCopy(`${claim} ${honest}`, 'sibling mutant')).toThrow(

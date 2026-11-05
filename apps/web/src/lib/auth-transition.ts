@@ -3,7 +3,7 @@
  *
  * The security page calls {@link notifyLocalAuthTransition} after a
  * qualifying result (logout or revoke-all fulfilled success, or a typed
- * HTTP401) so every mounted consumer in this tab — library, provider, BYOP —
+ * HTTP401) so every mounted consumer in this tab — library and account —
  * resets through the same callback it uses for the delivered cross-tab
  * transition (`nntune.library.auth-transition.v1` storage event). Only
  * qualifying security-action completions notify; sign-in completion and

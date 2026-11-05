@@ -5,7 +5,7 @@ import { onPaywall, type PaywallModel } from '../billing/planLimit.js';
 
 /**
  * Acceptance: a hung ApiClient request must abort after a deadline and
- * surface the typed ApiError instead of wedging auth/BYOP spinners forever.
+ * surface the typed ApiError instead of wedging auth spinners forever.
  *
  * Contract pinned here (the numeric deadline is the implementation's
  * configured choice):
@@ -124,12 +124,12 @@ describe('ApiClient request deadline', () => {
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 
-	it('aborts a hung POST to the vault test endpoint instead of wedging BYOP', async () => {
+	it('aborts a hung POST instead of wedging the caller', async () => {
 		const signals: (AbortSignal | undefined)[] = [];
 		const fetchFn = neverResolvingFetch(signals);
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		const tracked = track(client.post('/v1/vault/test', { provider: {} }));
+		const tracked = track(client.post('/v1/auth/magic/start', { email: 'alice@example.com' }));
 
 		await vi.advanceTimersByTimeAsync(STILL_PENDING_MS);
 		expect(tracked.settled).toBe(false);

@@ -139,17 +139,12 @@ impl handlers::Store for DenyingStore {
         magic_by_hash(token_hash: &str) -> Result<Option<auth::MagicLinkRecord>, handlers::StoreError>,
         reserve_rate_limit(scope_key: &str, action: &str, limit: u64, now: u64, window_secs: u64) -> Result<bool, handlers::StoreError>,
         prune_expired_challenges(now: u64) -> Result<(), handlers::StoreError>,
-        acquire_test_connection_lease(user_id: &str, token: &str, lease_secs: u64, max_concurrency: u32) -> Result<bool, handlers::StoreError>,
-        release_test_connection_lease(user_id: &str, token: &str) -> Result<(), handlers::StoreError>,
         invite_by_hash(code_hash: &str) -> Result<Option<auth::InviteRecord>, handlers::StoreError>,
         insert_session(record: &session::SessionRecord) -> Result<(), handlers::StoreError>,
         session_by_id(id: &str) -> Result<Option<session::SessionRecord>, handlers::StoreError>,
         rotate_session_row(id: &str, expected_counter: u32, new_counter: u32, new_expires_at: u64) -> Result<bool, handlers::StoreError>,
         revoke_session(id: &str) -> Result<(), handlers::StoreError>,
         revoke_all_sessions(user_id: &str) -> Result<(), handlers::StoreError>,
-        vault_by_user(user_id: &str) -> Result<Option<handlers::VaultRow>, handlers::StoreError>,
-        upsert_vault(user_id: &str, row: &handlers::VaultRow) -> Result<(), handlers::StoreError>,
-        delete_vault(user_id: &str) -> Result<(), handlers::StoreError>,
         insert_audit(event: &vault::AuditEvent) -> Result<(), handlers::StoreError>
     }
 
