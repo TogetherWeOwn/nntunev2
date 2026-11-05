@@ -7,6 +7,18 @@
   implementation acceptance requirements, public-playlist metadata-only rule,
   playlist public_id delete handle, and method-split step-up verification.
   No completed review score or client-compatibility test result is claimed.
+- **Revised:** 2026-11-03 — post-BYOP alignment
+  ([ADR 0013](0013-shared-popularity-cache.md),
+  [ADR 0014](0014-backend-provider-pool.md)): the native surface has no user
+  provider, indexer or NZB endpoints. Users supply no Usenet credentials and
+  no NZBs; NZB intake exists only on the separate admin ingest surface, and
+  pool accounts are operator configuration, never a user API. The legacy
+  `/v1/vault` endpoints in current code are removal-pending legacy, not
+  target surface (tracked in `docs/api-delivery-map.md`). Playlist restore
+  and cache refill resolve through the track's curated source and the
+  backend pool; there is no own-provider fetch and no per-user cache grant.
+  The Subsonic "caps apply equally — no bypass via the compat surface" rule
+  is unchanged.
 
 ## Context
 
@@ -25,8 +37,12 @@ least-privilege credential.
 
 1. **Native REST (OpenAPI 3.1, `openapi.yaml` at repo root of `workers/api`):**
    the canonical API. `apps/web` uses only this. Resources: `/v1/{me,library,
-   artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`
-   plus delete entry points `DELETE /v1/account`, `DELETE
+   artists,releases,tracks,playlists,plays,search,stream}`. There is no
+   `/v1/providers`, `/v1/indexers` or user NZB resource (2026-11-03
+   revision): provider accounts are service pool configuration (ADR 0014)
+   and NZB intake is admin-only ingest, neither reachable from a user
+   session or a scoped native credential. Delete entry points:
+   `DELETE /v1/account`, `DELETE
    /v1/libraries/{id}` (`libraries.id` UUID), `DELETE /v1/playlists/{public_id}`
    (playlist `public_id` TEXT; the `delete_operations.container_id` TEXT holds
    that handle, ADR 0002), `POST
@@ -151,7 +167,7 @@ least-privilege credential.
   clients use `t`/`s`. `/rest/*` logging MUST redact `u`, `p`, `t`, `s`
   and `apiKey` before any sink (access logs, error reports, traces).
   `scope='subsonic'` is an allowlist: the credential reaches only the
-  `/rest/*` subset — never `/v1`, provider credentials, or ingest.
+  `/rest/*` subset — never `/v1`, pool credentials, or ingest.
   Per-credential rate limits apply, and `last_used_at` anomalies (burst
   from a new IP/ASN) alert.
 - Catalog access is library-scoped by default (ADR 0002 §6): every read or
@@ -174,27 +190,30 @@ least-privilege credential.
   `/api/playlists` contract survives this ADR.
   Membership and playlist writes are ownership-checked per ADR 0002 §6 and cannot
   self-assert another user's rows: a playlist write needs the same library
-  membership reads need plus an own track source, and entries whose track left
+  membership reads need, and entries whose track left
   every caller library stay as dormant tombstones (stable positions/counts;
   `playlist_tracks.track_id` remains non-NULL; dormancy means no caller
-  `library_tracks` membership; stream/scrobble 404/70). Retain their encrypted
-  own source while any own playlist
-  entry survives; the entry-keyed restore `POST
-  /v1/playlists/{playlist_id}/entries/{entry_id}/restore` with body
+  `library_tracks` membership; stream/scrobble 404/70). The track's encrypted
+  curated source (ADR 0002, 2026-11-03 revision) is service-owned catalogue
+  data, retained independently of any user's entries; the entry-keyed restore
+  `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore` with body
   `{library_id}` restores membership — it resolves playlist, entry, and library
-  ownership first, then the track through the entry plus the caller's own
-  `track_sources` row, never through a caller-supplied catalog id — then an
-  own-provider fetch recreates evicted audio media/grants (ADR 0002 rules 3 and
-  6). A plain library write with a non-member track id stays 404/70 and cannot
-  restore; another user's entry id or a source-less dormant entry is 404/70.
-  Neither a dormant entry nor its retained source authorizes a read. `getCoverArt` takes only the
+  ownership first, then the track through the entry plus its curated
+  `track_sources` row, never through a caller-supplied catalog id — after
+  which ordinary playback serves from the shared cache or refills it through
+  the backend pool (ADR 0013/0014; ADR 0002 rules 3 and 6 as revised). A plain
+  library write with a non-member track id stays 404/70 and cannot restore;
+  another user's entry id or a dormant entry whose track has no curated
+  source is 404/70. Neither a dormant entry nor the curated source authorizes
+  a read by itself. `getCoverArt` takes only the
   opaque `coverart:{release_id}` id from `getAlbum`/`getSong`/`search3` and checks
   release membership **before** resolving `release_art`, reading bytes or refilling.
   The primary is the sole launch rendition, `original`. Art uses membership plus
   current entitlement (ADR 0002 rule 4 / ADR 0004),
-  **no audio grant**: the post-write `art` stage/refill uses embedded selectors from
-  the local owner's current member-track sources, or CAA from a verified release
-  MBID (ADR 0003, bounded prefix, per-user concurrency cap, negative-cache rules). Expired/missing art pointers or objects use that same bounded
+  **no audio grant** (per-user cache grants are retired, not signed stream grants, ADR 0013): the post-write
+  `art` stage/refill uses embedded selectors from the curated source recorded
+  at admin ingest, or CAA from a verified release
+  MBID (ADR 0003 as restated by ADR 0013, bounded prefix, per-user concurrency cap, negative-cache rules). Expired/missing art pointers or objects use that same bounded
   refill; unavailable art returns 404/70, temporary upstream failure a retryable
   error. Serve privately, never by raw hash or public R2 URL. A new endpoint that
   takes or returns a catalog id is denied until it declares how it applies this gate.
@@ -206,8 +225,9 @@ least-privilege credential.
 
 ## Consequences
 
-- Third-party clients work on day one for playback + library browse; advanced
-  features (BYOP management, ingest jobs) are REST-only.
+- Third-party clients work on day one for playback + library browse. There is
+  no provider management on any surface; ingest is an admin-only surface,
+  never part of the user REST or Subsonic APIs.
 - Fuzz/contract tests cover the Subsonic subset against known client quirks
   (case sensitivity, `c=` client param, token/salt and `apiKey` vectors,
   `apiKey`-without-`u`, error 43 on mixed `u`+`apiKey`, error 42 on `p=` or
