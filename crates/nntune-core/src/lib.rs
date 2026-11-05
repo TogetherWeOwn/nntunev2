@@ -17,6 +17,7 @@
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
 //! - [`nzb_writer`]: NZB emit side used by the poster (output always parses).
+//! - [`content_verify`]: bounded complete-read authentication and plaintext digest.
 //! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
 //! - [`encrypt`]: encrypt-on-write for the rclone-crypt layout.
 //! - [`par2`]: PAR2 recovery-set parsing and verification, plus the creator
@@ -34,6 +35,7 @@
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
 pub mod article;
+pub mod content_verify;
 pub mod decrypt;
 pub mod encrypt;
 pub mod error;

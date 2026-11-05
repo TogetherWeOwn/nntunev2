@@ -257,7 +257,7 @@ pub mod rclone {
                 .ok()
                 .and_then(|n| n.checked_add(CIPHER_OVERHEAD as usize))
                 .ok_or_else(out_of_range)?;
-            let mut sealed = vec![0u8; sealed_len];
+            let mut sealed = zeroize::Zeroizing::new(vec![0u8; sealed_len]);
             read_exact_at(src, &mut sealed, cipher_off)
                 .map_err(|e| Error::Decrypt(format!("rclone block {block_number}: {e}")))?;
 
