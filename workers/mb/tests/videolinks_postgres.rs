@@ -8,6 +8,10 @@ use nntune_mb::videolinks::harvest::{
 use nntune_mb::videolinks::moderation::{
     PgSubmissionStore, SubmissionStoreError, MAX_PENDING_SUBMISSIONS,
 };
+use nntune_mb::videolinks::retention::{
+    cleanup_metadata, CleanupError, MetadataBacklog, PgRetentionStore, RetentionStore,
+    MAX_CLEANUP_BATCHES,
+};
 use nntune_mb::videolinks::storage::{
     CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
 };
@@ -533,6 +537,17 @@ async fn contention_is_bounded(db: &mut Client, config: &Config) {
     .expect("purge statement timeout");
     assert_eq!(result, Err(ValidationError::Store));
     assert!(client.calls.borrow().is_empty());
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        PgRetentionStore::new(db).metadata_backlog(NOW),
+    )
+    .await
+    .expect("audit statement timeout");
+    assert_eq!(
+        result,
+        Err(CleanupError::Store),
+        "failure is not a zero receipt"
+    );
     tx.commit().await.unwrap();
 }
 
@@ -610,16 +625,35 @@ async fn cleanup_progress_is_bounded(db: &mut Client, config: &Config) {
         0,
         "zero is not proof that no locked work remains"
     );
-    lock.rollback().await.unwrap();
     assert_eq!(
-        store.purge_expired(NOW).await.unwrap(),
-        1,
-        "released row is retried on the next call"
+        PgRetentionStore::new(db)
+            .metadata_backlog(NOW)
+            .await
+            .unwrap(),
+        MetadataBacklog {
+            retained_rows: 2,
+            expired_rows: 1,
+            oldest_expired_validated_at: Some(stale),
+        },
+        "a locked overdue row remains visible to the independent audit"
     );
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!((report.purged_rows, report.batches), (0, 1));
+    assert_eq!(report.backlog.unwrap().expired_rows, 1);
+    lock.rollback().await.unwrap();
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!((report.purged_rows, report.batches), (1, 2));
     assert_eq!(
-        store.purge_expired(NOW).await.unwrap(),
-        0,
-        "idempotent after draining"
+        report.backlog.unwrap(),
+        MetadataBacklog {
+            retained_rows: 1,
+            expired_rows: 0,
+            oldest_expired_validated_at: None,
+        }
     );
     let after = states(db).await;
     assert_eq!(
@@ -627,6 +661,148 @@ async fn cleanup_progress_is_bounded(db: &mut Client, config: &Config) {
         MAX_PURGES_PER_CALL as usize + 2
     );
     assert_eq!(after.iter().filter(|row| row.1 == "validated").count(), 1);
+}
+
+async fn retention_audit_contract(db: &mut Client) {
+    reset_candidates(db).await;
+    let empty = MetadataBacklog {
+        retained_rows: 0,
+        expired_rows: 0,
+        oldest_expired_validated_at: None,
+    };
+    assert_eq!(
+        PgRetentionStore::new(db)
+            .metadata_backlog(NOW)
+            .await
+            .unwrap(),
+        empty
+    );
+    seed(db, 8).await;
+    assert_eq!(
+        PgRetentionStore::new(db)
+            .metadata_backlog(NOW)
+            .await
+            .unwrap(),
+        empty
+    );
+    db.execute(
+        "UPDATE public.video_link_candidates
+         SET validated_at = $1, expires_at = $2",
+        &[&NOW, &(NOW + VALIDATION_TTL_S)],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.video_link_candidates SET title = 'title', validated_at = 0
+         WHERE video_id = 'v0000000000';",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.video_link_candidates SET channel_id = 'channel', validated_at = $1
+         WHERE video_id = 'v0000000001'",
+        &[&(NOW - VALIDATION_TTL_S)],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.video_link_candidates SET duration_secs = 1, expires_at = $1
+         WHERE video_id = 'v0000000002'",
+        &[&NOW],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.video_link_candidates SET embeddable = false, expires_at = $1
+         WHERE video_id = 'v0000000003'",
+        &[&(NOW - 1)],
+    )
+    .await
+    .unwrap();
+    db.batch_execute(
+        "UPDATE public.video_link_candidates SET status = 'rejected'
+         WHERE video_id = 'v0000000004';
+         UPDATE public.video_link_candidates SET status = 'validated', validated_at = -1
+         WHERE video_id = 'v0000000005';
+         UPDATE public.video_link_candidates SET status = 'expired'
+         WHERE video_id = 'v0000000007'",
+    )
+    .await
+    .unwrap();
+    let before = states(db).await;
+    for now in [0, -1, i64::MIN] {
+        let mut store = PgRetentionStore::new(db);
+        assert_eq!(
+            store.metadata_backlog(now).await,
+            Err(CleanupError::InvalidTime)
+        );
+        assert_eq!(
+            store.purge_metadata(now).await,
+            Err(CleanupError::InvalidTime)
+        );
+    }
+    assert_eq!(
+        PgRetentionStore::new(db)
+            .metadata_backlog(NOW)
+            .await
+            .unwrap(),
+        MetadataBacklog {
+            retained_rows: 6,
+            expired_rows: 5,
+            oldest_expired_validated_at: Some(-1),
+        }
+    );
+    assert_eq!(
+        states(db).await,
+        before,
+        "audits and refused clocks never write"
+    );
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!((report.purged_rows, report.batches), (5, 2));
+    assert_eq!(
+        report.backlog.unwrap(),
+        MetadataBacklog {
+            retained_rows: 1,
+            expired_rows: 0,
+            oldest_expired_validated_at: None,
+        }
+    );
+
+    reset_candidates(db).await;
+    let cap = MAX_PURGES_PER_CALL * MAX_CLEANUP_BATCHES as i64;
+    seed(db, cap as i32 + 1).await;
+    db.execute(
+        "UPDATE public.video_link_candidates SET status = 'validated', title = 'old',
+             validated_at = $1, expires_at = $2",
+        &[&(NOW - VALIDATION_TTL_S), &(NOW + 1)],
+    )
+    .await
+    .unwrap();
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.purged_rows, report.batches),
+        (cap as u64, MAX_CLEANUP_BATCHES)
+    );
+    assert_eq!(
+        report.backlog.unwrap().expired_rows,
+        1,
+        "cap is not a drain claim"
+    );
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!((report.purged_rows, report.batches), (1, 2));
+    assert_eq!(report.backlog.unwrap(), empty);
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!((report.purged_rows, report.batches), (0, 1));
+    assert_eq!(report.backlog.unwrap(), empty);
 }
 
 async fn earlier_batch_survives(db: &mut Client) {
@@ -1530,6 +1706,7 @@ fn postgres_validation_store_contract() {
                 stale_writes_and_atomic_failure(&mut db).await;
                 contention_is_bounded(&mut db, &config).await;
                 cleanup_progress_is_bounded(&mut db, &config).await;
+                retention_audit_contract(&mut db).await;
                 earlier_batch_survives(&mut db).await;
                 candidate_admission_contract(&mut db).await;
                 fresh_link_read_contract(&mut db).await;

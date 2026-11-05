@@ -28,6 +28,7 @@
 
 pub mod harvest;
 pub mod moderation;
+pub mod retention;
 pub mod storage;
 pub mod validation;
 

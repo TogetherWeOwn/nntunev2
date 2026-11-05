@@ -15,8 +15,10 @@ client requiring a runtime Secret. `storage.rs` supplies bounded external
 candidate admission and fresh-link database reads. `harvest.rs` supplies a
 read-only paged MusicBrainz mirror source and a bounded runner that admits
 its pages into the app store. `moderation.rs` supplies a persistent pending
-queue and atomic decision/promotion in the app database. No route, schedule
-or database binding calls these adapters yet.
+queue and atomic decision/promotion in the app database. `retention.rs`
+supplies independent cleanup and aggregate backlog receipts without requiring
+a validation client or credential. No route, schedule or database binding
+calls these adapters yet.
 
 `refresh_due` purges one bounded batch of expired API-returned fields before
 contacting the validation client, requests at most 200 distinct IDs in four
@@ -301,8 +303,14 @@ cleared rows no longer consume the next batch.
 The disposable PostgreSQL contract adds more than one batch of expired rows,
 a held row, a fresh shared-ID association, successive-call progress and later
 cleanup after lock release. The incompatible-table-lock fixture retains the
-runner's cleanup-failure-before-HTTP check. Execution of this increment awaits
-exact-head Actions; no local tests/builds ran.
+runner's cleanup-failure-before-HTTP check. The
+[PostgreSQL job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42030304654/job/127254862087)
+and [MB Rust job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42030304654/job/127254862309)
+passed at `1cd8cfcbd58f3c54c4dd3698f13f31059b2b75d0`.
+[Run metadata](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42030304654)
+associates that head with this PR. Web E2E remained running at capture; no
+aggregate success or deployed-retention result is claimed. No local
+tests/builds ran.
 
 A returned count is only this call's acknowledged updates: even zero is **not**
 proof of a drained backlog because eligible rows can be locked. This bounds
@@ -312,6 +320,44 @@ locks, statement timeouts or arrivals faster than cleanup can still miss the
 retention deadline. The adapter still needs that runtime schedule and measured
 cleanup receipts. Filtering stale reads alone does not establish the deployed
 30-day deletion guarantee. Only video IDs may persist long-term.
+
+### Independent cleanup and backlog receipts
+
+`cleanup_metadata` is an inactive, credential-independent maintenance runner.
+Each invocation performs at most four 200-row purge calls (800 acknowledged
+updates), under a 10-second total deadline. A zero update count stops further
+writes but **always** leads to an independent audit before success. No
+validation queue, HTTP client or YouTube credential is needed. A write/audit
+failure or deadline returns earlier acknowledged progress without retrying;
+a failed or cancelled commit can still have an unknown outcome. A missing
+audit is not reported as a healthy or empty backlog.
+
+`PgRetentionStore` delegates writes to the existing cleanup adapter and audits
+in a read-only transaction with a 1.5-second statement timeout. One aggregate
+statement counts retained and expired recording/video rows and returns the
+oldest expired validation timestamp. It matches cleanup eligibility, including
+API-derived validated/rejected states with no display fields and unexpected
+metadata on pending/expired rows. It never selects display fields or IDs into
+the result. Unlike cleanup, the audit does not skip row locks: committed
+expired metadata held by another transaction remains visible. Incompatible
+table locks can time out; errors never become zero counts.
+
+The audit has a fixed-size result, **not bounded scan work**. Its counts are
+from one statement snapshot and use the trusted invocation clock carried as
+`evaluated_at`, not audit completion time. Concurrent changes and time elapsed
+during the invocation can change the live backlog. Nonpositive validation
+timestamps remain literal values, not a measured age. Receipt persistence,
+alerts, runtime scheduling, throughput/lock monitoring and exact deployed
+retention evidence remain unfinished; a successful empty audit is not a
+continuous 30-day guarantee.
+
+Five native acceptance fixtures cover zero-with-backlog, the write cap,
+partial failure, failed audit and invalid clock/count receipts. A deadline
+unit fixture checks cancellation and retained progress. The disposable
+PostgreSQL contract adds independent visibility of a held overdue row,
+post-release cleanup, cap/resume/replay, empty and metadata-only/state-only
+rows, invalid timestamps, exact expiry/age boundaries and table-lock errors.
+These new fixtures await exact-head Actions; no local tests/builds ran.
 
 ## Moderation queue
 
