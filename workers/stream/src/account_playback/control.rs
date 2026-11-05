@@ -27,7 +27,7 @@ type Waiter = RefCell<Option<Waker>>;
 struct State<'a> {
     track_id: String,
     deadline_ms: u64,
-    now_ms: &'a dyn Fn() -> u64,
+    now_ms: Rc<dyn Fn() -> u64 + 'a>,
     last_ms: Cell<u64>,
     stopped: Cell<bool>,
     waiters: RefCell<Vec<Weak<Waiter>>>,
@@ -69,6 +69,28 @@ impl<'a> RequestControl<'a> {
         track_id: &str,
         key: &[u8],
         now_ms: &'a dyn Fn() -> u64,
+        request_deadline_ms: u64,
+        abort: Signal<'a>,
+        timer: impl FnOnce(u64) -> Signal<'a>,
+    ) -> Result<Self, SourceError> {
+        Self::with_clock(
+            token,
+            track_id,
+            key,
+            Rc::new(now_ms),
+            request_deadline_ms,
+            abort,
+            timer,
+        )
+    }
+
+    /// Retain an owned clock along with the SAME request signals and watermark.
+    /// Static inputs produce a static control without leaking or spawning them.
+    pub fn with_clock(
+        token: &str,
+        track_id: &str,
+        key: &[u8],
+        now_ms: Rc<dyn Fn() -> u64 + 'a>,
         request_deadline_ms: u64,
         abort: Signal<'a>,
         timer: impl FnOnce(u64) -> Signal<'a>,

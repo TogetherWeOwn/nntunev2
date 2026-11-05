@@ -1,7 +1,9 @@
 //! Off-route catalogue/account supplier for the shared async reader. No second
 //! reader, HTTP writer or delivered-byte meter is implemented here.
 
-use std::{future::Future, task::Poll};
+use std::{future::Future, rc::Rc, task::Poll};
+
+use zeroize::Zeroizing;
 
 use futures_util::{future::Shared, FutureExt};
 use nntune_core::original_source::{reader::AsyncArticleSource, OriginalSource, SourceError};
@@ -18,14 +20,62 @@ use crate::{
 /// Internal telemetry only, never delivery, entitlement or public metadata.
 /// No Debug: neither encoded articles nor source/account identities are logged.
 pub struct ArticleSupplier<'a, R, A> {
-    source: OriginalSource,
+    source: Rc<OriginalSource>,
     opened: Vec<bool>,
     serving_accounts: Vec<String>,
     control: RequestControl<'a>,
-    registry: &'a R,
-    accounts: &'a A,
-    keys: ChannelKeys<'a>,
-    operation_timer: &'a dyn Fn(u64) -> Signal<'a>,
+    registry: Retained<'a, R>,
+    accounts: Retained<'a, A>,
+    keys: SupplierKeys<'a>,
+    operation_timer: Retained<'a, dyn Fn(u64) -> Signal<'a> + 'a>,
+}
+
+/// Request-owned runtime dependencies. No Debug: channel keys remain redacted
+/// and zeroize when the task releases its inputs, including an unpolled drop.
+/// This constructor does not qualify or enable a Worker transport.
+pub struct OwnedSupplierInputs<R, A> {
+    pub registry: R,
+    pub accounts: A,
+    pub account_key: Zeroizing<Vec<u8>>,
+    pub resolver_key: Zeroizing<Vec<u8>>,
+    pub operation_timer: Box<dyn Fn(u64) -> Signal<'static>>,
+}
+
+enum Retained<'a, T: ?Sized> {
+    Borrowed(&'a T),
+    Owned(Box<T>),
+}
+
+impl<T: ?Sized> Retained<'_, T> {
+    fn get(&self) -> &T {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+enum SupplierKeys<'a> {
+    Borrowed(ChannelKeys<'a>),
+    Owned {
+        account: Zeroizing<Vec<u8>>,
+        resolver: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl SupplierKeys<'_> {
+    fn get(&self) -> ChannelKeys<'_> {
+        match self {
+            Self::Borrowed(keys) => ChannelKeys {
+                account: keys.account,
+                resolver: keys.resolver,
+            },
+            Self::Owned { account, resolver } => ChannelKeys {
+                account: Some(account),
+                resolver: Some(resolver),
+            },
+        }
+    }
 }
 
 impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
@@ -43,8 +93,28 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
         control: RequestControl<'a>,
         operation_timer: &'a dyn Fn(u64) -> Signal<'a>,
     ) -> Result<Self, SourceError> {
+        Self::prepare_inputs(
+            catalogue,
+            Retained::Borrowed(registry),
+            Retained::Borrowed(accounts),
+            SupplierKeys::Borrowed(keys),
+            control,
+            Retained::Borrowed(operation_timer),
+        )
+        .await
+    }
+
+    async fn prepare_inputs(
+        catalogue: &impl OriginalCatalogue,
+        registry: Retained<'a, R>,
+        accounts: Retained<'a, A>,
+        keys: SupplierKeys<'a>,
+        control: RequestControl<'a>,
+        operation_timer: Retained<'a, dyn Fn(u64) -> Signal<'a> + 'a>,
+    ) -> Result<Self, SourceError> {
         let source = control
             .run(async {
+                let keys = keys.get();
                 if !keys.account.is_some_and(|key| key.len() >= 32)
                     || !keys.resolver.is_some_and(|key| key.len() >= 32)
                 {
@@ -64,7 +134,7 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
         Ok(Self {
             opened: vec![false; source.article_count()],
             serving_accounts: Vec::new(),
-            source,
+            source: Rc::new(source),
             control,
             registry,
             accounts,
@@ -75,6 +145,12 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
 
     pub fn source(&self) -> &OriginalSource {
         &self.source
+    }
+
+    /// Share this exact immutable lookup result with the checked response plan.
+    /// This clones only the Rc, never source contents or catalogue resolution.
+    pub fn shared_source(&self) -> Rc<OriginalSource> {
+        self.source.clone()
     }
 
     /// One actual account per successful encoded article, including proof reads.
@@ -110,21 +186,18 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
                 let scope = OperationScope {
                     control: control.clone(),
                     deadline_ms,
-                    timer: (self.operation_timer)(remaining_ms).shared(),
+                    timer: (self.operation_timer.get())(remaining_ms).shared(),
                 };
                 let guarded = Guarded {
                     scope: &scope,
-                    registry: self.registry,
-                    accounts: self.accounts,
+                    registry: self.registry.get(),
+                    accounts: self.accounts.get(),
                 };
                 let served = scope
                     .run(account_selection::run(
                         &guarded,
                         &guarded,
-                        ChannelKeys {
-                            account: self.keys.account,
-                            resolver: self.keys.resolver,
-                        },
+                        self.keys.get(),
                         WorkClass::Stream,
                         operation,
                         || control.observed_ms(),
@@ -143,6 +216,30 @@ impl<'a, R: RegistrySource, A: AccountSource> ArticleSupplier<'a, R, A> {
             .await?;
         self.serving_accounts.push(provider_id);
         Ok(bytes)
+    }
+}
+
+impl<R: RegistrySource + 'static, A: AccountSource + 'static> ArticleSupplier<'static, R, A> {
+    /// Retain all pool-side inputs across a scheduled task, without self-borrows.
+    /// The catalogue is owned through lookup and then released. Response/task
+    /// scheduling must still use the SAME control and reviewed response library.
+    pub async fn prepare_owned(
+        catalogue: impl OriginalCatalogue,
+        inputs: OwnedSupplierInputs<R, A>,
+        control: RequestControl<'static>,
+    ) -> Result<Self, SourceError> {
+        Self::prepare_inputs(
+            &catalogue,
+            Retained::Owned(Box::new(inputs.registry)),
+            Retained::Owned(Box::new(inputs.accounts)),
+            SupplierKeys::Owned {
+                account: inputs.account_key,
+                resolver: inputs.resolver_key,
+            },
+            control,
+            Retained::Owned(inputs.operation_timer),
+        )
+        .await
     }
 }
 
@@ -197,8 +294,8 @@ impl OperationScope<'_> {
 // or hint from consuming authority and dispatching BODY in the same outer poll.
 struct Guarded<'s, 'a, R, A> {
     scope: &'s OperationScope<'a>,
-    registry: &'a R,
-    accounts: &'a A,
+    registry: &'s R,
+    accounts: &'s A,
 }
 
 impl<R: RegistrySource, A> RegistrySource for Guarded<'_, '_, R, A> {
