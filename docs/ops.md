@@ -397,6 +397,23 @@ are not PR deletions; no merge from the target is required to hide them.
 Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 
+The secretless PR gate loads its checker and its stdlib-only
+`migration_history.py` import from a separate checkout of the event's full
+trusted **base SHA**. The PR **head SHA** is checked out with full Git
+history under a different root, used only as evidence through `--root`;
+no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+excludes the working directory, `PYTHONPATH` and user-site imports, then
+adds only the trusted checker directory. The checker runs outside both
+checkouts with no API token in its environment; Git ignores global/system
+configuration and disables hooks and filesystem-monitor commands. The
+PR tree cannot supply Git's local configuration, which checkout creates.
+The checked-out head supplies the manifest while pinned Git objects supply
+SQL bytes and ancestry. A PR predating the checker can therefore be
+validated without executing its Python files. Missing trusted checker code,
+manifest, pinned Git objects or API evidence fails closed: there is no
+fallback to PR code and no missing-file pass. This compatibility boundary
+does not grant old heads an exception to the manifest or lineage contract.
+
 The secretless PR gate retains **both** coverage sources: complete,
 paginated net PR-file mappings and every per-parent Git rename in the
 pinned base-to-head ancestry. Net mappings are not invented direct
