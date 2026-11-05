@@ -2,6 +2,10 @@
 //! This is fence/custody/cancellation proof, not network, crypto or topology proof.
 
 use super::*;
+
+#[path = "posted_generation_content_delivery_races.rs"]
+mod delivery_races;
+
 use nntune_ingest::posted_generations::{
     drive_content_read, ContentReadStep, GenerationContentTransport, StoredGeneration,
 };
