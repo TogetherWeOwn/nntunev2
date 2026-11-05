@@ -128,7 +128,22 @@ test('402 limit shows terminal paywall with usage and upgrade CTA, no countdown'
 });
 
 test('upgrade CTA closes the paywall before navigating to pricing', async ({ page }) => {
-	await toCheckoutLimit(page, 402, {}, { code: 'plan_limit_exceeded' });
+	await page.route('**/v1/me/subscription', (route) =>
+		route.fulfill({
+			status: 402,
+			contentType: 'application/json',
+			body: JSON.stringify({ code: 'plan_limit_exceeded' })
+		})
+	);
+	await page.route('**/v1/me/usage', (route) =>
+		route.fulfill({
+			status: 500,
+			contentType: 'application/json',
+			body: JSON.stringify({ code: 'internal' })
+		})
+	);
+	await page.goto('/account/billing');
+	await expect(page).toHaveURL(/\/account\/billing$/);
 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();

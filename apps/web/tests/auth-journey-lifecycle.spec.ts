@@ -437,7 +437,7 @@ for (const journey of ['login', 'signup'] as const) {
 		await seedNewVisit(page);
 		expect((await calls(page)).map(({ stage }) => stage)).toEqual(['start', 'ceremony', 'finish']);
 		await page.evaluate(() => window.__authJourney.release());
-		await expect(page).toHaveURL(/\/library$/);
+		await expect(page).toHaveURL(journey === 'signup' ? /\/account\/billing$/ : /\/library$/);
 		expect(await page.evaluate(() => sessionStorage.getItem('nntune:signed-in-email'))).toBe(EMAIL);
 		for (const storage of await storedState(page)) {
 			expect(storage['nntune.library.snapshot.v1']).toBeUndefined();
