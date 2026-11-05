@@ -965,6 +965,114 @@ pub async fn finish_verification(
     commit_mutation(tx, handle).await
 }
 
+/// A stopped candidate is not a conclusively failed generation. None of these
+/// outcomes grants fresh-post, serving, selection or cleanup authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonmentOutcome {
+    Applied,
+    AlreadyAbandoned,
+    StaleOrDiverged,
+}
+
+/// Explicitly stop this candidate after a caller's keep-original/cancellation
+/// decision. This does not infer terminal loss from transport noise, scheduling
+/// or repair exhaustion. It never starts a replacement or releases custody.
+///
+/// The current handle fences the entire transaction. All references (including
+/// in-flight), sealed custody and historical progress/evidence/budgets survive.
+/// Old callbacks/takeovers cannot resume an abandoned operation. After an
+/// ambiguous commit, retry THIS original handle: AlreadyAbandoned is a durable
+/// receipt only, not a refreshed posting handle. An expired attempt must stop.
+pub async fn abandon_candidate(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<AbandonmentOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if lock_candidate(&tx, handle).await?.is_none() {
+        if !lock_attempt(&tx, &handle.attempt).await? {
+            return Ok(AbandonmentOutcome::StaleOrDiverged);
+        }
+        // A terminal receipt is independent of later registry selection. It must
+        // still match the exact original operation/claim and health transition;
+        // a refreshed handle or another attempt cannot acknowledge this stop.
+        let applied_revision = handle
+            .health_revision
+            .checked_add(1)
+            .ok_or(StoreError::Inconsistent)?;
+        let applied_round = handle
+            .round
+            .checked_add(1)
+            .ok_or(StoreError::Inconsistent)?;
+        let abandoned = tx
+            .query_opt(
+                "SELECT o.id FROM posted_file_operations o \
+                 JOIN posted_files p ON p.id = o.generation_id AND p.generation_operation = o.id \
+                 JOIN posted_file_health h ON h.generation_id = o.generation_id \
+                 WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3 \
+                 AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6 \
+                 AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text \
+                 AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint \
+                 AND o.state = 'abandoned' AND h.state = 'unknown' AND h.failure_kind IS NULL \
+                 AND h.verified_at IS NULL AND h.retention_checked_at IS NULL \
+                 AND h.revision = $10 AND h.round = $11",
+                &[
+                    &handle.operation,
+                    &handle.generation,
+                    &handle.claim_token,
+                    &handle.attempt.job_id,
+                    &handle.attempt.attempt,
+                    &handle.attempt.token,
+                    &handle.registry_revision,
+                    &handle.predecessor,
+                    &handle.predecessor_health_revision,
+                    &applied_revision,
+                    &applied_round,
+                ],
+            )
+            .await
+            .map_err(database_error)?
+            .is_some();
+        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+        return Ok(if abandoned {
+            AbandonmentOutcome::AlreadyAbandoned
+        } else {
+            AbandonmentOutcome::StaleOrDiverged
+        });
+    }
+    tx.execute(
+        "UPDATE posted_file_operations SET state = 'abandoned' WHERE id = $1",
+        &[&handle.operation],
+    )
+    .await
+    .map_err(database_error)?;
+    tx.execute(
+        "UPDATE posted_file_health SET state = 'unknown', failure_kind = NULL, \
+         verified_at = NULL, retention_checked_at = NULL, revision = revision + 1, \
+         round = round + 1, round_token = gen_random_uuid()::text WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    let changed = tx
+        .execute(
+            "UPDATE posted_file_registry SET pending_operation = NULL, revision = revision + 1 \
+             WHERE pending_operation = $1 AND revision = $2 \
+             AND selected_generation IS NOT DISTINCT FROM $3::text",
+            &[
+                &handle.operation,
+                &handle.registry_revision,
+                &handle.predecessor,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Ok(AbandonmentOutcome::StaleOrDiverged);
+    }
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AbandonmentOutcome::Applied)
+}
+
 /// Durable evidence for one slot on one configured backbone. POST success is
 /// accounting only: it never sets `confirmed` or supplies content-integrity proof.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

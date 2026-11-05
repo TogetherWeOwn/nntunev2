@@ -41,6 +41,8 @@ const MIGRATION_0039: &str =
 const MIGRATION_0040: &str =
     include_str!("../../../migrations/0040_posted_file_recheck_cursor.sql");
 
+#[path = "support/posted_generation_abandon.rs"]
+mod posted_generation_abandon;
 #[path = "support/posted_generation_checkpoint.rs"]
 mod posted_generation_checkpoint;
 #[path = "support/posted_generation_content.rs"]
