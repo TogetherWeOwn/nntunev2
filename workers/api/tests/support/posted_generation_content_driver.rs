@@ -544,7 +544,7 @@ fn postgres_content_permit_preparation_alone_does_not_renew_delivery_leases() {
             .get(0);
         assert!(prepare_content_check(&mut db, &handle, ArticleSide::Post)
             .await
-            .quiet("prepare only")
+            .unwrap_or_else(|_| panic!("prepare only"))
             .is_some());
         assert!(snapshot(&db, &c.sealed).await == before);
         let attempt_after: i64 = db
