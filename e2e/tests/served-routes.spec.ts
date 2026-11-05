@@ -139,6 +139,10 @@ test.describe('served web routes (no-auth, staging)', () => {
         response?.status(),
         `[served-provider-retired] expected HTTP 404 for retired route ${path}`,
       ).toBe(404);
+      expect(
+        new URL(page.url()).pathname,
+        `[served-provider-retired] retired route ${path} must not redirect`,
+      ).toBe(path);
     }
     await expect(
       page.getByRole('heading', { level: 1 }),

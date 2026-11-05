@@ -379,11 +379,10 @@ test('an initially zero wait announces readiness once without waiting for a time
 });
 
 for (const retryAfter of ['3', '0', null] as const) {
-	// Catches absent/cosmetic Retry, modal Retry resubmitting on its own, and
-	// retrying anything other than the failed action. The modal Retry only
-	// dismisses (no retry action is attached to billing limits); the
-	// page-level Retry reruns the loader and reattempts exactly once.
-	test(`explicit Retry reattempts the limited action once (Retry-After ${retryAfter ?? 'unknown'})`, async ({ page }) => {
+	// Billing limits have no modal retry callback. Pin that existing dismissal
+	// behavior separately from the page-level Retry, which reruns the loader
+	// once; neither the countdown nor modal dismissal resubmits on its own.
+	test(`modal Retry dismisses; page Retry reloads once (Retry-After ${retryAfter ?? 'unknown'})`, async ({ page }) => {
 		const billing = await billingLimit(page, retryAfter);
 		const dialog = page.getByRole('dialog');
 		if (retryAfter === '3') {

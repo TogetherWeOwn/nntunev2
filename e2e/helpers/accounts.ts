@@ -877,5 +877,10 @@ export async function submitPublicUiSignupToBilling(
     page.getByRole('heading', { level: 1 }),
     'billing heading not visible after public UI signup',
   ).toContainText('Billing', { timeout: 15_000 });
+  await expect(page.getByText('to see your billing.', { exact: false })).toHaveCount(0);
+  await expect(
+    page.getByRole('link', { name: 'See plans', exact: true }),
+    'authenticated billing action not visible after public UI signup',
+  ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
 }

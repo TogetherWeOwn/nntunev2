@@ -61,10 +61,12 @@ test('public UI signup with virtual authenticator reaches billing', async ({
   // billing arrival asserted inside the helper. Diagnostics name no values.
   await submitPublicUiSignupToBilling(page, request, baseURL);
   // Belt-and-braces arrival assertion at the spec level (the helper already
-  // waits for and asserts both): the landed URL plus the billing heading.
+  // checks the authenticated no-subscription state): URL, heading and action.
   expect(page.url(), 'public UI signup did not land on billing').toContain('/account/billing');
   await expect(
     page.getByRole('heading', { level: 1 }),
     'billing heading not visible after public UI signup',
   ).toContainText('Billing', { timeout: 15_000 });
+  await expect(page.getByText('to see your billing.', { exact: false })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'See plans', exact: true })).toBeVisible();
 });

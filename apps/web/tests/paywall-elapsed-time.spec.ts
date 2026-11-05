@@ -261,6 +261,7 @@ test('unknown wait keeps current copy, shows no countdown, and never auto-retrie
 	// Dismissal still returns to billing.
 	await dialog.getByRole('button', { name: /not now/i }).click();
 	await expect(dialog).toBeHidden();
+	await expect(page).toHaveURL(/\/account\/billing\/?$/);
 });
 
 test('zero wait reads try-again-now and never counts negative', async ({ page }) => {

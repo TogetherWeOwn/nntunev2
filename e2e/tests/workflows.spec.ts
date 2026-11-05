@@ -316,6 +316,8 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(dedicated).toContain("'/account/billing'");
     expect(dedicated).toContain('page.url()');
     expect(dedicated).toContain("toContainText('Billing'");
+    expect(dedicated).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(dedicated).toContain("page.getByRole('link', { name: 'See plans', exact: true })).toBeVisible()");
     // Never the mint seam: arrival must come from the public form.
     expect(dedicated).not.toContain('tryMintTestAccount');
     expect(dedicated).not.toContain('API.testAccounts');
@@ -350,6 +352,9 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).toContain("'/account/billing'");
     expect(helper).toContain('page.url()');
     expect(helper).toContain("toContainText('Billing'");
+    expect(helper).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(helper).toContain("page.getByRole('link', { name: 'See plans', exact: true })");
+    expect(helper).toContain('authenticated billing action not visible after public UI signup');
     // Never the mint seam in the arrival path.
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');

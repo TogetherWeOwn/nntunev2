@@ -192,7 +192,7 @@ boundaries, not permission to change session semantics. Sources:
 `apps/web/src/routes/account/security/+page.svelte:18-102`.
 
 Security UI has sign-out and sign-out-everywhere only. **It is not SSR:** its
-load explicitly sets ssr=false and checks session via GET vault; 401 clears
+load explicitly sets ssr=false and checks session via GET /v1/credentials; 401 clears
 cached identity and redirects, other failures expose a warning. Do not claim
 server-rendered authenticated inventory or add private data to HTML. Sources:
 `apps/web/src/routes/account/security/+page.svelte:105-135`,
