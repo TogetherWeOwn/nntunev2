@@ -133,6 +133,8 @@ struct WriterState {
     block_after: Option<usize>,
     write_polls: usize,
     closes: usize,
+    /// `poll_close` stays pending (it is counted each poll) when set.
+    pending_close: bool,
     aborts: usize,
     disconnected: bool,
     waker: Option<Waker>,
@@ -172,7 +174,11 @@ impl OriginalWriter for Writer {
     }
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
-        self.0.borrow_mut().closes += 1;
+        let mut state = self.0.borrow_mut();
+        state.closes += 1;
+        if state.pending_close {
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -607,3 +613,5 @@ fn trait_open_binds_index_and_reference_before_any_io() {
         assert!(supplier.serving_accounts().is_empty());
     }
 }
+
+mod owned_task;

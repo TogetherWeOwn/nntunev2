@@ -398,12 +398,25 @@ writer with no article/write/close I/O or interval. Both entry points use the
 same pump and acknowledged-prefix settlement; expiry is rechecked on first
 output work after scheduling.
 
-Shared source ownership does not make borrowed pool inputs static. The existing
-pool owner must still supply owned registry/accounts/channel keys/clock/signals
-and operation timer, retaining the same request authority through task cleanup.
-Synthetic retained-input fixtures cover source-allocation retention, refusal
-release, unpolled drop and pending article/write/close drop/cancellation with one
-ACK-prefix interval. They are not production pool-task or actual Worker proof.
+Shared source ownership does not make borrowed pool inputs static.
+`ArticleSupplier::prepare_owned` retains registry/accounts, zeroizing channel
+keys and the operation timer; its static `RequestControl` owns the shared clock
+and request signals. After that single lookup, `ArticleSupplier::into_response`
+consumes the supplier and the same request's verified `OriginalAuthorization`.
+The resulting `supplier::task::OwnedAccountResponse` binds the supplier's exact
+source Rc and SAME control, exposing checked metadata without account I/O.
+Its `pump_owned` delegates to the library pump immediately (not inside an async
+wrapper), so the writer guard exists before an outer scheduler's first poll.
+Its off-route wasm `schedule_response` delegates to the existing scheduler;
+there is no second reader, writer, meter, request authority or task driver.
+
+Synthetic lifecycle fixtures use the real owned supplier and response task
+with fake catalogue/registry/account boundaries, signals and writer. They cover
+source-allocation retention, refusal release, unpolled drop and pending
+registry/hint/BODY/write/close drop/cancellation with exactly one ACK-prefix
+interval, or none at zero ACK. These are not actual Worker, remote-stop,
+physical-close/capacity or report-durability proof. No public caller or concrete
+Worker clock/signal/timer installation is added; qualification gates stay closed.
 
 The off-route wasm `schedule_response` creates the fixed-length channel, moves
 the source/supplier/control/writer into a `Context::wait_until` task, and returns

@@ -17,6 +17,8 @@ use crate::{
     account_selection::{self, AccountSource},
 };
 
+pub mod task;
+
 /// Internal telemetry only, never delivery, entitlement or public metadata.
 /// No Debug: neither encoded articles nor source/account identities are logged.
 pub struct ArticleSupplier<'a, R, A> {

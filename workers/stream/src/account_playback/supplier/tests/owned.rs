@@ -4,8 +4,8 @@
 use super::*;
 use std::rc::Weak;
 
-struct Probe<T> {
-    inner: T,
+pub(super) struct Probe<T> {
+    pub(super) inner: T,
     _lease: Rc<()>,
 }
 
@@ -30,21 +30,21 @@ impl<T: AccountSource> AccountSource for Probe<T> {
     }
 }
 
-struct Witness {
-    registry: Weak<()>,
-    accounts: Weak<()>,
-    clock: Weak<Cell<u64>>,
-    timer: Weak<()>,
-    abort: Rc<SignalState>,
-    request_timer: Rc<SignalState>,
-    operation_timer: Rc<SignalState>,
-    pending_catalogue: Rc<Cell<bool>>,
-    pending_registry: Rc<Cell<bool>>,
-    pending_body: Rc<Cell<bool>>,
+pub(super) struct Witness {
+    pub(super) registry: Weak<()>,
+    pub(super) accounts: Weak<()>,
+    pub(super) clock: Weak<Cell<u64>>,
+    pub(super) timer: Weak<()>,
+    pub(super) abort: Rc<SignalState>,
+    pub(super) request_timer: Rc<SignalState>,
+    pub(super) operation_timer: Rc<SignalState>,
+    pub(super) pending_catalogue: Rc<Cell<bool>>,
+    pub(super) pending_registry: Rc<Cell<bool>>,
+    pub(super) pending_body: Rc<Cell<bool>>,
 }
 
 impl Witness {
-    fn assert_released(&self) {
+    pub(super) fn assert_released(&self) {
         assert!(self.registry.upgrade().is_none());
         assert!(self.accounts.upgrade().is_none());
         assert!(self.clock.upgrade().is_none());
@@ -54,15 +54,15 @@ impl Witness {
     }
 }
 
-struct OwnedCase {
-    catalogue: FakeCatalogue,
-    inputs: OwnedSupplierInputs<Probe<FakeRegistry>, Probe<FakeAccounts>>,
-    control: RequestControl<'static>,
-    witness: Witness,
+pub(super) struct OwnedCase {
+    pub(super) catalogue: FakeCatalogue,
+    pub(super) inputs: OwnedSupplierInputs<Probe<FakeRegistry>, Probe<FakeAccounts>>,
+    pub(super) control: RequestControl<'static>,
+    pub(super) witness: Witness,
 }
 
 impl OwnedCase {
-    fn new(rig: Rig) -> Self {
+    pub(super) fn new(rig: Rig) -> Self {
         let registry_lease = Rc::new(());
         let account_lease = Rc::new(());
         let timer_lease = Rc::new(());
