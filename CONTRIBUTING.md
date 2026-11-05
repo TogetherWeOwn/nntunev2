@@ -53,11 +53,18 @@ For a small Rust reproduction, use the bounded Cargo pool from the repo
 root (see [pool rules](AGENTS.md#local-rust-builds-the-bounded-cargo-pool)):
 
 ```sh
-# Substitute the failing test name from the Actions job; do not run all crates.
-python3 scripts/cargo_cache.py run -- test -p nntune-core <failing_test_name> -- --exact
+# Copy both the package and fully qualified harness test name from the failing Actions job.
+python3 scripts/cargo_cache.py run -- test -p <failing_package> <fully_qualified_test_name> -- --exact
 # Or select the single failing standalone crate:
-python3 scripts/cargo_cache.py run -- test --manifest-path workers/api/Cargo.toml
+python3 scripts/cargo_cache.py run -- test --manifest-path <failing_crate_manifest>
 ```
+
+Replace the placeholders before running. The exact harness name includes
+its module path (for example, `transcode::tests::ffmpeg_argv_is_pinned`),
+not just the function name. Retain any feature or test-target selection
+needed by that failing test. Verify the intended test actually ran; zero
+matching tests is not a successful reproduction, even if Cargo exits 0.
+Take a standalone crate's manifest path from the failing Actions job too.
 
 Heavy focused reproductions/builds use the guarded **`boat` PATH wrapper**,
 never raw host builds. Retain its sizing, budget and security controls;

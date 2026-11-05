@@ -168,31 +168,37 @@ non-UTF-8 bytes); `import.sh:526-618`
 
 ## Build and test
 
-Build from the repository root (the validator stage needs the workspace —
-it copies the full workspace and builds the single validator package):
+The image build context is the repository root (the validator stage needs the
+workspace — it copies the full workspace and builds the single validator
+package). Image build and smoke test run on GitHub Actions in the `mb-import`
+job of [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml): clean-checkout
+image build, default-CMD smoke test, migrations and the integration suite in
+the shipped image.
 
-```sh
-docker build -f containers/mb-import/Dockerfile .
-```
+Local runs are only for focused reproduction of one failing test or crate:
+small Rust work goes through the bounded pool
+(`python3 scripts/cargo_cache.py run -- test ...`), and heavy focused work goes
+through the guarded `boat` PATH wrapper with `--no-env` and a source-only
+export, with cleanup verified. Do not run the full suite, a CI mirror, or an
+image build locally, including under Boat or a fallback; if no compliant path
+is available, defer to Actions. See the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only).
 
-(Sources: `Dockerfile:19-25` (validator stage), `:29-49` (runtime stage).)
+(Sources: `Dockerfile:19-25` (validator stage), `:29-49` (runtime stage);
+`.github/workflows/ci.yml` job `mb-import`.)
 
 The runtime stage runs the jobs as the non-root `postgres` user (`Dockerfile:43-46`).
 
-The mock-only admission suite needs Bash, Python 3 and standard shell tools,
-not Cargo, psql, credentials or a database:
-
-```sh
-bash containers/mb-import/tests/test_input_admission.sh
-```
-
-Its 44 cases capture SQL attempts and payloads with command doubles: deterministic
-publication switches (A during the first run, B on the next), all-file admission,
+The `mb-import-etl` Actions job runs the mock-only admission suite
+(`tests/test_input_admission.sh`) using Bash, Python 3 and standard shell
+tools, not Cargo, psql, credentials or a database. Its 44 cases capture
+SQL attempts and payloads with command doubles: deterministic publication
+switches (A during the first run, B on the next), all-file admission,
 sequence boundaries, ordinary directories, directory-shaped TSV refusal,
-rerun/resume and poison/FK routing.
-Run unprivileged so unreadable-file controls execute rather than skip. It does
-not execute PostgreSQL; the existing integration suite remains the DB-semantics
-control. CI runs both (`.github/workflows/ci.yml`, `mb-import-etl` and `mb-import`).
+rerun/resume and poison/FK routing. The suite runs unprivileged so
+unreadable-file controls execute rather than skip. It does not execute
+PostgreSQL; the `mb-import` integration suite remains the DB-semantics
+control. Both suites run in Actions, not as a local checklist.
 
 `test-import.sh` runs the integration suite (chunked import, kill-resume,
 same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and

@@ -102,9 +102,30 @@ authorize a full suite, CI mirror or heavy raw-host run. See
 [verification policy](CONTRIBUTING.md#verification-github-actions-first)
 for the permitted paths; defer to Actions when none is available.
 
-CI keeps the committed workspace and standalone Worker lockfiles pinned;
-`cargo-deny` checks lockfile freshness and the relevant Worker jobs use
-`--locked`. These dependency/security gates remain unchanged.
+In Actions, the `cargo-deny` job's `Prove committed lockfiles are fresh`
+step checks the workspace and api/mb/ingest/repair lockfiles.
+Those four Worker jobs also pass --locked to every test/clippy/check
+invocation, including wasm32 checks and clippy, so CI cannot silently
+re-resolve their dependency graphs. Formatting checks are unchanged.
+The workspace rust-test job separately pins one --locked probe:
+nntune-core --no-default-features. This is not a claim that every workspace
+command uses `--locked`; the standalone transcode Worker is outside the
+four-Worker freshness/compiling-flag gate.
+
+The four Worker test commands below document existing **Actions coverage**,
+not a local checklist:
+
+```text
+cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+```
+
+The API job additionally selects its ignored acceptance cases and skips
+Postgres cases handled by the separate database job. The transcode Worker
+job runs its own tests without `--locked`. These dependency/security gates
+remain unchanged.
 
 Record the reviewed head SHA and exact-head **Actions run/job links** with
 conclusions as CI evidence, not local transcripts. Reviewers and the

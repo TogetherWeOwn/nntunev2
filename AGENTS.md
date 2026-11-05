@@ -26,11 +26,18 @@ bounded slot pool in `scripts/cargo_cache.py`, either directly or via the
 host `cargo` shim (which routes automatically when that file exists):
 
 ```sh
-# Substitute the single failing test name from the Actions job.
-python3 scripts/cargo_cache.py run -- test -p nntune-core <failing_test_name> -- --exact
+# Copy both the package and fully qualified harness test name from the failing Actions job.
+python3 scripts/cargo_cache.py run -- test -p <failing_package> <fully_qualified_test_name> -- --exact
 # Or reproduce the one failing standalone crate, not every manifest:
-python3 scripts/cargo_cache.py run -- test --manifest-path workers/api/Cargo.toml
+python3 scripts/cargo_cache.py run -- test --manifest-path <failing_crate_manifest>
 ```
+
+Replace the placeholders before running. Use the full module-qualified name
+(for example, `transcode::tests::ffmpeg_argv_is_pinned`), not just the
+function name. If the job selects a feature or test target, retain that
+selection for the failing test. Confirm the intended test actually ran:
+zero matching tests is not a successful reproduction, even with exit 0.
+For a standalone-crate failure, take its manifest path from that Actions job.
 
 Keep any `check`, `clippy` or `build` reproduction scoped to that same
 failing crate; heavy work goes through Boat, not this pool. `run -- fmt`
