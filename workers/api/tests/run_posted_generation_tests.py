@@ -20,6 +20,14 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_acquires_atomically_and_restart_replays_without_renewal",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_completes_existing_preparation_after_client_drop",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_acquisition_error_rolls_back_job_receipt_and_attempt",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_foreign_missing_stopped_deleting_and_reset_jobs_refuse",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_concurrent_requests_commit_one_exact_attempt",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_expired_and_superseded_receipts_require_explicit_next_request",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_replay_rechecks_attempt_lease_after_observed_lock_wait",
+    "posted_generation_attempt_acquisition::startup::coordinator::postgres_coordinator_start_rechecks_owner_and_job_after_observed_lock_waits",
     "posted_generation_driver::delivery::durable::postgres_durable_delivery_restart_recovers_exact_attempt_and_cursor_without_handles",
     "posted_generation_driver::delivery::durable::postgres_durable_delivery_missing_or_unacquired_receipts_never_create_authority",
     "posted_generation_driver::delivery::durable::postgres_durable_delivery_rejects_mismatched_admission_owner_request_and_attempt",

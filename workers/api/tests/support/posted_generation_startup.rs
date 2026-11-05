@@ -3,6 +3,8 @@
 //! deployed coordinator or Queue consumer. Dropped replies simulate lost acks;
 //! receipt insertion failure is injected, but commit-error recovery is not.
 
+#[path = "posted_generation_coordinator_start.rs"]
+mod coordinator;
 #[path = "posted_generation_owner_fence.rs"]
 mod owner_fence;
 

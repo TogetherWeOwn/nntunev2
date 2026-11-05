@@ -39,7 +39,8 @@ mod attempts;
 pub use attempts::{
     acquire_prepared_attempt, prepare_attempt_acquisition, prepare_durable_attempt_acquisition,
     recover_attempt_acquisition, recover_durable_attempt_acquisition,
-    start_durable_attempt_acquisition, AttemptAcquisition, DurableAttemptRequest,
+    start_and_acquire_durable_attempt, start_durable_attempt_acquisition, AttemptAcquisition,
+    DurableAttemptRequest,
 };
 #[path = "posted_generation_driver.rs"]
 mod driver;

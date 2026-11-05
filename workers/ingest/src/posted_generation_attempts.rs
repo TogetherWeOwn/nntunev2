@@ -242,9 +242,69 @@ pub async fn start_durable_attempt_acquisition(
         .checked_add(1)
         .ok_or(StoreError::InvalidInput)?;
     let tx = client.transaction().await.map_err(database_error)?;
-    // Match admission/terminal writers: user deletion fence before the job lock.
-    if !lock_owner(&tx, owner_id).await? {
+    if !start_admitted_locked(&tx, job_id, owner_id, admission_key, expected_attempt).await? {
         return Ok(None);
+    }
+    let receipt = prepare_durable_locked(&tx, job_id, owner_id, request_id, next).await?;
+    if receipt.is_some() {
+        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    }
+    Ok(receipt)
+}
+
+/// Explicit coordinator startup: commit the admitted running transition, exact
+/// durable receipt and attempt acquisition together. This is NOT redelivery
+/// recovery: it may create the requested next attempt after its predecessor has
+/// expired. Only the trusted coordinator may authorize that request; shape-valid
+/// Queue/KV coordinates do not authenticate it.
+///
+/// Repeat the SAME request after an ambiguous commit or restart. Its own live
+/// acquired result is returned without renewal; expired or superseded results
+/// refuse, never borrow a newer token. A prior preparation-only receipt can also
+/// be completed. Refusal/error rolls back all writes in this call. No candidate,
+/// lease renewal, network IO, Queue authentication or producer wiring is added.
+/// Use `recover_durable_attempt_acquisition` for read-only delivery recovery.
+/// Revalidate any returned handle immediately before network work.
+pub async fn start_and_acquire_durable_attempt(
+    client: &mut Client,
+    request: &DurableAttemptRequest,
+) -> Result<AttemptOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !start_admitted_locked(
+        &tx,
+        &request.job_id,
+        &request.owner_id,
+        &request.admission_key,
+        request.next_attempt - 1,
+    )
+    .await?
+    {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
+    let Some(receipt) = prepare_durable_locked(
+        &tx,
+        &request.job_id,
+        &request.owner_id,
+        &request.request_id,
+        request.next_attempt,
+    )
+    .await?
+    else {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    };
+    acquire_prepared_locked(tx, &receipt.proposed).await
+}
+
+async fn start_admitted_locked(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+    admission_key: &str,
+    expected_attempt: i64,
+) -> Result<bool, StoreError> {
+    // Match admission/terminal writers: user deletion fence before the job lock.
+    if !lock_owner(tx, owner_id).await? {
+        return Ok(false);
     }
     let Some(job) = tx
         .query_opt(
@@ -255,7 +315,7 @@ pub async fn start_durable_attempt_acquisition(
         .await
         .map_err(database_error)?
     else {
-        return Ok(None);
+        return Ok(false);
     };
     match job.get::<_, &str>("status") {
         "running" => {}
@@ -270,7 +330,7 @@ pub async fn start_durable_attempt_acquisition(
                 .map_err(database_error)?
                 .get(0);
             if expected_attempt != 0 || has_history {
-                return Ok(None);
+                return Ok(false);
             }
             tx.execute(
                 "UPDATE ingest_jobs SET status = 'running' WHERE id = $1",
@@ -279,13 +339,9 @@ pub async fn start_durable_attempt_acquisition(
             .await
             .map_err(database_error)?;
         }
-        _ => return Ok(None),
+        _ => return Ok(false),
     }
-    let receipt = prepare_durable_locked(&tx, job_id, owner_id, request_id, next).await?;
-    if receipt.is_some() {
-        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    }
-    Ok(receipt)
+    Ok(true)
 }
 
 // Caller holds the owning job lock. This helper never commits independently of
@@ -366,7 +422,6 @@ pub async fn acquire_prepared_attempt(
     receipt: &AttemptAcquisition,
 ) -> Result<AttemptOutcome, StoreError> {
     let a = &receipt.proposed;
-    let expected = a.attempt - 1;
     let tx = client.transaction().await.map_err(database_error)?;
     if !lock_owner(&tx, &a.owner_id).await? {
         return Ok(AttemptOutcome::StaleOrMissing);
@@ -382,6 +437,16 @@ pub async fn acquire_prepared_attempt(
     {
         return Ok(AttemptOutcome::StaleOrMissing);
     }
+    acquire_prepared_locked(tx, a).await
+}
+
+// Caller holds the non-deleting owner and running job locks. Acquisition and
+// recovery commit only after the exact attempt and post-wait clock recheck.
+async fn acquire_prepared_locked(
+    tx: Transaction<'_>,
+    a: &AttemptHandle,
+) -> Result<AttemptOutcome, StoreError> {
+    let expected = a.attempt - 1;
     let old = tx
         .query_opt(
             "SELECT attempt, token FROM posted_file_job_attempts WHERE job_id = $1 FOR UPDATE",
