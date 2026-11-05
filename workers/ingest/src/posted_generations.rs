@@ -18,8 +18,8 @@
 //! concurrent health/repair. A timestamp, successful POST, STAT or elapsed time
 //! never authorizes cleanup; this preparation adapter grants no deletion permit.
 
-use crate::posted_files::{validate_posted_file_params, PostedFileParams};
-use crate::two_spool::SpoolCopyState;
+use crate::posted_files::{validate_posted_file_params, PostedFileParams, MAX_ARTICLE_COUNT};
+use crate::two_spool::{PostVerdict, SpoolCopyState, MAX_REPOST_ATTEMPTS_PER_ARTICLE};
 use std::fmt;
 use tokio_postgres::{Client, Row, Transaction};
 
@@ -936,6 +936,254 @@ pub async fn finish_verification(
     commit_mutation(tx, handle).await
 }
 
+/// Durable evidence for one slot on one configured backbone. POST success is
+/// accounting only: it never sets `confirmed` or supplies content-integrity proof.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotProgress {
+    pub confirmed: bool,
+    pub repost_attempts: u32,
+}
+
+/// Current-round checkpoint bound to the stored generation/plan. Missing rows
+/// mean unconfirmed/zero attempts, not a new local article set. This is a read
+/// snapshot, not POST authority, and must not be used to overwrite durable state
+/// from a job-keyed KV blob. Recheck scheduling/negative-health policy stays with
+/// the verifier; this preparation does not yet persist that scheduler state.
+pub struct GenerationCheckpoint {
+    generation: String,
+    plan: String,
+    round: i64,
+    slots: Vec<[SlotProgress; 2]>,
+}
+
+impl fmt::Debug for GenerationCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GenerationCheckpoint([REDACTED])")
+    }
+}
+
+impl GenerationCheckpoint {
+    pub fn generation_id(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan
+    }
+
+    pub fn round(&self) -> i64 {
+        self.round
+    }
+
+    pub fn article_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn slot(&self, slot: usize, side: ArticleSide) -> Option<SlotProgress> {
+        self.slots.get(slot).map(|s| s[side.db_value() as usize])
+    }
+}
+
+/// A single same-ID repost callback capability, prepared from durable custody
+/// and accounting under the current fence. It deliberately retains the exact
+/// health revision/round/claim: never reconstruct one from a new handle after an
+/// ambiguous callback commit. Recover by operation identity and load checkpoint
+/// instead. A repeated/stale callback cannot increment the next attempt.
+#[derive(Clone)]
+pub struct RepostPermit {
+    handle: GenerationHandle,
+    slot: i32,
+    side: ArticleSide,
+    expected_attempts: i32,
+}
+
+impl fmt::Debug for RepostPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RepostPermit([REDACTED])")
+    }
+}
+
+#[derive(Debug)]
+pub enum RepostPreparation {
+    Ready(Box<RepostPermit>),
+    AlreadyConfirmed,
+    BudgetExhausted,
+    StaleOrDiverged,
+}
+
+fn slot_progress(row: &Row) -> Result<SlotProgress, StoreError> {
+    let attempts: i32 = row.get("repost_attempts");
+    let repost_attempts = u32::try_from(attempts).map_err(|_| StoreError::Inconsistent)?;
+    if repost_attempts > MAX_REPOST_ATTEMPTS_PER_ARTICLE {
+        return Err(StoreError::Inconsistent);
+    }
+    Ok(SlotProgress {
+        confirmed: row.get("confirmed"),
+        repost_attempts,
+    })
+}
+
+/// Read a coherent checkpoint under the same lock order and revision fence as
+/// mutations. Both backbone lanes and all required slots (including recovery)
+/// are addressed by the immutable sealed plan. No article identities are read.
+/// `None` means stale, not an empty checkpoint or fresh-post permission.
+pub async fn load_checkpoint(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<Option<GenerationCheckpoint>, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(None);
+    };
+    let count = current.get::<_, i32>("article_count");
+    if !(1..=MAX_ARTICLE_COUNT).contains(&count) {
+        return Err(StoreError::Inconsistent);
+    }
+    let bundle = stored(&tx, &handle.generation).await?;
+    let mut slots = vec![[SlotProgress::default(); 2]; count as usize];
+    for row in tx
+        .query(
+            "SELECT slot, side, confirmed, repost_attempts FROM posted_file_article_progress \
+             WHERE generation_id = $1 AND round = $2",
+            &[&handle.generation, &handle.round],
+        )
+        .await
+        .map_err(database_error)?
+    {
+        let slot: i32 = row.get("slot");
+        let side: i16 = row.get("side");
+        if !(0..count).contains(&slot) || !(0..=1).contains(&side) {
+            return Err(StoreError::Inconsistent);
+        }
+        slots[slot as usize][side as usize] = slot_progress(&row)?;
+    }
+    let checkpoint = GenerationCheckpoint {
+        generation: handle.generation.clone(),
+        plan: bundle.plan_sha256().to_owned(),
+        round: handle.round,
+        slots,
+    };
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(Some(checkpoint))
+}
+
+/// Prepare immediately before same-ID network repair, with no transaction held
+/// over that request. Caller policy must have established a missing slot and
+/// must use the stored bundle's exact bytes/ID, including confirmed-duplicate
+/// client handling. This permit is not a lease extension or a network exactly-
+/// once guarantee; an in-flight request can complete after the fence expires.
+/// Answered accounting is capped per slot/backbone/round by the existing policy.
+/// Exhaustion keeps the original; it is NOT conclusive lost-content evidence.
+pub async fn prepare_repost(
+    client: &mut Client,
+    handle: &GenerationHandle,
+    slot: i32,
+    side: ArticleSide,
+) -> Result<RepostPreparation, StoreError> {
+    if slot < 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(RepostPreparation::StaleOrDiverged);
+    };
+    if slot >= current.get::<_, i32>("article_count") {
+        return Err(StoreError::InvalidInput);
+    }
+    if current.get::<_, &str>("state") != "verifying"
+        || handle.round == 0
+        || current.get::<_, Option<i64>>("verified_at").is_some()
+    {
+        return Ok(RepostPreparation::StaleOrDiverged);
+    }
+    let progress = tx
+        .query_opt(
+            "SELECT confirmed, repost_attempts FROM posted_file_article_progress \
+             WHERE generation_id = $1 AND round = $2 AND slot = $3 AND side = $4",
+            &[&handle.generation, &handle.round, &slot, &side.db_value()],
+        )
+        .await
+        .map_err(database_error)?
+        .as_ref()
+        .map(slot_progress)
+        .transpose()?
+        .unwrap_or_default();
+    let result = if progress.confirmed {
+        RepostPreparation::AlreadyConfirmed
+    } else if progress.repost_attempts >= MAX_REPOST_ATTEMPTS_PER_ARTICLE {
+        RepostPreparation::BudgetExhausted
+    } else {
+        RepostPreparation::Ready(Box::new(RepostPermit {
+            handle: handle.clone(),
+            slot,
+            side,
+            expected_attempts: progress.repost_attempts as i32,
+        }))
+    };
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(result)
+}
+
+/// Commit one answered callback against the original permit, incrementing the
+/// slot counter and health revision atomically. Duplicates, parallel callbacks,
+/// takeover and old rounds fail the same revision fence, with no counter write.
+/// Transport/auth-retryable and prohibited outcomes spend no budget and return
+/// Incomplete; their retry/keep-original disposition belongs to verifier policy,
+/// never a terminal health write or replacement authorization in this adapter.
+/// Posted/confirmed-duplicate outcomes do NOT confirm presence or content.
+pub async fn record_repost(
+    client: &mut Client,
+    permit: &RepostPermit,
+    verdict: PostVerdict,
+) -> Result<MutationOutcome, StoreError> {
+    let handle = &permit.handle;
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    };
+    if current.get::<_, &str>("state") != "verifying"
+        || handle.round == 0
+        || current.get::<_, Option<i64>>("verified_at").is_some()
+    {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    if !matches!(verdict, PostVerdict::Posted | PostVerdict::DuplicatePresent) {
+        return Ok(MutationOutcome::Incomplete);
+    }
+    let changed = tx
+        .execute(
+            "INSERT INTO posted_file_article_progress AS p \
+             (generation_id, round, slot, side, repost_attempts) \
+             SELECT $1, $2, $3, $4, 1 WHERE $5::integer = 0 OR EXISTS \
+             (SELECT 1 FROM posted_file_article_progress WHERE generation_id = $1 \
+              AND round = $2 AND slot = $3 AND side = $4) \
+             ON CONFLICT (generation_id, round, slot, side) DO UPDATE \
+             SET repost_attempts = p.repost_attempts + 1 \
+             WHERE NOT p.confirmed AND p.repost_attempts = $5 \
+             AND p.repost_attempts < $6",
+            &[
+                &handle.generation,
+                &handle.round,
+                &permit.slot,
+                &permit.side.db_value(),
+                &permit.expected_attempts,
+                &(MAX_REPOST_ATTEMPTS_PER_ARTICLE as i32),
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    tx.execute(
+        "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    commit_mutation(tx, handle).await
+}
+
 /// Lost admission acknowledgment: reread by durable operation identity before
 /// any POST. This never inserts, changes a plan, rotates a token or resets a
 /// counter. An expired handle needs explicit fenced takeover, not this method.
@@ -1011,6 +1259,30 @@ mod tests {
             round: 0,
             round_token: "private-round-token".into(),
         };
+        let permit = RepostPermit {
+            handle: handle.clone(),
+            slot: 2,
+            side: ArticleSide::Verify,
+            expected_attempts: 1,
+        };
+        assert_eq!(format!("{permit:?}"), "RepostPermit([REDACTED])");
+        assert_eq!(
+            format!("{:?}", RepostPreparation::Ready(Box::new(permit))),
+            "Ready(RepostPermit([REDACTED]))"
+        );
+        let checkpoint = GenerationCheckpoint {
+            generation: "private-generation".into(),
+            plan: "private-plan".into(),
+            round: 7,
+            slots: vec![[SlotProgress::default(); 2]; 3],
+        };
+        assert_eq!(
+            format!("{checkpoint:?}"),
+            "GenerationCheckpoint([REDACTED])"
+        );
+        assert_eq!(checkpoint.article_count(), 3);
+        assert!(checkpoint.slot(3, ArticleSide::Post).is_none());
+        assert!(checkpoint.slot(usize::MAX, ArticleSide::Verify).is_none());
         assert_eq!(format!("{attempt:?}"), "AttemptHandle([REDACTED])");
         assert_eq!(format!("{handle:?}"), "GenerationHandle([REDACTED])");
         assert_eq!(

@@ -35,6 +35,8 @@ use tokio_postgres::{Client, Config, NoTls};
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MIGRATION_0037: &str = include_str!("../../../migrations/0037_posted_file_generations.sql");
 
+#[path = "support/posted_generation_checkpoint.rs"]
+mod posted_generation_checkpoint;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
 #[path = "support/posted_generation_takeover.rs"]
