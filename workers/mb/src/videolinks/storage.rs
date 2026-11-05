@@ -134,18 +134,7 @@ impl<'a> PgCandidateStore<'a> {
 }
 
 fn canonical_mbid(mbid: &str) -> Result<String, CandidateStoreError> {
-    if mbid.len() != 36
-        || !mbid.bytes().enumerate().all(|(i, b)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                b == b'-'
-            } else {
-                b.is_ascii_hexdigit()
-            }
-        })
-    {
-        return Err(CandidateStoreError::InvalidInput);
-    }
-    Ok(mbid.to_ascii_lowercase())
+    super::canonical_mbid(mbid).ok_or(CandidateStoreError::InvalidInput)
 }
 
 fn checked_candidates(candidates: &[Candidate]) -> Result<Vec<Candidate>, CandidateStoreError> {

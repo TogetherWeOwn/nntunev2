@@ -26,6 +26,7 @@
 //! installation and live validation are not established by fixture-based
 //! tests. See `docs/videolinks-pipeline.md` for remaining integration work.
 
+pub mod harvest;
 pub mod storage;
 pub mod validation;
 
@@ -84,6 +85,21 @@ pub struct Candidate {
     pub recording_mbid: String,
     pub video_id: String,
     pub source: VideoSource,
+}
+
+pub(super) fn canonical_mbid(mbid: &str) -> Option<String> {
+    if mbid.len() != 36
+        || !mbid.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    Some(mbid.to_ascii_lowercase())
 }
 
 /// True when `id` is an 11-character YouTube video ID.

@@ -1,6 +1,9 @@
 //! Real validation adapter and proposed migration on CI's disposable PostgreSQL.
 //! Explicit feature/config required; never a live API request or staging apply.
 
+use nntune_mb::videolinks::harvest::{
+    HarvestError, MirrorCursor, PgMirrorSource, MAX_MIRROR_ROWS_PER_PAGE,
+};
 use nntune_mb::videolinks::storage::{
     CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
 };
@@ -753,6 +756,151 @@ async fn fresh_link_read_contract(db: &mut Client) {
         .all(|link| link.candidate.video_id != "v0000000005"));
 }
 
+async fn mirror_harvest_contract(db: &mut Client, config: &Config) {
+    reset_candidates(db).await;
+    // Reader-column fixtures of W6b, not a staging apply or full mirror migration.
+    db.batch_execute(
+        "CREATE TABLE public.mb_url (mbid uuid PRIMARY KEY, url text NOT NULL);
+         CREATE TABLE public.mb_recording_url (
+             recording_mbid uuid NOT NULL, url_mbid uuid NOT NULL REFERENCES public.mb_url(mbid),
+             link_name text NOT NULL, is_video boolean NOT NULL,
+             PRIMARY KEY (recording_mbid, url_mbid, link_name));
+         CREATE TABLE public.mb_recording_music_video (
+             recording_a_mbid uuid NOT NULL, recording_b_mbid uuid NOT NULL,
+             PRIMARY KEY (recording_a_mbid, recording_b_mbid),
+             CHECK (recording_a_mbid < recording_b_mbid));
+         INSERT INTO public.mb_url
+         SELECT ('10000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+                CASE i WHEN 1 THEN 'https://youtu.be/v0000000000'
+                       WHEN 2 THEN 'https://www.youtube.com/watch?v=v0000000001'
+                       WHEN 3 THEN 'https://other.example.test/watch?v=v0000000002'
+                       WHEN 4 THEN 'https://youtu.be/invalid'
+                       WHEN 5 THEN 'https://youtu.be/v0000000003?' || repeat('x', 2048)
+                       ELSE 'https://youtu.be/v0000000004' END
+         FROM generate_series(1, 6) AS i;
+         INSERT INTO public.mb_recording_url
+         SELECT CASE i WHEN 2 THEN '00000000-0000-0000-0000-000000000002'::uuid
+                       ELSE '00000000-0000-0000-0000-000000000001'::uuid END,
+                mbid, 'stream', i <> 6
+         FROM public.mb_url u
+         JOIN generate_series(1, 6) AS i
+           ON u.mbid = ('10000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid;
+         INSERT INTO public.mb_recording_url VALUES (
+             '00000000-0000-0000-0000-000000000001',
+             '10000000-0000-0000-0000-000000000001', 'duplicate relation', true);
+         INSERT INTO public.mb_recording_music_video VALUES (
+             '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002')",
+    )
+    .await
+    .unwrap();
+    let a = "00000000-0000-0000-0000-000000000001".to_owned();
+    let b = "00000000-0000-0000-0000-000000000002".to_owned();
+    let missing = "00000000-0000-0000-0000-000000000003".to_owned();
+    let selected = [b.clone(), a.clone(), missing.clone(), a.clone()];
+    let page = PgMirrorSource::new(db)
+        .candidate_page(&selected, None)
+        .await
+        .unwrap();
+    assert_eq!(page.scanned_rows, 10);
+    assert_eq!(page.next_cursor, None);
+    assert_eq!(
+        page.candidates,
+        [a.clone(), b.clone()]
+            .into_iter()
+            .flat_map(
+                |recording_mbid| ["v0000000000", "v0000000001"].map(|video_id| Candidate {
+                    recording_mbid: recording_mbid.clone(),
+                    video_id: video_id.into(),
+                    source: VideoSource::MbUrl,
+                })
+            )
+            .collect::<Vec<_>>()
+    );
+    assert!(PgMirrorSource::new(db)
+        .candidate_page(&[missing], None)
+        .await
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert!(PgMirrorSource::new(db)
+        .candidate_page(&[], None)
+        .await
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert!(
+        states(db).await.is_empty(),
+        "mirror reads never admit app candidates"
+    );
+
+    db.batch_execute(
+        "DELETE FROM public.mb_recording_music_video;
+         DELETE FROM public.mb_recording_url;
+         DELETE FROM public.mb_url;
+         INSERT INTO public.mb_url
+         SELECT ('10000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+                CASE WHEN i <= 200 THEN 'https://other.example.test/not-a-video'
+                     ELSE 'https://youtu.be/v0000000000' END
+         FROM generate_series(1, 202) AS i;
+         INSERT INTO public.mb_recording_url
+         SELECT CASE WHEN mbid = '10000000-0000-0000-0000-000000000202'
+                     THEN '00000000-0000-0000-0000-000000000002'::uuid
+                     ELSE '00000000-0000-0000-0000-000000000001'::uuid END,
+                mbid, 'stream', true FROM public.mb_url",
+    )
+    .await
+    .unwrap();
+    let first = PgMirrorSource::new(db)
+        .candidate_page(&selected, None)
+        .await
+        .unwrap();
+    assert_eq!(first.scanned_rows, MAX_MIRROR_ROWS_PER_PAGE);
+    assert!(first.candidates.is_empty());
+    assert_eq!(
+        first.next_cursor,
+        Some(MirrorCursor {
+            recording_mbid: a.clone(),
+            url_mbid: "10000000-0000-0000-0000-000000000200".into(),
+        })
+    );
+    let last = PgMirrorSource::new(db)
+        .candidate_page(&selected, first.next_cursor.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(last.scanned_rows, 2);
+    assert_eq!(last.candidates.len(), 2);
+    assert_eq!(last.candidates[0].recording_mbid, a);
+    assert_eq!(last.candidates[1].recording_mbid, b);
+    assert_eq!(last.next_cursor, None);
+    let replay = PgMirrorSource::new(db)
+        .candidate_page(&selected, first.next_cursor.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(last, replay);
+
+    let mut locker = connect(config).await;
+    let lock = locker.transaction().await.unwrap();
+    lock.batch_execute("LOCK TABLE public.mb_recording_url IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        PgMirrorSource::new(db)
+            .candidate_page(&selected, None)
+            .await,
+        Err(HarvestError::Store)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        PgMirrorSource::new(db)
+            .candidate_page(&selected, None)
+            .await
+            .unwrap(),
+        first
+    );
+}
+
 #[test]
 fn postgres_validation_store_contract() {
     let url = std::env::var("NNTUNE_VIDEOLINKS_TEST_DATABASE_URL")
@@ -769,7 +917,10 @@ fn postgres_validation_store_contract() {
                     .query_one(
                         "SELECT to_regclass('public.video_link_candidates') IS NULL
                          AND to_regclass('public.video_user_submissions') IS NULL
-                         AND to_regclass('public.video_coverage_snapshots') IS NULL",
+                         AND to_regclass('public.video_coverage_snapshots') IS NULL
+                         AND to_regclass('public.mb_url') IS NULL
+                         AND to_regclass('public.mb_recording_url') IS NULL
+                         AND to_regclass('public.mb_recording_music_video') IS NULL",
                         &[],
                     )
                     .await
@@ -787,6 +938,7 @@ fn postgres_validation_store_contract() {
                 earlier_batch_survives(&mut db).await;
                 candidate_admission_contract(&mut db).await;
                 fresh_link_read_contract(&mut db).await;
+                mirror_harvest_contract(&mut db, &config).await;
             })
             .await
             .expect("bounded PostgreSQL acceptance");

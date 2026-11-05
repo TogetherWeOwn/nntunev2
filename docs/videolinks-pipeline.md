@@ -12,8 +12,9 @@ validated IDs with the official video embed.
 runner** and an **app-side PostgreSQL store adapter**, not an activated
 curation service. `validation/http.rs` supplies an inactive Worker HTTP
 client requiring a runtime Secret. `storage.rs` supplies bounded external
-candidate admission and fresh-link database reads. No route, schedule or
-database binding calls these adapters yet.
+candidate admission and fresh-link database reads. `harvest.rs` supplies a
+read-only paged MusicBrainz mirror source. No route, schedule or database
+binding calls these adapters yet.
 
 `refresh_due` purges expired API-returned fields before contacting the
 validation client, requests at most 200 distinct IDs in four 50-ID batches,
@@ -106,8 +107,47 @@ acceptance cover database-specific source labels, canonical deduplication,
 replay/priority, metadata
 preservation, no partial admission on invalid input or constraint failure,
 new associations, freshness boundaries and the 50-by-five read cap.
-Execution of this increment awaits exact-head Actions; no local test,
-live database apply, authenticated route or deployed cleanup is claimed.
+The [MB Rust](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42012759761/job/127195646775)
+and [PostgreSQL](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42012759761/job/127195646761)
+jobs passed at `51142ac46a9350dd1d2df9793a87ca2e1f3c1a9e`. This is not a
+live database apply, authenticated route or deployed cleanup claim.
+
+### MusicBrainz mirror source boundary
+
+`PgMirrorSource::candidate_page` is an inactive reader for the CC0-only W6b
+mirror, separate from the app-side writer. Each call accepts at most 50
+UUID-shaped recording MBIDs, canonicalizes and deduplicates them, and reads
+at most 200 distinct raw recording/URL edges plus one lookahead. It follows
+video-marked direct URLs and both directions of music-video pairs, always
+associating the extracted ID with the **requested** recording. Multiple
+relationship labels and duplicate paths do not consume extra page slots.
+Non-video relationships are excluded in SQL; malformed IDs and non-YouTube
+hosts are skipped. SQL returns no URL above 2048 bytes. Raw source URLs are
+not persisted or exposed by the page result; candidates carry only MBID,
+video ID and source.
+
+The cursor is the last consumed **raw edge**, even when a page has zero
+candidates. The lookahead is not consumed. This prevents an invalid-URL
+page from hiding later usable links. Admission can deduplicate the same ID
+across pages; the reader does not write candidates or validate videos. A
+cursor is valid only for an unchanged recording selection and mirror
+snapshot. Calls use separate read-only transactions, not a snapshot across
+pages: the scheduler must restart a scan after an import, retaining
+idempotent app-side admission. This is not a complete catalogue scheduler.
+
+The reader uses explicit public table names, bound parameters, a read-only
+transaction and a 1.5-second statement timeout. Bounded results do not imply
+constant query work over the source graph. No live MusicBrainz API, other
+source API, YouTube request, app write, credential, schema, binding, route
+or schedule change is introduced.
+
+Three native fixtures cover selection/cursor policy, invalid-page progress,
+lookahead, deduplication and URL bounds. The existing disposable PostgreSQL
+contract adds actual reader SQL against minimal W6b reader-column fixtures
+(not a full mirror migration/apply), symmetric pairing, non-video exclusion,
+pagination/replay across recordings and lock timeout/recovery. Execution of
+this source increment awaits exact-head Actions; no local test or live
+source verification is claimed.
 
 ### PostgreSQL acceptance boundary
 
@@ -137,8 +177,9 @@ checkout or changing workspace membership.
 
 Still required before feature acceptance:
 
-- Wire source readers, the runner's app-side connection and a bounded
-  schedule. Keep the real PostgreSQL acceptance target green at each head.
+- Wire the mirror reader, remaining source readers, the runner's app-side
+  connection and a bounded schedule. Keep the real PostgreSQL acceptance
+  target green at each head.
 - Exercise the inactive HTTP adapter in the Worker runtime: fixed official
   HTTPS endpoint, no redirects, capped streaming body, cancellation on drop
   and sanitized failures. Native policy fixtures do not prove live fetch or
