@@ -54,6 +54,8 @@ const MIGRATION_0045: &str =
 
 #[path = "support/posted_generation_abandon.rs"]
 mod posted_generation_abandon;
+#[path = "support/posted_generation_attempt_acquisition.rs"]
+mod posted_generation_attempt_acquisition;
 #[path = "support/posted_generation_checkpoint.rs"]
 mod posted_generation_checkpoint;
 #[path = "support/posted_generation_content.rs"]

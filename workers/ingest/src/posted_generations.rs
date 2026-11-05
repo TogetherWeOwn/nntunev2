@@ -30,6 +30,12 @@ use crate::two_spool::{PostVerdict, SpoolCopyState, MAX_REPOST_ATTEMPTS_PER_ARTI
 use std::fmt;
 use tokio_postgres::{Client, Row, Transaction};
 
+#[path = "posted_generation_attempts.rs"]
+mod attempts;
+pub use attempts::{
+    acquire_prepared_attempt, prepare_attempt_acquisition, recover_attempt_acquisition,
+    AttemptAcquisition,
+};
 #[path = "posted_generation_driver.rs"]
 mod driver;
 pub use driver::{drive_pending_recheck, drive_recheck, GenerationTransport, RecheckStep};
@@ -84,8 +90,9 @@ fn identity(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Persisted attempt authority, minted only by `acquire_attempt`. Queue-carried
-/// attempt numbers do not construct this handle and are never sufficient.
+/// Persisted attempt authority, returned only after database acquisition or
+/// exact receipt recovery. Queue-carried attempt numbers do not construct this
+/// handle and are never sufficient.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttemptHandle {
     job_id: String,
