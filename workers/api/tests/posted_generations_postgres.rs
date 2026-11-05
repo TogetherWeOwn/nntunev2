@@ -51,6 +51,8 @@ mod posted_generation_checkpoint;
 mod posted_generation_content;
 #[path = "support/posted_generation_driver.rs"]
 mod posted_generation_driver;
+#[path = "support/posted_generation_failure.rs"]
+mod posted_generation_failure;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
 #[path = "support/posted_generation_presence.rs"]

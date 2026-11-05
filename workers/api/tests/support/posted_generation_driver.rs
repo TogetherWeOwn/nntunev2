@@ -709,7 +709,11 @@ fn postgres_driver_passes_reset_cursor_and_backoff_exhausts_to_keep_original_wit
         assert_eq!(baseline.0, "verifying");
         let custody = snapshot(&db, s).await;
         let mut t = Transport::new(s);
-        t.script_stat(0, true, &[StatVerdict::Missing; MAX_RECHECKS as usize]);
+        let mut verdicts = [StatVerdict::Missing; MAX_RECHECKS as usize];
+        // The last pass is unavailable: exhaustion must not upgrade that unknown
+        // into failure even though earlier answered repairs reached their cap.
+        verdicts[MAX_RECHECKS as usize - 1] = StatVerdict::Transport;
+        t.script_stat(0, true, &verdicts);
 
         for done in 0..MAX_RECHECKS {
             make_due(&db, s).await;

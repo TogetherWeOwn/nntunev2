@@ -42,6 +42,9 @@ pub enum RecheckStep {
     PresenceComplete(Box<GenerationHandle>),
     /// Scheduling history is exhausted or untracked, not proof of content loss.
     KeepOriginal,
+    /// Current Missing evidence after the repair cap concluded verification
+    /// failure. Keep the original, all custody and R2; never cleanup authority.
+    VerificationFailed,
     StaleOrDiverged,
 }
 
@@ -92,7 +95,17 @@ pub async fn drive_recheck<T: GenerationTransport>(
         return Err(StoreError::InvalidInput);
     }
     let Some(checkpoint) = load_checkpoint(client, handle).await? else {
-        return Ok(RecheckStep::StaleOrDiverged);
+        // The terminal commit may have succeeded without its acknowledgment.
+        // Retry only the original fence's receipt, never rebind an old answer.
+        let tx = client.transaction().await.map_err(database_error)?;
+        let failed =
+            stopped_candidate_receipt(&tx, handle, CandidateStop::VerificationFailed).await?;
+        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+        return Ok(if failed {
+            RecheckStep::VerificationFailed
+        } else {
+            RecheckStep::StaleOrDiverged
+        });
     };
     if checkpoint.presence_verified {
         return Ok(RecheckStep::PresenceComplete(Box::new(handle.clone())));
@@ -107,9 +120,16 @@ pub async fn drive_recheck<T: GenerationTransport>(
         RecheckPreparation::Waiting { not_before } => {
             return Ok(RecheckStep::Waiting { not_before });
         }
-        RecheckPreparation::Exhausted | RecheckPreparation::Untracked => {
-            return Ok(RecheckStep::KeepOriginal);
+        RecheckPreparation::Exhausted => {
+            return Ok(match fail_candidate_verification(client, handle).await? {
+                VerificationFailureOutcome::Applied | VerificationFailureOutcome::AlreadyFailed => {
+                    RecheckStep::VerificationFailed
+                }
+                VerificationFailureOutcome::InsufficientEvidence => RecheckStep::KeepOriginal,
+                VerificationFailureOutcome::StaleOrDiverged => RecheckStep::StaleOrDiverged,
+            });
         }
+        RecheckPreparation::Untracked => return Ok(RecheckStep::KeepOriginal),
         RecheckPreparation::StaleOrDiverged => return Ok(RecheckStep::StaleOrDiverged),
     };
     let tx = client.transaction().await.map_err(database_error)?;

@@ -33,6 +33,9 @@ pub use content::{
     ContentCheckReport, ContentCheckResult, ContentCheckState, ContentReadStep,
     GenerationContentTransport,
 };
+#[path = "posted_generation_failure.rs"]
+mod failure;
+pub use failure::{fail_candidate_verification, VerificationFailureOutcome};
 #[path = "posted_generation_presence.rs"]
 mod presence;
 pub use presence::{prepare_presence_check, record_presence_check, PresenceCheckPermit};
@@ -990,49 +993,7 @@ pub async fn abandon_candidate(
 ) -> Result<AbandonmentOutcome, StoreError> {
     let tx = client.transaction().await.map_err(database_error)?;
     if lock_candidate(&tx, handle).await?.is_none() {
-        if !lock_attempt(&tx, &handle.attempt).await? {
-            return Ok(AbandonmentOutcome::StaleOrDiverged);
-        }
-        // A terminal receipt is independent of later registry selection. It must
-        // still match the exact original operation/claim and health transition;
-        // a refreshed handle or another attempt cannot acknowledge this stop.
-        let applied_revision = handle
-            .health_revision
-            .checked_add(1)
-            .ok_or(StoreError::Inconsistent)?;
-        let applied_round = handle
-            .round
-            .checked_add(1)
-            .ok_or(StoreError::Inconsistent)?;
-        let abandoned = tx
-            .query_opt(
-                "SELECT o.id FROM posted_file_operations o \
-                 JOIN posted_files p ON p.id = o.generation_id AND p.generation_operation = o.id \
-                 JOIN posted_file_health h ON h.generation_id = o.generation_id \
-                 WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3 \
-                 AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6 \
-                 AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text \
-                 AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint \
-                 AND o.state = 'abandoned' AND h.state = 'unknown' AND h.failure_kind IS NULL \
-                 AND h.verified_at IS NULL AND h.retention_checked_at IS NULL \
-                 AND h.revision = $10 AND h.round = $11",
-                &[
-                    &handle.operation,
-                    &handle.generation,
-                    &handle.claim_token,
-                    &handle.attempt.job_id,
-                    &handle.attempt.attempt,
-                    &handle.attempt.token,
-                    &handle.registry_revision,
-                    &handle.predecessor,
-                    &handle.predecessor_health_revision,
-                    &applied_revision,
-                    &applied_round,
-                ],
-            )
-            .await
-            .map_err(database_error)?
-            .is_some();
+        let abandoned = stopped_candidate_receipt(&tx, handle, CandidateStop::Abandoned).await?;
         tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
         return Ok(if abandoned {
             AbandonmentOutcome::AlreadyAbandoned
@@ -1040,6 +1001,91 @@ pub async fn abandon_candidate(
             AbandonmentOutcome::StaleOrDiverged
         });
     }
+    stop_candidate(&tx, handle, CandidateStop::Abandoned).await?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AbandonmentOutcome::Applied)
+}
+
+#[derive(Clone, Copy)]
+enum CandidateStop {
+    Abandoned,
+    VerificationFailed,
+}
+
+impl CandidateStop {
+    fn health_state(self) -> &'static str {
+        match self {
+            Self::Abandoned => "unknown",
+            Self::VerificationFailed => "terminal_failed",
+        }
+    }
+
+    fn failure_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Abandoned => None,
+            Self::VerificationFailed => Some("verification"),
+        }
+    }
+}
+
+// A receipt is independent of later registry selection but must match the exact
+// original operation/claim and health transition. It grants no posting handle.
+async fn stopped_candidate_receipt(
+    tx: &Transaction<'_>,
+    handle: &GenerationHandle,
+    stop: CandidateStop,
+) -> Result<bool, StoreError> {
+    if !lock_attempt(tx, &handle.attempt).await? {
+        return Ok(false);
+    }
+    let applied_revision = handle
+        .health_revision
+        .checked_add(1)
+        .ok_or(StoreError::Inconsistent)?;
+    let applied_round = handle
+        .round
+        .checked_add(1)
+        .ok_or(StoreError::Inconsistent)?;
+    Ok(tx
+        .query_opt(
+            "SELECT o.id FROM posted_file_operations o \
+             JOIN posted_files p ON p.id = o.generation_id AND p.generation_operation = o.id \
+             JOIN posted_file_health h ON h.generation_id = o.generation_id \
+             WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3 \
+             AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6 \
+             AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text \
+             AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint \
+             AND o.state = 'abandoned' AND h.state = $12 \
+             AND h.failure_kind IS NOT DISTINCT FROM $13::text \
+             AND h.verified_at IS NULL AND h.retention_checked_at IS NULL \
+             AND h.revision = $10 AND h.round = $11",
+            &[
+                &handle.operation,
+                &handle.generation,
+                &handle.claim_token,
+                &handle.attempt.job_id,
+                &handle.attempt.attempt,
+                &handle.attempt.token,
+                &handle.registry_revision,
+                &handle.predecessor,
+                &handle.predecessor_health_revision,
+                &applied_revision,
+                &applied_round,
+                &stop.health_state(),
+                &stop.failure_kind(),
+            ],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some())
+}
+
+// Caller holds the complete candidate fence. All custody and references remain.
+async fn stop_candidate(
+    tx: &Transaction<'_>,
+    handle: &GenerationHandle,
+    stop: CandidateStop,
+) -> Result<(), StoreError> {
     tx.execute(
         "UPDATE posted_file_operations SET state = 'abandoned' WHERE id = $1",
         &[&handle.operation],
@@ -1047,10 +1093,14 @@ pub async fn abandon_candidate(
     .await
     .map_err(database_error)?;
     tx.execute(
-        "UPDATE posted_file_health SET state = 'unknown', failure_kind = NULL, \
+        "UPDATE posted_file_health SET state = $2, failure_kind = $3, \
          verified_at = NULL, retention_checked_at = NULL, revision = revision + 1, \
          round = round + 1, round_token = gen_random_uuid()::text WHERE generation_id = $1",
-        &[&handle.generation],
+        &[
+            &handle.generation,
+            &stop.health_state(),
+            &stop.failure_kind(),
+        ],
     )
     .await
     .map_err(database_error)?;
@@ -1068,10 +1118,9 @@ pub async fn abandon_candidate(
         .await
         .map_err(database_error)?;
     if changed != 1 {
-        return Ok(AbandonmentOutcome::StaleOrDiverged);
+        return Err(StoreError::Inconsistent);
     }
-    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(AbandonmentOutcome::Applied)
+    Ok(())
 }
 
 /// Durable evidence for one slot on one configured backbone. POST success is
@@ -1208,11 +1257,21 @@ pub async fn load_checkpoint(
     let Some(current) = lock_candidate(&tx, handle).await? else {
         return Ok(None);
     };
+    let checkpoint = checkpoint_locked(&tx, handle, &current).await?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(Some(checkpoint))
+}
+
+async fn checkpoint_locked(
+    tx: &Transaction<'_>,
+    handle: &GenerationHandle,
+    current: &Row,
+) -> Result<GenerationCheckpoint, StoreError> {
     let count = current.get::<_, i32>("article_count");
     if !(1..=MAX_ARTICLE_COUNT).contains(&count) {
         return Err(StoreError::Inconsistent);
     }
-    let bundle = stored(&tx, &handle.generation).await?;
+    let bundle = stored(tx, &handle.generation).await?;
     let mut slots = vec![[SlotProgress::default(); 2]; count as usize];
     for row in tx
         .query(
@@ -1236,12 +1295,11 @@ pub async fn load_checkpoint(
         plan: bundle.plan_sha256().to_owned(),
         round: handle.round,
         slots,
-        schedule: rechecks::load_schedule(&tx, handle).await?,
-        content_checks: content::load_checks(&tx, handle).await?,
+        schedule: rechecks::load_schedule(tx, handle).await?,
+        content_checks: content::load_checks(tx, handle).await?,
         presence_verified: current.get::<_, Option<i64>>("verified_at").is_some(),
     };
-    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(Some(checkpoint))
+    Ok(checkpoint)
 }
 
 /// Prepare immediately before same-ID network repair, with no transaction held
