@@ -50,6 +50,10 @@ async function mockMedia(page: Page, time: number, duration: number, seekableEnd
 				get: () => current,
 				set: (next: number) => {
 					current = next;
+					queueMicrotask(() => {
+						el.dispatchEvent(new Event('seeking'));
+						el.dispatchEvent(new Event('seeked'));
+					});
 				},
 				configurable: true
 			});
@@ -60,22 +64,53 @@ async function mockMedia(page: Page, time: number, duration: number, seekableEnd
 
 const position = (page: Page) => audio(page).evaluate((el: HTMLAudioElement) => el.currentTime);
 
-test('RJ-01 buttons jump the native player and announce politely', async ({ page }) => {
+for (const paused of [true, false]) {
+	test(`RJ-01 buttons jump and announce without changing ${paused ? 'paused' : 'playing'} intent`, async ({ page }) => {
+		await openWithTrack(page);
+		await expect(feedback(page)).toHaveAttribute('aria-live', 'polite');
+		await mockMedia(page, 30, 120);
+		await audio(page).evaluate((el: HTMLAudioElement, paused: boolean) => {
+			Object.defineProperty(el, 'paused', { value: paused, configurable: true });
+			if (!paused) el.dispatchEvent(new Event('playing'));
+		}, paused);
+		const calls = await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }));
+
+		await page.getByRole('button', { name: 'Forward 10 seconds' }).click();
+		expect(await position(page)).toBe(40);
+		await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:40.');
+
+		await page.getByRole('button', { name: 'Back 10 seconds' }).click();
+		expect(await position(page)).toBe(30);
+		await expect(feedback(page)).toHaveText('Back 10 seconds, now at 0:30.');
+
+		// The gesture never plays or pauses.
+		expect(await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }))).toEqual(calls);
+	});
+}
+
+test('RJ-03 native scrubbing retires the previous jump announcement', async ({ page }) => {
 	await openWithTrack(page);
-	await expect(feedback(page)).toHaveAttribute('aria-live', 'polite');
 	await mockMedia(page, 30, 120);
-	const calls = await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }));
-
 	await page.getByRole('button', { name: 'Forward 10 seconds' }).click();
-	expect(await position(page)).toBe(40);
 	await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:40.');
+	await audio(page).evaluate((el: HTMLAudioElement) => { el.currentTime = 90; });
+	await expect(feedback(page)).toHaveText('');
+	expect(await position(page)).toBe(90);
+});
 
-	await page.getByRole('button', { name: 'Back 10 seconds' }).click();
-	expect(await position(page)).toBe(30);
-	await expect(feedback(page)).toHaveText('Back 10 seconds, now at 0:30.');
-
-	// The gesture never plays or pauses.
-	expect(await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }))).toEqual(calls);
+test('RJ-04 an earlier seek completion cannot erase a newer jump announcement', async ({ page }) => {
+	await openWithTrack(page);
+	await mockMedia(page, 30, 120);
+	await page.getByRole('button', { name: 'Forward 10 seconds' }).evaluate((button: HTMLButtonElement) => {
+		const el = document.querySelector<HTMLAudioElement>('[data-testid="audio-player"]')!;
+		button.click();
+		el.dispatchEvent(new Event('seeking'));
+		button.click();
+		el.dispatchEvent(new Event('seeked'));
+		el.dispatchEvent(new Event('seeking'));
+	});
+	expect(await position(page)).toBe(50);
+	await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:50.');
 });
 
 test('RJ-02 clamps at the start and reports unseekable media without writing', async ({ page }) => {

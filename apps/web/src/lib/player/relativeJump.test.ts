@@ -30,11 +30,23 @@ describe('jumpMedia', () => {
 	});
 
 	it('reports a boundary without writing when already at an edge', () => {
-		expect(jumpMedia(media(0, 120), 'back')).toEqual({ kind: 'boundary', edge: 'start' });
-		expect(jumpMedia(media(120, 120), 'forward')).toEqual({ kind: 'boundary', edge: 'end' });
-		// Float readback just short of or past the end still counts as the end.
-		expect(jumpMedia(media(119.9999, 120), 'forward')).toEqual({ kind: 'boundary', edge: 'end' });
-		expect(jumpMedia(media(120.0001, 120), 'forward')).toEqual({ kind: 'boundary', edge: 'end' });
+		for (const [position, direction, edge] of [
+			[0, 'back', 'start'],
+			[120, 'forward', 'end'],
+			// Float readback just short of or past the end still counts as the end.
+			[119.9999, 'forward', 'end'],
+			[120.0001, 'forward', 'end']
+		] as const) {
+			const writes: number[] = [];
+			const el = {
+				duration: 120,
+				seekable: ranges([0, 120]),
+				get currentTime() { return position; },
+				set currentTime(value: number) { writes.push(value); }
+			};
+			expect(jumpMedia(el, direction)).toEqual({ kind: 'boundary', edge });
+			expect(writes).toEqual([]);
+		}
 		// The opposite direction still moves away from an edge.
 		expect(jumpMedia(media(0, 120), 'forward')).toMatchObject({ kind: 'jumped', target: 10 });
 		const past = media(120.0001, 120);
@@ -78,6 +90,20 @@ describe('jumpMedia', () => {
 		};
 		expect(jumpMedia(el, 'forward')).toEqual({ kind: 'refused' });
 	});
+
+	it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+		'refuses nonfinite readback %s after an accepted assignment', (readback) => {
+			let written = false;
+			const el = {
+				duration: 120,
+				seekable: ranges([0, 120]),
+				get currentTime() { return written ? readback : 30; },
+				set currentTime(_value: number) { written = true; }
+			};
+			expect(jumpMedia(el, 'forward')).toEqual({ kind: 'refused' });
+			expect(written).toBe(true);
+		}
+	);
 
 	it('reports a refused assignment', () => {
 		const el = {

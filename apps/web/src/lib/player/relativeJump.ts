@@ -54,7 +54,10 @@ export function jumpMedia(media: JumpMedia, direction: JumpDirection): JumpOutco
 	}
 	try {
 		media.currentTime = target;
-		if (Math.abs(media.currentTime - target) > TOLERANCE) return { kind: 'refused' };
+		const readback = media.currentTime;
+		if (!Number.isFinite(readback) || Math.abs(readback - target) > TOLERANCE) {
+			return { kind: 'refused' };
+		}
 	} catch {
 		return { kind: 'refused' };
 	}

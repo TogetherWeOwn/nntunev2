@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, currentTrack, naturalEndPolicy, selectTrack } from '#lib/player/queue.js';
+import { addTrack, createQueue, currentTrack, naturalEndPolicy, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -19,7 +19,7 @@ function restartFixture() {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
-		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
+		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
 		'currentAudioEvent', 'handleEnded', 'shortTitle'
 	]);
@@ -50,7 +50,7 @@ function restartFixture() {
 		play: () => Promise.resolve()
 	};
 	const bindings = {
-		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack,
+		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy,
 		streamUrl: track.streamUrl,
@@ -63,15 +63,15 @@ function restartFixture() {
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '', jumpStatusVersion = 0;
+		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
 		let playEpoch = 0, endGeneration = 0, queueAnnouncementVersion = 0;
 		let repeat = 'off', playingElement = element;
 		${compiled}
 		return {
 			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
-			sourceChange: resetRestartOnSourceChange,
-			replaceQueue,
+			select: selectQueuedTrack, remove: removeQueuedTrack,
+			seeking: (target = element) => handleSeeking({ currentTarget: target }),			replaceQueue,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
 			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue, jumpStatus })
@@ -81,8 +81,9 @@ function restartFixture() {
 		applyShareLink: () => void;
 		applyPendingShareSeek: () => void;
 		jump: (direction: 'back' | 'forward') => void;
-		sourceChange: (before: unknown, after: unknown) => void;
-		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
+		select: (index: number) => void;
+		remove: (index: number) => void;
+		seeking: (target?: unknown) => void;		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
 		end: (mode: 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
 		read: () => {
@@ -112,7 +113,7 @@ test('a new same-source share navigation supersedes an earlier restart marker', 
 });
 
 test('a jump readout clears on a same-source share and on a source change', async () => {
-	const { page, media, location, track } = restartFixture();
+	const { page, media, location } = restartFixture();
 	page.jump('forward');
 	expect(media.position).toBe(40);
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
@@ -122,7 +123,52 @@ test('a jump readout clears on a same-source share and on a source change', asyn
 	expect(media.position).toBe(90);
 	expect(page.read().jumpStatus).toBe('');
 	page.jump('back');
-	page.sourceChange(track, { id: 'pine', streamUrl: '/test-audio/pine' });
+	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+	page.select(1);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('removing the current queue row clears its jump readout', () => {
+	const { page } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+	page.jump('forward');
+	page.remove(0);
+	expect(currentTrack(page.read().queue)?.id).toBe('pine');
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('native seeking clears a previous jump readout but not the jump seek itself', () => {
+	const { page, media } = restartFixture();
+	page.jump('forward');
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	media.position = 90;
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('repeated seeks at the jump target retain an accurate readout', () => {
+	const { page } = restartFixture();
+	page.jump('forward');
+	page.seeking();
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+});
+
+test('detached media events cannot retire the current jump announcement', () => {
+	const { page } = restartFixture();
+	page.jump('forward');
+	page.seeking({});	page.seeking();
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+});
+
+test('a native seek retires earlier boundary feedback', () => {
+	const { page, media } = restartFixture();
+	media.position = 0;
+	page.jump('back');
+	expect(page.read().jumpStatus).toBe('Already at the start.');
+	media.position = 30;
+	page.seeking();
 	expect(page.read().jumpStatus).toBe('');
 });
 

@@ -385,6 +385,7 @@
 	// and at the auth boundary.
 	let jumpStatus = $state('');
 	let jumpStatusVersion = $state(0);
+	let lastJumpSeek: { element: HTMLAudioElement; target: number } | null = null;
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -1068,11 +1069,23 @@
 		}
 	}
 
-	function handleSeeking(): void {
+	function handleSeeking(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (!element) return;
+		// Keep the jump's own queued event from erasing its announcement.
+		// A different native seek retires feedback for the old position.
+		if (
+			lastJumpSeek?.element !== element ||
+			!Number.isFinite(element.currentTime) ||
+			Math.abs(element.currentTime - lastJumpSeek.target) > 0.05
+		) {
+			jumpStatus = '';
+			lastJumpSeek = null;
+		}
 		// A listener's own seek wins over a pending late-duration adjustment.
 		if (
 			pendingShareSeek?.appliedSeconds != null &&
-			audioEl?.currentTime !== pendingShareSeek.appliedSeconds
+			element.currentTime !== pendingShareSeek.appliedSeconds
 		) {
 			pendingShareSeek = null;
 		}
@@ -1222,6 +1235,8 @@
 			pendingShareSeek = null;
 		}
 		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
+		lastJumpSeek = element && outcome.kind === 'jumped'
+			? { element, target: outcome.target } : null;
 		jumpStatus = describeJump(direction, outcome);
 		// Re-announce a repeated identical outcome.
 		jumpStatusVersion += 1;
@@ -2559,8 +2574,7 @@
 						oncanplay={refreshRestartAvailability}
 						onprogress={refreshRestartAvailability}
 						ontimeupdate={refreshRestartAvailability}
-						onseeking={handleSeeking}
-					></audio>
+						onseeking={handleSeeking}					></audio>
 				{/key}
 				<button
 					class="nt-button nt-library-restart"
