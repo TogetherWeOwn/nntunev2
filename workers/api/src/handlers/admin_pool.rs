@@ -79,7 +79,7 @@ where
         if secret.validate().is_err() {
             return validation_failed("invalid pool provider");
         }
-        let secret_ref = match providers::mint_provider_id() {
+        let secret_ref = match pool_providers::mint_secret_ref() {
             Ok(id) => id,
             Err(_) => return unavailable(),
         };

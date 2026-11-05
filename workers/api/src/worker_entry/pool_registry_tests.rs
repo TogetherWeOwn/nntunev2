@@ -102,7 +102,7 @@ async fn connect(config: &tokio_postgres::Config, schema: &str) -> Client {
 
 fn write(revision: u64, rotate: bool) -> PoolProviderWrite {
     let secret = rotate.then(|| {
-        let secret_ref = crate::providers::mint_provider_id().unwrap();
+        let secret_ref = crate::pool_providers::mint_secret_ref().unwrap();
         let envelope = encrypt_pool_secret(
             &[7; 32],
             1,

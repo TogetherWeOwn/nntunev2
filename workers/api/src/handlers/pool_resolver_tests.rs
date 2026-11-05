@@ -95,7 +95,11 @@ fn pr_assert_generic_503(resp: &Response, generic: &str) {
         "username",
         "secret_ref",
     ] {
-        assert!(!resp.body.contains(needle), "{needle} leaked: {}", resp.body);
+        assert!(
+            !resp.body.contains(needle),
+            "{needle} leaked: {}",
+            resp.body
+        );
     }
 }
 
@@ -138,11 +142,19 @@ fn pool_resolver_registry_projection_is_scheduling_only() {
         "ciphertext",
         "label",
     ] {
-        assert!(!resp.body.contains(leaked), "{leaked} leaked: {}", resp.body);
+        assert!(
+            !resp.body.contains(leaked),
+            "{leaked} leaked: {}",
+            resp.body
+        );
     }
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
     let accounts = body["accounts"].as_array().unwrap();
-    assert_eq!(accounts.len(), 2, "disabled rows stay visible to schedulers");
+    assert_eq!(
+        accounts.len(),
+        2,
+        "disabled rows stay visible to schedulers"
+    );
     let first = accounts.iter().find(|a| a["id"] == POOL_ID).unwrap();
     assert_eq!(first["secret_ref"], secret_ref);
     assert_eq!(first["revision"], 1);
@@ -192,7 +204,10 @@ fn pool_resolver_all_ineligible_states_share_one_generic_503() {
     assert!(generic.contains("service unavailable"));
 
     // Missing account and wrong secret_ref / revision.
-    pr_assert_generic_503(&pr_resolve(&h, POOL_ID_B, 1, &secret_ref, "stream"), &generic);
+    pr_assert_generic_503(
+        &pr_resolve(&h, POOL_ID_B, 1, &secret_ref, "stream"),
+        &generic,
+    );
     pr_assert_generic_503(&pr_resolve(&h, POOL_ID, 1, POOL_ID_B, "stream"), &generic);
     pr_assert_generic_503(&pr_resolve(&h, POOL_ID, 2, &secret_ref, "stream"), &generic);
 
@@ -201,7 +216,10 @@ fn pool_resolver_all_ineligible_states_share_one_generic_503() {
     limited["ingest_limit"] = serde_json::json!(0);
     assert_eq!(pool_put(&h, &cookie, limited.clone(), 1, None).status, 200);
     pr_assert_generic_503(&pr_resolve(&h, POOL_ID, 2, &secret_ref, "ingest"), &generic);
-    assert_eq!(pr_resolve(&h, POOL_ID, 2, &secret_ref, "stream").status, 200);
+    assert_eq!(
+        pr_resolve(&h, POOL_ID, 2, &secret_ref, "stream").status,
+        200
+    );
     // Stale revision after that update.
     pr_assert_generic_503(&pr_resolve(&h, POOL_ID, 1, &secret_ref, "stream"), &generic);
 
@@ -296,7 +314,11 @@ fn pool_resolver_refuses_every_other_auth_without_store_or_dns() {
         ),
         (
             "tampered body",
-            pr_request(PR_RESOLVE, Some(header.clone()), &body.replace("stream", "ingest")),
+            pr_request(
+                PR_RESOLVE,
+                Some(header.clone()),
+                &body.replace("stream", "ingest"),
+            ),
         ),
     ];
     let mut session = good.clone();
@@ -328,7 +350,11 @@ fn pool_resolver_refuses_every_other_auth_without_store_or_dns() {
             assert!(!resp.body.contains(needle), "{name}: {}", resp.body);
         }
     }
-    assert_eq!(h.store.pool_reads.get(), 0, "refusals must not read registry or secrets");
+    assert_eq!(
+        h.store.pool_reads.get(),
+        0,
+        "refusals must not read registry or secrets"
+    );
     assert_eq!(counting.calls.get(), 0, "refusals must not resolve DNS");
     assert_eq!(pool_state(&h), state_before);
 
@@ -348,7 +374,11 @@ fn pool_resolver_refuses_every_other_auth_without_store_or_dns() {
 
     // The registry path is equally closed to session/bearer/meter auth.
     let reg_meter = crate::meter_sink::authorization_header(Some(PR_SECRET), NOW, b"{}").unwrap();
-    for auth in [None, Some(reg_meter), Some("Bearer ntk_synthetic".to_string())] {
+    for auth in [
+        None,
+        Some(reg_meter),
+        Some("Bearer ntk_synthetic".to_string()),
+    ] {
         let resp = pr_send(&h, &pr_request(PR_REGISTRY, auth, "{}"));
         assert_eq!(resp.status, 404, "{}", resp.body);
     }
@@ -466,7 +496,10 @@ fn pool_resolver_crypto_state_failures_are_generic_503() {
         .get_mut(&secret_ref)
         .unwrap()
         .0 = original_version;
-    assert_eq!(pr_resolve(&h, POOL_ID, 1, &secret_ref, "stream").status, 200);
+    assert_eq!(
+        pr_resolve(&h, POOL_ID, 1, &secret_ref, "stream").status,
+        200
+    );
 
     // Corrupted ciphertext / wrapped DEK / nonce.
     for field in 0..3 {
@@ -515,7 +548,7 @@ fn pool_resolver_envelope_substitution_fails() {
     let generic = pr_generic(&h);
     let kek_version = h.config.kek_version;
     let kek = *h.config.kek_by_version(kek_version).unwrap();
-    let swap = |envelope: crate::providers::ProviderCredsEnvelope| {
+    let swap = |envelope: crate::pool_providers::PoolSecretEnvelope| {
         h.store.pool_provider_secrets.borrow_mut().insert(
             secret_ref.clone(),
             (
@@ -534,11 +567,17 @@ fn pool_resolver_envelope_substitution_fails() {
     // Legacy-provider-table v2 envelope for a user whose id equals this
     // secret_ref, and for another user: the pool AAD table/scope differ.
     for user in [secret_ref.as_str(), "other-user"] {
-        let foreign = crate::providers::encrypt_provider_creds(
+        let foreign = crate::field_envelope::seal(
             &kek,
             kek_version,
-            user,
-            &secret_ref,
+            &crate::field_envelope::Context {
+                table: "providers",
+                field: "encrypted_creds",
+                scope: user,
+                row: &secret_ref,
+                version: 2,
+                format: 1,
+            },
             plaintext.as_bytes(),
         )
         .map_err(|_| ())
@@ -600,7 +639,10 @@ fn pool_resolver_dns_must_be_entirely_public() {
         ),
         ("late private", with([192, 168, 1, 9].into())),
         ("late loopback", with([127, 0, 0, 1].into())),
-        ("late v6 loopback", with(std::net::Ipv6Addr::LOCALHOST.into())),
+        (
+            "late v6 loopback",
+            with(std::net::Ipv6Addr::LOCALHOST.into()),
+        ),
         ("late link-local", with([169, 254, 169, 254].into())),
         (
             "late metadata-mapped v6",

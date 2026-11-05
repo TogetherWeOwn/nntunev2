@@ -124,13 +124,18 @@ No real service bindings or Containers are exercised by these tests.
 
 ## Checks
 
-```sh
-cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
-cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
-cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
-cargo check --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown
-cargo clippy --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
-```
+GitHub Actions job `rust (workers/transcode)` in
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs tests and
+clippy for all targets of `workers/transcode/Cargo.toml`, formatting, plus
+check and clippy for `wasm32-unknown-unknown`. Unlike the four locked Worker
+jobs, its compiling invocations do not use `--locked`. Review evidence is
+the exact-head Actions run, not a local transcript.
 
-(Mirrors CI job `rust (workers/transcode)`;
-Sources: `.github/workflows/ci.yml:594-615`.)
+Local runs are only for focused reproduction of one failing test or crate:
+small Rust work goes through the bounded pool
+(`python3 scripts/cargo_cache.py run -- test ...`), and heavy focused work goes
+through the guarded `boat` PATH wrapper with `--no-env` and a source-only
+export, with cleanup verified. Do not run the full suite, a CI mirror, or an
+image build locally, including under Boat or a fallback; if no compliant path
+is available, defer to Actions. See the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only).

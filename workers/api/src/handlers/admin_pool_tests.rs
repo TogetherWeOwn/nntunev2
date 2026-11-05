@@ -244,7 +244,7 @@ fn admin_pool_demoted_or_deleting_actor_writes_nothing() {
         secret: Some(crate::pool_providers::PoolSecretWrite {
             secret_ref: POOL_ID_B.to_string(),
             kek_version: 1,
-            envelope: crate::providers::ProviderCredsEnvelope {
+            envelope: crate::pool_providers::PoolSecretEnvelope {
                 dek_wrapped_nonce: [1; 12],
                 dek_wrapped: vec![2; 48],
                 payload_nonce: [3; 12],

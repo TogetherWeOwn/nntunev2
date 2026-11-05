@@ -6,7 +6,6 @@ use nntune_api::pool_providers::{
     decrypt_pool_secret, encrypt_pool_secret, rewrap_pool_secret, PoolProviderSecret,
     PoolProviderSettings,
 };
-use nntune_api::providers::{decrypt_provider_creds, encrypt_provider_creds};
 use nntune_api::vault::VaultError;
 use rand::RngCore;
 
@@ -171,27 +170,6 @@ fn tampering_and_transplant_fail() {
         decrypt_pool_secret(&k, 1, REF_A, &e).err(),
         Some(VaultError::CorruptStoredData)
     );
-}
-
-#[test]
-fn pool_and_legacy_provider_envelopes_do_not_cross() {
-    let k = key();
-    let pw = br#"{"password":"pw"}"#;
-
-    // Pool envelope presented as a legacy providers row, under every
-    // plausible owner scope.
-    let pool = encrypt_pool_secret(&k, 1, REF_A, &secret("pw")).unwrap();
-    for owner in ["service", "user-1", ""] {
-        assert!(decrypt_provider_creds(&k, owner, REF_A, 2, 1, 1, &pool).is_err());
-    }
-
-    // Legacy envelope presented as a pool secret.
-    for owner in ["service", "user-1"] {
-        let legacy = encrypt_provider_creds(&k, 1, owner, REF_A, pw).unwrap();
-        assert!(decrypt_pool_secret(&k, 1, REF_A, &legacy).is_err());
-        // Control: it still opens as the legacy row it is.
-        assert!(decrypt_provider_creds(&k, owner, REF_A, 2, 1, 1, &legacy).is_ok());
-    }
 }
 
 #[test]

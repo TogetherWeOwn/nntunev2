@@ -1,4 +1,4 @@
-//! Framework-agnostic HTTP handlers for the accounts/auth/vault API.
+//! Framework-agnostic HTTP handlers for the accounts/auth API.
 //!
 //! The Worker entry (`worker_entry`) adapts `worker::Request` into
 //! [`Request`] and renders [`Response`]; all security decisions live here
@@ -6,8 +6,7 @@
 //!
 //! Contracts enforced here (threat model + CISO conditions):
 //! - One generic error body per surface: auth failures are always
-//!   `401 {"error":"check your email and try again"}`, vault failures
-//!   always `400 {"error":"vault unavailable"}`, store failures
+//!   `401 {"error":"check your email and try again"}`, store failures
 //!   `500 {"error":"internal error"}`. No credential, host, banner or
 //!   existence detail ever reaches a body.
 //! - Every authenticated request goes through
@@ -21,16 +20,10 @@
 //!   so it requires the same exact `Origin` match even when unauthenticated
 //!   (login-CSRF session planting): browsers always send `Origin` on this
 //!   fetch POST, and API-only clients must send `Origin: <configured origin>`.
-//! - Vault reads/writes are keyed ONLY by the session's `user_id` — there
-//!   is no handler parameter naming a vault, so a non-owner cannot even
-//!   address another vault (no existence oracle).
 //! - Magic links, challenges and invites are consumed only through the
 //!   `*_atomically` helpers (conditional UPDATE/RETURNING, exactly one
 //!   row, committed before any response). Session refresh advances the
 //!   server row with a conditional counter update before `Set-Cookie`.
-//! - Outbound test-connection dials resolve ALL records immediately
-//!   before dialing, validate into a [`vault::ValidatedTarget`], and the
-//!   [`Dialer`] receives only that vetted address set.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -49,11 +42,8 @@ use crate::admin_ingest::{
     StoredAdminIngestJob,
 };
 use crate::b64::{decode as b64url_decode, encode as b64url_encode};
-use crate::providers::{self, ProviderMintRow};
 use crate::session::{self, SessionClaims, SessionRecord};
-use crate::vault::{
-    self, AuditEvent, DnsResolver, IndexerConfig, ProviderConfig, ValidatedTarget, VaultBlob,
-};
+use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
 /// Request bodies above this size reject before routing (not an oracle:
@@ -90,11 +80,6 @@ pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
 /// unchanged generic envelope). Drift must be a deliberate slice with README
 /// and caller updates, not a silent edit.
 pub const AUTH_MAIL_SEND_DEADLINE_SECS: u64 = 5;
-// Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
-// per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
-// once disagreed (10 vs 5) with both test suites green.
-// Expired leases outlive the bounded test-connection probe by five seconds.
-const TEST_CONNECTION_LEASE_SECS: u64 = 20;
 const AUTH_START_WINDOW_SECS: u64 = 3600;
 /// Finish-route attempt budgets (CISO follow-up): each forged assertion
 /// costs P-256 ECDSA verify + SHA-256 plus DB reads, while a failed verify
@@ -622,13 +607,6 @@ pub struct ChallengeRow {
     pub purpose: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct VaultRow {
-    pub blob: VaultBlob,
-    pub indexer_configured: bool,
-    pub updated_at: u64,
-}
-
 /// One `plans` row (migration 0021 as reseeded by 0026). Plan prices and
 /// quotas are data: the `GET /v1/plans` handler renders these rows, never
 /// a second hard-coded copy (the `PlanId` enum stays the parity mirror).
@@ -1111,21 +1089,6 @@ pub trait Store {
             Ok(())
         }
     }
-    /// Acquire one of the per-user test-connection leases until `expires_at`.
-    fn acquire_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-        lease_secs: u64,
-        max_concurrency: u32,
-    ) -> impl Future<Output = Result<bool, StoreError>>;
-    /// Release only the lease owned by `token`; a stale completion cannot
-    /// release a newer lease that reused the slot.
-    fn release_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-    ) -> impl Future<Output = Result<(), StoreError>>;
     fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -1234,45 +1197,6 @@ pub trait Store {
         }
     }
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
-    fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> impl Future<Output = Result<Option<VaultRow>, StoreError>>;
-    fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &VaultRow,
-    ) -> impl Future<Output = Result<(), StoreError>>;
-    fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
-    /// Mint one `providers` row for a vault save (migration 0022, v2).
-    /// Default no-op `Ok(())` keeps out-of-tree test stores (fixtures
-    /// without a providers table) compiling; `PgStore` MUST override it
-    /// with the fenced insert, which `worker_entry::tests` pins.
-    fn insert_provider(
-        &self,
-        _row: &ProviderMintRow,
-    ) -> impl Future<Output = Result<(), StoreError>> {
-        async { Ok(()) }
-    }
-    /// Atomic vault save: the vault upsert, the providers mint, and the
-    /// rotation prune of superseded unreferenced rows, as one unit — a
-    /// failed mint must never leave a committed vault row behind (the
-    /// save audit runs only after this returns `Ok`, so a partial write
-    /// would be a silent credential overwrite). `PgStore` MUST override
-    /// this with one transaction; the default runs the two writes
-    /// sequentially for out-of-tree test stores (whose no-op
-    /// `insert_provider` keeps the old upsert-only behavior).
-    fn save_vault_and_mint_provider(
-        &self,
-        user_id: &str,
-        vault: &VaultRow,
-        mint: &ProviderMintRow,
-    ) -> impl Future<Output = Result<(), StoreError>> {
-        async move {
-            self.upsert_vault(user_id, vault).await?;
-            self.insert_provider(mint).await
-        }
-    }
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -1291,17 +1215,11 @@ pub trait Store {
     /// The magic-finish invite gate refuses only accounts for which
     /// this is false — a never-admitted signup in progress — so
     /// established magic-only members keep signing in after
-    /// `INVITES_REQUIRED` flips. The default composes the credential
-    /// and vault reads only, keeping out-of-tree `Store` impls
-    /// compiling; production and the test fake override it with the
-    /// full predicate (sessions and role included).
+    /// `INVITES_REQUIRED` flips. The default checks credentials only;
+    /// production and the test fake override it with the full legacy
+    /// predicate (sessions, role and remaining encrypted rows included).
     fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
-        async move {
-            if !self.credentials_for_user(user_id).await?.is_empty() {
-                return Ok(true);
-            }
-            Ok(self.vault_by_user(user_id).await?.is_some())
-        }
+        async move { Ok(!self.credentials_for_user(user_id).await?.is_empty()) }
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
     /// The stored `users.role` for the admin guard, read fresh per
@@ -1688,37 +1606,6 @@ pub trait AsyncDns {
     fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
 }
 
-pub(crate) async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
-    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
-    #[cfg(not(target_arch = "wasm32"))]
-    let deadline = futures_timer::Delay::new(duration);
-    #[cfg(target_arch = "wasm32")]
-    let deadline = worker::Delay::from(duration);
-
-    let mut deadline = std::pin::pin!(deadline);
-    let mut resolution = dns.resolve(host);
-    std::future::poll_fn(|cx| {
-        // Expiry wins even if answers become ready in the same poll. Never
-        // return a partial family: all answers must reach the core SSRF guard.
-        if deadline.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(Vec::new());
-        }
-        resolution.as_mut().poll(cx)
-    })
-    .await
-    // Both losing futures drop before the caller can validate or dial.
-}
-
-struct StaticDns {
-    addresses: Vec<IpAddr>,
-}
-
-impl DnsResolver for StaticDns {
-    fn resolve(&self, _host: &str) -> Vec<IpAddr> {
-        self.addresses.clone()
-    }
-}
-
 // --- HTTP shapes --------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -1773,10 +1660,6 @@ fn generic_auth() -> Response {
         401,
         serde_json::json!({"error": "check your email and try again"}),
     )
-}
-
-fn generic_vault() -> Response {
-    json_response(400, serde_json::json!({"error": "vault unavailable"}))
 }
 
 /// The typed account-deletion fence refusal (ADR 0002 rule 3): HTTP 409
@@ -2422,12 +2305,6 @@ where
             let _ = deliver_mail_with_deadline(self.mailer.send_magic_link(email, &token)).await;
         }
     }
-
-    async fn resolve_all(&self, host: &str) -> StaticDns {
-        StaticDns {
-            addresses: resolve_bounded(self.dns, host).await,
-        }
-    }
 }
 
 // --- Request bodies ----------------------------------------------------------------------
@@ -2477,19 +2354,6 @@ struct LoginFinishBody {
 #[serde(deny_unknown_fields)]
 struct MagicFinishBody {
     token: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VaultPutBody {
-    provider: ProviderConfig,
-    indexer: Option<IndexerConfig>,
-}
-
-#[derive(serde::Serialize, Deserialize)]
-struct VaultPayload {
-    provider: ProviderConfig,
-    indexer: Option<IndexerConfig>,
 }
 
 // --- Route handlers ------------------------------------------------------------------------
@@ -3774,39 +3638,6 @@ where
     resp
 }
 
-fn summary_response(row: Option<&VaultRow>) -> Response {
-    let (provider_configured, indexer_configured, updated_at) = match row {
-        Some(row) => (true, row.indexer_configured, row.updated_at),
-        None => (false, false, 0),
-    };
-    let summary = vault::redacted_summary(provider_configured, indexer_configured, updated_at);
-    json_response(
-        200,
-        serde_json::json!({
-            "provider_configured": summary.provider_configured,
-            "indexer_configured": summary.indexer_configured,
-            "updated_at": summary.updated_at,
-        }),
-    )
-}
-
-async fn vault_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate(req, false).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    match ctx.store.vault_by_user(&claims.user_id).await {
-        Ok(row) => summary_response(row.as_ref()),
-        Err(_) => generic_vault(),
-    }
-}
-
 /// `GET /v1/plans`: every plan row for pricing display. Prices/quotas are
 /// plan *data* read from the `plans` table (the one runtime source, ADR
 /// 0004); the reserved `free` row (and any unrecognised id, fail-closed)
@@ -3929,364 +3760,6 @@ where
             "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
         }),
     )
-}
-
-/// Failure of one [`build_provider_mint_row`] call: the OS RNG was
-/// unavailable (retryable 503), or the mint inputs were invalid (a
-/// faulty caller clock — classified downstream through
-/// [`vault_write_failure`], like a failed write). The build touches no
-/// store: nothing has landed when it fails.
-enum MintBuildError {
-    RandomnessUnavailable,
-    Invalid,
-}
-
-/// Build the identity-bearing `providers` row for one vault save
-/// (migration 0022, envelope v2): fresh UUID, host-derived label, the
-/// provider config sealed under the current write KEK. Pure mint
-/// inputs, no store touch — the caller persists the row together with
-/// the vault upsert through
-/// [`Store::save_vault_and_mint_provider`], so a build failure fails
-/// the PUT before anything lands.
-fn build_provider_mint_row(
-    kek: &[u8; 32],
-    kek_version: u32,
-    user_id: &str,
-    provider: &ProviderConfig,
-    now: u64,
-) -> Result<ProviderMintRow, MintBuildError> {
-    // Fresh credential identity first: every failure below fails the
-    // PUT closed before the atomic save runs.
-    let id = match providers::mint_provider_id() {
-        Ok(id) => id,
-        Err(_) => return Err(MintBuildError::RandomnessUnavailable),
-    };
-    // `ProviderConfig` as caller-serialized JSON (payload format 1);
-    // serialization of a validated struct cannot fail, so a failure
-    // here collapses into the invalid outcome.
-    let plaintext = match serde_json::to_vec(provider) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(MintBuildError::Invalid),
-    };
-    let envelope =
-        match providers::encrypt_provider_creds(kek, kek_version, user_id, &id, &plaintext) {
-            Ok(envelope) => envelope,
-            Err(vault::VaultError::RandomnessUnavailable) => {
-                return Err(MintBuildError::RandomnessUnavailable)
-            }
-            Err(_) => return Err(MintBuildError::Invalid),
-        };
-    let row = ProviderMintRow {
-        id,
-        user_id: user_id.to_string(),
-        label: providers::provider_label_for_host(&provider.host),
-        encrypted_creds: envelope.ciphertext,
-        kek_version,
-        dek_wrapped_nonce: envelope.dek_wrapped_nonce,
-        dek_wrapped: envelope.dek_wrapped,
-        payload_nonce: envelope.payload_nonce,
-        created_at: now,
-        last_verified_at: now,
-    };
-    // By-construction values, but the clock is caller input: a faulty
-    // `now` fails here instead of as a 23514 at the database.
-    if providers::validate_mint_row(&row).is_err() {
-        return Err(MintBuildError::Invalid);
-    }
-    Ok(row)
-}
-
-/// Classify a failed vault-flow write: a fenced write (account being
-/// deleted) is the typed 409, never the generic vault failure;
-/// anything else stays generic so a probe failure cannot leak a new
-/// shape. Shared by the vault upsert and the providers mint (same
-/// fence, same classification).
-async fn vault_write_failure<S: Store>(store: &S, user_id: &str) -> Response {
-    if matches!(store.account_deleting(user_id).await, Ok(true)) {
-        return account_deleting_response();
-    }
-    generic_vault()
-}
-
-async fn vault_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate_privileged(req).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    let Some(body) = parse_body::<VaultPutBody>(req) else {
-        return generic_vault();
-    };
-    // Save-time SSRF validation over freshly resolved records (this does
-    // not authorize any later fetch; dial time revalidates).
-    let provider_dns = ctx.resolve_all(&body.provider.host).await;
-    if body.provider.validate(&provider_dns).is_err() {
-        return generic_vault();
-    }
-    if let Some(indexer) = &body.indexer {
-        let host = match url::Url::parse(&indexer.url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
-        {
-            Some(host) => host,
-            None => return generic_vault(),
-        };
-        let indexer_dns = ctx.resolve_all(&host).await;
-        if indexer.validate(&indexer_dns).is_err() {
-            return generic_vault();
-        }
-    }
-    // Repudiation-safe audit action from the core contract
-    // (`vault::ProviderConfig::audit_action`), taken BEFORE the move
-    // below: a save carrying the explicit cleartext opt-in must not look
-    // like a normal save in the audit log.
-    let audit_action = body.provider.audit_action();
-    let indexer_configured = body.indexer.is_some();
-    let payload = VaultPayload {
-        provider: body.provider,
-        indexer: body.indexer,
-    };
-    let plaintext = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(_) => return generic_vault(),
-    };
-    // Encrypt through the selected current write version only: the
-    // selector resolves the configured current key (which always wins
-    // over a same-version retained entry), never a prior. `None` is
-    // unreachable by construction — the current version always selects
-    // the current key — and fails closed like every other vault error.
-    let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
-        Some(kek) => kek,
-        None => return generic_vault(),
-    };
-    let blob = match vault::encrypt_vault(
-        current_kek,
-        ctx.cfg.kek_version,
-        &claims.user_id,
-        &plaintext,
-    ) {
-        Ok(blob) => blob,
-        Err(vault::VaultError::RandomnessUnavailable) => return unavailable(),
-        Err(_) => return generic_vault(),
-    };
-    let row = VaultRow {
-        blob,
-        indexer_configured,
-        updated_at: ctx.now,
-    };
-    // Mint the providers row for this save BEFORE the store touch: the
-    // build is pure, so a randomness or clock failure fails the PUT
-    // before anything lands.
-    let mint = match build_provider_mint_row(
-        current_kek,
-        ctx.cfg.kek_version,
-        &claims.user_id,
-        &payload.provider,
-        ctx.now,
-    ) {
-        Ok(row) => row,
-        Err(MintBuildError::RandomnessUnavailable) => return unavailable(),
-        Err(MintBuildError::Invalid) => {
-            return vault_write_failure(ctx.store, &claims.user_id).await
-        }
-    };
-    // One atomic save: vault upsert + providers mint + rotation prune.
-    // Either everything lands or nothing does, so the audit below
-    // describes a committed write and a failed PUT leaves no silent
-    // overwrite behind (a retry re-saves the single vault row and mints
-    // again with identical plaintext; the pool resolves the latest row
-    // per user).
-    if ctx
-        .store
-        .save_vault_and_mint_provider(&claims.user_id, &row, &mint)
-        .await
-        .is_err()
-    {
-        return vault_write_failure(ctx.store, &claims.user_id).await;
-    }
-    ctx.audit(&claims.user_id, audit_action, true).await;
-    summary_response(Some(&row))
-}
-
-async fn vault_delete<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate_privileged(req).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    if ctx.store.delete_vault(&claims.user_id).await.is_err() {
-        return generic_vault();
-    }
-    ctx.audit(&claims.user_id, "vault.delete", true).await;
-    summary_response(None)
-}
-
-async fn vault_test_connection<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate(req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    // Every failure below collapses to the same boolean (never a banner,
-    // host verdict or vault-existence signal).
-    let fail = || json_response(200, serde_json::json!({"ok": false}));
-    // Dual budget (per-IP AND per-account; roadmap R6): the limits come
-    // from `ctx.cfg.rate_limits` (`VAULT_TEST_*_RATE_LIMIT_*` [vars]
-    // overlaid by the Worker entry), whose per-account default IS
-    // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
-    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see
-    // rate_limit.rs. The per-IP budget has its own larger default
-    // (5x the account cap): NAT-shared addresses serve many accounts,
-    // so one account's allowed probes must not consume the whole IP
-    // budget and lock out its neighbours. Both slots are claimed as
-    // one all-or-none pair before any lookup or dial, so one host
-    // cannot burn probes across accounts, one account cannot burn
-    // them across hosts, and a denied attempt consumes neither
-    // budget. Denial keeps the same boolean collapse as every other
-    // failure on this route (never a 429 oracle here).
-    let limits = ctx.cfg.rate_limits;
-    let ip_key = rate_limit_ip_key(&ctx.source_ip);
-    let admitted = matches!(
-        ctx.store
-            .reserve_rate_limit_pair(
-                RateLimitBudget {
-                    scope_key: &ip_key,
-                    action: "vault.test_ip",
-                    limit: u64::from(limits.vault_test_ip_max_attempts),
-                    window_secs: limits.vault_test_window_secs,
-                },
-                RateLimitBudget {
-                    scope_key: &claims.user_id,
-                    action: "vault.test",
-                    limit: u64::from(limits.vault_test_max_attempts),
-                    window_secs: limits.vault_test_window_secs,
-                },
-                ctx.now,
-            )
-            .await,
-        Ok(PairAdmission::Allowed)
-    );
-    if !admitted {
-        return fail();
-    }
-    // What to dial: the stored vault by default (empty body), or a
-    // candidate envelope for test-before-save. A candidate runs the exact
-    // save-time guards (`validate` over freshly resolved records) without
-    // persisting anything, so the wizard can test a config the server has
-    // never stored. This widens no SSRF boundary: saving the same
-    // candidate then testing the stored row reaches the identical dial,
-    // and every failure below still collapses to the same boolean. A
-    // non-empty body that is not the save envelope fails closed instead
-    // of silently testing something else.
-    let (provider, indexer): (ProviderConfig, Option<IndexerConfig>) = if req.body.is_empty() {
-        let row = match ctx.store.vault_by_user(&claims.user_id).await {
-            Ok(Some(row)) => row,
-            _ => return fail(),
-        };
-        // Version-pinned decrypt: exactly one candidate — the key for the
-        // stored row's own version. An unprovisioned version selects
-        // nothing (no fallback to the current key, no trying every key)
-        // and collapses into the same boolean as a bad tag or a missing
-        // row, so unknown versions are not an oracle.
-        match ctx
-            .cfg
-            .kek_by_version(row.blob.kek_version)
-            .and_then(|kek| vault::decrypt_vault(kek, &claims.user_id, &row.blob).ok())
-            .and_then(|bytes| serde_json::from_slice::<VaultPayload>(&bytes).ok())
-        {
-            Some(payload) => (payload.provider, payload.indexer),
-            None => return fail(),
-        }
-    } else {
-        match serde_json::from_slice::<VaultPutBody>(&req.body).ok() {
-            Some(envelope) => (envelope.provider, envelope.indexer),
-            None => return generic_vault(),
-        }
-    };
-    // The attempt slot is reserved before any potentially slow lookup or
-    // dial, so concurrent requests cannot pass a count-then-act check.
-    // Fail closed on randomness before the lease: no token means no lease
-    // is acquired and no dial runs — the request ends 503, never a
-    // boolean that pretends the test ran.
-    let lease_token = match random_id::<16>() {
-        Ok(token) => token,
-        Err(_) => return unavailable(),
-    };
-    let result = async {
-        // Resolve all records immediately before the dial and hand the
-        // dialer only the vetted, bounded address set.
-        let dns = ctx.resolve_all(&provider.host).await;
-        let target: ValidatedTarget = match provider.validate(&dns) {
-            Ok(target) => target,
-            Err(_) => return Some(false),
-        };
-        // A candidate that would not save fails the test instead of
-        // testing half a config (the stored path was validated at save).
-        if let Some(indexer) = &indexer {
-            let host = match url::Url::parse(&indexer.url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
-            {
-                Some(host) => host,
-                None => return Some(false),
-            };
-            let indexer_dns = ctx.resolve_all(&host).await;
-            if indexer.validate(&indexer_dns).is_err() {
-                return Some(false);
-            }
-        }
-        let lease_acquired = ctx
-            .store
-            .acquire_test_connection_lease(
-                &claims.user_id,
-                &lease_token,
-                TEST_CONNECTION_LEASE_SECS,
-                vault::MAX_TEST_CONCURRENCY,
-            )
-            .await
-            .unwrap_or(false);
-        // A denied lease is `None` (fenced or contended, told apart
-        // below); every other failure stays the collapsed boolean.
-        if !lease_acquired {
-            return None;
-        }
-        let ok = ctx.dialer.probe(&target, provider.tls).await;
-        let _ = ctx
-            .store
-            .release_test_connection_lease(&claims.user_id, &lease_token)
-            .await;
-        Some(ok)
-    }
-    .await;
-    // A fenced lease (account being deleted) is the typed 409, never the
-    // boolean collapse: the lease is the fenced writer on this route
-    // (ADR 0002 rule 3), matching `vault_put`.
-    let Some(result) = result else {
-        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-            return account_deleting_response();
-        }
-        // Lease contention (slots exhausted): same boolean as every other
-        // failure on this route, never a distinct shape.
-        ctx.audit(&claims.user_id, "vault.test", false).await;
-        return json_response(200, serde_json::json!({"ok": false}));
-    };
-    ctx.audit(&claims.user_id, "vault.test", result).await;
-    json_response(200, serde_json::json!({"ok": result}))
 }
 
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
@@ -7106,9 +6579,6 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/refresh"
             | "/v1/session/logout"
             | "/v1/session/revoke-all"
-            | "/v1/vault"
-            | "/v1/vault/test"
-            | "/v1/vault/test-connection"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
             | "/v1/credentials"
@@ -7277,15 +6747,9 @@ where
         ("POST", "/v1/session/refresh") => session_refresh(ctx, req).await,
         ("POST", "/v1/session/logout") => session_logout(ctx, req).await,
         ("POST", "/v1/session/revoke-all") => session_revoke_all(ctx, req).await,
-        ("GET", "/v1/vault") => vault_get(ctx, req).await,
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
-        ("PUT", "/v1/vault") => vault_put(ctx, req).await,
-        ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
-        ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
-            vault_test_connection(ctx, req).await
-        }
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -7489,17 +6953,10 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
-        vaults: RefCell<HashMap<String, VaultRow>>,
-        providers: RefCell<Vec<ProviderMintRow>>,
-        /// Mirror of `user_cache_grants` attribution (`user_id`,
-        /// `provider_id` pairs): grant-referenced providers rows survive
-        /// the rotation prune and the vault-delete purge, like the
-        /// production `RESTRICT` FK.
-        provider_grants: RefCell<HashSet<(String, String)>>,
-        /// Vault-save store-error pin: when set,
-        /// `save_vault_and_mint_provider` fails like a production
-        /// outage without writing anything.
-        fail_vault_saves: RefCell<bool>,
+        /// User ids that still own a legacy `provider_vaults` row. The
+        /// product no longer reads or writes vaults; the reaper and
+        /// magic admission keep protecting these accounts.
+        legacy_vault_users: RefCell<HashSet<String>>,
         audits: RefCell<Vec<AuditEvent>>,
         /// Mirror of `users.role` (migration 0028): an absent entry is
         /// the column default (`member`) for an existing user.
@@ -7508,7 +6965,6 @@ mod tests {
         /// key with the raw stored text.
         app_settings_rows: RefCell<HashMap<String, String>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
-        test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
         delete_user_before_next_challenge: RefCell<Option<String>>,
         delete_user_after_next_challenge: RefCell<Option<String>>,
         orphan_user_after_next_challenge: RefCell<Option<String>>,
@@ -7637,8 +7093,8 @@ mod tests {
     }
 
     impl StoredPoolEnvelope {
-        fn to_envelope(&self) -> crate::providers::ProviderCredsEnvelope {
-            crate::providers::ProviderCredsEnvelope {
+        fn to_envelope(&self) -> crate::pool_providers::PoolSecretEnvelope {
+            crate::pool_providers::PoolSecretEnvelope {
                 dek_wrapped_nonce: self.dek_wrapped_nonce,
                 dek_wrapped: self.dek_wrapped.clone(),
                 payload_nonce: self.payload_nonce,
@@ -8314,7 +7770,7 @@ mod tests {
                 .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
-            let vault_owners: HashSet<String> = self.vaults.borrow().keys().cloned().collect();
+            let vault_owners: HashSet<String> = self.legacy_vault_users.borrow().clone();
             let session_owners: HashSet<String> = self
                 .sessions
                 .borrow()
@@ -8347,40 +7803,6 @@ mod tests {
                     || magic_owners.contains(&user.id)
                     || protected_user_id == Some(user.id.as_str())
             });
-            Ok(())
-        }
-        async fn acquire_test_connection_lease(
-            &self,
-            user_id: &str,
-            token: &str,
-            lease_secs: u64,
-            max_concurrency: u32,
-        ) -> Result<bool, StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account acquires no new lease rows.
-            if self.deleting_users.borrow().contains(user_id) {
-                return Ok(false);
-            }
-            let expires_at = NOW.saturating_add(lease_secs);
-            let mut leases = self.test_connection_leases.borrow_mut();
-            leases.retain(|_, (_, expires)| *expires > NOW);
-            for slot in 0..max_concurrency {
-                let key = (user_id.to_string(), slot);
-                if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(key) {
-                    entry.insert((token.to_string(), expires_at));
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        async fn release_test_connection_lease(
-            &self,
-            user_id: &str,
-            token: &str,
-        ) -> Result<(), StoreError> {
-            self.test_connection_leases
-                .borrow_mut()
-                .retain(|(owner, _), (lease_token, _)| owner != user_id || lease_token != token);
             Ok(())
         }
         async fn invite_by_hash(
@@ -8691,20 +8113,6 @@ mod tests {
             }
             Ok(())
         }
-        async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
-            Ok(self.vaults.borrow().get(user_id).cloned())
-        }
-        async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's upsert writes nothing and fails.
-            if self.deleting_users.borrow().contains(user_id) {
-                return Err(StoreError);
-            }
-            self.vaults
-                .borrow_mut()
-                .insert(user_id.to_string(), row.clone());
-            Ok(())
-        }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))
         }
@@ -8722,62 +8130,13 @@ mod tests {
                     .borrow()
                     .values()
                     .any(|s| s.user_id == user_id)
-                || self.vaults.borrow().contains_key(user_id)
+                || self.legacy_vault_users.borrow().contains(user_id)
                 || self
                     .user_roles
                     .borrow()
                     .get(user_id)
                     .is_some_and(|role| role.as_str() != crate::admin::ROLE_MEMBER);
             Ok(admitted)
-        }
-        async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
-            self.vaults.borrow_mut().remove(user_id);
-            // Mirror the production purge: unreferenced rows go with the
-            // vault; grant-referenced rows stay (RESTRICT).
-            let grants = self.provider_grants.borrow();
-            self.providers.borrow_mut().retain(|row| {
-                row.user_id != user_id || grants.contains(&(row.user_id.clone(), row.id.clone()))
-            });
-            Ok(())
-        }
-        async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's mint writes nothing and fails.
-            if self.deleting_users.borrow().contains(&row.user_id) {
-                return Err(StoreError);
-            }
-            self.providers.borrow_mut().push(row.clone());
-            Ok(())
-        }
-        async fn save_vault_and_mint_provider(
-            &self,
-            user_id: &str,
-            vault: &VaultRow,
-            mint: &ProviderMintRow,
-        ) -> Result<(), StoreError> {
-            // Mirror the production transaction: the fence and the
-            // outage pin fail BEFORE any write, so a failed save lands
-            // nothing — never a vault row without its mint.
-            if *self.fail_vault_saves.borrow() {
-                return Err(StoreError);
-            }
-            if self.deleting_users.borrow().contains(user_id) {
-                return Err(StoreError);
-            }
-            self.vaults
-                .borrow_mut()
-                .insert(user_id.to_string(), vault.clone());
-            let mut providers = self.providers.borrow_mut();
-            providers.push(mint.clone());
-            // Mirror the rotation prune: superseded rows survive only
-            // while a grant references them.
-            let grants = self.provider_grants.borrow();
-            providers.retain(|row| {
-                row.user_id != user_id
-                    || row.id == mint.id
-                    || grants.contains(&(row.user_id.clone(), row.id.clone()))
-            });
-            Ok(())
         }
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
             self.audits.borrow_mut().push(event.clone());
@@ -9905,37 +9264,6 @@ mod tests {
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&self.ctx(), &req))
-        }
-
-        fn call_full_with_ip(
-            &self,
-            source_ip: &str,
-            method: &str,
-            path: &str,
-            body: Option<String>,
-            cookie: Option<String>,
-            origin: Option<&str>,
-        ) -> Response {
-            let ctx = Ctx {
-                cfg: &self.config,
-                store: &self.store,
-                mailer: &self.mailer,
-                dialer: &self.dialer,
-                dns: &self.dns,
-                stripe: &self.stripe,
-                now: NOW,
-                source_ip: source_ip.to_string(),
-            };
-            let req = Request {
-                method: method.to_string(),
-                path: path.to_string(),
-                cookie,
-                origin: origin.map(str::to_string),
-                authorization: None,
-                stripe_signature: None,
-                body: body.map(|b| b.into_bytes()).unwrap_or_default(),
-            };
-            block_on(handle(&ctx, &req))
         }
 
         /// Bearer-route call with an explicit `Authorization` header value
@@ -14516,7 +13844,7 @@ mod tests {
             // ordinary request authentication accepts it as that user.
             let req = Request {
                 method: "GET".to_string(),
-                path: "/v1/vault".to_string(),
+                path: "/v1/plans".to_string(),
                 cookie: Some(format!("{}={session}", session::COOKIE_NAME)),
                 origin: None,
                 authorization: None,
@@ -15284,7 +14612,7 @@ mod tests {
     fn malformed_cookie_parts_do_not_hide_the_session_cookie() {
         let req = Request {
             method: "GET".to_string(),
-            path: "/v1/vault".to_string(),
+            path: "/v1/plans".to_string(),
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
             authorization: None,
@@ -15292,22 +14620,6 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
-    }
-
-    #[test]
-    fn test_connection_leases_enforce_cap_and_token_scoped_release() {
-        let store = FakeStore::default();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-a", 20, 2)).unwrap());
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-b", 20, 2)).unwrap());
-        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
-
-        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
-        // A stale token cannot release a slot that was reused by lease-c.
-        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
-        block_on(store.release_test_connection_lease("u1", "lease-c")).unwrap();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
     }
 
     #[test]
@@ -15401,12 +14713,12 @@ mod tests {
         );
         assert_eq!(cookie_of(&retried), successor);
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie.clone()), None)
                 .status,
             401
         );
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(successor.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(successor.clone()), None)
                 .status,
             200
         );
@@ -15626,7 +14938,7 @@ mod tests {
                 // C1, even though C2's response was already successfully used.
                 cookie_jar = cookie_of(&delayed);
             }
-            let authenticated = h.call_full("GET", "/v1/vault", None, Some(cookie_jar), None);
+            let authenticated = h.call_full("GET", "/v1/plans", None, Some(cookie_jar), None);
             assert_eq!(
                 authenticated.status,
                 if settle_before_advance { 200 } else { 401 }
@@ -15700,14 +15012,14 @@ mod tests {
         assert_eq!(uncertain.status, 500);
         assert!(uncertain.set_cookie.is_none());
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie.clone()), None)
                 .status,
             401
         );
         let recovered = bound_refresh(&h, &cookie, &key, NOW + 1, Some(ORIGIN));
         assert_eq!(recovered.status, 200);
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&recovered)), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie_of(&recovered)), None)
                 .status,
             200
         );
@@ -15738,7 +15050,7 @@ mod tests {
             401
         );
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&first)), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie_of(&first)), None)
                 .status,
             200
         );
@@ -15807,7 +15119,7 @@ mod tests {
             assert!(response.set_cookie.is_none());
         }
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie), None)
                 .status,
             200
         );
@@ -15852,576 +15164,8 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(resp.status, 200);
-        let dead = h.call_full("GET", "/v1/vault", None, Some(cookie2), None);
+        let dead = h.call_full("GET", "/v1/plans", None, Some(cookie2), None);
         assert_eq!(dead.status, 401);
-    }
-
-    #[test]
-    fn vault_crud_is_booleans_only_and_owner_scoped() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        seed_user(&h, "u2", "b@example.com");
-        let cookie_a = magic_login(&h, "a@example.com");
-        let cookie_b = magic_login(&h, "b@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie_a.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":true"),
-            "{}",
-            resp.body
-        );
-        for leak in ["news.example.com", "synthetic-user", "synthetic-pass"] {
-            assert!(!resp.body.contains(leak), "leaked {leak}");
-        }
-        // Another user sees an empty vault, never the owner's existence.
-        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie_b), None);
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-        // Unauthenticated and CSRF-origin mismatch both reject generically.
-        let resp = h.call_full("GET", "/v1/vault", None, None, None);
-        assert_eq!(resp.status, 401);
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie_a.clone()),
-            Some("https://evil.example.com"),
-        );
-        assert_eq!(resp.status, 401);
-        // Private targets collapse to the one generic vault error.
-        let mut dns_map = HashMap::new();
-        dns_map.insert(
-            "news.example.com".to_string(),
-            vec!["10.0.0.5".parse().unwrap()],
-        );
-        let h2_dns = FakeDns { map: dns_map };
-        let ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h2_dns,
-            now: NOW,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let req = Request {
-            method: "PUT".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie_a.clone()),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: put_body.to_string().into_bytes(),
-        };
-        let resp = block_on(handle(&ctx, &req));
-        assert_eq!(resp.status, 400);
-        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
-        // Delete returns to booleans-false.
-        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie_a), Some(ORIGIN));
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-    }
-
-    #[test]
-    fn vault_put_for_a_deleting_account_is_the_typed_409_and_writes_nothing() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Normal write first: fence open, the save lands.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        // Deletion scheduled: the same save is the typed fence refusal,
-        // never the generic 400, and the stored row is not replaced.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(
-            resp.body,
-            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
-        );
-        // Reads still work during grace (cancel must stay possible),
-        // and the pre-fence row is what they see.
-        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":true"),
-            "{}",
-            resp.body
-        );
-    }
-
-    #[test]
-    fn vault_put_mints_a_provider_row_and_a_fenced_put_mints_none() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Fence open: the save lands a vault row AND a providers row.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let minted = h.store.providers.borrow();
-        assert_eq!(minted.len(), 1, "one providers row per save");
-        let row = &minted[0];
-        assert_eq!(row.user_id, "u1");
-        assert_eq!(row.label, "news.example.com");
-        assert!(
-            crate::providers::validate_provider_mint_id(&row.id),
-            "{}",
-            row.id
-        );
-        assert_eq!(row.kek_version, 1);
-        assert!(!row.encrypted_creds.is_empty());
-        assert_eq!(row.dek_wrapped.len(), crate::providers::WRAPPED_DEK_LEN);
-        assert_eq!((row.created_at, row.last_verified_at), (NOW, NOW));
-        // The minted envelope decrypts under the test KEK with the
-        // stored row binding (user + minted id).
-        let back = crate::providers::decrypt_provider_creds(
-            &[9u8; 32],
-            "u1",
-            &row.id,
-            crate::providers::CREDS_ENVELOPE_VERSION,
-            crate::providers::CREDS_PAYLOAD_FORMAT_JSON_V1,
-            row.kek_version,
-            &crate::providers::ProviderCredsEnvelope {
-                dek_wrapped_nonce: row.dek_wrapped_nonce,
-                dek_wrapped: row.dek_wrapped.clone(),
-                payload_nonce: row.payload_nonce,
-                ciphertext: row.encrypted_creds.clone(),
-            },
-        )
-        .expect("minted envelope must decrypt");
-        let sealed: serde_json::Value = serde_json::from_slice(&back).expect("JSON payload");
-        assert_eq!(sealed["host"], "news.example.com");
-        assert_eq!(sealed["username"], "synthetic-user");
-        let first_id = row.id.clone();
-        drop(minted);
-        // A second save mints a fresh identity AND prunes the
-        // superseded unreferenced row: one live row per user, no
-        // decryptable stale copies accumulating.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let minted = h.store.providers.borrow();
-        assert_eq!(minted.len(), 1, "superseded row pruned, mint kept");
-        assert_ne!(minted[0].id, first_id, "the survivor is the new mint");
-        drop(minted);
-        // Fenced: the typed 409, and no further mint.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 1);
-    }
-
-    #[test]
-    fn vault_put_store_failure_saves_nothing_and_skips_audit() {
-        // The save is one atomic unit: a store outage fails the PUT
-        // without landing the vault row, the mint, or the audit — never
-        // a committed write the client was told failed.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        *h.store.fail_vault_saves.borrow_mut() = true;
-        let audits_before = h.store.audits.borrow().len();
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 400, "{}", resp.body);
-        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
-        assert!(
-            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
-            "no vault row on a failed save"
-        );
-        assert!(
-            h.store.providers.borrow().is_empty(),
-            "no mint on a failed save"
-        );
-        assert_eq!(
-            h.store.audits.borrow().len(),
-            audits_before,
-            "no audit for a write that never landed"
-        );
-        // The outage clears: the retry saves normally.
-        *h.store.fail_vault_saves.borrow_mut() = false;
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 1);
-    }
-
-    #[test]
-    fn vault_put_for_a_fenced_account_saves_nothing_and_skips_audit() {
-        // Fenced from the start: the typed 409, with no vault row, no
-        // mint, and no audit entry.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let audits_before = h.store.audits.borrow().len();
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert!(
-            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
-            "no vault row behind the fence"
-        );
-        assert!(
-            h.store.providers.borrow().is_empty(),
-            "no mint behind the fence"
-        );
-        assert_eq!(
-            h.store.audits.borrow().len(),
-            audits_before,
-            "no audit for a fenced save"
-        );
-    }
-
-    #[test]
-    fn vault_put_prunes_superseded_rows_unless_a_grant_references_them() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let save = || {
-            h.call_full(
-                "PUT",
-                "/v1/vault",
-                Some(put_body.to_string()),
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            )
-        };
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 1);
-        // A grant references the live row (pool attribution): the next
-        // save keeps it alongside the fresh mint.
-        h.store
-            .provider_grants
-            .borrow_mut()
-            .insert(("u1".to_string(), live[0].clone()));
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 2, "referenced row survives the prune");
-        // Drop the grant: the following save prunes the now-unreferenced
-        // superseded row and keeps only the fresh mint.
-        h.store.provider_grants.borrow_mut().clear();
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 1, "unreferenced rows pruned, mint kept");
-    }
-
-    #[test]
-    fn vault_delete_purges_unreferenced_rows_but_keeps_grant_referenced_ones() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let save = || {
-            h.call_full(
-                "PUT",
-                "/v1/vault",
-                Some(put_body.to_string()),
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            )
-        };
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let first = h.store.providers.borrow()[0].id.clone();
-        // Reference the first row, then rotate: two rows live.
-        h.store
-            .provider_grants
-            .borrow_mut()
-            .insert(("u1".to_string(), first.clone()));
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 2);
-        // Delete removes the vault and the unreferenced row; the
-        // grant-referenced row survives (RESTRICT attribution).
-        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie), Some(ORIGIN));
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-        let remaining = h.store.providers.borrow();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, first);
-    }
-
-    #[test]
-    fn mint_build_rejects_a_faulty_clock_before_any_store_touch() {
-        // The mint build is pure: a caller clock past the schema bound
-        // fails here (Invalid → generic vault failure downstream),
-        // never as a 23514 at the database. The build takes no store,
-        // so a failure cannot have landed anything by construction.
-        let provider = vault::ProviderConfig {
-            host: "news.example.com".to_string(),
-            port: 563,
-            tls: true,
-            username: "synthetic-user".to_string(),
-            password: "synthetic-pass".to_string(),
-            max_connections: 4,
-            allow_insecure_plaintext: false,
-        };
-        let bad = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, u64::MAX);
-        assert!(
-            matches!(bad, Err(MintBuildError::Invalid)),
-            "faulty clock must fail the build"
-        );
-        let good = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, NOW);
-        assert!(good.is_ok(), "sane clock must build");
-    }
-
-    #[test]
-    fn test_connection_for_a_deleting_account_is_the_typed_409() {
-        // ADR 0002 rule 3: the test-connection lease is a fenced writer, so
-        // a deleting account gets the typed 409 (like `vault_put`), never
-        // the collapsed `{"ok": false}` of an unreachable provider.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Fence open: the route answers its boolean (the fake dialer is up).
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test",
-            Some(candidate.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        // Deletion scheduled: the fenced lease is the typed refusal.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(
-            resp.body,
-            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
-        );
-    }
-
-    #[test]
-    fn vault_mutations_require_fresh_session_but_reads_do_not() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-
-        let fresh_put = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(fresh_put.status, 200, "{}", fresh_put.body);
-
-        let stale_ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h.dns,
-            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let stale_put_req = Request {
-            method: "PUT".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie.clone()),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: put_body.to_string().into_bytes(),
-        };
-        let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
-        assert_eq!(stale_put.status, 401);
-        assert_eq!(
-            stale_put.body,
-            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
-        );
-
-        let stale_get_req = Request {
-            method: "GET".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie.clone()),
-            origin: None,
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
-        assert_eq!(stale_get.status, 200, "{}", stale_get.body);
-
-        let stale_delete_req = Request {
-            method: "DELETE".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
-        assert_eq!(stale_delete.status, 401);
-        assert_eq!(
-            stale_delete.body,
-            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
-        );
-        assert!(h.store.vaults.borrow().contains_key("u1"));
     }
 
     // --- Native REST credentials (ADR 0010) -------------------------------------
@@ -16691,8 +15435,8 @@ mod tests {
         );
         assert_eq!(resp.status, 500);
         assert_eq!(resp.body, r#"{"error":"internal error"}"#);
-        let vault = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
-        assert_eq!(vault.status, 200, "unrelated routes keep serving");
+        let plans = h.call_full("GET", "/v1/plans", None, Some(cookie), None);
+        assert_eq!(plans.status, 200, "unrelated routes keep serving");
     }
 
     #[test]
@@ -18690,20 +17434,10 @@ mod tests {
 
         // Established via a vault, with no credential and no session.
         seed_user(&h, "u-magic-vault", "magic-vault@example.com");
-        h.store.vaults.borrow_mut().insert(
-            "u-magic-vault".to_string(),
-            VaultRow {
-                blob: crate::vault::VaultBlob {
-                    kek_version: 1,
-                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    dek_wrapped_b64url: "AA".to_string(),
-                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    payload_b64url: "AA".to_string(),
-                },
-                indexer_configured: false,
-                updated_at: NOW,
-            },
-        );
+        h.store
+            .legacy_vault_users
+            .borrow_mut()
+            .insert("u-magic-vault".to_string());
         let cookie = magic_login(&h, "magic-vault@example.com");
         assert!(!cookie.is_empty());
 
@@ -19137,63 +17871,6 @@ mod tests {
             r#"{"code":"not_found","message":"not found","retryable":false}"#
         );
         assert!(resp.set_cookie.is_none());
-    }
-
-    #[test]
-    fn test_connection_dials_only_vetted_addresses_and_rate_limits() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200);
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().as_slice(),
-            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
-        );
-        // Exhaust the per-user budget (shared with the vault module: 5 per
-        // 60s): further probes answer false without reaching the dialer.
-        for _ in 1..u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS) {
-            assert!(block_on(h.store.reserve_rate_limit(
-                "u1",
-                "vault.test",
-                u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
-                NOW,
-                vault::TEST_CONNECTION_WINDOW_SECS,
-            ))
-            .unwrap());
-        }
-        let before = h.dialer.seen.borrow().len();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), before);
     }
 
     // Shared synthetic-authenticator builders for the passkey tests below.
@@ -20161,121 +18838,6 @@ mod tests {
         }
     }
 
-    fn put_test_vault(h: &Harness, cookie: &str) {
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.to_string()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-    }
-
-    fn call_at(h: &Harness, now: u64, method: &str, path: &str, cookie: String) -> Response {
-        let ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h.dns,
-            now,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let req = Request {
-            method: method.to_string(),
-            path: path.to_string(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        block_on(handle(&ctx, &req))
-    }
-
-    #[test]
-    fn vault_test_connection_lease_cap_and_release_are_handler_enforced() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-
-        // A normal probe succeeds and releases its lease afterwards.
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), 1);
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "successful probe must release its lease"
-        );
-
-        // Fill the per-user lease cap directly (MAX_TEST_CONCURRENCY slots).
-        assert!(block_on(h.store.acquire_test_connection_lease(
-            "u1",
-            "lease-a",
-            20,
-            vault::MAX_TEST_CONCURRENCY
-        ))
-        .unwrap());
-        assert!(block_on(h.store.acquire_test_connection_lease(
-            "u1",
-            "lease-b",
-            20,
-            vault::MAX_TEST_CONCURRENCY
-        ))
-        .unwrap());
-
-        // The handler must refuse without reaching the dialer.
-        let before = h.dialer.seen.borrow().len();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            before,
-            "capped probe must not dial"
-        );
-        assert_eq!(h.store.test_connection_leases.borrow().len(), 2);
-
-        // Free both slots: the next probe is admitted and releases again.
-        block_on(h.store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        block_on(h.store.release_test_connection_lease("u1", "lease-b")).unwrap();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), before + 1);
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "probe must release its lease"
-        );
-    }
-
     #[test]
     fn register_start_budget_stores_no_challenge_past_cap() {
         let h = harness();
@@ -20976,10 +19538,6 @@ mod tests {
             norm.contains("let ip_key = rate_limit_ip_key(&self.source_ip);"),
             "auth-start pair key must derive from rate_limit_ip_key, not raw source_ip",
         );
-        assert!(
-            norm.contains("let ip_key = rate_limit_ip_key(&ctx.source_ip);"),
-            "vault-test pair key must derive from rate_limit_ip_key, not raw source_ip",
-        );
         for (scope, keyed) in [
             (
                 "auth.start_ip",
@@ -20988,10 +19546,6 @@ mod tests {
             (
                 "auth.start_ip_burst",
                 "scope_key: &ip_key, action: \"auth.start_ip_burst\",",
-            ),
-            (
-                "vault.test_ip",
-                "scope_key: &ip_key, action: \"vault.test_ip\",",
             ),
             (
                 "auth.mail_ip",
@@ -21391,20 +19945,10 @@ mod tests {
             revoked: false,
         }))
         .unwrap();
-        h.store.vaults.borrow_mut().insert(
-            "magic-only".to_string(),
-            VaultRow {
-                blob: crate::vault::VaultBlob {
-                    kek_version: 1,
-                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    dek_wrapped_b64url: "AA".to_string(),
-                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    payload_b64url: "AA".to_string(),
-                },
-                indexer_configured: false,
-                updated_at: NOW,
-            },
-        );
+        h.store
+            .legacy_vault_users
+            .borrow_mut()
+            .insert("magic-only".to_string());
         let (_, inbox_record) =
             auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
@@ -21433,8 +19977,8 @@ mod tests {
             "truly abandoned signup must still be reaped"
         );
         assert!(
-            h.store.vaults.borrow().contains_key("magic-only"),
-            "surviving vault must not cascade-delete"
+            h.store.legacy_vault_users.borrow().contains("magic-only"),
+            "surviving legacy vault marker must not cascade-delete"
         );
     }
 
@@ -21643,239 +20187,6 @@ mod tests {
     }
 
     #[test]
-    fn vault_test_connection_window_reopens_after_60s_at_handler() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-
-        for _ in 0..vault::TEST_CONNECTION_MAX_ATTEMPTS {
-            let resp = h.call_full(
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            );
-            assert_eq!(resp.body, r#"{"ok":true}"#);
-        }
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // Budget exhausted: blocked without a dial.
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // 2s later the 60s window is still closed (pins the window length).
-        let resp = call_at(
-            &h,
-            NOW + 2,
-            "POST",
-            "/v1/vault/test-connection",
-            cookie.clone(),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // After the window the same caller is admitted again and releases.
-        let resp = call_at(&h, NOW + 61, "POST", "/v1/vault/test-connection", cookie);
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize + 1
-        );
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "re-admitted probe must release its lease"
-        );
-    }
-
-    #[test]
-    fn vault_test_ip_budget_blocks_other_account_at_handler() {
-        // Per-IP gate isolated at the handler, NAT-sized: the per-IP
-        // cap sits ABOVE the per-account cap, so account A exhausting
-        // its own budget must NOT lock out neighbour B on the same
-        // address (first probe still admitted). Only once enough
-        // accounts together exhaust the larger per-IP budget is a
-        // fresh account denied on its FIRST probe with the usual
-        // boolean collapse and no dial. Shrinking the IP cap back to
-        // the account cap fails the neighbour probe; removing the
-        // handler's admission check fails the final denial.
-        let h = harness();
-        let account_cap = h.config.rate_limits.vault_test_max_attempts;
-        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
-        assert!(
-            ip_cap > account_cap,
-            "per-IP cap must exceed the per-account cap"
-        );
-        assert_eq!(
-            ip_cap % account_cap,
-            0,
-            "test arithmetic assumes whole account budgets fill the IP budget"
-        );
-        let fillers = (ip_cap / account_cap) as usize;
-        // fillers accounts to exhaust the IP budget, plus one victim.
-        let mut cookies = Vec::new();
-        for i in 0..=fillers {
-            let user_id = format!("u{i}");
-            let email = format!("nat{i}@example.com");
-            seed_user(&h, &user_id, &email);
-            let cookie = magic_login(&h, &email);
-            put_test_vault(&h, &cookie);
-            cookies.push(cookie);
-        }
-        let probe = |cookie: &str| {
-            h.call_full(
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.to_string()),
-                Some(ORIGIN),
-            )
-        };
-
-        // A exhausts its own per-account budget...
-        for i in 0..account_cap {
-            assert_eq!(probe(&cookies[0]).body, r#"{"ok":true}"#, "probe {i} by A");
-        }
-        // ...and neighbour B's first probe is still admitted: one
-        // account alone cannot consume the NAT-shared IP budget.
-        assert_eq!(
-            probe(&cookies[1]).body,
-            r#"{"ok":true}"#,
-            "neighbour behind the same IP must not be locked out by A alone"
-        );
-        // Fill the remaining per-IP slots across the other accounts.
-        let mut dialled = usize::try_from(account_cap).unwrap() + 1;
-        for (idx, cookie) in cookies.iter().enumerate().take(fillers).skip(1) {
-            let probes = if idx == 1 {
-                // B already used one of its account slots above.
-                account_cap - 1
-            } else {
-                account_cap
-            };
-            for i in 0..probes {
-                assert_eq!(probe(cookie).body, r#"{"ok":true}"#, "probe {i} by u{idx}");
-                dialled += 1;
-            }
-        }
-        assert_eq!(dialled, ip_cap as usize);
-        let dials = h.dialer.seen.borrow().len();
-        assert_eq!(dials, ip_cap as usize);
-
-        // The victim's per-account budget is untouched, but the shared
-        // per-IP budget is exhausted: denied before any dial.
-        let resp = probe(&cookies[fillers]);
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            dials,
-            "per-IP denial must happen before any dial"
-        );
-    }
-
-    #[test]
-    fn vault_test_ipv6_slash64_shares_ip_budget_at_handler() {
-        // Handler wiring pin for the vault per-IP key: probes spread
-        // across two addresses in one IPv6 /64 must share the single
-        // `vault.test_ip` budget through the real `vault_test_connection`
-        // handler. Each address alone stays well under the per-IP cap,
-        // so keying on the raw `source_ip` (instead of
-        // `rate_limit_ip_key`) would admit the victim's first probe and
-        // fail here — while the IPv4 harness default, where key == raw,
-        // keeps every other vault test green. A different /64 keeps its
-        // own budget.
-        let h = harness();
-        let account_cap = h.config.rate_limits.vault_test_max_attempts;
-        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
-        assert_eq!(
-            ip_cap % account_cap,
-            0,
-            "test arithmetic assumes whole account budgets fill the IP budget"
-        );
-        let fillers = (ip_cap / account_cap) as usize;
-        let ip_a = "2001:db8:abcd:12::1";
-        let ip_b = "2001:db8:abcd:12::9";
-        let ip_other = "2001:db8:abcd:13::1";
-        // fillers accounts to exhaust the shared /64 budget, plus one victim.
-        let mut cookies = Vec::new();
-        for i in 0..=fillers {
-            let user_id = format!("v6u{i}");
-            let email = format!("v6nat{i}@example.com");
-            seed_user(&h, &user_id, &email);
-            let cookie = magic_login(&h, &email);
-            put_test_vault(&h, &cookie);
-            cookies.push(cookie);
-        }
-        let probe = |cookie: &str, ip: &str| {
-            h.call_full_with_ip(
-                ip,
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.to_string()),
-                Some(ORIGIN),
-            )
-        };
-
-        // Fill the per-IP budget, alternating the two addresses in the
-        // /64 so neither raw address ever reaches the cap on its own.
-        let mut dialled = 0usize;
-        for (idx, cookie) in cookies.iter().enumerate().take(fillers) {
-            for i in 0..account_cap {
-                let ip = if dialled.is_multiple_of(2) {
-                    ip_a
-                } else {
-                    ip_b
-                };
-                assert_eq!(
-                    probe(cookie, ip).body,
-                    r#"{"ok":true}"#,
-                    "probe {i} by v6u{idx} from {ip}"
-                );
-                dialled += 1;
-            }
-        }
-        assert_eq!(dialled, ip_cap as usize);
-        let dials = h.dialer.seen.borrow().len();
-        assert_eq!(dials, ip_cap as usize);
-
-        // The victim's per-account budget is untouched, but the /64's
-        // shared per-IP budget is exhausted: denied before any dial.
-        let resp = probe(&cookies[fillers], ip_b);
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            dials,
-            "shared-/64 denial must happen before any dial"
-        );
-
-        // A different /64 keeps its own budget: the same victim is
-        // admitted from there (the denial above consumed neither budget).
-        let resp = probe(&cookies[fillers], ip_other);
-        assert_eq!(
-            resp.body, r#"{"ok":true}"#,
-            "a different /64 must keep its own budget"
-        );
-        assert_eq!(h.dialer.seen.borrow().len(), dials + 1);
-    }
-
-    #[test]
     fn previous_secret_authenticates_only_inside_rotation_window() {
         // Runbook §4: the Worker honors a staged previous secret only as
         // part of a recorded rotation, through the dual path. A pre-cutover
@@ -21952,7 +20263,7 @@ mod tests {
             };
             let req = Request {
                 method: "GET".to_string(),
-                path: "/v1/vault".to_string(),
+                path: "/v1/plans".to_string(),
                 cookie: Some(cookie.clone()),
                 origin: None,
                 authorization: None,
@@ -21994,41 +20305,6 @@ mod tests {
         assert!(session::verify_session(&primary, migrated_token, NOW).is_ok());
         // ... and once the previous secret is dropped the old token fails.
         assert_eq!(authed(&steady_cfg).status, 401);
-    }
-
-    #[test]
-    fn plaintext_opt_in_save_uses_insecure_audit_action() {
-        // The cleartext opt-in must be repudiation-safe in the audit log: a
-        // save with `allow_insecure_plaintext` records the insecure action,
-        // a normal save keeps the plain one.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-        assert_eq!(
-            h.store.audits.borrow().last().unwrap().action,
-            "vault.update"
-        );
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 119, "tls": false,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4, "allow_insecure_plaintext": true
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(
-            h.store.audits.borrow().last().unwrap().action,
-            vault::INSECURE_PLAINTEXT_AUDIT_ACTION
-        );
     }
 
     #[test]
@@ -22349,8 +20625,6 @@ mod tests {
             "/v1/session/refresh",
             "/v1/session/logout",
             "/v1/session/revoke-all",
-            "/v1/vault",
-            "/v1/vault/test-connection",
         ] {
             assert!(is_known_path(path), "{path}");
             let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
@@ -22366,173 +20640,127 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// Retired user-vault surface: every method and shape of these paths.
+    const RETIRED_VAULT_PATHS: [&str; 9] = [
+        "/v1/vault",
+        "/v1/vault/",
+        "/v1/vault/test",
+        "/v1/vault/test/",
+        "/v1/vault/test-connection",
+        "/v1/vault/test-connection/",
+        "/v1/vault/other",
+        "/v1/vault/test/extra",
+        "/V1/vault",
+    ];
+    const RETIRED_VAULT_METHODS: [&str; 9] = [
+        "GET", "PUT", "DELETE", "POST", "PATCH", "HEAD", "OPTIONS", "TRACE", "get",
+    ];
+
     #[test]
-    fn test_connection_accepts_candidate_envelope_without_stored_vault() {
-        // Test-before-save: an authenticated caller can dial a candidate
-        // config the server has never stored, under the same budget, lease
-        // and dial guards, without creating a vault row.
-        let h = harness();
+    fn retired_vault_paths_are_unknown_and_denied_by_the_scope_map() {
+        for path in RETIRED_VAULT_PATHS {
+            assert!(!is_known_path(path), "{path} must not be a known path");
+            assert!(
+                !options_preflight_served(path),
+                "{path} must not clear a browser preflight"
+            );
+            for method in RETIRED_VAULT_METHODS {
+                assert_eq!(
+                    crate::native_rest::scope_for_operation(method, path),
+                    crate::native_rest::RouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_vault_routes_are_plain_not_found_without_side_effects() {
+        let h = peppered_harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
+        // Retired paths must not even look the session up: any store
+        // authentication read would surface as a non-404 failure.
+        *h.store.fail_session_lookup.borrow_mut() = true;
+        let audits = h.store.audits.borrow().len();
+        let sessions = h.store.sessions.borrow().len();
+        let slots = h.store.rate_limit_slots.borrow().len();
+        let mails = h.mailer.sent.borrow().len();
+        let credential_lookups = *h.store.native_credential_lookups.borrow();
+        let expected = crate::api_error::ApiError::not_found("not found").body_json();
+
+        let provider_body = serde_json::json!({
             "provider": {
                 "host": "news.example.com", "port": 563, "tls": true,
                 "username": "synthetic-user", "password": "synthetic-pass",
                 "max_connections": 4
             },
             "indexer": null
-        });
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().as_slice(),
-            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
-        );
-        assert!(
-            h.store.vaults.borrow().is_empty(),
-            "candidate test must not persist a vault row"
-        );
-    }
-
-    #[test]
-    fn test_connection_rejects_unparsable_body_closed() {
-        // A non-empty body that is not the save envelope fails closed
-        // instead of silently testing something else.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
+        })
+        .to_string();
+        let bodies: [Option<String>; 6] = [
+            None,
+            Some(String::new()),
+            Some("{}".to_string()),
+            Some(provider_body),
             Some(r#"{"provider": {"host": 7}}"#.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 400);
-        assert!(h.dialer.seen.borrow().is_empty());
-    }
-
-    #[test]
-    fn test_connection_candidate_with_forbidden_host_fails_boolean() {
-        // A candidate pointing at a forbidden address collapses to the
-        // same boolean as a bad stored vault (never a banner or verdict).
-        let mut h = harness();
-        h.dns.map.insert(
-            "blocked.example.com".to_string(),
-            vec!["10.0.0.5".parse().unwrap()],
-        );
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
-            "provider": {
-                "host": "blocked.example.com", "port": 119, "tls": false,
-                "allow_insecure_plaintext": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert!(h.dialer.seen.borrow().is_empty());
-    }
-
-    #[test]
-    fn probe_dials_the_validated_target_port() {
-        // `Dialer::probe` takes no caller-supplied port, so the
-        // only port any dialer can reach is `target.port()` — vetted by
-        // `ProviderConfig::validate` against the NNTP allowlist. A
-        // recording dialer over both allowlisted ports must observe
-        // exactly the validated port (with the provider's own `tls` flag).
-        struct PortDialer {
-            seen: RefCell<Vec<(u16, bool)>>,
-        }
-
-        impl Dialer for PortDialer {
-            async fn probe(&self, target: &ValidatedTarget, tls: bool) -> bool {
-                self.seen.borrow_mut().push((target.port(), tls));
-                true
+            Some(r#"{"provider": {"host": "news.example.com""#.to_string()),
+        ];
+        let bearer = format!("Bearer ntk_{}", "0".repeat(43));
+        // (cookie, authorization, origin): anonymous, valid cookie
+        // session, presented bearer, and cookie plus bearer together.
+        let callers: [(Option<String>, Option<String>, Option<&str>); 6] = [
+            (None, None, None),
+            (None, None, Some(ORIGIN)),
+            (Some(cookie.clone()), None, None),
+            (Some(cookie.clone()), None, Some(ORIGIN)),
+            (None, Some(bearer.clone()), None),
+            (Some(cookie), Some(bearer), Some(ORIGIN)),
+        ];
+        for path in RETIRED_VAULT_PATHS {
+            for method in RETIRED_VAULT_METHODS {
+                for (cookie, authorization, origin) in &callers {
+                    for body in &bodies {
+                        let req = Request {
+                            method: method.to_string(),
+                            path: path.to_string(),
+                            cookie: cookie.clone(),
+                            origin: origin.map(str::to_string),
+                            authorization: authorization.clone(),
+                            stripe_signature: None,
+                            body: body.clone().unwrap_or_default().into_bytes(),
+                        };
+                        let resp = block_on(handle(&h.ctx(), &req));
+                        let who = format!(
+                            "{method} {path} cookie={} bearer={} body={body:?}",
+                            cookie.is_some(),
+                            authorization.is_some()
+                        );
+                        assert_eq!(resp.status, 404, "{who}: {}", resp.body);
+                        assert_eq!(resp.body, expected, "{who}");
+                        assert!(resp.set_cookie.is_none(), "{who}: no cookies");
+                        assert!(resp.retry_after.is_none(), "{who}");
+                    }
+                }
             }
         }
-
-        for (port, tls) in [(119u16, true), (563u16, true)] {
-            let config = ProviderConfig {
-                host: "news.example.com".to_string(),
-                port,
-                tls,
-                username: "synthetic-user".to_string(),
-                password: "synthetic-pass".to_string(),
-                max_connections: 4,
-                allow_insecure_plaintext: false,
-            };
-            let dns = StaticDns {
-                addresses: vec!["93.184.216.34".parse().unwrap()],
-            };
-            let target = config.validate(&dns).expect("allowlisted port validates");
-            assert_eq!(target.port(), port);
-            let dialer = PortDialer {
-                seen: RefCell::new(Vec::new()),
-            };
-            assert!(block_on(dialer.probe(&target, tls)));
-            assert_eq!(
-                dialer.seen.borrow().as_slice(),
-                [(port, tls)],
-                "dialed port must equal the validated target port"
-            );
-        }
-    }
-
-    #[test]
-    fn probe_takes_no_caller_supplied_port() {
-        // Shape pin: the trait, the handler call site, and
-        // the production dialer must never carry a caller-supplied port
-        // again — a reintroduced `port: u16` parameter would let a caller
-        // smuggle a substitute past the validated target. Slice ONLY the
-        // pre-test production source first: this test's own `PortDialer`
-        // above uses the two-argument shape, so searching the whole file
-        // would match the test itself. Comments are stripped next so prose
-        // mentioning a port cannot satisfy the pins.
-        let source = include_str!("handlers.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("test module must exist")
-            .0;
-        let code = strip_line_comments(production);
-        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            norm.contains("fn probe(&self, target: &ValidatedTarget, tls: bool)"),
-            "Dialer::probe must take only (target, tls) — no caller-supplied port",
+        assert_eq!(h.store.audits.borrow().len(), audits, "no audit rows");
+        assert_eq!(
+            h.store.sessions.borrow().len(),
+            sessions,
+            "no session writes"
         );
-        assert!(
-            !norm.contains("port: u16"),
-            "handler production code must not carry a caller-supplied port anywhere",
+        assert_eq!(h.store.rate_limit_slots.borrow().len(), slots, "no budgets");
+        assert_eq!(h.mailer.sent.borrow().len(), mails);
+        assert_eq!(
+            *h.store.native_credential_lookups.borrow(),
+            credential_lookups,
+            "no bearer credential lookup"
         );
+        assert!(h.dialer.seen.borrow().is_empty(), "no probe dial");
         assert!(
-            norm.contains("ctx.dialer.probe(&target, provider.tls).await"),
-            "handler must probe with the validated target only (plus its own tls flag)",
-        );
-        let entry = include_str!("worker_entry.rs");
-        let entry_code = strip_line_comments(entry);
-        let entry_norm = entry_code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            entry_norm.contains("async fn probe(&self, target: &ValidatedTarget, tls: bool)"),
-            "SocketDialer::probe must take only (target, tls)",
-        );
-        assert!(
-            entry_norm.contains("let port = target.port();"),
-            "SocketDialer must dial the validated target's own port",
+            h.store.legacy_vault_users.borrow().is_empty(),
+            "no vault state is created"
         );
     }
 
@@ -22595,9 +20823,6 @@ mod tests {
                 "magic-finish" => {
                     serde_json::from_value::<MagicFinishBody>(wire.clone()).map(|_| ())
                 }
-                "vault-save" | "vault-test" => {
-                    serde_json::from_value::<VaultPutBody>(wire.clone()).map(|_| ())
-                }
                 "credentials-mint" => {
                     serde_json::from_value::<CredentialsMintBody>(wire.clone()).map(|_| ())
                 }
@@ -22614,7 +20839,7 @@ mod tests {
             pinned += 1;
         }
         assert_eq!(
-            pinned, 11,
+            pinned, 9,
             "every body-bearing route (incl. the invite variant and the credentials mint) is pinned"
         );
     }

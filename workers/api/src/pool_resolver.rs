@@ -6,8 +6,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::pool_providers::{lower_uuid_ok, PoolProviderRow};
-use crate::providers::ProviderCredsEnvelope;
+use crate::pool_providers::{lower_uuid_ok, PoolProviderRow, PoolSecretEnvelope};
 
 pub use nntune_core::pool_channel::{
     authorization_header, verify, AuthError, DIAL_MATERIAL_TTL_SECS, MAX_CLOCK_SKEW_SECS,
@@ -93,7 +92,7 @@ impl<'a> From<&'a PoolProviderRow> for AccountSnapshot<'a> {
 pub struct StoredAccount {
     pub row: PoolProviderRow,
     pub kek_version: u32,
-    pub envelope: ProviderCredsEnvelope,
+    pub envelope: PoolSecretEnvelope,
 }
 
 /// One immediate TLS dial, not a reusable credential cache or a lease. The

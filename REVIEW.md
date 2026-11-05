@@ -12,6 +12,20 @@ Read `README.md` (architecture choices are normative there), `AGENTS.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, and the ADRs in `docs/adr/` for the area
 changed. Do not invent conventions they do not state.
 
+## Verification evidence
+
+Use the full reviewed head SHA and its GitHub Actions run/job links and
+conclusions as CI evidence. The real workflow is `.github/workflows/ci.yml`
+with aggregate `ci-ok`; do not ask for a local full-suite transcript or
+run a CI mirror. Local reproduction is limited to one failing test or crate;
+heavy focused work and any fallback retain the guarded Boat/pool limits in
+[CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first).
+A stale-head run or a skipped required job does not prove the gate passed.
+Actions evidence changes no required check or review/release gate, and
+never replaces same-build staging, migrations, rollback or exact-head
+production authorization. This analysis-only review is not the final
+merge/approval stage described in CONTRIBUTING.
+
 ## Before you flag a security issue
 
 - Require a concrete exploit path at the exact reviewed commit: who the

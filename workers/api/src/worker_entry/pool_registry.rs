@@ -81,8 +81,8 @@ pub(super) async fn account_on(
                 row.try_get("creds_payload_nonce").map_err(|_| StoreError)?;
             let dek_wrapped: Vec<u8> = row.try_get("creds_dek_wrapped").map_err(|_| StoreError)?;
             let ciphertext: Vec<u8> = row.try_get("encrypted_creds").map_err(|_| StoreError)?;
-            if version != crate::providers::CREDS_ENVELOPE_VERSION
-                || format != crate::providers::CREDS_PAYLOAD_FORMAT_JSON_V1
+            if version != pool_providers::CREDS_ENVELOPE_VERSION
+                || format != pool_providers::CREDS_PAYLOAD_FORMAT_JSON_V1
                 || kek_version <= 0
                 || dek_wrapped.len() != 48
                 || ciphertext.len() < 16
@@ -92,7 +92,7 @@ pub(super) async fn account_on(
             Ok(crate::pool_resolver::StoredAccount {
                 row: from_row(row)?,
                 kek_version: kek_version as u32,
-                envelope: crate::providers::ProviderCredsEnvelope {
+                envelope: pool_providers::PoolSecretEnvelope {
                     dek_wrapped_nonce: wrapped_nonce.try_into().map_err(|_| StoreError)?,
                     dek_wrapped,
                     payload_nonce: payload_nonce.try_into().map_err(|_| StoreError)?,

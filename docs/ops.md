@@ -785,13 +785,20 @@ without a tag. Production therefore only ever deploys on the release path
 only (`environment: staging` on both deploy jobs). No other GitHub
 environment exists on this repo.
 
-- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
-  pull requests, not on `main`: record the PR whose squash commit is the
-  promotion SHA, and that they were green on that PR's final head
-  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
-  or recorded as a flake/quarantine decision with a card link, never
-  dismissed.
+- [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
+  URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
+  CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
+  never in a local CI mirror. Reviewers and the Release Manager accept
+  these exact-head links as CI evidence, not local full-suite transcripts
+  ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
+  `migrations-staging` and `Devin Review` report on pull requests, not on
+  `main`: record the PR whose squash commit is the promotion SHA, and that
+  they were green on that PR's final head. Answer any advisory CodeRabbit
+  findings without waiting for it. Required checks and review/release
+  gates are unchanged; this evidence does not authorize production or
+  replace the staging, migration and rollback boxes below. A red required
+  check is fixed in code or recorded as a flake/quarantine decision with
+  a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:233-241` runs

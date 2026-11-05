@@ -222,7 +222,7 @@ pub fn idempotency_key(content_hex: &str) -> String {
 }
 
 /// Per-row data-encrypting key, cleared on drop (same zeroizing
-/// discipline as the provider envelope in [`crate::providers`]: not a
+/// discipline as the shared API field envelope: not a
 /// second crypto design).
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct Dek([u8; 32]);

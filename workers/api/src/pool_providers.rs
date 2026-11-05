@@ -4,8 +4,8 @@
 //! service, not per-user vault rows. This module holds the settings and
 //! write contracts, redacted views/audits, and the password secret envelope.
 //!
-//! Secret envelope: the same v2 field envelope as
-//! [`crate::providers`] (shared implementation, no second crypto path),
+//! Secret envelope: the shared API v2 field envelope
+//! (one implementation, no second crypto path),
 //! bound to AAD table `pool_provider_secrets`, owner scope `service`
 //! and row key `secret_ref` (a UUID). Because the table and scope differ
 //! from the legacy `providers` rows, a pool envelope never authenticates
@@ -18,11 +18,26 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::providers::{
-    decrypt_v2_in_table, encrypt_v2_in_table, rewrap_v2_in_table, validate_provider_mint_id,
-    ProviderCredsEnvelope, CREDS_ENVELOPE_VERSION, CREDS_PAYLOAD_FORMAT_JSON_V1,
-};
+use crate::field_envelope::{self, Context};
 use crate::vault::{host_shape_ok, nntp_port_allowed, VaultError, MAX_CONNECTIONS_CEILING};
+
+/// Stored pool-secret bytes; no plaintext DEK and deliberately no Debug.
+pub use crate::field_envelope::FieldEnvelope as PoolSecretEnvelope;
+
+/// Schema-pinned v2 envelope and JSON payload format.
+pub const CREDS_ENVELOPE_VERSION: i16 = 2;
+pub const CREDS_PAYLOAD_FORMAT_JSON_V1: i16 = 1;
+
+fn secret_context(secret_ref: &str) -> Context<'_> {
+    Context {
+        table: POOL_SECRET_AAD_TABLE,
+        field: "encrypted_creds",
+        scope: POOL_SECRET_OWNER_SCOPE,
+        row: secret_ref,
+        version: CREDS_ENVELOPE_VERSION as u16,
+        format: CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
+    }
+}
 
 /// AAD table pin for pool secrets.
 pub const POOL_SECRET_AAD_TABLE: &str = "pool_provider_secrets";
@@ -66,7 +81,19 @@ fn has_control(s: &str) -> bool {
 }
 
 pub fn lower_uuid_ok(raw: &str) -> bool {
-    validate_provider_mint_id(raw) && !raw.bytes().any(|b| b.is_ascii_uppercase())
+    crate::meter_sink::is_uuid_shaped(raw) && !raw.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// Fresh secret identity; randomness failure must not reuse an old identity.
+pub(crate) fn mint_secret_ref() -> Result<String, VaultError> {
+    let mut b = crate::random::secure_random_bytes::<16>()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12],
+        b[13], b[14], b[15]
+    ))
 }
 
 impl PoolProviderSettings {
@@ -168,18 +195,11 @@ pub fn encrypt_pool_secret(
     kek_version: u32,
     secret_ref: &str,
     secret: &PoolProviderSecret,
-) -> Result<ProviderCredsEnvelope, VaultError> {
+) -> Result<PoolSecretEnvelope, VaultError> {
     check_ref(secret_ref)?;
     secret.validate()?;
     let mut plaintext = serde_json::to_vec(secret).map_err(|_| VaultError::Crypto)?;
-    let out = encrypt_v2_in_table(
-        POOL_SECRET_AAD_TABLE,
-        kek,
-        kek_version,
-        POOL_SECRET_OWNER_SCOPE,
-        secret_ref,
-        &plaintext,
-    );
+    let out = field_envelope::seal(kek, kek_version, &secret_context(secret_ref), &plaintext);
     plaintext.zeroize();
     out
 }
@@ -190,19 +210,11 @@ pub fn decrypt_pool_secret(
     kek: &[u8; 32],
     kek_version: u32,
     secret_ref: &str,
-    envelope: &ProviderCredsEnvelope,
+    envelope: &PoolSecretEnvelope,
 ) -> Result<PoolProviderSecret, VaultError> {
     check_ref(secret_ref)?;
-    let mut plaintext = decrypt_v2_in_table(
-        POOL_SECRET_AAD_TABLE,
-        kek,
-        POOL_SECRET_OWNER_SCOPE,
-        secret_ref,
-        CREDS_ENVELOPE_VERSION,
-        CREDS_PAYLOAD_FORMAT_JSON_V1,
-        kek_version,
-        envelope,
-    )?;
+    let mut plaintext =
+        field_envelope::open(kek, kek_version, &secret_context(secret_ref), envelope)?;
     let parsed = serde_json::from_slice::<PoolProviderSecret>(&plaintext)
         .map_err(|_| VaultError::CorruptStoredData);
     plaintext.zeroize();
@@ -222,19 +234,15 @@ pub fn rewrap_pool_secret(
     new_kek: &[u8; 32],
     new_version: u32,
     secret_ref: &str,
-    envelope: &ProviderCredsEnvelope,
-) -> Result<ProviderCredsEnvelope, VaultError> {
+    envelope: &PoolSecretEnvelope,
+) -> Result<PoolSecretEnvelope, VaultError> {
     check_ref(secret_ref)?;
-    rewrap_v2_in_table(
-        POOL_SECRET_AAD_TABLE,
+    field_envelope::rewrap(
         old_kek,
         old_version,
         new_kek,
         new_version,
-        POOL_SECRET_OWNER_SCOPE,
-        secret_ref,
-        CREDS_ENVELOPE_VERSION,
-        CREDS_PAYLOAD_FORMAT_JSON_V1,
+        &secret_context(secret_ref),
         envelope,
     )
 }
@@ -270,7 +278,7 @@ impl PoolProviderRow {
 pub struct PoolSecretWrite {
     pub secret_ref: String,
     pub kek_version: u32,
-    pub envelope: ProviderCredsEnvelope,
+    pub envelope: PoolSecretEnvelope,
 }
 
 /// Compare-and-swap registry write. Revision zero means create, never upsert.
@@ -347,4 +355,79 @@ pub fn audit_changes(
         .into_iter()
         .map(|action| (action, details.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET_REF: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn pool_and_legacy_provider_envelopes_do_not_cross() {
+        let k = [7; 32];
+        let pw = br#"{"password":"pw"}"#;
+        let pool = encrypt_pool_secret(
+            &k,
+            1,
+            SECRET_REF,
+            &PoolProviderSecret {
+                password: "pw".into(),
+            },
+        )
+        .unwrap();
+        // Legacy contexts exist only in this fixture, not a credential writer.
+        for owner in ["service", "user-1", ""] {
+            let legacy_context = Context {
+                table: "providers",
+                field: "encrypted_creds",
+                scope: owner,
+                row: SECRET_REF,
+                version: 2,
+                format: 1,
+            };
+            assert!(field_envelope::open(&k, 1, &legacy_context, &pool).is_err());
+            let legacy = field_envelope::seal(&k, 1, &legacy_context, pw).unwrap();
+            assert!(decrypt_pool_secret(&k, 1, SECRET_REF, &legacy).is_err());
+            assert_eq!(
+                field_envelope::open(&k, 1, &legacy_context, &legacy).unwrap(),
+                pw
+            );
+        }
+        assert_eq!(
+            decrypt_pool_secret(&k, 1, SECRET_REF, &pool)
+                .unwrap()
+                .password,
+            "pw"
+        );
+    }
+
+    #[test]
+    fn secret_refs_are_fresh_lowercase_v4_uuids() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let id = mint_secret_ref().unwrap();
+            assert!(lower_uuid_ok(&id));
+            assert_eq!(id.as_bytes()[14], b'4');
+            assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+            assert!(seen.insert(id));
+        }
+    }
+
+    #[test]
+    fn lowercase_uuid_shape_is_unchanged() {
+        for bad in [
+            "",
+            "not-a-uuid",
+            "11111111111141118111111111111111",
+            "11111111-1111-4111-8111-11111111111g",
+            "ABCDEF12-1234-4234-8234-123456789ABC",
+            "11111111-1111-4111-8111-111111111111-",
+            "é1111111-1111-4111-8111-111111111111",
+        ] {
+            assert!(!lower_uuid_ok(bad));
+        }
+        // Shape, not a new version/variant constraint on existing identities.
+        assert!(lower_uuid_ok("abcdef12-1234-0234-0234-123456789abc"));
+    }
 }

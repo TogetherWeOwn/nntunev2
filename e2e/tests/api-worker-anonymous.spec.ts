@@ -8,7 +8,7 @@ import {
 import { anonymousApiGet, anonymousApiOptions, apiGet, apiPost } from '../helpers/accounts.js';
 
 // Anonymous API Worker contract (no app session by construction): liveness
-// answers 200, vault/session routes answer the generic 401, and unknown
+// answers 200, plans/session routes answer the generic 401, and unknown
 // paths answer the 404 envelope.
 //
 // Preflight is an edge concern on staging (TWO-411, option 2): Cloudflare
@@ -43,15 +43,15 @@ import { anonymousApiGet, anonymousApiOptions, apiGet, apiPost } from '../helper
 /** Liveness probe: unauthenticated at the Worker, Access pair only at the edge. */
 const HEALTHZ_PATH = '/healthz';
 
-/** Anonymous 401 probes: one vault read plus the session mutation family. */
-const ANONYMOUS_401_GET_PATHS = ['/v1/vault'] as const;
+/** Anonymous 401 probes: one plans read plus the session mutation family. */
+const ANONYMOUS_401_GET_PATHS = ['/v1/plans'] as const;
 const ANONYMOUS_401_POST_PATHS = ['/v1/session/refresh', '/v1/session/revoke-all'] as const;
 
 /** Unknown-path probe: served by no Worker route, so the catch-all 404 owns it. */
 const UNKNOWN_PATH = '/v1/e2e-probe-no-such-route';
 
 /** Known-path preflight probes (answered by Access): liveness plus the authed surface. */
-const PREFLIGHT_PATHS = ['/healthz', '/v1/vault'] as const;
+const PREFLIGHT_PATHS = ['/healthz', '/v1/plans'] as const;
 
 /**
  * The Worker's single generic anonymous-denial message, pinned in
@@ -304,12 +304,12 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     // not echo the distinguishing text.
     let distinguishing = '';
     try {
-      assertGenericAnonymous401({ ...ok, bodyText: '{"error":"vault not found for this user"}' });
+      assertGenericAnonymous401({ ...ok, bodyText: '{"error":"plans not found for this user"}' });
     } catch (error) {
       distinguishing = (error as Error).message;
     }
     expect(distinguishing, 'distinguishing message must fail').toMatch(/non-generic error message/);
-    expect(distinguishing).not.toContain('vault not found for this user');
+    expect(distinguishing).not.toContain('plans not found for this user');
     // A superset carrying account fields is an account-data oracle even with
     // the right message: only the single error key passes.
     expect(
@@ -514,7 +514,7 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     // These assertions pin the paths used by the live probes.
     // Configured staging legs check them against the served Worker.
     expect(HEALTHZ_PATH).toBe('/healthz');
-    expect([...ANONYMOUS_401_GET_PATHS]).toEqual(['/v1/vault']);
+    expect([...ANONYMOUS_401_GET_PATHS]).toEqual(['/v1/plans']);
     expect([...ANONYMOUS_401_POST_PATHS]).toEqual([
       '/v1/session/refresh',
       '/v1/session/revoke-all',
@@ -523,7 +523,7 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
   });
 
   test('preflight probes cover liveness and the authed surface', () => {
-    expect([...PREFLIGHT_PATHS]).toEqual(['/healthz', '/v1/vault']);
+    expect([...PREFLIGHT_PATHS]).toEqual(['/healthz', '/v1/plans']);
   });
 });
 
@@ -562,8 +562,8 @@ test.describe('anonymous API Worker contract (staging)', () => {
     ).toBe(true);
   });
 
-  test('anonymous GET /v1/vault answers the generic 401', async ({ request }) => {
-    const baseURL = stagingBaseUrl('skip', 'api-worker-vault-anonymous');
+  test('anonymous GET /v1/plans answers the generic 401', async ({ request }) => {
+    const baseURL = stagingBaseUrl('skip', 'api-worker-plans-anonymous');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
@@ -572,7 +572,7 @@ test.describe('anonymous API Worker contract (staging)', () => {
     expect(headers['Authorization'], 'worker probe must carry no app session').toBeUndefined();
 
     for (const path of ANONYMOUS_401_GET_PATHS) {
-      const context = `api-worker-vault-anonymous ${path}`;
+      const context = `api-worker-plans-anonymous ${path}`;
       const res = await apiGet(request, `${baseURL}${path}`, headers, context);
       const bodyText = await res.text().catch(() => '');
       assertNoAccessWall(
