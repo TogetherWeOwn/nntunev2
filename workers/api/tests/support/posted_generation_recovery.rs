@@ -3,13 +3,14 @@
 
 use super::*;
 use nntune_ingest::posted_generations::{
-    begin_verification_round, confirm_article, ArticleSide, MutationOutcome,
+    begin_verification_round, confirm_article, recover_pending, ArticleSide, MutationOutcome,
 };
 
 #[derive(Clone, Copy)]
 enum Entry {
     Recover,
     Replay,
+    Pending,
 }
 
 #[derive(Clone, Copy)]
@@ -26,6 +27,8 @@ enum Change {
     Revision,
     Round,
     RoundToken,
+    RegistryRevision,
+    PendingRemoved,
 }
 
 async fn resume(
@@ -38,6 +41,7 @@ async fn resume(
     match entry {
         Entry::Recover => recover(db, attempt, &sealed.hash, &sealed.op).await,
         Entry::Replay => admit(db, attempt, expected, &sealed.mint()).await,
+        Entry::Pending => recover_pending(db, attempt, &sealed.hash).await,
     }
 }
 
@@ -199,6 +203,16 @@ async fn interleave(entry: Entry, barrier: Barrier, change: Change) {
                         .await
                         .quiet("change one recovery health fence");
                 }
+                Change::RegistryRevision | Change::PendingRemoved => {
+                    let sql = match change {
+                        Change::RegistryRevision => "UPDATE posted_file_registry SET revision = revision + 1 WHERE plaintext_sha256 = $1",
+                        Change::PendingRemoved => "UPDATE posted_file_registry SET pending_operation = NULL WHERE plaintext_sha256 = $1",
+                        _ => unreachable!(),
+                    };
+                    tx.execute(sql, &[&c.sealed.hash])
+                        .await
+                        .quiet("change discovered registry fence");
+                }
                 Change::None => {}
             }
             let snapshot = frozen(&tx, &c).await;
@@ -225,6 +239,33 @@ async fn interleave(entry: Entry, barrier: Barrier, change: Change) {
         after_fixture == frozen(&db, &c).await,
         "recovery changed durable state"
     );
+}
+
+#[test]
+fn postgres_pending_discovery_rejects_registry_changes_between_discovery_and_recovery() {
+    run_test(async {
+        for change in [Change::RegistryRevision, Change::PendingRemoved] {
+            interleave(Entry::Pending, Barrier::Registry, change).await;
+        }
+    });
+}
+
+#[test]
+fn postgres_pending_discovery_rechecks_both_leases_after_registry_wait() {
+    run_test(async {
+        for change in [Change::AttemptExpiry, Change::OperationExpiry] {
+            interleave(Entry::Pending, Barrier::Registry, change).await;
+        }
+    });
+}
+
+#[test]
+fn postgres_pending_discovery_rechecks_both_leases_after_health_wait() {
+    run_test(async {
+        for change in [Change::AttemptExpiry, Change::OperationExpiry] {
+            interleave(Entry::Pending, Barrier::Health, change).await;
+        }
+    });
 }
 
 #[test]
@@ -266,7 +307,7 @@ fn postgres_admission_replay_rechecks_both_leases_after_health_wait() {
 #[test]
 fn postgres_recovery_and_replay_reject_each_changed_health_fence_after_wait() {
     run_test(async {
-        for entry in [Entry::Recover, Entry::Replay] {
+        for entry in [Entry::Recover, Entry::Replay, Entry::Pending] {
             for change in [Change::Revision, Change::Round, Change::RoundToken] {
                 interleave(entry, Barrier::Health, change).await;
             }
@@ -277,7 +318,7 @@ fn postgres_recovery_and_replay_reject_each_changed_health_fence_after_wait() {
 #[test]
 fn postgres_recovery_and_replay_resume_exact_bundle_after_unchanged_lock_waits() {
     run_test(async {
-        for entry in [Entry::Recover, Entry::Replay] {
+        for entry in [Entry::Recover, Entry::Replay, Entry::Pending] {
             for barrier in [Barrier::Registry, Barrier::Health] {
                 interleave(entry, barrier, Change::None).await;
             }

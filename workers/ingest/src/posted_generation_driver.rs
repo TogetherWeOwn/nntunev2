@@ -73,6 +73,37 @@ async fn finish(
     }
 }
 
+/// Resume one bounded delivery using only the persisted attempt and content
+/// hash. Discover/recover the current candidate and let `drive_recheck` load its
+/// durable cursor, schedule and counters; no Queue/KV handle or local progress
+/// is accepted. Losing the returned handle does not lose committed progress.
+/// Missing or no-longer-current work stops without network calls or a new mint.
+/// Callers must explicitly admit/begin a round or take over an expired attempt;
+/// this entry never performs those transitions implicitly. Terminal receipts
+/// still use `drive_recheck` with their original handle, not hash discovery.
+/// The production Queue/pool route remains unwired; trusted transport and all
+/// original-permit callback fences are unchanged.
+pub async fn drive_pending_recheck<T: GenerationTransport>(
+    client: &mut Client,
+    attempt: &AttemptHandle,
+    hash: &str,
+    transport: &mut T,
+    max_slots: usize,
+) -> Result<RecheckStep, StoreError> {
+    if max_slots == 0 || max_slots > STAT_BATCH_SIZE {
+        return Err(StoreError::InvalidInput);
+    }
+    match recover_pending(client, attempt, hash).await? {
+        AdmissionOutcome::ResumedSameCandidate(handle, _) => {
+            drive_recheck(client, &handle, transport, max_slots).await
+        }
+        AdmissionOutcome::InconsistentOrMissing | AdmissionOutcome::StaleOrDiverged => {
+            Ok(RecheckStep::StaleOrDiverged)
+        }
+        _ => Err(StoreError::Inconsistent),
+    }
+}
+
 /// Process at most `max_slots` slot/side pairs (1..=STAT_BATCH_SIZE). Each pair
 /// issues at most one STAT and, ONLY after an answered Missing, one same-ID POST.
 /// POST/duplicate success spends accounting but never confirms presence: the next

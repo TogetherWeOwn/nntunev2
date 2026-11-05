@@ -32,7 +32,7 @@ use tokio_postgres::{Client, Row, Transaction};
 
 #[path = "posted_generation_driver.rs"]
 mod driver;
-pub use driver::{drive_recheck, GenerationTransport, RecheckStep};
+pub use driver::{drive_pending_recheck, drive_recheck, GenerationTransport, RecheckStep};
 #[path = "posted_generation_content.rs"]
 mod content;
 pub use content::{
@@ -1486,6 +1486,36 @@ pub async fn record_repost(
     .await
     .map_err(database_error)?;
     commit_mutation(tx, handle).await
+}
+
+/// Discover the pending operation from the hash registry, not a Queue/KV hint.
+/// The first read is only discovery: `recover` revalidates the discovered exact
+/// operation under the owning persisted attempt and all current candidate fences.
+/// A concurrent change refuses rather than falling back to a different candidate.
+/// Missing/stopped/foreign/expired work never authorizes a mint or implicit
+/// takeover. No lease, round, cursor or budget is changed by discovery/recovery.
+/// This does not recover a lost `acquire_attempt` acknowledgment or construct
+/// attempt authority from queue-carried numbers.
+pub async fn recover_pending(
+    client: &mut Client,
+    attempt: &AttemptHandle,
+    hash: &str,
+) -> Result<AdmissionOutcome, StoreError> {
+    if !crate::two_spool::validate_plaintext_sha256(hash) {
+        return Err(StoreError::InvalidInput);
+    }
+    let operation: Option<String> = client
+        .query_opt(
+            "SELECT pending_operation FROM posted_file_registry WHERE plaintext_sha256 = $1",
+            &[&hash],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.get("pending_operation"));
+    let Some(operation) = operation else {
+        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    };
+    recover(client, attempt, hash, &operation).await
 }
 
 /// Lost admission acknowledgment: reread by durable operation identity before

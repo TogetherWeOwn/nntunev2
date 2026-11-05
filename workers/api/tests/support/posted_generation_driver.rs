@@ -21,6 +21,9 @@
 //! content, selection or cleanup authority, and no outcome here may write a
 //! negative health, touch custody or the registry.
 
+#[path = "posted_generation_delivery.rs"]
+mod delivery;
+
 use super::*;
 use nntune_ingest::posted_generations::{
     begin_verification_round, confirm_article, drive_recheck, finish_verification,
