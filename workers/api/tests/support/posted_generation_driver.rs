@@ -1048,6 +1048,60 @@ fn postgres_driver_end_cursor_recovers_completion_without_network_or_false_confi
 }
 
 #[test]
+fn postgres_due_driver_renews_live_leases_but_waiting_delivery_does_not() {
+    run_test(async {
+        let mut db = connect().await;
+        let (c, _, handle) = begun(&mut db).await;
+        let s = &c.sealed;
+        let start = db_now(&db).await;
+        for (sql, id) in [
+            (
+                "UPDATE posted_file_job_attempts SET lease_until = $2 WHERE job_id = $1",
+                &c.job,
+            ),
+            (
+                "UPDATE posted_file_operations SET lease_until = $2 WHERE id = $1",
+                &s.op,
+            ),
+        ] {
+            db.execute(sql, &[id, &(start + 30)])
+                .await
+                .quiet("shorten fixture lease");
+        }
+        let before = frozen(&db, s).await;
+        let mut t = Transport::new(s);
+        assert!(matches!(
+            drive_recheck(&mut db, &handle, &mut t, 1).await,
+            Ok(RecheckStep::Waiting { .. })
+        ));
+        assert!(before == frozen(&db, s).await);
+        assert!(t.calls.is_empty());
+
+        make_due(&db, s).await;
+        let _ = progress_handle(
+            drive_recheck(&mut db, &handle, &mut t, 1).await,
+            "due delivery heartbeat",
+        );
+        let row = db
+            .query_one(
+                "SELECT a.lease_until, o.lease_until FROM posted_file_job_attempts a \
+             JOIN posted_file_operations o ON o.job_id = a.job_id WHERE o.id = $1",
+                &[&s.op],
+            )
+            .await
+            .quiet("read renewed driver leases");
+        let a: i64 = row.get(0);
+        let o: i64 = row.get(1);
+        assert_eq!(a, o);
+        assert!(a >= start + 300);
+        assert!(t.calls == [st(0, true)]);
+        assert!(t.exact);
+        assert_eq!(repost_sum(&db, s).await, 0);
+        assert_eq!(content_rows(&db, s).await, 0);
+    });
+}
+
+#[test]
 fn postgres_driver_finished_presence_replays_with_zero_network() {
     run_test(async {
         let mut db = connect().await;

@@ -132,6 +132,11 @@ pub async fn drive_recheck<T: GenerationTransport>(
         RecheckPreparation::Untracked => return Ok(RecheckStep::KeepOriginal),
         RecheckPreparation::StaleOrDiverged => return Ok(RecheckStep::StaleOrDiverged),
     };
+    // Only a due delivery renews the existing live claim. Waiting, exhausted
+    // and already-complete deliveries do not keep otherwise idle work alive.
+    if !renew_candidate_lease(client, handle).await? {
+        return Ok(RecheckStep::StaleOrDiverged);
+    }
     let tx = client.transaction().await.map_err(database_error)?;
     if lock_candidate(&tx, handle).await?.is_none() {
         return Ok(RecheckStep::StaleOrDiverged);

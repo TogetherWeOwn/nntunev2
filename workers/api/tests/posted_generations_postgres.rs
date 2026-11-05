@@ -64,6 +64,8 @@ mod posted_generation_driver;
 mod posted_generation_failure;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
+#[path = "support/posted_generation_lease.rs"]
+mod posted_generation_lease;
 #[path = "support/posted_generation_legacy_fence.rs"]
 mod posted_generation_legacy_fence;
 #[path = "support/posted_generation_presence.rs"]

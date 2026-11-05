@@ -834,6 +834,50 @@ async fn lock_candidate(
     .map_err(database_error)
 }
 
+/// Extend both live leases for the exact current candidate, using the database
+/// clock after all lock waits. An expired attempt or operation is never revived:
+/// acquire/take over through the existing recovery path instead. No token,
+/// revision, round, checkpoint, budget or custody changes. A lost commit response
+/// requires recovery before more network work; renewal is not posting proof.
+/// This is a delivery-boundary heartbeat, not a lock held across a request or a
+/// timer that keeps a request alive after its original callback fence expires.
+pub async fn renew_candidate_lease(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<bool, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if lock_candidate(&tx, handle).await?.is_none() {
+        return Ok(false);
+    }
+    let renewed = tx
+        .query_opt(
+            "WITH db_clock AS MATERIALIZED (
+                 SELECT extract(epoch FROM clock_timestamp())::bigint AS now
+             ), deadline AS MATERIALIZED (
+                 SELECT GREATEST(a.lease_until, o.lease_until, c.now + $3) AS until
+                 FROM posted_file_job_attempts a
+                 JOIN posted_file_operations o ON o.job_id = a.job_id
+                 CROSS JOIN db_clock c
+                 WHERE a.job_id = $1 AND o.id = $2
+                 AND a.lease_until > c.now AND o.lease_until > c.now
+             ), renewed_attempt AS (
+                 UPDATE posted_file_job_attempts a SET lease_until = d.until
+                 FROM deadline d WHERE a.job_id = $1 RETURNING a.lease_until
+             )
+             UPDATE posted_file_operations o SET lease_until = a.lease_until
+             FROM renewed_attempt a WHERE o.id = $2 RETURNING o.id",
+            &[&handle.attempt.job_id, &handle.operation, &LEASE_SECONDS],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some();
+    if !renewed {
+        return Ok(false);
+    }
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(true)
+}
+
 /// Revalidate immediately before a network request, without holding locks
 /// across that request. A request may complete externally after expiry; this
 /// check does not authorize its later callback to bypass the same fence.
