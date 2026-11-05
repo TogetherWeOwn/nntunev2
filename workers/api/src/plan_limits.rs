@@ -312,12 +312,55 @@ pub fn check_ingest_write(ingest_today: u32) -> Decision {
 /// A track already playing is not this check's concern: callers evaluate
 /// it at new-playback (grant-issuance) time only.
 pub fn check_stream_hours(plan: PlanId, stream_seconds_month: u64) -> Decision {
-    let caps = plan.caps();
+    check_stream_hours_with_caps(&plan.caps(), stream_seconds_month)
+}
+
+/// Monthly stream guard against caller-supplied caps: the grant-
+/// issuance gate reads caps from the `plans` row (plan data, ADR 0004
+/// Consequences) via [`caps_from_plan_row`] instead of the parity
+/// mirror above, so a reseed re-caps without a code change. Same
+/// at-cap-denies rule and refusal wire as [`check_stream_hours`].
+pub fn check_stream_hours_with_caps(caps: &PlanCaps, stream_seconds_month: u64) -> Decision {
     if stream_seconds_month >= caps.stream_seconds_month {
-        deny_plan(LimitDimension::StreamHours, &caps)
+        deny_plan(LimitDimension::StreamHours, caps)
     } else {
         Decision::Allow
     }
+}
+
+/// Build [`PlanCaps`] from a `plans` row (`stream_hours_month` hours,
+/// `max_concurrent_streams` count): hours convert to seconds
+/// saturating, so a corrupt huge row caps at `u64::MAX` seconds rather
+/// than wrapping into a small allowance — and never below the raw
+/// value's own scale.
+pub fn caps_from_plan_row(stream_hours_month: u64, max_concurrent_streams: u32) -> PlanCaps {
+    PlanCaps {
+        stream_seconds_month: stream_hours_month.saturating_mul(3600),
+        max_concurrent_streams,
+    }
+}
+
+/// Parameters: plan id. The runtime caps row for
+/// [`caps_from_plan_row`]; a missing row fails closed to the reserved
+/// `free` caps at the call site.
+pub fn plan_caps_select_statement() -> &'static str {
+    "SELECT stream_hours_month, max_concurrent_streams FROM plans WHERE id = $1"
+}
+
+/// Lease-held refusal: the concurrent-stream 429 with the live lease's
+/// remaining TTL as `Retry-After` (the static
+/// [`CONCURRENT_RETRY_AFTER_SECS`] serves the stateless
+/// [`check_concurrent`]; the lease gate knows the real deadline).
+/// `retry_after_secs` is clamped to at least 1 — a `Retry-After: 0`
+/// invites an immediate hot retry against a lease that has not quite
+/// lapsed.
+pub fn deny_concurrent_lease(caps: &PlanCaps, retry_after_secs: u64) -> Denial {
+    Denial::rate_limited(
+        LimitDimension::Concurrent,
+        LimitDimension::Concurrent.cap_value(caps),
+        LimitDimension::Concurrent.reset_hint(),
+        retry_after_secs.max(1),
+    )
 }
 
 /// Concurrency guard: the per-user pool calls this at lease acquisition.
@@ -469,6 +512,42 @@ mod tests {
         assert_eq!(denial.reset_hint, "next-utc-month");
         // One second under the cap still admits.
         assert!(check_stream_hours(PlanId::Plus, 100 * 3600 - 1).is_allow());
+    }
+
+    #[test]
+    fn db_row_caps_drive_the_same_stream_guard() {
+        // The issuance gate's caps come from the plans row, not the
+        // enum mirror: a reseeded 2-hour row caps at 2 hours here.
+        let caps = caps_from_plan_row(2, 1);
+        assert_eq!(caps.stream_seconds_month, 2 * 3600);
+        assert!(check_stream_hours_with_caps(&caps, 2 * 3600 - 1).is_allow());
+        let denial = check_stream_hours_with_caps(&caps, 2 * 3600)
+            .denial()
+            .expect("at-cap denies");
+        assert_eq!(denial.limit_value, 2, "wire names the row's hours");
+        // Row values saturate instead of wrapping.
+        assert_eq!(
+            caps_from_plan_row(u64::MAX, 1).stream_seconds_month,
+            u64::MAX
+        );
+        assert_eq!(
+            plan_caps_select_statement(),
+            "SELECT stream_hours_month, max_concurrent_streams FROM plans WHERE id = $1"
+        );
+    }
+
+    #[test]
+    fn lease_denial_carries_the_live_retry_after() {
+        let caps = PlanId::Plus.caps();
+        let denial = deny_concurrent_lease(&caps, 37);
+        assert_eq!((denial.status, denial.code), (429, "rate_limited"));
+        assert_eq!(denial.dimension, LimitDimension::Concurrent);
+        assert_eq!(denial.retry_after_secs, Some(37));
+        assert!(denial
+            .headers()
+            .contains(&(RETRY_AFTER_HEADER.to_string(), "37".to_string())));
+        // Never zero: an about-to-lapse lease still backs the client off.
+        assert_eq!(deny_concurrent_lease(&caps, 0).retry_after_secs, Some(1));
     }
 
     #[test]

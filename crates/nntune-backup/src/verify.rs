@@ -2,9 +2,11 @@
 //! only) and count.
 //!
 //! The operator exports production-shaped rows with BYTEA columns
-//! hex-encoded (`encode(col, 'hex')`) — see
-//! `docs/offsite-backup-runbook.md` §4b — and supplies the KEKs for
-//! exactly the backup's versions. This module never prints plaintext,
+//! hex-encoded (`encode(col, 'hex')`), one JSON object per line via
+//! `row_to_json` — see `docs/offsite-backup-runbook.md` §4b — and
+//! supplies the KEKs for exactly the backup's versions. Anything that
+//! is not one JSON row object per line (a bare tab-delimited COPY
+//! included) fails closed as `Shape`. This module never prints plaintext,
 //! keys, or ciphertext; the [`VerifyReport`] carries counts and version
 //! numbers only. Unknown envelope versions and missing KEK versions are
 //! failures, not skips: the keyring backup is incomplete.
@@ -12,9 +14,43 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::envelope::{self, Envelope, ENVELOPE_VERSION_V2, KEK_LEN};
+
+/// Operator-supplied KEK set (version → KEK). No `Debug`: key material
+/// must never be printable. Zeroized on drop, so a normal return from
+/// the `verify` leg leaves no KEK bytes in memory; callers drop the
+/// value *before* any `process::exit`, which would skip destructors.
+#[derive(Clone, Default, Zeroize, ZeroizeOnDrop)]
+pub struct Keyring {
+    keys: Vec<(u32, [u8; KEK_LEN])>,
+}
+
+impl Keyring {
+    pub fn new(keys: BTreeMap<u32, [u8; KEK_LEN]>) -> Self {
+        Keyring {
+            keys: keys.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Copy one KEK out for a single row open. The caller zeroizes the
+    /// copy as soon as the open returns.
+    pub fn get(&self, version: u32) -> Option<[u8; KEK_LEN]> {
+        self.keys
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, k)| *k)
+    }
+
+    pub fn versions(&self) -> Vec<u32> {
+        self.keys.iter().map(|(v, _)| *v).collect()
+    }
+}
 
 /// One production-shaped envelope row, BYTEA columns hex-encoded.
 #[derive(Debug, Deserialize)]
@@ -92,14 +128,10 @@ fn hex_bytes(s: &str, expect: usize) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// Authenticate every row in `rows_jsonl` against `keyring`
-/// (version → KEK). The opened DEK is zeroized immediately: this leg
-/// proves openability, it never uses the plaintext.
-pub fn verify_rows(
-    rows_jsonl: &str,
-    keyring: &BTreeMap<u32, [u8; KEK_LEN]>,
-    tool: &str,
-) -> VerifyReport {
+/// Authenticate every row in `rows_jsonl` against `keyring`. The
+/// per-row KEK copy and the opened DEK are zeroized immediately: this
+/// leg proves openability, it never uses the plaintext.
+pub fn verify_rows(rows_jsonl: &str, keyring: &Keyring, tool: &str) -> VerifyReport {
     let mut rows = 0u64;
     let mut ok = 0u64;
     let mut failed = 0u64;
@@ -113,10 +145,7 @@ pub fn verify_rows(
             if row.envelope_version != ENVELOPE_VERSION_V2 {
                 return Err(VerifyError::Auth);
             }
-            let kek = keyring
-                .get(&row.kek_version)
-                .copied()
-                .ok_or(VerifyError::Auth)?;
+            let mut kek = keyring.get(row.kek_version).ok_or(VerifyError::Auth)?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(
                 &hex_bytes(&row.dek_wrapped_nonce_hex, 12).ok_or(VerifyError::Shape)?,
@@ -133,7 +162,7 @@ pub fn verify_rows(
                 payload_nonce: pnonce,
                 ciphertext: ct,
             };
-            let mut dek = envelope::open_media_key(
+            let opened = envelope::open_media_key(
                 &kek,
                 &row.user_id,
                 &row.row_key,
@@ -142,7 +171,9 @@ pub fn verify_rows(
                 row.kek_version,
                 &env,
             )
-            .map_err(|_| VerifyError::Auth)?;
+            .map_err(|_| VerifyError::Auth);
+            kek.zeroize();
+            let mut dek = opened?;
             dek.zeroize();
             Ok(())
         })();
@@ -158,7 +189,7 @@ pub fn verify_rows(
         rows,
         ok,
         failed,
-        keyring_versions: keyring.keys().copied().collect(),
+        keyring_versions: keyring.versions(),
     }
 }
 
@@ -192,8 +223,8 @@ mod tests {
         .to_string()
     }
 
-    fn keyring(versions: &[u32]) -> BTreeMap<u32, [u8; KEK_LEN]> {
-        versions.iter().map(|v| (*v, test_kek(0x33))).collect()
+    fn keyring(versions: &[u32]) -> Keyring {
+        Keyring::new(versions.iter().map(|v| (*v, test_kek(0x33))).collect())
     }
 
     #[test]
@@ -221,6 +252,18 @@ mod tests {
     #[test]
     fn bad_hex_fails_closed() {
         let rep = verify_rows("{\"oops\": true}\n", &keyring(&[7]), "test");
+        assert_eq!((rep.rows, rep.ok, rep.failed), (1, 0, 1));
+    }
+
+    #[test]
+    fn tab_delimited_copy_fails_closed() {
+        // A bare `COPY (SELECT …) TO STDOUT` emits tab-delimited text,
+        // not JSON: the verifier must count it failed, never open.
+        let rep = verify_rows(
+            "global\tu:t\t2\t1\t7\t00\t00\t00\t00\n",
+            &keyring(&[7]),
+            "test",
+        );
         assert_eq!((rep.rows, rep.ok, rep.failed), (1, 0, 1));
     }
 }

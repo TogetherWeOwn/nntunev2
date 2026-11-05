@@ -108,9 +108,12 @@ function findField(page: Page): Locator {
 	// Same vocabulary as the find specs: type search (role searchbox) or
 	// type text (role textbox); either way the accessible name must mention
 	// find or search. A "Clear search" button never matches these roles.
+	// Scoped to the page main: the app-shell top bar carries its own
+	// global Search field, which must never satisfy this locator.
 	return page
+		.getByRole('main')
 		.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }));
 }
 
 async function requireFind(page: Page): Promise<Locator> {

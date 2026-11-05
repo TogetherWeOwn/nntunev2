@@ -64,6 +64,48 @@ the activation checklist is accurate:
   endpoints, and usage-meter enforcement still depend on their venture
   slices; the journey specs expose those missing backend behaviors directly.
 
+## Track interaction hooks
+
+Track menus and selection add hooks without renaming the existing library,
+queue, audio or metering contracts. `helpers/contract.ts` registers
+`track-more`, `favorite-more` and `track-selection-toolbar` on the library, and
+`queue-more`, `queue-drop-target` and `queue-selection-toolbar` on the shared
+queue panel. `track-context-menu` belongs to the shared top-layer menu;
+only an open menu renders it. Scope row actions by the existing stable
+`data-id` (library) or `data-track-id` (queue), never by row position.
+The queue selection toolbar renders only while tracks are selected.
+
+`apps/web/src/lib/contract.test.ts` checks both route and shared-component
+sources for these declarations. Browser coverage lives in
+`apps/web/tests/track-interactions.spec.ts`; it complements rather than
+replaces the existing range-selection and playback journey suites.
+
+Queue insertion/reordering and Select remain metadata-only. The separate
+Play now menu action is an explicit transport gesture: it hydrates only the
+selected track, attempts playback once, and reports blocked or streamless
+outcomes without retrying. Batch Play now arranges the whole displayed selection,
+including the old current track when selected. Queue toolbar moves and Play next
+retain queue order even when checkboxes were activated in reverse order.
+Later queue/auth changes invalidate pending playback feedback. Done restores stranded focus to a surviving control rather than the
+page body; group drops resolve insertion boundaries outside the moving IDs.
+Copy link is inline rather than a one-choice submenu. The playlist slot
+is reserved and disabled with a "Not available yet" hint; backend routes
+and a playlist picker are pending. Arrow keys can discover the slot, but
+activation changes nothing and type-ahead skips it. Touch queue
+grips autoscroll the nearest scrolling pane while held at its edge; drop,
+Escape, hidden-page and unmount cleanup stop the animation.
+Pending long-presses cancel on page blur, hiding, scroll or pointer release
+outside the row; a hidden page also invalidates native drag tokens before
+any later drop. Unit tests cover gesture lifecycle cleanup, and browser
+coverage includes interruption cases plus open-menu/batch-selection axe scans
+at desktop and narrow widths. Those scans reject serious/critical findings;
+they do not replace manual keyboard, touch or assistive-technology review.
+
+These UI changes follow **AGENTS.md — Clean-room, YouTube and MetaBrainz
+guardrails**: original presentation, existing semantic colours, no changes to
+embedded video or catalogue licensing. Offline interaction tests are not
+staging ingest→play→meter acceptance evidence.
+
 ## Player contract migration (app-shell redesign, design spec v1)
 
 The custom player bar replaces the native `<audio controls>` timeline this

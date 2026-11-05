@@ -79,8 +79,9 @@
 //!   Dual-pepper transition: a record whose version matches ANY entry in
 //!   `peppers` authorizes; an empty slice or an unlisted version fails
 //!   closed. NOTE: this signature takes no cookie/session input by
-//!   design — the HTTP layer must not consult cookies on bearer routes
-//!   (ADR: no session-cookie fallback on credential routes).
+//!   design — cookies never rescue an invalid presented bearer at the
+//!   HTTP scope gate. Admission is not handler authentication: current
+//!   play-grant issuance still requires its own cookie session + Origin.
 //! - `pub fn revoke_credential(record: &mut NativeRestRecord, now: u64)`
 //!   (sets `revoked_at = Some(now)`; idempotent — never un-revokes) and
 //!   `pub fn revoke_all_for_user(records: &mut [NativeRestRecord],
@@ -105,7 +106,9 @@
 //!   collection roots plus subpaths (the HTTP layer passes the path
 //!   without the query string). Reads on the six catalog roots need
 //!   `library:read`; playlist writes need `playlists:write`; `/v1/plays`
-//!   writes need `plays:write`; `/v1/stream` reads need `stream:read`;
+//!   writes need `plays:write` at the scope gate (play events and grants
+//!   are distinct; this map is not native feature acceptance);
+//!   `/v1/stream` reads need `stream:read`;
 //!   `/v1/ingest` submission needs `ingest:submit`. Session-only (never
 //!   reachable by bearer, enforced by the auth layer): `/v1/me`,
 //!   `/v1/indexers`, `/v1/operations` reads, library membership writes

@@ -60,10 +60,23 @@ pub const SLICE_ALIGNMENT: u64 = 128;
 /// past it fails closed instead of emitting an unrepairable set.
 pub const MAX_DATA_SLICES: u64 = 20_000;
 
-/// Upper bound on recovery accumulator bytes per file (256 MiB). Real sets
-/// sit near 10% of the file (megabytes); this only stops a hostile or buggy
-/// length/slice combination from committing gigabytes in a Worker isolate.
-pub const MAX_ACCUMULATOR_BYTES: u64 = 256 << 20;
+/// Upper bound on recovery accumulator bytes per file (32 MiB). `new`
+/// allocates the accumulators in full and `finish` holds them alive while
+/// retaining every recovery packet, so the finish peak is ≈2× the
+/// accumulators plus O(slice) scratch; sizing the cap here keeps even the
+/// accepted worst case (≈64 MiB peak) inside the 128 MB Worker-isolate
+/// budget this card streams within. Accumulators sit near 10% of the file,
+/// so 32 MiB still admits ~320 MB per file — far above the FLAC-track class
+/// this serves (≈3.5 MB accumulators); no honest caller is rejected.
+pub const MAX_ACCUMULATOR_BYTES: u64 = 32 << 20;
+
+/// Scratch budget for the [`recover_slices`] dense solve (64 MiB). The
+/// Gauss-Jordan inversion holds three `m × m` `u16` matrices for `m` missing
+/// slices (6`m`² bytes), so this caps `m` near 3 300 — far above honest
+/// geometry (10% redundancy over at most [`MAX_DATA_SLICES`] slices caps `m`
+/// at ~2 000) while failing closed on absurd geometry (20 000 missing would
+/// otherwise commit ~2.4 GB and OOM the isolate).
+pub const MAX_RECOVERY_SCRATCH_BYTES: u64 = 64 << 20;
 
 /// Streaming zero-run chunk for slice-tail padding (same shape as the read
 /// side's hasher chunks).
@@ -88,6 +101,12 @@ pub fn slice_size_for_article_payload(payload_bytes: u64) -> Result<u64> {
 }
 
 /// Number of data slices for `total_len` bytes at `slice_size`.
+///
+/// # Panics
+///
+/// Panics if `slice_size` is zero (integer division by zero). Callers must
+/// validate first — [`Par2Creator::new`] rejects a zero slice size before
+/// reaching this.
 pub fn data_slice_count(total_len: u64, slice_size: u64) -> u64 {
     total_len.div_ceil(slice_size)
 }
@@ -265,7 +284,8 @@ impl Par2Creator {
             pushed: 0,
             whole_md5: md5::Context::new(),
             first16k_md5: md5::Context::new(),
-            first16k_remaining: FIRST_16K_SPAN.min(usize::try_from(total_len).unwrap_or(usize::MAX)),
+            first16k_remaining: FIRST_16K_SPAN
+                .min(usize::try_from(total_len).unwrap_or(usize::MAX)),
             slice_md5: md5::Context::new(),
             slice_crc: crc32fast::Hasher::new(),
             ifsc: Vec::with_capacity(data_usize),
@@ -301,8 +321,7 @@ impl Par2Creator {
         }
         while !chunk.is_empty() {
             let take = (self.slice_size - self.slice_fill).min(chunk.len());
-            self.slice_buf[self.slice_fill..self.slice_fill + take]
-                .copy_from_slice(&chunk[..take]);
+            self.slice_buf[self.slice_fill..self.slice_fill + take].copy_from_slice(&chunk[..take]);
             self.slice_md5.consume(&chunk[..take]);
             self.slice_crc.update(&chunk[..take]);
             self.slice_fill += take;
@@ -359,8 +378,7 @@ impl Par2Creator {
             if factor == 0 {
                 continue;
             }
-            let acc_e =
-                &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
+            let acc_e = &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
             gf16::madd(acc_e, &self.slice_scratch, factor);
         }
 
@@ -458,11 +476,16 @@ pub fn create_single_file(filename: &[u8], data: &[u8], slice_size: u64) -> Resu
 ///   [`gf16::input_bases`]);
 /// - `present` maps data-slice index → surviving bytes;
 /// - `recovery` maps recovery exponent → recovery-slice bytes (see
-///   [`CreatedSet::recovery_pairs`]);
+///   [`CreatedSet::recovery_pairs`]), in exponent-ascending order: the first
+///   `m` pairs cover the `m` missing slices, and exponents `0..m` keep the
+///   coefficient matrix a classical Vandermonde (always invertible for
+///   distinct non-zero bases);
 ///
 /// Returns the reconstructed `(index, bytes)` pairs in index order. Errors
 /// when more slices are missing than recovery slices cover, on size or index
-/// violations, or on a singular matrix (which honest sets never produce).
+/// violations, when the dense-solve scratch would pass
+/// [`MAX_RECOVERY_SCRATCH_BYTES`], or on a singular matrix (which honest
+/// sets never produce).
 pub fn recover_slices(
     block_size: usize,
     data_count: usize,
@@ -506,6 +529,19 @@ pub fn recover_slices(
     if missing.is_empty() {
         return Ok(Vec::new());
     }
+    // Fail closed before the dense `m × m` solve below: three `u16`
+    // matrices (6 bytes per cell) must fit the scratch budget, checked
+    // without overflow.
+    {
+        let m = missing.len() as u64;
+        let bytes = m.checked_mul(m).and_then(|cells| cells.checked_mul(6));
+        if bytes.map_or(true, |b| b > MAX_RECOVERY_SCRATCH_BYTES) {
+            return Err(malformed(format!(
+                "recovery of {} slices needs past the {MAX_RECOVERY_SCRATCH_BYTES}-byte scratch budget",
+                missing.len()
+            )));
+        }
+    }
 
     let bases = gf16::input_bases(data_count).ok_or_else(|| malformed("no bases"))?;
     let words = block_size / 2;
@@ -545,7 +581,7 @@ pub fn recover_slices(
 
     Ok(missing
         .into_iter()
-        .zip(out.into_iter())
+        .zip(out)
         .map(|(i, w)| (i as u32, words_to_bytes(&w)))
         .collect())
 }

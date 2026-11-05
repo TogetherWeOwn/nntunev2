@@ -198,7 +198,7 @@ test('missing library endpoint stays neutral and does not expose a cached snapsh
 	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
 });
 
-test('empty library keeps the NZB import link', async ({ page }) => {
+test('empty library carries no NZB import link', async ({ page }) => {
 	await page.route('**/api/library', (route) =>
 		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
 	);
@@ -206,10 +206,8 @@ test('empty library keeps the NZB import link', async ({ page }) => {
 	await page.goto('/library');
 
 	await expect(page.getByRole('status')).toContainText(/library is empty/i);
-	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveAttribute(
-		'href',
-		'/library/import'
-	);
+	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
 });
 
 test('a never-settling library request times out and exits loading state', async ({ page }) => {

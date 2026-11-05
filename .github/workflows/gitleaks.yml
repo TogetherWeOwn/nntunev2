@@ -71,8 +71,8 @@ jobs:
           # working copy hides nothing; a PR-added ignore takes effect
           # only after merge — and the merge itself required this scan to
           # pass first.
-          if [ "${{ github.event_name }}" = pull_request ]; then
-            base="refs/remotes/origin/${{ github.base_ref }}"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            base="refs/remotes/origin/${GITHUB_BASE_REF}"
             scratch="$(mktemp -d "$RUNNER_TEMP/gitleaks-base-policy.XXXXXX")"
             if git cat-file -e "${base}:.gitleaks.toml" 2>/dev/null; then
               git show "${base}:.gitleaks.toml" > "${scratch}/gitleaks.toml"

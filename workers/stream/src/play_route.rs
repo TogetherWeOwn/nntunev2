@@ -214,6 +214,11 @@ impl RoutePlay {
             track_id: self.track_id.clone(),
             start,
             end,
+            // The portable core serves slices without a confirmed file
+            // total; the wasm route (which reads the blob length) is
+            // the path that supplies it. The api derivation resolves
+            // its own metadata when this is absent.
+            file_bytes: None,
         })
     }
 

@@ -149,11 +149,127 @@ target = "mirror"
 sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
 
 [[migration]]
-file = "0031_posted_files.sql"
+file = "0031_meter_derivation_and_leases.sql"
 target = "app"
-sha256 = "6c32727f45d824a8c71a2e74843a3e6740f248913f31d6e25e7e82a6d5233791"
+sha256 = "0073041714e1a43d69f9dcb42483a3cc12baf6945326b8b20bac94047c85611a"
 
 [[migration]]
-file = "0032_posted_files_crypto.sql"
+file = "0032_ledger_seconds_floor.sql"
 target = "app"
-sha256 = "5f157f5460a76c2db3bbec3d2e94db1f4a91d1bce7f2e9cd3c74dcbe553a91a3"
+sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
+
+[[migration]]
+file = "0033_invite_codes.sql"
+target = "app"
+sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
+
+[[migration]]
+file = "0034_admin_ingest.sql"
+target = "app"
+sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"
+
+[[migration]]
+file = "0035_posted_files.sql"
+target = "app"
+sha256 = "e5217460bf27d7b6e22350297148ec2454fef7d47f28eb30d7f52d83d0823c83"
+
+[[migration.source_rename_history]]
+parent = "c600da0f21590b9f6fd009b9317810aee4cd248d"
+commit = "d025f104804eead969511de1ebd4300c51d43da4"
+old_path = "migrations/0027_posted_files.sql"
+new_path = "migrations/0028_posted_files.sql"
+old_sha256 = "0cc1e99a7cb35858257b2eb41e4ca43984b39e72948d4ccc4d228691c583239a"
+new_sha256 = "a1ca5c41409f82a7869bf59deea5b03dc1244336238089128e3fe06708209044"
+
+[[migration.source_rename_history]]
+parent = "0eb70d1fdf8d7059f05fa46c0d2b67af9da6ec60"
+commit = "492424d88ec41e5c356c6bac421d428d16546d29"
+old_path = "migrations/0028_posted_files.sql"
+new_path = "migrations/0030_posted_files.sql"
+old_sha256 = "a1ca5c41409f82a7869bf59deea5b03dc1244336238089128e3fe06708209044"
+new_sha256 = "dc5d0cfe0e1850b50c4dd0febb1abed98178432c266db8eadb47acdd48abfb19"
+
+[[migration.source_rename_history]]
+parent = "492424d88ec41e5c356c6bac421d428d16546d29"
+commit = "e9a98c041ea14a010e76efeeb19984be2df9e00f"
+old_path = "migrations/0030_posted_files.sql"
+new_path = "migrations/0031_posted_files.sql"
+old_sha256 = "dc5d0cfe0e1850b50c4dd0febb1abed98178432c266db8eadb47acdd48abfb19"
+new_sha256 = "6c32727f45d824a8c71a2e74843a3e6740f248913f31d6e25e7e82a6d5233791"
+
+[[migration.source_rename_history]]
+parent = "e9a98c041ea14a010e76efeeb19984be2df9e00f"
+commit = "b7ebea3761d18eca577db39175468dc888872768"
+old_path = "migrations/0031_posted_files.sql"
+new_path = "migrations/0033_posted_files.sql"
+old_sha256 = "6c32727f45d824a8c71a2e74843a3e6740f248913f31d6e25e7e82a6d5233791"
+new_sha256 = "a581a32971148ad0dd2b12c90e12898ecb3fcb55fb1d13daa8b35e2bbb88df01"
+
+[[migration.source_rename_history]]
+parent = "b7ebea3761d18eca577db39175468dc888872768"
+commit = "075cf8749cf06a8530e5e7e99beda4be42d43bdc"
+old_path = "migrations/0033_posted_files.sql"
+new_path = "migrations/0034_posted_files.sql"
+old_sha256 = "a581a32971148ad0dd2b12c90e12898ecb3fcb55fb1d13daa8b35e2bbb88df01"
+new_sha256 = "ef8e99df7f0bed8bbbe5c6583f71cbcc3268651354e0a1ce7ef4638c3aeac565"
+
+[[migration.source_rename_history]]
+parent = "05962ea6093feb207080f16ec8931d58f18fe255"
+commit = "2edad6a4aca7b7c28ced9c6d4fd2ca3adc7933b8"
+old_path = "migrations/0034_posted_files.sql"
+new_path = "migrations/0035_posted_files.sql"
+old_sha256 = "ef8e99df7f0bed8bbbe5c6583f71cbcc3268651354e0a1ce7ef4638c3aeac565"
+new_sha256 = "e5217460bf27d7b6e22350297148ec2454fef7d47f28eb30d7f52d83d0823c83"
+
+[[migration]]
+file = "0036_posted_files_crypto.sql"
+target = "app"
+sha256 = "2eda914417a2111d0d799261d570348c2e41d3bdc981d338235f63cf8682e8bc"
+
+[[migration.source_rename_history]]
+parent = "c600da0f21590b9f6fd009b9317810aee4cd248d"
+commit = "d025f104804eead969511de1ebd4300c51d43da4"
+old_path = "migrations/0028_posted_files_crypto.sql"
+new_path = "migrations/0029_posted_files_crypto.sql"
+old_sha256 = "6aa34a789e4fbe024dbb33e92fc8d79e9546e2142b83f286251917deed08bd4d"
+new_sha256 = "7c8f49ebfbde1daf61d4fd8e63a8b8ade090aa953e08c4adfbadbe1033b2287a"
+
+[[migration.source_rename_history]]
+parent = "0eb70d1fdf8d7059f05fa46c0d2b67af9da6ec60"
+commit = "492424d88ec41e5c356c6bac421d428d16546d29"
+old_path = "migrations/0029_posted_files_crypto.sql"
+new_path = "migrations/0031_posted_files_crypto.sql"
+old_sha256 = "7c8f49ebfbde1daf61d4fd8e63a8b8ade090aa953e08c4adfbadbe1033b2287a"
+new_sha256 = "3cae0e0078a07b4685c259a0b89c8a952f3a43e8eea23b15d8983a564bf45528"
+
+[[migration.source_rename_history]]
+parent = "492424d88ec41e5c356c6bac421d428d16546d29"
+commit = "e9a98c041ea14a010e76efeeb19984be2df9e00f"
+old_path = "migrations/0031_posted_files_crypto.sql"
+new_path = "migrations/0032_posted_files_crypto.sql"
+old_sha256 = "3cae0e0078a07b4685c259a0b89c8a952f3a43e8eea23b15d8983a564bf45528"
+new_sha256 = "5f157f5460a76c2db3bbec3d2e94db1f4a91d1bce7f2e9cd3c74dcbe553a91a3"
+
+[[migration.source_rename_history]]
+parent = "e9a98c041ea14a010e76efeeb19984be2df9e00f"
+commit = "b7ebea3761d18eca577db39175468dc888872768"
+old_path = "migrations/0032_posted_files_crypto.sql"
+new_path = "migrations/0034_posted_files_crypto.sql"
+old_sha256 = "5f157f5460a76c2db3bbec3d2e94db1f4a91d1bce7f2e9cd3c74dcbe553a91a3"
+new_sha256 = "4fdbcf80e441afd5ef30f82ca378d19f32a71382793a9564d9388c8fa2d3f40f"
+
+[[migration.source_rename_history]]
+parent = "b7ebea3761d18eca577db39175468dc888872768"
+commit = "075cf8749cf06a8530e5e7e99beda4be42d43bdc"
+old_path = "migrations/0034_posted_files_crypto.sql"
+new_path = "migrations/0035_posted_files_crypto.sql"
+old_sha256 = "4fdbcf80e441afd5ef30f82ca378d19f32a71382793a9564d9388c8fa2d3f40f"
+new_sha256 = "f9ed9bc2398fc19f56ab2688715c391606595c5b8296431e7f97b6594dcc9fd7"
+
+[[migration.source_rename_history]]
+parent = "05962ea6093feb207080f16ec8931d58f18fe255"
+commit = "2edad6a4aca7b7c28ced9c6d4fd2ca3adc7933b8"
+old_path = "migrations/0035_posted_files_crypto.sql"
+new_path = "migrations/0036_posted_files_crypto.sql"
+old_sha256 = "f9ed9bc2398fc19f56ab2688715c391606595c5b8296431e7f97b6594dcc9fd7"
+new_sha256 = "2eda914417a2111d0d799261d570348c2e41d3bdc981d338235f63cf8682e8bc"

@@ -14,19 +14,25 @@
 
 pub mod account_deletion;
 pub mod admin;
+pub mod admin_ingest;
 pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
 pub mod billing_reconcile;
+mod field_envelope;
 pub mod handlers;
 pub mod ingest_grant;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
 mod magic_redemption;
+pub mod meter_sink;
 pub mod native_rest;
+pub mod original_source;
 pub mod plan_limits;
+pub mod play_grant;
+pub mod playback;
 pub mod providers;
 pub mod random;
 pub mod rate_limit;

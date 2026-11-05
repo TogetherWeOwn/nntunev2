@@ -3,10 +3,14 @@
 //! A bundle is a directory — the unit the operator copies to R2
 //! (`offsite/<env>/...`, see `docs/offsite-backup-runbook.md`). Every
 //! file except the manifest itself is content-addressed by SHA-256 in
-//! the manifest, so `verify_bundle` detects truncation or tampering
-//! before any restore. The bundle carries ciphertext and wrapped keys
+//! the manifest, so `verify_bundle` detects truncation or corruption
+//! before any restore. The manifest itself is unauthenticated, so it
+//! is not tamper evidence on its own: tampering that rewrites both a
+//! file and its manifest entry is caught downstream by the AEAD row
+//! verification (`verify_rows`), which fails closed. The bundle carries ciphertext and wrapped keys
 //! only: KEK values never appear here (keyring entries are version
-//! numbers + dates, never material).
+//! numbers only, never material; date ranges live in the operator
+//! manifest, not the bundle).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +40,10 @@ pub struct TableCount {
 }
 
 /// Keyring coverage metadata: which KEK versions the backed-up rows
-/// reference. Versions only — never key material.
+/// reference. Version numbers only — never key material, and no date
+/// ranges: the active date ranges live in the operator keyring
+/// manifest (`docs/offsite-backup-runbook.md` §1), which this bundle
+/// manifest only mirrors by version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeyringCoverage {
     pub versions: Vec<u32>,
@@ -113,6 +120,34 @@ pub struct BundleWriter {
     staged: Vec<String>,
 }
 
+/// Reject bundle-relative paths that could escape the bundle root.
+/// `Path::components` parses per-platform (on Unix `C:\x` is an
+/// ordinary file name), so check both the parsed components (prefix,
+/// root, parent) and the Windows spellings explicitly: backslash
+/// separators and drive-letter/`:` spellings are never valid in a
+/// bundle path, and the bundle must verify identically on every
+/// platform the tool builds on.
+fn is_unsafe_bundle_path(rel: &str) -> bool {
+    if rel.is_empty() {
+        return true;
+    }
+    if rel.contains('\\') || rel.contains(':') {
+        return true;
+    }
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return true;
+    }
+    path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    })
+}
+
 impl BundleWriter {
     pub fn new(dir: &Path, env: &str, tool: &str, created_at_unix: i64) -> Self {
         BundleWriter {
@@ -127,9 +162,11 @@ impl BundleWriter {
     }
 
     /// Stage one file (relative path inside the bundle). Parent
-    /// directories are created. Refuses absolute paths and `..`.
+    /// directories are created. Refuses absolute, prefixed, rooted
+    /// and parent paths, including Windows spellings (see
+    /// [`is_unsafe_bundle_path`]).
     pub fn stage_file(&mut self, rel: &str, bytes: &[u8]) -> Result<(), BundleError> {
-        if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|p| p == "..") {
+        if is_unsafe_bundle_path(rel) {
             return Err(BundleError::Io(format!("unsafe bundle path: {rel}")));
         }
         let full = self.dir.join(rel);
@@ -184,9 +221,17 @@ impl BundleWriter {
 }
 
 /// Read the manifest without trusting it: unknown format versions
-/// refuse fail-closed before any restore.
+/// refuse fail-closed before any restore. A symlinked manifest is
+/// refused outright: it could point outside the bundle boundary.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
-    let raw = std::fs::read(dir.join(MANIFEST_FILE)).map_err(|_| BundleError::MissingFile {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let meta = std::fs::symlink_metadata(&manifest_path).map_err(|_| BundleError::MissingFile {
+        path: MANIFEST_FILE.to_string(),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(BundleError::Io(format!("refuses symlink: {MANIFEST_FILE}")));
+    }
+    let raw = std::fs::read(&manifest_path).map_err(|_| BundleError::MissingFile {
         path: MANIFEST_FILE.to_string(),
     })?;
     let manifest: Manifest =
@@ -198,14 +243,40 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
 }
 
 /// Verify every manifest-listed file exists with the recorded hash.
-/// Returns the manifest on success.
+/// Returns the manifest on success. Symlinks are refused at every
+/// level: `fs::read` follows them, so without this check a crafted
+/// bundle could verify bytes from outside the bundle boundary — either
+/// via a symlinked file or via a symlinked intermediate directory
+/// (e.g. `blobs/` pointing elsewhere).
 pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
     let manifest = read_manifest(dir)?;
     for f in &manifest.files {
-        if f.path.is_empty() || f.path.starts_with('/') || f.path.split('/').any(|p| p == "..") {
+        if is_unsafe_bundle_path(&f.path) {
             return Err(BundleError::Io(format!("unsafe bundle path: {}", f.path)));
         }
-        let bytes = std::fs::read(dir.join(&f.path)).map_err(|_| BundleError::MissingFile {
+        let full = dir.join(&f.path);
+        // Walk the file and every ancestor directory down to (but
+        // excluding) the bundle root: any symlink in the chain could
+        // redirect reads outside the bundle. `full` is
+        // `dir.join(rel)` with `rel` relative and `..`-free, so the
+        // ancestor chain always reaches `dir`.
+        let mut cur: &Path = &full;
+        loop {
+            let meta = std::fs::symlink_metadata(cur).map_err(|_| BundleError::MissingFile {
+                path: f.path.clone(),
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(BundleError::Io(format!("refuses symlink: {}", f.path)));
+            }
+            if cur == dir {
+                break;
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        let bytes = std::fs::read(&full).map_err(|_| BundleError::MissingFile {
             path: f.path.clone(),
         })?;
         if bytes.len() as u64 != f.bytes || sha256_hex(&bytes) != f.sha256_hex {
@@ -258,6 +329,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn symlinks_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 4));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        w.stage_file("blobs/x.bin", b"secretbox-bytes").unwrap();
+        w.finish().unwrap();
+        // Swap a verified file for a symlink to bytes outside the
+        // bundle: verification must refuse, not follow.
+        let outside =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-outside", std::process::id()));
+        std::fs::write(&outside, b"secretbox-bytes").unwrap();
+        std::fs::remove_file(dir.join("blobs/x.bin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("blobs/x.bin")).unwrap();
+        #[cfg(unix)]
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_parent_dir_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 5));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        w.stage_file("blobs/x.bin", b"secretbox-bytes").unwrap();
+        w.finish().unwrap();
+        // Swap the intermediate directory for a symlink to a
+        // lookalike tree outside the bundle: verification must refuse,
+        // not follow it — even though the final file name resolves.
+        let outside = std::env::temp_dir().join(format!(
+            "nntune-backup-test-{}-outside-dir",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.bin"), b"secretbox-bytes").unwrap();
+        std::fs::remove_dir_all(dir.join("blobs")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("blobs")).unwrap();
+        #[cfg(unix)]
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn unsafe_paths_refused() {
         let dir =
             std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 3));
@@ -265,6 +387,56 @@ mod tests {
         let mut w = writer_in(&dir);
         assert!(w.stage_file("../evil", b"x").is_err());
         assert!(w.stage_file("/abs", b"x").is_err());
+        assert!(w.stage_file("a/../../evil", b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_spellings_refused() {
+        // Drive-qualified, backslash and `:` spellings must refuse at
+        // stage time and at verify time alike: on Windows
+        // `dir.join("C:/evil")` escapes the bundle root even though the
+        // Unix `starts_with('/')`/`..` check would pass them.
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 6));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        for rel in [
+            "C:/evil/x.bin",
+            "C:\\evil\\x.bin",
+            "blobs\\x.bin",
+            "\\\\server\\share\\x.bin",
+            "a:b",
+        ] {
+            assert!(w.stage_file(rel, b"x").is_err(), "staged {rel}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Verify-time: a crafted manifest listing a drive-qualified
+        // path refuses before any read, not after joining.
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 7));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = Manifest {
+            format_version: BUNDLE_FORMAT_VERSION,
+            env: "synthetic".to_string(),
+            created_at_unix: 1_700_000_000,
+            tool: "test".to_string(),
+            tables: vec![],
+            keyring: KeyringCoverage { versions: vec![] },
+            files: vec![BundleFile {
+                path: "C:/evil/x.bin".to_string(),
+                sha256_hex: sha256_hex(b"x"),
+                bytes: 1,
+            }],
+        };
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

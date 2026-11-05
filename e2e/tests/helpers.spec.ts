@@ -588,6 +588,17 @@ test.describe('anonymousGet (no credentials, no follow)', () => {
 });
 
 test.describe('readApiBody', () => {
+  test('body-read errors are discarded without exposing their message or cause', async () => {
+    const sentinel = 'synthetic-body-read-secret';
+    const raw = Object.assign(new Error(sentinel), { cause: new Error(sentinel) });
+    const body = await readApiBody({
+      status: () => 200,
+      headers: () => ({}),
+      text: async () => { throw raw; },
+    }, 'https://fixture.invalid/probe', 'body-read');
+    expect(body).toBe('');
+  });
+
   test('returns the body text for a clean response', async () => {
     const body = await readApiBody(
       {

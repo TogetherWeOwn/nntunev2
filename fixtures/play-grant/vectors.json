@@ -1,0 +1,57 @@
+{
+  "_comment": "Play grant v2: the api play_grant::issue_v2_at minter must reproduce `token` byte-exactly; the stream grant::issue_v2_at must reproduce it too and grant::verify must accept it at now_unix. Token shape v2.<base64url(payload)>.<base64url(hmac-sha256(payload_b64))>, payload user|track|play|lease_epoch|exp. Generated with Python hmac (independent of both crates). Secrets are synthetic and deliberately low-entropy; the MACs authenticate nothing.",
+  "vectors": [
+    {
+      "name": "basic",
+      "secret": "play-grant-test-secret-0123456789ab",
+      "user_id": "user_01",
+      "track_id": "track-9",
+      "play_id": "play-7",
+      "lease_epoch": 3,
+      "now_unix": 1800000000,
+      "ttl_secs": 600,
+      "exp_unix": 1800000600,
+      "payload": "user_01|track-9|play-7|3|1800000600",
+      "token": "v2.dXNlcl8wMXx0cmFjay05fHBsYXktN3wzfDE4MDAwMDA2MDA.JiM0YSX3fEV3t4LCN80PudwgCpBM9sj-F_cni3kbhy0"
+    },
+    {
+      "name": "ttl_clamped_to_cap",
+      "secret": "play-grant-test-secret-0123456789ab",
+      "user_id": "user_01",
+      "track_id": "track-9",
+      "play_id": "play-7",
+      "lease_epoch": 3,
+      "now_unix": 1800000000,
+      "ttl_secs": 86400,
+      "exp_unix": 1800000900,
+      "payload": "user_01|track-9|play-7|3|1800000900",
+      "token": "v2.dXNlcl8wMXx0cmFjay05fHBsYXktN3wzfDE4MDAwMDA5MDA.fyOnWI2chGUmhsB3PDGwHLcRNnca5h9FfFt4rYaYXJA"
+    },
+    {
+      "name": "uuid_shaped_ids",
+      "secret": "another-synthetic-secret-for-vectors-00",
+      "user_id": "3f02f41c-703c-4f20-9b6d-1707ab5fd3c8",
+      "track_id": "b7e2a1c0-1111-4222-8333-444455556666",
+      "play_id": "c1d2e3f4-5555-4666-8777-888899990000",
+      "lease_epoch": 1,
+      "now_unix": 1700000000,
+      "ttl_secs": 900,
+      "exp_unix": 1700000900,
+      "payload": "3f02f41c-703c-4f20-9b6d-1707ab5fd3c8|b7e2a1c0-1111-4222-8333-444455556666|c1d2e3f4-5555-4666-8777-888899990000|1|1700000900",
+      "token": "v2.M2YwMmY0MWMtNzAzYy00ZjIwLTliNmQtMTcwN2FiNWZkM2M4fGI3ZTJhMWMwLTExMTEtNDIyMi04MzMzLTQ0NDQ1NTU1NjY2NnxjMWQyZTNmNC01NTU1LTQ2NjYtODc3Ny04ODg4OTk5OTAwMDB8MXwxNzAwMDAwOTAw.OkJNordomwm74WpOMIFY9hEvzNWTdSFXxEjv4Ef4LIU"
+    },
+    {
+      "name": "epoch_beyond_u32",
+      "secret": "play-grant-test-secret-0123456789ab",
+      "user_id": "u2",
+      "track_id": "t2",
+      "play_id": "p2",
+      "lease_epoch": 4294967296,
+      "now_unix": 1893456000,
+      "ttl_secs": 60,
+      "exp_unix": 1893456060,
+      "payload": "u2|t2|p2|4294967296|1893456060",
+      "token": "v2.dTJ8dDJ8cDJ8NDI5NDk2NzI5NnwxODkzNDU2MDYw.GJj07vp4GqA0eX8NMJM2LqU0QqQxdSxnYGaqAPQccjM"
+    }
+  ]
+}

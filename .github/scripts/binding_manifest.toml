@@ -163,6 +163,10 @@ prod = "nntunev2-audio-prod"
 binding = "METER"
 type = "analytics_engine"
 
+[[worker.binding]]
+binding = "API"
+type = "service"
+
 [[worker]]
 name = "repair"
 config = "workers/repair/wrangler.toml"

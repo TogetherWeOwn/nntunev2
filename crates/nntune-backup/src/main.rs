@@ -5,11 +5,9 @@
 //! environment for `verify` and never appears in output. Exit 0 on
 //! success, 2 on drill/verify failure, 1 on usage/IO errors.
 
-use std::collections::BTreeMap;
-
 use nntune_backup::bundle;
 use nntune_backup::drill::{self, DrillError};
-use nntune_backup::verify;
+use nntune_backup::verify::{self, Keyring};
 
 /// Default fixture size: 3 full 64 KiB rclone blocks + a partial block,
 /// so the drill always crosses block boundaries via ranged reads.
@@ -25,16 +23,27 @@ fn usage() -> ! {
 }
 
 /// KEKs from the operator environment: `BACKUP_DRILL_KEK_V<version>`
-/// holding 64 lowercase hex chars. Values are zeroized on drop and
-/// never reach stdout.
-fn keyring_from_env() -> Result<BTreeMap<u32, [u8; 32]>, String> {
-    let mut keys: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
+/// holding 64 lowercase hex chars. Returned as a [`Keyring`] so the
+/// material is zeroized on drop; callers drop it before any
+/// `process::exit`, which would skip destructors. Values never reach
+/// stdout.
+fn keyring_from_env() -> Result<Keyring, String> {
+    let mut keys: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
+    // The process exits immediately after any error here, but KEK
+    // bytes parsed before the bad variable must still not linger:
+    // clear them before returning the error.
     for (name, value) in std::env::vars() {
         if let Some(v) = name.strip_prefix("BACKUP_DRILL_KEK_V") {
-            let version: u32 = v.parse().map_err(|_| format!("bad KEK var: {name}"))?;
-            let raw = verify::decode_hex(value.trim()).ok_or_else(|| format!("{name}: bad hex"))?;
+            let version: u32 = match v.parse() {
+                Ok(v) => v,
+                Err(_) => return clear_and_fail(&mut keys, format!("bad KEK var: {name}")),
+            };
+            let raw = match verify::decode_hex(value.trim()) {
+                Some(raw) => raw,
+                None => return clear_and_fail(&mut keys, format!("{name}: bad hex")),
+            };
             if raw.len() != 32 {
-                return Err(format!("{name}: want 64 hex chars"));
+                return clear_and_fail(&mut keys, format!("{name}: want 64 hex chars"));
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&raw);
@@ -44,7 +53,21 @@ fn keyring_from_env() -> Result<BTreeMap<u32, [u8; 32]>, String> {
     if keys.is_empty() {
         return Err("no BACKUP_DRILL_KEK_V<version> in environment".to_string());
     }
-    Ok(keys)
+    Ok(Keyring::new(keys))
+}
+
+/// Zeroize already-parsed KEK bytes, then report the parse failure.
+/// Split out (rather than a closure) so the error sites can keep
+/// borrowing `keys` mutably for subsequent inserts.
+fn clear_and_fail(
+    keys: &mut std::collections::BTreeMap<u32, [u8; 32]>,
+    msg: String,
+) -> Result<Keyring, String> {
+    use zeroize::Zeroize;
+    for k in keys.values_mut() {
+        k.zeroize();
+    }
+    Err(msg)
 }
 
 fn main() {
@@ -114,6 +137,9 @@ fn main() {
             });
             let rep = verify::verify_rows(&text, &keyring, "backup-drill");
             println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            // Zeroize before the fallible exit: `process::exit` skips
+            // destructors, so dropping here is what clears the KEKs.
+            drop(keyring);
             if rep.failed > 0 || rep.rows == 0 {
                 std::process::exit(2);
             }

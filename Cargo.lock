@@ -936,6 +936,8 @@ dependencies = [
  "nntune-test-nntp",
  "quick-xml",
  "rustls",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-rustls",

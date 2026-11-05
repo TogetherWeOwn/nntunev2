@@ -5,9 +5,11 @@ import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { loadRecentFinds } from '#lib/library/recent-finds.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
+import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -48,7 +50,8 @@ function pageScript(search: string) {
 		selectQueueIndex: queueFunctions.selectTrack,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
-		resolveStreamUrl, resolveShareTarget,
+		clearMiniPlayerHint, setMiniPlayerHint,
+		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},

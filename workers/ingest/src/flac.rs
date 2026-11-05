@@ -73,7 +73,7 @@ pub const MAX_FLAC_BYTES: usize = 1 << 30;
 pub const MAX_METADATA_BLOCKS: usize = 256;
 /// Most metadata bytes accepted in total (16 MiB — covers large embedded
 /// art without letting a hostile file force huge copies).
-pub const MAX_METADATA_BYTES: usize = 16 << 20;
+pub const MAX_FLAC_METADATA_BYTES: usize = 16 << 20;
 /// Most audio frames accepted per walk (250k × 4 KiB ≈ 1B samples ≈
 /// 88 min at 192 kHz — beyond that the file quarantines as pathological).
 pub const MAX_FRAMES: usize = 250_000;
@@ -645,7 +645,7 @@ fn split_metadata(bytes: &[u8]) -> Result<(Vec<MetaBlock>, usize), FlacReject> {
             return Err(FlacReject::BadMetadata("reserved block type"));
         }
         metadata_bytes = metadata_bytes.saturating_add(len);
-        if metadata_bytes > MAX_METADATA_BYTES {
+        if metadata_bytes > MAX_FLAC_METADATA_BYTES {
             return Err(FlacReject::BadMetadata("metadata over size cap"));
         }
         let body_start = pos + 4;
