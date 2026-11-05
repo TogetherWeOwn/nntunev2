@@ -38,8 +38,8 @@ use crate::delivered::{DeliveredInterval, DeliveredSink};
 /// Runtime lifetime limits and abort/report durability need Worker qualification.
 pub fn schedule_response<T, C>(
     play: OwnedOriginalPlay,
-    mut transport: T,
-    mut control: C,
+    transport: T,
+    control: C,
     env: Env,
     ctx: worker::Context,
 ) -> worker::Result<Response>
@@ -49,16 +49,16 @@ where
 {
     let (response, writer) = channel(play.status(), play.headers(), play.body_len())?;
     let ctx = Rc::new(ctx);
-    let mut sink = WorkerDeliveredSink {
+    let sink = WorkerDeliveredSink {
         env,
         ctx: ctx.clone(),
     };
+    // Install the abort guard before scheduling, even if the task is never polled.
+    let pump = play.pump_owned(transport, control, sink, writer);
     ctx.wait_until(async move {
         // The writer aborts on error/drop; the response settles its ACK prefix
         // through the sink. Never turn an interrupted body into a successful EOF.
-        let _ = play
-            .pump(&mut transport, &mut control, &mut sink, writer)
-            .await;
+        let _ = pump.await;
     });
     Ok(response)
 }
