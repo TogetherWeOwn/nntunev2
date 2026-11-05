@@ -16,15 +16,18 @@ pnpm --dir apps/web dev
 
 ## Checks
 
-```sh
-pnpm --dir apps/web test      # vitest unit tests
-pnpm --dir apps/web check     # svelte-check typecheck
-pnpm --dir apps/web build     # Cloudflare production build
-pnpm --dir apps/web test:e2e  # Playwright smoke (builds + serves preview)
-```
+Push the PR branch and open a draft PR while incomplete. GitHub Actions
+[CI](../../.github/workflows/ci.yml) runs `vitest`, `svelte-check`,
+`web-build`, `web-e2e` and `web-a11y` under the `ci-ok` gate. Full frontend
+suites/build verification belong there, not in a local CI mirror.
 
-Playwright needs a Chromium build (`playwright install chromium`) plus the
-system libraries Chromium links against; see `playwright.config.ts`.
+Local tests are only for focused reproduction of one failing Actions test;
+select that test, not the entire frontend or Playwright suite. Heavy focused
+reproduction/builds use the guarded `boat` PATH wrapper with `--no-env`,
+source-only export and verified cleanup, never a heavy raw-host fallback.
+See [verification policy](../../CONTRIBUTING.md#verification-github-actions-first)
+for limits and exact-head Actions run/job evidence. Playwright's browser
+and system-library requirements remain in `playwright.config.ts`.
 
 ## Bundle budget
 
@@ -44,11 +47,11 @@ Production builds run a build-only Terser compression pass in Vite's
 chunk content hashes are finalized and supplies a source map for composition.
 It uses safe ES2020 compression, without property mangling or unsafe transforms;
 application features and the raw-byte gate remain unchanged. Verify the result
-with `pnpm --dir apps/web build` followed by
-`python3 .github/scripts/check_web_bundle_budget.py` from the repository root.
+in the exact-head Actions `web-build` job, which runs the build and
+`python3 .github/scripts/check_web_bundle_budget.py`; cite its job URL and total.
 
-To update the budget deliberately, in its own PR: rebuild, confirm the growth
-is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
+To update the budget deliberately, in its own PR: use that Actions build,
+confirm the growth is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
 with a comment citing the reason, and update the number in this paragraph.
 Never bump it just to make a red build green. Wasm/script size gates are out
 of scope here (tracked separately as Wasm enforcement). Before adding code
@@ -59,9 +62,9 @@ splitting rules in [`docs/web-code-splitting-plan.md`](../../docs/web-code-split
 
 `tests/accessibility-axe.spec.ts` runs axe (`@axe-core/playwright`) over
 every route and fails on any serious or critical violation. It runs in CI
-as the `web-a11y` job and as part of the full Playwright suite; run it
-alone with `pnpm test:e2e:a11y`. Minor/moderate findings are attached to
-the test report as warnings, not failures.
+as the `web-a11y` job and as part of the full Playwright suite. Use that
+Actions job for the gate, not a local full-route scan. Minor/moderate
+findings are attached to the test report as warnings, not failures.
 
 ## Deploy
 
