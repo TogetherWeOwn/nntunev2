@@ -882,13 +882,13 @@ where
 
     // Phase 4: judge, repair once, re-verify, stage.
     let parts = target.div_ceil(PART_BYTES) as u32;
-    let staged = |proof: StagingProof| {
+    let staged = |proof: StagingProof, sha256_hex: String, md5_hex: String| {
         FullFileOutcome::Staged(StagedFile {
             track_id: spec.track_id.to_string(),
             file_index: spec.file_index,
             byte_len: target,
-            sha256_hex: sha256_hex.clone(),
-            md5_hex: md5_hex.clone(),
+            sha256_hex,
+            md5_hex,
             proof,
             parts,
         })
@@ -898,13 +898,13 @@ where
         // gaps without a set reach here; re-check). A gapped file with no
         // triage cannot prove byte-identity.
         if gaps.is_empty() {
-            return staged(StagingProof::TransportComplete);
+            return staged(StagingProof::TransportComplete, sha256_hex, md5_hex);
         }
         return blocked(spec, BlockReason::Par2Unusable, &recs, 0);
     };
     if bad.is_empty() {
         if target == t.file_len && md5_hex == hex::encode(t.whole_md5) {
-            return staged(StagingProof::Par2Verified);
+            return staged(StagingProof::Par2Verified, sha256_hex, md5_hex);
         }
         if target != t.file_len {
             return blocked(spec, BlockReason::LengthMismatch, &recs, 0);
@@ -939,9 +939,13 @@ where
                         if re_err {
                             return blocked(spec, BlockReason::SinkFailed, &recs, bad.len() as u32);
                         }
-                        let (re_bad, re_md5sum, _, _) = re_walk.finish(target);
+                        let (re_bad, re_md5sum, re_sha256, _) = re_walk.finish(target);
                         if re_bad.is_empty() && re_md5sum == t.whole_md5 {
-                            return staged(StagingProof::Par2Verified);
+                            return staged(
+                                StagingProof::Par2Verified,
+                                hex::encode(re_sha256.finalize()),
+                                hex::encode(re_md5sum),
+                            );
                         }
                         return blocked(spec, BlockReason::RepairMismatch, &recs, bad.len() as u32);
                     }
@@ -1536,6 +1540,14 @@ mod tests {
             FullFileOutcome::Staged(staged) => {
                 assert_eq!(staged.proof, StagingProof::Par2Verified);
                 assert_eq!(sink.staged_bytes(), data.as_slice(), "byte-identical");
+                assert_eq!(
+                    staged.sha256_hex,
+                    hex::encode(Sha256::digest(sink.staged_bytes()))
+                );
+                assert_eq!(
+                    staged.md5_hex,
+                    hex::encode(md5::compute(sink.staged_bytes()).0)
+                );
                 assert_eq!(
                     sink.stream_windows.get(),
                     staged.parts * 2,

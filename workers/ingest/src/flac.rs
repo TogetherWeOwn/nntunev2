@@ -892,8 +892,11 @@ fn parse_frame_header(
     let first_sample = if variable {
         coded
     } else {
+        // Fixed-block frame numbers use the nominal size, even when the
+        // final frame is short. STREAMINFO excludes that short tail from
+        // its nominal block-size bounds.
         coded
-            .checked_mul(u64::from(block_samples))
+            .checked_mul(u64::from(streaminfo.max_block_size))
             .ok_or(FlacReject::BadFrameHeader)?
     };
     if first_sample != expected_sample {
@@ -917,7 +920,8 @@ fn parse_frame_header(
 /// the seek index. Frame extents are found by scanning for the next
 /// sync that parses *and* preserves sample continuity *and* carries a
 /// matching CRC-16 — a false sync inside audio bytes fails one of the
-/// three and is skipped.
+/// three and is skipped. This is not a subframe decoder; STREAMINFO's
+/// known total provides the independent final sample-count check.
 fn walk_frames(
     bytes: &[u8],
     frames_start: usize,
@@ -1435,11 +1439,19 @@ mod tests {
     }
 
     fn test_frame(frame_no: u64, samples: u32, seed: u8) -> Vec<u8> {
-        // Fixed blocking (strategy 0), blocksize 0001 (192), rate 1001
-        // (44100), stereo independent (0001), 8-bit samples (001).
-        assert_eq!(samples, TEST_BLOCK);
-        let mut header = vec![0xFF, 0xF8, 0x19, 0x12];
-        header.extend_from_slice(&utf8_number(frame_no));
+        // Fixed blocking (strategy 0), rate 1001 (44100), stereo
+        // independent (0001), 8-bit samples (001).
+        test_frame_with_strategy(frame_no, samples, seed, false)
+    }
+
+    fn test_frame_with_strategy(coded: u64, samples: u32, seed: u8, variable: bool) -> Vec<u8> {
+        assert!((1..=256).contains(&samples));
+        let block_rate = if samples == TEST_BLOCK { 0x19 } else { 0x69 };
+        let mut header = vec![0xFF, 0xF8 | u8::from(variable), block_rate, 0x12];
+        header.extend_from_slice(&utf8_number(coded));
+        if samples != TEST_BLOCK {
+            header.push((samples - 1) as u8);
+        }
         let header_crc = crc8(&header);
         let mut frame = header;
         frame.push(header_crc);
@@ -1586,6 +1598,98 @@ mod tests {
             last.byte_offset + u64::from(last.byte_len),
             bytes.len() as u64
         );
+    }
+
+    fn flac_with_frames(frames: &[(u64, u32, bool)], known_total: bool) -> Vec<u8> {
+        let total = if known_total {
+            frames
+                .iter()
+                .map(|(_, samples, _)| u64::from(*samples))
+                .sum()
+        } else {
+            0
+        };
+        let mut bytes = FLAC_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0x80, 0, 0, 34]);
+        bytes.extend_from_slice(&test_streaminfo(total, [0; 16]));
+        for &(coded, samples, variable) in frames {
+            bytes.extend_from_slice(&test_frame_with_strategy(coded, samples, 0, variable));
+        }
+        bytes
+    }
+
+    #[test]
+    fn walk_accepts_fixed_block_short_tail() {
+        for known_total in [false, true] {
+            let bytes = flac_with_frames(
+                &[
+                    (0, TEST_BLOCK, false),
+                    (1, TEST_BLOCK, false),
+                    (2, 37, false),
+                ],
+                known_total,
+            );
+            let walk = walk_flac(&bytes).expect("fixed-block short final frame");
+            assert_eq!(walk.frame_count, 3);
+            assert_eq!(walk.total_samples, 2 * u64::from(TEST_BLOCK) + 37);
+            assert_eq!(walk.frame_spans[2].first_sample, 2 * u64::from(TEST_BLOCK));
+            assert_eq!(walk.frame_spans[2].samples, 37);
+        }
+    }
+
+    #[test]
+    fn walk_accepts_single_short_frame_and_checks_tail_crc() {
+        let walk =
+            walk_flac(&flac_with_frames(&[(0, 37, false)], true)).expect("short-only stream");
+        assert_eq!(walk.frame_count, 1);
+        assert_eq!(walk.total_samples, 37);
+        let mut bytes = flac_with_frames(&[(0, TEST_BLOCK, false), (1, 37, false)], true);
+        let tail = walk_flac(&bytes).expect("baseline").frame_spans[1];
+        bytes[tail.byte_offset as usize + 12] ^= 1;
+        assert_eq!(walk_flac(&bytes).unwrap_err(), FlacReject::BadFrameCrc);
+    }
+
+    #[test]
+    fn walk_rejects_fixed_block_discontinuities_with_known_total() {
+        for frames in [
+            vec![
+                (0, TEST_BLOCK, false),
+                (1, 37, false),
+                (2, TEST_BLOCK, false),
+            ],
+            vec![(0, TEST_BLOCK, false), (2, TEST_BLOCK, false)],
+            vec![(0, TEST_BLOCK, false), (0, TEST_BLOCK, false)],
+        ] {
+            assert!(walk_flac(&flac_with_frames(&frames, true)).is_err());
+        }
+    }
+
+    #[test]
+    fn walk_preserves_variable_block_sample_numbering() {
+        let bytes = flac_with_frames(&[(0, 100, true), (100, 192, true), (292, 37, true)], true);
+        let walk = walk_flac(&bytes).expect("variable blocks use absolute sample numbers");
+        assert_eq!(walk.frame_count, 3);
+        assert_eq!(walk.total_samples, 329);
+        assert_eq!(walk.frame_spans[2].first_sample, 292);
+        assert!(walk_flac(&flac_with_frames(&[(0, 100, true), (101, 37, true)], true)).is_err());
+    }
+
+    #[test]
+    fn walk_skips_embedded_discontinuous_header_with_matching_prefix_crc() {
+        let mut frame = test_frame(0, TEST_BLOCK, 0);
+        let prefix_crc = crc16(&frame[..20]);
+        frame[20..22].copy_from_slice(&prefix_crc.to_be_bytes());
+        let embedded = test_frame(2, TEST_BLOCK, 0);
+        frame[22..28].copy_from_slice(&embedded[..6]);
+        let len = frame.len();
+        let frame_crc = crc16(&frame[..len - 2]);
+        frame[len - 2..].copy_from_slice(&frame_crc.to_be_bytes());
+        let mut bytes = flac_with_frames(&[(0, TEST_BLOCK, false), (1, TEST_BLOCK, false)], true);
+        let start = bytes.len() - 2 * len;
+        bytes[start..start + len].copy_from_slice(&frame);
+        let walk = walk_flac(&bytes).expect("sample data is not a frame boundary");
+        assert_eq!(walk.frame_count, 2);
+        assert_eq!(walk.total_samples, 2 * u64::from(TEST_BLOCK));
     }
 
     #[test]

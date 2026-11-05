@@ -44,4 +44,5 @@ for f in "${tests[@]}"; do
   echo "test:    ${f#"$root"/}"
   psql_run -f "$f"
 done
+python3 -I "$root/workers/api/tests/test_pointer_switch_sql.py"
 echo "migration tests passed"

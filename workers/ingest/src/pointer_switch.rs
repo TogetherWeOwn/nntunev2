@@ -496,7 +496,7 @@ pub const SWITCH_SOURCE_PARAM_ORDER: [&str; 9] = [
 /// carries no user identity post-`0027`, so the fence owner is bound but
 /// not stored — the [`crate::track_writers`] `tracks` precedent.
 pub fn switch_track_source_sql() -> &'static str {
-    "UPDATE track_sources SET source_job_id = $3, nzb_ref_encrypted = $4, nzb_ref_envelope_version = 2, nzb_ref_kek_version = $5, nzb_ref_dek_wrapped_nonce = $6, nzb_ref_dek_wrapped = $7, nzb_ref_payload_nonce = $8, nzb_ref_payload_format = $9 FROM (SELECT id FROM users WHERE id = $10 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE track_sources.track_id = $1::text::uuid AND track_sources.source_job_id = $2 AND track_sources.user_id = writer_fence.id"
+    "UPDATE track_sources SET source_job_id = $3, nzb_ref_encrypted = $4, nzb_ref_envelope_version = 2, nzb_ref_kek_version = $5, nzb_ref_dek_wrapped_nonce = $6, nzb_ref_dek_wrapped = $7, nzb_ref_payload_nonce = $8, nzb_ref_payload_format = $9 FROM (SELECT id FROM users WHERE id = $10 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE track_sources.track_id = $1::text::uuid AND track_sources.source_job_id = $2 AND writer_fence.id IS NOT NULL"
 }
 
 /// Fetch the serving pointer for CAS classification and rollback reads.
@@ -1022,6 +1022,7 @@ mod tests {
         // Only v2 mint output is bindable: the version is a literal.
         assert!(sql.contains("nzb_ref_envelope_version = 2"), "{sql}");
         assert!(!sql.contains("$11"), "{sql}");
+        assert!(!sql.contains("track_sources.user_id"), "{sql}");
         for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
             assert!(
                 sql.contains(&format!("${i}")),
@@ -1034,10 +1035,7 @@ mod tests {
             sql.contains("FROM (SELECT id FROM users WHERE id = $10 AND deleting_at IS NULL FOR SHARE) AS writer_fence"),
             "{sql}"
         );
-        assert!(
-            sql.contains("track_sources.user_id = writer_fence.id"),
-            "{sql}"
-        );
+        assert!(sql.contains("writer_fence.id IS NOT NULL"), "{sql}");
         assert!(!sql.contains("FOR UPDATE"), "{sql}");
         assert!(!sql.contains("NOWAIT"), "{sql}");
         assert!(!sql.contains("SKIP LOCKED"), "{sql}");
