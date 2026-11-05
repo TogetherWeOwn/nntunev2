@@ -968,3 +968,166 @@ fn postgres_retained_content_prepare_refuses_round_zero_pending_and_unknown_refe
         assert!(before == frozen(&db, &s).await);
     });
 }
+
+fn content_result(
+    intact: bool,
+    bundle: &StoredGeneration,
+    side: ArticleSide,
+) -> ContentCheckResult<'_> {
+    if intact {
+        ContentCheckResult::Intact(good(bundle, side))
+    } else {
+        ContentCheckResult::IntegrityFailed
+    }
+}
+
+#[test]
+fn postgres_retained_content_reference_reinsert_after_prepare_stales_intact_and_negative_reports() {
+    run_test(async {
+        let mut db = connect().await;
+        // Intact on the verify side would insert a new row; the negative report
+        // on the post side would withdraw health. Neither may happen when stale.
+        for (intact, side) in [(true, ArticleSide::Verify), (false, ArticleSide::Post)] {
+            let f = retained(&mut db, true).await;
+            let s = f.case.sealed.clone();
+            seed_evidence(&db, &s).await;
+            let old_token = reference_token(&db, &s, "serving", &f.owner).await;
+            let (old, bundle) = serving_c(&mut db, &f, side, "prepare").await;
+
+            reinsert_reference(&db, &s, &f.owner).await;
+            assert!(
+                reference_token(&db, &s, "serving", &f.owner).await != old_token,
+                "a reinserted reference must be a new incarnation"
+            );
+            let before = frozen(&db, &s).await;
+            let rows = content_rows(&db, &s).await;
+            let h0 = health(&db, &s.generation).await;
+            assert!(
+                is_stale(
+                    &record_retained_content_check(
+                        &mut db,
+                        &old,
+                        content_result(intact, &bundle, side)
+                    )
+                    .await
+                ),
+                "the report of a replaced reference must be stale"
+            );
+            assert!(before == frozen(&db, &s).await, "stale report: no writes");
+            assert!(rows == content_rows(&db, &s).await, "no content evidence");
+            assert!(h0 == health(&db, &s.generation).await, "health unchanged");
+            assert_eq!(custody_rows(&db, &s).await, 1);
+
+            // The new incarnation can still be observed; the old permit stays dead.
+            let (fresh, fresh_bundle) = serving_c(&mut db, &f, side, "prepare new").await;
+            assert!(is_applied(
+                &record_retained_content_check(
+                    &mut db,
+                    &fresh,
+                    content_result(intact, &fresh_bundle, side)
+                )
+                .await
+            ));
+            assert!(is_stale(
+                &record_retained_content_check(
+                    &mut db,
+                    &old,
+                    content_result(intact, &bundle, side)
+                )
+                .await
+            ));
+        }
+    });
+}
+
+#[test]
+fn postgres_retained_content_reference_reinsert_while_callback_waits_on_reference_row_refuses_it() {
+    run_test(async {
+        let mut db = connect().await;
+        for (intact, side) in [(true, ArticleSide::Verify), (false, ArticleSide::Post)] {
+            let f = retained(&mut db, true).await;
+            let s = f.case.sealed.clone();
+            seed_evidence(&db, &s).await;
+            let (old, bundle) = serving_c(&mut db, &f, side, "prepare").await;
+            let before = frozen(&db, &s).await;
+            let rows = content_rows(&db, &s).await;
+            let h0 = health(&db, &s.generation).await;
+
+            let mut worker = connect().await;
+            let pid = backend_pid(&worker).await;
+            let owner = f.owner.clone();
+            let outcome = reinsert_during_reference_wait(
+                &db,
+                &s,
+                &owner,
+                pid,
+                record_retained_content_check(
+                    &mut worker,
+                    &old,
+                    content_result(intact, &bundle, side),
+                ),
+            )
+            .await;
+            assert!(
+                is_stale(&outcome),
+                "a report released after a reference reinsert must be stale"
+            );
+            let after = frozen(&db, &s).await;
+            for index in [0, 1, 2, 3] {
+                assert!(before.0[index] == after.0[index], "no state change");
+            }
+            assert!(before.1 == after.1, "evidence unchanged");
+            assert!(rows == content_rows(&db, &s).await, "no content evidence");
+            assert!(h0 == health(&db, &s.generation).await, "health unchanged");
+            assert_eq!(custody_rows(&db, &s).await, 1);
+
+            let (fresh, fresh_bundle) = serving_c(&mut db, &f, side, "prepare new").await;
+            assert!(is_applied(
+                &record_retained_content_check(
+                    &mut db,
+                    &fresh,
+                    content_result(intact, &fresh_bundle, side)
+                )
+                .await
+            ));
+        }
+    });
+}
+
+#[test]
+fn postgres_retained_content_noop_reference_upsert_preserves_the_original_permit() {
+    run_test(async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        seed_evidence(&db, &s).await;
+        let token = reference_token(&db, &s, "serving", &f.owner).await;
+        let (permit, bundle) = serving_c(&mut db, &f, ArticleSide::Verify, "prepare").await;
+        let before = frozen(&db, &s).await;
+        db.execute(
+            "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+             VALUES ('serving', $1, $2, $3) ON CONFLICT (kind, owner_id, generation_id) \
+             DO UPDATE SET plaintext_sha256 = EXCLUDED.plaintext_sha256",
+            &[&f.owner, &s.generation, &s.hash],
+        )
+        .await
+        .quiet("no-op reference upsert");
+        assert!(
+            reference_token(&db, &s, "serving", &f.owner).await == token,
+            "a true no-op must keep the incarnation token"
+        );
+        assert!(before == frozen(&db, &s).await, "no-op writes nothing");
+        assert!(
+            is_applied(
+                &record_retained_content_check(
+                    &mut db,
+                    &permit,
+                    ContentCheckResult::Intact(good(&bundle, ArticleSide::Verify)),
+                )
+                .await
+            ),
+            "the original permit survives a no-op upsert"
+        );
+        assert_eq!(content_rows(&db, &s).await.len(), 2);
+    });
+}

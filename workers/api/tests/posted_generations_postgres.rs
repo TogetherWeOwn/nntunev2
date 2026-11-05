@@ -1,5 +1,5 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0043.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0044.
 //!
 //! Run with `--features postgres-tests --test posted_generations_postgres` on
 //! the migrated, throwaway `nntune_ci` service. `NNTUNE_TEST_DATABASE_URL` is
@@ -46,6 +46,8 @@ const MIGRATION_0042: &str =
     include_str!("../../../migrations/0042_posted_file_legacy_health_fence.sql");
 const MIGRATION_0043: &str =
     include_str!("../../../migrations/0043_posted_file_registration_fence.sql");
+const MIGRATION_0044: &str =
+    include_str!("../../../migrations/0044_posted_file_reference_fence.sql");
 
 #[path = "support/posted_generation_abandon.rs"]
 mod posted_generation_abandon;

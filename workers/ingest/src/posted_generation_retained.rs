@@ -2,7 +2,9 @@
 //!
 //! This is not candidate verification or a new health scheduler. Preparation is
 //! read-only and captures the original job-attempt, reference and health fence
-//! together with immutable custody. No transaction spans a reader. An explicit
+//! together with immutable custody. The reference token binds the original
+//! incarnation, so removing and recreating an association cannot revive a read.
+//! No transaction spans a reader. An explicit
 //! unknown/failed read may withdraw eligibility through that exact permit only.
 //! Complete-read observations do not establish independent-backbone provenance,
 //! affirmative retention, terminal loss, reuse or cleanup authority.
@@ -43,6 +45,7 @@ pub struct RetainedCheckPermit {
     generation: String,
     reference_kind: RetainedReferenceKind,
     reference_owner: String,
+    reference_token: String,
     revision: i64,
     round: i64,
     round_token: String,
@@ -79,6 +82,11 @@ pub enum RetainedInvalidation {
     StaleOrMissing,
 }
 
+struct RetainedFence {
+    health: Row,
+    reference_token: String,
+}
+
 // Match candidate/publication lock order: owning job/attempt, hash registry,
 // generation operation/health, then reference. Retained work need not target the
 // currently selected winner: a superseded rollback/serving reference still owns
@@ -89,7 +97,7 @@ async fn lock_retained(
     generation: &str,
     kind: RetainedReferenceKind,
     owner: &str,
-) -> Result<Option<Row>, StoreError> {
+) -> Result<Option<RetainedFence>, StoreError> {
     if !lock_attempt(tx, attempt).await? {
         return Ok(None);
     }
@@ -126,24 +134,28 @@ async fn lock_retained(
         )
         .await
         .map_err(database_error)?;
-    if health.is_none()
-        || tx
-            .query_opt(
-                "SELECT generation_id FROM posted_file_references \
-                 WHERE generation_id = $1 AND kind = $2 AND owner_id = $3 FOR UPDATE",
-                &[&generation, &kind.db_value(), &owner],
-            )
-            .await
-            .map_err(database_error)?
-            .is_none()
-    {
+    let Some(health) = health else {
         return Ok(None);
-    }
+    };
+    let Some(reference) = tx
+        .query_opt(
+            "SELECT reference_token FROM posted_file_references \
+             WHERE generation_id = $1 AND kind = $2 AND owner_id = $3 FOR UPDATE",
+            &[&generation, &kind.db_value(), &owner],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(None);
+    };
     // The DB clock must be sampled again AFTER every possible lock wait.
     if !lock_attempt(tx, attempt).await? {
         return Ok(None);
     }
-    Ok(health)
+    Ok(Some(RetainedFence {
+        health,
+        reference_token: reference.get("reference_token"),
+    }))
 }
 
 /// Prepare one referenced-generation read with its original persisted fence.
@@ -161,7 +173,7 @@ pub async fn prepare_retained_check(
         return Err(StoreError::InvalidInput);
     }
     let tx = client.transaction().await.map_err(database_error)?;
-    let Some(health) = lock_retained(&tx, attempt, generation, kind, owner).await? else {
+    let Some(fence) = lock_retained(&tx, attempt, generation, kind, owner).await? else {
         return Ok(None);
     };
     let row = tx
@@ -177,9 +189,10 @@ pub async fn prepare_retained_check(
         generation: generation.to_owned(),
         reference_kind: kind,
         reference_owner: owner.to_owned(),
-        revision: health.get("revision"),
-        round: health.get("round"),
-        round_token: health.get("round_token"),
+        reference_token: fence.reference_token,
+        revision: fence.health.get("revision"),
+        round: fence.health.get("round"),
+        round_token: fence.health.get("round_token"),
     };
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(Some((permit, custody)))
@@ -215,10 +228,11 @@ pub async fn invalidate_retained_check(
     Ok(RetainedInvalidation::Applied)
 }
 
-fn matches_fence(health: &Row, permit: &RetainedCheckPermit) -> bool {
-    health.get::<_, i64>("revision") == permit.revision
-        && health.get::<_, i64>("round") == permit.round
-        && health.get::<_, &str>("round_token") == permit.round_token
+fn matches_fence(fence: &RetainedFence, permit: &RetainedCheckPermit) -> bool {
+    fence.reference_token == permit.reference_token
+        && fence.health.get::<_, i64>("revision") == permit.revision
+        && fence.health.get::<_, i64>("round") == permit.round
+        && fence.health.get::<_, &str>("round_token") == permit.round_token
 }
 
 async fn withdraw_health(tx: &Transaction<'_>, generation: &str) -> Result<(), StoreError> {

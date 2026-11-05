@@ -308,3 +308,8 @@ sha256 = "bbab9bdecc6e7f77fd5ea13e30872d749277ed5a4b879b65550cec1a51b995af"
 file = "0043_posted_file_registration_fence.sql"
 target = "app"
 sha256 = "85c53d0a48ac671278233a32773d5f0fa9a54f4589b0c4ffd2b68a5ad94ba22c"
+
+[[migration]]
+file = "0044_posted_file_reference_fence.sql"
+target = "app"
+sha256 = "e0ba8547547ac9de21b06ab39ea92c3397d8064aac0754df5f350e0a6a4c73c3"

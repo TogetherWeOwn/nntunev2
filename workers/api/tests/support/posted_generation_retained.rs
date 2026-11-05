@@ -256,6 +256,100 @@ async fn expire_during_lock_wait<T>(
     outcome
 }
 
+/// The reference incarnation token. Callers only compare it, never print it.
+async fn reference_token(db: &Client, s: &Sealed, kind: &str, owner: &str) -> String {
+    db.query_one(
+        "SELECT reference_token FROM posted_file_references \
+         WHERE generation_id = $1 AND kind = $2 AND owner_id = $3",
+        &[&s.generation, &kind, &owner],
+    )
+    .await
+    .quiet("read reference token")
+    .get(0)
+}
+
+/// Same-key delete then reinsert of the serving reference (an ABA).
+async fn reinsert_reference(db: &Client, s: &Sealed, owner: &str) {
+    db.execute(
+        "DELETE FROM posted_file_references WHERE generation_id = $1 \
+         AND kind = 'serving' AND owner_id = $2",
+        &[&s.generation, &owner],
+    )
+    .await
+    .quiet("fixture delete reference for reinsert");
+    add_reference(db, s, "serving", owner).await;
+}
+
+/// Require the reference trigger, not an unrelated FK/unique/transport error.
+fn db_rejected<T>(result: Result<T, tokio_postgres::Error>) -> bool {
+    matches!(result, Err(ref e) if e.as_db_error().is_some_and(|e|
+        e.code() == &SqlState::RAISE_EXCEPTION
+            && e.message() == "posted generation reference is immutable"))
+}
+
+/// An independent session deletes and reinserts the serving reference in one
+/// open transaction. `call` (bound to backend `pid`) must be observed blocked
+/// by exactly that session before it commits, so the callback is waiting on the
+/// reference row and is released only after the new incarnation exists.
+async fn reinsert_during_reference_wait<T>(
+    db: &Client,
+    s: &Sealed,
+    owner: &str,
+    pid: i32,
+    call: impl Future<Output = T>,
+) -> T {
+    let mut blocker = connect().await;
+    let tx = blocker
+        .transaction()
+        .await
+        .quiet("open reinsert transaction");
+    let blocker_pid: i32 = tx
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .quiet("read blocker pid")
+        .get(0);
+    tx.execute(
+        "DELETE FROM posted_file_references WHERE generation_id = $1 \
+         AND kind = 'serving' AND owner_id = $2",
+        &[&s.generation, &owner],
+    )
+    .await
+    .quiet("delete reference in held transaction");
+    tx.execute(
+        "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+         VALUES ('serving', $1, $2, $3)",
+        &[&owner, &s.generation, &s.hash],
+    )
+    .await
+    .quiet("reinsert reference in held transaction");
+    let (outcome, ()) = tokio::join!(call, async {
+        loop {
+            let blocked: bool = db
+                .query_one(
+                    "SELECT $1::int4 = ANY(pg_blocking_pids($2::int4))",
+                    &[&blocker_pid, &pid],
+                )
+                .await
+                .quiet("observe callback blocked on reference")
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tx.commit().await.quiet("commit reference reinsert");
+    });
+    outcome
+}
+
+async fn backend_pid(client: &Client) -> i32 {
+    client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .quiet("read worker pid")
+        .get(0)
+}
+
 #[test]
 fn postgres_retained_prepare_binds_exact_custody_is_redacted_and_dropped_permit_writes_nothing() {
     run_test(async {
@@ -894,5 +988,294 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
             "invalidation never invents a plan hash"
         );
         assert!(is_stale(&invalidate_retained_check(&mut db, &permit).await));
+    });
+}
+
+#[test]
+fn postgres_retained_reference_reinsert_after_prepare_stales_negative_callback_and_keeps_state() {
+    run_test(async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        seed_evidence(&db, &s).await;
+        let old_token = reference_token(&db, &s, "serving", &f.owner).await;
+        let permit = serving(&mut db, &f, "prepare").await;
+
+        reinsert_reference(&db, &s, &f.owner).await;
+        assert!(
+            reference_token(&db, &s, "serving", &f.owner).await != old_token,
+            "a reinserted reference must be a new incarnation"
+        );
+        let before = frozen(&db, &s).await;
+        let h0 = health(&db, &s.generation).await;
+        assert_eq!(h0.state, "usable");
+
+        assert!(
+            is_stale(&invalidate_retained_check(&mut db, &permit).await),
+            "the callback of a replaced reference must be stale"
+        );
+        assert!(before == frozen(&db, &s).await, "stale callback: no writes");
+        assert!(h0 == health(&db, &s.generation).await, "health unchanged");
+        assert_eq!(custody_rows(&db, &s).await, 1);
+
+        // A permit prepared against the new incarnation is current; the old
+        // one stays dead.
+        let fresh = serving(&mut db, &f, "prepare new incarnation").await;
+        assert!(is_applied(
+            &invalidate_retained_check(&mut db, &fresh).await
+        ));
+        assert_eq!(health(&db, &s.generation).await.state, "unknown");
+        assert!(is_stale(&invalidate_retained_check(&mut db, &permit).await));
+    });
+}
+
+#[test]
+fn postgres_retained_reference_reinsert_while_callback_waits_on_reference_row_refuses_it() {
+    run_test(async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        seed_evidence(&db, &s).await;
+        let permit = serving(&mut db, &f, "prepare").await;
+        let before = frozen(&db, &s).await;
+        let h0 = health(&db, &s.generation).await;
+
+        let mut worker = connect().await;
+        let pid = backend_pid(&worker).await;
+        let owner = f.owner.clone();
+        let outcome = reinsert_during_reference_wait(
+            &db,
+            &s,
+            &owner,
+            pid,
+            invalidate_retained_check(&mut worker, &permit),
+        )
+        .await;
+        assert!(
+            is_stale(&outcome),
+            "a callback released after a reference reinsert must be stale"
+        );
+        // Everything except the replaced reference row is unchanged.
+        let after = frozen(&db, &s).await;
+        for index in [0, 1, 2, 3] {
+            assert!(before.0[index] == after.0[index], "no state change");
+        }
+        assert!(before.1 == after.1, "evidence unchanged");
+        assert!(h0 == health(&db, &s.generation).await, "health unchanged");
+        assert!(is_stale(&invalidate_retained_check(&mut db, &permit).await));
+        assert!(after == frozen(&db, &s).await, "replay writes nothing");
+
+        let fresh = serving(&mut db, &f, "prepare new incarnation").await;
+        assert!(is_applied(
+            &invalidate_retained_check(&mut db, &fresh).await
+        ));
+    });
+}
+
+#[test]
+fn postgres_retained_noop_reference_upsert_preserves_the_original_permit() {
+    run_test(async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        seed_evidence(&db, &s).await;
+        let token = reference_token(&db, &s, "serving", &f.owner).await;
+        let permit = serving(&mut db, &f, "prepare").await;
+        let before = frozen(&db, &s).await;
+
+        // Both no-op shapes: DO NOTHING and an identical-value DO UPDATE.
+        db.execute(
+            "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+             VALUES ('serving', $1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&f.owner, &s.generation, &s.hash],
+        )
+        .await
+        .quiet("no-op reference do nothing");
+        db.execute(
+            "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+             VALUES ('serving', $1, $2, $3) ON CONFLICT (kind, owner_id, generation_id) \
+             DO UPDATE SET plaintext_sha256 = EXCLUDED.plaintext_sha256",
+            &[&f.owner, &s.generation, &s.hash],
+        )
+        .await
+        .quiet("no-op reference upsert");
+        assert!(
+            reference_token(&db, &s, "serving", &f.owner).await == token,
+            "a true no-op must keep the incarnation token"
+        );
+        assert!(before == frozen(&db, &s).await, "no-op writes nothing");
+
+        assert!(
+            is_applied(&invalidate_retained_check(&mut db, &permit).await),
+            "the original permit survives a no-op upsert"
+        );
+        assert_eq!(health(&db, &s.generation).await.state, "unknown");
+    });
+}
+
+async fn reference_tokens(db: &Client, s: &Sealed) -> Vec<String> {
+    db.query(
+        "SELECT reference_token FROM posted_file_references WHERE generation_id = $1 \
+         ORDER BY kind, owner_id",
+        &[&s.generation],
+    )
+    .await
+    .quiet("read reference tokens")
+    .iter()
+    .map(|r| r.get(0))
+    .collect()
+}
+
+#[test]
+fn postgres_retained_reference_token_survives_0044_and_historical_0037_replay() {
+    run_blocking(true, async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        let rollback = format!("pg-rollback-{}", f.case.uuid);
+        add_reference(&db, &s, "rollback", &rollback).await;
+        seed_evidence(&db, &s).await;
+        let permit = serving(&mut db, &f, "prepare before replay").await;
+        let tokens = reference_tokens(&db, &s).await;
+        assert_eq!(tokens.len(), 2);
+        let before = frozen(&db, &s).await;
+        let h0 = health(&db, &s.generation).await;
+
+        let ddl = connect().await;
+        ddl.batch_execute(MIGRATION_0044)
+            .await
+            .quiet("replay migration 0044");
+        ddl.batch_execute(MIGRATION_0044)
+            .await
+            .quiet("replay migration 0044 again");
+        ddl.batch_execute(MIGRATION_0037)
+            .await
+            .quiet("replay historical migration 0037");
+        ddl.batch_execute(MIGRATION_0044)
+            .await
+            .quiet("replay migration 0044 after historical 0037");
+
+        assert!(
+            tokens == reference_tokens(&db, &s).await,
+            "replay must preserve every reference token"
+        );
+        assert!(before == frozen(&db, &s).await, "replay preserves state");
+        assert!(h0 == health(&db, &s.generation).await);
+        assert_eq!(custody_rows(&db, &s).await, 1);
+        assert!(
+            db_rejected(
+                db.execute(
+                    "UPDATE posted_file_references SET reference_token = gen_random_uuid()::text \
+                     WHERE generation_id = $1",
+                    &[&s.generation],
+                )
+                .await
+            ),
+            "the immutability trigger survives replay"
+        );
+        assert!(
+            is_applied(&invalidate_retained_check(&mut db, &permit).await),
+            "a permit prepared before replay is still current"
+        );
+    });
+}
+
+#[test]
+fn postgres_retained_reference_identity_and_token_are_immutable_and_tokens_are_distinct() {
+    run_test(async {
+        let mut db = connect().await;
+        let f = retained(&mut db, true).await;
+        let s = f.case.sealed.clone();
+        let rollback = format!("pg-rollback-{}", f.case.uuid);
+        let pin = format!("pg-pin-{}", f.case.uuid);
+        let in_flight = format!("pg-flight-{}", f.case.uuid);
+        add_reference(&db, &s, "rollback", &rollback).await;
+        add_reference(&db, &s, "legacy_pin", &pin).await;
+        add_reference(&db, &s, "in_flight", &in_flight).await;
+
+        let tokens = reference_tokens(&db, &s).await;
+        assert_eq!(tokens.len(), 4);
+        let mut unique = tokens.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "default tokens must be distinct");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM posted_file_references WHERE generation_id = $1 \
+                 AND reference_token ~ \
+                 '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'",
+                &[&s.generation]
+            )
+            .await,
+            4,
+            "every token has UUID shape"
+        );
+        let other_hash = digest(&db, "other-reference-identity", &f.case.uuid).await;
+        let before = snapshot(&db, &s).await;
+
+        let owner = f.owner.clone();
+        let updates: [(&str, &str); 6] = [
+            (
+                "kind",
+                "UPDATE posted_file_references SET kind = 'rollback'",
+            ),
+            (
+                "owner",
+                "UPDATE posted_file_references SET owner_id = owner_id || 'x'",
+            ),
+            (
+                "generation",
+                "UPDATE posted_file_references SET generation_id = generation_id || 'x'",
+            ),
+            (
+                "hash",
+                "UPDATE posted_file_references SET plaintext_sha256 = $3",
+            ),
+            (
+                "token",
+                "UPDATE posted_file_references SET reference_token = gen_random_uuid()::text",
+            ),
+            (
+                "token copy",
+                "UPDATE posted_file_references SET reference_token = \
+                 (SELECT reference_token FROM posted_file_references \
+                  WHERE generation_id = $1 AND kind = 'rollback')",
+            ),
+        ];
+        for (label, head) in updates {
+            let sql = format!(
+                "{head} WHERE generation_id = $1 AND kind = 'serving' AND owner_id = $2 \
+                 AND $3::text IS NOT NULL"
+            );
+            assert!(
+                db_rejected(
+                    db.execute(sql.as_str(), &[&s.generation, &owner, &other_hash])
+                        .await
+                ),
+                "{label}: identity update must be rejected"
+            );
+            assert!(before == snapshot(&db, &s).await, "{label}: no change");
+        }
+        assert!(tokens == reference_tokens(&db, &s).await);
+
+        // A true no-op update is permitted and keeps the token.
+        db.execute(
+            "UPDATE posted_file_references SET owner_id = owner_id, \
+             reference_token = reference_token WHERE generation_id = $1",
+            &[&s.generation],
+        )
+        .await
+        .quiet("true no-op reference update");
+        assert!(tokens == reference_tokens(&db, &s).await);
+
+        // Delete and reinsert of the same key yields a new default token.
+        reinsert_reference(&db, &s, &owner).await;
+        let after = reference_tokens(&db, &s).await;
+        assert_eq!(after.len(), 4);
+        assert!(
+            after.iter().filter(|t| tokens.contains(t)).count() == 3,
+            "only the reinserted reference gets a new token"
+        );
     });
 }
