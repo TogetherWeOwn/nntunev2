@@ -26,6 +26,7 @@
 //! installation and live validation are not established by fixture-based
 //! tests. See `docs/videolinks-pipeline.md` for remaining integration work.
 
+pub mod storage;
 pub mod validation;
 
 use serde::{Deserialize, Serialize};

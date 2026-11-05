@@ -11,8 +11,9 @@ validated IDs with the official video embed.
 `workers/mb/src/videolinks/validation.rs` adds a **bounded validation
 runner** and an **app-side PostgreSQL store adapter**, not an activated
 curation service. `validation/http.rs` supplies an inactive Worker HTTP
-client requiring a runtime Secret. No route, schedule or database binding
-calls the runner yet.
+client requiring a runtime Secret. `storage.rs` supplies bounded external
+candidate admission and fresh-link database reads. No route, schedule or
+database binding calls these adapters yet.
 
 `refresh_due` purges expired API-returned fields before contacting the
 validation client, requests at most 200 distinct IDs in four 50-ID batches,
@@ -65,11 +66,48 @@ this is not a bound on its network allocations. Invalid UTF-8 fails closed.
 
 Five native unit tests cover request construction, invalid inputs, body
 budget boundaries, split UTF-8 and cancellation-guard drop. They do not
-exercise actual Worker fetch/AbortSignal behaviour. Compilation and native
-test execution await exact-head Actions (including the existing MB wasm32
-check); an installed secret and live transport validation remain unproven.
-No dependency, binding, route, schedule or migration changes accompany this
+exercise actual Worker fetch/AbortSignal behaviour. The
+[MB Rust job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42009295264/job/127183903094)
+passed at `52f88ff60d7596cacaadf4af8e282cd843f78acc`, including its native
+test and wasm32 compilation steps. That is not live transport evidence;
+an installed secret and live transport validation remain unproven. No
+dependency, binding, route, schedule or migration changes accompany this
 adapter.
+
+### Candidate admission and fresh-read boundary
+
+`PgCandidateStore` is a second inactive app-side adapter over migration
+0035. `admit_external_candidates` accepts at most 200 recording/video
+pairs, requires canonical UUID-shaped recording MBIDs and valid video IDs,
+and deduplicates after lowercasing MBIDs. Source priority is preserved
+across repeated/concurrent admission: an existing row's provenance can
+upgrade, but validation data, TTL and first-seen time are not reset. A
+new association starts pending even when the same video is already
+validated for another recording. The whole write is atomic.
+
+This method trusts the caller to establish external source provenance
+and licence eligibility; it is **not a user-submission endpoint**. It
+refuses `user_submission` inputs instead of trusting an approval flag.
+Persistent approval and candidate promotion still need their own atomic,
+authorized moderation path. Source readers are not wired by this adapter.
+
+`fresh_links` accepts at most 50 recording MBIDs and returns at most five
+links per distinct recording, ordered by source priority, validation time
+and video ID. SQL filters out pending/rejected/expired, non-embeddable,
+never-validated and future-dated rows before fetching metadata. Both
+`expires_at > now` and validation age strictly below 30 days are required;
+an overlong stored expiry cannot extend TTL. The clock is supplied by the
+trusted caller, not an end user. Each admission/read statement has a
+1.5-second server timeout. Reads perform no network request, do not cache
+metadata and do not replace the required scheduled cleanup.
+
+Four native input/serialization fixtures and expanded disposable-PostgreSQL
+acceptance cover database-specific source labels, canonical deduplication,
+replay/priority, metadata
+preservation, no partial admission on invalid input or constraint failure,
+new associations, freshness boundaries and the 50-by-five read cap.
+Execution of this increment awaits exact-head Actions; no local test,
+live database apply, authenticated route or deployed cleanup is claimed.
 
 ### PostgreSQL acceptance boundary
 
@@ -105,7 +143,8 @@ Still required before feature acceptance:
   HTTPS endpoint, no redirects, capped streaming body, cancellation on drop
   and sanitized failures. Native policy fixtures do not prove live fetch or
   AbortSignal behaviour.
-- Connect authenticated submission/moderation and fresh-link reads.
+- Connect authenticated submission/moderation and wire fresh-link routes to
+  the bounded app-side reader. Admission/reads alone do not authenticate callers.
 - Implement and verify metadata refresh/deletion, not just stale-read
   rejection, within the 30-day limit.
 - Query actual played-track counts and persist/report coverage snapshots.

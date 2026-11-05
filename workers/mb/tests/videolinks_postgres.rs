@@ -1,11 +1,14 @@
 //! Real validation adapter and proposed migration on CI's disposable PostgreSQL.
 //! Explicit feature/config required; never a live API request or staging apply.
 
+use nntune_mb::videolinks::storage::{
+    CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
+};
 use nntune_mb::videolinks::validation::{
     refresh_due, BatchValidation, PgValidationStore, ValidationClient, ValidationError,
     ValidationResponse, ValidationStore, MAX_VALIDATIONS_PER_RUN,
 };
-use nntune_mb::videolinks::VALIDATION_TTL_S;
+use nntune_mb::videolinks::{Candidate, VideoSource, VALIDATION_TTL_S};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -454,6 +457,302 @@ async fn earlier_batch_survives(db: &mut Client) {
     );
 }
 
+fn external_candidate(id: usize, source: VideoSource) -> Candidate {
+    Candidate {
+        recording_mbid: "abcdef01-2345-6789-abcd-0123456789ab".into(),
+        video_id: format!("v{id:010}"),
+        source,
+    }
+}
+
+async fn candidate_admission_contract(db: &mut Client) {
+    reset_candidates(db).await;
+    let mut upper = external_candidate(0, VideoSource::MbUrl);
+    upper.recording_mbid.make_ascii_uppercase();
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[
+                external_candidate(0, VideoSource::ListenBrainz),
+                upper,
+                external_candidate(1, VideoSource::Wikidata),
+                external_candidate(2, VideoSource::MbUrl),
+                external_candidate(3, VideoSource::ListenBrainz),
+            ])
+            .await
+            .unwrap(),
+        4,
+        "canonical duplicate keys are admitted once"
+    );
+    let source: String = db
+        .query_one(
+            "SELECT source FROM public.video_link_candidates WHERE video_id='v0000000003'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        source, "listenbrainz",
+        "database label differs from the enum's snake-case form"
+    );
+    let client = FixtureClient::new(vec![(
+        200,
+        r#"{"items":[
+        {"id":"v0000000000","status":{"embeddable":true,"privacyStatus":"public"},"snippet":{"title":"preserved"}},
+        {"id":"v0000000001","status":{"embeddable":true,"privacyStatus":"public"},"snippet":{"title":"also preserved"}}
+    ]}"#,
+    )]);
+    refresh_due(&mut PgValidationStore::new(db), &client, NOW)
+        .await
+        .unwrap();
+    let before = states(db).await;
+    let preserved: String = db.query_one(
+        "SELECT ROW(title, channel_id, duration_secs, embeddable, validated_at, expires_at, first_seen_at)::text
+         FROM public.video_link_candidates WHERE video_id='v0000000001'", &[]).await.unwrap().get(0);
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[
+                external_candidate(0, VideoSource::ListenBrainz),
+                external_candidate(1, VideoSource::MbUrl),
+            ])
+            .await
+            .unwrap(),
+        1,
+        "only a provenance upgrade writes"
+    );
+    assert_eq!(
+        states(db).await,
+        before,
+        "admission does not reset checked data"
+    );
+    let row = db.query_one(
+        "SELECT source, ROW(title, channel_id, duration_secs, embeddable, validated_at, expires_at, first_seen_at)::text
+         FROM public.video_link_candidates WHERE video_id='v0000000001'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "mb_url");
+    assert_eq!(row.get::<_, String>(1), preserved);
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[external_candidate(1, VideoSource::MbUrl),])
+            .await
+            .unwrap(),
+        0,
+        "replay is a no-op"
+    );
+
+    let mut other = external_candidate(0, VideoSource::Wikidata);
+    other.recording_mbid = "abcdef01-2345-6789-abcd-0123456789ac".into();
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(std::slice::from_ref(&other))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        PgCandidateStore::new(db)
+            .fresh_links(&[other.recording_mbid], NOW)
+            .await
+            .unwrap()
+            .is_empty(),
+        "new recording association requires its own validation"
+    );
+    let before = states(db).await;
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[
+                external_candidate(4, VideoSource::MbUrl),
+                external_candidate(5, VideoSource::UserSubmission),
+            ])
+            .await,
+        Err(CandidateStoreError::InvalidInput)
+    );
+    assert_eq!(
+        states(db).await,
+        before,
+        "no partial input admission or moderation bypass"
+    );
+
+    db.batch_execute(
+        "ALTER TABLE public.video_link_candidates ADD CONSTRAINT fixture_reject_candidate
+                      CHECK (video_id <> 'v0000000009')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[
+                external_candidate(8, VideoSource::MbUrl),
+                external_candidate(9, VideoSource::MbUrl),
+            ])
+            .await,
+        Err(CandidateStoreError::Store)
+    );
+    assert_eq!(
+        states(db).await,
+        before,
+        "constraint failure rolls back the whole batch"
+    );
+    db.batch_execute(
+        "ALTER TABLE public.video_link_candidates DROP CONSTRAINT fixture_reject_candidate",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .admit_external_candidates(&[external_candidate(8, VideoSource::MbUrl)])
+            .await
+            .unwrap(),
+        1,
+        "failed transaction leaves connection usable"
+    );
+}
+
+async fn fresh_link_read_contract(db: &mut Client) {
+    reset_candidates(db).await;
+    seed(db, 16).await;
+    db.execute(
+        "UPDATE public.video_link_candidates SET status='validated', title='fixture fresh',
+             channel_id='fixture channel', duration_secs=180, embeddable=true,
+             validated_at=$1, expires_at=$1::bigint + 100",
+        &[&NOW],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.video_link_candidates SET
+             status=CASE video_id WHEN 'v0000000003' THEN 'pending' WHEN 'v0000000004' THEN 'rejected'
+                    WHEN 'v0000000005' THEN 'expired' ELSE status END,
+             validated_at=CASE video_id WHEN 'v0000000001' THEN $1::bigint - $2::bigint
+                          WHEN 'v0000000002' THEN $1::bigint + 1 WHEN 'v0000000008' THEN 0 ELSE validated_at END,
+             expires_at=CASE WHEN video_id='v0000000000' THEN $1 ELSE expires_at END,
+             embeddable=CASE video_id WHEN 'v0000000006' THEN false WHEN 'v0000000007' THEN NULL ELSE embeddable END,
+             source=CASE video_id WHEN 'v0000000009' THEN 'wikidata'
+                    WHEN 'v0000000015' THEN 'user_submission' ELSE source END",
+        &[&NOW, &VALIDATION_TTL_S]).await.unwrap();
+    let mbid = "00000000-0000-0000-0000-000000000001".to_string();
+    let before = states(db).await;
+    let links = PgCandidateStore::new(db)
+        .fresh_links(&[mbid.clone(), mbid.clone()], NOW)
+        .await
+        .unwrap();
+    assert_eq!(links.len(), MAX_LINKS_PER_RECORDING as usize);
+    assert_eq!(
+        links
+            .iter()
+            .map(|link| link.candidate.video_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "v0000000010",
+            "v0000000011",
+            "v0000000012",
+            "v0000000013",
+            "v0000000014"
+        ]
+    );
+    assert!(links
+        .iter()
+        .all(|link| link.title.as_deref() == Some("fixture fresh")
+            && link.channel_id.as_deref() == Some("fixture channel")
+            && link.duration_secs == Some(180)
+            && link.validated_at == NOW
+            && link.expires_at == NOW + 100));
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(std::slice::from_ref(&mbid), NOW + 100)
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "exact expiry is stale even when no purge has run"
+    );
+    assert_eq!(
+        states(db).await,
+        before,
+        "reads do not replace required metadata cleanup"
+    );
+
+    // The last second of TTL is eligible; an overlong expires_at never extends it.
+    db.execute("UPDATE public.video_link_candidates SET validated_at=$1, expires_at=$2 WHERE video_id='v0000000014'",
+        &[&(NOW - VALIDATION_TTL_S + 1), &i64::MAX]).await.unwrap();
+    db.batch_execute("DELETE FROM public.video_link_candidates WHERE video_id <> 'v0000000014'")
+        .await
+        .unwrap();
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(std::slice::from_ref(&mbid), NOW)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(PgCandidateStore::new(db)
+        .fresh_links(std::slice::from_ref(&mbid), NOW + 1)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(PgCandidateStore::new(db)
+        .fresh_links(std::slice::from_ref(&mbid), i64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(std::slice::from_ref(&mbid), 0)
+            .await,
+        Err(CandidateStoreError::InvalidTime)
+    );
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(std::slice::from_ref(&mbid), i64::MIN)
+            .await,
+        Err(CandidateStoreError::InvalidTime)
+    );
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(&["invalid".into()], NOW)
+            .await,
+        Err(CandidateStoreError::InvalidInput)
+    );
+    assert_eq!(
+        PgCandidateStore::new(db)
+            .fresh_links(&vec![mbid; MAX_RECORDINGS_PER_READ + 1], NOW)
+            .await,
+        Err(CandidateStoreError::InvalidInput)
+    );
+    assert!(PgCandidateStore::new(db)
+        .fresh_links(&[], NOW)
+        .await
+        .unwrap()
+        .is_empty());
+
+    reset_candidates(db).await;
+    // Maximum read fan-out: five links per requested recording, never the sixth.
+    db.execute(
+        "INSERT INTO public.video_link_candidates
+         (recording_mbid, video_id, source, status, embeddable, validated_at, expires_at)
+         SELECT ('00000000-0000-0000-0000-' || lpad(r::text,12,'0'))::uuid,
+                'v' || lpad(v::text,10,'0'), 'mb_url', 'validated', true, $1, $1::bigint + 100
+         FROM generate_series(1,50) r CROSS JOIN generate_series(0,5) v",
+        &[&NOW],
+    )
+    .await
+    .unwrap();
+    let mbids: Vec<_> = (1..=50)
+        .map(|i| format!("00000000-0000-0000-0000-{i:012}"))
+        .collect();
+    let links = PgCandidateStore::new(db)
+        .fresh_links(&mbids, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        links.len(),
+        MAX_RECORDINGS_PER_READ * MAX_LINKS_PER_RECORDING as usize
+    );
+    assert!(links
+        .iter()
+        .all(|link| link.candidate.video_id != "v0000000005"));
+}
+
 #[test]
 fn postgres_validation_store_contract() {
     let url = std::env::var("NNTUNE_VIDEOLINKS_TEST_DATABASE_URL")
@@ -486,6 +785,8 @@ fn postgres_validation_store_contract() {
                 stale_writes_and_atomic_failure(&mut db).await;
                 contention_is_bounded(&mut db, &config).await;
                 earlier_batch_survives(&mut db).await;
+                candidate_admission_contract(&mut db).await;
+                fresh_link_read_contract(&mut db).await;
             })
             .await
             .expect("bounded PostgreSQL acceptance");
