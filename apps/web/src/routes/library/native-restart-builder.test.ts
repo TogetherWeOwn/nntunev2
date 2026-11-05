@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
+import { createPlayerSession } from '#lib/player/session.js';
 import { addTrack, createQueue, currentTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
@@ -10,16 +11,16 @@ const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
 }) as Record<string, string>;
 
-// Exercise the real page handlers with mutable native getters. Lifecycle and
+// Exercise the real session restart and route share handlers with native getters.
+// Component lifecycle and
 // rendering are intentionally excluded here; the browser banks cover those.
 function restartFixture() {
 	const source = sources['./+page.svelte'];
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
-		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
-		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'retireQueueWork', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
+		'applyShareLink', 'applyPendingShareSeek', 'supersedeShareSeek'
 	]);
 	const handlers = parsed.statements.filter((node) =>
 		ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text)
@@ -31,39 +32,54 @@ function restartFixture() {
 	const location = { search: '' };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
-	const element = {
-		get duration() { return media.duration; },
-		get currentTime() { return media.position; },
-		set currentTime(value: number) {
-			writes.push(value);
-			if (media.refuse) throw new Error('native seek refused');
-			media.position = value;
+	const element = Object.assign(new EventTarget(), {
+		paused: true, ended: false, error: null, readyState: 4,
+		volume: 1, muted: false, playbackRate: 1, pause() {}, play: async () => {}, load() {},
+	});
+	Object.defineProperties(element, {
+		duration: { get: () => media.duration },
+		currentTime: {
+			get: () => media.position,
+			set: (value: number) => {
+				writes.push(value);
+				if (media.refuse) throw new Error('native seek refused');
+				media.position = value;
+			}
 		},
-		get seekable() {
-			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
-		},
-		getAttribute: (name: string) => name === 'src' ? track.streamUrl : null
-	};
+		seekable: { get: () => ({ length: 1, start: () => media.rangeStart, end: () => media.duration }) },
+		getAttribute: { value: (name: string) => name === 'src' ? track.streamUrl : null }
+	});
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint, setMiniPlayerHint, createPlayerSession,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), audioEl = element;
+		const player = createPlayerSession({ flush: () => Promise.resolve() });
+		player.setQueue(queue);
+		player.start(null);
+		player.attach(element);
+		player.subscribe((s) => { queue = s.queue; audioEl = s.audio ?? undefined; });
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
+		let queueAnnouncement = '';
 		const restartSupersededSources = new Set();
 		let playEpoch = 0;
 		${compiled}
+		player.onBeforeRestart(supersedeShareSeek);
 		return {
-			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek,
-			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue })
+			restart: player.restart, applyShareLink, applyPendingShareSeek,
+			refresh: () => element.dispatchEvent(new Event('timeupdate')),
+			read: () => ({
+				restartCanSeek: player.snapshot().restartAvailable,
+				restartStatus: player.snapshot().restartStatus,
+				restartStatusVersion: player.snapshot().restartVersion,
+				pendingShareSeek, queue
+			})
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;

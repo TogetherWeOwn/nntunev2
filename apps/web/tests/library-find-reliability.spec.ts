@@ -1,4 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ */
 
 /** Builder-owned regressions supplementing the protected acceptance banks. */
 const ITEMS = [
@@ -74,6 +83,7 @@ test('[LF-R-HIDDEN] find discloses the exact hidden selection and clears only th
 	);
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 
 	const privateChoice = page.getByRole('checkbox', {
 		name: 'Select Private Previous Account Text',
@@ -118,6 +128,7 @@ test('[LF-R-FAVORITES] find intersects Favorites only and each reset preserves t
 	});
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	await page.locator('[data-testid="library-item"][data-id="find-beta"]')
 		.getByRole('button', { name: 'Star Beta Song', exact: true }).click();
 	await page.getByRole('checkbox', { name: 'Select Private Previous Account Text', exact: true }).check();

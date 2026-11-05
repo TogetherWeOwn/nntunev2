@@ -1,4 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ */
 
 // Builder-owned integration coverage for bulk addition after favorites/query
 // filtering. The original bulk and favorites acceptance banks stay unchanged.
@@ -24,6 +33,7 @@ test.beforeEach(async ({ page, context }) => {
 });
 
 test('Favorites-only bulk uses visible sorted rows and retains hidden queued tracks/current', async ({ page }) => {
+	await openQueue(page);
 	for (const title of ['Zulu Song', 'Alpha Song']) {
 		await page.getByRole('button', { name: `Star ${title}`, exact: true }).click();
 	}
@@ -46,6 +56,7 @@ test('Favorites-only bulk uses visible sorted rows and retains hidden queued tra
 });
 
 test('an empty Favorites-only view disables bulk instead of adding hidden library rows', async ({ page }) => {
+	await openQueue(page);
 	await page.getByRole('combobox', { name: 'Show', exact: true }).selectOption('favorites');
 	await expect(page.getByTestId('library-item')).toHaveCount(0);
 	await expect(page.getByRole('button', { name: LABEL, exact: true })).toBeDisabled();
@@ -56,6 +67,7 @@ test('an empty Favorites-only view disables bulk instead of adding hidden librar
 });
 
 test('bulk composes the query with descending favorites and recomputes availability without auto-adding', async ({ page }) => {
+	await openQueue(page);
 	for (const title of ['Zulu Song', 'Middle Song', 'Alpha Song']) {
 		await page.getByRole('button', { name: `Star ${title}`, exact: true }).click();
 	}

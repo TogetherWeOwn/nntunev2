@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { closeQueue, openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: visible library row states and track count.
@@ -72,6 +73,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Out of scope (not pinned): queue editing/reordering/filtering/sorting,
  * PlayerQueue changes, durations/artwork, playback, deployment.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -135,6 +142,7 @@ test('LIBROWS-01: queueing a row shows a visible Queued badge on that row only',
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await expect(page.getByTestId('library-queued-badge')).toHaveCount(0);
 
@@ -152,6 +160,7 @@ test('LIBROWS-02: badge presence agrees with the queued aria-label on every row'
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
@@ -168,6 +177,7 @@ test('LIBROWS-03: an already-queued row reports aria-pressed=true, unqueued rows
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await row(page, 'row-mike').click();
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
@@ -188,6 +198,7 @@ test('LIBROWS-04: re-activating a queued row neither duplicates, errors nor stea
 	page.on('pageerror', (error) => pageErrors.push(String(error)));
 
 	await seedLibrary(page);
+	await openQueue(page);
 
 	const control = rowButton(page, 'row-mike');
 	await control.focus();
@@ -217,6 +228,7 @@ test('LIBROWS-04: re-activating a queued row neither duplicates, errors nor stea
 
 test('LIBROWS-05: a three-track library heads the list with "3 tracks"', async ({ page }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	const count = page.getByTestId('library-track-count');
 	await expect(count).toBeVisible();
@@ -288,6 +300,7 @@ test('LIBROWS-08: refresh reconciles badges, pressed state and count with the ne
 	);
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	await expect(page.getByTestId('library-track-count')).toHaveText('3 tracks');
 
 	await row(page, 'row-mike').click();
@@ -328,7 +341,9 @@ test('LIBROWS-09: narrow screens keep the badge, count and row operability on-sc
 	await expect(page.getByTestId('library-track-count')).toBeVisible();
 
 	await row(page, 'row-mike').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await closeQueue(page, { url: /\/library(\?|$)/, heading: 'Library' });
 
 	const badge = badgeFor(page, 'row-mike');
 	await expect(badge).toBeVisible();
@@ -342,6 +357,7 @@ test('LIBROWS-09: narrow screens keep the badge, count and row operability on-sc
 
 	// Rows stay operable at this width: queueing a second row works.
 	await row(page, 'row-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 });
 
@@ -350,6 +366,7 @@ test.describe('dark color scheme', () => {
 
 	test('LIBROWS-10: the queued badge renders visibly in dark mode', async ({ page }) => {
 		await seedLibrary(page);
+		await openQueue(page);
 
 		await row(page, 'row-mike').click();
 		await expect(page.getByTestId('queue-item')).toHaveCount(1);

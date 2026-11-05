@@ -1,4 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ */
 
 const AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 const AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
@@ -50,6 +59,7 @@ test('bulk queue activations never write to browser storage', async ({ page }) =
 	await expect(page.getByTestId('queue-announcement')).toContainText(/queued 1.*0 already queued/i);
 	await action.click();
 	await expect(page.getByTestId('queue-announcement')).toContainText(/queued 0.*1 already queued/i);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	const calls = await page.evaluate(() => (window as unknown as { storageCalls: string[] }).storageCalls);
 	expect(calls).toEqual([]);
@@ -69,6 +79,7 @@ test('the bulk queue outcome cannot survive an account-boundary retry', async ({
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(1);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('favorites-empty')).toBeVisible();
 	await expect(page.getByTestId('queue-announcement')).toHaveText('');

@@ -1,10 +1,15 @@
 import { mount, tick } from 'svelte';
-import Library from '../../../src/routes/library/+page.svelte';
+import Fixture from './Fixture.svelte';
 import { moveTrack, restoreQueue, selectTrack, type QueueState, type Track } from '../../../src/lib/player/queue.js';
 import '../../../src/app.css';
 
-/** Test-only bridge; the Vite pre-transform exports the route's existing setter. */
-const library = mount(Library, { target: document.getElementById('app')! }) as unknown as {
+/**
+ * Engineering Lead authorized a one-time same-PR migration from library-local
+ * native controls to the approved persistent custom transport. The bounded
+ * executor exception covers this input bridge only; other Builder edits remain
+ * prohibited. The Vite transform exports only the route's existing queue setter.
+ */
+const library = mount(Fixture, { target: document.getElementById('app')! }) as unknown as {
 	acceptanceReplaceQueue(state: QueueState): void;
 };
 let state: QueueState = { tracks: [], currentIndex: -1 };

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: library rows expose their queued state to assistive tech.
@@ -17,6 +18,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * `aria-selected="true"`, or an accessible name / text that says the
  * track is queued. Queued is membership in the queue, not "currently
  * playing": after Next, the previous track is still queued.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -68,6 +75,7 @@ test('selecting a row exposes it as queued and leaves other rows unqueued', asyn
 	}
 
 	await row(page, 'row-mike').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 
@@ -82,6 +90,7 @@ test('re-selecting a queued row keeps one queue entry and stays queued', async (
 	await seedLibrary(page);
 
 	await row(page, 'row-mike').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await row(page, 'row-mike').click();
 
@@ -97,6 +106,7 @@ test('queued state tracks queue membership, not the now-playing track', async ({
 
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 

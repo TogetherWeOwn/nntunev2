@@ -36,32 +36,56 @@ describe('resolveStreamUrl', () => {
 	});
 });
 
-// Builder-owned exact pins for the library player wiring, via the same Vite
-// raw-glob seam as the acceptance source pin. The acceptance pin in
-// `import-validation.test.ts` is intentionally loose (it only requires
-// `src={`) and that file is acceptance-owned, so the exact binding and the
-// helper derivation are pinned here instead.
-const routeSources = import.meta.glob('../../routes/**/*.svelte', {
+// Engineering Lead authorized one-time same-PR physical player/queue owner
+// source-wiring migration only. Behavior vectors remain protected and require
+// independent equivalence review.
+// Follow each production connection separately; unrelated source tokens cannot
+// substitute for normalization reaching the selected layout-owned audio.
+const sources = import.meta.glob([
+	'../../routes/library/+page.svelte', '../../routes/+layout.svelte',
+	'../player/PlayerAudio.svelte', '../player/context.ts', '../player/session.ts'
+], {
 	query: '?raw',
 	import: 'default',
 	eager: true
 }) as Record<string, string>;
 
 describe('library player wiring', () => {
-	const source = routeSources['../../routes/library/+page.svelte'];
+	const library = sources['../../routes/library/+page.svelte'];
+	const audio = sources['../player/PlayerAudio.svelte'];
 
-	it('derives the stream URL through resolveStreamUrl', () => {
-		expect(source).toMatch(/resolveStreamUrl\(currentTrack\)/);
+	it('normalizes a selected library item before it enters the shared queue', () => {
+		expect(library).toMatch(/function playableTrackFor\(item: LibraryItem\): Track \{\s*return \{ \.\.\.queuedTrackFor\(item\), streamUrl: resolveStreamUrl\(\{ streamUrl: item\.streamUrl \}\) \};\s*\}/);
+		expect(library).toContain('replaceQueue(addTrack(queue, playableTrackFor(item)))');
+		expect(library).toContain('player.setQueue(next)');
+		expect(library).toContain('const player = usePlayerSession()');
 	});
 
-	it('renders audio only when a stream URL exists', () => {
-		expect(source).toMatch(/\{#if streamUrl\}/);
+	it('shares the selected queue through the layout-provided session', () => {
+		const layout = sources['../../routes/+layout.svelte'];
+		expect(layout).toContain('const player = createPlayerSession({ flush: tick })');
+		expect(layout).toContain('providePlayerSession(player)');
+		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+		const context = sources['../player/context.ts'];
+		expect(context).toContain('setContext(PLAYER_SESSION, session)');
+		expect(context).toContain('getContext<PlayerSession>(PLAYER_SESSION)');
+		const session = sources['../player/session.ts'];
+		expect(session).toContain("import { writable } from 'svelte/store'");
+		expect(session).toContain('publish({ queue,');
+		expect(session).toContain('subscribe: store.subscribe');
+		expect(audio).toContain('const player = usePlayerSession()');
+		expect(audio).toContain('const selected = $derived(currentTrack($player.queue))');
 	});
 
-	it('binds the audio src to exactly the derived stream URL', () => {
-		expect(source).toMatch(/<audio[^>]*\ssrc=\{streamUrl\}/);
+	it('renders audio only when a normalized stream URL exists', () => {
+		expect(audio).toContain('{#if selected?.streamUrl}');
+	});
+
+	it('binds the audio src to exactly the selected normalized stream URL', () => {
+		expect(audio).toMatch(/<audio[^>]*\ssrc=\{selected\.streamUrl\}/);
 		// Any other binding expression must fail — not just a literal.
-		expect(source).not.toMatch(/<audio[^>]*\ssrc=\{(?!streamUrl\})/);
-		expect(source).not.toMatch(/<audio[^>]*\ssrc=""/);
+		expect(audio).not.toMatch(/<audio[^>]*\ssrc=\{(?!selected\.streamUrl\})/);
+		expect(audio).not.toMatch(/<audio[^>]*\ssrc=""/);
 	});
 });

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { closeQueue, openQueue } from './helpers/queue-host';
 
 /**
  * PLAYALL acceptance bank — protected; the paired build owns the combined
@@ -49,6 +50,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * auth leakage; inaccessible or overflowing narrow-screen action.
  * Pre-feature expected RED: action/disabled-state assertions, never setup
  * errors.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const LABEL = 'Play displayed from the top';
@@ -242,6 +249,7 @@ test('PLAYALL-00 control: bulk appends in displayed order without reselecting', 
 	await expectView(page, ORIGINAL);
 	await rowAction(page, 'shown-zulu').click();
 	await rowAction(page, 'shown-alpha').click();
+	await openQueue(page);
 	await expectQueue(page, ['shown-zulu', 'shown-alpha'], 'shown-zulu');
 	await sort(page, 'Title A–Z');
 	await expectView(page, TITLE);
@@ -275,6 +283,7 @@ test('PLAYALL-01 empty queue loads displayed order, selects first and names outc
 	const listBox = await page.getByTestId('library-list').boundingBox();
 	expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(listBox!.y);
 	await control.click();
+	await openQueue(page);
 	await expectQueue(page, TITLE, 'shown-alpha');
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 	await expectOutcome(page, { title: 'Alpha Song', added: 5 });
@@ -301,6 +310,7 @@ test('PLAYALL-02 non-empty queue appends missing through the append core and sel
 	await openLibrary(page);
 	await row(page, 'shown-zulu').getByRole('button', { name: 'Star Zulu Song', exact: true }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
+	await openQueue(page);
 	await row(page, 'shown-echo').getByRole('checkbox').check();
 	await expect(page.getByTestId('selection-count')).toContainText('1 selected');
 	await sort(page, 'Title A–Z');
@@ -348,6 +358,7 @@ test('PLAYALL-03 all-already-queued selects the first displayed track in place w
 	await openLibrary(page);
 	await expect(bulkAction(page)).toBeEnabled();
 	await bulkAction(page).click();
+	await openQueue(page);
 	await expectQueue(page, ORIGINAL, 'shown-zulu');
 	await sort(page, 'Title A–Z');
 	await expectView(page, TITLE);
@@ -370,6 +381,7 @@ test('PLAYALL-04 empty displayed set disables honestly and never invents tracks'
 	const api = await mockLibrary(page);
 	await stubPlay(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await page.getByLabel('Find in loaded tracks').fill('zzz-no-such-track');
 	await expect(page.getByTestId('library-item')).toHaveCount(0);
 	await expect(page.getByText('No matches in your loaded tracks.')).toBeVisible();
@@ -399,6 +411,7 @@ test('PLAYALL-05 play() rejection leaves the first track selected-but-paused wit
 	await expect(control, `${ACTION_MARKER} the one-action play-from-top control is missing`).toBeVisible();
 	await expect(control).toBeEnabled();
 	await control.click();
+	await openQueue(page);
 	await expectQueue(page, ['shown-zulu', 'shown-alpha', 'shown-middle'], 'shown-zulu');
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	// Exactly one gesture-driven play() attempt; no out-of-gesture retry.
@@ -427,6 +440,7 @@ test('PLAYALL-06 favorites-only view plays the displayed projection and leaves f
 	await row(page, 'shown-middle').getByRole('button', { name: 'Star Middle Song', exact: true }).click();
 	await row(page, 'shown-alpha').getByRole('button', { name: 'Star Alpha Song', exact: true }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
+	await openQueue(page);
 	await page.getByLabel('Show', { exact: true }).selectOption('favorites');
 	await expectView(page, ['shown-alpha', 'shown-middle']);
 	const control = action(page);
@@ -457,6 +471,7 @@ test('PLAYALL-07 auth transition fences play state; the next account starts clea
 	await expect(control, `${ACTION_MARKER} the one-action play-from-top control is missing`).toBeVisible();
 	await expect(control).toBeEnabled();
 	await control.click();
+	await openQueue(page);
 	await expectQueue(page, ORIGINAL, 'shown-zulu');
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');
@@ -503,10 +518,17 @@ for (const scheme of ['light', 'dark'] as const) {
 		expect(box!.height, 'touch action needs a usable target').toBeGreaterThanOrEqual(44);
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 		await page.keyboard.press('Enter');
+		await openQueue(page);
 		await expectQueue(page, ORIGINAL, 'shown-zulu');
 		await expectOutcome(page, { title: 'Zulu Song', added: 5 });
+		await closeQueue(page, { url: /\/library(\?|$)/, heading: 'Library' });
 		await expect(control).toBeEnabled();
+		// Close returns focus to the shell Queue toggle; put it back on the production action
+		// so the second Enter lands on it and does not toggle the queue.
+		await control.focus();
+		await expect(control).toBeFocused();
 		await page.keyboard.press('Enter');
+		await openQueue(page);
 		await expectQueue(page, ORIGINAL, 'shown-zulu');
 	});
 }

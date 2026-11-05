@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: selecting library rows fills the player queue (M1-i,
@@ -39,6 +40,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   session's queue.
  *
  * Out of scope (not pinned): audio playback, prev/seek, queue reorder.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -102,6 +109,7 @@ async function fireAuthTransition(page: Page): Promise<void> {
 test('empty selection shows an empty queue with next disabled', async ({ page }) => {
 	await seedLibrary(page);
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(page.getByTestId('player-next')).toBeDisabled();
@@ -118,6 +126,7 @@ test('selecting rows A, B, C fills the queue in that order with A now playing', 
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
@@ -133,6 +142,7 @@ test('selecting the same row twice does not duplicate it in the queue', async ({
 	await seedLibrary(page);
 
 	await row(page, 'row-mike').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await row(page, 'row-mike').click();
 
@@ -147,6 +157,7 @@ test('player-next advances now-playing to B and marks B current', async ({ page 
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 
@@ -167,6 +178,7 @@ test('auth transition clears the queue so nothing leaks into the next session', 
 
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 

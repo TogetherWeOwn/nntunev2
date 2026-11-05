@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned supplement to the protected play-from-top acceptance bank
@@ -27,6 +28,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * tests/library-play-displayed-builder.spec.ts --workers=1`. Real /library,
  * real queue and real ordering; only /api/library is mocked and media
  * requests are refused. No backend/provider/production requests.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const LABEL = 'Play displayed from the top';
@@ -164,6 +171,7 @@ test('selects the first appended track when the first displayed track is already
 	await mockLibrary(page);
 	await stubRejectPlay(page);
 	await openLibrary(page, ITEMS.length);
+	await openQueue(page);
 	await rowAction(page, 'shown-zulu').click();
 	await expectQueue(page, ['shown-zulu'], 'shown-zulu');
 	await action(page).click();
@@ -201,6 +209,7 @@ test('grouped by artist, an empty queue loads in the rendered grouped order', as
 	await mockLibrary(page);
 	await stubRejectPlay(page);
 	await openLibrary(page, ITEMS.length);
+	await openQueue(page);
 	await groupByArtist(page);
 	await action(page).click();
 	await expectQueue(page, GROUPED_ORDER, 'shown-middle');
@@ -212,6 +221,7 @@ test('grouped by artist, an all-queued activation selects the first grouped row 
 	await mockLibrary(page);
 	await stubRejectPlay(page);
 	await openLibrary(page, ITEMS.length);
+	await openQueue(page);
 	await bulkAction(page).click();
 	await expectQueue(page, FLAT_ORDER, 'shown-zulu');
 	await groupByArtist(page);
@@ -232,6 +242,7 @@ for (const grouped of [false, true]) {
 		await mockLibrary(page, STREAM_ITEMS);
 		await stubResolvePlay(page);
 		await openLibrary(page, STREAM_ITEMS.length);
+		await openQueue(page);
 		await bulkAction(page).click();
 		const ids = ['shown-zulu', 'shown-alpha', 'shown-middle'];
 		await expectQueue(page, ids, 'shown-zulu');
@@ -280,6 +291,7 @@ test('same-ID refresh hydrates a bulk slot without replacing its stored title or
 	}));
 	await stubResolvePlay(page);
 	await openLibrary(page, 1);
+	await openQueue(page);
 	await bulkAction(page).click();
 	await expectStoredQueueLabels(page);
 	await expect(page.locator('audio')).toHaveCount(0);
@@ -304,6 +316,7 @@ for (const refreshedStream of [undefined, '/__playall-build__/new.mp3']) {
 		}));
 		await stubResolvePlay(page);
 		await openLibrary(page, 1);
+		await openQueue(page);
 		await rowAction(page, 'same').click();
 		await expectStoredQueueLabels(page);
 		const player = page.locator('audio[data-testid="audio-player"]');
@@ -325,6 +338,7 @@ test('bulk then rejected play hydrates the existing slot but reports selected an
 	await mockLibrary(page, SOLO_ITEM);
 	await stubRejectPlay(page);
 	await openLibrary(page, SOLO_ITEM.length);
+	await openQueue(page);
 	await bulkAction(page).click();
 	await expect(page.locator('audio')).toHaveCount(0);
 	await action(page).click();
@@ -344,6 +358,7 @@ test('no-stream title truncation keeps the boundary emoji whole and feedback tru
 	await mockLibrary(page, [{ id: 'emoji-boundary', title: `${prefix}😀 beyond the limit` }]);
 	await stubResolvePlay(page);
 	await openLibrary(page, 1);
+	await openQueue(page);
 	await action(page).click();
 	await expectQueue(page, ['emoji-boundary'], 'emoji-boundary');
 	await expect(announcement(page)).toHaveText(`Selected ${prefix}😀; no stream to play. Added 1.`);
@@ -358,6 +373,7 @@ test('resolving play() announces the exact Playing outcome with counts', async (
 	await mockLibrary(page, STREAM_ITEMS);
 	await stubResolvePlay(page);
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await action(page).click();
 	await expectQueue(page, ['shown-zulu', 'shown-alpha', 'shown-middle'], 'shown-zulu');
 	await expect.poll(() => playCalls(page)).toBe(1);
@@ -377,6 +393,7 @@ test('rejected play() names paused/blocked and never claims Playing', async ({ p
 	const pageErrors: string[] = [];
 	page.on('pageerror', (error) => pageErrors.push(String(error)));
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await action(page).click();
 	await expectQueue(page, ['shown-zulu', 'shown-alpha', 'shown-middle'], 'shown-zulu');
 	await expect.poll(() => playCalls(page)).toBe(1);
@@ -437,6 +454,7 @@ for (const edit of DIRECT_EDITS) {
 		await openLibrary(page, STREAM_ITEMS.length);
 		await action(page).click();
 		await expect.poll(() => playCalls(page)).toBe(1);
+		await openQueue(page);
 		await edit.click(page);
 		// The edit's own announcement proves its epoch bump landed before
 		// the late play() outcome resolves.
@@ -453,6 +471,7 @@ test('deferred play() outcome is fenced by trimming previous tracks', async ({ p
 	await mockLibrary(page, STREAM_ITEMS);
 	await stubDeferredPlay(page);
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await rowAction(page, 'shown-zulu').click();
 	await expectQueue(page, ['shown-zulu'], 'shown-zulu');
 	await action(page).click();
@@ -474,6 +493,7 @@ test('deferred play() outcome is fenced by an auth transition', async ({ page })
 	);
 	await stubDeferredPlay(page);
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await action(page).click();
 	await expect.poll(() => playCalls(page)).toBe(1);
 	const otherTab = await page.context().newPage();
@@ -505,6 +525,7 @@ test('no-op Next while play() is pending leaves the outcome alone', async ({ pag
 	await mockLibrary(page, SOLO_ITEM);
 	await stubDeferredPlay(page);
 	await openLibrary(page, SOLO_ITEM.length);
+	await openQueue(page);
 	await action(page).click();
 	await expectQueue(page, ['solo-track'], 'solo-track');
 	await expect.poll(() => playCalls(page)).toBe(1);
@@ -522,6 +543,7 @@ test('real Next while play() is pending fences the stale outcome', async ({ page
 	await mockLibrary(page, STREAM_ITEMS);
 	await stubDeferredPlay(page);
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await action(page).click();
 	await expectQueue(page, ['shown-zulu', 'shown-alpha', 'shown-middle'], 'shown-zulu');
 	await expect.poll(() => playCalls(page)).toBe(1);
@@ -539,6 +561,7 @@ test('bulk append of stream-bearing items stays metadata-only without mounting a
 	await mockLibrary(page, STREAM_ITEMS);
 	await stubRejectPlay(page);
 	await openLibrary(page, STREAM_ITEMS.length);
+	await openQueue(page);
 	await expect(bulkAction(page)).toBeEnabled();
 	await bulkAction(page).click();
 	await expectQueue(page, ['shown-zulu', 'shown-alpha', 'shown-middle'], 'shown-zulu');

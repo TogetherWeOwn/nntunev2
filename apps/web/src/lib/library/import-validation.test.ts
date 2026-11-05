@@ -81,22 +81,26 @@ describe('validateImportFile', () => {
 	});
 });
 
-// Raw route markup via Vite glob (same seam as `../contract.test.ts`).
-const routeSources = import.meta.glob('../../routes/**/*.svelte', {
+// Engineering Lead authorized a one-time same-PR physical player/queue owner
+// source-location migration only. General acceptance ownership and all import
+// vectors above remain protected; independent equivalence review is required.
+// Browser URL vectors in player-session-builder.spec.ts exercise
+// the real library -> normalized queue -> layout-owned audio path.
+const playerSources = import.meta.glob(['../../routes/+layout.svelte', '../player/PlayerAudio.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
 }) as Record<string, string>;
 
 describe('library player markup', () => {
-	// The positive path (a selected track carrying a real stream URL) is not
-	// reachable in this slice: the library API shape has no stream URL yet
-	// and player wiring is explicitly out of scope. The Playwright half
-	// pins the reachable behaviour (no <audio> at all while no real URL
-	// exists); this source pin is the closest honest seam for "when a real
-	// URL exists, the player renders with its contract hook and a bound
-	// src, never a literal empty one".
-	const source = routeSources['../../routes/library/+page.svelte'];
+	const source = playerSources['../player/PlayerAudio.svelte'];
+
+	it('mounts the audio surface in the persistent application layout', () => {
+		const layout = playerSources['../../routes/+layout.svelte'];
+		expect(layout).toContain("import PlayerAudio from '#lib/player/PlayerAudio.svelte'");
+		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+	});
 
 	it('keeps the audio-player contract hook on an <audio> element', () => {
 		expect(source).toMatch(/<audio[^>]*data-testid="audio-player"/);
@@ -104,6 +108,7 @@ describe('library player markup', () => {
 
 	it('never renders a literal empty src — the src is bound to the stream URL', () => {
 		expect(source).not.toMatch(/<audio[^>]*\ssrc=""/);
-		expect(source).toMatch(/<audio[^>]*\ssrc=\{/);
+		expect(source).toMatch(/<audio[^>]*\ssrc=\{selected\.streamUrl\}/);
+		expect(source).toContain('{#if selected?.streamUrl}');
 	});
 });

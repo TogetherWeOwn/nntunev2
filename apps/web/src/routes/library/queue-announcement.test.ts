@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
+import { createTrackListExport } from '#lib/player/trackListExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
 import {
@@ -14,7 +15,9 @@ import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
+import { createPlayerFacade, liftPlayerProjections } from './player-harness.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
+import { queueViewActions } from '#lib/player/queueViewActions.js';
 import {
 	appendResultLabel,
 	appendSelection,
@@ -76,14 +79,20 @@ function pageScript() {
 	const script = extractFirstScript(sources['./+page.svelte']);
 	if (!script) throw new Error('Library page script missing');
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
-	const body = parsed.statements
-		.filter((statement) => !ts.isImportDeclaration(statement))
-		.map((statement) => statement.getText(parsed))
-		.join('\n');
-	const compiled = ts.transpileModule(body, {
+	// The route reads queue/repeat/audio from the layout-owned player session.
+	const facade = createPlayerFacade();
+	// Synchronous membership cases start after the authenticated-load bootstrap.
+	facade.initializeFavorites();
+	const lifted = liftPlayerProjections(
+		parsed, parsed.statements.filter((statement) => !ts.isImportDeclaration(statement))
+	);
+	const compiled = ts.transpileModule(`let $player = __facade.get();\n${lifted.body}\n${lifted.sync}`, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
+		createTrackListExport,
+		formatQueueText: queueFunctions.formatQueueText,
+		formatQueueM3U: queueFunctions.formatQueueM3U,
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
@@ -120,6 +129,11 @@ function pageScript() {
 		toggleSelected,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		subscribeLocalAuthTransition,
+		usePlayerSession: () => facade,
+		// Host-owner adapter only: run the mounted QueueView's real move action.
+		moveQueuedTrack: queueViewActions(facade).onmove,
+		__facade: facade,
+		$effect: () => {},
 		browserStorage: () => null,
 		clearSnapshot: () => {},
 		invalidateLibraryCache: () => {},
@@ -134,11 +148,11 @@ function pageScript() {
 		return {
 			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
 			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
-			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			read: () => ({ queue, announcement: player.get().queueFeedback, items, loadError }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
-			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); },
+			emptyQueueWithoutEdit: () => { const text = player.get().queueFeedback; player.setQueue(clearQueue(queue)); player.setQueueFeedback(text); },
 			setFavoriteAnnouncementForFixture: (announcement) => {
 				favoritesAnnouncement = announcement;
 			}

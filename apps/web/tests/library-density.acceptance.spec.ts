@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * DENSITY browser acceptance — protected test-only handoff.
@@ -56,6 +57,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * menu radios writing the same `nntune:density:v1` raw enum, but it
  * must never create a second combobox named "Density"; the page select
  * stays the single combobox and reflects whichever writer chose last.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const DENSITY_KEY = 'nntune:density:v1';
@@ -273,6 +280,7 @@ test.beforeEach(async ({ context }) => {
 
 test('DEN-00 control: real page, rows, queue, find/order/appearance controls and WCAG target sizes already work', async ({ page }) => {
 	const { writes } = await openLibrary(page);
+	await openQueue(page);
 	await queueTwo(page);
 	await expectRowTextsVisible(page);
 	// Page main only: the app-shell top bar carries its own Search field.
@@ -297,6 +305,7 @@ test('DEN-01 default: Density control offers Comfortable/Compact and starts at C
 
 test('DEN-02 compact: both lists shrink, text stays visible, Comfortable restores the geometry', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await queueTwo(page);
 	const comfortableLibrary = await rowHeight(row(page, 'den-alpha'));
 	const comfortableQueue = await rowHeight(queueRow(page, 'den-zulu'));
@@ -318,6 +327,7 @@ test('DEN-02 compact: both lists shrink, text stays visible, Comfortable restore
 
 test('DEN-03 targets: WCAG 2.5.8 target size holds in both densities and Compact shrinks no target', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await queueTwo(page);
 	await row(page, 'den-beta').getByRole('button', { name: /star|favorite/i }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
@@ -342,6 +352,7 @@ test('DEN-03 targets: WCAG 2.5.8 target size holds in both densities and Compact
 
 test('DEN-04 keyboard: Tab order and visible focus are identical in both densities; the select works by keyboard', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await queueTwo(page);
 	await expectDensityControl(page, 'comfortable');
 	const comfortableSequence = await tabSequence(page);
@@ -389,6 +400,7 @@ test('DEN-05 persistence: choice stores only the raw enum, survives reload both 
 		storageWrites.push(...await page.evaluate(() =>
 			(window as Window & { __densityAudit: { writes: [string, string][] } }).__densityAudit.writes));
 	};
+	await openQueue(page);
 	await queueTwo(page);
 	const comfortable = await rowHeight(row(page, 'den-alpha'));
 	await page.evaluate((key) => localStorage.setItem(key, 'dark'), APPEARANCE_KEY);
@@ -458,6 +470,7 @@ for (const refusal of ['read', 'write'] as const) {
 			}
 		}, { key: DENSITY_KEY, mode: refusal });
 		await openLibrary(page);
+		await openQueue(page);
 		await queueTwo(page);
 		await expectDensityControl(page, 'comfortable');
 		const comfortable = await rowHeight(row(page, 'den-alpha'));
@@ -477,6 +490,7 @@ for (const refusal of ['read', 'write'] as const) {
 
 test('DEN-08 views: Compact persists across find, ordering and favorites use on the library page', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await queueTwo(page);
 	const comfortableLibrary = await rowHeight(row(page, 'den-alpha'));
 	const comfortableQueue = await rowHeight(queueRow(page, 'den-zulu'));

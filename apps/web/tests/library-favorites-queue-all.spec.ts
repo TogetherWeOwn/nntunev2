@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: queue all local favorites in star order with one action.
@@ -51,6 +52,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * queue, FAVQ-03 dedupe/in-place/current, FAVQ-04 announcement once,
  * FAVQ-05 unresolvable skip, FAVQ-06 auth-transition purge, FAVQ-07
  * keyboard, FAVQ-08 narrow-screen touch, FAVQ-09 zero side effects.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Fixture titles/artists deliberately avoid the words "star", "favorite",
@@ -140,6 +147,7 @@ test('[FAVQ-01] the queue-all action renders exactly once only when a favorite r
 
 test('[FAVQ-02] queue-all appends resolved favorites in star order', async ({ page }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	// Star in an order that matches neither library order nor title order.
 	await starButton(page, 'favq-mike').click();
@@ -161,6 +169,7 @@ test('[FAVQ-03] queue-all dedupes in place and never steals the current track', 
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	// The middle-starred favorite is already queued and current.
 	await row(page, 'favq-zulu').click();
@@ -227,6 +236,7 @@ test('[FAVQ-05] queue-all skips stored favorites absent from the library', async
 		}
 	);
 	await seedLibrary(page);
+	await openQueue(page);
 
 	// The shelf lists the resolved set; the ghost id stays stored but unlisted.
 	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
@@ -251,6 +261,7 @@ test('[FAVQ-06] an auth transition purges queued favorites before the next accou
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await starButton(page, 'favq-mike').click();
 	await starButton(page, 'favq-zulu').click();
@@ -294,6 +305,7 @@ test('[FAVQ-06] an auth transition purges queued favorites before the next accou
 
 test('[FAVQ-07] the queue-all action is keyboard operable', async ({ page }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await starButton(page, 'favq-alpha').click();
 	await starButton(page, 'favq-mike').click();
@@ -328,6 +340,7 @@ test.describe('narrow-screen touch', () => {
 		await expect(action, 'queue-all action must stay visible at 360px width').toBeVisible();
 		await action.tap();
 
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(2);
 		expect(await queueIds(page)).toEqual(['favq-zulu', 'favq-mike']);
 		await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
@@ -353,6 +366,7 @@ test('[FAVQ-09] queue-all issues no network mutations, storage writes, or playba
 
 	await action.click();
 	// Non-vacuous gate: the queue-all under observation must succeed.
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueIds(page)).toEqual(['favq-mike', 'favq-alpha']);
 

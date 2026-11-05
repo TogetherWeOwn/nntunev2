@@ -3,6 +3,7 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type QueueState, type Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/queue-direct-selection/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * PICK — protected test-only handoff. No live API, provider, audio or deployment.
@@ -23,6 +24,12 @@ import type {} from './fixtures/queue-direct-selection/mount.js';
  * Breaks caught: inert callbacks, displayed-index selection, stale removed rows,
  * host state mutation in the child, accidental Play-now/stream fetching/storage,
  * rearranging to select, incorrect Next boundary, focus theft, account leakage.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
 	componentOrigin: [async ({}, use) => {
@@ -134,6 +141,7 @@ async function seed(page: Page, baseURL: string, payload = { current: LIBRARY, s
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
 	for (const id of IDS) await page.locator(`[data-testid="library-item"][data-id="${id}"] button.nt-library-row`).click();
+	await openQueue(page);
 	await selected(page, 'pick-mike', 'Mike Song', 1);
 }
 
@@ -203,7 +211,9 @@ for (const example of [
 			await expect(target).toBeEnabled();
 			if (example.touch) await target.tap();
 			else {
-				await page.getByRole('button', { name: 'Refresh', exact: true }).focus();
+				const closeQueue = page.getByRole('button', { name: 'Close queue', exact: true });
+				await expect(closeQueue).toBeVisible();
+				await closeQueue.focus();
 				for (let tabs = 0; tabs < 70 && !(await target.evaluate((element) => element === document.activeElement)); tabs += 1) await page.keyboard.press('Tab');
 				await expect(target).toBeFocused();
 				await page.keyboard.press(example.key);
