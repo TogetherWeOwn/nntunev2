@@ -85,8 +85,8 @@ pub mod yenc;
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
 // (and a single-threaded isolate cannot park a waiter anyway). The Worker
 // entry point gets an async shared-future equivalent; see the module docs.
-#[cfg(target_arch = "wasm32")]
-pub mod account_runtime;
+// account_runtime.rs is intentionally not installed: candidate/journal and
+// operation dispatch require actual Worker qualification before export.
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 pub mod source_catalogue;

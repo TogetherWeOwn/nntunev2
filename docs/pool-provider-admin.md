@@ -4,6 +4,16 @@ The ADR 0014 service registry is managed only through the admin API. It is
 not a user provider or credential-vault API. The registry API alone does not
 install account scheduling or enable NNTP cache-miss playback.
 
+**Landing boundary:** the API registry/admin/resolver and migration 0035 are
+intentionally enabled effects requiring full review and the pre-merge schema
+approval/apply/ledger gate. Account runtime, candidate/journal/config writes,
+alarms, transport, selection and the ingress decorator described below remain
+uninstalled source. Stream exports no account class or binding/migration and
+its existing object does not forward account operation paths. Live ingest keeps
+the supported `/probe` and `/body` contracts, without account attribution. This
+is not actual Worker qualification or authority to provision keys, apply SQL,
+deploy, activate operations or serve public misses.
+
 ## Authentication and responses
 
 All endpoints require an authenticated admin cookie session and a fresh
@@ -17,7 +27,9 @@ step-up behavior applies; OPTIONS does not advertise these paths.
   encrypted envelope nor `secret_ref` is returned. Reads refuse a registry
   larger than 1,000 accounts rather than silently hide accounts.
 - `POST /v1/admin/pool-providers` creates one account. Body:
-  `{"settings": {...}, "expected_revision": 0, "password": "..."}`.
+  `{"settings": {...}, "expected_revision": 0, "password": "..."}`. Creates
+  at 1,000 total rows (including disabled accounts) return conflict before any
+  secret or audit write; updates and rotations still work at capacity.
 - `PUT /v1/admin/pool-providers/{id}` replaces the settings of one account.
   Body: `{"settings": {...}, "expected_revision": N}`. Include `password`
   only for an explicit credential rotation. The path and settings IDs must
@@ -144,14 +156,14 @@ physical close remains possible after poisoning, but uncertain capacity is not
 released. Synchronous AUTHINFO checks refuse while the owner lock is held,
 rather than block or borrow shared mutable state across an await.
 
-The dedicated `NntpAccount` Durable Object retains the owner in its separate
-account namespace. Its authenticated candidate endpoint offers scheduling hints
-only, never reservations or credentials. The user meter object remains separate.
-The account alarm reconciles registry revocations and drains retained controls,
-including after registry failure. Failed/slow refresh cannot suppress cleanup.
-Storage promises have bounded waits; an uncertain write still fences admission.
-Wakes continue only for live controls or current cancellable reservations, not
-forever for recovery-fenced bookkeeping after all physical sockets have drained.
+The uninstalled `NntpAccount` adapter describes an owner in a separate account
+namespace. Its authenticated candidate endpoint would reconcile durable config
+and offer hints, never reservations or credentials; it is not read-only. The
+user meter object remains separate. The retained alarm code reconciles registry
+revocations and drains controls, including after registry failure. Storage
+promises have bounded waits; an uncertain write fences admission. These source
+contracts are not evidence of deployed persistence, delivery or physical close.
+There is no installed account class, namespace, candidate route or alarm here.
 
 `account_operation` composes one BODY or bounded STAT batch: fresh registry,
 durable cleanup wake, durable class reservation, signed exact-identity resolution,
@@ -200,18 +212,21 @@ The whole selection call has a <=20-second deadline. Worker client adapters use
 only the dedicated `NNTP_ACCOUNT` namespace and never a public URL fallback.
 
 The shared `nntune_core::pool_operation` codec is the single binary BODY/JSON STAT
-contract used by stream and ingest. The binding-only per-user object forwards
-`/pool-body` and `/pool-stat` envelopes through selection with a **fixed ingest
-class**. It validates the routing owner, object shape, duplicate/unknown fields,
+contract in the stream and ingest source libraries. The uninstalled ingress
+adapter would forward `/pool-body` and `/pool-stat` envelopes through selection
+with a **fixed ingest class**. It validates the routing owner, object shape, duplicate/unknown fields,
 message IDs and size before registry/account work; user/job IDs, byte-range hints
 and batch indices never enter account operations. This object owns no account
 lease or credential material. No user-vault fallback is added.
 
-Ingest calls those new paths, refuses legacy unattributed `200` responses, checks
-content type/size and the exact STAT multiset, and retains the actual successful
-serving identity. An operation-level missing article is `410`; a route `404` is
-unavailable, never missing data. Requests disable redirects, and response I/O
-keeps the existing single whole-call deadline and streaming byte ceiling.
+The **unwired** ingest account decoders refuse legacy unattributed `200`
+responses, check content type/size and the exact STAT multiset, and retain the
+successful serving identity. Their operation-level missing article is `410`;
+a route `404` is unavailable, never missing data. Live callers instead keep the
+legacy `/probe` and `/body` codecs, caps and deadlines, reject redirects and
+never construct account-attributed bytes. The consumer clears inherited account
+evidence from checkpoints, verify progress and scratch adoption; these paths
+cannot promote legacy bytes or queue hints into service-account provenance.
 
 Checkpoint `pool_observations` unions confirmed successful account IDs across
 batches and BODY fetches, with a 1,000-ID ceiling and explicit truncation flag.

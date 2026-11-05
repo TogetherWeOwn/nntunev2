@@ -35,7 +35,7 @@ fn body_request_carries_job_identity_and_validates_the_id() {
     // The pool interpolates the id into `BODY <id>`: injection shapes must
     // never leave this crate.
     assert!(build_body_request(&msg(), "x@y>\r\nQUIT\r\n<z").is_err());
-    assert_eq!(POOL_BODY_URL, "https://nntp-pool/pool-body");
+    assert_eq!(POOL_BODY_URL, "https://nntp-pool/body");
 }
 
 #[test]

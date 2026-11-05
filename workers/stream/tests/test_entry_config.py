@@ -7,7 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class EntryConfigTests(unittest.TestCase):
-    def test_every_stream_config_uses_owned_entry_and_both_classes(self):
+    def test_every_stream_config_keeps_account_deployment_uninstalled(self):
         paths = list(ROOT.glob('wrangler*.toml'))
         self.assertTrue(paths)
         self.assertFalse(list(ROOT.glob('wrangler*.json*')))
@@ -17,8 +17,10 @@ class EntryConfigTests(unittest.TestCase):
                 for environment in [config, *config.get('env', {}).values()]:
                     self.assertEqual(environment.get('main', config['main']), 'entry.mjs')
                     bindings = environment['durable_objects']['bindings']
-                    self.assertEqual({b['class_name'] for b in bindings},
-                                     {'NntpAccount', 'NntpPool'})
+                    self.assertEqual({(b['name'], b['class_name']) for b in bindings},
+                                     {('NNTP_POOL', 'NntpPool')})
+                    self.assertEqual(environment.get('migrations', config['migrations']),
+                                     [{'tag': 'v1', 'new_sqlite_classes': ['NntpPool']}])
                     command = environment.get('build', config['build'])['command']
                     self.assertIn('worker-build --version 0.8.7 --locked', command)
                     self.assertIn('worker-build --release --locked', command)
@@ -27,14 +29,23 @@ class EntryConfigTests(unittest.TestCase):
                     self.assertNotIn('--no-panic-recovery', command)
                     self.assertNotIn('--no-minify', command)
 
-    def test_entry_preserves_sdk_exports_without_exporting_guard_helper(self):
+    def test_entry_is_only_the_existing_sdk_reexport(self):
         entry = (ROOT / 'entry.mjs').read_text()
-        self.assertIn('guardDurableObjects(sdk);', entry)
-        self.assertIn('export * from "./build/worker/shim.mjs";', entry)
-        self.assertIn('export { default } from "./build/worker/shim.mjs";', entry)
-        self.assertNotIn('export { guardDurableObjects', entry)
-        runtime = (ROOT / 'src/account_runtime.rs').read_text()
-        self.assertIn('const OPERATIONS_QUALIFIED: bool = false;', runtime)
+        code = '\n'.join(line for line in entry.splitlines()
+                         if line.strip() and not line.lstrip().startswith('//'))
+        self.assertEqual(code, 'export * from "./build/worker/shim.mjs";\n'
+                               'export { default } from "./build/worker/shim.mjs";')
+
+    def test_account_runtime_and_existing_do_forwarding_are_uninstalled(self):
+        library = (ROOT / 'src/lib.rs').read_text()
+        self.assertNotIn('pub mod account_runtime;', library)
+        runtime = (ROOT / 'src/runtime.rs').read_text()
+        self.assertNotIn('crate::account_runtime', runtime)
+        self.assertNotIn('crate::account_request', runtime)
+        self.assertIn('routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name)',
+                      runtime)
+        account = (ROOT / 'src/account_runtime.rs').read_text()
+        self.assertIn('const OPERATIONS_QUALIFIED: bool = false;', account)
 
 
 if __name__ == '__main__':

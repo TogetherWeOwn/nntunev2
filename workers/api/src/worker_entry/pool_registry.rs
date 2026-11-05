@@ -8,6 +8,9 @@ use crate::pool_providers::{
 
 const ROW_COLUMNS: &str = "(to_jsonb(p) - 'secret_ref' - 'revision' - 'created_at' - 'updated_at')::text AS settings, p.secret_ref, p.revision";
 
+/// Registry capacity; `list_on` refuses anything larger.
+const MAX_PROVIDERS: i64 = 1000;
+
 fn from_row(row: &tokio_postgres::Row) -> Result<PoolProviderRow, StoreError> {
     let settings: String = row.try_get("settings").map_err(|_| StoreError)?;
     let settings: PoolProviderSettings = serde_json::from_str(&settings).map_err(|_| StoreError)?;
@@ -36,7 +39,7 @@ pub(super) async fn list_on(
         )
         .await
         .map_err(|_| StoreError)?;
-    if rows.len() > 1000 {
+    if rows.len() as i64 > MAX_PROVIDERS {
         return Err(StoreError);
     }
     rows.iter().map(from_row).collect()
@@ -153,6 +156,24 @@ pub(super) async fn write_on(
     let previous = rows.first().map(from_row).transpose()?;
     if previous.as_ref().map_or(0, |row| row.revision) != write.expected_revision {
         return Ok(PoolProviderWriteOutcome::Conflict);
+    }
+    // list_on hard-rejects more than MAX_PROVIDERS rows, so a create that
+    // would commit one more must be refused before any secret or audit write.
+    // All rows count, disabled included. The shared admin_writes lock above
+    // serializes creators, so the count cannot go stale before the insert.
+    if previous.is_none() {
+        let count = tx
+            .query_typed("SELECT count(*) FROM pool_providers", &[])
+            .await
+            .map_err(|_| StoreError)?;
+        let count: i64 = count
+            .first()
+            .ok_or(StoreError)?
+            .try_get(0)
+            .map_err(|_| StoreError)?;
+        if count >= MAX_PROVIDERS {
+            return Ok(PoolProviderWriteOutcome::Conflict);
+        }
     }
     let secret_ref = match (&write.secret, &previous) {
         (Some(secret), _) => secret.secret_ref.clone(),

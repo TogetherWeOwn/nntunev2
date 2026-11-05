@@ -18,7 +18,6 @@ assert.equal(packageInfo.type, "module");
 const events = [];
 const errors = [];
 let urlImports = 0;
-let denyFetch = false;
 let panicFetch = false;
 let instance;
 const actualWebAssembly = WebAssembly;
@@ -38,13 +37,14 @@ wasmApi.Instance = class {
     }
     instance = new actualWebAssembly.Instance(module, imports);
     this.exports = { ...instance.exports };
-    for (const name of ["nntpaccount_new", "nntppool_new", "nntpaccount_fetch",
-      "nntppool_fetch", "nntpaccount_alarm", "nntppool_alarm", "fetch"]) {
+    for (const name of ["nntpaccount_new", "nntpaccount_fetch", "nntpaccount_alarm"]) {
+      assert.equal(this.exports[name], undefined, `unqualified account export ${name}`);
+    }
+    for (const name of ["nntppool_new", "nntppool_fetch", "nntppool_alarm", "fetch"]) {
       assert.equal(typeof this.exports[name], "function", `missing Wasm export ${name}`);
       const original = this.exports[name];
       this.exports[name] = (...args) => {
         events.push({ name, args });
-        if (denyFetch && name.endsWith("_fetch")) throw new Error("unexpected Wasm fetch");
         if (panicFetch && name.endsWith("_fetch")) {
           panicFetch = false;
           throw new WebAssembly.RuntimeError("synthetic package recovery fixture");
@@ -114,7 +114,8 @@ async function recover(ctor, object, prefix, state, env) {
 }
 const originals = new Map();
 const recovery = new Map();
-for (const name of ["NntpAccount", "NntpPool"]) {
+assert.equal(sdk.namespace.NntpAccount, undefined);
+for (const name of ["NntpPool"]) {
   const ctor = sdk.namespace[name];
   assert.equal(typeof ctor, "function");
   originals.set(name, Object.getOwnPropertyDescriptors(ctor.prototype));
@@ -133,48 +134,20 @@ if (!bundle) {
   for (const [name, descriptors] of originals) {
     const after = Object.getOwnPropertyDescriptors(entry.namespace[name].prototype);
     assert.deepEqual(Object.keys(after), Object.keys(descriptors));
-    for (const key of Object.keys(after)) {
-      if (key === "fetch") {
-        assert.notEqual(after[key].value, descriptors[key].value);
-        for (const flag of ["writable", "enumerable", "configurable"]) {
-          assert.equal(after[key][flag], descriptors[key][flag]);
-        }
-      } else assert.deepEqual(after[key], descriptors[key]);
-    }
+    for (const key of Object.keys(after)) assert.deepEqual(after[key], descriptors[key]);
   }
 }
 
-function longUrl(size, kind) {
-  if (kind === "authority") return `https://${"a".repeat(size - 17)}.invalid/`;
-  const prefix = kind === "query" ? "https://fixture.invalid/?" : "https://fixture.invalid/";
-  const encoded = kind === "encoded" ? "%E2%82%AC" : "";
-  return prefix + encoded + "a".repeat(size - prefix.length - encoded.length);
-}
 let checks = 0;
-for (const [name, prefix, path] of [["NntpAccount", "nntpaccount", "/candidate"],
-  ["NntpPool", "nntppool", "/probe"]]) {
+assert.equal(entry.namespace.NntpAccount, undefined);
+for (const [name, prefix, path] of [["NntpPool", "nntppool", "/probe"]]) {
   const state = { id: { name: undefined }, storage: {} };
   const env = {};
   const object = new entry.namespace[name](state, env);
   const creation = events.filter((event) => event.name === `${prefix}_new`).at(-1);
   assert.deepEqual(creation.args, [state, env]);
   checks++;
-  for (const kind of ["path", "query", "authority", "encoded"]) {
-    for (const size of [255, 256, 257, 8192]) {
-      const request = new Request(longUrl(size, kind));
-      assert.equal(request.url.length, size);
-      const before = count(`${prefix}_fetch`);
-      const imports = urlImports;
-      denyFetch = size > 256;
-      const response = await object.fetch(request);
-      assert.equal(response.status, 404);
-      assert.equal(count(`${prefix}_fetch`) - before, size <= 256 ? 1 : 0);
-      assert.equal(urlImports - imports, size <= 256 ? 1 : 0);
-      if (size <= 256) assert.equal(events.filter((event) => event.name === `${prefix}_fetch`).at(-1).args[1], request);
-      checks++;
-    }
-  }
-  denyFetch = false;
+  // The decorator remains off-route; this package preserves existing dispatch.
   for (const route of [path, "/not-a-route", "/internal/account/body"]) {
     const request = new Request(`https://fixture.invalid${route}`);
     const before = count(`${prefix}_fetch`);
@@ -196,13 +169,6 @@ for (const [name, prefix, path] of [["NntpAccount", "nntpaccount", "/candidate"]
   // Inject only at the retained Wasm dispatch boundary, not by editing glue.
   // The existing SDK proxy must still catch a trap and reconstruct after reset.
   assert.deepEqual(await recover(entry.namespace[name], object, prefix, state, env), recovery.get(name));
-  const dispatches = count(`${prefix}_fetch`);
-  const imports = urlImports;
-  const refused = await object.fetch(new Request(longUrl(257, "query")));
-  assert.equal(refused.status, 404);
-  assert.equal(count(`${prefix}_fetch`), dispatches);
-  assert.equal(urlImports, imports);
-  checks++;
 }
 const publicObject = new entry.namespace.default({}, {});
 const publicBefore = count("fetch");
@@ -210,7 +176,7 @@ const publicReply = await publicObject.fetch(new Request("https://fixture.invali
 assert.equal(publicReply.status, 404);
 assert.equal(count("fetch") - publicBefore, 1);
 checks++;
-assert.equal(errors.length, 4, "only the baseline and guarded SDK traps are expected");
+assert.equal(errors.length, 2, "only the baseline and entry SDK traps are expected");
 for (const error of errors) assert.match(String(error), /synthetic package recovery fixture/);
 assert.ok(instance);
 console.log(`generated package ingress: ${checks} checks passed (${bundle ? "bundled" : "module"}); local host stubs, not Worker qualification`);

@@ -71,15 +71,27 @@ The ordinary pool admission and supervision implementation is shared with
 - The standard exit-75 refusal and preservation rules remain unchanged. Never
   fall back to a per-worktree target or alter a pool policy/lease by hand.
 
-The deploy entry point is `<output>/worker/shim.mjs`, with the upstream generated
-JavaScript, Wasm and package metadata beside it. Record a checksum of the final
-`index_bg.wasm`, the source commit and the build result when using an artifact
-for qualification. Packaging is **not** a deploy, an NNTP fixture handshake,
-proof that an unused adapter survived dead-code elimination, or evidence of
-Worker CSPRNG, certificate time or physical socket closure. Those require a
-reachable qualification call site in an authorized non-production Worker and
-an owned synthetic peer. Production peer validation and public-CA verification
-must not be relaxed to make a local fixture work.
+`<output>/worker/shim.mjs` is the **generated package entry**, with the upstream
+JavaScript, Wasm and package metadata beside it. It is not necessarily the
+configured deploy entry. In particular, the stream Worker must use its checked-in
+`entry.mjs`, retaining the `./build/worker/shim.mjs` relative package layout.
+Do not deploy or qualify stream by substituting the generated shim: that would
+bypass application-owned entry behavior when such behavior is installed.
+
+The current stream entry is deliberately a pass-through. Its account runtime,
+class/binding/migration and ingress decorator are uninstalled source, not a
+qualified runtime hidden behind a flag. Source tests require the account exports
+to be absent and existing object dispatch unchanged. Reinstalling these adapters
+for actual Worker qualification needs separate authorization and review of the
+final configured entry/bundle; direct-shim execution cannot supply that proof.
+
+Record a checksum of the final `index_bg.wasm`, source commit, configured entry
+and build result when using an artifact for qualification. Packaging is **not**
+a deploy, an NNTP fixture handshake, proof that an unused adapter survived dead-
+code elimination, or evidence of Worker CSPRNG, certificate time or physical
+socket closure. Those require a reachable qualification call site in an
+authorized non-production Worker and an owned synthetic peer. Production peer
+validation and public-CA verification must not be relaxed to make a fixture work.
 
 ## Offline regressions
 

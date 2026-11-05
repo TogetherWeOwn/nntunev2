@@ -384,3 +384,109 @@ async fn production_registry_concurrent_cas_has_one_winner() {
     assert_eq!(list_on(&f.db).await.unwrap()[0].revision, 2);
     f.cleanup().await;
 }
+
+/// Seeds `n` valid providers (each with its own secret), every third one
+/// disabled, none using `ID`. Bulk SQL: 1000 full encrypts are not needed.
+async fn seed(f: &Fixture, n: i64) {
+    f.db.batch_execute(&format!(
+        "INSERT INTO pool_provider_secrets (secret_ref, encrypted_creds, creds_envelope_version, \
+         creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce, \
+         creds_payload_format, created_at, updated_at) \
+         SELECT ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0')), decode('00','hex'), 2, 1, \
+         decode(repeat('00',12),'hex'), decode(repeat('00',48),'hex'), decode(repeat('00',12),'hex'), \
+         1, 1, 1 FROM generate_series(1,{n}) i; \
+         INSERT INTO pool_providers (id, label, host, port, tls, username, can_read, can_post, \
+         max_connections, stream_reserve, ingest_limit, backbone, tier, enabled, secret_ref, \
+         revision, created_at, updated_at) \
+         SELECT ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'seed', 'seed.example.test', \
+         563, true, 'seed', true, false, 4, 1, 3, 'seed', 0, i % 3 <> 0, \
+         ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0')), 1, 1, 1 \
+         FROM generate_series(1,{n}) i;"
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn production_registry_create_refused_at_capacity_without_orphans() {
+    let f = Fixture::new().await;
+    let mut db = f.connection().await;
+    seed(&f, 1000).await;
+    assert_eq!(f.counts().await, (1000, 1000, 0));
+    // The 1001st row (counting disabled ones) is a Conflict and writes
+    // neither a secret nor an audit row.
+    assert!(matches!(
+        write_on(&mut db, "admin", &write(0, true), "", NOW)
+            .await
+            .unwrap(),
+        PoolProviderWriteOutcome::Conflict
+    ));
+    assert_eq!(f.counts().await, (1000, 1000, 0));
+    assert_eq!(list_on(&db).await.unwrap().len(), 1000);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_registry_updates_still_apply_at_capacity() {
+    let f = Fixture::new().await;
+    let mut db = f.connection().await;
+    seed(&f, 999).await;
+    let first = applied(
+        write_on(&mut db, "admin", &write(0, true), "", NOW)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(f.counts().await, (1000, 1000, 1));
+    let mut update = write(1, false);
+    update.settings.enabled = false;
+    let second = applied(
+        write_on(&mut db, "admin", &update, "", NOW + 1)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(second.revision, 2);
+    assert_eq!(second.secret_ref, first.secret_ref);
+    let rotated = applied(
+        write_on(&mut db, "admin", &write(2, true), "", NOW + 2)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rotated.revision, 3);
+    assert_eq!(f.counts().await.0, 1000);
+    assert_eq!(f.counts().await.1, 1000);
+    assert_eq!(list_on(&db).await.unwrap().len(), 1000);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_registry_concurrent_creates_with_one_slot_left() {
+    let f = Fixture::new().await;
+    let mut a = f.connection().await;
+    let mut b = f.connection().await;
+    seed(&f, 999).await;
+    let wa = write(0, true);
+    let mut wb = write(0, true);
+    wb.settings.id = "22222222-2222-4222-8222-222222222222".into();
+    let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            write_on(&mut a, "admin", &wa, "", NOW),
+            write_on(&mut b, "admin", &wb, "", NOW)
+        )
+    })
+    .await
+    .expect("concurrent creates finish");
+    assert!(matches!(
+        (&a, &b),
+        (
+            Ok(PoolProviderWriteOutcome::Applied(_)),
+            Ok(PoolProviderWriteOutcome::Conflict)
+        ) | (
+            Ok(PoolProviderWriteOutcome::Conflict),
+            Ok(PoolProviderWriteOutcome::Applied(_))
+        )
+    ));
+    // Exactly one provider, one secret and one audit row were committed.
+    assert_eq!(f.counts().await, (1000, 1000, 1));
+    assert_eq!(list_on(&f.db).await.unwrap().len(), 1000);
+    f.cleanup().await;
+}

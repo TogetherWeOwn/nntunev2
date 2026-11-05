@@ -5,92 +5,60 @@ NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
 wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
 excluded from native builds and tests.
 
-## Raw Durable Object URL boundary
+## Deployment entry and uninstalled ingress boundary
 
-`wrangler.toml` selects the application-owned `entry.mjs`, which imports the
-unmodified generated SDK entry. Before either `NntpAccount` or `NntpPool` fetch
-can convert a Request into Rust, `ingress.mjs` bounds its complete serialized
-URL to 256 UTF-16 units and 256 UTF-8 bytes. Over-limit or inaccessible URLs
-receive a fixed 404 without invoking the original fetch or reading headers or
-body. The bounded byte scan handles surrogate pairs and replacement characters
-without allocating an encoded copy. Platform Request creation and its JS URL
-string are outside this bound; the default/public Worker fetch is unchanged.
-
-Both generated fetch descriptors are checked before either is decorated. A
-changed SDK export shape fails initialization rather than silently exposing an
-unguarded class. Constructors, SDK recovery proxies, alarms, other methods and
-all named/default exports are retained. The Rust URL/header/body/cancellation
-checks remain defense in depth, not proof of the earlier conversion boundary.
+`wrangler.toml` selects the application-owned `entry.mjs`. It currently only
+re-exports the generated SDK: existing `NntpPool` construction, fetch and alarms
+are unchanged. `ingress.mjs` is retained as **uninstalled source**, not imported
+by this entry. Its 256-unit/byte raw-URL guard has portable tests, but is not a
+protection claimed for the deployed existing object. Installing it changes
+module startup and shared ingress and requires separate actual Worker proof.
 
 Only worker-build **0.8.7**'s normal minified module output with panic recovery
-is supported here. The build command pins that tool, rejects custom-shim and
-coredump hooks, and executes the real generated package through
-`tests/check-package.mjs` before deployment packaging can proceed. Legacy,
-no-panic-recovery and custom modes are not qualified. Local builds must use the
-bounded pool path in AGENTS.md, not the Wrangler install command:
+is supported. The build pins that tool, rejects custom-shim/coredump hooks and
+executes `tests/check-package.mjs`. The checker requires account exports to be
+absent, checks the unchanged existing object descriptors/dispatch/recovery and
+checks its alarm and a harmless public route with network-denying host stubs.
+Its optional second path argument checks a bundled entry. This is synthetic
+package evidence, **not actual Cloudflare Worker qualification**.
 
-```sh
-python3 scripts/cargo_cache.py worker-build --crate workers/stream --output workers/stream/build/new-package
-node --experimental-vm-modules workers/stream/tests/check-package.mjs workers/stream/build/new-package
-node --test workers/stream/tests/ingress.test.mjs
-python3 workers/stream/tests/test_entry_config.py
-```
+CI runs the source, ingress-helper and generated-package checks. Full suites
+and packaging gates belong on GitHub Actions; local execution is only for a
+permitted focused failing-test/crate reproduction under AGENTS.md. Neither a
+packaged shim nor the helper tests authorize deployment or qualification.
+Stream artifacts must retain the configured `entry.mjs` and its relative
+package layout, not substitute `build/worker/shim.mjs` as the deploy entry.
+See [Worker packaging](../../docs/worker-packaging.md).
 
-The generated-package checker executes actual minified glue and Wasm with
-network-denying local host stubs. It counts generated fetch and URL imports,
-compares SDK recovery against its unmodified baseline, and checks both alarms
-and a harmless public route. Its optional second path argument runs the same
-behavioral bank on a bundled entry. These are local fixtures, **not actual
-Cloudflare Worker qualification** or final Wrangler-bundle proof. The release
-artifact still needs authorized Worker instrumentation at URL import/handler
-entry, direct receiving-object rejection/admission, alarm delivery and audited
-removal of test-only instrumentation. Existing TLS/entropy/clock/physical-close,
-independent security and curated one-account staging gates remain mandatory;
-operations and public misses remain disabled.
+No new dependency or host installation is authorized. The existing packaging
+pins/locked inputs do not remove Cargo's lack of native release-age and blanket
+build-script/proc-macro controls.
 
-No dependencies are added or installed by these tests. Existing local packaging
-tools are version-checked by `scripts/worker_package.py`; the normal CI/deployment
-install now selects the same worker-build version instead of a floating release.
-Cargo has no stable native release-age filter or blanket dependency build-script
-or proc-macro disable. Version pins and locked/offline inputs do not remove that
-supply-chain gap, and this change does not authorize a host tool installation.
+## Account owner boundary (uninstalled source)
 
-This backend/playback boundary follows AGENTS.md **Clean-room, YouTube and
-MetaBrainz guardrails**; tests use generated requests, not provider data.
+`src/account_runtime.rs` is deliberately not declared as a crate module.
+There is no generated `NntpAccount` export, `NNTP_ACCOUNT` binding or account
+class migration in the deploy configuration. Existing user DO dispatch does
+not forward account ingest paths. Therefore candidate/config/journal writes,
+account alarms and dialing are unreachable from the shipped entry, rather
+than relying on missing keys or a false dial flag alone. No deployed class or
+migration history is claimed or changed by this source configuration.
 
-## Account owner boundary (scheduling only)
+The retained adapter describes an account-UUID owner and authenticated
+`POST /candidate` protocol using `POOL_ACCOUNT_SECRET`, with registry refresh
+through `POOL_RESOLVER_SECRET`. A candidate would reconcile durable config;
+it is **not** a read-only scheduling projection or a lease. The operation
+flag in that uninstalled file remains hard-false. These libraries, account
+transport and raw-URL guard need authorized actual Worker ingress, TLS/name/
+chain/time/entropy, alarm/persistence/physical-close/cancellation/capacity and
+curated staging qualification before any future wiring. No environment toggle,
+key provisioning or fixture is supplied here. Public NNTP misses stay disabled.
 
-`NntpAccount` (`src/account_runtime.rs`, `NNTP_ACCOUNT`) is a separate
-Durable Object, named by the lowercase account UUID rather than a user ID.
-The additive SQLite class migration preserves the existing `NntpPool` user
-meter namespace. Each account instance constructs one retained serialized
-owner over its own journal; requests never construct replacement owners.
-
-Its only route is internal `POST /candidate`, with an object body containing
-`account_id` and `class` (`stream` or `ingest`). It authenticates the exact
-path/body/timestamp with the separate `POOL_ACCOUNT_SECRET` channel and
-rejects browser context, other methods/paths and a mismatched object name.
-The shared authentication contract is `nntune_core::pool_channel`; neither a
-play grant nor a resolver signature authorizes this route. Missing keys fail
-closed. No keys are provisioned by this change.
-
-Each accepted hint request makes a fresh, signed registry-only read through
-the `API` service binding using `POOL_RESOLVER_SECRET`; it never resolves
-credentials. Redirects and non-200 replies fail closed. Registry response I/O
-is limited to three seconds and 512 KiB, with at most 1,000 unique validated
-account rows; the entire hint handler, including inbound body and durable
-storage, is bounded to ten seconds. The current row is reconciled under the
-owner lock, preserving revision, recovery, storage-failure and quarantine
-fences. Responses are `no-store` and expose only account ID, tier, in-flight
-count and eligibility, never credential identity or endpoint material.
-
-**A candidate is not a lease.** This route cannot reserve capacity, dial,
-authenticate to a provider, or fetch bytes. There is no public route or ingest
-caller to the new namespace yet. Public NNTP misses and real account dialing
-remain disabled pending live Worker transport/physical-close qualification.
-Operation-time registry refresh, authoritative admission and deadline/revocation
-cleanup are still required before enabling them. Native fake tests and Worker
-packaging do not satisfy those live qualification gates.
+The API registry/admin/resolver and SQL migration are separate **enabled
+effects**, not made dormant by removing this runtime. Their compatibility,
+full review and pre-merge schema approval/application/ledger gates remain.
+Legacy ingest calls keep `/probe` and `/body`; their bytes and queue hints do
+not establish service-account provenance or serving authority.
 
 This backend/playback preparation follows AGENTS.md **Clean-room, YouTube and
 MetaBrainz guardrails**; it adds no UI assets, video behavior or catalogue data.

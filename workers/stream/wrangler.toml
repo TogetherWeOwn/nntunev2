@@ -37,19 +37,11 @@ command = 'test -z "${CUSTOM_SHIM+x}${COREDUMP+x}" && cargo install -q worker-bu
 name = "NNTP_POOL"
 class_name = "NntpPool"
 
-# Account ownership is separate from the existing user meter object. This
-# namespace currently offers authenticated scheduling hints only, never dials.
-[[durable_objects.bindings]]
-name = "NNTP_ACCOUNT"
-class_name = "NntpAccount"
+# No account namespace/class migration is installed before qualification.
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NntpPool"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["NntpAccount"]
 
 # Top-level target is the default `wrangler deploy` (production). Named
 # environments below must restate their own bindings (Cloudflare does not
@@ -72,9 +64,6 @@ name = "nntune-stream-staging"
 [[env.staging.durable_objects.bindings]]
 name = "NNTP_POOL"
 class_name = "NntpPool"
-[[env.staging.durable_objects.bindings]]
-name = "NNTP_ACCOUNT"
-class_name = "NntpAccount"
 [[env.staging.r2_buckets]]
 binding = "AUDIO_CACHE"
 bucket_name = "nntunev2-audio-staging"
@@ -90,9 +79,6 @@ name = "nntune-stream"
 [[env.production.durable_objects.bindings]]
 name = "NNTP_POOL"
 class_name = "NntpPool"
-[[env.production.durable_objects.bindings]]
-name = "NNTP_ACCOUNT"
-class_name = "NntpAccount"
 [[env.production.r2_buckets]]
 binding = "AUDIO_CACHE"
 bucket_name = "nntunev2-audio-prod"

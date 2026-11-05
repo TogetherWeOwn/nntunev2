@@ -1,4 +1,7 @@
-//! Shared producer/consumer wire tests; no Worker I/O or provider operation.
+//! Account BODY/STAT routes are disabled and unqualified. The live callers
+//! stay on the legacy `/probe` and `/body` wire contracts and never name an
+//! account; the `classify_account_*` decoders below are pure, UNWIRED source
+//! pinned off-route. No Worker I/O or provider operation.
 
 use nntune_core::pool_operation::{
     OperationReply, Output, Served, INGEST_BODY_PATH, INGEST_STAT_PATH,
@@ -22,16 +25,93 @@ fn req() -> ProbeRequest {
     build_probe_request(&msg, 7, &SMALL_NZB_SEGMENTS).unwrap()
 }
 
+/// Body of `fn name` up to the next top-level item.
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source
+        .find(&format!("fn {name}"))
+        .unwrap_or_else(|| panic!("fn {name} must exist"));
+    let rest = &source[start..];
+    let end = rest.find("\n}\n").expect("function must close");
+    &rest[..end]
+}
+
 #[test]
-fn paths_match_shared_ingress_not_legacy_user_provider_routes() {
-    assert_eq!(
+fn live_callers_stay_on_legacy_routes_not_shared_account_ingress() {
+    assert_eq!(POOL_BODY_URL, "https://nntp-pool/body");
+    assert_eq!(POOL_PROBE_URL, "https://nntp-pool/probe");
+    assert_ne!(
         POOL_BODY_URL,
         format!("https://nntp-pool{INGEST_BODY_PATH}")
     );
-    assert_eq!(
+    assert_ne!(
         POOL_PROBE_URL,
         format!("https://nntp-pool{INGEST_STAT_PATH}")
     );
+}
+
+#[test]
+fn live_calls_return_legacy_types_and_never_use_account_decoders() {
+    let probe = include_str!("../src/pool_probe.rs");
+    let body = include_str!("../src/pool_body.rs");
+    const PROBE_RET: &str = "Result<ProbeOutcome, PoolProbeError>";
+    const BODY_RET: &str = "Result<BodyFetch, PoolBodyError>";
+    for (source, name, ret, legacy) in [
+        (probe, "call_pool_probe", PROBE_RET, ""),
+        (
+            probe,
+            "call_pool_probe_with_deadline",
+            PROBE_RET,
+            "classify_reply",
+        ),
+        (body, "call_pool_body", BODY_RET, ""),
+        (
+            body,
+            "call_pool_body_with_deadline",
+            BODY_RET,
+            "classify_body_reply",
+        ),
+    ] {
+        let function = function_body(source, name);
+        assert!(function.contains(ret), "{name} signature");
+        assert!(
+            !function.contains("classify_account"),
+            "{name} is wired to an account decoder"
+        );
+        assert!(
+            !function.contains("PROVIDER_HEADER"),
+            "{name} reads the account header"
+        );
+        assert!(function.contains(legacy), "{name} legacy classifier");
+    }
+}
+
+#[test]
+fn queue_consumer_does_not_collect_observations_or_construct_served_fetches() {
+    let source = include_str!("../src/queue_consumer.rs");
+    let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+    for forbidden in [
+        "classify_account",
+        "ArticleFetch::Served",
+        "PoolObservations",
+        "observations.record(",
+        "observations.merge(",
+        "PoolProvenance::from_body",
+        "AssemblyProvenance",
+        "PoolProbeOutcome",
+        "PoolBodyFetch",
+        "served.provider_id",
+        "PROVIDER_HEADER",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "queue consumer production path must not use {forbidden}"
+        );
+    }
+    assert!(production.contains("ArticleFetch::Present(bytes)"));
+    // Persisted checkpoints and verify progress are scrubbed of account
+    // evidence on load, so adoption cannot carry provenance forward.
+    assert!(production.contains("scrub_checkpoint_account_evidence(cp);"));
+    assert!(production.contains("scrub_progress_account_evidence(&mut progress);"));
 }
 
 #[test]

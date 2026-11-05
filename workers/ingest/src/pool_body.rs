@@ -1,11 +1,17 @@
-//! Account BODY through binding-only per-user ingress. The stream Worker
-//! selects and admits one account with fixed ingest class; this object name is only
-//! a routing check, never a user-provider lookup or capacity owner.
+//! Pool body call: one [`BodyRequest`] to the user's `NntpPool` Durable
+//! Object (stream Worker), answered with the raw article body or a
+//! `404` when the provider no longer has the article.
 //!
-//! Successful binary replies must name the actual serving account. Account
-//! missing is `410`; route `404` is unavailable. The old pure classifier remains
-//! for compatibility tests/error mapping, not successful production consumption.
-//! Account operations and ingress stay hard-disabled pending qualification.
+//! Same trust shape as the probe ([`crate::pool_probe`]): the cross-script
+//! Durable Object binding, `id_from_name(user_id)`, no public route and no
+//! shared secret. The envelope JSON is the stream crate's
+//! `body::BodyRequest`; unknown response fields never appear because a
+//! `200` body is the article bytes themselves. A legacy reply names no
+//! serving account and is never attributed to one.
+//!
+//! [`classify_account_body_reply`] decodes the account BODY wire shape. It
+//! is pure and UNWIRED: account BODY routes are disabled/unqualified and no
+//! live caller uses it.
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,7 +23,7 @@ use crate::queue::QueueMsg;
 
 /// Body route on the Durable Object. The host is a placeholder: a stub
 /// fetch is delivered to the object and never leaves the runtime.
-pub const POOL_BODY_URL: &str = "https://nntp-pool/pool-body";
+pub const POOL_BODY_URL: &str = "https://nntp-pool/body";
 
 /// Largest pool reply accepted: the pool's own article cap
 /// (`MAX_BODY_ARTICLE_BYTES` in the stream crate). A longer `200` is a
@@ -67,16 +73,17 @@ pub enum BodyFetch {
     TooLarge,
 }
 
-/// Actual serving identity exists only for successful bytes. Missing and
-/// oversized articles are request-specific outcomes, not attribution evidence.
+/// UNWIRED: decoded account BODY reply; no live caller produces it.
+/// Actual serving identity exists only for successful bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolBodyFetch {
     pub provider_id: Option<String>,
     pub outcome: BodyFetch,
 }
 
-/// Decode the shared account wire contract, never accepting legacy unattributed
-/// `200` replies or route-miss `404`s as missing article data.
+/// UNWIRED pure decoder for the shared account wire contract, never accepting
+/// unattributed `200` replies or route-miss `404`s as missing article data.
+/// Not called by `call_pool_body`.
 pub fn classify_account_body_reply(
     status: u16,
     content_type: &str,
@@ -226,7 +233,7 @@ fn push_reply_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<(), PoolBodyError
 /// undeclared or lying length is stopped on the chunk that would cross the
 /// cap. Oversize is `Rejected` because more bytes existed, never a truncated
 /// prefix handed to the classifier, and the excess is dropped unretained.
-pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<PoolBodyFetch, PoolBodyError> {
+pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, PoolBodyError> {
     call_pool_body_with_deadline(env, req, POOL_BODY_DEADLINE_MS).await
 }
 
@@ -236,7 +243,7 @@ pub async fn call_pool_body_with_deadline(
     env: &Env,
     req: &BodyRequest,
     deadline_ms: u64,
-) -> Result<PoolBodyFetch, PoolBodyError> {
+) -> Result<BodyFetch, PoolBodyError> {
     let unavailable = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
@@ -276,17 +283,6 @@ pub async fn call_pool_body_with_deadline(
     };
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let provider_id = response
-        .headers()
-        .get(nntune_core::pool_operation::PROVIDER_HEADER)
-        .ok()
-        .flatten();
     if let Ok(Some(declared)) = response.headers().get("content-length") {
         if let Ok(len) = declared.trim().parse::<usize>() {
             if len > MAX_BODY_REPLY_BYTES {
@@ -334,13 +330,7 @@ pub async fn call_pool_body_with_deadline(
         }
     };
     drop(deadline);
-    classify_account_body_reply(
-        status,
-        &content_type,
-        provider_id.as_deref(),
-        retry_after.as_deref(),
-        bytes,
-    )
+    classify_body_reply(status, retry_after.as_deref(), &bytes)
 }
 
 #[cfg(test)]

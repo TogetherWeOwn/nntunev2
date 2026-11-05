@@ -542,6 +542,31 @@ async fn load_upload_parse(
     Ok((parsed, files))
 }
 
+/// The legacy live callers name no serving account, so no persisted record may
+/// carry one forward. A checkpoint written by an account-aware build is
+/// scrubbed on load: retained observations, output records and input provenance
+/// fields are untrusted and off-route. Input bytes/keys and the cursor are
+/// preserved, so supported non-account transcode semantics are unchanged.
+fn scrub_checkpoint_account_evidence(cp: &mut JobCheckpoint) {
+    cp.pool_observations = Default::default();
+    cp.transcode_outputs.clear();
+    for input in &mut cp.transcode_inputs {
+        input.pool_provenance = None;
+    }
+}
+
+/// Same rule for a persisted verify progress record.
+fn scrub_progress_account_evidence(progress: &mut VerifyProgress) {
+    for staged in progress.staged.values_mut() {
+        staged.pool_provenance = None;
+    }
+    for segments in progress.spool.values_mut() {
+        for segment in segments {
+            segment.pool_provenance = None;
+        }
+    }
+}
+
 /// Run the executable part of one delivery, mutating `cp` in memory only.
 ///
 /// Upload jobs run `Parsing` (digest-check + shared parser), `Probing`
@@ -564,6 +589,7 @@ async fn load_upload_parse(
 async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
     // Old queue/checkpoint hints cannot become pool-account grant attribution.
     cp.provider_id = None;
+    scrub_checkpoint_account_evidence(cp);
     if cp.state == JobState::Queued {
         advance_checkpoint(cp, false);
     }
@@ -595,9 +621,7 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
             }
             let batches = crate::parse::probe_batches_with_ranges(&parsed);
             let probing_started_ms = Date::now().as_millis();
-            let observations =
-                std::cell::RefCell::new(crate::pool_attribution::PoolObservations::default());
-            let result = run_probing_batches(
+            run_probing_batches(
                 msg,
                 cp,
                 &batches,
@@ -606,22 +630,9 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
                     Date::now().as_millis().saturating_sub(probing_started_ms)
                         >= PROBE_DELIVERY_BUDGET_MS
                 },
-                |request| {
-                    let observations = &observations;
-                    async move {
-                        let served = call_pool_probe(env, &request).await?;
-                        observations
-                            .borrow_mut()
-                            .record(&served.provider_id)
-                            .map_err(|_| PoolProbeError::Rejected)?;
-                        Ok(served.outcome)
-                    }
-                },
+                |request| async move { call_pool_probe(env, &request).await },
             )
-            .await;
-            // Keep successful earlier batches even when a later batch fails.
-            cp.pool_observations.merge(&observations.into_inner());
-            result?;
+            .await?;
             // Probing completed and advanced the checkpoint to
             // Verifying: continuing to the next state is progress, not
             // a failure, so it must not spend the attempt budget.
@@ -788,6 +799,7 @@ async fn run_verifying(
         Some(progress) if progress.round == round => progress,
         _ => VerifyProgress::new(round),
     };
+    scrub_progress_account_evidence(&mut progress);
     let bucket = match env.bucket(SCRATCH_BINDING) {
         Ok(bucket) => bucket,
         Err(_) => {
@@ -804,11 +816,7 @@ async fn run_verifying(
         }
     };
     let scratch = R2Scratch { bucket };
-    let mut source = PoolBodySource {
-        env,
-        msg,
-        observations: Default::default(),
-    };
+    let mut source = PoolBodySource { env, msg };
     let started_ms = worker::Date::now().as_millis();
     let deadline = move || {
         worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
@@ -826,9 +834,6 @@ async fn run_verifying(
         &deadline,
     )
     .await;
-    // Observations are evidence only: scratch/checkpoint persistence is not
-    // atomic, and adopted bytes cannot prove a single provider for this job.
-    cp.pool_observations.merge(&source.observations);
     let spooled_after: usize = progress.spool.values().map(Vec::len).sum();
     let judged_after: u64 = progress.judging.values().map(|c| c.pos).sum();
     // Durable segment-level spool growth is progress exactly like a
@@ -911,7 +916,6 @@ async fn run_verifying(
 struct PoolBodySource<'a> {
     env: &'a Env,
     msg: &'a QueueMsg,
-    observations: crate::pool_attribution::PoolObservations,
 }
 
 impl BodySource for PoolBodySource<'_> {
@@ -921,25 +925,16 @@ impl BodySource for PoolBodySource<'_> {
     ) -> Result<crate::verify::ArticleFetch, VerifyError> {
         let req = build_body_request(self.msg, segment_id)
             .map_err(|_| VerifyError::Permanent("invalid segment id".into()))?;
-        let fetched = call_pool_body(self.env, &req).await;
-        match fetched {
-            Ok(served) => match served.outcome {
-                BodyFetch::Bytes(bytes) => {
-                    let Some(provider_id) = served.provider_id else {
-                        return Err(VerifyError::Transient(
-                            "pool body attribution unavailable".into(),
-                        ));
-                    };
-                    self.observations.record(&provider_id).map_err(|_| {
-                        VerifyError::Transient("pool body attribution unavailable".into())
-                    })?;
-                    Ok(crate::verify::ArticleFetch::Served { provider_id, bytes })
-                }
-                BodyFetch::Missing => Ok(crate::verify::ArticleFetch::Missing),
-                // `413` is absent, size-refused article data, never a permanent
-                // job failure by itself or a repairable transport fault.
-                BodyFetch::TooLarge => Ok(crate::verify::ArticleFetch::TooLarge),
-            },
+        // The legacy route names no serving account: bytes are `Present`
+        // and never attributed to any account.
+        match call_pool_body(self.env, &req).await {
+            Ok(BodyFetch::Bytes(bytes)) => Ok(crate::verify::ArticleFetch::Present(bytes)),
+            Ok(BodyFetch::Missing) => Ok(crate::verify::ArticleFetch::Missing),
+            // `413` is per-article data: the segment is judged absent
+            // and flagged size-refused (never a permanent job failure
+            // by itself), so the round can skip the repair dispatch a
+            // refetch-identical refusal could never satisfy.
+            Ok(BodyFetch::TooLarge) => Ok(crate::verify::ArticleFetch::TooLarge),
             Err(PoolBodyError::Retry { .. }) => {
                 Err(VerifyError::Transient("pool body fetch unavailable".into()))
             }
@@ -997,20 +992,8 @@ fn staged_from_metadata(
         spool: Vec::new(),
         crc32: meta.get("crc32").and_then(|v| v.parse().ok()).unwrap_or(0),
         missing: meta.get("missing").is_some_and(|v| v == "1"),
-        pool_provenance: meta
-            .get("pool_provenance")
-            .filter(|raw| raw.len() <= 1800)
-            .and_then(|raw| {
-                serde_json::from_str::<crate::pool_provenance::PoolProvenance>(raw).ok()
-            })
-            .filter(|proof| {
-                proof.matches_identity(
-                    meta.get("sha256").map(String::as_str).unwrap_or(""),
-                    meta.get("size")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(size),
-                )
-            }),
+        // Scratch metadata never supplies account provenance on adoption.
+        pool_provenance: None,
     })
 }
 
@@ -1020,15 +1003,6 @@ fn staged_from_metadata(
 /// together with the parse side (see the round-trip tests).
 fn staged_to_metadata(meta: &StagedFile) -> std::collections::HashMap<String, String> {
     let mut md = std::collections::HashMap::new();
-    if let Some(proof) = meta
-        .pool_provenance
-        .as_ref()
-        .filter(|proof| proof.matches_identity(&meta.sha256, meta.size))
-    {
-        if let Ok(raw) = serde_json::to_string(proof) {
-            md.insert("pool_provenance".into(), raw);
-        }
-    }
     md.insert("sha256".to_string(), meta.sha256.clone());
     md.insert("size".to_string(), meta.size.to_string());
     md.insert("crc32".to_string(), meta.crc32.to_string());
@@ -3501,9 +3475,55 @@ mod tests {
         assert_eq!(staged.size_refused_blocks, 0);
     }
 
-    fn proven_scratch_meta() -> StagedFile {
+    #[test]
+    fn persisted_account_evidence_is_scrubbed_but_cursor_and_inputs_survive() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 2);
+        cp.transcode_next = 1;
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        cp.pool_observations.record(id).unwrap();
+        let input = &mut cp.transcode_inputs[0];
+        input.sha256 = crate::dispatch::content_sha256_hex(b"source");
+        input.size = b"source".len() as u64;
+        input.pool_provenance = crate::pool_provenance::PoolProvenance::from_body(id, b"source");
+        assert!(input.pool_provenance.is_some());
+        // Even a deserialized output record is untrusted on this live path.
+        cp.transcode_outputs.insert(
+            0,
+            serde_json::from_value(serde_json::json!({
+                "source": input,
+                "staging_id": "unqualified",
+                "artifact_sha256": "a".repeat(64),
+                "byte_size": 1,
+            }))
+            .unwrap(),
+        );
+        let before = cp.clone();
+        scrub_checkpoint_account_evidence(&mut cp);
+        assert!(cp.pool_observations.provider_ids.is_empty());
+        assert!(cp.transcode_outputs.is_empty());
+        assert!(cp
+            .transcode_inputs
+            .iter()
+            .all(|i| i.pool_provenance.is_none()));
+        assert_eq!(cp.transcode_next, before.transcode_next);
+        for (now, was) in cp.transcode_inputs.iter().zip(&before.transcode_inputs) {
+            assert_eq!(
+                (&now.key, &now.sha256, now.size, now.file_index),
+                (&was.key, &was.sha256, was.size, was.file_index)
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_metadata_neither_writes_nor_adopts_account_provenance() {
         let bytes = b"decoded audio";
-        StagedFile {
+        let proof = crate::pool_provenance::PoolProvenance::from_body(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            bytes,
+        );
+        assert!(proof.is_some());
+        let meta = StagedFile {
             key: "k".into(),
             size: bytes.len() as u64,
             sha256: crate::dispatch::content_sha256_hex(bytes),
@@ -3513,68 +3533,26 @@ mod tests {
             spool: Vec::new(),
             crc32: crc32fast::hash(bytes),
             missing: false,
-            pool_provenance: crate::pool_provenance::PoolProvenance::from_body(
-                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                bytes,
-            ),
-        }
-    }
-
-    #[test]
-    fn staged_metadata_roundtrips_content_bound_contributors_within_r2_budget() {
-        let mut meta = proven_scratch_meta();
-        let mut value = serde_json::to_value(meta.pool_provenance.as_ref().unwrap()).unwrap();
-        value["provider_ids"] = serde_json::json!((0..crate::pool_provenance::MAX_CONTRIBUTORS)
-            .map(|n| format!("{n:08x}-0000-4000-8000-000000000000"))
-            .collect::<Vec<_>>());
-        meta.pool_provenance = Some(serde_json::from_value(value).unwrap());
-        meta.par2_set_id = Some("f".repeat(64));
-        let written = staged_to_metadata(&meta);
-        assert!(written.contains_key("pool_provenance"));
-        assert!(
-            written
-                .iter()
-                .map(|(k, v)| k.len() + v.len())
-                .sum::<usize>()
-                <= 2048
+            pool_provenance: proof.clone(),
+        };
+        let mut written = staged_to_metadata(&meta);
+        assert!(!written.contains_key("pool_provenance"));
+        // A planted proof matching the bytes is still never adopted.
+        written.insert(
+            "pool_provenance".into(),
+            serde_json::to_string(proof.as_ref().unwrap()).unwrap(),
         );
         let restored = staged_from_metadata("k", meta.size, &written).unwrap();
-        assert_eq!(restored, meta);
-    }
-
-    #[test]
-    fn malformed_or_stale_metadata_never_adopts_provenance() {
-        let meta = proven_scratch_meta();
-        let written = staged_to_metadata(&meta);
-        for (key, value) in [
-            ("pool_provenance", "garbage".to_owned()),
-            ("pool_provenance", " ".repeat(1801)),
-            ("sha256", "f".repeat(64)),
-            ("size", "999".to_owned()),
-        ] {
-            let mut damaged = written.clone();
-            damaged.insert(key.to_owned(), value);
-            let restored = staged_from_metadata("k", meta.size, &damaged).unwrap();
-            assert_eq!(restored.pool_provenance, None, "{key}");
-        }
-        let mut legacy = written;
-        legacy.remove("pool_provenance");
+        assert_eq!(restored.pool_provenance, None);
+        let mut progress = VerifyProgress::new(1);
+        progress.staged.insert(0, meta.clone());
+        scrub_progress_account_evidence(&mut progress);
+        let staged = progress.staged.get(&0).unwrap();
+        assert!(staged.pool_provenance.is_none());
         assert_eq!(
-            staged_from_metadata("k", meta.size, &legacy)
-                .unwrap()
-                .pool_provenance,
-            None
+            (&staged.key, &staged.sha256, staged.size),
+            (&meta.key, &meta.sha256, meta.size)
         );
-    }
-
-    #[test]
-    fn metadata_writer_omits_stale_proof_instead_of_rebinding_it() {
-        let mut meta = proven_scratch_meta();
-        meta.sha256 = "f".repeat(64);
-        assert!(!staged_to_metadata(&meta).contains_key("pool_provenance"));
-        let mut meta = proven_scratch_meta();
-        meta.size += 1;
-        assert!(!staged_to_metadata(&meta).contains_key("pool_provenance"));
     }
 
     #[test]
