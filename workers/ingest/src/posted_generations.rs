@@ -23,6 +23,12 @@ use crate::two_spool::{PostVerdict, SpoolCopyState, MAX_REPOST_ATTEMPTS_PER_ARTI
 use std::fmt;
 use tokio_postgres::{Client, Row, Transaction};
 
+#[path = "posted_generation_rechecks.rs"]
+mod rechecks;
+pub use rechecks::{
+    complete_recheck, prepare_recheck, RecheckPermit, RecheckPreparation, RecheckSchedule,
+};
+
 const LEASE_SECONDS: i64 = 300;
 
 /// Static, redacted errors. Never surface PostgreSQL errors: their detail may
@@ -49,7 +55,7 @@ fn identity(value: &str) -> bool {
 
 /// Persisted attempt authority, minted only by `acquire_attempt`. Queue-carried
 /// attempt numbers do not construct this handle and are never sufficient.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttemptHandle {
     job_id: String,
     owner_id: String,
@@ -87,7 +93,7 @@ impl fmt::Debug for Observation {
 
 /// The one current admission fence. Fields stay private so only a committed
 /// adapter result can construct a handle. No Debug/Display exposes tokens.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GenerationHandle {
     attempt: AttemptHandle,
     operation: String,
@@ -823,9 +829,10 @@ async fn commit_mutation(
     Ok(MutationOutcome::Applied(Box::new(refreshed)))
 }
 
-/// Start a distinct verification evidence round. Old evidence is retained but
-/// cannot satisfy the new round. This does not reset repost accounting or
-/// checkpoint budgets, promote a candidate, or grant retention/serving proof.
+/// Start a distinct verification evidence round and its propagation schedule.
+/// Old evidence, schedule and repost accounting are retained, not reused as a
+/// new round's proof. Takeover/recovery never calls this to reset a budget.
+/// This does not promote a candidate or grant retention/serving proof.
 /// Ambiguous acknowledgments recover the committed round by operation identity.
 pub async fn begin_verification_round(
     client: &mut Client,
@@ -843,6 +850,7 @@ pub async fn begin_verification_round(
     )
     .await
     .map_err(database_error)?;
+    rechecks::start_round(&tx, handle).await?;
     commit_mutation(tx, handle).await
 }
 
@@ -947,13 +955,15 @@ pub struct SlotProgress {
 /// Current-round checkpoint bound to the stored generation/plan. Missing rows
 /// mean unconfirmed/zero attempts, not a new local article set. This is a read
 /// snapshot, not POST authority, and must not be used to overwrite durable state
-/// from a job-keyed KV blob. Recheck scheduling/negative-health policy stays with
-/// the verifier; this preparation does not yet persist that scheduler state.
+/// from a job-keyed KV blob. The schedule persists propagation/backoff and pass
+/// counts; policy/provenance and queue delivery remain with the verifier. A
+/// stopped schedule is never terminal negative health.
 pub struct GenerationCheckpoint {
     generation: String,
     plan: String,
     round: i64,
     slots: Vec<[SlotProgress; 2]>,
+    schedule: Option<RecheckSchedule>,
 }
 
 impl fmt::Debug for GenerationCheckpoint {
@@ -977,6 +987,10 @@ impl GenerationCheckpoint {
 
     pub fn article_count(&self) -> usize {
         self.slots.len()
+    }
+
+    pub fn recheck_schedule(&self) -> Option<RecheckSchedule> {
+        self.schedule
     }
 
     pub fn slot(&self, slot: usize, side: ArticleSide) -> Option<SlotProgress> {
@@ -1062,6 +1076,7 @@ pub async fn load_checkpoint(
         plan: bundle.plan_sha256().to_owned(),
         round: handle.round,
         slots,
+        schedule: rechecks::load_schedule(&tx, handle).await?,
     };
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(Some(checkpoint))
@@ -1275,6 +1290,7 @@ mod tests {
             plan: "private-plan".into(),
             round: 7,
             slots: vec![[SlotProgress::default(); 2]; 3],
+            schedule: Some(RecheckSchedule::Untracked),
         };
         assert_eq!(
             format!("{checkpoint:?}"),

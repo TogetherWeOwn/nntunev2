@@ -1,5 +1,5 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migration 0037.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037/0038.
 //!
 //! Run with `--features postgres-tests --test posted_generations_postgres` on
 //! the migrated, throwaway `nntune_ci` service. `NNTUNE_TEST_DATABASE_URL` is
@@ -34,11 +34,14 @@ use tokio_postgres::{Client, Config, NoTls};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MIGRATION_0037: &str = include_str!("../../../migrations/0037_posted_file_generations.sql");
+const MIGRATION_0038: &str = include_str!("../../../migrations/0038_posted_file_rechecks.sql");
 
 #[path = "support/posted_generation_checkpoint.rs"]
 mod posted_generation_checkpoint;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
+#[path = "support/posted_generation_rechecks.rs"]
+mod posted_generation_rechecks;
 #[path = "support/posted_generation_takeover.rs"]
 mod posted_generation_takeover;
 
