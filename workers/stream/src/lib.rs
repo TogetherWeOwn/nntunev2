@@ -51,13 +51,17 @@ pub mod account_operation;
 pub mod account_owner;
 pub mod account_playback;
 pub mod account_pool;
+// Retain wasm type checking without installing the unqualified account ingress.
 #[cfg(any(target_arch = "wasm32", test))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod account_request;
 pub mod account_route;
 pub mod account_selection;
 pub mod account_storage;
 pub mod account_supervisor;
+// The account transport has no installed runtime caller until qualification.
 #[cfg(any(target_arch = "wasm32", test))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod account_transport;
 pub mod api_error;
 pub mod body;
