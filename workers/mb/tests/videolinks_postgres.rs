@@ -261,7 +261,10 @@ async fn expiry_and_due_bounds(db: &mut Client) {
         "UPDATE public.video_link_candidates
          SET status=CASE WHEN video_id='v0000000001' THEN 'rejected' ELSE 'validated' END,
              title='old title', channel_id='old channel', duration_secs=180, embeddable=true,
-             validated_at=$1, expires_at=$2::bigint + CASE video_id
+             validated_at=$1::bigint + CASE video_id
+                WHEN 'v0000000000' THEN -1 WHEN 'v0000000001' THEN 0
+                WHEN 'v0000000002' THEN 1 WHEN 'v0000000003' THEN 86400 ELSE 86401 END,
+             expires_at=$2::bigint + CASE video_id
                 WHEN 'v0000000000' THEN -1 WHEN 'v0000000001' THEN 0
                 WHEN 'v0000000002' THEN 1 WHEN 'v0000000003' THEN 86400 ELSE 86401 END",
         &[&(NOW - VALIDATION_TTL_S), &NOW],
@@ -283,9 +286,9 @@ async fn expiry_and_due_bounds(db: &mut Client) {
         "SELECT status, validated_at, expires_at,
                 title IS NULL AND channel_id IS NULL AND duration_secs IS NULL AND embeddable IS NULL
          FROM public.video_link_candidates ORDER BY video_id", &[]).await.unwrap();
-    for row in &rows[..2] {
+    for (i, row) in rows[..2].iter().enumerate() {
         assert_eq!(row.get::<_, String>(0), "expired");
-        assert_eq!(row.get::<_, i64>(1), NOW - VALIDATION_TTL_S);
+        assert_eq!(row.get::<_, i64>(1), NOW - VALIDATION_TTL_S - 1 + i as i64);
         assert_eq!(row.get::<_, i64>(2), 0);
         assert!(row.get::<_, bool>(3));
     }
@@ -313,6 +316,101 @@ async fn expiry_and_due_bounds(db: &mut Client) {
         .await
         .unwrap()
         .is_empty());
+}
+
+async fn validation_age_overrides_overlong_expiry(db: &mut Client) {
+    reset_candidates(db).await;
+    seed(db, 8).await;
+    let validation_times = [
+        -1,
+        0,
+        NOW - VALIDATION_TTL_S - 1,
+        NOW - VALIDATION_TTL_S,
+        NOW - VALIDATION_TTL_S + 1,
+        NOW - VALIDATION_TTL_S + 86400,
+        NOW - VALIDATION_TTL_S + 86401,
+        NOW,
+    ];
+    for (i, validated_at) in validation_times.into_iter().enumerate() {
+        db.execute(
+            "UPDATE public.video_link_candidates
+             SET status=CASE WHEN $1::text='v0000000003' THEN 'rejected' ELSE 'validated' END,
+                 title='old title', channel_id='old channel', duration_secs=180, embeddable=true,
+                 validated_at=$2, expires_at=$3
+             WHERE video_id=$1",
+            &[
+                &format!("v{i:010}"),
+                &validated_at,
+                &(NOW + 2 * VALIDATION_TTL_S),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    let before = states(db).await;
+    for now in [i64::MIN, -1, 0] {
+        let mut store = PgValidationStore::new(db);
+        assert_eq!(
+            store.purge_expired(now).await,
+            Err(ValidationError::InvalidTime)
+        );
+        assert_eq!(
+            store.due_video_ids(now, 1).await,
+            Err(ValidationError::InvalidTime)
+        );
+    }
+    assert_eq!(
+        states(db).await,
+        before,
+        "invalid clocks leave rows unchanged"
+    );
+    // Queue selection also honors age when called without a preceding purge.
+    let mut store = PgValidationStore::new(db);
+    let due = store.due_video_ids(NOW, usize::MAX).await.unwrap();
+    assert_eq!(due, (0..6).map(|i| format!("v{i:010}")).collect::<Vec<_>>());
+    assert_eq!(store.purge_expired(NOW).await.unwrap(), 4);
+    assert_eq!(store.purge_expired(NOW).await.unwrap(), 0);
+    let rows = db.query(
+        "SELECT status, validated_at, expires_at,
+                title IS NULL AND channel_id IS NULL AND duration_secs IS NULL AND embeddable IS NULL
+         FROM public.video_link_candidates ORDER BY video_id", &[]).await.unwrap();
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.get::<_, i64>(1),
+            validation_times[i],
+            "retain stale-write fence"
+        );
+        assert_eq!(row.get::<_, bool>(3), i < 4);
+        if i < 4 {
+            assert_eq!(row.get::<_, String>(0), "expired");
+            assert_eq!(row.get::<_, i64>(2), 0);
+        } else {
+            assert_eq!(row.get::<_, String>(0), "validated");
+            assert_eq!(row.get::<_, i64>(2), NOW + 2 * VALIDATION_TTL_S);
+        }
+    }
+    // At the next second the fifth row reaches 30 days, even on API failure.
+    let client = FixtureClient::new(vec![(503, "not persisted")]);
+    assert_eq!(
+        refresh_due(&mut PgValidationStore::new(db), &client, NOW + 1).await,
+        Err(ValidationError::HttpStatus(503))
+    );
+    assert!(states(db).await[..5]
+        .iter()
+        .all(|row| row.1 == "expired" && row.2.is_none()));
+    // Removing stale fields must still allow a later checked validation.
+    assert_eq!(
+        PgValidationStore::new(db)
+            .apply_batch(&checked_batch(NOW + 2).await)
+            .await
+            .unwrap(),
+        1
+    );
+    let refreshed = &states(db).await[0];
+    assert_eq!(
+        (refreshed.1.as_str(), refreshed.3, refreshed.4),
+        ("rejected", NOW + 2, NOW + 2 + VALIDATION_TTL_S)
+    );
 }
 
 async fn stale_writes_and_atomic_failure(db: &mut Client) {
@@ -1337,6 +1435,7 @@ fn postgres_validation_store_contract() {
                 db.batch_execute(MIGRATION).await.unwrap();
                 writes_and_replays(&mut db).await;
                 expiry_and_due_bounds(&mut db).await;
+                validation_age_overrides_overlong_expiry(&mut db).await;
                 stale_writes_and_atomic_failure(&mut db).await;
                 contention_is_bounded(&mut db, &config).await;
                 earlier_batch_survives(&mut db).await;

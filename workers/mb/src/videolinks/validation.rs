@@ -197,7 +197,7 @@ const PURGE_EXPIRED_SQL: &str = "\
 UPDATE public.video_link_candidates
 SET title = NULL, channel_id = NULL, duration_secs = NULL, embeddable = NULL,
     status = 'expired', expires_at = 0, updated_at = now()
-WHERE expires_at <= $1
+WHERE (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2)
   AND (status IN ('validated', 'rejected') OR title IS NOT NULL
        OR channel_id IS NOT NULL OR duration_secs IS NOT NULL OR embeddable IS NOT NULL)";
 
@@ -205,6 +205,7 @@ const DUE_IDS_SQL: &str = "\
 SELECT video_id
 FROM public.video_link_candidates
 WHERE status IN ('pending', 'expired') OR expires_at <= $1
+   OR validated_at <= 0 OR validated_at <= $3
 GROUP BY video_id
 ORDER BY min(expires_at), video_id
 LIMIT $2";
@@ -258,6 +259,10 @@ fn stored_updates(batch: &BatchValidation) -> Result<String, ValidationError> {
 
 impl ValidationStore for PgValidationStore<'_> {
     async fn purge_expired(&mut self, now: i64) -> Result<u64, ValidationError> {
+        if now <= 0 {
+            return Err(ValidationError::InvalidTime);
+        }
+        let oldest = now - VALIDATION_TTL_S;
         let tx = self
             .client
             .transaction()
@@ -267,7 +272,7 @@ impl ValidationStore for PgValidationStore<'_> {
             .await
             .map_err(|_| ValidationError::Store)?;
         let rows = tx
-            .execute(PURGE_EXPIRED_SQL, &[&now])
+            .execute(PURGE_EXPIRED_SQL, &[&now, &oldest])
             .await
             .map_err(|_| ValidationError::Store)?;
         tx.commit().await.map_err(|_| ValidationError::Store)?;
@@ -279,8 +284,12 @@ impl ValidationStore for PgValidationStore<'_> {
         now: i64,
         limit: usize,
     ) -> Result<Vec<String>, ValidationError> {
+        if now <= 0 {
+            return Err(ValidationError::InvalidTime);
+        }
         let limit = limit.min(MAX_VALIDATIONS_PER_RUN) as i64;
         let due_before = now.saturating_add(REFRESH_AHEAD_S);
+        let oldest = due_before - VALIDATION_TTL_S;
         let tx = self
             .client
             .transaction()
@@ -290,7 +299,7 @@ impl ValidationStore for PgValidationStore<'_> {
             .await
             .map_err(|_| ValidationError::Store)?;
         let rows = tx
-            .query(DUE_IDS_SQL, &[&due_before, &limit])
+            .query(DUE_IDS_SQL, &[&due_before, &limit, &oldest])
             .await
             .map_err(|_| ValidationError::Store)?;
         let ids = rows

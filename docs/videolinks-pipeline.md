@@ -269,9 +269,28 @@ submissions; deduplication itself does not check moderation.
 
 `is_fresh` and `expires_at` calculate the 30-day boundary.
 The proposed schema carries `validated_at` / `expires_at`. Writers must
-set those fields together with validation data. Readers must reject
-`expires_at <= now()`; the refresh/delete job must also remove stale
-API-returned fields. Only video IDs may persist long-term.
+set those fields together with validation data. Fresh-link reads and the
+PostgreSQL maintenance adapter enforce validation age independently of the
+stored expiry. Cleanup removes API-returned fields when `expires_at <= now`
+**or** `validated_at <= now - 30 days`, including the exact boundary, so an
+overlong stored expiry cannot extend retention. Metadata with a nonpositive
+validation timestamp is also removed. Cleanup preserves IDs, provenance,
+first-seen time and the validation timestamp (the stale-write fence), sets
+status to `expired` and expiry to zero, and is idempotent.
+
+The due-ID selector independently includes nonpositive validation timestamps
+and validations reaching 30 days within the next 24 hours, even if their
+stored expiry is too far ahead. Both maintenance methods reject nonpositive
+caller clocks before SQL. The disposable PostgreSQL contract includes an
+eight-row age/expiry boundary fixture, rejected-row cleanup, preserved metadata
+on still-fresh rows, refresh-ahead, API-failure persistence and later checked
+revalidation. Execution of this repair awaits exact-head Actions; no local
+tests/builds ran.
+
+This adapter still needs a bounded runtime schedule and measured cleanup
+receipts. A query's timeout can roll its cleanup back; filtering stale reads
+alone does not establish the deployed 30-day deletion guarantee. Only video
+IDs may persist long-term.
 
 ## Moderation queue
 
@@ -315,8 +334,11 @@ Actions; no local tests/builds or deployed moderation acceptance are claimed.
 `compute_coverage` calculates the raw share from a caller-supplied set of
 fresh linked recordings and the **played-weighted** share from supplied
 play counts. The played share is absent, not zero, when no play data
-exists. Querying the catalogue and plays, filtering fresh playable links,
-and writing `video_coverage_snapshots` remain integration work.
+exists. There is no persisted recording-play-count source in this branch:
+the stream metering ledger records admitted usage, not actual recording play
+counts, and cannot substitute for the plays feed. Querying the catalogue and
+plays, filtering fresh playable links, and writing `video_coverage_snapshots`
+remain integration work.
 
 ## Player-surface requirements (for the embed card)
 
