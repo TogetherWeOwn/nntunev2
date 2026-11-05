@@ -27,6 +27,12 @@ SESSION_TTL_SECS = "86400"
 # fail-closed), which means the lane did not supply it. Leave unset for
 # local dev.
 # BUILD_SHA = "unknown"
+# Scheduled retention requires the exact deployment environment plus BUILD_SHA
+# and the cache-disabled attestation below. The staging generator sets staging;
+# production qualification must supply production. No triggers are installed here:
+# recurring idle staging cron is forbidden; bounded activation/expiry and live
+# retention/alert qualification remain separate rollout gates.
+# ENVIRONMENT = "staging"            # or "production", never inferred from RP_ID
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery

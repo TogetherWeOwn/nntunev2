@@ -16,11 +16,12 @@ Worker compilation. The required `api-migrations` job owns the relocated
 
 The integration contract keeps app writes/state on `HYPERDRIVE`, mirror reads
 on a separate read-only `MB_DB` connection, and validation on a runtime Secret.
-It still needs scheduled and authenticated entry points, durable harvest
-selection/cursors, and generated configuration parity. Independent cleanup
+It still needs a curation scheduled entry, authenticated routes, durable harvest
+selection/cursors, and mirror configuration parity. Independent cleanup
 now selects unrefreshed metadata with a one-day safety window and audits both
-due and hard-expired backlog. An inactive retention tick now persists app-owned
-leases and latest receipts; runtime headroom admission and alerts remain
+due and hard-expired backlog. A real scheduled retention entry now calls the
+app-owned lease/cleanup/latest-receipt tick, but no trigger is configured or
+installed. Runtime headroom admission and operational alerts remain
 unfinished. Staging must not have recurring curation triggers when idle;
 bounded trusted qualification and actual binding/grant/Secret verification
 remain rollout prerequisites. No binding, trigger, grant or Secret is
@@ -36,8 +37,8 @@ read-only paged MusicBrainz mirror source and a bounded runner that admits
 its pages into the app store. `moderation.rs` supplies a persistent pending
 queue and atomic decision/promotion in the app database. `retention.rs`
 supplies independent cleanup and aggregate backlog receipts without requiring
-a validation client or credential. No route, schedule or database binding
-calls these adapters yet.
+a validation client or credential. The scheduled retention dispatcher calls
+only the app cleanup/receipt adapters; the other adapters remain unwired.
 
 `refresh_due` purges one bounded batch of expired API-returned fields before
 contacting the validation client, requests at most 200 distinct IDs in four
@@ -72,9 +73,34 @@ the adapter alone does not establish metadata deletion within 30 days.
 ### Durable retention ownership boundary
 
 `jobs.rs::cleanup_tick` composes claim, independent cleanup/audit and a fenced
-receipt in one 20-second attempt, with no retry/drain loop. Connection acquisition
-is not inside that budget: the future scheduled caller must bound it as well.
-There is still no scheduled event handler or active trigger.
+receipt in one 20-second attempt, with no retry/drain loop. The real
+`lib.rs` scheduled-event handler awaits `worker_entry::dispatch_scheduled`,
+which connects through app `HYPERDRIVE` and calls this tick. The existing
+15-second dial/handshake/setup budget is retained; one 40-second outer deadline
+owns connection acquisition plus the tick. The driver follows the existing
+connection lifecycle; dropping a waiter is not proof of server-side cancellation.
+No active trigger is configured or installed.
+
+`scheduled.rs` accepts only the exact trusted cleanup cron `*/15 * * * *`.
+It rejects invalid, unsafe, future or off-grid event milliseconds, retaining
+the original tick identity on delayed delivery. It requires vars-only
+`ENVIRONMENT` (`staging` or `production`), an exact lowercase 40-hex `BUILD_SHA`
+and the app's cache-disabled attestation before constructing connection I/O.
+The actual staging config generator supplies only the environment label; neither
+it nor the example adds recurring triggers. There is no public job-kick endpoint,
+mirror lookup, validation Secret/client, or HTTP/auth startup configuration in
+this path. A missing session/KEK/mail/YouTube credential cannot suppress cleanup.
+
+Fixed-label completion logs distinguish suppressed delivery, drained audit,
+due backlog, expired backlog and failures without API fields or raw exceptions.
+Failures and hard-expired backlog reject the scheduled invocation after logging;
+due backlog is a warning, not healthy retention. Suppression means no cleanup
+ran. Native fixtures cover configuration/event rejection before I/O, one attempt,
+error propagation, outer timeout/cancellation and outcome labels. Worker event,
+socket and exception behaviour still needs exact-SHA deployed qualification.
+These logs are not a durable alert queue or proof of alert delivery; missed-tick
+detection, bounded staging trigger lifetime and production trigger installation
+remain separately gated operational work.
 
 The proposed app migration `0036_videolinks_retention_jobs.sql` adds two tables.
 Their fixed staging/production keys allow at most two job rows and two latest

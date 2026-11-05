@@ -21,7 +21,9 @@
 //!
 //! Parsing and policy helpers live here; [`validation`] adds a bounded
 //! runner, app-side PostgreSQL adapter and inactive Worker HTTP client. No
-//! runtime route or schedule activates them yet. The query builder omits
+//! runtime route or curation schedule activates validation yet. A separate
+//! scheduled entry wires credential-independent retention without installing
+//! triggers. The query builder omits
 //! the API key; the HTTP client requires a runtime Secret. Credential
 //! installation and live validation are not established by fixture-based
 //! tests. See `docs/videolinks-pipeline.md` for remaining integration work.
@@ -30,6 +32,7 @@ pub mod harvest;
 pub mod jobs;
 pub mod moderation;
 pub mod retention;
+pub mod scheduled;
 pub mod storage;
 pub mod validation;
 
