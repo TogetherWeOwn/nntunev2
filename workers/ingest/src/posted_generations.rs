@@ -2,8 +2,10 @@
 //!
 //! Preparation only: migration 0037 retains the unique hash constraint, so
 //! replacement is refused until the legacy writer/publication rollout is
-//! complete. No queue, NNTP, KV or pointer caller is wired here. An admitted
-//! bundle is custody, NOT verification, registry promotion or serving authority.
+//! complete. Migration 0042 also rejects unfenced health changes on registered
+//! legacy custody; it is not proof that incompatible workers have been drained.
+//! No queue, NNTP, KV or pointer caller is wired here. An admitted bundle is
+//! custody, NOT verification, registry promotion or serving authority.
 //! No transaction may span a network POST. Commit errors are ambiguous and
 //! require operation-identity recovery, never a remint or optimistic POST.
 //!
