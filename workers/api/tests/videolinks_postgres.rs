@@ -1,25 +1,25 @@
 //! Real validation adapter and proposed migration on CI's disposable PostgreSQL.
 //! Explicit feature/config required; never a live API request or staging apply.
 
-use nntune_mb::videolinks::harvest::{
+use nntune_api::videolinks::harvest::{
     admit_mirror_pages, HarvestError, MirrorCursor, MirrorHarvestError, PgMirrorSource,
     MAX_MIRROR_PAGES_PER_RUN, MAX_MIRROR_ROWS_PER_PAGE,
 };
-use nntune_mb::videolinks::moderation::{
+use nntune_api::videolinks::moderation::{
     PgSubmissionStore, SubmissionStoreError, MAX_PENDING_SUBMISSIONS,
 };
-use nntune_mb::videolinks::retention::{
+use nntune_api::videolinks::retention::{
     cleanup_metadata, CleanupError, MetadataBacklog, PgRetentionStore, RetentionStore,
     MAX_CLEANUP_BATCHES,
 };
-use nntune_mb::videolinks::storage::{
+use nntune_api::videolinks::storage::{
     CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
 };
-use nntune_mb::videolinks::validation::{
+use nntune_api::videolinks::validation::{
     refresh_due, BatchValidation, PgValidationStore, ValidationClient, ValidationError,
     ValidationResponse, ValidationStore, MAX_PURGES_PER_CALL, MAX_VALIDATIONS_PER_RUN,
 };
-use nntune_mb::videolinks::{Candidate, SubmissionStatus, VideoSource, VALIDATION_TTL_S};
+use nntune_api::videolinks::{Candidate, SubmissionStatus, VideoSource, VALIDATION_TTL_S};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;

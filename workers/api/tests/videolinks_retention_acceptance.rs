@@ -1,9 +1,9 @@
 //! Credential-independent cleanup receipts, not a deployed retention schedule.
 
-use nntune_mb::videolinks::retention::{
+use nntune_api::videolinks::retention::{
     cleanup_metadata, CleanupError, MetadataBacklog, RetentionStore, MAX_CLEANUP_BATCHES,
 };
-use nntune_mb::videolinks::validation::MAX_PURGES_PER_CALL;
+use nntune_api::videolinks::validation::MAX_PURGES_PER_CALL;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};

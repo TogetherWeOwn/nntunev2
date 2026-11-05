@@ -27,7 +27,7 @@ SAVE_IF_MAIN = "${{ github.ref == 'refs/heads/main' }}"
 # Job id -> the standalone crate dirs its rust-cache step must name.
 STANDALONE_WORKSPACES = {
     "api": ["workers/api"],
-    "api-migrations": ["workers/api", "workers/mb"],
+    "api-migrations": ["workers/api"],
     "rust-mb": ["workers/mb"],
     "rust-ingest": ["workers/ingest"],
     "rust-repair": ["workers/repair"],
@@ -167,15 +167,19 @@ class TestRustCachePolicy(unittest.TestCase):
     def test_literal_workspaces_hashes_are_not_comments(self):
         """Hashes in block data change the action input and must not be stripped."""
         for line in [
-            "            workers/mb # validation store\n",
-            "            # native acceptance target\n            workers/mb\n",
+            "            workers/api # validation store\n",
+            "            # native acceptance target\n            workers/api\n",
         ]:
             with self.subTest(line=line):
                 chunk = split_jobs(self.ci)["api-migrations"]
-                bad = chunk.replace("            workers/mb\n", line, 1)
+                bad = chunk.replace(
+                    "          workspaces: workers/api\n",
+                    "          workspaces: |\n" + line,
+                    1,
+                )
                 self.assertNotEqual(bad, chunk)
                 self.assertIn(
-                    "api-migrations: rust-cache must name workspaces: workers/api, workers/mb",
+                    "api-migrations: rust-cache must name workspaces: workers/api",
                     cache_errors(self.ci.replace(chunk, bad, 1)),
                 )
 

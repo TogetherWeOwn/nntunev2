@@ -18,7 +18,7 @@
 //!
 //! Standalone integration target: no existing suite is edited.
 
-use nntune_mb::videolinks::{
+use nntune_api::videolinks::{
     compute_coverage, decide_submission, dedupe_candidates, expires_at, extract_video_id, is_fresh,
     is_playable, is_valid_video_id, normalise_submission, parse_videos_list_response,
     validation_batches, videos_list_query, Candidate, ModerationError, SubmissionStatus,

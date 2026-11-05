@@ -519,7 +519,7 @@ jobs:
       - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets -- --include-ignored --skip 'worker_entry::atomic_registration_store_acceptance::postgres_'
         env:
           NNTUNE_REDEMPTION_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
-      - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
@@ -620,9 +620,7 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: |
-            workers/api
-            workers/mb
+          workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise production session retry adapter under PostgreSQL contention
@@ -654,7 +652,7 @@ jobs:
       - name: Exercise video validation adapter on disposable PostgreSQL
         run: |
           psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntune_videolinks_ci'
-          cargo test --locked --manifest-path workers/mb/Cargo.toml --features postgres-tests --test videolinks_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test videolinks_postgres
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
           NNTUNE_VIDEOLINKS_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_videolinks_ci
@@ -676,7 +674,7 @@ jobs:
           workspaces: workers/mb
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
-      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --features postgres-tests --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).

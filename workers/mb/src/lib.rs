@@ -42,7 +42,6 @@ mod api_error;
 use api_error::ApiError;
 
 pub mod replication;
-pub mod videolinks;
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.

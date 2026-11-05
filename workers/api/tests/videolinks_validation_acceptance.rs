@@ -1,11 +1,11 @@
 //! Validation-runner contract. These fixtures exercise orchestration, not a
 //! deployed schedule, a database connection or a live YouTube credential.
 
-use nntune_mb::videolinks::validation::{
+use nntune_api::videolinks::validation::{
     refresh_due, BatchValidation, ValidationClient, ValidationError, ValidationResponse,
     ValidationStore, MAX_VALIDATIONS_PER_RUN,
 };
-use nntune_mb::videolinks::VALIDATION_TTL_S;
+use nntune_api::videolinks::VALIDATION_TTL_S;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;

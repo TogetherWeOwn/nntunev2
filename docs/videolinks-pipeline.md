@@ -7,8 +7,27 @@ validated IDs with the official video embed.
 
 ## Implementation status
 
-`workers/mb/src/videolinks.rs` provides parsing and policy helpers.
-`workers/mb/src/videolinks/validation.rs` adds a **bounded validation
+The runtime home is the existing API Worker. The curation module and four
+acceptance targets have moved there without changing their behavior; the MB
+Worker no longer exports curation and remains a read-only mirror service.
+The ordinary API job owns native policy tests, feature-enabled Clippy and
+Worker compilation. The required `api-migrations` job owns the relocated
+`videolinks_postgres` target. This relocation is not runtime activation.
+
+The integration contract keeps app writes/state on `HYPERDRIVE`, mirror reads
+on a separate read-only `MB_DB` connection, and validation on a runtime Secret.
+It still needs scheduled and authenticated entry points, app-owned durable
+leases/cursors/receipts, and generated configuration parity. Cleanup must run
+independently of validation credentials, delete unrefreshed metadata with a
+one-day safety window, and measure both due and hard-expired backlog before
+metadata-producing work is admitted. Those changes are not implemented by
+this move. Staging must not have recurring curation triggers when idle;
+bounded trusted qualification and actual binding/grant/Secret verification
+remain rollout prerequisites. No binding, trigger, grant or Secret is
+installed by relocating source.
+
+`workers/api/src/videolinks.rs` provides parsing and policy helpers.
+`workers/api/src/videolinks/validation.rs` adds a **bounded validation
 runner** and an **app-side PostgreSQL store adapter**, not an activated
 curation service. `validation/http.rs` supplies an inactive Worker HTTP
 client requiring a runtime Secret. `storage.rs` supplies bounded external
@@ -206,7 +225,7 @@ metadata round trips, exact-boundary cleanup, refresh-ahead selection,
 queue limits, stale/same-second writes, constraint-induced batch rollback,
 row-lock statement timeouts and earlier-batch persistence after API failure.
 The whole database contract has a 30-second deadline. This target does not
-run in ordinary database-free MB tests; the MB Clippy lane includes it.
+run in ordinary database-free API tests; the API Clippy lane includes it.
 
 Only native test dependencies enable Tokio runtime/TCP features. Existing
 Tokio/PostgreSQL versions remain pinned; the added Mio lock entry matches

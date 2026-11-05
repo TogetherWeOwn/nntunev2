@@ -40,6 +40,7 @@ pub mod session;
 pub mod session_retry_store;
 pub mod stripe;
 pub mod vault;
+pub mod videolinks;
 pub mod webauthn;
 pub mod worker_entry;
 
