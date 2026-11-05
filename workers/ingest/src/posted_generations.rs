@@ -484,6 +484,9 @@ pub async fn admit(
         {
             return Ok(AdmissionOutcome::StaleOrDiverged);
         }
+        if lock_candidate(&tx, &handle).await?.is_none() {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        }
         tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
         return Ok(AdmissionOutcome::ResumedSameCandidate(handle, bundle));
     }
@@ -1486,8 +1489,11 @@ pub async fn record_repost(
 }
 
 /// Lost admission acknowledgment: reread by durable operation identity before
-/// any POST. This never inserts, changes a plan, rotates a token or resets a
-/// counter. An expired handle needs explicit fenced takeover, not this method.
+/// any POST. Recheck the complete candidate fence and both leases after all lock
+/// waits, as on exact-mint admission replay. This never renews a lease, inserts,
+/// changes a plan, rotates a token or resets a counter. An expired handle needs
+/// explicit fenced takeover, not this method. Revalidate again immediately before
+/// each network request; this returned snapshot is not a lease on future work.
 pub async fn recover(
     client: &mut Client,
     attempt: &AttemptHandle,
@@ -1516,6 +1522,9 @@ pub async fn recover(
     };
     let bundle = stored(&tx, &handle.generation).await?;
     if bundle.custody()?.plaintext_sha256 != hash {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    if lock_candidate(&tx, &handle).await?.is_none() {
         return Ok(AdmissionOutcome::StaleOrDiverged);
     }
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
