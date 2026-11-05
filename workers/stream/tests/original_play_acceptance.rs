@@ -854,6 +854,11 @@ impl AsyncArticleSource for RetainedArticles {
 
 #[test]
 fn shared_source_owned_inputs_release_on_unpolled_and_pending_task_drop_or_cancel() {
+    async fn scheduled<F: Future<Output = Result<(), SourceError>>>(
+        pump: F,
+    ) -> Result<(), SourceError> {
+        pump.await
+    }
     for cancel in [false, true] {
         // Unpolled, pending article, pending write, pending close, success.
         for phase in 0..5 {
@@ -883,12 +888,12 @@ fn shared_source_owned_inputs_release_on_unpolled_and_pending_task_drop_or_cance
             drop(source);
             let reports = Rc::new(RefCell::new(Vec::new()));
             // Own the guard and every input before the scheduler wraps the task.
-            let task = owned.pump_owned(
+            let task = scheduled(owned.pump_owned(
                 transport,
                 control,
                 ReportSink(reports.clone()),
                 Writer(st.clone()),
-            );
+            ));
             fn require_static(_: &(impl Future<Output = Result<(), SourceError>> + 'static)) {}
             require_static(&task);
             let mut future = Box::pin(task);
@@ -914,6 +919,8 @@ fn shared_source_owned_inputs_release_on_unpolled_and_pending_task_drop_or_cance
             }
             drop(future);
             assert!(weak.upgrade().is_none());
+            assert_eq!(Rc::strong_count(&observed_control.state), 1);
+            assert_eq!(Rc::strong_count(&observed_control.now), 1);
             let st = st.borrow();
             let expected = [0, 0, 1, 7, 7][phase];
             assert_eq!(st.got, (1..1 + expected as u8).collect::<Vec<_>>());
