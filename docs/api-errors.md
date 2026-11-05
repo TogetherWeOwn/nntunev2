@@ -107,10 +107,10 @@ complete served set; they intentionally carry no `api_error` registry entry
 (`registry_matches_docs_api_errors`, `docs_registry_matches_all_worker_registries`)
 ignore this table by design: its rows use bare codes, never the `| \``
 envelope-registry prefix. Ingest consumes them through `classify_reply` in
-`workers/ingest/src/pool_probe.rs:69-99` (400/413/401/403 are `Rejected`,
+`workers/ingest/src/pool_probe.rs:119-148` (400/413/401/403 are `Rejected`,
 everything else is `Retry` with clamped `Retry-After`; a 401/403's
 `Retry-After` is deliberately unread) and `classify_body_reply` in
-`workers/ingest/src/pool_body.rs:83-118` (exact `{"error":"missing"}` 404 is
+`workers/ingest/src/pool_body.rs:129-163` (exact `{"error":"missing"}` 404 is
 `Missing` data, 413 is `TooLarge` data, 400/401/403 are `Rejected`,
 everything else is `Retry` with clamped `Retry-After`, including non-exact
 404s at the default delay). The pool wire never emits 401/403 today (auth
@@ -303,8 +303,8 @@ code, status, or retryable drift):
   `workers/stream/src/body.rs:73-101`, route constants and decisions in
   `workers/stream/src/routes.rs:29-107`, pool fetch in
   `workers/stream/src/runtime.rs:79-206`, consumed by `classify_reply` in
-  `workers/ingest/src/pool_probe.rs:69-99` and `classify_body_reply` in
-  `workers/ingest/src/pool_body.rs:83-118`, pinned by
+  `workers/ingest/src/pool_probe.rs:119-148` and `classify_body_reply` in
+  `workers/ingest/src/pool_body.rs:129-163`, pinned by
   `workers/stream/tests/pool_error_wire_codes.rs` (served set ⊆ pool table).
 
 ## Adding a code

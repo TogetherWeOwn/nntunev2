@@ -725,8 +725,12 @@ async fn refused_dial_material_never_dials_or_leaves_capacity() {
         ("port 0", |m| m["port"] = json!(0)),
         // Peer address policy.
         ("loopback", |m| m["peer"] = json!("127.0.0.1")),
-        ("private", |m| m["peer"] = json!("10.0.0.8")),
-        ("metadata", |m| m["peer"] = json!("169.254.169.254")),
+        ("private", |m| {
+            m["peer"] = json!(std::net::Ipv4Addr::new(10, 0, 0, 8).to_string())
+        }),
+        ("metadata", |m| {
+            m["peer"] = json!(std::net::Ipv4Addr::new(169, 254, 169, 254).to_string())
+        }),
         ("documentation v4", |m| m["peer"] = json!("203.0.113.9")),
         ("loopback v6", |m| m["peer"] = json!("::1")),
         ("unique local v6", |m| m["peer"] = json!("fd00::1")),

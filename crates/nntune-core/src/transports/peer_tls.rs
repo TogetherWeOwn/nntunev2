@@ -273,17 +273,15 @@ mod tests {
     #[test]
     fn forbidden_peers_ports_and_non_dns_identities_refuse() {
         for peer in [
-            "127.0.0.1:563",
-            "10.0.0.1:563",
-            "169.254.169.254:563",
-            "[::1]:563",
-            "[::ffff:127.0.0.1]:563",
-            "93.184.216.34:443",
-            "93.184.216.34:0",
+            "127.0.0.1:563".parse().unwrap(),
+            ([10, 0, 0, 1], 563).into(),
+            ([169, 254, 169, 254], 563).into(),
+            "[::1]:563".parse().unwrap(),
+            "[::ffff:127.0.0.1]:563".parse().unwrap(),
+            "93.184.216.34:443".parse().unwrap(),
+            "93.184.216.34:0".parse().unwrap(),
         ] {
-            assert!(
-                PeerTlsTarget::new(peer.parse().unwrap(), "nntp.fixture.invalid".into()).is_err()
-            );
+            assert!(PeerTlsTarget::new(peer, "nntp.fixture.invalid".into()).is_err());
         }
         for name in ["127.0.0.1", "93.184.216.34", "::1", "", "not a dns name"] {
             assert!(PeerTlsTarget::new("93.184.216.34:563".parse().unwrap(), name.into()).is_err());

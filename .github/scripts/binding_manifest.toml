@@ -154,6 +154,10 @@ binding = "NNTP_POOL"
 type = "durable_object"
 
 [[worker.binding]]
+binding = "NNTP_ACCOUNT"
+type = "durable_object"
+
+[[worker.binding]]
 binding = "AUDIO_CACHE"
 type = "r2"
 staging = "nntunev2-audio-staging"

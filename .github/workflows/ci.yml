@@ -135,7 +135,7 @@ jobs:
 
   rust-wasm:
     name: rust check (wasm32)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -145,6 +145,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -218,7 +225,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   worker-wasm-budget:
     name: worker wasm budget (enforcing)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -228,6 +235,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -247,7 +261,7 @@ jobs:
   # can never fail the build. No thresholds, no dependency-gate changes.
   worker-wasm-sizes:
     name: worker wasm sizes (report-only)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
     # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
     timeout-minutes: 35
@@ -260,6 +274,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
