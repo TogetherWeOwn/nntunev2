@@ -617,6 +617,59 @@ fn pool_resolver_envelope_substitution_fails() {
 }
 
 #[test]
+fn pool_resolver_pending_dns_drops_with_request() {
+    struct PendingDns(std::cell::Cell<usize>);
+    struct Resolution<'a>(&'a std::cell::Cell<usize>);
+    impl Drop for Resolution<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    impl AsyncDns for PendingDns {
+        fn resolve<'a>(
+            &'a self,
+            _host: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>> {
+            let resolution = Resolution(&self.0);
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                drop(resolution);
+                Vec::new()
+            })
+        }
+    }
+
+    let (h, _cookie, secret_ref) = pr_seeded();
+    let dns = PendingDns(std::cell::Cell::new(0));
+    let base = h.ctx();
+    let ctx = Ctx {
+        cfg: base.cfg,
+        store: base.store,
+        mailer: base.mailer,
+        dialer: base.dialer,
+        dns: &dns,
+        stripe: base.stripe,
+        now: base.now,
+        source_ip: base.source_ip,
+    };
+    let request = pr_signed(
+        PR_RESOLVE,
+        &pr_resolve_body(POOL_ID, 1, &secret_ref, "stream"),
+    );
+    let mut request = Box::pin(handle(&ctx, &request));
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    assert!(request.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(dns.0.get(), 0);
+    drop(request);
+    assert_eq!(
+        dns.0.get(),
+        1,
+        "cancelled resolution must not outlive request"
+    );
+    assert!(h.dialer.seen.borrow().is_empty());
+}
+
+#[test]
 fn pool_resolver_dns_must_be_entirely_public() {
     let (mut h, _cookie, secret_ref) = pr_seeded();
     let generic = pr_generic(&h);

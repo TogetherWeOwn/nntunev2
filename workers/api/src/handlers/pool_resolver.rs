@@ -5,6 +5,37 @@ use crate::pool_resolver::{
     self as wire, AccountSnapshot, AuthError, DialMaterial, ResolveRequest,
 };
 
+async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
+    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+
+    let mut deadline = std::pin::pin!(deadline);
+    let mut resolution = dns.resolve(host);
+    std::future::poll_fn(|cx| {
+        // Expiry wins even if answers become ready in the same poll. Never
+        // return a partial family: all answers must reach the core SSRF guard.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Vec::new());
+        }
+        resolution.as_mut().poll(cx)
+    })
+    .await
+    // Both losing futures drop before the caller can validate or dial.
+}
+
+struct StaticDns {
+    addresses: Vec<IpAddr>,
+}
+
+impl vault::DnsResolver for StaticDns {
+    fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+        self.addresses.clone()
+    }
+}
+
 pub(super) async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
