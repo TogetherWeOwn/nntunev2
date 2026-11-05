@@ -1,11 +1,15 @@
-//! Guarded outbound fetch for BYO Newznab indexer search URLs.
+//! Guarded outbound fetch for admin-ingest Newznab indexer search URLs.
 //!
-//! The indexer URL is user-supplied and the fetch carries the vault-resolved
-//! API key, so the fetch is hostile input shaped like the vault
-//! `test-connection` and NZB fetch surfaces: syntactic URL checks alone are
-//! bypassable through DNS (rebinding, mixed public/private answers) and
-//! redirects (metadata endpoints, port-scan hops, http downgrades that would
-//! leak the key in cleartext).
+//! ADMIN-INGEST-ONLY BOUNDARY. The indexer URL is operator configuration
+//! for the admin-ingest path, never a user-supplied value, and the fetch
+//! carries the service-held admin-ingest API key, never a user vault key.
+//! No user-authenticated route may cause a server-side fetch of a
+//! user-supplied URL through this module: treat any caller-supplied URL as
+//! hostile input shaped like the vault `test-connection` and NZB fetch
+//! surfaces. Syntactic URL checks alone are bypassable through DNS
+//! (rebinding, mixed public/private answers) and redirects (metadata
+//! endpoints, port-scan hops, http downgrades that would leak the key in
+//! cleartext).
 //!
 //! Invariant (mirrors `workers/api` vault guard; keep the two in sync):
 //! - https only, no embedded credentials, 443-only port allowlist;
@@ -376,8 +380,9 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-/// Guarded fetch for one Newznab search URL (typically built by
-/// `newznab::build_search_url` + `inject_api_key`):
+/// Guarded fetch for one admin-ingest Newznab search URL (typically built
+/// by `newznab::build_search_url` + `inject_api_key` from operator
+/// configuration — never from user input):
 /// - validate before ANY transport call, resolving each hop's host exactly
 ///   once and dialing only that vetted set (a second, different DNS answer
 ///   is never consulted — no rebinding window);
@@ -449,9 +454,9 @@ pub fn fetch_indexer(
 }
 
 /// Host-only extraction for the decision log: the log records the blocked
-/// URL's host and the rejection code, NEVER the full URL (it embeds the
-/// user's indexer api key). Unparseable input yields the `invalid`
-/// placeholder, which contains no part of the input.
+/// URL's host and the rejection code, NEVER the full URL (it may embed the
+/// service-held admin-ingest indexer api key). Unparseable input yields
+/// the `invalid` placeholder, which contains no part of the input.
 pub fn url_host_for_log(url: &str) -> String {
     const PLACEHOLDER: &str = "invalid";
     parse_log_host(url).unwrap_or_else(|| PLACEHOLDER.to_string())
