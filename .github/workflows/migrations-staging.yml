@@ -64,8 +64,15 @@ jobs:
           # changes; the checker independently collects every per-parent
           # Git rename, including files created then renamed within the PR.
           # Metadata pins the API response and detects the 3000-file cap.
-          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr-metadata.json"
+          # Project only consumed fields before the bounded checker input:
+          # unrelated patches and PR bodies can exceed its byte budget.
+          # Keep every record and page boundary, including non-migrations;
+          # counts, truncation, rename paths and pinned SHAs still fail closed.
+          gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            | jq -c '{base: {sha: .base.sha}, head: {sha: .head.sha}, changed_files}' \
+            > "$RUNNER_TEMP/pr-metadata.json"
           gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
+            | jq -c 'map(map({filename, status} + (if has("previous_filename") then {previous_filename} else {} end)))' \
             > "$RUNNER_TEMP/pr-files.json"
           python3 .github/scripts/migrations_rename_check.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
