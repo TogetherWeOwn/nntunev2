@@ -42,6 +42,13 @@ pub use rechecks::{
     complete_recheck, prepare_recheck, RecheckPermit, RecheckPreparation, RecheckSchedule,
 };
 
+#[path = "posted_generation_retained.rs"]
+mod retained;
+pub use retained::{
+    invalidate_retained_check, prepare_retained_check, RetainedCheckPermit, RetainedCustody,
+    RetainedInvalidation, RetainedReferenceKind,
+};
+
 const LEASE_SECONDS: i64 = 300;
 
 /// Static, redacted errors. Never surface PostgreSQL errors: their detail may

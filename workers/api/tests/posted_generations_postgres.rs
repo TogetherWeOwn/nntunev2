@@ -53,6 +53,8 @@ mod posted_generation_health;
 mod posted_generation_presence;
 #[path = "support/posted_generation_rechecks.rs"]
 mod posted_generation_rechecks;
+#[path = "support/posted_generation_retained.rs"]
+mod posted_generation_retained;
 #[path = "support/posted_generation_takeover.rs"]
 mod posted_generation_takeover;
 
