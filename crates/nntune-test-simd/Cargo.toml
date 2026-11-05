@@ -1,0 +1,27 @@
+[package]
+name = "nntune-test-simd"
+version = "0.1.0"
+edition = "2021"
+description = "Differential tests that execute the nntune-core wasm32 simd128 kernels (yEnc decoder, PAR2 gf16 madd) under a wasm runtime"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/nntunev2"
+# 1.81 is the highest `rust_version` in the dependency closure
+# (wasm-bindgen-test 0.3.79); the kernels under test build older.
+rust-version = "1.81"
+
+[lib]
+name = "nntune_test_simd"
+path = "src/lib.rs"
+
+[dependencies]
+# Scalar core only (the kernels under test need no transport or TLS), the
+# same shape the rust-wasm lane checks with `--no-default-features`.
+nntune-core = { version = "0.1.0", path = "../nntune-core", default-features = false }
+
+[dev-dependencies]
+# Exact pin: 0.3.79 is the 0.3.x release whose `wasm-bindgen =0.2.129`
+# requirement matches Cargo.lock, and the CI lane installs the
+# wasm-bindgen-test-runner CLI at exactly that wasm-bindgen version (the
+# runner and the compiled test must agree on the shared wire format).
+# Bump this together with the runner digest in .github/workflows/ci.yml.
+wasm-bindgen-test = "=0.3.79"
