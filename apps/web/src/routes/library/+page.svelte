@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -318,6 +319,7 @@
 			target.muted = settings.muted;
 			target.playbackRate = settings.playbackRate;
 			target.currentTime = 0;
+			jumpStatus = '';
 			playingElement = target;
 			await target.play();
 			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
@@ -379,6 +381,10 @@
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
 	let restartStatusVersion = $state(0);
+	// One-shot readout for Back/Forward 10 seconds; cleared on source change
+	// and at the auth boundary.
+	let jumpStatus = $state('');
+	let jumpStatusVersion = $state(0);
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -822,6 +828,7 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			restartCanSeek = false;
 			restartStatus = '';
+			jumpStatus = '';
 		}
 	}
 
@@ -893,6 +900,7 @@
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
+		jumpStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 	}
@@ -1029,6 +1037,9 @@
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		// A same-source share skips the source-change reset; the share moves the
+		// position, so an earlier jump readout no longer describes it.
+		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
 		void tick().then(() => applyPendingShareSeek());
@@ -1168,6 +1179,7 @@
 		if (Math.abs(position) <= 0.05) {
 			try {
 				element.currentTime = 0;
+				jumpStatus = '';
 			} catch {
 				// Already at the start; a refusal changes nothing there.
 			}
@@ -1177,6 +1189,7 @@
 		let refused = false;
 		try {
 			element.currentTime = 0;
+			jumpStatus = '';
 		} catch {
 			refused = true;
 		}
@@ -1193,6 +1206,25 @@
 				? withTitle('Restarted')
 				: withTitle('Could not restart')
 		);
+	}
+
+	/**
+	 * Back/Forward 10 seconds act on the mounted audio element for the current
+	 * source only. Like restart, the gesture supersedes a pending inbound-share
+	 * seek for that source even if the jump is refused, so later metadata
+	 * events cannot move the position to the share time.
+	 */
+	function jumpRelative(direction: JumpDirection): void {
+		const element = audioEl;
+		const current = queueCurrentTrack(queue);
+		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
+		if (live && pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === streamUrl) {
+			pendingShareSeek = null;
+		}
+		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
+		jumpStatus = describeJump(direction, outcome);
+		// Re-announce a repeated identical outcome.
+		jumpStatusVersion += 1;
 	}
 
 	if (typeof window !== 'undefined') {
@@ -2545,6 +2577,27 @@
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
 			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
+			<div class="nt-player-jump">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-back"
+					aria-label="Back 10 seconds"
+					onclick={() => jumpRelative('back')}
+				>
+					Back 10 s
+				</button>
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-forward"
+					aria-label="Forward 10 seconds"
+					onclick={() => jumpRelative('forward')}
+				>
+					Forward 10 s
+				</button>
+			</div>
+			<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
 		</section>
 	{/if}
 </main>
@@ -2765,6 +2818,15 @@
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;
+	}
+	.nt-player-jump {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-player-jump button {
+		min-height: 2.75rem;
 	}
 	.nt-library-order {
 		display: flex;
