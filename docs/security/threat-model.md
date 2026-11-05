@@ -381,28 +381,12 @@ labelled as such throughout — nothing below presents one as merged.
 
 Fenced writers (account-owned creates/restores, api/ingest/stream):
 
-- **api vault credential upsert** (`upsert_vault` in
-  `workers/api/src/worker_entry.rs`): fenced `INSERT ... SELECT`;
-  a 0-row upsert fails closed and the handler classifies it through
-  the `account_deleting` probe into the typed 409. `delete_vault`
-  is deliberately NOT fenced — removal cannot restore state, and the
-  erasure executor deletes the row anyway.
-- **api providers mint** (`save_vault_and_mint_provider` in
-  `workers/api/src/worker_entry.rs`): the vault upsert, the
-  `providers` mint (`workers/api/src/providers.rs`, fenced
-  `INSERT ... SELECT` with the id cast `$1::text::uuid`), and the
-  rotation prune of superseded unreferenced rows run in one
-  transaction — a 0-row write on either fenced statement rolls
-  everything back, so a failed mint never leaves a committed vault
-  row the client was told failed. `delete_vault` purges the user's
-  unreferenced `providers` rows alongside the vault row (also
-  unfenced — removal cannot restore state); grant-referenced rows
-  survive under the `RESTRICT` attribution guarantee.
-- **api test-connection lease acquire** (`vault_test_leases` insert in
-  `workers/api/src/worker_entry.rs`): fenced like the upsert, so a
-  deleting account acquires no new lease rows; a fenced lease returns
-  the typed 409 `account_deleting` (probed once), never the boolean
-  collapse.
+- **Retired user-provider writers:** the user vault upsert, provider mint,
+  delete and test-connection handlers and their store methods are removed.
+  `/v1/vault` and its test paths return the ordinary unknown-route 404.
+  Existing encrypted rows remain subject to KEK retention and rewrap rules
+  until the separate forward purge migration; no new user credentials land.
+
 - **api library genre/playlist mutations** (`workers/api/src/library.rs`):
   every create/update/delete statement carries the fence in-statement
   (user-initiated deletes are deliberately fenced — a 409 during grace);

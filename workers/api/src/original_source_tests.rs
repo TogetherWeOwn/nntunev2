@@ -117,7 +117,7 @@ impl TempDb {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "source-conformance-{}.sqlite",
-            crate::providers::mint_provider_id().unwrap()
+            crate::b64::encode(&crate::random::secure_random_bytes::<16>().unwrap())
         ));
         std::fs::OpenOptions::new()
             .write(true)

@@ -87,7 +87,6 @@ struct FakeStore {
     magic: RefCell<HashMap<String, auth::MagicLinkRecord>>,
     invites: RefCell<HashMap<String, auth::InviteRecord>>,
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
-    vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     audits: RefCell<Vec<vault::AuditEvent>>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
     fail_revoke_session: Cell<bool>,
@@ -253,24 +252,6 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn acquire_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-        _lease_secs: u64,
-        _max_concurrency: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        Ok(true)
-    }
-
-    async fn release_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-    ) -> Result<(), handlers::StoreError> {
-        Ok(())
-    }
-
     async fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -329,29 +310,6 @@ impl handlers::Store for FakeStore {
                 row.revoked = true;
             }
         }
-        Ok(())
-    }
-
-    async fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        Ok(self.vaults.borrow().get(user_id).cloned())
-    }
-
-    async fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        self.vaults
-            .borrow_mut()
-            .insert(user_id.to_string(), row.clone());
-        Ok(())
-    }
-
-    async fn delete_vault(&self, user_id: &str) -> Result<(), handlers::StoreError> {
-        self.vaults.borrow_mut().remove(user_id);
         Ok(())
     }
 
