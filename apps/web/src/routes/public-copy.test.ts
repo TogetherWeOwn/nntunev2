@@ -1,6 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import Home from './+page.svelte';
+import Signup from './signup/+page.svelte';
 import { GET } from './manifest.webmanifest/+server';
 
 function expectAccountPlanCopy(copy: string) {
@@ -19,6 +20,14 @@ describe('public account-plan copy', () => {
 		expectAccountPlanCopy(body);
 		expect(body).toContain('href="/signup"');
 		expect(body).toContain('href="/pricing"');
+	});
+
+	it('describes account creation and plan selection in signup metadata without promising playback', () => {
+		const { head } = render(Signup);
+		const description = head.match(/<meta name="description" content="([^"]*)"/u)?.[1];
+		expect(description).toMatch(/create your NNTune account/i);
+		expect(description).toMatch(/choose an account plan/i);
+		expect(description).not.toMatch(/listen|stream|provider|Usenet|BYOP/i);
 	});
 
 	it('keeps the install manifest aligned with the account-plan flow', async () => {

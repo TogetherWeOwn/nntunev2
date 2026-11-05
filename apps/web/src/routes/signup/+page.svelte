@@ -175,7 +175,7 @@
 
 <svelte:head>
 	<title>NNTune — get started</title>
-	<meta name="description" content="Create your NNTune account and start listening." />
+	<meta name="description" content="Create your NNTune account, then choose an account plan." />
 </svelte:head>
 
 <main class="nt-wrap">

@@ -312,8 +312,9 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     sign-out invalidating library snapshots across tabs (logout, revoke-all,
     and confirmed 401 clear stored snapshots; 500/transport failure claims
     nothing and clears nothing).
-  - `apps/web/tests/account-security.spec.ts` — pins revoke-all asking
-    for confirmation before revoking and redirecting after success,
+  - `apps/web/tests/account-security.spec.ts` — uses the bounded session
+    snapshot for an authenticated account without a subscription; pins revoke-all
+    asking for confirmation before revoking and redirecting after success,
     per-session sign-out, and failure/401 handling staying on the page
     with a notice.
   - `apps/web/tests/billing-signed-out.spec.ts` — pins a signed-out

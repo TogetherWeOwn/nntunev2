@@ -187,15 +187,22 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
 async function mockAccountApis(page: Page): Promise<void> {
-	await page.route('**/v1/credentials', (route) =>
+	await page.route('**/v1/me/*', (route) =>
+		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
+	);
+	await page.route('**/v1/me/subscription', (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: 'application/json',
-			body: JSON.stringify({ credentials: [] })
+			body: JSON.stringify({
+				state: 'no_subscription',
+				planId: null,
+				status: null,
+				currentPeriodEnd: null,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
+			})
 		})
-	);
-	await page.route('**/v1/me/*', (route) =>
-		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
 	);
 }
 

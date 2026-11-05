@@ -13,7 +13,9 @@ export const load: PageLoad = async ({ fetch }) => {
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch });
 	let sessionCheckFailed = false;
 	try {
-		await client.listCredentials();
+		// One account snapshot, not the unbounded credential history. A session
+		// without a subscription still receives 200; entitlement is irrelevant.
+		await client.get<unknown>('/v1/me/subscription');
 	} catch (error) {
 		if (error instanceof ApiError && error.status === 401) {
 			invalidateLibraryCache();

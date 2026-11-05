@@ -192,11 +192,12 @@ boundaries, not permission to change session semantics. Sources:
 `apps/web/src/routes/account/security/+page.svelte:18-102`.
 
 Security UI has sign-out and sign-out-everywhere only. **It is not SSR:** its
-load explicitly sets ssr=false and checks session via GET /v1/credentials; 401 clears
-cached identity and redirects, other failures expose a warning. Do not claim
+load explicitly sets ssr=false and checks session via GET /v1/me/subscription,
+a single account snapshot even without a subscription; it never reads credential
+history. A 401 clears cached identity and redirects; other failures expose a warning. Do not claim
 server-rendered authenticated inventory or add private data to HTML. Sources:
 `apps/web/src/routes/account/security/+page.svelte:105-135`,
-`apps/web/src/routes/account/security/+page.ts:8-26`.
+`apps/web/src/routes/account/security/+page.ts:8-28`.
 
 ## 3. Proposed management contract — not implemented
 

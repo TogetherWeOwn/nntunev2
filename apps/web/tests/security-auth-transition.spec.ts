@@ -56,8 +56,8 @@ type HoldRule = string | { path: string; methods?: string[]; passFirst?: number 
  * a stray request cannot hide behind a benign fixture.
  *
  * A rule can narrow by HTTP method and can pass the first N matches
- * through (the security page load probes GET /v1/credentials before any
- * held action runs, so a credentials hold must not swallow that probe).
+ * through (the security page load probes GET /v1/me/subscription before any
+ * held action runs, so a subscription hold must not swallow that probe).
  */
 async function fixtures(page: Page, holds: HoldRule[]) {
 	const normalized = holds.map((rule) =>
@@ -245,11 +245,18 @@ async function release(page: Page, path: string, status: number, body: unknown) 
 /** A second tab in the same context performs a real live logout. */
 async function actorLogout(page: Page) {
 	const actor = await page.context().newPage();
-	await actor.route('**/v1/credentials', (route) =>
+	await actor.route('**/v1/me/subscription', (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: 'application/json',
-			body: JSON.stringify({ credentials: [] })
+			body: JSON.stringify({
+				state: 'no_subscription',
+				planId: null,
+				status: null,
+				currentPeriodEnd: null,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
+			})
 		})
 	);
 	await actor.route('**/v1/session/logout', (route) =>
