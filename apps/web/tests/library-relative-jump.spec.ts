@@ -113,6 +113,28 @@ test('RJ-04 an earlier seek completion cannot erase a newer jump announcement', 
 	await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:50.');
 });
 
+for (const direction of ['forward', 'back'] as const) {
+	test(`RJ-05 an older ${direction} seek event preserves newer boundary feedback`, async ({ page }) => {
+		await openWithTrack(page);
+		await mockMedia(page, direction === 'forward' ? 115 : 5, 120);
+		await audio(page).evaluate((el: HTMLAudioElement) => {
+			Object.defineProperty(el, 'paused', { value: true, configurable: true });
+		});
+		const calls = await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }));
+		const name = direction === 'forward' ? 'Forward 10 seconds' : 'Back 10 seconds';
+		await page.getByRole('button', { name }).evaluate((button: HTMLButtonElement) => {
+			// Both gestures happen before the first jump's queued media events.
+			button.click();
+			button.click();
+		});
+		expect(await position(page)).toBe(direction === 'forward' ? 120 : 0);
+		await expect(feedback(page)).toHaveText(`Already at the ${direction === 'forward' ? 'end' : 'start'}.`);
+		expect(await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }))).toEqual(calls);
+		await audio(page).evaluate((el: HTMLAudioElement) => { el.currentTime = 60; });
+		await expect(feedback(page)).toHaveText('');
+	});
+}
+
 test('RJ-02 clamps at the start and reports unseekable media without writing', async ({ page }) => {
 	await openWithTrack(page);
 	await mockMedia(page, 4, 120);

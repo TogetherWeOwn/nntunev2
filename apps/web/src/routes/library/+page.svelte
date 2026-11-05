@@ -1235,8 +1235,11 @@
 			pendingShareSeek = null;
 		}
 		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
-		lastJumpSeek = element && outcome.kind === 'jumped'
-			? { element, target: outcome.target } : null;
+		// A no-write outcome must not disown an earlier jump's queued event.
+		// handleSeeking still retires feedback at a different element or position.
+		if (element && outcome.kind === 'jumped') {
+			lastJumpSeek = { element, target: outcome.target };
+		}
 		jumpStatus = describeJump(direction, outcome);
 		// Re-announce a repeated identical outcome.
 		jumpStatusVersion += 1;

@@ -162,6 +162,25 @@ test('detached media events cannot retire the current jump announcement', () => 
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 });
 
+test('an older jump event preserves newer no-write boundary feedback', () => {
+	for (const direction of ['forward', 'back'] as const) {
+		const { page, media, writes } = restartFixture();
+		media.position = direction === 'forward' ? 115 : 5;
+		page.jump(direction);
+		expect(media.position).toBe(direction === 'forward' ? 120 : 0);
+		page.jump(direction);
+		const boundary = `Already at the ${direction === 'forward' ? 'end' : 'start'}.`;
+		expect(page.read().jumpStatus).toBe(boundary);
+		expect(writes).toHaveLength(1);
+		// Deliver the first jump's queued event only after the no-write outcome.
+		page.seeking();
+		expect(page.read().jumpStatus).toBe(boundary);
+		media.position = 60;
+		page.seeking();
+		expect(page.read().jumpStatus).toBe('');
+	}
+});
+
 test('a native seek retires earlier boundary feedback', () => {
 	const { page, media } = restartFixture();
 	media.position = 0;
