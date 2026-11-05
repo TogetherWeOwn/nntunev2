@@ -283,7 +283,7 @@ impl Drop for MeteredStream {
 /// POST one delivered interval to the user's pool object. Bounded
 /// retries: a duplicate report is safe (the meter merges unions per
 /// play), and a lost one only under-meters.
-async fn report_delivered(env: Env, interval: DeliveredInterval) {
+pub(crate) async fn report_delivered(env: Env, interval: DeliveredInterval) {
     let Ok(body) = serde_json::to_string(&interval) else {
         return;
     };

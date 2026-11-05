@@ -2,7 +2,14 @@
 //! to the request authority; this seam neither dials nor authenticates users.
 //! The verified prefix walk is deliberately the baseline even with a hint.
 
-use std::{io::Read, ops::Range};
+use std::{
+    collections::VecDeque,
+    future::{poll_fn, Future},
+    io::{Cursor, Read},
+    ops::Range,
+    pin::pin,
+    task::{Context, Poll},
+};
 
 use super::{OriginalSource, RangeHint, SourceError, MAX_ARTICLE_BYTES};
 use crate::yenc::{self, DecodedPart};
@@ -301,4 +308,115 @@ pub fn read_range<T: ArticleSource, C: ReadControl>(
         reader.push(body, control, &mut sink)?;
     }
     Ok(())
+}
+
+/// Async supplier for one complete, transfer-encoded article. The supplier
+/// must cap collection at `MAX_ARTICLE_BYTES` before growing its buffer and
+/// enforce its own operation timer. `index` is the trusted source ordinal,
+/// not a client-selected article. Dropping the future cancels local work;
+/// account capacity/physical close remain the supplier's responsibility.
+pub trait AsyncArticleSource {
+    fn open(
+        &mut self,
+        index: usize,
+        reference: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, SourceError>>;
+}
+
+/// Request authority with a wakeable cancellation/deadline signal. A pending
+/// implementation must register the waker; `check` alone cannot interrupt an
+/// awaited article. Return the same redacted error that `check` would return.
+pub trait AsyncReadControl: ReadControl {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError>;
+}
+
+/// Lazy async wrapper over the shared incremental `RangeReader`. A push may
+/// emit the current and retained final slice; at most two bounded article
+/// slices are queued, and each pull releases only one. These are verified
+/// bytes, not writer acknowledgements or delivery evidence.
+/// An error or a dropped pending pull permanently stops the wrapper. Drop it
+/// to discard buffers; an uncertain supplier operation is never retried.
+pub struct AsyncRangeReader<'a> {
+    walk: RangeReader<'a>,
+    pending: VecDeque<Vec<u8>>,
+    stopped: bool,
+}
+
+impl<'a> AsyncRangeReader<'a> {
+    pub fn new(source: &'a OriginalSource, range: Range<u64>) -> Result<Self, SourceError> {
+        Ok(Self {
+            walk: RangeReader::new(source, range)?,
+            pending: VecDeque::new(),
+            stopped: false,
+        })
+    }
+
+    pub async fn next<T: AsyncArticleSource, C: AsyncReadControl>(
+        &mut self,
+        transport: &mut T,
+        control: &mut C,
+    ) -> Result<Option<Vec<u8>>, SourceError> {
+        if self.stopped {
+            return Err(SourceError::Cancelled);
+        }
+        // Fail closed even when the caller drops an externally pending await.
+        self.stopped = true;
+        control.check()?;
+        loop {
+            // Also check the wakeable signal before releasing buffered output:
+            // draining the retained final slice does not await the transport.
+            poll_fn(|cx| match control.poll_cancel(cx) {
+                Poll::Ready(error) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Ready(Ok(())),
+            })
+            .await?;
+            if let Some(bytes) = self.pending.pop_front() {
+                control.check()?;
+                self.stopped = false;
+                return Ok(Some(bytes));
+            }
+            let Some((index, _)) = self.walk.request()? else {
+                self.stopped = false;
+                return Ok(None);
+            };
+            let encoded = {
+                let reference = self.walk.next_reference()?.ok_or(SourceError::Integrity)?;
+                control.check()?;
+                let mut opening = pin!(async { transport.open(index, reference).await });
+                poll_fn(|cx| {
+                    // Cancellation wins a simultaneous-ready article race.
+                    if let Poll::Ready(error) = control.poll_cancel(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                    opening.as_mut().poll(cx)
+                })
+                .await?
+            };
+            control.check()?;
+            let walking_prefix = self.walk.final_loaded;
+            self.walk.push(Cursor::new(encoded), control, |bytes| {
+                // This is an article-sized adapter, never a file accumulator.
+                if self.pending.len() == 2 || bytes.len() > MAX_ARTICLE_BYTES {
+                    return Err(SourceError::Bounds);
+                }
+                self.pending.push_back(bytes.to_vec());
+                Ok(())
+            })?;
+            if walking_prefix && self.pending.is_empty() && !self.walk.done {
+                // Ready suppliers must not monopolize a poll while skipping a
+                // long prefix. Retain progress, then recheck control next poll.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        }
+    }
 }
