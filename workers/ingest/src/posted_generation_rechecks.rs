@@ -22,6 +22,7 @@ pub enum RecheckSchedule {
 pub struct RecheckPermit {
     handle: GenerationHandle,
     completed_passes: u32,
+    pub(super) cursor: i32,
 }
 
 impl fmt::Debug for RecheckPermit {
@@ -124,6 +125,18 @@ pub async fn prepare_recheck(
     if !unfinished(&current, handle) {
         return Ok(RecheckPreparation::StaleOrDiverged);
     }
+    let cursor: i32 = tx
+        .query_one(
+            "SELECT work_cursor FROM posted_file_recheck_schedule \
+             WHERE generation_id = $1 AND round = $2",
+            &[&handle.generation, &handle.round],
+        )
+        .await
+        .map_err(database_error)?
+        .get(0);
+    if !(0..=current.get::<_, i32>("article_count") * 2).contains(&cursor) {
+        return Err(StoreError::Inconsistent);
+    }
     let outcome = match load_schedule(&tx, handle).await? {
         Some(RecheckSchedule::Waiting {
             completed_passes,
@@ -135,6 +148,7 @@ pub async fn prepare_recheck(
                 RecheckPreparation::Ready(Box::new(RecheckPermit {
                     handle: handle.clone(),
                     completed_passes,
+                    cursor,
                 }))
             }
         }
@@ -187,7 +201,7 @@ pub async fn complete_recheck(
     let delay = (recheck_delay_ms(completed_passes) / 1000) as i64;
     let changed = tx
         .execute(
-            "UPDATE posted_file_recheck_schedule SET completed_passes = $3, \
+            "UPDATE posted_file_recheck_schedule SET completed_passes = $3, work_cursor = 0, \
              state = CASE WHEN $4 THEN 'exhausted' ELSE 'waiting' END, \
              not_before = CASE WHEN $4 THEN NULL ELSE \
                  ceil(extract(epoch FROM clock_timestamp()))::bigint + $5 END \
@@ -199,6 +213,57 @@ pub async fn complete_recheck(
                 &exhausted,
                 &delay,
                 &(completed_passes as i32),
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    tx.execute(
+        "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    commit_mutation(tx, handle).await
+}
+
+/// Advance exactly one slot/side after its callbacks. A crash before this commit
+/// repeats only same-ID work; a crash after it resumes at the next cursor. The
+/// revision bump retires even idempotent network permits from the prior step.
+/// Pass completion and cursor reset share the existing completion transaction.
+pub(super) async fn advance_cursor(
+    client: &mut Client,
+    handle: &GenerationHandle,
+    permit: &RecheckPermit,
+    cursor: i32,
+) -> Result<MutationOutcome, StoreError> {
+    let mut expected = permit.handle.clone();
+    expected.health_revision = handle.health_revision;
+    if &expected != handle {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    };
+    if !unfinished(&current, handle)
+        || !(0..current.get::<_, i32>("article_count") * 2).contains(&cursor)
+    {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    let changed = tx
+        .execute(
+            "UPDATE posted_file_recheck_schedule SET work_cursor = work_cursor + 1 \
+             WHERE generation_id = $1 AND round = $2 AND completed_passes = $3 \
+             AND state = 'waiting' AND work_cursor = $4 \
+             AND not_before <= floor(extract(epoch FROM clock_timestamp()))::bigint",
+            &[
+                &handle.generation,
+                &handle.round,
+                &(permit.completed_passes as i32),
+                &cursor,
             ],
         )
         .await
@@ -240,6 +305,7 @@ mod tests {
                 round_token: "private-round-token".into(),
             },
             completed_passes: 1,
+            cursor: 2,
         };
         assert_eq!(format!("{permit:?}"), "RecheckPermit([REDACTED])");
         assert_eq!(

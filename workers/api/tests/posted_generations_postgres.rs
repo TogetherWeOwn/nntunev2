@@ -38,10 +38,15 @@ const MIGRATION_0038: &str = include_str!("../../../migrations/0038_posted_file_
 const MIGRATION_0039: &str =
     include_str!("../../../migrations/0039_posted_file_content_checks.sql");
 
+const MIGRATION_0040: &str =
+    include_str!("../../../migrations/0040_posted_file_recheck_cursor.sql");
+
 #[path = "support/posted_generation_checkpoint.rs"]
 mod posted_generation_checkpoint;
 #[path = "support/posted_generation_content.rs"]
 mod posted_generation_content;
+#[path = "support/posted_generation_driver.rs"]
+mod posted_generation_driver;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
 #[path = "support/posted_generation_presence.rs"]
