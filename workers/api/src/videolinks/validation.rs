@@ -194,23 +194,63 @@ impl<'a> PgValidationStore<'a> {
     pub fn new(app_client: &'a mut Client) -> Self {
         Self { client: app_client }
     }
+
+    pub(super) async fn purge_metadata_due(
+        &mut self,
+        now: i64,
+        safety_window_s: i64,
+    ) -> Result<u64, ValidationError> {
+        let (expires_before, validated_before) = metadata_cutoffs(now, safety_window_s)?;
+        let tx = self
+            .client
+            .transaction()
+            .await
+            .map_err(|_| ValidationError::Store)?;
+        tx.batch_execute("SET LOCAL statement_timeout = '1500ms'")
+            .await
+            .map_err(|_| ValidationError::Store)?;
+        let rows = tx
+            .execute(
+                PURGE_DUE_SQL,
+                &[&expires_before, &validated_before, &MAX_PURGES_PER_CALL],
+            )
+            .await
+            .map_err(|_| ValidationError::Store)?;
+        tx.commit().await.map_err(|_| ValidationError::Store)?;
+        Ok(rows)
+    }
 }
 
-const PURGE_EXPIRED_SQL: &str = "\
-WITH expired AS (
+/// Explicit early-deletion cutoffs, separate from the real invocation clock.
+/// A later concurrent validation is not invalid merely because it is newer.
+pub(super) fn metadata_cutoffs(
+    now: i64,
+    safety_window_s: i64,
+) -> Result<(i64, i64), ValidationError> {
+    if now <= 0 || !(0..VALIDATION_TTL_S).contains(&safety_window_s) {
+        return Err(ValidationError::InvalidTime);
+    }
+    let expires_before = now
+        .checked_add(safety_window_s)
+        .ok_or(ValidationError::InvalidTime)?;
+    Ok((expires_before, now - (VALIDATION_TTL_S - safety_window_s)))
+}
+
+const PURGE_DUE_SQL: &str = "\
+WITH due AS (
     SELECT recording_mbid, video_id FROM public.video_link_candidates
     WHERE (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2)
       AND (status IN ('validated', 'rejected') OR title IS NOT NULL
            OR channel_id IS NOT NULL OR duration_secs IS NOT NULL OR embeddable IS NOT NULL)
-    ORDER BY recording_mbid, video_id
+    ORDER BY validated_at, expires_at, recording_mbid, video_id
     LIMIT $3
     FOR UPDATE SKIP LOCKED
 )
 UPDATE public.video_link_candidates AS c
 SET title = NULL, channel_id = NULL, duration_secs = NULL, embeddable = NULL,
     status = 'expired', expires_at = 0, updated_at = now()
-FROM expired AS e
-WHERE c.recording_mbid = e.recording_mbid AND c.video_id = e.video_id";
+FROM due AS d
+WHERE c.recording_mbid = d.recording_mbid AND c.video_id = d.video_id";
 
 const DUE_IDS_SQL: &str = "\
 SELECT video_id
@@ -270,24 +310,7 @@ fn stored_updates(batch: &BatchValidation) -> Result<String, ValidationError> {
 
 impl ValidationStore for PgValidationStore<'_> {
     async fn purge_expired(&mut self, now: i64) -> Result<u64, ValidationError> {
-        if now <= 0 {
-            return Err(ValidationError::InvalidTime);
-        }
-        let oldest = now - VALIDATION_TTL_S;
-        let tx = self
-            .client
-            .transaction()
-            .await
-            .map_err(|_| ValidationError::Store)?;
-        tx.batch_execute("SET LOCAL statement_timeout = '1500ms'")
-            .await
-            .map_err(|_| ValidationError::Store)?;
-        let rows = tx
-            .execute(PURGE_EXPIRED_SQL, &[&now, &oldest, &MAX_PURGES_PER_CALL])
-            .await
-            .map_err(|_| ValidationError::Store)?;
-        tx.commit().await.map_err(|_| ValidationError::Store)?;
-        Ok(rows)
+        self.purge_metadata_due(now, 0).await
     }
 
     async fn due_video_ids(

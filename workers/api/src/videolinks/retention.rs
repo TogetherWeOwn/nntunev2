@@ -3,7 +3,9 @@
 //! The caller still owns the app connection, trusted clock, schedule and
 //! receipt/alert delivery. A point-in-time audit is not a retention guarantee.
 
-use super::validation::{PgValidationStore, ValidationError, ValidationStore, MAX_PURGES_PER_CALL};
+use super::validation::{
+    metadata_cutoffs, PgValidationStore, ValidationError, MAX_PURGES_PER_CALL,
+};
 use super::VALIDATION_TTL_S;
 use serde::Serialize;
 use std::future::Future;
@@ -12,6 +14,8 @@ use std::time::Duration;
 use tokio_postgres::Client;
 
 pub const MAX_CLEANUP_BATCHES: usize = 4;
+/// Delete unrefreshed metadata a day before the hard retention ceiling.
+pub const CLEANUP_SAFETY_WINDOW_S: i64 = 24 * 60 * 60;
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +32,9 @@ pub enum CleanupError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MetadataBacklog {
     pub retained_rows: u64,
+    /// Includes hard-expired/invalid rows and the pre-deadline safety window.
+    pub due_rows: u64,
+    pub oldest_due_validated_at: Option<i64>,
     pub expired_rows: u64,
     pub oldest_expired_validated_at: Option<i64>,
 }
@@ -37,6 +44,7 @@ pub struct CleanupReport {
     /// Trusted invocation clock used for every expiry comparison, not the
     /// wall-clock completion time of the audit or a durable scheduler receipt.
     pub evaluated_at: i64,
+    pub safety_window_s: i64,
     pub batches: usize,
     pub purged_rows: u64,
     pub backlog: Option<MetadataBacklog>,
@@ -50,8 +58,9 @@ pub struct CleanupFailure {
 
 #[allow(async_fn_in_trait)]
 pub trait RetentionStore {
-    /// Acknowledged writes only, at most MAX_PURGES_PER_CALL. A failed commit
-    /// can have an unknown outcome. Zero does not establish an empty backlog.
+    /// Clear metadata due within CLEANUP_SAFETY_WINDOW_S using the real clock,
+    /// oldest validation first. Acknowledged writes only, at most MAX_PURGES_PER_CALL.
+    /// A failed commit can be unknown; zero does not establish an empty backlog.
     async fn purge_metadata(&mut self, now: i64) -> Result<u64, CleanupError>;
     async fn metadata_backlog(&mut self, now: i64) -> Result<MetadataBacklog, CleanupError>;
 }
@@ -74,11 +83,12 @@ async fn cleanup_with_budget(
 ) -> Result<CleanupReport, CleanupFailure> {
     let mut progress = CleanupReport {
         evaluated_at: now,
+        safety_window_s: CLEANUP_SAFETY_WINDOW_S,
         batches: 0,
         purged_rows: 0,
         backlog: None,
     };
-    let result = if now <= 0 {
+    let result = if metadata_cutoffs(now, CLEANUP_SAFETY_WINDOW_S).is_err() {
         Err(CleanupError::InvalidTime)
     } else {
         with_deadline(budget, async {
@@ -135,13 +145,16 @@ impl<'a> PgRetentionStore<'a> {
     }
 }
 
-// Keep eligibility aligned with validation::PURGE_EXPIRED_SQL, including
+// Keep eligibility aligned with validation::PURGE_DUE_SQL, including
 // API-derived terminal states even when their display fields are all absent.
 const BACKLOG_SQL: &str = "\
 SELECT count(*), count(*) FILTER (WHERE expired),
-       min(validated_at) FILTER (WHERE expired)
+       min(validated_at) FILTER (WHERE expired),
+       count(*) FILTER (WHERE due), min(validated_at) FILTER (WHERE due)
 FROM (
-    SELECT validated_at, (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2) AS expired
+    SELECT validated_at,
+           (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2) AS expired,
+           (expires_at <= $3 OR validated_at <= 0 OR validated_at <= $4) AS due
     FROM public.video_link_candidates
     WHERE status IN ('validated', 'rejected') OR title IS NOT NULL
        OR channel_id IS NOT NULL OR duration_secs IS NOT NULL OR embeddable IS NOT NULL
@@ -150,7 +163,7 @@ FROM (
 impl RetentionStore for PgRetentionStore<'_> {
     async fn purge_metadata(&mut self, now: i64) -> Result<u64, CleanupError> {
         PgValidationStore::new(self.client)
-            .purge_expired(now)
+            .purge_metadata_due(now, CLEANUP_SAFETY_WINDOW_S)
             .await
             .map_err(|error| match error {
                 ValidationError::InvalidTime => CleanupError::InvalidTime,
@@ -163,9 +176,8 @@ impl RetentionStore for PgRetentionStore<'_> {
     /// timeout is an error, never a zero-backlog receipt. Dropping the waiter
     /// does not guarantee server cancellation; row locks do not hide backlog.
     async fn metadata_backlog(&mut self, now: i64) -> Result<MetadataBacklog, CleanupError> {
-        if now <= 0 {
-            return Err(CleanupError::InvalidTime);
-        }
+        let (expires_before, validated_before) = metadata_cutoffs(now, CLEANUP_SAFETY_WINDOW_S)
+            .map_err(|_| CleanupError::InvalidTime)?;
         let oldest = now - VALIDATION_TTL_S;
         let tx = self
             .client
@@ -176,13 +188,19 @@ impl RetentionStore for PgRetentionStore<'_> {
             .await
             .map_err(|_| CleanupError::Store)?;
         let row = tx
-            .query_one(BACKLOG_SQL, &[&now, &oldest])
+            .query_one(
+                BACKLOG_SQL,
+                &[&now, &oldest, &expires_before, &validated_before],
+            )
             .await
             .map_err(|_| CleanupError::Store)?;
         let retained: i64 = row.try_get(0).map_err(|_| CleanupError::Store)?;
         let expired: i64 = row.try_get(1).map_err(|_| CleanupError::Store)?;
+        let due: i64 = row.try_get(3).map_err(|_| CleanupError::Store)?;
         let backlog = MetadataBacklog {
             retained_rows: retained.try_into().map_err(|_| CleanupError::Store)?,
+            due_rows: due.try_into().map_err(|_| CleanupError::Store)?,
+            oldest_due_validated_at: row.try_get(4).map_err(|_| CleanupError::Store)?,
             expired_rows: expired.try_into().map_err(|_| CleanupError::Store)?,
             oldest_expired_validated_at: row.try_get(2).map_err(|_| CleanupError::Store)?,
         };
@@ -197,6 +215,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::task::{Context, Wake, Waker};
+
+    #[test]
+    fn explicit_cutoffs_keep_the_real_clock_and_reject_overflow() {
+        let now = 1_700_000_000;
+        assert_eq!(metadata_cutoffs(now, 0), Ok((now, now - VALIDATION_TTL_S)));
+        assert_eq!(
+            metadata_cutoffs(now, CLEANUP_SAFETY_WINDOW_S),
+            Ok((
+                now + CLEANUP_SAFETY_WINDOW_S,
+                now - VALIDATION_TTL_S + CLEANUP_SAFETY_WINDOW_S
+            ))
+        );
+        assert_eq!(
+            metadata_cutoffs(1, CLEANUP_SAFETY_WINDOW_S),
+            Ok((86_401, 1 - 29 * 86_400))
+        );
+        assert!(
+            metadata_cutoffs(i64::MAX - CLEANUP_SAFETY_WINDOW_S, CLEANUP_SAFETY_WINDOW_S).is_ok()
+        );
+        for (now, window) in [
+            (0, CLEANUP_SAFETY_WINDOW_S),
+            (i64::MIN, CLEANUP_SAFETY_WINDOW_S),
+            (i64::MAX, CLEANUP_SAFETY_WINDOW_S),
+            (now, -1),
+            (now, VALIDATION_TTL_S),
+        ] {
+            assert_eq!(
+                metadata_cutoffs(now, window),
+                Err(ValidationError::InvalidTime)
+            );
+        }
+    }
 
     struct ThreadWake(std::thread::Thread);
 

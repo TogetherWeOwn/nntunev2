@@ -17,11 +17,10 @@ Worker compilation. The required `api-migrations` job owns the relocated
 The integration contract keeps app writes/state on `HYPERDRIVE`, mirror reads
 on a separate read-only `MB_DB` connection, and validation on a runtime Secret.
 It still needs scheduled and authenticated entry points, app-owned durable
-leases/cursors/receipts, and generated configuration parity. Cleanup must run
-independently of validation credentials, delete unrefreshed metadata with a
-one-day safety window, and measure both due and hard-expired backlog before
-metadata-producing work is admitted. Those changes are not implemented by
-this move. Staging must not have recurring curation triggers when idle;
+leases/cursors/receipts, and generated configuration parity. Independent cleanup
+now selects unrefreshed metadata with a one-day safety window and audits both
+due and hard-expired backlog. Runtime headroom admission, receipt persistence
+and alerts are not implemented yet. Staging must not have recurring curation triggers when idle;
 bounded trusted qualification and actual binding/grant/Secret verification
 remain rollout prerequisites. No binding, trigger, grant or Secret is
 installed by relocating source.
@@ -292,12 +291,18 @@ submissions; deduplication itself does not check moderation.
 The proposed schema carries `validated_at` / `expires_at`. Writers must
 set those fields together with validation data. Fresh-link reads and the
 PostgreSQL maintenance adapter enforce validation age independently of the
-stored expiry. Cleanup removes API-returned fields when `expires_at <= now`
-**or** `validated_at <= now - 30 days`, including the exact boundary, so an
-overlong stored expiry cannot extend retention. Metadata with a nonpositive
-validation timestamp is also removed. Cleanup preserves IDs, provenance,
-first-seen time and the validation timestamp (the stale-write fence), sets
-status to `expired` and expiry to zero, and is idempotent.
+stored expiry. The validator's `purge_expired` removes API-returned fields at
+`expires_at <= now` **or** `validated_at <= now - 30 days`. Independent retention
+cleanup uses an explicit one-day safety window: `expires_at <= now + 1 day`
+**or** `validated_at <= now - 29 days`, including the exact boundary. Both also
+remove metadata with nonpositive validation timestamps. A timestamp newer than
+the invocation clock is not by itself invalid: a concurrent refresh may have
+started later. Such a fresh refresh survives both cleanup and audit at the older
+clock. An overlong stored expiry cannot extend retention. The trusted clock is never advanced
+to simulate early deletion. Cutoff overflow and invalid clocks fail before SQL.
+Cleanup preserves IDs, provenance, first-seen time and the validation timestamp
+(the stale-write fence), sets status to `expired` and expiry to zero, and is
+idempotent.
 
 The due-ID selector independently includes nonpositive validation timestamps
 and validations reaching 30 days within the next 24 hours, even if their
@@ -311,8 +316,9 @@ passed at `c4cd0380289405aad4a6410d71bc9dc3e4074bb8`. Web E2E remained
 running at capture; this is not aggregate CI or deployed cleanup evidence.
 No local tests/builds ran.
 
-Each `purge_expired` call clears at most 200 recording/video rows in one
-transaction, ordered by the composite key and joined back by both columns.
+Each purge call clears at most 200 recording/video rows in one transaction,
+ordered by validation timestamp, expiry and composite key, and joined back by
+both key columns. Oldest validations take priority over key order.
 `FOR UPDATE SKIP LOCKED` allows cleanup of unlocked rows without waiting for
 one held row. It does not bypass table locks; the 1.5-second statement timeout
 still applies. A fresh association sharing an expired row's video ID is not
@@ -353,8 +359,10 @@ audit is not reported as a healthy or empty backlog.
 
 `PgRetentionStore` delegates writes to the existing cleanup adapter and audits
 in a read-only transaction with a 1.5-second statement timeout. One aggregate
-statement counts retained and expired recording/video rows and returns the
-oldest expired validation timestamp. It matches cleanup eligibility, including
+statement counts retained, cleanup-due and hard-expired/invalid recording/video
+rows, with separate oldest due and expired validation timestamps. Due includes
+the one-day pre-deadline window; hard-expired/invalid does not shift with that
+window. It matches cleanup eligibility, including
 API-derived validated/rejected states with no display fields and unexpected
 metadata on pending/expired rows. It never selects display fields or IDs into
 the result. Unlike cleanup, the audit does not skip row locks: committed
@@ -363,12 +371,13 @@ table locks can time out; errors never become zero counts.
 
 The audit has a fixed-size result, **not bounded scan work**. Its counts are
 from one statement snapshot and use the trusted invocation clock carried as
-`evaluated_at`, not audit completion time. Concurrent changes and time elapsed
-during the invocation can change the live backlog. Nonpositive validation
-timestamps remain literal values, not a measured age. Receipt persistence,
-alerts, runtime scheduling, throughput/lock monitoring and exact deployed
-retention evidence remain unfinished; a successful empty audit is not a
-continuous 30-day guarantee.
+`evaluated_at`, not audit completion time; the report also states `safety_window_s`.
+Concurrent changes and time elapsed during the invocation can change the live
+backlog. Invalid validation timestamps remain literal values, not a measured
+age. Receipt persistence, alerts, runtime scheduling, measured capacity/headroom
+admission and exact deployed retention evidence remain unfinished. Positive
+hard-expired/invalid backlog needs incident handling, not a healthy receipt;
+a successful empty audit is not a continuous 30-day guarantee.
 
 Five native acceptance fixtures cover zero-with-backlog, the write cap,
 partial failure, failed audit and invalid clock/count receipts. A deadline
@@ -376,7 +385,14 @@ unit fixture checks cancellation and retained progress. The disposable
 PostgreSQL contract adds independent visibility of a held overdue row,
 post-release cleanup, cap/resume/replay, empty and metadata-only/state-only
 rows, invalid timestamps, exact expiry/age boundaries and table-lock errors.
-These new fixtures await exact-head Actions; no local tests/builds ran.
+The API relocation head `978dbf39dad8364f36c9d5c0d7e56881a6ef6c31` passed
+[API](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42039488786/job/127286213123)
+and [PostgreSQL](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42039488786/job/127286213382)
+jobs; web E2E was still running at capture, so no aggregate success is claimed.
+The newer safety-window fixtures add exact age/expiry boundaries, due-only
+locked backlog, newer concurrent checked refresh preservation,
+oldest-first batch priority and cutoff overflow. Their execution awaits
+new-head Actions; no local tests/builds ran.
 
 ## Moderation queue
 

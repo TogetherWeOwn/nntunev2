@@ -632,6 +632,8 @@ async fn cleanup_progress_is_bounded(db: &mut Client, config: &Config) {
             .unwrap(),
         MetadataBacklog {
             retained_rows: 2,
+            due_rows: 1,
+            oldest_due_validated_at: Some(stale),
             expired_rows: 1,
             oldest_expired_validated_at: Some(stale),
         },
@@ -651,6 +653,8 @@ async fn cleanup_progress_is_bounded(db: &mut Client, config: &Config) {
         report.backlog.unwrap(),
         MetadataBacklog {
             retained_rows: 1,
+            due_rows: 0,
+            oldest_due_validated_at: None,
             expired_rows: 0,
             oldest_expired_validated_at: None,
         }
@@ -667,6 +671,8 @@ async fn retention_audit_contract(db: &mut Client) {
     reset_candidates(db).await;
     let empty = MetadataBacklog {
         retained_rows: 0,
+        due_rows: 0,
+        oldest_due_validated_at: None,
         expired_rows: 0,
         oldest_expired_validated_at: None,
     };
@@ -731,7 +737,7 @@ async fn retention_audit_contract(db: &mut Client) {
     .await
     .unwrap();
     let before = states(db).await;
-    for now in [0, -1, i64::MIN] {
+    for now in [0, -1, i64::MIN, i64::MAX] {
         let mut store = PgRetentionStore::new(db);
         assert_eq!(
             store.metadata_backlog(now).await,
@@ -749,6 +755,8 @@ async fn retention_audit_contract(db: &mut Client) {
             .unwrap(),
         MetadataBacklog {
             retained_rows: 6,
+            due_rows: 5,
+            oldest_due_validated_at: Some(-1),
             expired_rows: 5,
             oldest_expired_validated_at: Some(-1),
         }
@@ -766,6 +774,8 @@ async fn retention_audit_contract(db: &mut Client) {
         report.backlog.unwrap(),
         MetadataBacklog {
             retained_rows: 1,
+            due_rows: 0,
+            oldest_due_validated_at: None,
             expired_rows: 0,
             oldest_expired_validated_at: None,
         }
@@ -803,6 +813,173 @@ async fn retention_audit_contract(db: &mut Client) {
         .unwrap();
     assert_eq!((report.purged_rows, report.batches), (0, 1));
     assert_eq!(report.backlog.unwrap(), empty);
+}
+
+async fn retention_safety_window_contract(db: &mut Client, config: &Config) {
+    use nntune_api::videolinks::retention::CLEANUP_SAFETY_WINDOW_S;
+
+    reset_candidates(db).await;
+    seed(db, 8).await;
+    let due_age = NOW - VALIDATION_TTL_S + CLEANUP_SAFETY_WINDOW_S;
+    db.execute(
+        "UPDATE public.video_link_candidates SET status = 'validated', title = 'retained',
+             validated_at = $1, expires_at = $2",
+        &[&NOW, &(NOW + VALIDATION_TTL_S)],
+    )
+    .await
+    .unwrap();
+    for (id, validated_at, expires_at) in [
+        (0, due_age, NOW + VALIDATION_TTL_S),
+        (2, due_age + 1, NOW + VALIDATION_TTL_S),
+        (3, NOW, NOW + CLEANUP_SAFETY_WINDOW_S),
+        (4, NOW, NOW + CLEANUP_SAFETY_WINDOW_S + 1),
+        (5, NOW - VALIDATION_TTL_S, NOW + VALIDATION_TTL_S),
+        (6, NOW + 1, NOW + VALIDATION_TTL_S),
+        (7, due_age, NOW + VALIDATION_TTL_S),
+    ] {
+        db.execute(
+            "UPDATE public.video_link_candidates SET validated_at = $1, expires_at = $2
+             WHERE video_id = $3",
+            &[&validated_at, &expires_at, &format!("v{id:010}")],
+        )
+        .await
+        .unwrap();
+    }
+    db.batch_execute(
+        "UPDATE public.video_link_candidates SET status = 'rejected', title = NULL
+         WHERE video_id = 'v0000000007'",
+    )
+    .await
+    .unwrap();
+    let before = states(db).await;
+    let mut locker = connect(config).await;
+    let lock = locker.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT video_id FROM public.video_link_candidates
+         WHERE video_id = 'v0000000000' FOR UPDATE",
+        &[],
+    )
+    .await
+    .unwrap();
+    let backlog = PgRetentionStore::new(db)
+        .metadata_backlog(NOW)
+        .await
+        .unwrap();
+    assert_eq!(backlog.retained_rows, 8);
+    assert_eq!((backlog.due_rows, backlog.expired_rows), (4, 1));
+    assert_eq!(
+        backlog.oldest_due_validated_at,
+        Some(NOW - VALIDATION_TTL_S)
+    );
+    assert_eq!(
+        backlog.oldest_expired_validated_at,
+        Some(NOW - VALIDATION_TTL_S)
+    );
+    assert_eq!(states(db).await, before, "audit is read-only");
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!(report.evaluated_at, NOW, "never advance the trusted clock");
+    assert_eq!(report.safety_window_s, CLEANUP_SAFETY_WINDOW_S);
+    assert_eq!(report.purged_rows, 3);
+    let backlog = report.backlog.unwrap();
+    assert_eq!(
+        (
+            backlog.retained_rows,
+            backlog.due_rows,
+            backlog.expired_rows
+        ),
+        (5, 1, 0)
+    );
+    assert_eq!(backlog.oldest_due_validated_at, Some(due_age));
+    assert_eq!(backlog.oldest_expired_validated_at, None);
+    let after = states(db).await;
+    for id in [0, 1, 2, 4, 6] {
+        assert_eq!(after[id], before[id], "fresh or locked row preserved");
+    }
+    for id in [3, 5, 7] {
+        assert_eq!(after[id].1, "expired");
+        assert_eq!(after[id].2, None);
+        assert_eq!(after[id].3, before[id].3, "retain the stale-write fence");
+    }
+    // A committed refresh after the audit must survive the later purge: the
+    // audit is not a list of row keys that may be cleared unconditionally.
+    lock.rollback().await.unwrap();
+    let later = checked_batch(NOW + 1).await;
+    assert_eq!(
+        PgValidationStore::new(db)
+            .apply_batch(&later)
+            .await
+            .unwrap(),
+        1
+    );
+    let refreshed = states(db).await;
+    assert_eq!(refreshed[0].1, "rejected");
+    assert_eq!(refreshed[0].3, NOW + 1);
+    let report = cleanup_metadata(&mut PgRetentionStore::new(db), NOW)
+        .await
+        .unwrap();
+    assert_eq!(report.purged_rows, 0);
+    let backlog = report.backlog.unwrap();
+    assert_eq!((backlog.due_rows, backlog.expired_rows), (0, 0));
+    assert_eq!(
+        states(db).await,
+        refreshed,
+        "a later checked refresh survives an older cleanup clock"
+    );
+    assert_eq!(
+        PgValidationStore::new(db).purge_expired(NOW).await.unwrap(),
+        0
+    );
+    assert_eq!(states(db).await, refreshed);
+
+    // Give the oldest row the last key: age priority, not key order, must
+    // select it in the first bounded batch.
+    reset_candidates(db).await;
+    seed(db, MAX_PURGES_PER_CALL as i32 + 1).await;
+    db.execute(
+        "UPDATE public.video_link_candidates SET status = 'validated', title = 'due',
+             validated_at = $1, expires_at = $2",
+        &[&due_age, &(NOW + VALIDATION_TTL_S)],
+    )
+    .await
+    .unwrap();
+    let oldest_id = format!("v{MAX_PURGES_PER_CALL:010}");
+    db.execute(
+        "UPDATE public.video_link_candidates SET validated_at = $1 WHERE video_id = $2",
+        &[&(due_age - 1), &oldest_id],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PgRetentionStore::new(db).purge_metadata(NOW).await.unwrap(),
+        200
+    );
+    let row = db
+        .query_one(
+            "SELECT title FROM public.video_link_candidates WHERE video_id = $1",
+            &[&oldest_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, Option<String>>(0),
+        None,
+        "oldest row is not starved by key order"
+    );
+    let backlog = PgRetentionStore::new(db)
+        .metadata_backlog(NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            backlog.retained_rows,
+            backlog.due_rows,
+            backlog.expired_rows
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(backlog.oldest_due_validated_at, Some(due_age));
 }
 
 async fn earlier_batch_survives(db: &mut Client) {
@@ -1707,6 +1884,7 @@ fn postgres_validation_store_contract() {
                 contention_is_bounded(&mut db, &config).await;
                 cleanup_progress_is_bounded(&mut db, &config).await;
                 retention_audit_contract(&mut db).await;
+                retention_safety_window_contract(&mut db, &config).await;
                 earlier_batch_survives(&mut db).await;
                 candidate_admission_contract(&mut db).await;
                 fresh_link_read_contract(&mut db).await;

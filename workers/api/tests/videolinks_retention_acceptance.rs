@@ -1,7 +1,8 @@
 //! Credential-independent cleanup receipts, not a deployed retention schedule.
 
 use nntune_api::videolinks::retention::{
-    cleanup_metadata, CleanupError, MetadataBacklog, RetentionStore, MAX_CLEANUP_BATCHES,
+    cleanup_metadata, CleanupError, MetadataBacklog, RetentionStore, CLEANUP_SAFETY_WINDOW_S,
+    MAX_CLEANUP_BATCHES,
 };
 use nntune_api::videolinks::validation::MAX_PURGES_PER_CALL;
 use std::collections::VecDeque;
@@ -44,6 +45,8 @@ fn store(purges: Vec<Result<u64, CleanupError>>) -> Store {
         purges: purges.into(),
         backlog: Ok(MetadataBacklog {
             retained_rows: 3,
+            due_rows: 2,
+            oldest_due_validated_at: Some(NOW - 3_000_000),
             expired_rows: 1,
             oldest_expired_validated_at: Some(NOW - 3_000_000),
         }),
@@ -57,6 +60,7 @@ fn zero_purge_still_audits_locked_backlog_without_claiming_it_is_drained() {
     let report = block_on(cleanup_metadata(&mut store, NOW)).unwrap();
     assert_eq!((report.batches, report.purged_rows), (1, 0));
     assert_eq!(report.evaluated_at, NOW);
+    assert_eq!(report.safety_window_s, CLEANUP_SAFETY_WINDOW_S);
     assert_eq!(report.backlog, Some(store.backlog.clone().unwrap()));
     assert_eq!(store.events, ["purge", "audit"]);
 }
@@ -104,7 +108,13 @@ fn failed_audit_is_not_a_successful_retention_receipt() {
 
 #[test]
 fn invalid_clocks_and_unbounded_store_receipts_fail_closed() {
-    for now in [0, -1, i64::MIN] {
+    for now in [
+        0,
+        -1,
+        i64::MIN,
+        i64::MAX - CLEANUP_SAFETY_WINDOW_S + 1,
+        i64::MAX,
+    ] {
         let mut store = store(Vec::new());
         let failure = block_on(cleanup_metadata(&mut store, now)).unwrap_err();
         assert_eq!(failure.error, CleanupError::InvalidTime);
