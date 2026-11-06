@@ -80,6 +80,88 @@ function end(audio: AudioFake) {
 	audio.emit('ended');
 }
 
+describe('native zero-assignment boundary', () => {
+	for (const outcome of ['throw', 'sticky', 'nan', 'infinity', 'negative-infinity', 'success'] as const) {
+		it(`delivers completion only after a normal ${outcome} setter return, before observations`, () => {
+			const state = setup();
+			let position = 37;
+			let assigned = false;
+			let reset = false;
+			const writes: number[] = [];
+			state.audio.duration = NaN;
+			Object.defineProperty(state.audio, 'currentTime', {
+				get: () => { if (assigned) expect(reset).toBe(true); return position; },
+				set: (value: number) => {
+					writes.push(value);
+					expect(reset).toBe(false);
+					if (outcome === 'throw') throw new Error('refused');
+					if (outcome === 'success') position = value;
+					if (outcome === 'nan') position = NaN;
+					if (outcome === 'infinity') position = Infinity;
+					if (outcome === 'negative-infinity') position = -Infinity;
+					assigned = true;
+				}
+			});
+			const onAssigned = vi.fn(() => { expect(assigned).toBe(true); reset = true; });
+			expect(state.transport.seekToStart({ isCurrent: () => true, onAssigned })).toBe(outcome === 'success');
+			expect(writes).toEqual([0]);
+			expect(onAssigned).toHaveBeenCalledTimes(outcome === 'throw' ? 0 : 1);
+			expect(reset).toBe(outcome !== 'throw');
+			expect(state.audio.play).not.toHaveBeenCalled();
+			expect(state.audio.load).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const point of ['before', 'setter', 'reset'] as const) {
+		it(`stops stale zero-seek continuation at ${point}`, () => {
+			const state = setup();
+			let current = point !== 'before';
+			let position = 37;
+			const writes: number[] = [];
+			Object.defineProperty(state.audio, 'currentTime', {
+				get: () => position,
+				set: (value: number) => { writes.push(value); position = value; if (point === 'setter') current = false; }
+			});
+			state.onchange.mockClear();
+			const onAssigned = vi.fn(() => { if (point === 'reset') current = false; });
+			expect(state.transport.seekToStart({ isCurrent: () => current, onAssigned })).toBe(false);
+			expect(writes).toEqual(point === 'before' ? [] : [0]);
+			expect(onAssigned).toHaveBeenCalledTimes(point === 'reset' ? 1 : 0);
+			expect(state.onchange).not.toHaveBeenCalled();
+			expect(state.audio.play).not.toHaveBeenCalled();
+		});
+	}
+
+	it('does not retain the completion callback for ordinary seeks', () => {
+		const state = setup();
+		const onAssigned = vi.fn();
+		expect(state.transport.seekToStart({ isCurrent: () => true, onAssigned })).toBe(true);
+		expect(state.transport.seek(10)).toBe(true);
+		expect(onAssigned).toHaveBeenCalledOnce();
+	});
+
+	it('cancels pending resume even when a zero setter throws', () => {
+		const state = setup({ [RESUME_STORAGE_KEY]: '{"second":25}' });
+		const next = new AudioFake();
+		next.src = SECOND.streamUrl;
+		next.duration = NaN;
+		let position = 37;
+		let refuse = true;
+		Object.defineProperty(next, 'currentTime', {
+			get: () => position,
+			set: (value: number) => { if (refuse) throw new Error('refused'); position = value; }
+		});
+		state.transport.connect(next.element, SECOND);
+		const onAssigned = vi.fn();
+		expect(state.transport.seekToStart({ isCurrent: () => true, onAssigned })).toBe(false);
+		refuse = false;
+		next.duration = 100;
+		next.emit('loadedmetadata');
+		expect(position).toBe(37);
+		expect(onAssigned).not.toHaveBeenCalled();
+	});
+});
+
 describe('app player transport', () => {
 	it('distinguishes pending play, audible playback, interruption and manual pause', async () => {
 		const state = setup();

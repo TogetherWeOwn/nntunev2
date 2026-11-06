@@ -7,9 +7,12 @@ import io
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -481,6 +484,105 @@ class GitFixture(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(migrations_rename_check.main(args), 1)
 
+    def run_workflow(self, pages, metadata, api_exit=0):
+        from test_ci_pnpm_retry import split_jobs, split_steps, step_field
+
+        source = pathlib.Path(__file__).resolve().parents[2]
+        job = split_jobs((source / ".github/workflows/migrations-staging.yml").read_text())["migrations-staging"]
+        steps = split_steps(job)
+        command = "\n".join(textwrap.dedent(next(
+            step for step in steps if step_field(step, "name") == name
+        ).split("        run: |\n", 1)[1]) for name in (
+            "Collect pinned PR API evidence", "Check migration rename history"))
+        workspace_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace_tmp.cleanup)
+        workspace = pathlib.Path(workspace_tmp.name)
+        (workspace / "pr-data").symlink_to(self.root, target_is_directory=True)
+        scripts = workspace / "trusted-checker/.github/scripts"
+        scripts.mkdir(parents=True)
+        for name in ("migration_history.py", "migrations_rename_check.py"):
+            shutil.copyfile(source / ".github/scripts" / name, scripts / name)
+        api = workspace / "api"
+        api.mkdir()
+        self.workflow_api = api
+        self.assertFalse((self.root / ".github/scripts").exists())
+        (api / "files.json").write_text(json.dumps(pages))
+        (api / "metadata.json").write_text(json.dumps(metadata))
+        # Exercise the actual workflow shell and jq, replacing only the network.
+        stub = api / "gh"
+        stub.write_text(
+            "#!/usr/bin/env python3\nimport os, pathlib, sys\n"
+            "root = pathlib.Path(os.environ['RUNNER_TEMP'])\n"
+            "files = '/files?' in sys.argv[-1]\n"
+            "print((root / ('files.json' if files else 'metadata.json')).read_text())\n"
+            "sys.exit(int(os.environ['API_EXIT']) if files else 0)\n"
+        )
+        stub.chmod(0o755)
+        env = {**os.environ, "PATH": str(api) + os.pathsep + os.environ["PATH"],
+               "BASH_ENV": "/dev/null", "RUNNER_TEMP": str(api), "REPO": "example/project", "PR_NUMBER": "1",
+               "BASE_SHA": self.base, "HEAD_SHA": self.git("rev-parse", "HEAD"),
+               "GITHUB_WORKSPACE": str(workspace), "API_EXIT": str(api_exit)}
+        return subprocess.run(["bash", "-eo", "pipefail", "-c", command], cwd=api,
+                              env=env, capture_output=True, text=True, timeout=30)
+
+    def workflow_inputs(self):
+        entries = self.chain()
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("record source metadata")
+        files = [{"filename": "migrations/manifest.toml", "status": "modified"}] + [
+            {"filename": "migrations/" + e["file"], "status": "added"} for e in entries]
+        files += [{"filename": f"docs/file-{i}.md", "status": "modified"} for i in range(97)]
+        files += [{"filename": "docs/new.md", "previous_filename": "docs/old.md", "status": "renamed"}]
+        metadata = {"base": {"sha": self.base}, "head": {"sha": head}, "changed_files": len(files)}
+        return [files[:100], files[100:]], metadata
+
+    def test_workflow_projects_large_patches_retaining_complete_pages_and_history(self):
+        pages, metadata = self.workflow_inputs()
+        pages[0][0]["patch"] = "x" * (history.MAX_INPUT + 1)
+        metadata["body"] = "y" * (history.MAX_INPUT + 1)
+        result = self.run_workflow(pages, metadata)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("pinned Git source lineage and applied aliases verified", result.stdout)
+        compact = history.read_input(self.workflow_api / "pr-files.json")
+        projected = json.loads(compact)
+        self.assertEqual([100, 1], [len(page) for page in projected])
+        self.assertEqual(pages[-1], projected[-1])  # Includes the non-migration rename.
+        self.assertEqual(set(pages[0][0]) - {"patch"}, set(projected[0][0]))
+        self.assertNotIn("body", json.loads(history.read_input(self.workflow_api / "pr-metadata.json")))
+
+    def test_workflow_projection_keeps_fail_closed_coverage_checks(self):
+        pages, metadata = self.workflow_inputs()
+        for mutation, diagnostic in (("truncated", "truncated or duplicated"),
+                                     ("short-page", "pagination is malformed or incomplete"),
+                                     ("missing-migration", "API migration coverage differs"),
+                                     ("missing-old-path", "distinct old path"),
+                                     ("stale-head", "pinned event commits"),
+                                     ("file-cap", "file count missing or at truncation bound"),
+                                     ("oversized-path", "input byte bound exceeded")):
+            broken, meta = copy.deepcopy(pages), copy.deepcopy(metadata)
+            if mutation == "truncated":
+                broken.pop()
+            elif mutation == "short-page":
+                broken[-1].insert(0, broken[0].pop())
+            elif mutation == "file-cap":
+                meta["changed_files"] = history.MAX_FILES
+            elif mutation == "oversized-path":
+                broken[-1][-1]["filename"] = "docs/" + "x" * history.MAX_INPUT
+            elif mutation == "missing-migration":
+                broken[0][1] = {"filename": "docs/substitute.md", "status": "added"}
+            elif mutation == "missing-old-path":
+                del broken[-1][-1]["previous_filename"]
+            else:
+                meta["head"]["sha"] = self.base
+            with self.subTest(mutation=mutation):
+                result = self.run_workflow(broken, meta)
+                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+        # A plausible complete response followed by an API failure must not pass.
+        result = self.run_workflow(pages, metadata, api_exit=7)
+        self.assertEqual(7, result.returncode, result.stdout + result.stderr)
+        self.assertNotIn("verified", result.stdout)
+
     def test_duplicate_net_and_git_coverage_is_idempotent(self):
         self.write("0001_old.sql")
         self.commit()
@@ -496,6 +598,132 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(len(h.events), 1)
         self.assertEqual(len(states["migrations/0002_final.sql"][1]), 1)
         self.assertEqual(h.collect(), states)
+
+    def workflow_checker(self, entries, *, poison=False, files=None, metadata=None,
+                         missing=None, truncated=False, missing_code=False):
+        """Run the real isolated workflow launcher against checker-free PR data."""
+        scripts = pathlib.Path(__file__).resolve().parent
+        workflow = (scripts.parent / "workflows/migrations-staging.yml").read_text()
+        launcher = re.search(r"<<'PY'\n(.*?)^          PY$", workflow, re.M | re.S)
+        self.assertIsNotNone(launcher, "workflow must isolate trusted imports from old PR data")
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("record source metadata")
+        self.assertFalse((self.root / ".github/scripts/migrations_rename_check.py").exists())
+        if poison:
+            # These must remain inert even when the data directory is cwd and
+            # PYTHONPATH. No attacker-provided code is executed by the fixture.
+            bad = "raise RuntimeError('PR-controlled Python must not load')\n"
+            (self.root / ".github/scripts").mkdir(parents=True)
+            for directory in (self.root, self.root / ".github/scripts"):
+                for name in ("migrations_rename_check.py", "migration_history.py", "json.py", "sitecustomize.py"):
+                    (directory / name).write_text(bad)
+        if files is None:
+            files = [[{"filename": "migrations/manifest.toml", "status": "modified"}] + [
+                {"filename": "migrations/" + e["file"], "status": "added"} for e in entries]]
+        if metadata is None:
+            metadata = {"base": {"sha": self.base}, "head": {"sha": head},
+                        "changed_files": sum(len(page) for page in files)}
+        # Evidence is outside the untrusted checkout, like RUNNER_TEMP in CI.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp)
+            (evidence / "files.json").write_text(json.dumps(files))
+            (evidence / "metadata.json").write_text(json.dumps(metadata))
+            if missing:
+                (evidence / missing).unlink()
+            if truncated:
+                (evidence / "files.json").write_text("[[")
+            if missing_code:
+                scripts = evidence / "absent-trusted-scripts"
+            args = [sys.executable, "-I", "-", str(scripts), "--root", str(self.root),
+                    "--base-sha", self.base, "--head-sha", head,
+                    "--files-file", str(evidence / "files.json"),
+                    "--metadata-file", str(evidence / "metadata.json")]
+            return subprocess.run(args, input=textwrap.dedent(launcher.group(1)),
+                                  cwd=self.root, env=dict(os.environ, PYTHONPATH=str(self.root)),
+                                  capture_output=True, text=True, timeout=30)
+
+    def test_workflow_trusted_checker_is_available_before_checker_exists(self):
+        entries = self.chain()
+        result = self.workflow_checker(entries)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pinned Git source lineage", result.stdout)
+
+    def test_workflow_old_head_cannot_replace_executable_or_imports(self):
+        result = self.workflow_checker(self.chain(), poison=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_workflow_trusted_checker_still_refuses_missing_lineage(self):
+        entries = self.chain()
+        entries[0]["source_rename_history"] = []
+        result = self.workflow_checker(entries)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("lacks source_rename_history", result.stderr)
+
+    def test_workflow_trusted_checker_refuses_forged_lineage(self):
+        entries = self.chain()
+        entries[0]["source_rename_history"][0]["commit"] = "0" * 40
+        result = self.workflow_checker(entries)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("forged, missing, unreachable", result.stderr)
+
+    def test_workflow_trusted_checker_refuses_invalid_lineage(self):
+        entries = self.chain()
+        entries[0]["source_rename_history"][0]["old_path"] = "migrations/../invalid.sql"
+        result = self.workflow_checker(entries)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("source rename paths must be distinct flat migration paths", result.stderr)
+
+    def test_workflow_missing_metadata_fails(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), missing="metadata.json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read history input", result.stderr)
+
+    def test_workflow_truncated_input_fails(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), truncated=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("invalid API JSON", result.stderr)
+
+    def test_workflow_incomplete_api_coverage_fails(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), files=[[
+            {"filename": "migrations/manifest.toml", "status": "modified"}]])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("coverage differs", result.stderr)
+
+    def test_workflow_missing_trusted_code_never_falls_back_to_pr(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), poison=True, missing_code=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ModuleNotFoundError", result.stderr)
+        self.assertNotIn("PR-controlled Python must not load", result.stderr)
+
+
+class WorkflowBoundary(unittest.TestCase):
+    def test_separate_immutable_code_and_data_pins(self):
+        workflow = (pathlib.Path(__file__).resolve().parents[1] /
+                    "workflows/migrations-staging.yml").read_text()
+        code, data = workflow.split("      - name: Check out pinned PR evidence")
+        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", code)
+        self.assertIn("path: trusted-checker", code)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", data)
+        self.assertIn("path: pr-data", data)
+        self.assertIn("fetch-depth: 0", data)
+        self.assertEqual(workflow.count("persist-credentials: false"), 2)
+        check = workflow.split("      - name: Check migration rename history")[1]
+        self.assertIn("working-directory: ${{ runner.temp }}", check)
+        self.assertIn('python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', check)
+        self.assertIn('--root "$GITHUB_WORKSPACE/pr-data"', check)
+        self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", check)
+        self.assertIn("GIT_CONFIG_KEY_0: core.hooksPath", check)
+        self.assertIn("GIT_CONFIG_KEY_1: core.fsmonitor", check)
+        self.assertNotIn("GH_TOKEN", check)
+        self.assertNotIn("secrets.", check)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertIn("    name: migrations-staging", workflow)
+        self.assertIn("  contents: read", workflow)
+        self.assertIn("  pull-requests: read", workflow)
 
 
 class StrictInputs(unittest.TestCase):

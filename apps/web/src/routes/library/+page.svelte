@@ -769,6 +769,8 @@
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		// Same-source navigation also retires the persistent jump readout.
+		player.retireJumpForShare(target.trackId, source);
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
 		void tick().then(() => applyPendingShareSeek());
@@ -798,11 +800,13 @@
 		}
 	}
 
-	function handleSeeking(): void {
+	function handleSeeking(event: Event): void {
+		const element = audioEl;
+		if (!element || event.currentTarget !== element) return;
 		// A listener's own seek wins over a pending late-duration adjustment.
 		if (
 			pendingShareSeek?.appliedSeconds != null &&
-			audioEl?.currentTime !== pendingShareSeek.appliedSeconds
+			element.currentTime !== pendingShareSeek.appliedSeconds
 		) {
 			pendingShareSeek = null;
 		}
@@ -810,10 +814,14 @@
 
 	// Both the visible control and guarded shortcut notify this route before
 	// restarting, so later metadata cannot resurrect an inbound share seek.
-	function supersedeShareSeek(trackId: string, source: string): void {
+	function supersedePositionSeek(trackId: string, source: string): void {
 		if (pendingShareSeek?.trackId === trackId && pendingShareSeek.streamUrl === source) {
 			pendingShareSeek = null;
 		}
+	}
+
+	function supersedeShareSeek(trackId: string, source: string): void {
+		supersedePositionSeek(trackId, source);
 		restartSupersededSources.add(`${trackId}\n${source}`);
 	}
 
@@ -1425,6 +1433,7 @@
 		window.addEventListener('pagehide', recordFindQuery);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		const unsubscribeRestart = player.onBeforeRestart(supersedeShareSeek);
+		const unsubscribePosition = player.onBeforePositionIntent(supersedePositionSeek);
 		const unsubscribeNavigation = player.onBeforeNavigate((next) => retireQueueWork(next, true));
 		const unsubscribeFavorite = player.onQueuedFavorite(afterQueuedFavorite);
 		const unsubscribeInsert = player.onQueueInsert(insertQueuedIds);
@@ -1453,6 +1462,7 @@
 			recordFindQuery();
 			unsubscribeLocal();
 			unsubscribeRestart();
+			unsubscribePosition();
 			unsubscribeNavigation();
 			unsubscribeFavorite();
 			window.removeEventListener('storage', handleAuthTransition);

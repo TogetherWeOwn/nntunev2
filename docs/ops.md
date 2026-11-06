@@ -397,6 +397,23 @@ are not PR deletions; no merge from the target is required to hide them.
 Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 
+The secretless PR gate loads its checker and its stdlib-only
+`migration_history.py` import from a separate checkout of the event's full
+trusted **base SHA**. The PR **head SHA** is checked out with full Git
+history under a different root, used only as evidence through `--root`;
+no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+excludes the working directory, `PYTHONPATH` and user-site imports, then
+adds only the trusted checker directory. The checker runs outside both
+checkouts with no API token in its environment; Git ignores global/system
+configuration and disables hooks and filesystem-monitor commands. The
+PR tree cannot supply Git's local configuration, which checkout creates.
+The checked-out head supplies the manifest while pinned Git objects supply
+SQL bytes and ancestry. A PR predating the checker can therefore be
+validated without executing its Python files. Missing trusted checker code,
+manifest, pinned Git objects or API evidence fails closed: there is no
+fallback to PR code and no missing-file pass. This compatibility boundary
+does not grant old heads an exception to the manifest or lineage contract.
+
 The secretless PR gate retains **both** coverage sources: complete,
 paginated net PR-file mappings and every per-parent Git rename in the
 pinned base-to-head ancestry. Net mappings are not invented direct
@@ -768,13 +785,20 @@ without a tag. Production therefore only ever deploys on the release path
 only (`environment: staging` on both deploy jobs). No other GitHub
 environment exists on this repo.
 
-- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
-  pull requests, not on `main`: record the PR whose squash commit is the
-  promotion SHA, and that they were green on that PR's final head
-  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
-  or recorded as a flake/quarantine decision with a card link, never
-  dismissed.
+- [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
+  URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
+  CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
+  never in a local CI mirror. Reviewers and the Release Manager accept
+  these exact-head links as CI evidence, not local full-suite transcripts
+  ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
+  `migrations-staging` and `Devin Review` report on pull requests, not on
+  `main`: record the PR whose squash commit is the promotion SHA, and that
+  they were green on that PR's final head. Answer any advisory CodeRabbit
+  findings without waiting for it. Required checks and review/release
+  gates are unchanged; this evidence does not authorize production or
+  replace the staging, migration and rollback boxes below. A red required
+  check is fixed in code or recorded as a flake/quarantine decision with
+  a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:233-241` runs

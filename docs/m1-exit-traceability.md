@@ -5,6 +5,15 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → library → meter → limits) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
+**Target-model note (2026-11-03):** the BYOP step is retired. Under
+ADR 0013/0014 users bring no provider or NZB; the target journey is
+signup → subscription/entitlement → play/seek over the admin-ingested
+shared catalogue, with ingest as an admin action rather than a user step.
+Rows below describe the current specs and their measured gaps, not proof
+that the shared catalogue or pool is implemented. Keep their current
+coverage and update this matrix in the same PRs that change the specs,
+per the rule below.
+
 Line numbers below track the cited specs; re-verify with the commands at the
 end of this document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -210,12 +219,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   while the staging legs prove liveness and fail-closed denial behind the
   Access edge with the Access pair only and no app session
   (`e2e/tests/api-worker-anonymous.spec.ts:531` "GET /healthz answers 200 with ok:true and no session",
-  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/vault answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/plans answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:586` "anonymous POST /v1/session/refresh answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:613` "anonymous POST /v1/session/revoke-all answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:637` "GET unknown worker path answers the 404 not_found envelope",
   `e2e/tests/api-worker-anonymous.spec.ts:656` "anonymous OPTIONS preflight is answered by Access and never reaches the Worker"):
-  `GET /healthz` answers 200 with ok true, the vault read and both session
+  `GET /healthz` answers 200 with ok true, the plans read and both session
   mutations answer the generic 401 with no cookie set, and the unknown path
   answers the not_found envelope — each leg first clears the Access-wall
   check so an edge denial can never masquerade as Worker evidence, with

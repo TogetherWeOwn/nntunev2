@@ -24,29 +24,22 @@
 //!   and is rejected in steady state.
 //! - strict secret codec (`secret-codec-flexible-vs-strict-b64`): the
 //!   shared-codec contract the env layer must decode through.
-//! - plaintext opt-in audit (`late-novel-plaintext-optin-audit-action`):
-//!   `plaintext_opt_in_save_audits_insecure_action`.
 //! - invite throttle (`late-novel-invite-redemption-unthrottled`):
 //!   `invite_budget_*` — the 11th redemption attempt is denied with the
 //!   generic error even with a valid code.
-//! - test-connection budget (`late-novel-test-connection-limit-10-vs-5`):
-//!   `test_connection_enforces_shared_five_per_minute_budget` — the HTTP
-//!   layer enforces the single documented 5/minute budget.
 //! - purpose confusion (round-2 regression): `register_finish_rejects_*`
 //!   and `login_finish_rejects_register_purpose_challenge`.
 //! - inbox proof (round-2 regression):
 //!   `register_finish_without_inbox_proof_enrolls_nothing`.
 //! - enumeration shape (round-2 regression): `auth_starts_keep_fixed_shape*`.
 //! - single-use / concurrency (rounds 1-2 regressions): `*_rejects_replay*`,
-//!   `login_finish_rejects_replayed_assertion_clone`,
-//!   `test_connection_lease_cap_blocks_third_concurrent_probe`.
+//!   `login_finish_rejects_replayed_assertion_clone`.
 //! - body cap (round-2 regression): `oversized_body_rejected_before_routing`.
 //! - challenge-row growth (rounds 1-2 regressions):
 //!   `login_start_budget_stores_no_challenge_past_cap`,
 //!   `register_start_for_taken_account_stores_nothing`.
 //! - cookie parsing (round-1 regression):
 //!   `nameless_cookie_does_not_break_session_auth`.
-//! - vault SSRF/validation wiring: `vault_put_*`.
 //! - WebAuthn ceremony edges: `attestation_*`, `assertion_*`.
 //!
 //! Explicitly NOT covered by cargo tests (Worker/deploy surface, no native
@@ -81,14 +74,11 @@ const ORIGIN: &str = "https://passkey.example.com";
 const SOURCE_IP: &str = "198.51.100.9";
 const PUBLIC_HOST: &str = "news.example.com";
 const PUBLIC_IP: &str = "93.184.216.34";
-const LOOPBACK_HOST: &str = "quarantine.example.com";
-const INDEXER_HOST: &str = "index.example.com";
 
 const PRIMARY_SECRET: &[u8] = b"acceptance-primary-secret-fits-32-bytes!";
 const PREVIOUS_SECRET: &[u8] = b"acceptance-previous-secret-fits-32-byte!";
 
 const GENERIC_AUTH_BODY: &str = r#"{"error":"check your email and try again"}"#;
-const GENERIC_VAULT_BODY: &str = r#"{"error":"vault unavailable"}"#;
 
 // --- async helper ----------------------------------------------------------------
 
@@ -114,11 +104,9 @@ struct FakeStore {
     magic: RefCell<HashMap<String, auth::MagicLinkRecord>>,
     invites: RefCell<HashMap<String, auth::InviteRecord>>,
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
-    vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     audits: RefCell<Vec<vault::AuditEvent>>,
     race_next_sign_count_advance: Cell<bool>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
-    test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
 }
 
 impl FakeStore {
@@ -358,37 +346,6 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn acquire_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-        lease_secs: u64,
-        max_concurrency: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        let expires_at = NOW.saturating_add(lease_secs);
-        let mut leases = self.test_connection_leases.borrow_mut();
-        leases.retain(|_, (_, expires)| *expires > NOW);
-        for slot in 0..max_concurrency {
-            let key = (user_id.to_string(), slot);
-            if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(key) {
-                entry.insert((token.to_string(), expires_at));
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    async fn release_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-    ) -> Result<(), handlers::StoreError> {
-        self.test_connection_leases
-            .borrow_mut()
-            .retain(|(owner, _), (lease_token, _)| owner != user_id || lease_token != token);
-        Ok(())
-    }
-
     async fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -471,29 +428,6 @@ impl handlers::Store for FakeStore {
                 row.revoked = true;
             }
         }
-        Ok(())
-    }
-
-    async fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        Ok(self.vaults.borrow().get(user_id).cloned())
-    }
-
-    async fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        self.vaults
-            .borrow_mut()
-            .insert(user_id.to_string(), row.clone());
-        Ok(())
-    }
-
-    async fn delete_vault(&self, user_id: &str) -> Result<(), handlers::StoreError> {
-        self.vaults.borrow_mut().remove(user_id);
         Ok(())
     }
 
@@ -619,20 +553,10 @@ fn test_config(invites_required: bool, previous: Option<Vec<u8>>) -> handlers::C
 
 fn test_dns() -> FakeDns {
     FakeDns {
-        map: HashMap::from([
-            (
-                PUBLIC_HOST.to_string(),
-                vec![PUBLIC_IP.parse().expect("public fixture ip")],
-            ),
-            (
-                INDEXER_HOST.to_string(),
-                vec![PUBLIC_IP.parse().expect("public fixture ip")],
-            ),
-            (
-                LOOPBACK_HOST.to_string(),
-                vec!["127.0.0.1".parse().expect("loopback fixture ip")],
-            ),
-        ]),
+        map: HashMap::from([(
+            PUBLIC_HOST.to_string(),
+            vec![PUBLIC_IP.parse().expect("public fixture ip")],
+        )]),
     }
 }
 
@@ -733,44 +657,6 @@ fn magic_cookie(harness: &Harness, user_id: &str, email: &str) -> String {
     );
     assert_eq!(response.status, 200, "{}", response.body);
     cookie_of(&response)
-}
-
-fn public_provider() -> serde_json::Value {
-    serde_json::json!({
-        "host": PUBLIC_HOST,
-        "port": 563,
-        "tls": true,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4
-    })
-}
-
-fn plaintext_opt_in_provider() -> serde_json::Value {
-    serde_json::json!({
-        "host": PUBLIC_HOST,
-        "port": 119,
-        "tls": false,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4,
-        "allow_insecure_plaintext": true
-    })
-}
-
-fn put_vault(
-    harness: &Harness,
-    cookie: &str,
-    provider: serde_json::Value,
-    indexer: Option<serde_json::Value>,
-) -> handlers::Response {
-    harness.call_full(
-        "PUT",
-        "/v1/vault",
-        Some(serde_json::json!({"provider": provider, "indexer": indexer}).to_string()),
-        Some(cookie.to_string()),
-        Some(ORIGIN),
-    )
 }
 
 // --- Synthetic WebAuthn fixtures (no real authenticator) -------------------------------
@@ -1062,7 +948,7 @@ fn previous_secret_authenticates_and_refresh_migrates_to_primary() {
     });
     let cookie = format!("{}={}", session::COOKIE_NAME, old_token);
 
-    let response = harness.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None);
+    let response = harness.call_full("GET", "/v1/credentials", None, Some(cookie.clone()), None);
     assert_eq!(
         response.status, 200,
         "pre-cutover token must authenticate inside the rotation window: {}",
@@ -1091,7 +977,7 @@ fn previous_secret_authenticates_and_refresh_migrates_to_primary() {
     // The superseded pre-cutover token no longer matches the advanced row.
     let stale = harness.call_full(
         "GET",
-        "/v1/vault",
+        "/v1/credentials",
         None,
         Some(format!("{}={}", session::COOKIE_NAME, old_token)),
         None,
@@ -1117,7 +1003,7 @@ fn previous_secret_rejected_in_steady_state() {
     });
     let response = harness.call_full(
         "GET",
-        "/v1/vault",
+        "/v1/credentials",
         None,
         Some(format!("{}={}", session::COOKIE_NAME, old_token)),
         None,
@@ -1148,30 +1034,6 @@ fn shared_codec_rejects_padded_and_std_alphabet_secrets() {
         b64::decode(&b64::encode(&secret)).expect("round trip"),
         secret
     );
-}
-
-// --- Plaintext opt-in audit (finding: late-novel-plaintext-optin-audit-action) ----------
-
-#[test]
-fn plaintext_opt_in_save_audits_insecure_action() {
-    let harness = harness();
-    let cookie = magic_cookie(&harness, "plain-user", "plain@example.com");
-
-    let response = put_vault(&harness, &cookie, plaintext_opt_in_provider(), None);
-    assert_eq!(response.status, 200, "{}", response.body);
-    assert_eq!(
-        harness
-            .store
-            .audits_with(vault::INSECURE_PLAINTEXT_AUDIT_ACTION),
-        1,
-        "cleartext opt-in save must be repudiation-safe, not plain vault.update"
-    );
-    assert_eq!(harness.store.audits_with("vault.update"), 0);
-
-    let cookie = magic_cookie(&harness, "tls-user", "tls@example.com");
-    let response = put_vault(&harness, &cookie, public_provider(), None);
-    assert_eq!(response.status, 200, "{}", response.body);
-    assert_eq!(harness.store.audits_with("vault.update"), 1);
 }
 
 // --- Invite throttle (finding: late-novel-invite-redemption-unthrottled) -----------------
@@ -1274,102 +1136,6 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
             .expect("lookup works")
             .is_empty(),
         "no credential may be enrolled past the invite budget"
-    );
-}
-
-// --- Test-connection budget (finding: late-novel-test-connection-limit-10-vs-5) ----------
-
-#[test]
-fn test_connection_enforces_shared_five_per_minute_budget() {
-    assert_eq!(vault::TEST_CONNECTION_MAX_ATTEMPTS, 5);
-    assert_eq!(vault::TEST_CONNECTION_WINDOW_SECS, 60);
-    let harness = harness();
-    let cookie = magic_cookie(&harness, "budget-user", "budget@example.com");
-    let saved = put_vault(&harness, &cookie, public_provider(), None);
-    assert_eq!(saved.status, 200, "{}", saved.body);
-
-    for attempt in 1..=5u32 {
-        let response = harness.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(response.status, 200, "attempt {attempt}: {}", response.body);
-        assert!(
-            response.body.contains(r#""ok":true"#),
-            "attempt {attempt} must be admitted: {}",
-            response.body
-        );
-    }
-    assert_eq!(harness.store.audits_with("vault.test"), 5);
-    assert_eq!(harness.dialer.seen.borrow().len(), 5);
-
-    // Sixth attempt inside the window: denied before any dial, and the
-    // denial itself is not a new audit row.
-    let denied = harness.call_full(
-        "POST",
-        "/v1/vault/test-connection",
-        None,
-        Some(cookie),
-        Some(ORIGIN),
-    );
-    assert_eq!(denied.status, 200, "{}", denied.body);
-    assert!(
-        denied.body.contains(r#""ok":false"#),
-        "over-budget attempt must fail closed: {}",
-        denied.body
-    );
-    assert_eq!(
-        harness.store.audits_with("vault.test"),
-        5,
-        "denial must not mint an audit row"
-    );
-    assert_eq!(
-        harness.dialer.seen.borrow().len(),
-        5,
-        "denial must not reach the dialer"
-    );
-}
-
-#[test]
-fn test_connection_lease_cap_blocks_third_concurrent_probe() {
-    let harness = harness();
-    let cookie = magic_cookie(&harness, "lease-user", "lease@example.com");
-    let saved = put_vault(&harness, &cookie, public_provider(), None);
-    assert_eq!(saved.status, 200, "{}", saved.body);
-
-    // Saturate both concurrency leases out of band: the handler's own
-    // acquisition must then fail and the probe must never run.
-    for (slot, token) in ["seed-token-a", "seed-token-b"].iter().enumerate() {
-        assert!(
-            block_on(harness.store.acquire_test_connection_lease(
-                "lease-user",
-                token,
-                20,
-                vault::MAX_TEST_CONCURRENCY,
-            ))
-            .expect("lease seeds"),
-            "lease slot {slot} must be seeded"
-        );
-    }
-    let response = harness.call_full(
-        "POST",
-        "/v1/vault/test-connection",
-        None,
-        Some(cookie),
-        Some(ORIGIN),
-    );
-    assert_eq!(response.status, 200, "{}", response.body);
-    assert!(
-        response.body.contains(r#""ok":false"#),
-        "lease exhaustion must fail closed: {}",
-        response.body
-    );
-    assert!(
-        harness.dialer.seen.borrow().is_empty(),
-        "no dial without a lease"
     );
 }
 
@@ -1730,14 +1496,15 @@ fn login_finish_rejects_replayed_assertion_clone() {
 fn oversized_body_rejected_before_routing() {
     let harness = harness();
     let big = "9".repeat(33 * 1024);
-    let response = harness.call_full("PUT", "/v1/vault", Some(big), None, Some(ORIGIN));
+    let response = harness.call_full("POST", "/v1/session/refresh", Some(big), None, Some(ORIGIN));
     assert_eq!(response.status, 400, "{}", response.body);
     assert_eq!(
         response.body,
         r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
     );
-    assert!(
-        harness.store.vaults.borrow().is_empty(),
+    assert_eq!(
+        harness.store.challenge_count(),
+        0,
         "oversized body must not reach storage"
     );
 }
@@ -1822,69 +1589,12 @@ fn nameless_cookie_does_not_break_session_auth() {
     // cookie must be skipped, not abort the whole header.
     let response = harness.call_full(
         "GET",
-        "/v1/vault",
+        "/v1/credentials",
         None,
         Some(format!("nameless-part; {cookie}")),
         None,
     );
     assert_eq!(response.status, 200, "{}", response.body);
-}
-
-// --- Vault SSRF and validation wiring ----------------------------------------------------------------
-
-#[test]
-fn vault_put_rejects_private_dns_answers_at_save() {
-    let harness = harness();
-    let cookie = magic_cookie(&harness, "ssrf-user", "ssrf@example.com");
-
-    let private_provider = serde_json::json!({
-        "host": LOOPBACK_HOST,
-        "port": 563,
-        "tls": true,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4
-    });
-    let response = put_vault(&harness, &cookie, private_provider, None);
-    assert_eq!(response.status, 400, "{}", response.body);
-    assert_eq!(response.body, GENERIC_VAULT_BODY);
-
-    let literal_provider = serde_json::json!({
-        "host": "127.0.0.1",
-        "port": 563,
-        "tls": true,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4
-    });
-    let response = put_vault(&harness, &cookie, literal_provider, None);
-    assert_eq!(response.status, 400, "{}", response.body);
-
-    let saved = harness.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None);
-    assert_eq!(saved.status, 200, "{}", saved.body);
-    let summary: serde_json::Value = serde_json::from_str(&saved.body).expect("JSON");
-    assert_eq!(
-        summary["provider_configured"],
-        serde_json::json!(false),
-        "rejected saves store nothing"
-    );
-
-    // Control: the public-host save succeeds through the same path.
-    let good = put_vault(&harness, &cookie, public_provider(), None);
-    assert_eq!(good.status, 200, "{}", good.body);
-}
-
-#[test]
-fn vault_put_rejects_cleartext_indexer_url() {
-    let harness = harness();
-    let cookie = magic_cookie(&harness, "indexer-user", "indexer@example.com");
-    let indexer = serde_json::json!({
-        "url": format!("http://{INDEXER_HOST}/api"),
-        "api_key": "synthetic-indexer-key"
-    });
-    let response = put_vault(&harness, &cookie, public_provider(), Some(indexer));
-    assert_eq!(response.status, 400, "{}", response.body);
-    assert_eq!(response.body, GENERIC_VAULT_BODY);
 }
 
 // --- WebAuthn ceremony edges (through the public webauthn API) ---------------------------------------

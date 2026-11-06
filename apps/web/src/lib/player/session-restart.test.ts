@@ -3,6 +3,84 @@ import { createPlayerSession } from './session.js';
 import { createQueue } from './queue.js';
 import { RESUME_STORAGE_KEY } from './resume.js';
 
+import { restartNative } from './nativeRestart.js';
+
+for (const atStart of [false, true]) {
+	for (const outcome of ['unavailable', 'throw', 'sticky', 'nan', 'infinity', 'negative-infinity', 'success'] as const) {
+		test(`native reset boundary distinguishes ${outcome} ${atStart ? 'at start' : 'away from start'} without events`, () => {
+			const audio = new AudioFake('/a');
+			let position = atStart ? 0.02 : 30;
+			let assigned = false;
+			let reset = false;
+			const trace: string[] = [];
+			const writes: number[] = [];
+			if (outcome === 'unavailable') audio.ranges = [];
+			Object.defineProperty(audio, 'currentTime', {
+				get: () => {
+					if (assigned) expect(reset).toBe(true);
+					trace.push('read');
+					return position;
+				},
+				set: (value: number) => {
+					writes.push(value);
+					trace.push('setter');
+					expect(reset).toBe(false);
+					if (outcome === 'throw') throw new Error('refused');
+					if (outcome === 'success') position = value;
+					if (outcome === 'nan') position = NaN;
+					if (outcome === 'infinity') position = Infinity;
+					if (outcome === 'negative-infinity') position = -Infinity;
+					assigned = true;
+					trace.push('setter-return');
+				}
+			});
+			const onAssigned = vi.fn(() => { trace.push('reset'); reset = true; });
+			const result = restartNative(audio.element, 'Coral Night', { isCurrent: () => true, onAssigned });
+			const normal = outcome !== 'unavailable' && outcome !== 'throw';
+			expect(writes).toEqual(outcome === 'unavailable' ? [] : [0]);
+			expect(onAssigned).toHaveBeenCalledTimes(normal ? 1 : 0);
+			expect(reset).toBe(normal);
+			if (normal) expect(trace.indexOf('reset')).toBe(trace.indexOf('setter-return') + 1);
+			const words = outcome === 'unavailable' ? 'Could not restart'
+				: atStart ? 'Already at the start of' : outcome === 'success' ? 'Restarted' : 'Could not restart';
+			expect(result).toBe(`${words} Coral Night.`);
+			for (const call of [audio.play, audio.pause, audio.load]) expect(call).not.toHaveBeenCalled();
+		});
+	}
+}
+
+for (const point of ['getter', 'setter', 'reset'] as const) {
+	test(`native reset boundary fences reentry from the ${point}`, () => {
+		const audio = new AudioFake('/a');
+		let current = true;
+		let position = 30;
+		let reset = false;
+		const writes: number[] = [];
+		Object.defineProperty(audio, 'currentTime', {
+			get: () => { if (point === 'getter') current = false; return position; },
+			set: (value: number) => {
+				writes.push(value);
+				position = value;
+				if (point === 'setter') current = false;
+			}
+		});
+		const onAssigned = vi.fn(() => { reset = true; if (point === 'reset') current = false; });
+		expect(restartNative(audio.element, 'Coral Night', { isCurrent: () => current, onAssigned })).toBe('Could not restart Coral Night.');
+		expect(writes).toEqual(point === 'getter' ? [] : [0]);
+		expect(reset).toBe(point === 'reset');
+		expect(onAssigned).toHaveBeenCalledTimes(point === 'reset' ? 1 : 0);
+	});
+}
+
+test('native reset callback faults are not classified as refused native assignments', () => {
+	const audio = new AudioFake('/a');
+	const failure = new Error('subscriber failure');
+	const onAssigned = vi.fn(() => { throw failure; });
+	expect(() => restartNative(audio.element, 'Coral Night', { isCurrent: () => true, onAssigned })).toThrow(failure);
+	expect(audio.currentTime).toBe(0);
+	expect(onAssigned).toHaveBeenCalledOnce();
+});
+
 const A = { id: 'a', title: 'Coral Night', artist: 'Mira', streamUrl: '/a' };
 const B = { id: 'b', title: 'Pine Morning', artist: 'North', streamUrl: '/b' };
 
@@ -150,6 +228,115 @@ test('even refused restart supersedes deferred resume before late native metadat
 	audio.duration = 120;
 	audio.emit('loadedmetadata');
 	expect(audio.currentTime).toBe(30);
+});
+
+for (const atStart of [false, true]) {
+	for (const outcome of ['unavailable', 'throw', 'sticky', 'nan', 'infinity', 'negative-infinity', 'success'] as const) {
+		test(`session reset retires jump at normal assignment: ${outcome}, atStart=${atStart}`, () => {
+			const { session, audio } = setup();
+			session.jumpRelative('forward');
+			let position = atStart ? 0.02 : 40;
+			if (atStart) {
+				audio.currentTime = position;
+				session.jumpRelative('back');
+			}
+			const before = session.snapshot();
+			const writes: number[] = [];
+			let assigned = false;
+			Object.defineProperty(audio, 'currentTime', {
+				get: () => {
+					if (assigned) expect(session.snapshot().jumpStatus).toBe('');
+					return position;
+				},
+				set: (value: number) => {
+					writes.push(value);
+					expect(session.snapshot().jumpStatus).toBe(before.jumpStatus);
+					if (outcome === 'throw') throw new Error('refused');
+					if (outcome === 'success') position = value;
+					if (outcome === 'nan') position = NaN;
+					if (outcome === 'infinity') position = Infinity;
+					if (outcome === 'negative-infinity') position = -Infinity;
+					assigned = true;
+				}
+			});
+			if (outcome === 'unavailable') audio.ranges = [];
+			const accepted = session.restart();
+			const completed = outcome !== 'unavailable' && outcome !== 'throw';
+			expect(writes).toEqual(outcome === 'unavailable' ? [] : [0]);
+			expect(session.snapshot().jumpStatus).toBe(completed ? '' : before.jumpStatus);
+			expect(session.snapshot().jumpStatusVersion).toBe(before.jumpStatusVersion);
+			expect(session.snapshot().restartVersion).toBe(before.restartVersion + 1);
+			const words = outcome === 'unavailable' ? 'Could not restart'
+				: atStart ? 'Already at the start of' : outcome === 'success' ? 'Restarted' : 'Could not restart';
+			expect(session.snapshot().restartStatus).toBe(`${words} Coral Night.`);
+			expect(accepted).toBe(!words.startsWith('Could not'));
+			expect(session.snapshot().queue).toBe(before.queue);
+			for (const call of [audio.play, audio.pause, audio.load]) expect(call).not.toHaveBeenCalled();
+			// No media event delivered the reset. An older queued seek cannot undo it.
+			assigned = false;
+			position = 40;
+			audio.emit('seeking');
+			expect(session.snapshot().jumpStatus).toBe(completed ? '' : before.jumpStatus);
+			session.destroy();
+		});
+	}
+}
+
+for (const point of ['before-intent', 'getter', 'setter', 'reset-publication'] as const) {
+	for (const boundary of ['source', 'url', 'auth', 'reattach', 'destroy', 'nested'] as const) {
+		test(`position action fences ${boundary} reentry at ${point}`, () => {
+			const { session, audio } = setup();
+			session.jumpRelative('forward');
+			const version = session.snapshot().jumpStatusVersion;
+			let position = 40;
+			let armed = true;
+			const writes: number[] = [];
+			const reenter = () => {
+				if (!armed) return;
+				armed = false;
+				if (boundary === 'source') session.setQueue(createQueue([B]));
+				if (boundary === 'url') session.setQueue(createQueue([{ ...A, streamUrl: '/new-a' }]));
+				if (boundary === 'auth') session.resetAtAuthBoundary();
+				if (boundary === 'destroy') session.destroy();
+				if (boundary === 'reattach') session.attach(audio.element);
+				if (boundary === 'nested') session.jumpRelative('back');
+			};
+			Object.defineProperty(audio, 'currentTime', {
+				get: () => { if (point === 'getter') reenter(); return position; },
+				set: (value: number) => { writes.push(value); position = value; if (point === 'setter') reenter(); }
+			});
+			if (point === 'before-intent') session.onBeforeRestart(reenter);
+			const unsubscribe = session.subscribe((state) => {
+				if (point === 'reset-publication' && state.jumpStatus === '') reenter();
+			});
+			const restartVersion = session.snapshot().restartVersion;
+			expect(session.restart()).toBe(false);
+			expect(session.snapshot().restartVersion).toBe(boundary === 'auth' ? 0 : restartVersion);
+			if (boundary === 'nested') {
+				expect(session.snapshot().jumpStatusVersion).toBe(version + 1);
+				expect(session.snapshot().jumpStatus).not.toBe('');
+			} else expect(session.snapshot().jumpStatus).toBe('');
+			if (point === 'before-intent' || point === 'getter') expect(writes).not.toContain(0);
+			else expect(writes.filter((value) => value === 0)).toHaveLength(1);
+			unsubscribe();
+			session.destroy();
+		});
+	}
+}
+
+test('old detach cannot retire the same element in a new attachment incarnation', () => {
+	const { session, audio, detach } = setup();
+	const nextDetach = session.attach(audio.element);
+	session.jumpRelative('forward');
+	const before = session.snapshot();
+	detach();
+	audio.emit('seeking');
+	expect(session.snapshot().audio).toBe(audio.element);
+	expect(session.snapshot().jumpStatus).toBe(before.jumpStatus);
+	expect(session.snapshot().jumpStatusVersion).toBe(before.jumpStatusVersion);
+	nextDetach();
+	expect(session.snapshot().jumpStatus).toBe('');
+	session.destroy();
 });
 
 for (const raw of ['', ' \t ', ' /a ']) {

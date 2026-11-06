@@ -409,6 +409,75 @@ describe('player session', () => {
 			expect(session.snapshot().announcement).toBe('');
 		});
 
+		for (const repeat of ['one', 'queue'] as const) {
+			for (const outcome of ['throw', 'sticky', 'nan', 'infinity', 'negative-infinity', 'success', 'unknown-duration'] as const) {
+				it(`natural repeat ${repeat} resets jump at assignment, not outcome: ${outcome}`, async () => {
+					const { session, release } = setup([A], { [REPEAT_KEY]: repeat });
+					const { audio } = mount(session, A);
+					Object.defineProperty(audio, 'seekable', {
+						value: { length: 1, start: () => 0, end: () => 100 }
+					});
+					audio.currentTime = 30;
+					session.jumpRelative('forward');
+					const before = session.snapshot();
+					expect(before.jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+					await startPlaying(session, audio);
+					end(audio);
+					let position = 100;
+					let assigned = false;
+					const writes: number[] = [];
+					Object.defineProperty(audio, 'currentTime', {
+						get: () => {
+							if (assigned) expect(session.snapshot().jumpStatus).toBe('');
+							return position;
+						},
+						set: (value: number) => {
+							writes.push(value);
+							expect(session.snapshot().jumpStatus).toBe(before.jumpStatus);
+							if (outcome === 'throw') throw new Error('refused');
+							if (outcome === 'success' || outcome === 'unknown-duration') position = value;
+							if (outcome === 'nan') position = NaN;
+							if (outcome === 'infinity') position = Infinity;
+							if (outcome === 'negative-infinity') position = -Infinity;
+							assigned = true;
+						}
+					});
+					if (outcome === 'unknown-duration') audio.duration = NaN;
+					await release();
+					expect(writes).toEqual([0]);
+					expect(session.snapshot().jumpStatus).toBe(outcome === 'throw' ? before.jumpStatus : '');
+					expect(session.snapshot().jumpStatusVersion).toBe(before.jumpStatusVersion);
+					expect(session.snapshot().audio).toBe(audio.element);
+					if (repeat === 'one') expect(session.snapshot().queue).toBe(before.queue);
+					else expect(session.snapshot().queue).toEqual(before.queue);
+					const accepted = outcome === 'success' || outcome === 'unknown-duration';
+					expect(audio.play).toHaveBeenCalledTimes(accepted ? 2 : 1);
+					expect(session.snapshot().announcement).toBe(accepted ? 'Playing Track A.' : '');
+					session.destroy();
+				});
+			}
+
+			it(`a jump to duration does not trigger natural repeat ${repeat}`, async () => {
+				const { session, release } = setup([A], { [REPEAT_KEY]: repeat });
+				const { audio } = mount(session, A);
+				Object.defineProperty(audio, 'seekable', {
+					value: { length: 1, start: () => 0, end: () => 100 }
+				});
+				await startPlaying(session, audio);
+				audio.currentTime = 95;
+				session.jumpRelative('forward');
+				audio.emit('seeking');
+				audio.emit('seeked');
+				end(audio);
+				await release();
+				expect(audio.currentTime).toBe(100);
+				expect(audio.play).toHaveBeenCalledOnce();
+				expect(session.snapshot().jumpStatus).toBe('Forward to the end, 1:40.');
+				expect(session.snapshot().announcement).toBe('');
+				session.destroy();
+			});
+		}
+
 		it('wraps to the first track when repeating the queue', async () => {
 			const { session, release } = setup([A, B], { [REPEAT_KEY]: 'queue' });
 			session.setQueue({ ...session.snapshot().queue, currentIndex: 1 });

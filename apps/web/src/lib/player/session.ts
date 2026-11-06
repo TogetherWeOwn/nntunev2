@@ -9,7 +9,8 @@ import type { SnapshotStorage } from '../library/cache.js';
 import type { SleepTimerMode } from './sleepTimer.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { displayTitle } from '../library/order.js';
-import { restartIsAvailable, restartNative } from './nativeRestart.js';
+import { restartIsAvailable, restartNative, type NativeResetBoundary } from './nativeRestart.js';
+import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { applyQueueAction, type QueueAction } from './queueActions.js';
 import { createQueueShare } from './queueShare.js';
 import { createQueueExport } from './queueExport.js';
@@ -39,6 +40,8 @@ export interface PlayerSessionSnapshot {
 	restartAvailable: boolean;
 	restartStatus: string;
 	restartVersion: number;
+	jumpStatus: string;
+	jumpStatusVersion: number;
 }
 
 export interface PlayerSessionDeps {
@@ -52,14 +55,14 @@ function emptyQueueView(queueConfirmGeneration = 0, queueFeedbackExposed = false
 		announcement: '', queueFeedback: '', queueFeedbackExposed, queueConfirmGeneration,
 		queueShareStatus: '', queueShareFallbackUrl: null,
 		queueFilterQuery: '', queueSelection: createQueueSelection(), queueDensity: 'comfortable' as const, queueLiveRegions: true,
-		restartAvailable: false, restartStatus: ''
+		restartAvailable: false, restartStatus: '', jumpStatus: ''
 	};
 }
 
 export function createPlayerSession(deps: PlayerSessionDeps) {
 	let state: PlayerSessionSnapshot = {
 		...emptyQueueView(0, true), repeat: 'off', transport: null,
-		announcementVersion: 0, queueFeedbackVersion: 0, restartVersion: 0
+		announcementVersion: 0, queueFeedbackVersion: 0, restartVersion: 0, jumpStatusVersion: 0
 	};
 	const store = writable(state);
 	let storage: SnapshotStorage | null = null;
@@ -68,6 +71,9 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	let transport: Transport | null = null;
 	let generation = 0;
 	let sourceOwner = {};
+	let attachmentOwner = {};
+	let positionIntent = 0;
+	let jumpSeek: { audio: HTMLAudioElement; owner: object; target: number } | null = null;
 	// Detached, authenticated fallback evidence only; never part of the snapshot.
 	let queuedSources = new Map<string, { streamUrl: string }>();
 	let connecting = false;
@@ -78,6 +84,7 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		isActive: () => started
 	});
 	const beforeRestart = new Set<(trackId: string, source: string) => void>();
+	const beforePositionIntent = new Set<(trackId: string, source: string) => void>();
 	const beforeNavigate = new Set<(next: QueueState) => void>();
 	const afterQueuedFavorite = new Set<(id: string) => void>();
 	// Mounted producer action only; never consulted for queued playback.
@@ -96,21 +103,85 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 			state.audio?.getAttribute('src') === selected.streamUrl ? state.audio : null;
 	}
 
-	function restart(): boolean {
-		const audio = matchingAudio();
+	function positionAction() {
+		const intent = ++positionIntent;
+		const revision = generation;
+		const owner = sourceOwner;
+		const attachment = attachmentOwner;
+		const audio = state.audio;
 		const selected = currentTrack(state.queue);
-		if (!started || !audio || !selected) {
+		const id = selected?.id;
+		const source = selected?.streamUrl;
+		const isCurrent = () => started && intent === positionIntent && revision === generation &&
+			owner === sourceOwner && attachment === attachmentOwner && state.audio === audio &&
+			currentTrack(state.queue)?.id === id && currentTrack(state.queue)?.streamUrl === source;
+		return { audio, selected, isCurrent,
+			live: () => isCurrent() && audio && audio.isConnected !== false &&
+				audio.getAttribute('src') === source && isCurrent() ? audio : null };
+	}
+
+	function retireJump(): void {
+		jumpSeek = null;
+		if (state.jumpStatus) publish({ jumpStatus: '' });
+	}
+
+	function resetBoundary(isCurrent: () => boolean): NativeResetBoundary {
+		return { isCurrent, onAssigned: () => { if (isCurrent()) retireJump(); } };
+	}
+
+	function restart(): boolean {
+		const action = positionAction();
+		const audio = action.live();
+		const { selected, isCurrent } = action;
+		if (!isCurrent()) return false;
+		if (!audio || !selected) {
 			publish({ restartAvailable: false, restartStatus: '' });
 			return false;
 		}
-		// Invalidate deferred share and resume seeks before the native write,
-		// including a refused write. Metadata must not undo explicit intent.
-		for (const listener of beforeRestart) listener(selected.id, selected.streamUrl);
-		if (!started || matchingAudio() !== audio) return false;
+		// Intent cancels deferred seeks even when the native write is refused.
+		for (const listener of beforeRestart) {
+			listener(selected.id, selected.streamUrl);
+			if (!isCurrent()) return false;
+		}
 		transport?.cancelPendingResume();
-		const text = restartNative(audio, displayTitle(selected));
-		publish({ restartStatus: text, restartAvailable: restartIsAvailable(audio), restartVersion: state.restartVersion + 1 });
-		return !text.startsWith('Could not restart');
+		const text = restartNative(audio, displayTitle(selected), resetBoundary(isCurrent));
+		if (!isCurrent()) return false;
+		const available = restartIsAvailable(audio);
+		if (!isCurrent()) return false;
+		publish({ restartStatus: text, restartAvailable: available, restartVersion: state.restartVersion + 1 });
+		return isCurrent() && !text.startsWith('Could not restart');
+	}
+
+	function jumpRelative(direction: JumpDirection): void {
+		const action = positionAction();
+		const audio = action.live();
+		const { selected, isCurrent } = action;
+		if (!isCurrent()) return;
+		if (audio && selected) {
+			for (const listener of beforePositionIntent) {
+				listener(selected.id, selected.streamUrl);
+				if (!isCurrent()) return;
+			}
+			transport?.cancelPendingResume();
+		}
+		// Keep the shipped helper unchanged; fence every potentially reentrant
+		// native read/write without letting an old getter authorize a new write.
+		const outcome = audio ? jumpMedia({
+			get duration() { return isCurrent() ? audio.duration : Number.NaN; },
+			get currentTime() { return isCurrent() ? audio.currentTime : Number.NaN; },
+			set currentTime(value) { if (isCurrent()) audio.currentTime = value; },
+			get seekable() { return audio.seekable; }
+		}, direction) : { kind: 'unavailable' as const };
+		if (!isCurrent()) return;
+		if (audio && outcome.kind === 'jumped') jumpSeek = { audio, owner: attachmentOwner, target: outcome.target };
+		publish({ jumpStatus: describeJump(direction, outcome), jumpStatusVersion: state.jumpStatusVersion + 1 });
+	}
+
+	function retireJumpForShare(id: string, source: string): void {
+		const selected = currentTrack(state.queue);
+		if (selected?.id !== id || selected.streamUrl !== source) return;
+		const action = positionAction();
+		if (action.live() && action.isCurrent()) retireJump();
 	}
 
 	function publish(patch: Partial<PlayerSessionSnapshot>): void {
@@ -260,12 +331,16 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		const before = currentTrack(state.queue);
 		const after = currentTrack(queue);
 		const changedSource = before?.id !== after?.id || before?.streamUrl !== after?.streamUrl;
-		if (changedSource) transport?.disconnect();
+		if (changedSource) {
+			jumpSeek = null;
+			attachmentOwner = {};
+			transport?.disconnect();
+		}
 		if (generation !== revision + 1 || queuedSources !== previousSources) return false;
 		// Publish the membership/evidence pair atomically, before any subscriber runs.
 		queuedSources = sources;
 		publish({ queue, queueSelection: reconcileQueueSelection(state.queueSelection, queue, state.queueFilterQuery),
-			...(changedSource ? { audio: null, restartAvailable: false, restartStatus: '' } : {}), announcement: '', queueFeedback: '',
+			...(changedSource ? { audio: null, restartAvailable: false, restartStatus: '', jumpStatus: '' } : {}), announcement: '', queueFeedback: '',
 			queueShareStatus: '', queueShareFallbackUrl: null,
 			...(queue.tracks.length ? { queueFeedbackExposed: true } : {}) });
 		return generation === revision + 1 && queuedSources === sources;
@@ -481,22 +556,29 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 
 	async function advanceAfterEnd(id: string): Promise<void> {
 		if (!started || currentTrack(state.queue)?.id !== id) return;
+		const endIntent = ++positionIntent;
+		const endedAudio = state.audio;
+		const endedAttachment = attachmentOwner;
+		const endedSource = currentTrack(state.queue)?.streamUrl;
 		const result = naturalEndPolicy(state.queue, {
 			repeat: state.repeat, radioActive: false, continueRadio: false,
 			playing: true, validEnd: true, sleepComplete: false
 		});
 		if (result.action !== 'play') return;
-		if (!prepareNavigation(result.queue)) return;
-		if (!setQueue(result.queue)) return;
+		if (!prepareNavigation(result.queue) || positionIntent !== endIntent) return;
+		if (!setQueue(result.queue) || positionIntent !== endIntent) return;
 		const revision = generation;
 		const selected = currentTrack(state.queue);
 		await deps.flush();
-		if (!started || revision !== generation || !selected || !state.audio ||
-			state.audio.getAttribute('src') !== selected.streamUrl) return;
-		// Repeat is an explicit restart, not a restore of the just-completed position.
-		if (!transport?.seekToStart()) return;
+		if (!started || revision !== generation || positionIntent !== endIntent || !selected) return;
+		const sameSource = selected.id === id && selected.streamUrl === endedSource;
+		if (sameSource && (state.audio !== endedAudio || attachmentOwner !== endedAttachment)) return;
+		const action = positionAction();
+		if (!action.live() || !action.isCurrent()) return;
+		// A normal zero assignment retires feedback even if readback refuses it.
+		if (!transport?.seekToStart(resetBoundary(action.isCurrent)) || !action.isCurrent()) return;
 		await transport.play();
-		if (revision !== generation || state.transport?.status !== 'playing') return;
+		if (!action.isCurrent() || state.transport?.status !== 'playing') return;
 		const title = Array.from(selected.title.trim() || selected.id).slice(0, 60).join('');
 		publish({ announcement: `Playing ${title}.`, announcementVersion: state.announcementVersion + 1,
 			queueFeedback: `Playing ${title}.`, queueFeedbackVersion: state.queueFeedbackVersion + 1 });
@@ -506,8 +588,11 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		const selected = currentTrack(state.queue);
 		if (!selected || !selected.streamUrl || audio.getAttribute('src') !== selected.streamUrl) return () => {};
 		const revision = generation;
-		const current = () => generation === revision && state.audio === audio && currentTrack(state.queue) === selected;
-		publish({ audio });
+		const owner = attachmentOwner = {};
+		jumpSeek = null;
+		const attached = () => attachmentOwner === owner && state.audio === audio;
+		const current = () => generation === revision && attached() && currentTrack(state.queue) === selected;
+		publish({ audio, jumpStatus: '' });
 		if (!current()) return () => {};
 		const activeTransport = transport;
 		if (activeTransport) {
@@ -521,19 +606,35 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 			if (!current()) return () => {};
 		}
 		const refreshRestart = () => {
-			if (state.audio === audio) publish({ restartAvailable: matchingAudio() === audio && restartIsAvailable(audio) });
+			if (!attached()) return;
+			const available = matchingAudio() === audio && restartIsAvailable(audio);
+			if (attached()) publish({ restartAvailable: available });
+		};
+		const seeking = () => {
+			if (!attached() || !state.jumpStatus) return;
+			const intent = positionIntent;
+			const position = audio.currentTime;
+			if (!attached() || intent !== positionIntent) return;
+			if (jumpSeek?.audio === audio && jumpSeek.owner === owner && Number.isFinite(position) &&
+				Math.abs(position - jumpSeek.target) <= 0.05) return;
+			retireJump();
 		};
 		const events = ['loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate'];
 		for (const event of events) audio.addEventListener(event, refreshRestart);
+		audio.addEventListener('seeking', seeking);
 		refreshRestart();
 		return () => {
 			for (const event of events) audio.removeEventListener(event, refreshRestart);
-			if (state.audio !== audio) return;
+			audio.removeEventListener('seeking', seeking);
+			if (!attached()) return;
 			const revision = ++generation;
+			++positionIntent;
+			jumpSeek = null;
 			pendingNavigation = null;
 			transport?.disconnect();
-			if (generation !== revision || state.audio !== audio) return;
-			publish({ audio: null, restartAvailable: false, restartStatus: '' });
+			if (generation !== revision || !attached()) return;
+			attachmentOwner = {};
+			publish({ audio: null, restartAvailable: false, restartStatus: '', jumpStatus: '' });
 		};
 	}
 
@@ -574,6 +675,9 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 
 	function resetAtAuthBoundary(): void {
 		sourceOwner = {};
+		attachmentOwner = {};
+		++positionIntent;
+		jumpSeek = null;
 		queuedSources = new Map();
 		clearFavoritesAtAuthBoundary(favoritesSession, storage);
 		favoritesInitialized = false;
@@ -589,6 +693,9 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 
 	function destroy(): void {
 		sourceOwner = {};
+		attachmentOwner = {};
+		++positionIntent;
+		jumpSeek = null;
 		queuedSources = new Map();
 		queueShare.reset();
 		queueExport.reset(true);
@@ -601,6 +708,7 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		favoritesSession = null;
 		favoritesInitialized = false;
 		beforeRestart.clear();
+		beforePositionIntent.clear();
 		beforeNavigate.clear();
 		afterQueuedFavorite.clear();
 		queueInsert.clear();
@@ -655,7 +763,11 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		},
 		seek: (seconds: number) => transport?.seek(seconds) ?? false,
 		seekBy: (seconds: number) => transport?.seekBy(seconds) ?? false,
-		restart,
+		restart, jumpRelative, retireJumpForShare,
+		onBeforePositionIntent: (listener: (trackId: string, source: string) => void) => {
+			beforePositionIntent.add(listener);
+			return () => { beforePositionIntent.delete(listener); };
+		},
 		onBeforeRestart: (listener: (trackId: string, source: string) => void) => {
 			beforeRestart.add(listener);
 			return () => { beforeRestart.delete(listener); };

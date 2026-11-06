@@ -136,6 +136,11 @@
 		<input type="range" data-testid="player-seek" aria-label="Seek" aria-valuetext={`${formatDuration(position)} of ${duration ? formatDuration(duration) : 'unknown duration'}`} min="0" max={duration || 1} step="0.1" value={position} disabled={!duration} oninput={(event) => seek(Number(event.currentTarget.value))} />
 		<span>{duration ? formatDuration(duration) : '—'}</span>
 	</div>
+	<div class="transport-buttons">
+		<button type="button" data-testid="player-seek-back" aria-label="Back 10 seconds" onclick={() => player.jumpRelative('back')}>Back 10 s</button>
+		<button type="button" data-testid="player-seek-forward" aria-label="Forward 10 seconds" onclick={() => player.jumpRelative('forward')}>Forward 10 s</button>
+	</div>
+	<p data-testid="player-seek-feedback" aria-live="polite">{#key $player.jumpStatusVersion}{$player.jumpStatus}{/key}</p>
 {/snippet}
 
 {#snippet restartControl()}

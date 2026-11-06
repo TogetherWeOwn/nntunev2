@@ -78,6 +78,53 @@ async function navigate(page: Page, path: 'home' | 'library') {
 	await expect(page).toHaveURL(new RegExp(`/${path}$`));
 }
 
+for (const playing of [false, true]) {
+	test(`relative jumps survive Library teardown with the real ${playing ? 'playing' : 'paused'} decoder`, async ({ page }) => {
+		const { audio, errors } = await openLibrary(page);
+		if (!playing) {
+			await togglePlayViaPlayerUi(page, audio);
+			await expect(audio).toHaveJSProperty('paused', true);
+		}
+		await expect.poll(() => audio.evaluate((el: HTMLAudioElement) =>
+			el.seekable.length ? el.seekable.end(0) : 0)).toBeGreaterThan(35);
+		await audio.evaluate((el: HTMLAudioElement) => { el.currentTime = 20; });
+		await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.seeking)).toBe(false);
+		const original = (await audio.elementHandle())!;
+		await audio.evaluate((el: HTMLAudioElement) => {
+			const events: string[] = [];
+			for (const name of ['play', 'pause', 'loadstart', 'emptied']) el.addEventListener(name, () => events.push(name));
+			(el as HTMLAudioElement & { jumpLifecycle: string[] }).jumpLifecycle = events;
+		});
+		await navigate(page, 'home');
+		await expect(page.getByTestId('library-item')).toHaveCount(0);
+		const forward = page.getByRole('button', { name: 'Forward 10 seconds', exact: true });
+		await forward.focus();
+		const before = await audio.evaluate((el: HTMLAudioElement) => el.currentTime);
+		await forward.press('Enter');
+		await expect(forward).toBeFocused();
+		await expect(page.getByTestId('player-seek-feedback')).toHaveText(/^Forward 10 seconds, now at /);
+		const after = await audio.evaluate((el: HTMLAudioElement) => el.currentTime);
+		expect(after - before).toBeGreaterThan(9);
+		expect(after - before).toBeLessThan(12);
+		const outcome = await page.getByTestId('player-seek-feedback').textContent();
+		await navigate(page, 'library');
+		await expect(page.getByTestId('player-seek-feedback')).toHaveText(outcome!);
+		const back = page.getByRole('button', { name: 'Back 10 seconds', exact: true });
+		await back.focus();
+		const beforeBack = await audio.evaluate((el: HTMLAudioElement) => el.currentTime);
+		await back.press('Enter');
+		await expect(back).toBeFocused();
+		await expect(page.getByTestId('player-seek-feedback')).toHaveText(/^Back 10 seconds, now at /);
+		expect(beforeBack - await audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeGreaterThan(8);
+		expect(await original.evaluate((el) => el === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
+		await expect(audio).toHaveCount(1);
+		await expect(audio).toHaveAttribute('src', ITEMS[0].streamUrl);
+		await expect(audio).toHaveJSProperty('paused', !playing);
+		expect(await audio.evaluate((el) => (el as HTMLAudioElement & { jumpLifecycle: string[] }).jumpLifecycle)).toEqual([]);
+		expect(errors).toEqual([]);
+	});
+}
+
 for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as const) {
 	test(`metadata-only queued Play survives actual Library teardown: ${outcome}`, async ({ page }) => {
 		const errors: string[] = [];

@@ -12,7 +12,12 @@ export function restartIsAvailable(element: HTMLAudioElement): boolean {
 	return false;
 }
 
-export function restartNative(element: HTMLAudioElement, title: string): string {
+export interface NativeResetBoundary {
+	isCurrent: () => boolean;
+	onAssigned: () => void;
+}
+
+export function restartNative(element: HTMLAudioElement, title: string, boundary?: NativeResetBoundary): string {
 	const withTitle = (words: string): string => {
 		const suffix = ` ${title}.`;
 		if (words.length + suffix.length <= 99) return `${words}${suffix}`;
@@ -21,19 +26,29 @@ export function restartNative(element: HTMLAudioElement, title: string): string 
 		if (last >= 0xd800 && last <= 0xdbff) end -= 1;
 		return `${words} ${title.slice(0, end)}…`;
 	};
+	const current = () => !boundary || boundary.isCurrent();
 	// Availability may have changed since the last native event.
-	if (!restartIsAvailable(element)) return withTitle('Could not restart');
+	if (!restartIsAvailable(element) || !current()) return withTitle('Could not restart');
 	let before = Number.NaN;
 	try { before = element.currentTime; } catch { /* Refuse below. */ }
-	if (!Number.isFinite(before)) return withTitle('Could not restart');
+	if (!Number.isFinite(before) || !current()) return withTitle('Could not restart');
 	if (Math.abs(before) <= 0.05) {
-		try { element.currentTime = 0; } catch { /* Already at the start. */ }
-		return withTitle('Already at the start of');
+		let assigned = false;
+		try { element.currentTime = 0; assigned = true; } catch { /* Already at the start. */ }
+		if (!current()) return withTitle('Could not restart');
+		if (assigned) boundary?.onAssigned();
+		return current() ? withTitle('Already at the start of') : withTitle('Could not restart');
 	}
 	try {
 		element.currentTime = 0;
+	} catch { return withTitle('Could not restart'); }
+	if (!current()) return withTitle('Could not restart');
+	// Completion precedes readback, even when the native setter silently refuses.
+	boundary?.onAssigned();
+	if (!current()) return withTitle('Could not restart');
+	try {
 		const readback = element.currentTime;
-		if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) return withTitle('Restarted');
-	} catch { /* A throwing or sticky setter must never claim success. */ }
+		if (current() && Number.isFinite(readback) && Math.abs(readback) <= 0.05) return withTitle('Restarted');
+	} catch { /* A throwing or sticky readback must never claim success. */ }
 	return withTitle('Could not restart');
 }

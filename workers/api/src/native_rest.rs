@@ -481,7 +481,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
-            if path == "/v1/me" || path == "/v1/indexers" || path == "/v1/vault" {
+            if path == "/v1/me" || path == "/v1/indexers" {
                 return SessionOnly;
             }
             // Billing/usage display reads: session-only like checkout —
@@ -557,8 +557,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Session-only writes (never reachable by bearer).
             if path == "/v1/indexers"
-                || path == "/v1/vault/test"
-                || path == "/v1/vault/test-connection"
                 || path == "/v1/credentials"
                 || path == "/v1/auth/passkey/login/start"
                 || path == "/v1/session/refresh"
@@ -597,7 +595,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" || path == "/v1/vault" {
+            if path == "/v1/me" {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one

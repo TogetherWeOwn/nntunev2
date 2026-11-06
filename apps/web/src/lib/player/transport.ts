@@ -80,12 +80,15 @@ export function createTransport(deps: TransportDeps) {
 		deps.onchange(snapshot());
 	}
 
-	function publishPosition(): void {
+	function publishPosition(isCurrent?: () => boolean): void {
 		const state = snapshot();
+		if (isCurrent && !isCurrent()) return;
 		setMediaSessionPosition(state.duration === null ? null : {
 			duration: state.duration, position: state.position, playbackRate: state.rate
 		}, deps.mediaSession);
-		publish();
+		if (isCurrent) {
+			if (isCurrent()) deps.onchange(state);
+		} else publish();
 	}
 
 	const playback = createPlayback({
@@ -120,13 +123,14 @@ export function createTransport(deps: TransportDeps) {
 		pendingResume = null;
 	}
 
-	function observeSeek(): void {
+	function observeSeek(isCurrent?: () => boolean): void {
 		// Native controls supersede resume too. Ignore events emitted inside
 		// our own restore setter; a refused restore must remain retryable.
 		if (!restoringPosition) cancelPendingResume();
 		const audio = liveElement();
-		terminalSeek = !!audio && Number.isFinite(audio.duration) && audio.duration > 0 &&
+		const terminal = !!audio && Number.isFinite(audio.duration) && audio.duration > 0 &&
 			audio.currentTime >= audio.duration;
+		if (!isCurrent || isCurrent()) terminalSeek = terminal;
 	}
 
 	function seek(seconds: number): boolean {
@@ -135,24 +139,43 @@ export function createTransport(deps: TransportDeps) {
 		return setPosition(audio, Math.max(0, Math.min(audio.duration, seconds)));
 	}
 
-	function seekToStart(): boolean {
+	function seekToStart(boundary?: import('./nativeRestart.js').NativeResetBoundary): boolean {
 		const audio = liveElement();
 		// Zero is meaningful even before metadata, unlike an arbitrary seek.
-		return audio ? setPosition(audio, 0) : false;
+		return audio ? setPosition(audio, 0, boundary) : false;
 	}
 
-	function setPosition(audio: HTMLAudioElement, target: number): boolean {
+	function setPosition(audio: HTMLAudioElement, target: number, boundary?: import('./nativeRestart.js').NativeResetBoundary): boolean {
+		const revision = generation;
+		const current = () => {
+			if (!boundary) return true;
+			if (revision !== generation || !boundary.isCurrent()) return false;
+			const matching = liveElement() === audio;
+			return matching && revision === generation && boundary.isCurrent();
+		};
 		// An explicit seek supersedes a deferred restore, even if the setter refuses it.
 		pendingResume = null;
+		if (!current()) return false;
 		try {
 			audio.currentTime = target;
 		} catch {
-			publish();
+			if (current()) {
+				if (boundary) {
+					const state = snapshot();
+					if (current()) deps.onchange(state);
+				} else publish();
+			}
 			return false;
 		}
-		observeSeek();
-		publishPosition();
-		return Math.abs(audio.currentTime - target) < 0.01;
+		if (!current()) return false;
+		boundary?.onAssigned();
+		if (!current()) return false;
+		observeSeek(boundary ? current : undefined);
+		if (!current()) return false;
+		publishPosition(boundary ? current : undefined);
+		if (!current()) return false;
+		const readback = audio.currentTime;
+		return current() && Math.abs(readback - target) < 0.01;
 	}
 
 	function restorePosition(): void {

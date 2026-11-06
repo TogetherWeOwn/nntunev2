@@ -56,6 +56,7 @@ pub mod meter;
 pub mod meter_sink;
 pub mod nntp;
 pub mod observability;
+pub mod original_play;
 pub mod play;
 pub mod play_route;
 pub mod pool;

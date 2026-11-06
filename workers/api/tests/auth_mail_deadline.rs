@@ -203,22 +203,6 @@ impl handlers::Store for FakeStore {
     ) -> Result<bool, handlers::StoreError> {
         panic!("auth-start must not advance a credential")
     }
-    async fn acquire_test_connection_lease(
-        &self,
-        _: &str,
-        _: &str,
-        _: u64,
-        _: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        panic!("auth-start must not acquire a probe lease")
-    }
-    async fn release_test_connection_lease(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<(), handlers::StoreError> {
-        panic!("auth-start must not release a probe lease")
-    }
     async fn invite_by_hash(
         &self,
         _: &str,
@@ -248,22 +232,6 @@ impl handlers::Store for FakeStore {
     }
     async fn revoke_all_sessions(&self, _: &str) -> Result<(), handlers::StoreError> {
         panic!("auth-start must not revoke sessions")
-    }
-    async fn vault_by_user(
-        &self,
-        _: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        panic!("auth-start must not read a vault")
-    }
-    async fn upsert_vault(
-        &self,
-        _: &str,
-        _: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        panic!("auth-start must not write a vault")
-    }
-    async fn delete_vault(&self, _: &str) -> Result<(), handlers::StoreError> {
-        panic!("auth-start must not delete a vault")
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
         self.audits.borrow_mut().push(event.clone());
