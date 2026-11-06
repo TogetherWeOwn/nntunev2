@@ -27,6 +27,9 @@ use nntune_ingest::posted_generations::dispatch::{
 };
 use std::collections::{HashMap, VecDeque};
 
+#[path = "posted_generation_tagged_dispatch.rs"]
+mod tagged;
+
 const ON: DispatchMode = DispatchMode::PreparationOnly;
 const OFF: DispatchMode = DispatchMode::Disabled;
 const SMALL: usize = 2_600;

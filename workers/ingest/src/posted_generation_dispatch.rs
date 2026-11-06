@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 
+#[path = "posted_generation_storage.rs"]
+pub mod storage;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DispatchMode {
     #[default]
@@ -191,6 +194,97 @@ pub trait DispatchQueue {
     fn send(&mut self, pointer: DispatchPointer) -> impl Future<Output = Result<(), StoreError>>;
 }
 
+/// Internal preparation input. The immutable sealed-plan reference and opened
+/// canonical bytes MUST come from the API/keyring boundary (not yet wired).
+/// This function never stores them in R2. No Debug or serialization: neither
+/// tags nor plan plaintext may leak.
+pub struct TaggedDispatchInput<'a> {
+    pub file_index: i32,
+    pub tagged: crate::flac::TaggedFlac,
+    pub plan: DispatchObject,
+    pub canonical_plan: &'a [u8],
+}
+
+/// Existing tag output -> create-only tagged R2 object -> transactional file
+/// checkpoint/outbox. Revalidate admission after storage IO before committing
+/// dispatch. Failed/ambiguous operations retain the stored object; no cleanup
+/// or acquisition is inferred. Concrete sealed-plan resolution and selected
+/// Queue recovery remain necessary before this is a complete live binding.
+pub async fn prepare_tagged_file_dispatch<S: storage::TaggedObjectStore>(
+    client: &mut Client,
+    mode: DispatchMode,
+    job_id: &str,
+    operation_key: &str,
+    expected_attempt: i64,
+    input: TaggedDispatchInput<'_>,
+    store: &mut S,
+) -> Result<Option<DispatchPointer>, StoreError> {
+    if mode == DispatchMode::Disabled {
+        return Ok(None);
+    }
+    let object_id = storage::tagged_object_id(job_id, operation_key, input.file_index)?;
+    if expected_attempt < 0
+        || expected_attempt == i64::MAX
+        || input.canonical_plan.is_empty()
+        || input.plan.id() == object_id
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(job) = admission_locked(&tx, job_id, None).await? else {
+        return Ok(None);
+    };
+    if input.file_index >= job.get::<_, i32>("file_count") {
+        return Ok(None);
+    }
+    let provenance = AdmissionIdentity::from_row(&job);
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    let frozen =
+        storage::freeze_tagged_file(store, job_id, operation_key, input.file_index, input.tagged)
+            .await?;
+    let file = PreparedDispatchFile {
+        file_index: input.file_index,
+        object: frozen.object,
+        plaintext_bytes: frozen.size,
+        plaintext_sha256: frozen.sha256,
+        plan: input.plan,
+        plan_bytes: i64::try_from(input.canonical_plan.len())
+            .map_err(|_| StoreError::InvalidInput)?,
+        plan_sha256: hex::encode(Sha256::digest(input.canonical_plan)),
+    };
+    prepare_file_dispatch_bound(
+        client,
+        mode,
+        job_id,
+        operation_key,
+        expected_attempt,
+        &file,
+        Some(&provenance),
+    )
+    .await
+}
+
+#[derive(PartialEq, Eq)]
+struct AdmissionIdentity {
+    owner: String,
+    admission: String,
+    original: String,
+    original_bytes: i64,
+    file_count: i32,
+}
+
+impl AdmissionIdentity {
+    fn from_row(row: &Row) -> Self {
+        Self {
+            owner: row.get("user_id"),
+            admission: row.get("idempotency_key"),
+            original: row.get("content_sha256"),
+            original_bytes: row.get("nzb_bytes"),
+            file_count: row.get("file_count"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchSend {
     Disabled,
@@ -277,6 +371,27 @@ pub async fn prepare_file_dispatch(
     expected_attempt: i64,
     file: &PreparedDispatchFile,
 ) -> Result<Option<DispatchPointer>, StoreError> {
+    prepare_file_dispatch_bound(
+        client,
+        mode,
+        job_id,
+        operation_key,
+        expected_attempt,
+        file,
+        None,
+    )
+    .await
+}
+
+async fn prepare_file_dispatch_bound(
+    client: &mut Client,
+    mode: DispatchMode,
+    job_id: &str,
+    operation_key: &str,
+    expected_attempt: i64,
+    file: &PreparedDispatchFile,
+    expected_provenance: Option<&AdmissionIdentity>,
+) -> Result<Option<DispatchPointer>, StoreError> {
     if mode == DispatchMode::Disabled {
         return Ok(None);
     }
@@ -291,7 +406,10 @@ pub async fn prepare_file_dispatch(
     let Some(job) = admission_locked(&tx, job_id, None).await? else {
         return Ok(None);
     };
-    if file.file_index >= job.get::<_, i32>("file_count") {
+    if file.file_index >= job.get::<_, i32>("file_count")
+        || expected_provenance
+            .is_some_and(|expected| *expected != AdmissionIdentity::from_row(&job))
+    {
         return Ok(None);
     }
     let owner: String = job.get("user_id");

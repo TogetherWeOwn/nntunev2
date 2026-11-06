@@ -20,6 +20,12 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_commits_byte_derived_storage_identity_and_replays",
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_disabled_or_unadmitted_never_reaches_storage",
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_revalidates_role_stop_original_owner_and_admission_after_storage",
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_ambiguous_put_and_divergent_retry_keep_one_identity",
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_readback_failure_retains_object_without_dispatch_or_attempt",
+    "posted_generation_dispatch::tagged::postgres_tagged_producer_refuses_plan_alias_and_invalid_file_before_storage",
     "posted_generation_dispatch::postgres_dispatch_default_disabled_has_no_database_or_io_effect",
     "posted_generation_dispatch::postgres_dispatch_admin_admission_prepares_and_pipeline_or_drifted_jobs_refuse",
     "posted_generation_dispatch::postgres_dispatch_prepare_reuses_pointer_across_restart_and_changed_inputs_refuse",
