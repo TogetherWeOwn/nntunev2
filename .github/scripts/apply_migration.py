@@ -24,11 +24,14 @@ and ``--record-only`` alike — a migrator URL pointed at the wrong
 database must never create the tracking table, run migration DDL, or
 record false history there.
 
-Files carrying their own top-level transaction control (or psql
-meta-commands, which can escape the transaction) cannot join the
-tracking transaction; apply those by hand, then re-run with
-``--record-only``. ``--dry-run`` prints the composed SQL without
-touching a database.
+A single exact outer ``BEGIN; ... COMMIT;`` envelope is lexically
+validated and removed in memory, never executed. Effects and the
+original-file checksum receipt then join the runner's transaction.
+Other transaction control and psql meta-commands refuse, including in
+``--record-only`` mode; that flag is for independently verified historic
+backfill, not an unsupported-SQL workaround. Tracking bootstrap/ACL
+transaction A commits independently before effects/receipt transaction B.
+``--dry-run`` prints composition only, not successful apply evidence.
 """
 import argparse
 import hashlib
@@ -43,8 +46,8 @@ import urllib.parse
 import migration_history
 
 # The tracking table's rows are deploy proof for the staging gate, so
-# its write privileges are pinned here, in the one DDL constant shared
-# by the migrator and the committed backfill files: no role other than
+# its write privileges are pinned here. The dated backfill generator
+# freezes its historical DDL separately. No role other than
 # the table owner (the migrator role that creates it) may hold a write
 # privilege — on the table (``pg_class.relacl``) or on any column
 # (``pg_attribute.attacl``; column-level INSERT alone can forge a
@@ -52,37 +55,40 @@ import migration_history
 # database's default privileges granted at CREATE time. The revoke
 # pass runs on every DDL execution, so a later stray GRANT is removed
 # by the next apply; the staging gate also fails closed while such a
-# grant exists. Read privileges are untouched.
+# grant exists. Read privileges are untouched. Qualify runner-owned
+# routines, catalogs, types and operators: migrations deliberately put public first.
 DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
-    file       TEXT PRIMARY KEY,
-    sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    applied_by TEXT NOT NULL
+    file       pg_catalog.text PRIMARY KEY,
+    sha256     pg_catalog.text NOT NULL
+               CHECK (sha256 OPERATOR(pg_catalog.~) '^[0-9a-f]{64}$'),
+    applied_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now(),
+    applied_by pg_catalog.text NOT NULL
 );
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
     ON TABLE public.schema_migrations FROM PUBLIC;
 DO $privileges$
 DECLARE
-    grant_row record;
+    grant_row pg_catalog.record;
 BEGIN
     FOR grant_row IN
         SELECT DISTINCT a.grantee
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        CROSS JOIN aclexplode(c.relacl) a
-        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
-          AND a.privilege_type IN
-              ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
-          AND a.grantee <> c.relowner
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+        CROSS JOIN pg_catalog.aclexplode(c.relacl) a
+        WHERE n.nspname OPERATOR(pg_catalog.=) 'public'
+          AND c.relname OPERATOR(pg_catalog.=) 'schema_migrations'
+          AND a.privilege_type OPERATOR(pg_catalog.=) ANY
+              (ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'])
+          AND a.grantee OPERATOR(pg_catalog.<>) c.relowner
     LOOP
-        IF grant_row.grantee = 0 THEN
+        IF grant_row.grantee OPERATOR(pg_catalog.=) 0 THEN
             EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
-                 || 'ON TABLE public.schema_migrations FROM PUBLIC';
+                 OPERATOR(pg_catalog.||) 'ON TABLE public.schema_migrations FROM PUBLIC';
         ELSE
-            EXECUTE format(
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
                 'ON TABLE public.schema_migrations FROM %I',
-                pg_get_userbyid(grant_row.grantee));
+                pg_catalog.pg_get_userbyid(grant_row.grantee));
         END IF;
     END LOOP;
     -- Column privileges live in pg_attribute.attacl, not relacl, so the
@@ -90,26 +96,28 @@ BEGIN
     -- INSERT, UPDATE and REFERENCES exist as column-level writes.
     FOR grant_row IN
         SELECT DISTINCT a.grantee, t.attname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_attribute t ON t.attrelid = c.oid
-            AND t.attnum > 0 AND NOT t.attisdropped
-        CROSS JOIN aclexplode(t.attacl) a
-        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
-          AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
-          AND a.grantee <> c.relowner
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+        JOIN pg_catalog.pg_attribute t ON t.attrelid OPERATOR(pg_catalog.=) c.oid
+            AND t.attnum OPERATOR(pg_catalog.>) 0 AND NOT t.attisdropped
+        CROSS JOIN pg_catalog.aclexplode(t.attacl) a
+        WHERE n.nspname OPERATOR(pg_catalog.=) 'public'
+          AND c.relname OPERATOR(pg_catalog.=) 'schema_migrations'
+          AND a.privilege_type OPERATOR(pg_catalog.=) ANY
+              (ARRAY['INSERT', 'UPDATE', 'REFERENCES'])
+          AND a.grantee OPERATOR(pg_catalog.<>) c.relowner
     LOOP
-        IF grant_row.grantee = 0 THEN
-            EXECUTE format(
+        IF grant_row.grantee OPERATOR(pg_catalog.=) 0 THEN
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
                 'ON TABLE public.schema_migrations FROM PUBLIC',
                 grant_row.attname, grant_row.attname, grant_row.attname);
         ELSE
-            EXECUTE format(
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
                 'ON TABLE public.schema_migrations FROM %I',
                 grant_row.attname, grant_row.attname, grant_row.attname,
-                pg_get_userbyid(grant_row.grantee));
+                pg_catalog.pg_get_userbyid(grant_row.grantee));
         END IF;
     END LOOP;
 END
@@ -125,57 +133,145 @@ CONFLICTING_HISTORY = "schema-migrations: conflicting recorded history"
 
 FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
 DATABASE_RE = re.compile(r"^[A-Za-z0-9_]+$")
-TXN_CONTROL_RE = re.compile(
-    r"\b(BEGIN|COMMIT|ROLLBACK)(\s+(WORK|TRANSACTION))?\s*;|\bSTART\s+TRANSACTION\b",
-    re.I,
-)
-PSQL_META_RE = re.compile(r"^\s*\\[A-Za-z!]", re.M)
 DOLLAR_QUOTE_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9$]*")
+TRANSACTION_WORDS = {
+    "BEGIN", "START", "COMMIT", "END", "ABORT", "ROLLBACK", "SAVEPOINT", "RELEASE",
+}
+# Replace, never append to, caller PGOPTIONS. psql() also pins these for
+# callers that supply a child environment directly (both transactions).
+SESSION_OPTIONS = (
+    "-c search_path=public,pg_catalog -c standard_conforming_strings=on "
+    "-c statement_timeout=90000 -c lock_timeout=10000 "
+    "-c idle_in_transaction_session_timeout=90000"
+)
 
 
 class ApplyError(Exception):
     pass
 
 
-def strip_hidden_sql(text):
-    """Blank dollar-quoted bodies, strings and comments.
+def sql_statements(text):
+    """Lex a bounded SQL subset into statements of (token, start, end).
 
-    What remains is top-level SQL, so transaction control can be told
-    apart from PL/pgSQL blocks (``BEGIN`` inside ``$$ ... $$``) and from
-    words mentioned in comments or literals.
+    Literals/quoted identifiers are opaque tokens; comments are trivia.
+    Spans let us remove only validated boundary statements, not rewrite
+    the migration. Nested block comments, doubled quotes, E strings and
+    tagged dollar quotes follow PostgreSQL rules. Unicode escape forms,
+    unquoted non-ASCII SQL, implicit string continuation and SQL-standard
+    unquoted routine bodies are deliberately unsupported.
+    No tokenization error may turn the rest of a file into hidden text.
     """
-    out, i, n = [], 0, len(text)
+    if any(ord(ch) < 32 and ch not in "\t\n\r\f" for ch in text):
+        raise ApplyError("unsupported control character in migration")
+    statements, tokens, i, n = [], [], 0, len(text)
     while i < n:
+        start = i
+        if ord(text[i]) > 127:
+            raise ApplyError("non-ASCII SQL must be quoted")
+        if text[i] in " \t\n\r\f":
+            i += 1
+            continue
         if text.startswith("--", i):
-            end = text.find("\n", i)
-            i = n if end == -1 else end
-        elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-        elif text[i] == "'":
+            end = re.search(r"[\r\n]", text[i:])
+            i = n if end is None else i + end.start()
+            continue
+        if text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise ApplyError("unterminated block comment in migration")
+            continue
+        if text[i] == "\\":
+            raise ApplyError("psql meta-commands are not supported")
+        if text[i:i + 2].upper() == "U&":
+            raise ApplyError("Unicode escape syntax is not supported")
+        escaped = text[i:i + 2].upper() == "E'"
+        if text[i] in "'\"" or escaped:
+            if escaped:
+                i += 1
+            quote = text[i]
             i += 1
             while i < n:
-                if text[i] == "'":
-                    if text.startswith("''", i):
-                        i += 2
-                        continue
+                if escaped and text[i] == "\\":
+                    i += 2
+                elif text[i] == quote:
                     i += 1
-                    break
-                i += 1
-            out.append("''")
+                    if i < n and text[i] == quote:
+                        i += 1
+                    else:
+                        break
+                else:
+                    i += 1
+            else:
+                raise ApplyError("unterminated quoted token in migration")
+            token = "<identifier>" if quote == '"' else "<string>"
+            # Newline-separated string constants inherit E-string escape
+            # rules across the boundary in PostgreSQL. Refuse this rare
+            # form rather than lex its continuation with different rules.
+            if token == "<string>" and tokens and tokens[-1][0] == "<string>":
+                raise ApplyError("implicit string continuation is not supported")
         elif match := DOLLAR_QUOTE_RE.match(text, i):
             end = text.find(match.group(0), match.end())
-            i = n if end == -1 else end + len(match.group(0))
-            out.append("$$ $$")
+            if end == -1:
+                raise ApplyError("unterminated dollar quote in migration")
+            i = end + len(match.group(0))
+            token = "<quoted>"
+        elif match := WORD_RE.match(text, i):
+            i = match.end()
+            token = match.group(0).upper()
         else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
+            token, i = text[i], i + 1
+        if token == ";":
+            if tokens:
+                statements.append((tokens, i))
+                tokens = []
+        else:
+            tokens.append((token, start, i))
+    if tokens:
+        raise ApplyError("migration statements must end with a semicolon")
+    return statements
 
 
-def has_toplevel_txn_control(body):
-    stripped = strip_hidden_sql(body)
-    return bool(TXN_CONTROL_RE.search(stripped) or PSQL_META_RE.search(stripped))
+def transaction_body(body):
+    """Accept plain SQL or one exact outer BEGIN; ... COMMIT; envelope.
+
+    This is a lexical boundary validator, not a general SQL parser. SQL
+    validity and transactional restrictions still belong to PostgreSQL.
+    Never execute a file-level COMMIT or use record-only to skip refusal.
+    """
+    statements = sql_statements(body)
+    if not statements:
+        raise ApplyError("migration has no SQL statements")
+    words = [[token for token, _, _ in tokens] for tokens, _ in statements]
+    wrapped = words[0] == ["BEGIN"] and words[-1] == ["COMMIT"]
+    inner = words[1:-1] if wrapped else words
+    if not inner:
+        raise ApplyError("transaction envelope must contain SQL")
+    for statement in inner:
+        # Fail closed on all transaction variants, including END/ABORT,
+        # two-phase commit and SQL-standard BEGIN ATOMIC routine bodies.
+        if (statement[0] in TRANSACTION_WORDS
+                or statement[:2] == ["PREPARE", "TRANSACTION"]
+                or "BEGIN" in statement
+                or statement[0] in {"RESET", "DISCARD", "COPY"}):
+            raise ApplyError("unsupported transaction control or SQL form")
+        if statement[0] == "SET" and statement != [
+                "SET", "SEARCH_PATH", "=", "PUBLIC", ",", "PG_CATALOG"]:
+            raise ApplyError("only the pinned search_path SET is supported")
+    if wrapped:
+        # Remove boundary tokens + their semicolons, preserving every
+        # effect statement and all surrounding comments/literal bytes.
+        opening, closing = statements[0], statements[-1]
+        return (body[:opening[0][0][1]] + body[opening[1]:closing[0][0][1]]
+                + body[closing[1]:])
+    return body
 
 
 def load_manifest(manifest_path):
@@ -239,10 +335,10 @@ def validate_expected_database(expected_database):
 
 
 def insert_sql(filename, sha256, applied_by, applied_at=None, on_conflict=True):
-    # One value per line: the committed backfill files use this too, and
-    # a public checksum sharing a line with an auth-flavoured filename
+    # One value per line, matching the historical backfill layout: a
+    # public checksum sharing a line with an auth-flavoured filename
     # false-positives secret scanners as a credential pair.
-    when = f"'{applied_at}'::timestamptz" if applied_at else "now()"
+    when = f"'{applied_at}'::pg_catalog.timestamptz" if applied_at else "pg_catalog.now()"
     conflict = "\nON CONFLICT (file) DO NOTHING" if on_conflict else ""
     return (
         "INSERT INTO public.schema_migrations (file, sha256, applied_at, applied_by)\n"
@@ -263,7 +359,7 @@ def database_guard_sql(expected_database):
     """
     return f"""DO $dbguard$
 BEGIN
-    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() OPERATOR(pg_catalog.<>) {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
 END
@@ -271,7 +367,12 @@ $dbguard$;"""
 
 
 def ddl_sql(expected_database):
-    return database_guard_sql(expected_database) + "\n" + DDL + "\n"
+    # Bootstrap/ACL writes need serialization too: concurrent CREATE or
+    # REVOKE can race on catalog tuples even when B is correctly locked.
+    # A still commits independently and releases its lock before B.
+    return (database_guard_sql(expected_database)
+            + f"\nSELECT pg_catalog.pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
+            + DDL + "\n")
 
 
 def history_names_for(entries, identity):
@@ -312,42 +413,45 @@ def guard_sql(identity, expected_database, priors=(), history_names=()):
     a permitted pair and never satisfies a prior.
     """
     def pairs_of(pairs):
-        return ", ".join(
-            f"({quote_literal(name)}, '{sha}')" for name, sha in pairs)
+        return " OR ".join(
+            f"(file OPERATOR(pg_catalog.=) {quote_literal(name)} "
+            f"AND sha256 OPERATOR(pg_catalog.=) '{sha}')" for name, sha in pairs)
 
     permitted = list(identity) + [pair for prior in priors for pair in prior]
     denied = sorted({name for pairs in (identity, *priors) for name, _sha in pairs}
                     | set(history_names))
     duplicate_checks = "".join(f"""
-    IF (SELECT count(*) FROM public.schema_migrations
-        WHERE (file, sha256) IN ({pairs_of(pairs)})) > 1 THEN
+    IF (SELECT pg_catalog.count(*) FROM public.schema_migrations
+        WHERE {pairs_of(pairs)}) OPERATOR(pg_catalog.>) 1 THEN
         RAISE EXCEPTION '{CONFLICTING_HISTORY}';
     END IF;""" for pairs in (identity, *priors))
-    names = ", ".join(quote_literal(name) for name, _sha in identity)
-    denied_names = ", ".join(quote_literal(name) for name in denied)
+    names = " OR ".join(
+        f"file OPERATOR(pg_catalog.=) {quote_literal(name)}" for name, _sha in identity)
+    denied_names = " OR ".join(
+        f"file OPERATOR(pg_catalog.=) {quote_literal(name)}" for name in denied)
     prior_checks = "".join(f"""
     IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE (file, sha256) IN ({pairs_of(prior)})) THEN
+               WHERE {pairs_of(prior)}) THEN
         RAISE EXCEPTION '{MISSING_PRIOR}';
     END IF;""" for prior in priors)
-    return f"""SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
+    return f"""SELECT pg_catalog.pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
 DO $guard$
 BEGIN
-    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() OPERATOR(pg_catalog.<>) {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE file IN ({denied_names})
-                 AND (file, sha256) NOT IN ({pairs_of(permitted)})) THEN
+               WHERE ({denied_names})
+                 AND NOT ({pairs_of(permitted)})) THEN
         RAISE EXCEPTION '{CONFLICTING_HISTORY}';
     END IF;
     {duplicate_checks.strip()}
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE (file, sha256) IN ({pairs_of(identity)})) THEN
+               WHERE {pairs_of(identity)}) THEN
         RAISE EXCEPTION '{ALREADY_SAME}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE file IN ({names})) THEN
+               WHERE {names}) THEN
         RAISE EXCEPTION '{ALREADY_DIFFERENT}';
     END IF;{prior_checks}
 END
@@ -370,12 +474,10 @@ def compose(file_path, manifest_path, applied_by, record_only=False,
     entries = load_manifest(manifest_path)
     target, identity, priors = resolve_entry(entries, filename, sha256)
     history_names = history_names_for(entries, identity)
-    body = contents.decode("utf-8")
-    if not record_only and has_toplevel_txn_control(body):
-        raise ApplyError(
-            f"{filename} carries top-level transaction control or psql "
-            "meta-commands; apply it by hand, then re-run with --record-only"
-        )
+    try:
+        body = transaction_body(contents.decode("utf-8"))
+    except UnicodeError as exc:
+        raise ApplyError("migration must be valid UTF-8") from exc
     parts = [guard_sql(identity, expect_database, priors, history_names)]
     if not record_only:
         parts.append(body.rstrip() + "\n")
@@ -410,6 +512,7 @@ def connection_env(database_url):
         "PGDATABASE": database,
         "PGUSER": urllib.parse.unquote(url.username),
         "PGCONNECT_TIMEOUT": "10",
+        "PGOPTIONS": SESSION_OPTIONS,
     })
     if url.password:
         child["PGPASSWORD"] = urllib.parse.unquote(url.password)
@@ -424,8 +527,16 @@ def psql(child, sql, single_transaction=False):
             "--no-align", "--set", "ON_ERROR_STOP=1"]
     if single_transaction:
         args.append("--single-transaction")
-    result = subprocess.run(args, input=sql, text=True, capture_output=True,
-                            timeout=120, env=child)
+    try:
+        result = subprocess.run(
+            args, input=sql, text=True, capture_output=True, timeout=120,
+            env={**child, "PGOPTIONS": SESSION_OPTIONS})
+    except subprocess.TimeoutExpired:
+        raise ApplyError(
+            "psql timed out; commit outcome may be unknown; reconcile the "
+            "original checksum receipt and effects before retrying") from None
+    except OSError:
+        raise ApplyError("cannot start psql; connection details redacted") from None
     if result.returncode != 0:
         if ALREADY_SAME in result.stderr:
             raise _AlreadyRecorded(same=True)
@@ -442,7 +553,12 @@ def psql(child, sql, single_transaction=False):
             raise ApplyError(
                 "an earlier same-target migration is not recorded; "
                 "apply migrations in manifest order")
-        raise ApplyError("psql failed; see the operator-side psql output")
+        raise ApplyError(
+            f"psql failed (exit code {result.returncode}); database output redacted; "
+            "possible causes include SQL or connection failure and server-side timeout; "
+            "commit outcome may be unknown; reconcile the original checksum receipt "
+            "and effects before retrying; consult access-controlled server logs "
+            "through the approved operator process")
     return result.stdout
 
 
