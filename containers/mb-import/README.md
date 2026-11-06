@@ -50,7 +50,7 @@ shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py:343-352` (`DUMP_TS` validation), `:379-384` (temp SQLite projection), `:1090-1106` (immutable
 snapshot + atomic `curated` swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
-`.github/workflows/ci.yml:298-313`.)
+`.github/workflows/ci.yml:533-548`.)
 
 ### Import admission
 
@@ -184,31 +184,37 @@ non-UTF-8 bytes); `import.sh:774-878`
 
 ## Build and test
 
-Build from the repository root (the validator stage needs the workspace —
-it copies the full workspace and builds the single validator package):
+The image build context is the repository root (the validator stage needs the
+workspace — it copies the full workspace and builds the single validator
+package). Image build and smoke test run on GitHub Actions in the `mb-import`
+job of [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml): clean-checkout
+image build, default-CMD smoke test, migrations and the integration suite in
+the shipped image.
 
-```sh
-docker build -f containers/mb-import/Dockerfile .
-```
+Local runs are only for focused reproduction of one failing test or crate:
+small Rust work goes through the bounded pool
+(`python3 scripts/cargo_cache.py run -- test ...`), and heavy focused work goes
+through the guarded `boat` PATH wrapper with `--no-env` and a source-only
+export, with cleanup verified. Do not run the full suite, a CI mirror, or an
+image build locally, including under Boat or a fallback; if no compliant path
+is available, defer to Actions. See the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only).
 
-(Sources: `Dockerfile:19-25` (validator stage), `:29-49` (runtime stage).)
+(Sources: `Dockerfile:19-25` (validator stage), `:29-49` (runtime stage);
+`.github/workflows/ci.yml` job `mb-import`.)
 
 The runtime stage runs the jobs as the non-root `postgres` user (`Dockerfile:43-46`).
 
-The mock-only admission suite needs Bash, Python 3 and standard shell tools,
-not Cargo, psql, credentials or a database:
-
-```sh
-bash containers/mb-import/tests/test_input_admission.sh
-```
-
-Its 44 cases capture SQL attempts and payloads with command doubles: deterministic
-publication switches (A during the first run, B on the next), all-file admission,
+The `mb-import-etl` Actions job runs the mock-only admission suite
+(`tests/test_input_admission.sh`) using Bash, Python 3 and standard shell
+tools, not Cargo, psql, credentials or a database. Its 44 cases capture
+SQL attempts and payloads with command doubles: deterministic publication
+switches (A during the first run, B on the next), all-file admission,
 sequence boundaries, ordinary directories, directory-shaped TSV refusal,
-rerun/resume and poison/FK routing.
-Run unprivileged so unreadable-file controls execute rather than skip. It does
-not execute PostgreSQL; the existing integration suite remains the DB-semantics
-control. CI runs both (`.github/workflows/ci.yml`, `mb-import-etl` and `mb-import`).
+rerun/resume and poison/FK routing. The suite runs unprivileged so
+unreadable-file controls execute rather than skip. It does not execute
+PostgreSQL; the `mb-import` integration suite remains the DB-semantics
+control. Both suites run in Actions, not as a local checklist.
 
 `test-import.sh` runs the integration suite (chunked import, kill-resume,
 same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and
@@ -219,25 +225,23 @@ routing across every parent, and the newer/older-changed-dump and
 split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:suites 1-14`;
-`.github/workflows/ci.yml:746-790`.)
+`.github/workflows/ci.yml:900-951`.)
 
-Run it in the shipped image, as CI does (the image carries `mb-validate`):
-
-```sh
-docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
-docker run --rm --network host \
-  -e DATABASE_URL=<scratch-url> -e ALLOW_TEST_TRUNCATE=1 \
-  -v "$PWD/containers/mb-import/test-import.sh:/job/test-import.sh:ro" \
-  mb-import:ci bash /job/test-import.sh
-```
+The shipped CI image carries `mb-validate`.
+The Docker build and import test suite run in the GitHub Actions
+[`mb-import` job](../../.github/workflows/ci.yml); push the PR branch and
+open a draft PR while incomplete. Do not mirror this database/container
+suite on the shared host. The validator's unit tests run in the workflow's
+`rust-test` workspace job, not as a local workspace checklist. Record
+exact-head Actions run/job links as verification evidence.
 
 The suite truncates all twenty-five mirror tables, so `ALLOW_TEST_TRUNCATE=1` is
 mandatory and the target must be scratch — never staging or production.
 (Sources: `test-import.sh:11-15` (refusal guard), `:47-51` (truncate + state
-reset).) Unit tests for the validator run with the workspace: `cargo test`.
-(Sources: `Cargo.toml:2` (workspace member);
-`crates/mb-import-validate/src/lib.rs:799-1389` (unit tests);
-`.github/workflows/ci.yml:51` (`cargo test --workspace`).)
+reset).) Local work is limited to one failing test or crate under the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only);
+heavy work uses guarded Boat, never a raw-host fallback. This does not
+authorize database access or bypass scratch-target guards.
 
 ## Secrets
 

@@ -4,7 +4,7 @@ import { notifyLocalAuthTransition, subscribeLocalAuthTransition } from './auth-
 /**
  * Same-window auth-transition dispatch contract. The security page calls
  * `notifyLocalAuthTransition()` after a qualifying result; every mounted
- * consumer (library, provider, BYOP) resets through the same callback it
+ * consumer (library, account) resets through the same callback it
  * uses for the delivered cross-tab transition. Both entry points are
  * no-throw; a failing listener or broken callback must never suppress the
  * other local resets.

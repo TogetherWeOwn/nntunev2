@@ -189,7 +189,9 @@ async function noPlayback(page: Page, calls: string[]) {
 
 async function tabTo(page: Page, target: Locator) {
 	await button(page, 'Refresh').focus();
-	for (let tabs = 0; tabs < 80 && !(await target.evaluate((element) => element === document.activeElement)); tabs += 1) {
+	// The four-track fixture traverses both library and queue row actions.
+	// Allow for additive controls while keeping keyboard reachability bounded.
+	for (let tabs = 0; tabs < 160 && !(await target.evaluate((element) => element === document.activeElement)); tabs += 1) {
 		await page.keyboard.press('Tab');
 	}
 	await expect(target).toBeFocused();

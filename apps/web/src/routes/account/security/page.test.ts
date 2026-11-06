@@ -38,20 +38,45 @@ describe('account security page', () => {
 		expect(body).toMatch(/<button[^>]*>[\s\S]*?Sign out[\s\S]*?<\/button>/i);
 	});
 
-	it('verifies an authenticated session with a read-only vault request', async () => {
-		const requests: Array<{ url: string; method: string }> = [];
-		const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
-			requests.push({ url: String(input), method: init?.method ?? 'GET' });
-			return new Response('{}', { status: 200 });
-		}) as typeof fetch;
+	it.each(['active', 'no_subscription', 'lapsed'] as const)(
+		'verifies a %s session without reading an oversized credential history',
+		async (state) => {
+			const credentialHistory = JSON.stringify({
+				credentials: Array.from({ length: 5_000 }, (_, id) => ({
+					id: String(id),
+					label: 'Historical credential',
+					scopes: ['catalogue:read'],
+					created_at: '2025-01-01T00:00:00Z',
+					expires_at: '2025-02-01T00:00:00Z',
+					revoked_at: '2025-01-02T00:00:00Z',
+					last_used_at: '2025-01-01T00:00:00Z'
+				}))
+			});
+			expect(new TextEncoder().encode(credentialHistory).byteLength).toBeGreaterThan(1_048_576);
+			const requests: Array<{ url: string; method: string; credentials?: RequestCredentials }> = [];
+			const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				requests.push({ url, method: init?.method ?? 'GET', credentials: init?.credentials });
+				if (url.endsWith('/v1/credentials')) return new Response(credentialHistory);
+				expect(url).toMatch(/\/v1\/me\/subscription$/);
+				return Response.json({
+					state,
+					planId: state === 'no_subscription' ? null : 'solo',
+					status: state === 'no_subscription' ? null : state === 'active' ? 'active' : 'canceled',
+					currentPeriodEnd: null,
+					graceUntil: null,
+					cancelAtPeriodEnd: false
+				});
+			}) as typeof fetch;
 
-		const data = await load({ fetch: fetchFn } as never);
+			const data = await load({ fetch: fetchFn } as never);
 
-		expect(data?.sessionCheckFailed).toBe(false);
-		expect(requests).toHaveLength(1);
-		expect(requests[0]).toMatchObject({ url: expect.stringMatching(/\/v1\/vault$/), method: 'GET' });
-		expect(requests.some(({ url }) => /refresh|rotate/i.test(url))).toBe(false);
-	});
+			expect(data?.sessionCheckFailed).toBe(false);
+			expect(requests).toEqual([
+				{ url: expect.stringMatching(/\/v1\/me\/subscription$/), method: 'GET', credentials: 'include' }
+			]);
+		}
+	);
 
 	it('redirects a 401 to login, clears the stale label and library snapshots, and does not rotate the session', async () => {
 		const snapshot = JSON.stringify({
@@ -106,7 +131,7 @@ describe('account security page', () => {
 			expect(local.getItem(LIBRARY_SNAPSHOT_KEY)).toBeNull();
 			expect(broadcasts).toHaveLength(1);
 			expect(requests).toHaveLength(1);
-			expect(requests[0]).toMatch(/\/v1\/vault$/);
+			expect(requests[0]).toMatch(/\/v1\/me\/subscription$/);
 			expect(requests.some((url) => /refresh|rotate/i.test(url))).toBe(false);
 		} finally {
 			vi.unstubAllGlobals();

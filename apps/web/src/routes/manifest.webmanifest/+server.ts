@@ -9,7 +9,7 @@ const MANIFEST = {
 	name: 'NNTune',
 	short_name: 'NNTune',
 	description:
-		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.',
+		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up to choose an account plan.',
 	start_url: '/',
 	scope: '/',
 	display: 'standalone',

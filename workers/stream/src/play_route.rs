@@ -133,12 +133,14 @@ pub fn bearer_token(header: Option<&str>) -> Option<&str> {
 }
 
 /// A refused play: render `api_error.body_json()` with `status` (and
-/// `Retry-After` when carried). No body bytes are ever served.
+/// `Retry-After` / `Content-Range` when carried). No media bytes are served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayRouteRefusal {
     pub status: u16,
     pub api_error: ApiError,
     pub retry_after: Option<String>,
+    /// For a 416 with a known file size: `bytes */<size>`.
+    pub content_range: Option<String>,
 }
 
 impl From<&PlayError> for PlayRouteRefusal {
@@ -147,6 +149,7 @@ impl From<&PlayError> for PlayRouteRefusal {
             status: error.http_status(),
             api_error: error.api_error(),
             retry_after: error.retry_after_header(),
+            content_range: None,
         }
     }
 }
@@ -293,6 +296,7 @@ pub fn serve_play(
                     status: 401,
                     api_error: ApiError::unauthorized(),
                     retry_after: None,
+                    content_range: None,
                 });
             }
         }
@@ -363,6 +367,7 @@ pub fn serve_play(
                     status: 404,
                     api_error: ApiError::not_found(),
                     retry_after: None,
+                    content_range: None,
                 });
             }
             PlayRouteOutcome::Refuse(PlayRouteRefusal::from(&error))

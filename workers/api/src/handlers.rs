@@ -1,4 +1,4 @@
-//! Framework-agnostic HTTP handlers for the accounts/auth/vault API.
+//! Framework-agnostic HTTP handlers for the accounts/auth API.
 //!
 //! The Worker entry (`worker_entry`) adapts `worker::Request` into
 //! [`Request`] and renders [`Response`]; all security decisions live here
@@ -6,8 +6,7 @@
 //!
 //! Contracts enforced here (threat model + CISO conditions):
 //! - One generic error body per surface: auth failures are always
-//!   `401 {"error":"check your email and try again"}`, vault failures
-//!   always `400 {"error":"vault unavailable"}`, store failures
+//!   `401 {"error":"check your email and try again"}`, store failures
 //!   `500 {"error":"internal error"}`. No credential, host, banner or
 //!   existence detail ever reaches a body.
 //! - Every authenticated request goes through
@@ -21,16 +20,10 @@
 //!   so it requires the same exact `Origin` match even when unauthenticated
 //!   (login-CSRF session planting): browsers always send `Origin` on this
 //!   fetch POST, and API-only clients must send `Origin: <configured origin>`.
-//! - Vault reads/writes are keyed ONLY by the session's `user_id` — there
-//!   is no handler parameter naming a vault, so a non-owner cannot even
-//!   address another vault (no existence oracle).
 //! - Magic links, challenges and invites are consumed only through the
 //!   `*_atomically` helpers (conditional UPDATE/RETURNING, exactly one
 //!   row, committed before any response). Session refresh advances the
 //!   server row with a conditional counter update before `Set-Cookie`.
-//! - Outbound test-connection dials resolve ALL records immediately
-//!   before dialing, validate into a [`vault::ValidatedTarget`], and the
-//!   [`Dialer`] receives only that vetted address set.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -49,11 +42,8 @@ use crate::admin_ingest::{
     StoredAdminIngestJob,
 };
 use crate::b64::{decode as b64url_decode, encode as b64url_encode};
-use crate::providers::{self, ProviderMintRow};
 use crate::session::{self, SessionClaims, SessionRecord};
-use crate::vault::{
-    self, AuditEvent, DnsResolver, IndexerConfig, ProviderConfig, ValidatedTarget, VaultBlob,
-};
+use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
 /// Request bodies above this size reject before routing (not an oracle:
@@ -90,11 +80,6 @@ pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
 /// unchanged generic envelope). Drift must be a deliberate slice with README
 /// and caller updates, not a silent edit.
 pub const AUTH_MAIL_SEND_DEADLINE_SECS: u64 = 5;
-// Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
-// per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
-// once disagreed (10 vs 5) with both test suites green.
-// Expired leases outlive the bounded test-connection probe by five seconds.
-const TEST_CONNECTION_LEASE_SECS: u64 = 20;
 const AUTH_START_WINDOW_SECS: u64 = 3600;
 /// Finish-route attempt budgets (CISO follow-up): each forged assertion
 /// costs P-256 ECDSA verify + SHA-256 plus DB reads, while a failed verify
@@ -612,13 +597,6 @@ pub struct ChallengeRow {
     pub purpose: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct VaultRow {
-    pub blob: VaultBlob,
-    pub indexer_configured: bool,
-    pub updated_at: u64,
-}
-
 /// One `plans` row (migration 0021 as reseeded by 0026). Plan prices and
 /// quotas are data: the `GET /v1/plans` handler renders these rows, never
 /// a second hard-coded copy (the `PlanId` enum stays the parity mirror).
@@ -1072,21 +1050,6 @@ pub trait Store {
             Ok(())
         }
     }
-    /// Acquire one of the per-user test-connection leases until `expires_at`.
-    fn acquire_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-        lease_secs: u64,
-        max_concurrency: u32,
-    ) -> impl Future<Output = Result<bool, StoreError>>;
-    /// Release only the lease owned by `token`; a stale completion cannot
-    /// release a newer lease that reused the slot.
-    fn release_test_connection_lease(
-        &self,
-        user_id: &str,
-        token: &str,
-    ) -> impl Future<Output = Result<(), StoreError>>;
     fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -1195,45 +1158,6 @@ pub trait Store {
         }
     }
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
-    fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> impl Future<Output = Result<Option<VaultRow>, StoreError>>;
-    fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &VaultRow,
-    ) -> impl Future<Output = Result<(), StoreError>>;
-    fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
-    /// Mint one `providers` row for a vault save (migration 0022, v2).
-    /// Default no-op `Ok(())` keeps out-of-tree test stores (fixtures
-    /// without a providers table) compiling; `PgStore` MUST override it
-    /// with the fenced insert, which `worker_entry::tests` pins.
-    fn insert_provider(
-        &self,
-        _row: &ProviderMintRow,
-    ) -> impl Future<Output = Result<(), StoreError>> {
-        async { Ok(()) }
-    }
-    /// Atomic vault save: the vault upsert, the providers mint, and the
-    /// rotation prune of superseded unreferenced rows, as one unit — a
-    /// failed mint must never leave a committed vault row behind (the
-    /// save audit runs only after this returns `Ok`, so a partial write
-    /// would be a silent credential overwrite). `PgStore` MUST override
-    /// this with one transaction; the default runs the two writes
-    /// sequentially for out-of-tree test stores (whose no-op
-    /// `insert_provider` keeps the old upsert-only behavior).
-    fn save_vault_and_mint_provider(
-        &self,
-        user_id: &str,
-        vault: &VaultRow,
-        mint: &ProviderMintRow,
-    ) -> impl Future<Output = Result<(), StoreError>> {
-        async move {
-            self.upsert_vault(user_id, vault).await?;
-            self.insert_provider(mint).await
-        }
-    }
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -1252,17 +1176,11 @@ pub trait Store {
     /// The magic-finish invite gate refuses only accounts for which
     /// this is false — a never-admitted signup in progress — so
     /// established magic-only members keep signing in after
-    /// `INVITES_REQUIRED` flips. The default composes the credential
-    /// and vault reads only, keeping out-of-tree `Store` impls
-    /// compiling; production and the test fake override it with the
-    /// full predicate (sessions and role included).
+    /// `INVITES_REQUIRED` flips. The default checks credentials only;
+    /// production and the test fake override it with the full legacy
+    /// predicate (sessions, role and remaining encrypted rows included).
     fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
-        async move {
-            if !self.credentials_for_user(user_id).await?.is_empty() {
-                return Ok(true);
-            }
-            Ok(self.vault_by_user(user_id).await?.is_some())
-        }
+        async move { Ok(!self.credentials_for_user(user_id).await?.is_empty()) }
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
     /// The stored `users.role` for the admin guard, read fresh per
@@ -1408,14 +1326,18 @@ pub trait Store {
         async move { Ok(None) }
     }
     /// Record the created session (and later terminal marks) on the
-    /// operation row. Default `Err` (fail closed).
+    /// operation row — but only while the row still holds the single
+    /// flight. Reports whether the mark landed: a mark that arrives after
+    /// a deliberate supersede must not resurrect the retired row, so the
+    /// caller retries into the replacement instead. Default `Err` (fail
+    /// closed).
     fn update_checkout_operation(
         &self,
         _op_id: &str,
         _state: &str,
         _price_id: &str,
         _session_id: Option<&str>,
-    ) -> impl Future<Output = Result<(), StoreError>> {
+    ) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Err(StoreError) }
     }
     /// One guarded admin NZB upload attempt (migration 0034): validate
@@ -1645,37 +1567,6 @@ pub trait AsyncDns {
     fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
 }
 
-pub(crate) async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
-    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
-    #[cfg(not(target_arch = "wasm32"))]
-    let deadline = futures_timer::Delay::new(duration);
-    #[cfg(target_arch = "wasm32")]
-    let deadline = worker::Delay::from(duration);
-
-    let mut deadline = std::pin::pin!(deadline);
-    let mut resolution = dns.resolve(host);
-    std::future::poll_fn(|cx| {
-        // Expiry wins even if answers become ready in the same poll. Never
-        // return a partial family: all answers must reach the core SSRF guard.
-        if deadline.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(Vec::new());
-        }
-        resolution.as_mut().poll(cx)
-    })
-    .await
-    // Both losing futures drop before the caller can validate or dial.
-}
-
-struct StaticDns {
-    addresses: Vec<IpAddr>,
-}
-
-impl DnsResolver for StaticDns {
-    fn resolve(&self, _host: &str) -> Vec<IpAddr> {
-        self.addresses.clone()
-    }
-}
-
 // --- HTTP shapes --------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -1730,10 +1621,6 @@ fn generic_auth() -> Response {
         401,
         serde_json::json!({"error": "check your email and try again"}),
     )
-}
-
-fn generic_vault() -> Response {
-    json_response(400, serde_json::json!({"error": "vault unavailable"}))
 }
 
 /// The typed account-deletion fence refusal (ADR 0002 rule 3): HTTP 409
@@ -2379,12 +2266,6 @@ where
             let _ = deliver_mail_with_deadline(self.mailer.send_magic_link(email, &token)).await;
         }
     }
-
-    async fn resolve_all(&self, host: &str) -> StaticDns {
-        StaticDns {
-            addresses: resolve_bounded(self.dns, host).await,
-        }
-    }
 }
 
 // --- Request bodies ----------------------------------------------------------------------
@@ -2434,19 +2315,6 @@ struct LoginFinishBody {
 #[serde(deny_unknown_fields)]
 struct MagicFinishBody {
     token: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VaultPutBody {
-    provider: ProviderConfig,
-    indexer: Option<IndexerConfig>,
-}
-
-#[derive(serde::Serialize, Deserialize)]
-struct VaultPayload {
-    provider: ProviderConfig,
-    indexer: Option<IndexerConfig>,
 }
 
 // --- Route handlers ------------------------------------------------------------------------
@@ -3731,39 +3599,6 @@ where
     resp
 }
 
-fn summary_response(row: Option<&VaultRow>) -> Response {
-    let (provider_configured, indexer_configured, updated_at) = match row {
-        Some(row) => (true, row.indexer_configured, row.updated_at),
-        None => (false, false, 0),
-    };
-    let summary = vault::redacted_summary(provider_configured, indexer_configured, updated_at);
-    json_response(
-        200,
-        serde_json::json!({
-            "provider_configured": summary.provider_configured,
-            "indexer_configured": summary.indexer_configured,
-            "updated_at": summary.updated_at,
-        }),
-    )
-}
-
-async fn vault_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate(req, false).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    match ctx.store.vault_by_user(&claims.user_id).await {
-        Ok(row) => summary_response(row.as_ref()),
-        Err(_) => generic_vault(),
-    }
-}
-
 /// `GET /v1/plans`: every plan row for pricing display. Prices/quotas are
 /// plan *data* read from the `plans` table (the one runtime source, ADR
 /// 0004); the reserved `free` row (and any unrecognised id, fail-closed)
@@ -3886,364 +3721,6 @@ where
             "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
         }),
     )
-}
-
-/// Failure of one [`build_provider_mint_row`] call: the OS RNG was
-/// unavailable (retryable 503), or the mint inputs were invalid (a
-/// faulty caller clock — classified downstream through
-/// [`vault_write_failure`], like a failed write). The build touches no
-/// store: nothing has landed when it fails.
-enum MintBuildError {
-    RandomnessUnavailable,
-    Invalid,
-}
-
-/// Build the identity-bearing `providers` row for one vault save
-/// (migration 0022, envelope v2): fresh UUID, host-derived label, the
-/// provider config sealed under the current write KEK. Pure mint
-/// inputs, no store touch — the caller persists the row together with
-/// the vault upsert through
-/// [`Store::save_vault_and_mint_provider`], so a build failure fails
-/// the PUT before anything lands.
-fn build_provider_mint_row(
-    kek: &[u8; 32],
-    kek_version: u32,
-    user_id: &str,
-    provider: &ProviderConfig,
-    now: u64,
-) -> Result<ProviderMintRow, MintBuildError> {
-    // Fresh credential identity first: every failure below fails the
-    // PUT closed before the atomic save runs.
-    let id = match providers::mint_provider_id() {
-        Ok(id) => id,
-        Err(_) => return Err(MintBuildError::RandomnessUnavailable),
-    };
-    // `ProviderConfig` as caller-serialized JSON (payload format 1);
-    // serialization of a validated struct cannot fail, so a failure
-    // here collapses into the invalid outcome.
-    let plaintext = match serde_json::to_vec(provider) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(MintBuildError::Invalid),
-    };
-    let envelope =
-        match providers::encrypt_provider_creds(kek, kek_version, user_id, &id, &plaintext) {
-            Ok(envelope) => envelope,
-            Err(vault::VaultError::RandomnessUnavailable) => {
-                return Err(MintBuildError::RandomnessUnavailable)
-            }
-            Err(_) => return Err(MintBuildError::Invalid),
-        };
-    let row = ProviderMintRow {
-        id,
-        user_id: user_id.to_string(),
-        label: providers::provider_label_for_host(&provider.host),
-        encrypted_creds: envelope.ciphertext,
-        kek_version,
-        dek_wrapped_nonce: envelope.dek_wrapped_nonce,
-        dek_wrapped: envelope.dek_wrapped,
-        payload_nonce: envelope.payload_nonce,
-        created_at: now,
-        last_verified_at: now,
-    };
-    // By-construction values, but the clock is caller input: a faulty
-    // `now` fails here instead of as a 23514 at the database.
-    if providers::validate_mint_row(&row).is_err() {
-        return Err(MintBuildError::Invalid);
-    }
-    Ok(row)
-}
-
-/// Classify a failed vault-flow write: a fenced write (account being
-/// deleted) is the typed 409, never the generic vault failure;
-/// anything else stays generic so a probe failure cannot leak a new
-/// shape. Shared by the vault upsert and the providers mint (same
-/// fence, same classification).
-async fn vault_write_failure<S: Store>(store: &S, user_id: &str) -> Response {
-    if matches!(store.account_deleting(user_id).await, Ok(true)) {
-        return account_deleting_response();
-    }
-    generic_vault()
-}
-
-async fn vault_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate_privileged(req).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    let Some(body) = parse_body::<VaultPutBody>(req) else {
-        return generic_vault();
-    };
-    // Save-time SSRF validation over freshly resolved records (this does
-    // not authorize any later fetch; dial time revalidates).
-    let provider_dns = ctx.resolve_all(&body.provider.host).await;
-    if body.provider.validate(&provider_dns).is_err() {
-        return generic_vault();
-    }
-    if let Some(indexer) = &body.indexer {
-        let host = match url::Url::parse(&indexer.url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
-        {
-            Some(host) => host,
-            None => return generic_vault(),
-        };
-        let indexer_dns = ctx.resolve_all(&host).await;
-        if indexer.validate(&indexer_dns).is_err() {
-            return generic_vault();
-        }
-    }
-    // Repudiation-safe audit action from the core contract
-    // (`vault::ProviderConfig::audit_action`), taken BEFORE the move
-    // below: a save carrying the explicit cleartext opt-in must not look
-    // like a normal save in the audit log.
-    let audit_action = body.provider.audit_action();
-    let indexer_configured = body.indexer.is_some();
-    let payload = VaultPayload {
-        provider: body.provider,
-        indexer: body.indexer,
-    };
-    let plaintext = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(_) => return generic_vault(),
-    };
-    // Encrypt through the selected current write version only: the
-    // selector resolves the configured current key (which always wins
-    // over a same-version retained entry), never a prior. `None` is
-    // unreachable by construction — the current version always selects
-    // the current key — and fails closed like every other vault error.
-    let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
-        Some(kek) => kek,
-        None => return generic_vault(),
-    };
-    let blob = match vault::encrypt_vault(
-        current_kek,
-        ctx.cfg.kek_version,
-        &claims.user_id,
-        &plaintext,
-    ) {
-        Ok(blob) => blob,
-        Err(vault::VaultError::RandomnessUnavailable) => return unavailable(),
-        Err(_) => return generic_vault(),
-    };
-    let row = VaultRow {
-        blob,
-        indexer_configured,
-        updated_at: ctx.now,
-    };
-    // Mint the providers row for this save BEFORE the store touch: the
-    // build is pure, so a randomness or clock failure fails the PUT
-    // before anything lands.
-    let mint = match build_provider_mint_row(
-        current_kek,
-        ctx.cfg.kek_version,
-        &claims.user_id,
-        &payload.provider,
-        ctx.now,
-    ) {
-        Ok(row) => row,
-        Err(MintBuildError::RandomnessUnavailable) => return unavailable(),
-        Err(MintBuildError::Invalid) => {
-            return vault_write_failure(ctx.store, &claims.user_id).await
-        }
-    };
-    // One atomic save: vault upsert + providers mint + rotation prune.
-    // Either everything lands or nothing does, so the audit below
-    // describes a committed write and a failed PUT leaves no silent
-    // overwrite behind (a retry re-saves the single vault row and mints
-    // again with identical plaintext; the pool resolves the latest row
-    // per user).
-    if ctx
-        .store
-        .save_vault_and_mint_provider(&claims.user_id, &row, &mint)
-        .await
-        .is_err()
-    {
-        return vault_write_failure(ctx.store, &claims.user_id).await;
-    }
-    ctx.audit(&claims.user_id, audit_action, true).await;
-    summary_response(Some(&row))
-}
-
-async fn vault_delete<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate_privileged(req).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    if ctx.store.delete_vault(&claims.user_id).await.is_err() {
-        return generic_vault();
-    }
-    ctx.audit(&claims.user_id, "vault.delete", true).await;
-    summary_response(None)
-}
-
-async fn vault_test_connection<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _token) = match ctx.authenticate(req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    // Every failure below collapses to the same boolean (never a banner,
-    // host verdict or vault-existence signal).
-    let fail = || json_response(200, serde_json::json!({"ok": false}));
-    // Dual budget (per-IP AND per-account; roadmap R6): the limits come
-    // from `ctx.cfg.rate_limits` (`VAULT_TEST_*_RATE_LIMIT_*` [vars]
-    // overlaid by the Worker entry), whose per-account default IS
-    // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
-    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see
-    // rate_limit.rs. The per-IP budget has its own larger default
-    // (5x the account cap): NAT-shared addresses serve many accounts,
-    // so one account's allowed probes must not consume the whole IP
-    // budget and lock out its neighbours. Both slots are claimed as
-    // one all-or-none pair before any lookup or dial, so one host
-    // cannot burn probes across accounts, one account cannot burn
-    // them across hosts, and a denied attempt consumes neither
-    // budget. Denial keeps the same boolean collapse as every other
-    // failure on this route (never a 429 oracle here).
-    let limits = ctx.cfg.rate_limits;
-    let ip_key = rate_limit_ip_key(&ctx.source_ip);
-    let admitted = matches!(
-        ctx.store
-            .reserve_rate_limit_pair(
-                RateLimitBudget {
-                    scope_key: &ip_key,
-                    action: "vault.test_ip",
-                    limit: u64::from(limits.vault_test_ip_max_attempts),
-                    window_secs: limits.vault_test_window_secs,
-                },
-                RateLimitBudget {
-                    scope_key: &claims.user_id,
-                    action: "vault.test",
-                    limit: u64::from(limits.vault_test_max_attempts),
-                    window_secs: limits.vault_test_window_secs,
-                },
-                ctx.now,
-            )
-            .await,
-        Ok(PairAdmission::Allowed)
-    );
-    if !admitted {
-        return fail();
-    }
-    // What to dial: the stored vault by default (empty body), or a
-    // candidate envelope for test-before-save. A candidate runs the exact
-    // save-time guards (`validate` over freshly resolved records) without
-    // persisting anything, so the wizard can test a config the server has
-    // never stored. This widens no SSRF boundary: saving the same
-    // candidate then testing the stored row reaches the identical dial,
-    // and every failure below still collapses to the same boolean. A
-    // non-empty body that is not the save envelope fails closed instead
-    // of silently testing something else.
-    let (provider, indexer): (ProviderConfig, Option<IndexerConfig>) = if req.body.is_empty() {
-        let row = match ctx.store.vault_by_user(&claims.user_id).await {
-            Ok(Some(row)) => row,
-            _ => return fail(),
-        };
-        // Version-pinned decrypt: exactly one candidate — the key for the
-        // stored row's own version. An unprovisioned version selects
-        // nothing (no fallback to the current key, no trying every key)
-        // and collapses into the same boolean as a bad tag or a missing
-        // row, so unknown versions are not an oracle.
-        match ctx
-            .cfg
-            .kek_by_version(row.blob.kek_version)
-            .and_then(|kek| vault::decrypt_vault(kek, &claims.user_id, &row.blob).ok())
-            .and_then(|bytes| serde_json::from_slice::<VaultPayload>(&bytes).ok())
-        {
-            Some(payload) => (payload.provider, payload.indexer),
-            None => return fail(),
-        }
-    } else {
-        match serde_json::from_slice::<VaultPutBody>(&req.body).ok() {
-            Some(envelope) => (envelope.provider, envelope.indexer),
-            None => return generic_vault(),
-        }
-    };
-    // The attempt slot is reserved before any potentially slow lookup or
-    // dial, so concurrent requests cannot pass a count-then-act check.
-    // Fail closed on randomness before the lease: no token means no lease
-    // is acquired and no dial runs — the request ends 503, never a
-    // boolean that pretends the test ran.
-    let lease_token = match random_id::<16>() {
-        Ok(token) => token,
-        Err(_) => return unavailable(),
-    };
-    let result = async {
-        // Resolve all records immediately before the dial and hand the
-        // dialer only the vetted, bounded address set.
-        let dns = ctx.resolve_all(&provider.host).await;
-        let target: ValidatedTarget = match provider.validate(&dns) {
-            Ok(target) => target,
-            Err(_) => return Some(false),
-        };
-        // A candidate that would not save fails the test instead of
-        // testing half a config (the stored path was validated at save).
-        if let Some(indexer) = &indexer {
-            let host = match url::Url::parse(&indexer.url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
-            {
-                Some(host) => host,
-                None => return Some(false),
-            };
-            let indexer_dns = ctx.resolve_all(&host).await;
-            if indexer.validate(&indexer_dns).is_err() {
-                return Some(false);
-            }
-        }
-        let lease_acquired = ctx
-            .store
-            .acquire_test_connection_lease(
-                &claims.user_id,
-                &lease_token,
-                TEST_CONNECTION_LEASE_SECS,
-                vault::MAX_TEST_CONCURRENCY,
-            )
-            .await
-            .unwrap_or(false);
-        // A denied lease is `None` (fenced or contended, told apart
-        // below); every other failure stays the collapsed boolean.
-        if !lease_acquired {
-            return None;
-        }
-        let ok = ctx.dialer.probe(&target, provider.tls).await;
-        let _ = ctx
-            .store
-            .release_test_connection_lease(&claims.user_id, &lease_token)
-            .await;
-        Some(ok)
-    }
-    .await;
-    // A fenced lease (account being deleted) is the typed 409, never the
-    // boolean collapse: the lease is the fenced writer on this route
-    // (ADR 0002 rule 3), matching `vault_put`.
-    let Some(result) = result else {
-        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-            return account_deleting_response();
-        }
-        // Lease contention (slots exhausted): same boolean as every other
-        // failure on this route, never a distinct shape.
-        ctx.audit(&claims.user_id, "vault.test", false).await;
-        return json_response(200, serde_json::json!({"ok": false}));
-    };
-    ctx.audit(&claims.user_id, "vault.test", result).await;
-    json_response(200, serde_json::json!({"ok": result}))
 }
 
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
@@ -6526,12 +6003,21 @@ where
         })
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    // Best-effort mark: the session already exists under our idempotency
-    // key, so a lost mark only costs a retrieve on the next attempt.
-    let _ = ctx
+    // Conditional mark: the session already exists under our idempotency
+    // key, so a lost mark only costs a retrieve on the next attempt — but
+    // a mark that lands after a deliberate supersede must not resurrect
+    // the retired row. A missed mark means the flight moved on (the
+    // replacer expired this very session before retiring the row), so the
+    // in-hand session is dead: fail retryable and let the retry converge
+    // onto the replacement instead of handing out an expired URL.
+    let marked = ctx
         .store
         .update_checkout_operation(operation_id, "submitted", price_id, Some(&session.id))
-        .await;
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
     session.url.ok_or(EnsureCheckoutError::Failed)
 }
 
@@ -6551,6 +6037,154 @@ where
 pub enum EnsureCheckoutError {
     Unavailable,
     Failed,
+}
+
+/// What one retrieved flight session decides: reuse its URL, retire it so
+/// the caller mints a replacement, accept the completed purchase, or keep
+/// the flight without minting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlightSessionDecision {
+    /// Open, price-matched, with a URL: hand it over.
+    Reuse(String),
+    /// Deliberately retired (expired first while still open, or confirmed
+    /// dead): the caller mints the replacement under a fresh operation.
+    Replace,
+    /// Complete and paid: reconciled through the shared driver; the caller
+    /// refuses the duplicate purchase.
+    Completed,
+    /// Complete but unpaid, or any other unrecognized state: the flight
+    /// stays open for the real completion; the caller fails retryable
+    /// without minting beside unknown state.
+    Retained,
+}
+
+/// Branch on one flight session retrieved fresh from Stripe (never trusted
+/// from the row): reuse the open price-matched session, expire a still-open
+/// unusable one before its deliberate replacement, reconcile a completed
+/// paid session through the shared driver, or retain the flight without
+/// minting for anything else. Only `status == "expired"` deliberately
+/// replaces among the closed states: a `complete` session that is not paid
+/// (`unpaid` async processing, `no_payment_required` subscription already
+/// created) can still succeed, so a retry must never mint a second
+/// subscription checkout beside it. A Stripe-404 (past retention, never
+/// minted) replaces like a confirmed-expired session; any other retrieve
+/// failure fails retryable instead of minting beside unknown state.
+async fn handle_flight_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    session_id: &str,
+    price_id: &str,
+) -> Result<FlightSessionDecision, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = match ctx
+        .stripe
+        .retrieve_checkout_session(session_id.to_string())
+        .await
+    {
+        Ok(session) => session,
+        Err(err) if err.http_status == 404 => {
+            // Missing (past retention, never minted): same deliberate
+            // replacement as a confirmed-expired session.
+            replace_checkout_operation(ctx, op, None).await?;
+            return Ok(FlightSessionDecision::Replace);
+        }
+        Err(_) => return Err(EnsureCheckoutError::Failed),
+    };
+    if session.status.as_deref() == Some("open") {
+        if crate::billing_reconcile::checkout_price_matches(op, price_id) {
+            if let Some(url) = session.url {
+                return Ok(FlightSessionDecision::Reuse(url));
+            }
+        }
+        // Open but unusable for this attempt: price-mismatched (the flight
+        // belongs to another price) or URL-less. Expire it first — a
+        // replacement never mints beside a possibly-payable session — then
+        // replace deliberately.
+        replace_checkout_operation(ctx, op, Some(session_id)).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    if session.status.as_deref() == Some("complete")
+        && session.payment_status.as_deref() == Some("paid")
+    {
+        // The purchase completed but its webhook was lost (or lands after
+        // this retry): reconcile the paid session through the shared driver
+        // instead of minting a second payable session. Money already landed,
+        // whatever price it names — no replacement is minted on this path.
+        reconcile_checkout_session(ctx, session_id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        return Ok(FlightSessionDecision::Completed);
+    }
+    if session.status.as_deref() == Some("expired") {
+        // Confirmed dead without payment: no expiry call needed — Stripe
+        // converges the state itself — just supersede and replace.
+        replace_checkout_operation(ctx, op, None).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    // Complete but not paid, or any other unrecognized state: the flight
+    // stays open for the real completion and nothing mints beside it —
+    // retryable, never a blind replace.
+    Ok(FlightSessionDecision::Retained)
+}
+
+/// Recover the Stripe session for a session-less operation under its
+/// ORIGINAL operation id and recorded price, and carry the recovered id on
+/// the operation (best-effort mark repair — a lost mark only costs a
+/// re-resolve on the next attempt). A missing `session_id` does not mean
+/// Stripe has no session: the create mark is best-effort, so the same-key
+/// replay recovers the original create without duplicating, and when
+/// nothing was ever created the replay first-creates exactly one session
+/// under that key. Either way the caller retires the recovered session per
+/// its retrieved state before superseding — a replacement never mints
+/// beside a possibly-payable session. Any Stripe failure fails retryable
+/// with the flight untouched: nothing supersedes beside unknown state.
+async fn resolve_sessionless_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    mut op: crate::billing_reconcile::StoredCheckoutOp,
+    recorded_price_id: &str,
+    customer_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<crate::billing_reconcile::StoredCheckoutOp, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let recovered = ctx
+        .stripe
+        .create_checkout_session(crate::stripe::CreateCheckoutSession {
+            operation_id: op.id.clone(),
+            customer_id: customer_id.to_string(),
+            price_id: recorded_price_id.to_string(),
+            success_url: success_url.to_string(),
+            cancel_url: cancel_url.to_string(),
+        })
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    op.session_id = Some(recovered.id.clone());
+    // Conditional, like the create-path mark: the in-memory row already
+    // carries the recovered id for this attempt, so a lost mark only costs
+    // a re-resolve on the next one — never a duplicate session. A missed
+    // mark means the row retired while the replay was in flight (a
+    // concurrent replacer superseded it): fail retryable with the flight
+    // untouched instead of acting on the dead row.
+    let state = op.state.clone();
+    let marked = ctx
+        .store
+        .update_checkout_operation(&op.id, &state, recorded_price_id, op.session_id.as_deref())
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
+    Ok(op)
 }
 
 pub async fn ensure_checkout_session<S, M, D, N>(
@@ -6611,39 +6245,68 @@ where
         .open_checkout_operation(user_id)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    if let Some(op) = open {
-        // An open session is verified fresh: still-open reuses its fresh
-        // URL (lost responses and concurrent attempts converge here —
-        // no second session is minted). A closed, expired, or vanished
-        // session repairs under the SAME operation id (same idempotency
-        // key replays, never duplicates).
-        if let Some(session_id) = op.session_id.clone() {
-            if let Ok(session) = ctx
-                .stripe
-                .retrieve_checkout_session(session_id.clone())
-                .await
-            {
-                if session.status.as_deref() == Some("open") {
-                    if let Some(url) = session.url {
-                        return Ok(url);
-                    }
-                } else if session.status.as_deref() == Some("complete")
-                    && session.payment_status.as_deref() == Some("paid")
-                {
-                    // The purchase completed but its webhook was lost (or
-                    // lands after this retry): reconcile the paid session
-                    // through the shared driver instead of minting a second
-                    // payable session under the same idempotency key. A
-                    // failed or still-absent retrieve falls through to the
-                    // repair below; only a confirmed-expired session or a
-                    // missing one repairs.
-                    reconcile_checkout_session(ctx, &session_id)
-                        .await
-                        .map_err(|_| EnsureCheckoutError::Failed)?;
-                    return Err(EnsureCheckoutError::Unavailable);
-                }
-            }
+    if let Some(mut op) = open {
+        // A session-less operation whose recorded price no longer matches
+        // is resolved under its ORIGINAL operation id and price before
+        // anything retires it: a lost mark does not mean Stripe has no
+        // session, so the same-key replay recovers it first and the flight
+        // below retires it per its retrieved state. Only then does the
+        // flight supersede — a replacement never mints beside a
+        // possibly-payable session. A price-matched orphan still repairs
+        // under its own id further below (same key replays the lost create,
+        // never duplicates). An unresolvable flight (no bound customer to
+        // replay with, or any Stripe failure) fails retryable with the
+        // flight untouched: nothing supersedes beside unknown state.
+        if op.session_id.is_none()
+            && !crate::billing_reconcile::checkout_price_matches(&op, price_id)
+        {
+            let Some(customer_id) = input.stripe_customer_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            let recorded = op.price_id.clone().unwrap_or_else(|| price_id.to_string());
+            op = resolve_sessionless_operation(
+                ctx,
+                op,
+                &recorded,
+                &customer_id,
+                success_url,
+                cancel_url,
+            )
+            .await?;
         }
+        if let Some(session_id) = op.session_id.clone() {
+            // An open session is verified fresh against Stripe before reuse,
+            // and its recorded price must match the newly requested one: a
+            // second attempt naming a different plan never inherits the first
+            // attempt's session. A confirmed-expired or Stripe-404-missing
+            // session is deliberately replaced — the dead operation is
+            // superseded (releasing the flight) and a fresh operation mints
+            // under a fresh Stripe idempotency key, so a repair can never
+            // replay a dead session inside Stripe's retention window. Lost
+            // responses and same-price concurrent attempts still converge
+            // here: no second session is minted for them.
+            return match handle_flight_session(ctx, &op, &session_id, price_id).await? {
+                FlightSessionDecision::Reuse(url) => Ok(url),
+                FlightSessionDecision::Replace => {
+                    create_fresh_checkout_session(
+                        ctx,
+                        user_id,
+                        input.stripe_customer_id.clone(),
+                        price_id,
+                        success_url,
+                        cancel_url,
+                        test_clock,
+                    )
+                    .await
+                }
+                FlightSessionDecision::Completed => Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => Err(EnsureCheckoutError::Failed),
+            };
+        }
+        // Orphan operation (no session recorded — either never created, or
+        // the mark was lost) whose price still matches: repair under its own
+        // id (same key replays the lost create, never duplicates).
+        // (Mismatched orphans resolved above and carry a session now.)
         let Some(customer_id) = input.stripe_customer_id.clone() else {
             billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
             return Err(EnsureCheckoutError::Unavailable);
@@ -6651,46 +6314,200 @@ where
         return create_session_under(ctx, &op.id, &customer_id, price_id, success_url, cancel_url)
             .await;
     }
-    // No flight: mint the operation id, ensure the customer (with the
-    // test-clock seam), then insert single-flight — a racer converges on
-    // the winner's row below instead of minting a second subscription.
-    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
-    let customer_id = match input.stripe_customer_id.clone() {
-        Some(customer_id) => customer_id,
-        None => {
-            ctx.stripe
-                .create_customer(crate::stripe::CreateCustomer {
-                    operation_id: operation_id.clone(),
-                    user_id: Some(user_id.to_string()),
-                    test_clock: test_clock.map(str::to_string),
-                })
-                .await
-                .map_err(|_| EnsureCheckoutError::Failed)?
-                .id
-        }
-    };
-    let outcome = ctx
-        .store
-        .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
-        .await
-        .map_err(|_| EnsureCheckoutError::Failed)?;
-    let converged = outcome.op();
-    // Converge on the winner-bound customer: a racing loser that started
-    // unbound minted its own orphan customer before the insert, and the
-    // pre-insert snapshot still names nothing. Re-read the binding — the
-    // payable session must sit on the bound customer.
-    let customer_id =
-        converged_session_customer(ctx, user_id, input.stripe_customer_id.clone(), customer_id)
-            .await?;
-    create_session_under(
+    create_fresh_checkout_session(
         ctx,
-        &converged.id,
-        &customer_id,
+        user_id,
+        input.stripe_customer_id.clone(),
         price_id,
         success_url,
         cancel_url,
+        test_clock,
     )
     .await
+}
+
+/// Fresh-operation purchase attempt (no usable open flight): mint the
+/// operation id, ensure the customer (with the test-clock seam), then
+/// insert single-flight — a racer converges on the winner's row below
+/// instead of minting a second subscription. The converged operation's
+/// recorded price is checked before minting: a single-flight loser that
+/// asked for a different price replaces deliberately instead of
+/// inheriting the winner's session.
+async fn create_fresh_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    snapshot_customer: Option<String>,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
+    let mut snapshot_customer = snapshot_customer;
+    let mut minted_customer: Option<String> = None;
+    loop {
+        let customer_id = match snapshot_customer.clone() {
+            Some(customer_id) => customer_id,
+            None => match minted_customer.clone() {
+                Some(customer_id) => customer_id,
+                None => {
+                    let created = ctx
+                        .stripe
+                        .create_customer(crate::stripe::CreateCustomer {
+                            operation_id: operation_id.clone(),
+                            user_id: Some(user_id.to_string()),
+                            test_clock: test_clock.map(str::to_string),
+                        })
+                        .await
+                        .map_err(|_| EnsureCheckoutError::Failed)?;
+                    minted_customer = Some(created.id.clone());
+                    created.id
+                }
+            },
+        };
+        let outcome = ctx
+            .store
+            .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        let converged = outcome.op();
+        // A converged loser that named a different price must not inherit the
+        // winner's session (which keeps the first attempt's price). A
+        // session-less winner is still creating (or lost its mark): recover
+        // under the winner's key and price first, exactly like an orphan —
+        // otherwise the replace below would orphan a payable session.
+        // Either way the winner's session retires per its retrieved state
+        // before the retry mints under this attempt's fresh operation.
+        if !crate::billing_reconcile::checkout_price_matches(converged, price_id) {
+            let resolved = match converged.session_id.clone() {
+                Some(_) => converged.clone(),
+                None => {
+                    let customer_id = converged_session_customer(
+                        ctx,
+                        user_id,
+                        snapshot_customer.clone(),
+                        customer_id.clone(),
+                    )
+                    .await?;
+                    let recorded = converged
+                        .price_id
+                        .clone()
+                        .unwrap_or_else(|| price_id.to_string());
+                    resolve_sessionless_operation(
+                        ctx,
+                        converged.clone(),
+                        &recorded,
+                        &customer_id,
+                        success_url,
+                        cancel_url,
+                    )
+                    .await?
+                }
+            };
+            let Some(session_id) = resolved.session_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            match handle_flight_session(ctx, &resolved, &session_id, price_id).await? {
+                // Unreachable: the price mismatches by construction, so the
+                // winner's session is never reusable here. Fail safe — the
+                // retry heals it, and nothing mints beside unknown state.
+                FlightSessionDecision::Reuse(_) => return Err(EnsureCheckoutError::Failed),
+                FlightSessionDecision::Replace => {
+                    // Re-read the binding (the supersede released the flight, so the
+                    // retry sees whatever the winner bound). A still-unbound retry
+                    // reuses this attempt's already-minted customer instead of
+                    // minting a second orphan.
+                    snapshot_customer = snapshot_customer_fresh(ctx, user_id).await?;
+                    continue;
+                }
+                FlightSessionDecision::Completed => return Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => return Err(EnsureCheckoutError::Failed),
+            }
+        }
+        // Converge on the winner-bound customer: a racing loser that started
+        // unbound minted its own orphan customer before the insert, and the
+        // pre-insert snapshot still names nothing. Re-read the binding — the
+        // payable session must sit on the bound customer.
+        let customer_id =
+            converged_session_customer(ctx, user_id, snapshot_customer.clone(), customer_id)
+                .await?;
+        return create_session_under(
+            ctx,
+            &converged.id,
+            &customer_id,
+            price_id,
+            success_url,
+            cancel_url,
+        )
+        .await;
+    }
+}
+
+/// Re-read the account's bound customer after a deliberate replacement
+/// (the supersede released the flight, so the retry reads whatever the
+/// winner bound). `None` when still unbound — the caller then reuses its
+/// already-minted customer instead of minting a second orphan.
+async fn snapshot_customer_fresh<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+) -> Result<Option<String>, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    Ok(ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+        .stripe_customer_id)
+}
+
+/// Deliberately retire an open flight: expire the still-open Stripe
+/// session when one is named (so no second payable session lingers
+/// beside its replacement), then mark the operation superseded — the
+/// flight releases, and the replacement inserts a fresh operation with a
+/// fresh Stripe idempotency key. Confirmed-dead sessions pass `None` (no
+/// expiry call: Stripe already converged the state). Any expiry or store
+/// failure fails the attempt retryable: a replacement never mints beside
+/// a possibly-payable session.
+async fn replace_checkout_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    expire_session_id: Option<&str>,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Some(session_id) = expire_session_id {
+        ctx.stripe
+            .expire_checkout_session(session_id.to_string())
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+    }
+    // A supersede is idempotent retirement: the conditional mark may
+    // report `false` when the row already retired, which is success here.
+    ctx.store
+        .update_checkout_operation(
+            &op.id,
+            crate::billing_reconcile::SUPERSEDED_OP_STATE,
+            &op.price_id.clone().unwrap_or_default(),
+            op.session_id.as_deref(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| EnsureCheckoutError::Failed)
 }
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
@@ -6723,9 +6540,6 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/refresh"
             | "/v1/session/logout"
             | "/v1/session/revoke-all"
-            | "/v1/vault"
-            | "/v1/vault/test"
-            | "/v1/vault/test-connection"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
             | "/v1/credentials"
@@ -6894,15 +6708,9 @@ where
         ("POST", "/v1/session/refresh") => session_refresh(ctx, req).await,
         ("POST", "/v1/session/logout") => session_logout(ctx, req).await,
         ("POST", "/v1/session/revoke-all") => session_revoke_all(ctx, req).await,
-        ("GET", "/v1/vault") => vault_get(ctx, req).await,
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
-        ("PUT", "/v1/vault") => vault_put(ctx, req).await,
-        ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
-        ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
-            vault_test_connection(ctx, req).await
-        }
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -7098,17 +6906,10 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
-        vaults: RefCell<HashMap<String, VaultRow>>,
-        providers: RefCell<Vec<ProviderMintRow>>,
-        /// Mirror of `user_cache_grants` attribution (`user_id`,
-        /// `provider_id` pairs): grant-referenced providers rows survive
-        /// the rotation prune and the vault-delete purge, like the
-        /// production `RESTRICT` FK.
-        provider_grants: RefCell<HashSet<(String, String)>>,
-        /// Vault-save store-error pin: when set,
-        /// `save_vault_and_mint_provider` fails like a production
-        /// outage without writing anything.
-        fail_vault_saves: RefCell<bool>,
+        /// User ids that still own a legacy `provider_vaults` row. The
+        /// product no longer reads or writes vaults; the reaper and
+        /// magic admission keep protecting these accounts.
+        legacy_vault_users: RefCell<HashSet<String>>,
         audits: RefCell<Vec<AuditEvent>>,
         /// Mirror of `users.role` (migration 0028): an absent entry is
         /// the column default (`member`) for an existing user.
@@ -7117,7 +6918,6 @@ mod tests {
         /// key with the raw stored text.
         app_settings_rows: RefCell<HashMap<String, String>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
-        test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
         delete_user_before_next_challenge: RefCell<Option<String>>,
         delete_user_after_next_challenge: RefCell<Option<String>>,
         orphan_user_after_next_challenge: RefCell<Option<String>>,
@@ -7169,6 +6969,12 @@ mod tests {
         /// statements. A loser converging while the flag is set sees the op
         /// but no binding.
         defer_customer_bind: RefCell<bool>,
+        /// Race pin: when set, `create_checkout_operation` lands this
+        /// winner row just before its own insert, mirroring a racer that
+        /// wins the single flight between this attempt's open-flight read
+        /// and its insert. The attempt must converge onto (and, on a price
+        /// mismatch, deliberately replace) the winner.
+        plant_winner_on_next_create: RefCell<Option<crate::billing_reconcile::StoredCheckoutOp>>,
         /// Paid-invoice history by Stripe invoice id (idempotent on the id,
         /// mirroring `paid_invoice_history`).
         invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
@@ -7770,7 +7576,7 @@ mod tests {
                 .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
-            let vault_owners: HashSet<String> = self.vaults.borrow().keys().cloned().collect();
+            let vault_owners: HashSet<String> = self.legacy_vault_users.borrow().clone();
             let session_owners: HashSet<String> = self
                 .sessions
                 .borrow()
@@ -7803,40 +7609,6 @@ mod tests {
                     || magic_owners.contains(&user.id)
                     || protected_user_id == Some(user.id.as_str())
             });
-            Ok(())
-        }
-        async fn acquire_test_connection_lease(
-            &self,
-            user_id: &str,
-            token: &str,
-            lease_secs: u64,
-            max_concurrency: u32,
-        ) -> Result<bool, StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account acquires no new lease rows.
-            if self.deleting_users.borrow().contains(user_id) {
-                return Ok(false);
-            }
-            let expires_at = NOW.saturating_add(lease_secs);
-            let mut leases = self.test_connection_leases.borrow_mut();
-            leases.retain(|_, (_, expires)| *expires > NOW);
-            for slot in 0..max_concurrency {
-                let key = (user_id.to_string(), slot);
-                if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(key) {
-                    entry.insert((token.to_string(), expires_at));
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        async fn release_test_connection_lease(
-            &self,
-            user_id: &str,
-            token: &str,
-        ) -> Result<(), StoreError> {
-            self.test_connection_leases
-                .borrow_mut()
-                .retain(|(owner, _), (lease_token, _)| owner != user_id || lease_token != token);
             Ok(())
         }
         async fn invite_by_hash(
@@ -8147,20 +7919,6 @@ mod tests {
             }
             Ok(())
         }
-        async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
-            Ok(self.vaults.borrow().get(user_id).cloned())
-        }
-        async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's upsert writes nothing and fails.
-            if self.deleting_users.borrow().contains(user_id) {
-                return Err(StoreError);
-            }
-            self.vaults
-                .borrow_mut()
-                .insert(user_id.to_string(), row.clone());
-            Ok(())
-        }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))
         }
@@ -8178,62 +7936,13 @@ mod tests {
                     .borrow()
                     .values()
                     .any(|s| s.user_id == user_id)
-                || self.vaults.borrow().contains_key(user_id)
+                || self.legacy_vault_users.borrow().contains(user_id)
                 || self
                     .user_roles
                     .borrow()
                     .get(user_id)
                     .is_some_and(|role| role.as_str() != crate::admin::ROLE_MEMBER);
             Ok(admitted)
-        }
-        async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
-            self.vaults.borrow_mut().remove(user_id);
-            // Mirror the production purge: unreferenced rows go with the
-            // vault; grant-referenced rows stay (RESTRICT).
-            let grants = self.provider_grants.borrow();
-            self.providers.borrow_mut().retain(|row| {
-                row.user_id != user_id || grants.contains(&(row.user_id.clone(), row.id.clone()))
-            });
-            Ok(())
-        }
-        async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's mint writes nothing and fails.
-            if self.deleting_users.borrow().contains(&row.user_id) {
-                return Err(StoreError);
-            }
-            self.providers.borrow_mut().push(row.clone());
-            Ok(())
-        }
-        async fn save_vault_and_mint_provider(
-            &self,
-            user_id: &str,
-            vault: &VaultRow,
-            mint: &ProviderMintRow,
-        ) -> Result<(), StoreError> {
-            // Mirror the production transaction: the fence and the
-            // outage pin fail BEFORE any write, so a failed save lands
-            // nothing — never a vault row without its mint.
-            if *self.fail_vault_saves.borrow() {
-                return Err(StoreError);
-            }
-            if self.deleting_users.borrow().contains(user_id) {
-                return Err(StoreError);
-            }
-            self.vaults
-                .borrow_mut()
-                .insert(user_id.to_string(), vault.clone());
-            let mut providers = self.providers.borrow_mut();
-            providers.push(mint.clone());
-            // Mirror the rotation prune: superseded rows survive only
-            // while a grant references them.
-            let grants = self.provider_grants.borrow();
-            providers.retain(|row| {
-                row.user_id != user_id
-                    || row.id == mint.id
-                    || grants.contains(&(row.user_id.clone(), row.id.clone()))
-            });
-            Ok(())
         }
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
             self.audits.borrow_mut().push(event.clone());
@@ -8363,6 +8072,7 @@ mod tests {
                     plan_id: row.plan_id.clone(),
                     status: row.status.clone(),
                     paid_through_unix: row.paid_through_unix,
+                    paid_invoice_id: row.paid_invoice_id.clone(),
                     grace_until_unix: row.grace_until_unix,
                 }
             });
@@ -8405,8 +8115,19 @@ mod tests {
             // Mirrors the production upsert's monotonic coverage CASE: a
             // pass that folded an older snapshot commits without
             // regressing confirmed `paid_through_at` (or the plan and
-            // anchor tied to it). Status and bindings still update
-            // verbatim; history still converges on the invoice id.
+            // anchor tied to it). An equal-end pass carrying an anchor
+            // relabels the plan and anchor (the defined equal-end
+            // plan-switch outcome) — but only when the stored row still
+            // matches what the pass read — so a keep committing after a
+            // relabel, or an older relabel committing after a newer one,
+            // keeps the stored ones instead of reversing the newer
+            // plan/anchor. An anchor-less tie keeps the stored ones too.
+            // The same staleness predicate guards
+            // `status` and `grace_until`: strictly older money — or the
+            // anchor-less equal-end shape only the stale fold emits — keeps
+            // the stored verbatim fields instead of writing stale ones over
+            // a fresher pass. Bindings still update verbatim; history still
+            // converges on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
             let merged = match rows.get(user_id) {
                 Some(existing)
@@ -8417,11 +8138,40 @@ mod tests {
                             .paid_through_unix
                             .is_none_or(|previous| end > previous)
                     });
+                    let relabels = !advances
+                        && outcome.row.paid_invoice_id.is_some()
+                        && matches!(
+                            (outcome.row.paid_through_unix, existing.paid_through_unix),
+                            (Some(end), Some(previous)) if end == previous
+                        )
+                        // Mirrors the tie arm (`subscriptions.plan_id =
+                        // $14 AND subscriptions.paid_invoice_id IS NOT
+                        // DISTINCT FROM $13`): only a pass whose read row
+                        // is still stored relabels — a late keep, or an
+                        // older relabel, committing after the row moved
+                        // keeps the stored plan/anchor. `None` read plan
+                        // never equals a stored plan, so an anchor-less
+                        // keep never relabels either.
+                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                        && existing.paid_invoice_id == outcome.read_anchor;
+                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                        (Some(end), Some(previous)) => {
+                            end < previous
+                                || (end == previous
+                                    && outcome.row.paid_invoice_id.is_none()
+                                    && existing.paid_invoice_id.is_some())
+                        }
+                        _ => false,
+                    };
                     let mut row = outcome.row.clone();
-                    if !advances {
+                    if !advances && !relabels {
                         row.paid_through_unix = existing.paid_through_unix;
                         row.plan_id = existing.plan_id.clone();
                         row.paid_invoice_id = existing.paid_invoice_id.clone();
+                    }
+                    if stale {
+                        row.status = existing.status.clone();
+                        row.grace_until_unix = existing.grace_until_unix;
                     }
                     row
                 }
@@ -8462,6 +8212,13 @@ mod tests {
         ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
+            }
+            // Race pin: land the winner between the caller's open-flight
+            // read and this insert (consumed once).
+            if let Some(winner) = self.plant_winner_on_next_create.borrow_mut().take() {
+                self.checkout_ops
+                    .borrow_mut()
+                    .insert(winner.id.clone(), winner);
             }
             let mut ops = self.checkout_ops.borrow_mut();
             // The partial unique admits at most one open flight per user:
@@ -8516,18 +8273,25 @@ mod tests {
             state: &str,
             price_id: &str,
             session_id: Option<&str>,
-        ) -> Result<(), StoreError> {
+        ) -> Result<bool, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Best-effort mark like production: a missing row (already
-            // resolved elsewhere) still answers `Ok`.
-            if let Some(op) = self.checkout_ops.borrow_mut().get_mut(op_id) {
-                op.state = state.to_string();
-                op.price_id = Some(price_id.to_string());
-                op.session_id = session_id.map(str::to_string);
+            // Mirrors the production conditional mark: only an unresolved
+            // row takes the mark. A missing or already-retired row (lost
+            // mark, or superseded while its Stripe create was still in
+            // flight) reports `false` instead of resurrecting the flight.
+            let mut ops = self.checkout_ops.borrow_mut();
+            let Some(op) = ops.get_mut(op_id) else {
+                return Ok(false);
+            };
+            if !crate::billing_reconcile::is_single_flight_state(&op.state) {
+                return Ok(false);
             }
-            Ok(())
+            op.state = state.to_string();
+            op.price_id = Some(price_id.to_string());
+            op.session_id = session_id.map(str::to_string);
+            Ok(true)
         }
         async fn admin_ingest_upload(
             &self,
@@ -8917,6 +8681,25 @@ mod tests {
         /// Subscription ids passed to `cancel_subscription` (proves a
         /// recovered or unknown remote is never canceled).
         canceled: RefCell<Vec<String>>,
+        /// Session ids passed to `expire_checkout_session` (proves a
+        /// price-mismatched or dead session is deliberately retired
+        /// before its replacement mints).
+        expired: RefCell<Vec<String>>,
+        /// Operation ids that minted through `create_checkout_session`
+        /// (proves a replacement mints under a fresh operation — hence a
+        /// fresh Stripe idempotency key — never the dead session's).
+        /// Same-key replays are not mints and are not logged here.
+        session_create_ops: RefCell<Vec<String>>,
+        /// Session id minted per operation id: the production Stripe
+        /// replays a create under a seen idempotency key instead of
+        /// minting again, and the orphan-recovery path depends on it
+        /// (recover under the old key, then retire per the retrieved
+        /// state). Replays answer the stored session without bumping
+        /// `sessions_created`.
+        sessions_by_op: RefCell<HashMap<String, String>>,
+        /// Session ids that retrieve as Stripe 404s (proves a missing
+        /// session repairs under a fresh key instead of replaying).
+        missing_sessions: RefCell<HashSet<String>>,
         /// Method names that fail like a Stripe outage.
         fail: RefCell<HashSet<String>>,
         /// Next customer id minted by `create_customer`.
@@ -8972,23 +8755,38 @@ mod tests {
                 if self.fail("create_checkout_session") {
                     return self.err();
                 }
+                // Same-key replay, like the real idempotency key: answer
+                // the stored session without minting again.
+                if let Some(id) = self.sessions_by_op.borrow().get(&req.operation_id).cloned() {
+                    if let Some(session) = self.sessions.borrow().get(&id).cloned() {
+                        return Ok(session);
+                    }
+                }
                 let mut created = self.sessions_created.borrow_mut();
                 *created += 1;
+                self.session_create_ops
+                    .borrow_mut()
+                    .push(req.operation_id.clone());
                 self.session_customers
                     .borrow_mut()
                     .push(req.customer_id.clone());
                 let id = format!("cs_test_{created}");
                 let url = format!("https://checkout.stripe.com/pay/{id}");
-                Ok(crate::stripe::CheckoutSession {
-                    id,
+                let session = crate::stripe::CheckoutSession {
+                    id: id.clone(),
                     status: Some("open".to_string()),
                     payment_status: Some("unpaid".to_string()),
                     customer: Some(req.customer_id),
                     subscription: None,
                     url: Some(url),
-                    client_reference_id: Some(req.operation_id),
+                    client_reference_id: Some(req.operation_id.clone()),
                     livemode: false,
-                })
+                };
+                self.sessions_by_op
+                    .borrow_mut()
+                    .insert(req.operation_id, id.clone());
+                self.sessions.borrow_mut().insert(id, session.clone());
+                Ok(session)
             })
         }
         fn retrieve_checkout_session(
@@ -9004,11 +8802,51 @@ mod tests {
                 if self.fail("retrieve_checkout_session") {
                     return self.err();
                 }
+                if self.missing_sessions.borrow().contains(&session_id) {
+                    return Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    ));
+                }
                 self.sessions
                     .borrow()
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn expire_checkout_session(
+            &self,
+            session_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("expire_checkout_session") {
+                    return self.err();
+                }
+                self.expired.borrow_mut().push(session_id.clone());
+                // Like the real `POST /v1/checkout/sessions/{id}/expire`:
+                // the stored session transitions and the expired object
+                // comes back, so a follow-up retrieve observes it; an
+                // unknown id 404s.
+                let mut sessions = self.sessions.borrow_mut();
+                match sessions.get_mut(&session_id) {
+                    Some(session) => {
+                        session.status = Some("expired".to_string());
+                        session.url = None;
+                        Ok(session.clone())
+                    }
+                    None => Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    )),
+                }
             })
         }
         fn retrieve_subscription(
@@ -9232,37 +9070,6 @@ mod tests {
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&self.ctx(), &req))
-        }
-
-        fn call_full_with_ip(
-            &self,
-            source_ip: &str,
-            method: &str,
-            path: &str,
-            body: Option<String>,
-            cookie: Option<String>,
-            origin: Option<&str>,
-        ) -> Response {
-            let ctx = Ctx {
-                cfg: &self.config,
-                store: &self.store,
-                mailer: &self.mailer,
-                dialer: &self.dialer,
-                dns: &self.dns,
-                stripe: &self.stripe,
-                now: NOW,
-                source_ip: source_ip.to_string(),
-            };
-            let req = Request {
-                method: method.to_string(),
-                path: path.to_string(),
-                cookie,
-                origin: origin.map(str::to_string),
-                authorization: None,
-                stripe_signature: None,
-                body: body.map(|b| b.into_bytes()).unwrap_or_default(),
-            };
-            block_on(handle(&ctx, &req))
         }
 
         /// Bearer-route call with an explicit `Authorization` header value
@@ -10599,15 +10406,16 @@ mod tests {
         // pass folded from an older snapshot. Coverage (`paid_through_at`
         // and the plan/anchor tied to it) stays at the fresher values —
         // the production upsert's monotonic CASE, mirrored by the fake —
-        // while status still updates verbatim and both paid invoices keep
-        // their history rows.
+        // and the stale pass keeps the stored status/grace instead of
+        // writing older verbatim fields over the fresher pass. Both paid
+        // invoices still keep their history rows.
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         h.store
             .billing_customers
             .borrow_mut()
             .insert("u1".to_string(), "cus_test_1".to_string());
-        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str| {
+        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str, grace: Option<i64>| {
             crate::billing_reconcile::ReconciledRow {
                 stripe_subscription_id: "sub_test_1".to_string(),
                 stripe_customer_id: "cus_test_1".to_string(),
@@ -10619,7 +10427,7 @@ mod tests {
                 cancel_at_period_end: false,
                 paid_through_unix: paid,
                 paid_invoice_id: anchor.map(str::to_string),
-                grace_until_unix: None,
+                grace_until_unix: grace,
             }
         };
         let history_row = |id: &str, end: i64| crate::billing_reconcile::PaidInvoiceRow {
@@ -10632,20 +10440,29 @@ mod tests {
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
         };
+        let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
             row: row(
                 Some(BILLING_NOW + BILLING_PERIOD),
                 Some("in_test_2"),
-                "active",
+                "past_due",
+                Some(fresh_grace),
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            // Inserts (no stored row yet), so the guard never reads this.
+            read_plan: None,
+            read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
         let stale = crate::billing_reconcile::ReconcileOutcome {
-            row: row(Some(BILLING_NOW), Some("in_test_1"), "past_due"),
+            row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            // Read the fresh row: strictly-older money, so the stale arm
+            // fires on the ends regardless.
+            read_plan: Some(PLAN_PLUS.to_string()),
+            read_anchor: Some("in_test_2".to_string()),
         };
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
         let live = live_for(&h, "u1").expect("live row stored");
@@ -10662,12 +10479,630 @@ mod tests {
             Some("in_test_2"),
             "the anchor stays with the advancing money"
         );
-        assert_eq!(live.status, "past_due", "status still updates verbatim");
+        assert_eq!(
+            live.status, "past_due",
+            "a stale snapshot never regresses status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(fresh_grace),
+            "a stale snapshot never clears a fresher grace"
+        );
         assert_eq!(
             h.store.invoice_history.borrow().len(),
             2,
             "both paid invoices keep their history rows"
         );
+    }
+
+    /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
+    /// row plus the full price map, so `reconcile_subscription` runs the
+    /// real fold instead of a hand-built row.
+    fn fold_input(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        grace: Option<i64>,
+        anchor: Option<&str>,
+    ) -> crate::billing_reconcile::ReconcileInput {
+        crate::billing_reconcile::ReconcileInput {
+            stripe_customer_id: Some("cus_test_1".to_string()),
+            live: Some(crate::billing_reconcile::LiveRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            }),
+            bindings: test_bindings(),
+        }
+    }
+
+    fn stored_seed(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        anchor: Option<&str>,
+        grace: Option<i64>,
+    ) -> crate::billing_reconcile::ReconcileOutcome {
+        crate::billing_reconcile::ReconcileOutcome {
+            row: crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                current_period_end_unix: Some(BILLING_NOW + BILLING_PERIOD),
+                cancel_at_period_end: false,
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            },
+            history: vec![],
+            fail_closed: None,
+            // Seeds commit as inserts (no stored row yet), so the
+            // equal-end adopt arm never reads this.
+            read_plan: None,
+            read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_equal_end_plan_switch_persists_through_store() {
+        // The pure fold relabels on an equal-end plan switch, and the
+        // production upsert's plan/anchor CASEs must persist that relabel:
+        // stored PLUS ending E, paid PRO invoice also ending E → the row
+        // becomes PRO anchored on the new invoice. A strict-greater guard
+        // would keep PLUS and the old anchor forever (no later money can
+        // fix a stuck plan), so this test folds the real snapshot and
+        // commits through the store instead of asserting the fold alone.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_old"), None),
+        ))
+        .expect("seed stores");
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        // The pass reads the stored row (anchor `in_old`, present in the
+        // snapshot): a real pass always folds what it read, and the write
+        // only trusts a relabel whose read row is still stored.
+        let outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_old")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(outcome.row.plan_id, PLAN_PRO, "the fold relabels");
+        assert_eq!(
+            outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the fold anchors on the new evidence"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("switch stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the equal-end relabel persists in the write"
+        );
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor follows the new evidence"
+        );
+        assert_eq!(live.status, "active");
+        assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_stale_fold_commit_race_keeps_fresher_status_and_grace() {
+        // Interleaving built from REAL fold outcomes (not hand-built
+        // rows): stale pass S folds an older snapshot (E1 money) over
+        // stored E2/active, fresh pass F folds the equal-E2 failed renewal
+        // (past_due + first grace). F commits first, S second — S must
+        // compare strictly older in the write guard and keep the stored
+        // status/grace instead of overwriting them with older verbatim
+        // fields. Hand-building S with the stored end would bypass the
+        // fold's normalization and miss exactly this.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        let e1 = BILLING_NOW;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        h.store.invoice_history.borrow_mut().insert(
+            "in_seed".to_string(),
+            crate::billing_reconcile::PaidInvoiceRow {
+                stripe_invoice_id: "in_seed".to_string(),
+                stripe_subscription_id: "sub_test_1".to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                period_start_unix: BILLING_NOW - BILLING_PERIOD,
+                period_end_unix: e2,
+                amount_cents: 1_000,
+                currency: "usd".to_string(),
+                paid_at_unix: BILLING_NOW,
+            },
+        );
+        // S reads stored E2/active with remote money E1 < E2: stale.
+        let older = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                e1 - BILLING_PERIOD,
+                e1,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, None),
+            &older,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e1),
+            "the stale fold carries its evidence end into the write guard"
+        );
+        // F reads the same stored row with the equal-E2 failed renewal. A
+        // real fresh listing still carries the stored anchor invoice (the
+        // failure adds no new invoice, it does not erase the paid one), so
+        // the snapshot contains in_seed and the keep re-pins it — an
+        // anchor-less equal-end row against an anchored stored row is the
+        // stale shape, and must not be mistaken for this fresh outcome.
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        assert_eq!(
+            fresh_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_seed"),
+            "the fresh keep re-pins the stored anchor it observed"
+        );
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "the second-committing stale pass keeps the fresher status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "the second-committing stale pass keeps the fresher grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "both the seed and the stale invoice keep history rows"
+        );
+    }
+
+    #[test]
+    fn billing_stale_without_item_plan_money_keeps_recovery() {
+        // The NULL-evidence stale shape, built from REAL fold outcomes:
+        // stale pass S reads stored E2/active anchored `in_seed`, but its
+        // snapshot lost the anchor AND holds no item-plan money at all
+        // (empty listing) — so the fold emits no evidence end. The write
+        // guard only fires on non-NULL evidence, so the fold falls back to
+        // the stored end with the anchor cleared: the anchor-less
+        // equal-end shape the guard already reads as stale. F (the
+        // equal-E2 failed renewal: `past_due` + first grace) commits first,
+        // S second — S must keep the recovery's status/grace instead of
+        // overwriting them with the older verbatim fields.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        let emptied = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &emptied,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e2),
+            "a stale pass with no item-plan money carries the stored end so the guard can see it"
+        );
+        assert!(
+            stale_outcome.row.paid_invoice_id.is_none(),
+            "only the stale branch emits the anchor-less shape"
+        );
+        assert_eq!(
+            stale_outcome.read_anchor.as_deref(),
+            Some("in_seed"),
+            "the write needs the read anchor to tell keeps from relabels"
+        );
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "a stale pass with no evidence money keeps the recovery status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "a stale pass with no evidence money keeps the recovery grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_seed"),
+            "the anchor stays with the recovery"
+        );
+    }
+
+    #[test]
+    fn billing_relabel_first_keep_second_keeps_new_plan() {
+        // Relabel-then-keep commit order, built from REAL fold outcomes:
+        // keep pass K folds the pre-switch snapshot (plus/E/`in_plus`) and
+        // re-pins the anchor it read; relabel pass R folds the switched
+        // snapshot (pro item, both invoices, the switch paid later) over
+        // the same stored row. R commits first, K second — the stored row
+        // no longer matches what K read, so the write keeps the relabeled
+        // plan/anchor instead of flipping the row back to plus until the
+        // next reconcile.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let plus_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_plus",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+        };
+        let keep_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &plus_view,
+            BILLING_NOW,
+        );
+        assert_eq!(keep_outcome.row.plan_id, PLAN_PLUS, "the keep folds plus");
+        assert_eq!(
+            keep_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_plus"),
+            "the keep re-pins the anchor it read"
+        );
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the relabel adopts the current item plan"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the relabel anchors on the new evidence"
+        );
+        assert_eq!(
+            relabel_outcome.read_plan.as_deref(),
+            Some(PLAN_PLUS),
+            "the relabel records the plan it read"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_plus"),
+            "the relabel records the anchor it read"
+        );
+        // R commits first, K second.
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        block_on(h.store.store_reconcile_outcome("u1", &keep_outcome)).expect("keep stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the late keep does not reverse the committed relabel"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor stays with the new evidence"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_shared_invoice_relabel_persists_through_store() {
+        // One paid invoice carrying qualifying lines for BOTH plans, same
+        // end: stored PLUS/E anchored on `in_shared`, the item now reports
+        // PRO. The fold relabels onto the shared invoice — emitted anchor
+        // equalling the read anchor — and the write must still persist it
+        // when nothing moved the row meanwhile: gating the adopt on
+        // emitted-vs-read difference would leave PLUS stuck forever (no
+        // later money can fix a same-invoice switch), so the arm compares
+        // stored-vs-read instead. Built from a REAL fold outcome.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_shared"), None),
+        ))
+        .expect("seed stores");
+        let mut shared = test_invoice(
+            "in_shared",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            end,
+            BILLING_NOW,
+        );
+        shared
+            .lines
+            .as_mut()
+            .expect("invoice lines")
+            .data
+            .push(crate::stripe::InvoiceLine {
+                id: "in_shared_line_2".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PRO.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(end),
+                }),
+            });
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![shared],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_shared")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the fold relabels onto the shared invoice"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_shared"),
+            "the shared invoice anchors both plans"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_shared"),
+            "emitted and read anchors coincide here by construction"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "a same-invoice relabel persists when the row never moved"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_shared"),
+            "the anchor stays on the shared invoice"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_older_relabel_committing_second_keeps_newer_switch() {
+        // Two paid switches, same end, reverse commit order — built from
+        // REAL fold outcomes: older pass O reads stored plus/E/`in_plus`
+        // and relabels onto its own newer-paid evidence `in_old`; newer
+        // pass N relabels onto `in_new` (paid later still) and commits
+        // first. O commits second with a different anchor than it read, so
+        // an emitted-vs-read gate would revert the row to the older
+        // switch; the stored-vs-read arm keeps the newer plan/anchor.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let older_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let older_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &older_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            older_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_old"),
+            "the older pass relabels onto its own evidence"
+        );
+        let newer_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 120,
+                ),
+            ],
+        };
+        let newer_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &newer_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            newer_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the newer pass relabels onto the later payment"
+        );
+        // Newer commits first, older second.
+        block_on(h.store.store_reconcile_outcome("u1", &newer_outcome)).expect("newer stores");
+        block_on(h.store.store_reconcile_outcome("u1", &older_outcome)).expect("older stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "an older relabel committing second never reverts a newer switch"
+        );
+        assert_eq!(live.status, "active");
     }
 
     #[test]
@@ -10738,6 +11173,858 @@ mod tests {
         let live = live_for(&h, "u1").expect("reconciled");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
         assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_price_mismatched_open_session_expires_and_replaces() {
+        // The first attempt names PLUS and leaves its session open; the
+        // second attempt names PRO. The second attempt must not inherit the
+        // first attempt's session (which keeps the first attempt's price):
+        // the open session is expired first — a replacement never mints
+        // beside a possibly-payable session — the flight is superseded, and
+        // the replacement mints under a fresh operation id, hence a fresh
+        // Stripe idempotency key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_old_1".to_string(),
+            test_session(
+                "cs_old_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("price-mismatched attempt replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_old_1".to_string()].as_slice(),
+            "the mismatched open session is expired before replacement"
+        );
+        // The dead session transitioned, like the real expire endpoint.
+        let dead = &h.stripe.sessions.borrow()["cs_old_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        assert!(dead.url.is_none());
+        // The old flight is superseded (releasing the slot) with its price
+        // and session preserved for the audit trail.
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        // Exactly one new session, minted under a fresh operation id — a
+        // fresh idempotency key, never the dead session's — on the bound
+        // customer.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_test_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_session_mark_misses_retired_and_missing_rows() {
+        // The conditional mark only lands on unresolved rows: a mark that
+        // arrives after a deliberate supersede reports `false` and leaves
+        // the retired row untouched instead of resurrecting `submitted` on
+        // it; a missing row reports `false` the same way.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("mark"),
+            "unresolved row takes the mark"
+        );
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                crate::billing_reconcile::SUPERSEDED_OP_STATE,
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("retire"),
+            "open row retires"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("late mark"),
+            "retired row rejects the late mark"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_missing_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("missing mark"),
+            "missing row reports a miss"
+        );
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the late session id never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_late_create_mark_after_supersede_fails_without_reviving() {
+        // A replacer superseded op A while A's original Stripe create was
+        // still in flight. The late-arriving create must NOT resurrect
+        // `submitted` on the retired row (which would re-occupy the flight
+        // and hand out the now-expired session's URL): the conditional mark
+        // misses, the attempt fails retryable, and the flight stays free
+        // for the replacement.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let created = block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        block_on(replace_checkout_operation(&ctx, created.op(), None)).expect("supersede");
+        let open = block_on(h.store.open_checkout_operation("u1")).expect("open read");
+        assert_eq!(open, None, "supersede releases the flight");
+        // Late create under the retired id: Stripe replays the create (same
+        // key), but the mark misses the retired row.
+        let err = block_on(create_session_under(
+            &ctx,
+            "op_test_1",
+            "cus_test_1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Failed));
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id, None,
+            "late mark never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_converged_loser_with_different_price_replaces() {
+        // A racer wins the single flight between this attempt's open-flight
+        // read and its insert, naming a different price (the TOCTOU behind
+        // the converged-session price check). The loser must not inherit
+        // the winner's session: expire + supersede, then mint under its own
+        // fresh operation — reusing its already-minted customer instead of
+        // minting a second orphan.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_loser_1".to_string());
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_race_1".to_string(),
+            test_session(
+                "cs_race_1",
+                "open",
+                "unpaid",
+                Some("cus_winner_1"),
+                None,
+                Some("op_race_winner"),
+            ),
+        );
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: Some("cs_race_1".to_string()),
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_race_1".to_string()].as_slice(),
+            "the winner's open session is expired before replacement"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(winner.session_id.as_deref(), Some("cs_race_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        // One customer create: the retry reuses the loser's orphan once the
+        // winner's flight is retired and no binding exists yet.
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            [(Some("u1".to_string()), None)].as_slice()
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_loser_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_expired_session_repair_mints_under_fresh_key() {
+        // The recorded session is confirmed dead (expired without payment):
+        // no expiry call is needed — Stripe already converged the state —
+        // the dead operation is superseded and the repair mints under a
+        // fresh operation id, so the repair can never replay the dead
+        // session inside Stripe's retention window. Same price: the replace
+        // is about the dead session, not a plan switch.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        let mut dead = test_session(
+            "cs_old_1",
+            "expired",
+            "unpaid",
+            Some("cus_test_1"),
+            None,
+            Some("op_test_1"),
+        );
+        dead.url = None;
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .insert("cs_old_1".to_string(), dead);
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("expired repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a confirmed-dead session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_missing_session_repair_mints_under_fresh_key() {
+        // The recorded session is gone from Stripe (404, past retention or
+        // never minted): the same deliberate replacement as a
+        // confirmed-expired session — supersede, then mint fresh.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_gone_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe
+            .missing_sessions
+            .borrow_mut()
+            .insert("cs_gone_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("missing-session repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a missing session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+    }
+
+    #[test]
+    fn billing_session_retrieve_outage_fails_without_replacement() {
+        // An unconfirmed retrieve (any non-404 Stripe failure) fails
+        // retryable: no replacement mints beside a session whose state is
+        // unknown, and the flight stays open for the retry.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .fail
+            .borrow_mut()
+            .insert("retrieve_checkout_session".to_string());
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement beside unknown state"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the retry");
+        assert_eq!(open.id, "op_test_1");
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_unpaid_session_retains_flight_without_minting() {
+        // A `complete`/`unpaid` session is still processing asynchronously
+        // (the create request does not restrict payment methods): a retry
+        // must not supersede it and mint a second subscription checkout
+        // while the first can still succeed. The flight stays open for the
+        // real completion and the attempt fails retryable — no supersede,
+        // no mint.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_unpaid_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_unpaid_1".to_string(),
+            test_session(
+                "cs_unpaid_1",
+                "complete",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second subscription checkout beside a completable session"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the real completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_unpaid_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_no_payment_required_session_retains_flight_without_minting() {
+        // A `complete`/`no_payment_required` session already created its
+        // subscription: same deliberate-retention as `unpaid` — the flight
+        // stays open (the webhook reconciles the subscription out of the
+        // slot) and no second checkout mints.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_npr_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_npr_1".to_string(),
+            test_session(
+                "cs_npr_1",
+                "complete",
+                "no_payment_required",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second checkout beside the created subscription"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the webhook completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_npr_1"));
+    }
+
+    #[test]
+    fn billing_orphan_with_live_session_and_price_mismatch_expires_before_replacing() {
+        // A missing `session_id` does not mean Stripe has no session: the
+        // create mark is best-effort, and until the replay the same-key
+        // path was the only recovery. Here the orphan's PLUS session is
+        // still live in Stripe while the retry names PRO: the old flight
+        // must recover under its original key and price, expire the
+        // payable session, and only then supersede and mint fresh — never
+        // leave the first attempt's session payable beside the PRO one.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The mark was lost, but the session is live under the old key.
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_live_1".to_string(),
+            test_session(
+                "cs_live_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_old_1"),
+            ),
+        );
+        h.stripe
+            .sessions_by_op
+            .borrow_mut()
+            .insert("op_old_1".to_string(), "cs_live_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        // The replay recovered (not re-minted): exactly one mint, the
+        // replacement under its fresh operation id.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_old_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_live_1".to_string()].as_slice(),
+            "the recovered payable session expires before its replacement mints"
+        );
+        let dead = &h.stripe.sessions.borrow()["cs_live_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        let old = block_on(h.store.checkout_operation_by_id("op_old_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_orphan_mismatch_with_no_session_stillborn_expires_and_replaces() {
+        // The mismatched orphan never created anything: the same-key
+        // replay first-creates exactly one session under the old key, which
+        // is immediately expired (never payable) before the supersede and
+        // the fresh mint. No payable session lingers on either key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(
+            minted.as_slice(),
+            ["op_old_1".to_string(), minted[1].clone()].as_slice(),
+            "the replay recovers under the old key, the replacement under a fresh one"
+        );
+        assert_ne!(minted[1], "op_old_1");
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the stillborn session expires before the replacement mints"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_converged_sessionless_winner_with_price_mismatch_resolves_before_replacing() {
+        // A single-flight winner that has not recorded a session yet
+        // (still creating, or its mark was lost) while the loser names a
+        // different price: the loser must recover under the WINNER's key
+        // and price before retiring it — superseding blind would orphan a
+        // payable session the winner is about to mark.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: None,
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser resolves the winner then replaces");
+        // One replay under the winner's key (expired), one fresh mint under
+        // the loser's own operation.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 2);
+        assert_eq!(
+            minted[0], "op_race_winner",
+            "the recovery replays under the winner's key, never a fresh one"
+        );
+        assert_ne!(
+            minted[1], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the winner's recovered session expires before the replacement mints"
+        );
+        assert!(
+            h.stripe.customers_created.borrow().is_empty(),
+            "no orphan customer: the account was already bound"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(
+            winner.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the recovery repairs the winner's mark before retiring it"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[1]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_earlier_plan_invoices_keep_history_rows() {
+        // The subscription now sits on PRO after a plan change; the fold
+        // still writes one history row per confirmed paid invoice — the
+        // earlier PLUS invoice keeps its own plan label — while coverage
+        // follows the current item's plan. Redelivery stays idempotent on
+        // the invoice id.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_plus_1".to_string(),
+            test_invoice(
+                "in_plus_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_pro_1".to_string(),
+            test_invoice(
+                "in_pro_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 2 * BILLING_PERIOD,
+                BILLING_NOW + BILLING_PERIOD + 60,
+            ),
+        );
+        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("reconciles");
+        assert!(outcome.fail_closed.is_none());
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history["in_plus_1"].plan_id, PLAN_PLUS);
+        assert_eq!(history["in_pro_1"].plan_id, PLAN_PRO);
+        assert_eq!(
+            history["in_plus_1"].period_end_unix,
+            BILLING_NOW + BILLING_PERIOD
+        );
+        assert_eq!(
+            history["in_pro_1"].period_end_unix,
+            BILLING_NOW + 2 * BILLING_PERIOD
+        );
+        drop(history);
+        // Redelivery of the same remote state: same two rows, no dupes.
+        block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).expect("reconciles");
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "history stays idempotent on the invoice id"
+        );
     }
 
     #[test]
@@ -11529,6 +12816,190 @@ mod tests {
         assert!(h.store.playback_leases.borrow().is_empty());
     }
 
+    /// Real session/credential issuance through `handle`, with an entitled
+    /// user and optionally an existing lease and metered window. No live I/O.
+    fn play_bearer_harness(scope: &str, occupied: bool) -> (Harness, String, String) {
+        let mut h = play_harness();
+        h.config = h.config.with_native_rest_pepper(vec![7u8; 32], 1);
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": [scope], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "credential issuance status");
+        let body: serde_json::Value = serde_json::from_str(&minted.body).unwrap();
+        let secret = mint_secret(&body);
+        if occupied {
+            let issued = play_call(
+                &h,
+                &cookie,
+                serde_json::json!({"track_id": "track-9", "session_id": "existing-tab"}),
+            );
+            assert_eq!(issued.status, 200, "session grant positive control");
+            let issued: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+            let window = crate::ledger::prepare_play_window(
+                "user-plays-1",
+                "track-9",
+                issued["play_id"].as_str().unwrap(),
+                100,
+                Some(1000),
+                Some(100_000),
+                NOW,
+            )
+            .unwrap();
+            block_on(h.store.record_play_window(&window)).unwrap();
+        }
+        (h, cookie, secret)
+    }
+
+    fn assert_play_bearer_refused(
+        h: &Harness,
+        secret: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        body: &[u8],
+        status: u16,
+    ) {
+        let leases = h.store.playback_leases.borrow().clone();
+        let windows = h.store.play_windows.borrow().clone();
+        let seconds = h.store.stream_seconds.borrow().clone();
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/plays".to_string(),
+            cookie: cookie.map(str::to_string),
+            origin: origin.map(str::to_string),
+            authorization: Some(format!("Bearer {secret}")),
+            stripe_signature: None,
+            body: body.to_vec(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, status, "play-grant refusal status");
+        let expected = match status {
+            401 => generic_auth(),
+            403 => scope_forbidden(),
+            404 => not_found(),
+            _ => panic!("unexpected refusal status"),
+        };
+        assert!(resp.body == expected.body, "exact names-only refusal body");
+        assert!(resp.set_cookie.is_none());
+        assert!(!resp.body.contains("\"grant\""));
+        assert_eq!(*h.store.playback_leases.borrow(), leases);
+        assert_eq!(*h.store.play_windows.borrow(), windows);
+        assert_eq!(*h.store.stream_seconds.borrow(), seconds);
+    }
+
+    #[test]
+    fn play_issue_in_scope_bearer_requires_origin_and_session() {
+        for occupied in [false, true] {
+            for (has_cookie, origin) in [
+                (false, None),
+                (false, Some(ORIGIN)),
+                (true, None),
+                (true, Some("https://wrong-origin.example")),
+            ] {
+                // Also pin ordering before configuration/body validation:
+                // an unconfigured minter + malformed body must still be 401.
+                for configured in [true, false] {
+                    let (mut h, cookie, secret) = play_bearer_harness("plays:write", occupied);
+                    if !configured {
+                        h.config.play_grant_secret = None;
+                    }
+                    let valid_body = serde_json::json!({
+                        "track_id": "track-9", "session_id": "new-tab", "takeover": true,
+                    })
+                    .to_string();
+                    let body = if configured {
+                        valid_body.as_bytes()
+                    } else {
+                        b"{"
+                    };
+                    assert_play_bearer_refused(
+                        &h,
+                        &secret,
+                        has_cookie.then_some(cookie.as_str()),
+                        origin,
+                        body,
+                        401,
+                    );
+                    let rows =
+                        block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(
+                        rows[0].last_used_at,
+                        Some(NOW),
+                        "scope gate admitted bearer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn play_issue_valid_wrong_scope_is_403_before_session_dispatch() {
+        for occupied in [false, true] {
+            for with_session in [false, true] {
+                let (h, cookie, secret) = play_bearer_harness("library:read", occupied);
+                assert_play_bearer_refused(
+                    &h,
+                    &secret,
+                    with_session.then_some(cookie.as_str()),
+                    with_session.then_some(ORIGIN),
+                    b"{",
+                    403,
+                );
+                let rows = block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                assert_eq!(rows[0].last_used_at, None, "wrong scope not admitted");
+            }
+        }
+    }
+
+    #[test]
+    fn play_issue_invalid_bearers_are_plain_404_without_cookie_rescue() {
+        for occupied in [false, true] {
+            for with_session in [false, true] {
+                for kind in ["malformed", "unknown", "revoked", "expired"] {
+                    let (h, cookie, minted) = play_bearer_harness("plays:write", occupied);
+                    let rows =
+                        block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                    let secret = match kind {
+                        "malformed" => "ntk_bad-shape".to_string(),
+                        "unknown" => format!("ntk_{}", "0".repeat(43)),
+                        "revoked" => {
+                            block_on(h.store.revoke_native_credential(
+                                &rows[0].record.id,
+                                "user-plays-1",
+                                NOW,
+                            ))
+                            .unwrap();
+                            minted
+                        }
+                        "expired" => {
+                            h.store
+                                .native_credentials
+                                .borrow_mut()
+                                .get_mut(&rows[0].record.id)
+                                .unwrap()
+                                .record
+                                .expires_at = NOW - 1;
+                            minted
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_play_bearer_refused(
+                        &h,
+                        &secret,
+                        with_session.then_some(cookie.as_str()),
+                        with_session.then_some(ORIGIN),
+                        br#"{"track_id":"track-9","session_id":"new-tab","takeover":true}"#,
+                        404,
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn play_issue_presented_invalid_bearer_still_plain_404() {
         // The bearer gate runs before dispatch on this path: a junk key
@@ -12179,7 +13650,7 @@ mod tests {
             // ordinary request authentication accepts it as that user.
             let req = Request {
                 method: "GET".to_string(),
-                path: "/v1/vault".to_string(),
+                path: "/v1/plans".to_string(),
                 cookie: Some(format!("{}={session}", session::COOKIE_NAME)),
                 origin: None,
                 authorization: None,
@@ -12947,7 +14418,7 @@ mod tests {
     fn malformed_cookie_parts_do_not_hide_the_session_cookie() {
         let req = Request {
             method: "GET".to_string(),
-            path: "/v1/vault".to_string(),
+            path: "/v1/plans".to_string(),
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
             authorization: None,
@@ -12955,22 +14426,6 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
-    }
-
-    #[test]
-    fn test_connection_leases_enforce_cap_and_token_scoped_release() {
-        let store = FakeStore::default();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-a", 20, 2)).unwrap());
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-b", 20, 2)).unwrap());
-        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
-
-        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
-        // A stale token cannot release a slot that was reused by lease-c.
-        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
-        block_on(store.release_test_connection_lease("u1", "lease-c")).unwrap();
-        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
     }
 
     #[test]
@@ -13064,12 +14519,12 @@ mod tests {
         );
         assert_eq!(cookie_of(&retried), successor);
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie.clone()), None)
                 .status,
             401
         );
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(successor.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(successor.clone()), None)
                 .status,
             200
         );
@@ -13289,7 +14744,7 @@ mod tests {
                 // C1, even though C2's response was already successfully used.
                 cookie_jar = cookie_of(&delayed);
             }
-            let authenticated = h.call_full("GET", "/v1/vault", None, Some(cookie_jar), None);
+            let authenticated = h.call_full("GET", "/v1/plans", None, Some(cookie_jar), None);
             assert_eq!(
                 authenticated.status,
                 if settle_before_advance { 200 } else { 401 }
@@ -13363,14 +14818,14 @@ mod tests {
         assert_eq!(uncertain.status, 500);
         assert!(uncertain.set_cookie.is_none());
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie.clone()), None)
                 .status,
             401
         );
         let recovered = bound_refresh(&h, &cookie, &key, NOW + 1, Some(ORIGIN));
         assert_eq!(recovered.status, 200);
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&recovered)), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie_of(&recovered)), None)
                 .status,
             200
         );
@@ -13401,7 +14856,7 @@ mod tests {
             401
         );
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&first)), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie_of(&first)), None)
                 .status,
             200
         );
@@ -13470,7 +14925,7 @@ mod tests {
             assert!(response.set_cookie.is_none());
         }
         assert_eq!(
-            h.call_full("GET", "/v1/vault", None, Some(cookie), None)
+            h.call_full("GET", "/v1/plans", None, Some(cookie), None)
                 .status,
             200
         );
@@ -13515,576 +14970,8 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(resp.status, 200);
-        let dead = h.call_full("GET", "/v1/vault", None, Some(cookie2), None);
+        let dead = h.call_full("GET", "/v1/plans", None, Some(cookie2), None);
         assert_eq!(dead.status, 401);
-    }
-
-    #[test]
-    fn vault_crud_is_booleans_only_and_owner_scoped() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        seed_user(&h, "u2", "b@example.com");
-        let cookie_a = magic_login(&h, "a@example.com");
-        let cookie_b = magic_login(&h, "b@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie_a.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":true"),
-            "{}",
-            resp.body
-        );
-        for leak in ["news.example.com", "synthetic-user", "synthetic-pass"] {
-            assert!(!resp.body.contains(leak), "leaked {leak}");
-        }
-        // Another user sees an empty vault, never the owner's existence.
-        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie_b), None);
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-        // Unauthenticated and CSRF-origin mismatch both reject generically.
-        let resp = h.call_full("GET", "/v1/vault", None, None, None);
-        assert_eq!(resp.status, 401);
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie_a.clone()),
-            Some("https://evil.example.com"),
-        );
-        assert_eq!(resp.status, 401);
-        // Private targets collapse to the one generic vault error.
-        let mut dns_map = HashMap::new();
-        dns_map.insert(
-            "news.example.com".to_string(),
-            vec!["10.0.0.5".parse().unwrap()],
-        );
-        let h2_dns = FakeDns { map: dns_map };
-        let ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h2_dns,
-            now: NOW,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let req = Request {
-            method: "PUT".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie_a.clone()),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: put_body.to_string().into_bytes(),
-        };
-        let resp = block_on(handle(&ctx, &req));
-        assert_eq!(resp.status, 400);
-        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
-        // Delete returns to booleans-false.
-        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie_a), Some(ORIGIN));
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-    }
-
-    #[test]
-    fn vault_put_for_a_deleting_account_is_the_typed_409_and_writes_nothing() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Normal write first: fence open, the save lands.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        // Deletion scheduled: the same save is the typed fence refusal,
-        // never the generic 400, and the stored row is not replaced.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(
-            resp.body,
-            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
-        );
-        // Reads still work during grace (cancel must stay possible),
-        // and the pre-fence row is what they see.
-        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":true"),
-            "{}",
-            resp.body
-        );
-    }
-
-    #[test]
-    fn vault_put_mints_a_provider_row_and_a_fenced_put_mints_none() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Fence open: the save lands a vault row AND a providers row.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let minted = h.store.providers.borrow();
-        assert_eq!(minted.len(), 1, "one providers row per save");
-        let row = &minted[0];
-        assert_eq!(row.user_id, "u1");
-        assert_eq!(row.label, "news.example.com");
-        assert!(
-            crate::providers::validate_provider_mint_id(&row.id),
-            "{}",
-            row.id
-        );
-        assert_eq!(row.kek_version, 1);
-        assert!(!row.encrypted_creds.is_empty());
-        assert_eq!(row.dek_wrapped.len(), crate::providers::WRAPPED_DEK_LEN);
-        assert_eq!((row.created_at, row.last_verified_at), (NOW, NOW));
-        // The minted envelope decrypts under the test KEK with the
-        // stored row binding (user + minted id).
-        let back = crate::providers::decrypt_provider_creds(
-            &[9u8; 32],
-            "u1",
-            &row.id,
-            crate::providers::CREDS_ENVELOPE_VERSION,
-            crate::providers::CREDS_PAYLOAD_FORMAT_JSON_V1,
-            row.kek_version,
-            &crate::providers::ProviderCredsEnvelope {
-                dek_wrapped_nonce: row.dek_wrapped_nonce,
-                dek_wrapped: row.dek_wrapped.clone(),
-                payload_nonce: row.payload_nonce,
-                ciphertext: row.encrypted_creds.clone(),
-            },
-        )
-        .expect("minted envelope must decrypt");
-        let sealed: serde_json::Value = serde_json::from_slice(&back).expect("JSON payload");
-        assert_eq!(sealed["host"], "news.example.com");
-        assert_eq!(sealed["username"], "synthetic-user");
-        let first_id = row.id.clone();
-        drop(minted);
-        // A second save mints a fresh identity AND prunes the
-        // superseded unreferenced row: one live row per user, no
-        // decryptable stale copies accumulating.
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let minted = h.store.providers.borrow();
-        assert_eq!(minted.len(), 1, "superseded row pruned, mint kept");
-        assert_ne!(minted[0].id, first_id, "the survivor is the new mint");
-        drop(minted);
-        // Fenced: the typed 409, and no further mint.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 1);
-    }
-
-    #[test]
-    fn vault_put_store_failure_saves_nothing_and_skips_audit() {
-        // The save is one atomic unit: a store outage fails the PUT
-        // without landing the vault row, the mint, or the audit — never
-        // a committed write the client was told failed.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        *h.store.fail_vault_saves.borrow_mut() = true;
-        let audits_before = h.store.audits.borrow().len();
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 400, "{}", resp.body);
-        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
-        assert!(
-            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
-            "no vault row on a failed save"
-        );
-        assert!(
-            h.store.providers.borrow().is_empty(),
-            "no mint on a failed save"
-        );
-        assert_eq!(
-            h.store.audits.borrow().len(),
-            audits_before,
-            "no audit for a write that never landed"
-        );
-        // The outage clears: the retry saves normally.
-        *h.store.fail_vault_saves.borrow_mut() = false;
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 1);
-    }
-
-    #[test]
-    fn vault_put_for_a_fenced_account_saves_nothing_and_skips_audit() {
-        // Fenced from the start: the typed 409, with no vault row, no
-        // mint, and no audit entry.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let audits_before = h.store.audits.borrow().len();
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert!(
-            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
-            "no vault row behind the fence"
-        );
-        assert!(
-            h.store.providers.borrow().is_empty(),
-            "no mint behind the fence"
-        );
-        assert_eq!(
-            h.store.audits.borrow().len(),
-            audits_before,
-            "no audit for a fenced save"
-        );
-    }
-
-    #[test]
-    fn vault_put_prunes_superseded_rows_unless_a_grant_references_them() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let save = || {
-            h.call_full(
-                "PUT",
-                "/v1/vault",
-                Some(put_body.to_string()),
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            )
-        };
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 1);
-        // A grant references the live row (pool attribution): the next
-        // save keeps it alongside the fresh mint.
-        h.store
-            .provider_grants
-            .borrow_mut()
-            .insert(("u1".to_string(), live[0].clone()));
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 2, "referenced row survives the prune");
-        // Drop the grant: the following save prunes the now-unreferenced
-        // superseded row and keeps only the fresh mint.
-        h.store.provider_grants.borrow_mut().clear();
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let live: Vec<String> = h
-            .store
-            .providers
-            .borrow()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        assert_eq!(live.len(), 1, "unreferenced rows pruned, mint kept");
-    }
-
-    #[test]
-    fn vault_delete_purges_unreferenced_rows_but_keeps_grant_referenced_ones() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let save = || {
-            h.call_full(
-                "PUT",
-                "/v1/vault",
-                Some(put_body.to_string()),
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            )
-        };
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let first = h.store.providers.borrow()[0].id.clone();
-        // Reference the first row, then rotate: two rows live.
-        h.store
-            .provider_grants
-            .borrow_mut()
-            .insert(("u1".to_string(), first.clone()));
-        let resp = save();
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 2);
-        // Delete removes the vault and the unreferenced row; the
-        // grant-referenced row survives (RESTRICT attribution).
-        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie), Some(ORIGIN));
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert!(
-            resp.body.contains("\"provider_configured\":false"),
-            "{}",
-            resp.body
-        );
-        let remaining = h.store.providers.borrow();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, first);
-    }
-
-    #[test]
-    fn mint_build_rejects_a_faulty_clock_before_any_store_touch() {
-        // The mint build is pure: a caller clock past the schema bound
-        // fails here (Invalid → generic vault failure downstream),
-        // never as a 23514 at the database. The build takes no store,
-        // so a failure cannot have landed anything by construction.
-        let provider = vault::ProviderConfig {
-            host: "news.example.com".to_string(),
-            port: 563,
-            tls: true,
-            username: "synthetic-user".to_string(),
-            password: "synthetic-pass".to_string(),
-            max_connections: 4,
-            allow_insecure_plaintext: false,
-        };
-        let bad = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, u64::MAX);
-        assert!(
-            matches!(bad, Err(MintBuildError::Invalid)),
-            "faulty clock must fail the build"
-        );
-        let good = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, NOW);
-        assert!(good.is_ok(), "sane clock must build");
-    }
-
-    #[test]
-    fn test_connection_for_a_deleting_account_is_the_typed_409() {
-        // ADR 0002 rule 3: the test-connection lease is a fenced writer, so
-        // a deleting account gets the typed 409 (like `vault_put`), never
-        // the collapsed `{"ok": false}` of an unreachable provider.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        // Fence open: the route answers its boolean (the fake dialer is up).
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test",
-            Some(candidate.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        // Deletion scheduled: the fenced lease is the typed refusal.
-        h.store.deleting_users.borrow_mut().insert("u1".to_string());
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 409, "{}", resp.body);
-        assert_eq!(
-            resp.body,
-            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
-        );
-    }
-
-    #[test]
-    fn vault_mutations_require_fresh_session_but_reads_do_not() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-
-        let fresh_put = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(fresh_put.status, 200, "{}", fresh_put.body);
-
-        let stale_ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h.dns,
-            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let stale_put_req = Request {
-            method: "PUT".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie.clone()),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: put_body.to_string().into_bytes(),
-        };
-        let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
-        assert_eq!(stale_put.status, 401);
-        assert_eq!(
-            stale_put.body,
-            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
-        );
-
-        let stale_get_req = Request {
-            method: "GET".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie.clone()),
-            origin: None,
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
-        assert_eq!(stale_get.status, 200, "{}", stale_get.body);
-
-        let stale_delete_req = Request {
-            method: "DELETE".to_string(),
-            path: "/v1/vault".to_string(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
-        assert_eq!(stale_delete.status, 401);
-        assert_eq!(
-            stale_delete.body,
-            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
-        );
-        assert!(h.store.vaults.borrow().contains_key("u1"));
     }
 
     // --- Native REST credentials (ADR 0010) -------------------------------------
@@ -14354,8 +15241,8 @@ mod tests {
         );
         assert_eq!(resp.status, 500);
         assert_eq!(resp.body, r#"{"error":"internal error"}"#);
-        let vault = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
-        assert_eq!(vault.status, 200, "unrelated routes keep serving");
+        let plans = h.call_full("GET", "/v1/plans", None, Some(cookie), None);
+        assert_eq!(plans.status, 200, "unrelated routes keep serving");
     }
 
     #[test]
@@ -16350,20 +17237,10 @@ mod tests {
 
         // Established via a vault, with no credential and no session.
         seed_user(&h, "u-magic-vault", "magic-vault@example.com");
-        h.store.vaults.borrow_mut().insert(
-            "u-magic-vault".to_string(),
-            VaultRow {
-                blob: crate::vault::VaultBlob {
-                    kek_version: 1,
-                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    dek_wrapped_b64url: "AA".to_string(),
-                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    payload_b64url: "AA".to_string(),
-                },
-                indexer_configured: false,
-                updated_at: NOW,
-            },
-        );
+        h.store
+            .legacy_vault_users
+            .borrow_mut()
+            .insert("u-magic-vault".to_string());
         let cookie = magic_login(&h, "magic-vault@example.com");
         assert!(!cookie.is_empty());
 
@@ -16797,63 +17674,6 @@ mod tests {
             r#"{"code":"not_found","message":"not found","retryable":false}"#
         );
         assert!(resp.set_cookie.is_none());
-    }
-
-    #[test]
-    fn test_connection_dials_only_vetted_addresses_and_rate_limits() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200);
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().as_slice(),
-            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
-        );
-        // Exhaust the per-user budget (shared with the vault module: 5 per
-        // 60s): further probes answer false without reaching the dialer.
-        for _ in 1..u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS) {
-            assert!(block_on(h.store.reserve_rate_limit(
-                "u1",
-                "vault.test",
-                u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
-                NOW,
-                vault::TEST_CONNECTION_WINDOW_SECS,
-            ))
-            .unwrap());
-        }
-        let before = h.dialer.seen.borrow().len();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), before);
     }
 
     // Shared synthetic-authenticator builders for the passkey tests below.
@@ -17821,121 +18641,6 @@ mod tests {
         }
     }
 
-    fn put_test_vault(h: &Harness, cookie: &str) {
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 563, "tls": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie.to_string()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-    }
-
-    fn call_at(h: &Harness, now: u64, method: &str, path: &str, cookie: String) -> Response {
-        let ctx = Ctx {
-            cfg: &h.config,
-            store: &h.store,
-            mailer: &h.mailer,
-            dialer: &h.dialer,
-            dns: &h.dns,
-            now,
-            source_ip: "198.51.100.9".to_string(),
-            stripe: &h.stripe,
-        };
-        let req = Request {
-            method: method.to_string(),
-            path: path.to_string(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.to_string()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        block_on(handle(&ctx, &req))
-    }
-
-    #[test]
-    fn vault_test_connection_lease_cap_and_release_are_handler_enforced() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-
-        // A normal probe succeeds and releases its lease afterwards.
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), 1);
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "successful probe must release its lease"
-        );
-
-        // Fill the per-user lease cap directly (MAX_TEST_CONCURRENCY slots).
-        assert!(block_on(h.store.acquire_test_connection_lease(
-            "u1",
-            "lease-a",
-            20,
-            vault::MAX_TEST_CONCURRENCY
-        ))
-        .unwrap());
-        assert!(block_on(h.store.acquire_test_connection_lease(
-            "u1",
-            "lease-b",
-            20,
-            vault::MAX_TEST_CONCURRENCY
-        ))
-        .unwrap());
-
-        // The handler must refuse without reaching the dialer.
-        let before = h.dialer.seen.borrow().len();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            before,
-            "capped probe must not dial"
-        );
-        assert_eq!(h.store.test_connection_leases.borrow().len(), 2);
-
-        // Free both slots: the next probe is admitted and releases again.
-        block_on(h.store.release_test_connection_lease("u1", "lease-a")).unwrap();
-        block_on(h.store.release_test_connection_lease("u1", "lease-b")).unwrap();
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(h.dialer.seen.borrow().len(), before + 1);
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "probe must release its lease"
-        );
-    }
-
     #[test]
     fn register_start_budget_stores_no_challenge_past_cap() {
         let h = harness();
@@ -18636,10 +19341,6 @@ mod tests {
             norm.contains("let ip_key = rate_limit_ip_key(&self.source_ip);"),
             "auth-start pair key must derive from rate_limit_ip_key, not raw source_ip",
         );
-        assert!(
-            norm.contains("let ip_key = rate_limit_ip_key(&ctx.source_ip);"),
-            "vault-test pair key must derive from rate_limit_ip_key, not raw source_ip",
-        );
         for (scope, keyed) in [
             (
                 "auth.start_ip",
@@ -18648,10 +19349,6 @@ mod tests {
             (
                 "auth.start_ip_burst",
                 "scope_key: &ip_key, action: \"auth.start_ip_burst\",",
-            ),
-            (
-                "vault.test_ip",
-                "scope_key: &ip_key, action: \"vault.test_ip\",",
             ),
             (
                 "auth.mail_ip",
@@ -19051,20 +19748,10 @@ mod tests {
             revoked: false,
         }))
         .unwrap();
-        h.store.vaults.borrow_mut().insert(
-            "magic-only".to_string(),
-            VaultRow {
-                blob: crate::vault::VaultBlob {
-                    kek_version: 1,
-                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    dek_wrapped_b64url: "AA".to_string(),
-                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    payload_b64url: "AA".to_string(),
-                },
-                indexer_configured: false,
-                updated_at: NOW,
-            },
-        );
+        h.store
+            .legacy_vault_users
+            .borrow_mut()
+            .insert("magic-only".to_string());
         let (_, inbox_record) =
             auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
@@ -19093,8 +19780,8 @@ mod tests {
             "truly abandoned signup must still be reaped"
         );
         assert!(
-            h.store.vaults.borrow().contains_key("magic-only"),
-            "surviving vault must not cascade-delete"
+            h.store.legacy_vault_users.borrow().contains("magic-only"),
+            "surviving legacy vault marker must not cascade-delete"
         );
     }
 
@@ -19303,239 +19990,6 @@ mod tests {
     }
 
     #[test]
-    fn vault_test_connection_window_reopens_after_60s_at_handler() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-
-        for _ in 0..vault::TEST_CONNECTION_MAX_ATTEMPTS {
-            let resp = h.call_full(
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.clone()),
-                Some(ORIGIN),
-            );
-            assert_eq!(resp.body, r#"{"ok":true}"#);
-        }
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // Budget exhausted: blocked without a dial.
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // 2s later the 60s window is still closed (pins the window length).
-        let resp = call_at(
-            &h,
-            NOW + 2,
-            "POST",
-            "/v1/vault/test-connection",
-            cookie.clone(),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
-        );
-
-        // After the window the same caller is admitted again and releases.
-        let resp = call_at(&h, NOW + 61, "POST", "/v1/vault/test-connection", cookie);
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize + 1
-        );
-        assert!(
-            h.store.test_connection_leases.borrow().is_empty(),
-            "re-admitted probe must release its lease"
-        );
-    }
-
-    #[test]
-    fn vault_test_ip_budget_blocks_other_account_at_handler() {
-        // Per-IP gate isolated at the handler, NAT-sized: the per-IP
-        // cap sits ABOVE the per-account cap, so account A exhausting
-        // its own budget must NOT lock out neighbour B on the same
-        // address (first probe still admitted). Only once enough
-        // accounts together exhaust the larger per-IP budget is a
-        // fresh account denied on its FIRST probe with the usual
-        // boolean collapse and no dial. Shrinking the IP cap back to
-        // the account cap fails the neighbour probe; removing the
-        // handler's admission check fails the final denial.
-        let h = harness();
-        let account_cap = h.config.rate_limits.vault_test_max_attempts;
-        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
-        assert!(
-            ip_cap > account_cap,
-            "per-IP cap must exceed the per-account cap"
-        );
-        assert_eq!(
-            ip_cap % account_cap,
-            0,
-            "test arithmetic assumes whole account budgets fill the IP budget"
-        );
-        let fillers = (ip_cap / account_cap) as usize;
-        // fillers accounts to exhaust the IP budget, plus one victim.
-        let mut cookies = Vec::new();
-        for i in 0..=fillers {
-            let user_id = format!("u{i}");
-            let email = format!("nat{i}@example.com");
-            seed_user(&h, &user_id, &email);
-            let cookie = magic_login(&h, &email);
-            put_test_vault(&h, &cookie);
-            cookies.push(cookie);
-        }
-        let probe = |cookie: &str| {
-            h.call_full(
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.to_string()),
-                Some(ORIGIN),
-            )
-        };
-
-        // A exhausts its own per-account budget...
-        for i in 0..account_cap {
-            assert_eq!(probe(&cookies[0]).body, r#"{"ok":true}"#, "probe {i} by A");
-        }
-        // ...and neighbour B's first probe is still admitted: one
-        // account alone cannot consume the NAT-shared IP budget.
-        assert_eq!(
-            probe(&cookies[1]).body,
-            r#"{"ok":true}"#,
-            "neighbour behind the same IP must not be locked out by A alone"
-        );
-        // Fill the remaining per-IP slots across the other accounts.
-        let mut dialled = usize::try_from(account_cap).unwrap() + 1;
-        for (idx, cookie) in cookies.iter().enumerate().take(fillers).skip(1) {
-            let probes = if idx == 1 {
-                // B already used one of its account slots above.
-                account_cap - 1
-            } else {
-                account_cap
-            };
-            for i in 0..probes {
-                assert_eq!(probe(cookie).body, r#"{"ok":true}"#, "probe {i} by u{idx}");
-                dialled += 1;
-            }
-        }
-        assert_eq!(dialled, ip_cap as usize);
-        let dials = h.dialer.seen.borrow().len();
-        assert_eq!(dials, ip_cap as usize);
-
-        // The victim's per-account budget is untouched, but the shared
-        // per-IP budget is exhausted: denied before any dial.
-        let resp = probe(&cookies[fillers]);
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            dials,
-            "per-IP denial must happen before any dial"
-        );
-    }
-
-    #[test]
-    fn vault_test_ipv6_slash64_shares_ip_budget_at_handler() {
-        // Handler wiring pin for the vault per-IP key: probes spread
-        // across two addresses in one IPv6 /64 must share the single
-        // `vault.test_ip` budget through the real `vault_test_connection`
-        // handler. Each address alone stays well under the per-IP cap,
-        // so keying on the raw `source_ip` (instead of
-        // `rate_limit_ip_key`) would admit the victim's first probe and
-        // fail here — while the IPv4 harness default, where key == raw,
-        // keeps every other vault test green. A different /64 keeps its
-        // own budget.
-        let h = harness();
-        let account_cap = h.config.rate_limits.vault_test_max_attempts;
-        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
-        assert_eq!(
-            ip_cap % account_cap,
-            0,
-            "test arithmetic assumes whole account budgets fill the IP budget"
-        );
-        let fillers = (ip_cap / account_cap) as usize;
-        let ip_a = "2001:db8:abcd:12::1";
-        let ip_b = "2001:db8:abcd:12::9";
-        let ip_other = "2001:db8:abcd:13::1";
-        // fillers accounts to exhaust the shared /64 budget, plus one victim.
-        let mut cookies = Vec::new();
-        for i in 0..=fillers {
-            let user_id = format!("v6u{i}");
-            let email = format!("v6nat{i}@example.com");
-            seed_user(&h, &user_id, &email);
-            let cookie = magic_login(&h, &email);
-            put_test_vault(&h, &cookie);
-            cookies.push(cookie);
-        }
-        let probe = |cookie: &str, ip: &str| {
-            h.call_full_with_ip(
-                ip,
-                "POST",
-                "/v1/vault/test-connection",
-                None,
-                Some(cookie.to_string()),
-                Some(ORIGIN),
-            )
-        };
-
-        // Fill the per-IP budget, alternating the two addresses in the
-        // /64 so neither raw address ever reaches the cap on its own.
-        let mut dialled = 0usize;
-        for (idx, cookie) in cookies.iter().enumerate().take(fillers) {
-            for i in 0..account_cap {
-                let ip = if dialled.is_multiple_of(2) {
-                    ip_a
-                } else {
-                    ip_b
-                };
-                assert_eq!(
-                    probe(cookie, ip).body,
-                    r#"{"ok":true}"#,
-                    "probe {i} by v6u{idx} from {ip}"
-                );
-                dialled += 1;
-            }
-        }
-        assert_eq!(dialled, ip_cap as usize);
-        let dials = h.dialer.seen.borrow().len();
-        assert_eq!(dials, ip_cap as usize);
-
-        // The victim's per-account budget is untouched, but the /64's
-        // shared per-IP budget is exhausted: denied before any dial.
-        let resp = probe(&cookies[fillers], ip_b);
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().len(),
-            dials,
-            "shared-/64 denial must happen before any dial"
-        );
-
-        // A different /64 keeps its own budget: the same victim is
-        // admitted from there (the denial above consumed neither budget).
-        let resp = probe(&cookies[fillers], ip_other);
-        assert_eq!(
-            resp.body, r#"{"ok":true}"#,
-            "a different /64 must keep its own budget"
-        );
-        assert_eq!(h.dialer.seen.borrow().len(), dials + 1);
-    }
-
-    #[test]
     fn previous_secret_authenticates_only_inside_rotation_window() {
         // Runbook §4: the Worker honors a staged previous secret only as
         // part of a recorded rotation, through the dual path. A pre-cutover
@@ -19612,7 +20066,7 @@ mod tests {
             };
             let req = Request {
                 method: "GET".to_string(),
-                path: "/v1/vault".to_string(),
+                path: "/v1/plans".to_string(),
                 cookie: Some(cookie.clone()),
                 origin: None,
                 authorization: None,
@@ -19654,41 +20108,6 @@ mod tests {
         assert!(session::verify_session(&primary, migrated_token, NOW).is_ok());
         // ... and once the previous secret is dropped the old token fails.
         assert_eq!(authed(&steady_cfg).status, 401);
-    }
-
-    #[test]
-    fn plaintext_opt_in_save_uses_insecure_audit_action() {
-        // The cleartext opt-in must be repudiation-safe in the audit log: a
-        // save with `allow_insecure_plaintext` records the insecure action,
-        // a normal save keeps the plain one.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        put_test_vault(&h, &cookie);
-        assert_eq!(
-            h.store.audits.borrow().last().unwrap().action,
-            "vault.update"
-        );
-        let put_body = serde_json::json!({
-            "provider": {
-                "host": "news.example.com", "port": 119, "tls": false,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4, "allow_insecure_plaintext": true
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "PUT",
-            "/v1/vault",
-            Some(put_body.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(
-            h.store.audits.borrow().last().unwrap().action,
-            vault::INSECURE_PLAINTEXT_AUDIT_ACTION
-        );
     }
 
     #[test]
@@ -20009,8 +20428,6 @@ mod tests {
             "/v1/session/refresh",
             "/v1/session/logout",
             "/v1/session/revoke-all",
-            "/v1/vault",
-            "/v1/vault/test-connection",
         ] {
             assert!(is_known_path(path), "{path}");
             let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
@@ -20026,173 +20443,127 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// Retired user-vault surface: every method and shape of these paths.
+    const RETIRED_VAULT_PATHS: [&str; 9] = [
+        "/v1/vault",
+        "/v1/vault/",
+        "/v1/vault/test",
+        "/v1/vault/test/",
+        "/v1/vault/test-connection",
+        "/v1/vault/test-connection/",
+        "/v1/vault/other",
+        "/v1/vault/test/extra",
+        "/V1/vault",
+    ];
+    const RETIRED_VAULT_METHODS: [&str; 9] = [
+        "GET", "PUT", "DELETE", "POST", "PATCH", "HEAD", "OPTIONS", "TRACE", "get",
+    ];
+
     #[test]
-    fn test_connection_accepts_candidate_envelope_without_stored_vault() {
-        // Test-before-save: an authenticated caller can dial a candidate
-        // config the server has never stored, under the same budget, lease
-        // and dial guards, without creating a vault row.
-        let h = harness();
+    fn retired_vault_paths_are_unknown_and_denied_by_the_scope_map() {
+        for path in RETIRED_VAULT_PATHS {
+            assert!(!is_known_path(path), "{path} must not be a known path");
+            assert!(
+                !options_preflight_served(path),
+                "{path} must not clear a browser preflight"
+            );
+            for method in RETIRED_VAULT_METHODS {
+                assert_eq!(
+                    crate::native_rest::scope_for_operation(method, path),
+                    crate::native_rest::RouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_vault_routes_are_plain_not_found_without_side_effects() {
+        let h = peppered_harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
+        // Retired paths must not even look the session up: any store
+        // authentication read would surface as a non-404 failure.
+        *h.store.fail_session_lookup.borrow_mut() = true;
+        let audits = h.store.audits.borrow().len();
+        let sessions = h.store.sessions.borrow().len();
+        let slots = h.store.rate_limit_slots.borrow().len();
+        let mails = h.mailer.sent.borrow().len();
+        let credential_lookups = *h.store.native_credential_lookups.borrow();
+        let expected = crate::api_error::ApiError::not_found("not found").body_json();
+
+        let provider_body = serde_json::json!({
             "provider": {
                 "host": "news.example.com", "port": 563, "tls": true,
                 "username": "synthetic-user", "password": "synthetic-pass",
                 "max_connections": 4
             },
             "indexer": null
-        });
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":true}"#);
-        assert_eq!(
-            h.dialer.seen.borrow().as_slice(),
-            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
-        );
-        assert!(
-            h.store.vaults.borrow().is_empty(),
-            "candidate test must not persist a vault row"
-        );
-    }
-
-    #[test]
-    fn test_connection_rejects_unparsable_body_closed() {
-        // A non-empty body that is not the save envelope fails closed
-        // instead of silently testing something else.
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
+        })
+        .to_string();
+        let bodies: [Option<String>; 6] = [
+            None,
+            Some(String::new()),
+            Some("{}".to_string()),
+            Some(provider_body),
             Some(r#"{"provider": {"host": 7}}"#.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 400);
-        assert!(h.dialer.seen.borrow().is_empty());
-    }
-
-    #[test]
-    fn test_connection_candidate_with_forbidden_host_fails_boolean() {
-        // A candidate pointing at a forbidden address collapses to the
-        // same boolean as a bad stored vault (never a banner or verdict).
-        let mut h = harness();
-        h.dns.map.insert(
-            "blocked.example.com".to_string(),
-            vec!["10.0.0.5".parse().unwrap()],
-        );
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let candidate = serde_json::json!({
-            "provider": {
-                "host": "blocked.example.com", "port": 119, "tls": false,
-                "allow_insecure_plaintext": true,
-                "username": "synthetic-user", "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        });
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            Some(candidate.to_string()),
-            Some(cookie),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.body, r#"{"ok":false}"#);
-        assert!(h.dialer.seen.borrow().is_empty());
-    }
-
-    #[test]
-    fn probe_dials_the_validated_target_port() {
-        // `Dialer::probe` takes no caller-supplied port, so the
-        // only port any dialer can reach is `target.port()` — vetted by
-        // `ProviderConfig::validate` against the NNTP allowlist. A
-        // recording dialer over both allowlisted ports must observe
-        // exactly the validated port (with the provider's own `tls` flag).
-        struct PortDialer {
-            seen: RefCell<Vec<(u16, bool)>>,
-        }
-
-        impl Dialer for PortDialer {
-            async fn probe(&self, target: &ValidatedTarget, tls: bool) -> bool {
-                self.seen.borrow_mut().push((target.port(), tls));
-                true
+            Some(r#"{"provider": {"host": "news.example.com""#.to_string()),
+        ];
+        let bearer = format!("Bearer ntk_{}", "0".repeat(43));
+        // (cookie, authorization, origin): anonymous, valid cookie
+        // session, presented bearer, and cookie plus bearer together.
+        let callers: [(Option<String>, Option<String>, Option<&str>); 6] = [
+            (None, None, None),
+            (None, None, Some(ORIGIN)),
+            (Some(cookie.clone()), None, None),
+            (Some(cookie.clone()), None, Some(ORIGIN)),
+            (None, Some(bearer.clone()), None),
+            (Some(cookie), Some(bearer), Some(ORIGIN)),
+        ];
+        for path in RETIRED_VAULT_PATHS {
+            for method in RETIRED_VAULT_METHODS {
+                for (cookie, authorization, origin) in &callers {
+                    for body in &bodies {
+                        let req = Request {
+                            method: method.to_string(),
+                            path: path.to_string(),
+                            cookie: cookie.clone(),
+                            origin: origin.map(str::to_string),
+                            authorization: authorization.clone(),
+                            stripe_signature: None,
+                            body: body.clone().unwrap_or_default().into_bytes(),
+                        };
+                        let resp = block_on(handle(&h.ctx(), &req));
+                        let who = format!(
+                            "{method} {path} cookie={} bearer={} body={body:?}",
+                            cookie.is_some(),
+                            authorization.is_some()
+                        );
+                        assert_eq!(resp.status, 404, "{who}: {}", resp.body);
+                        assert_eq!(resp.body, expected, "{who}");
+                        assert!(resp.set_cookie.is_none(), "{who}: no cookies");
+                        assert!(resp.retry_after.is_none(), "{who}");
+                    }
+                }
             }
         }
-
-        for (port, tls) in [(119u16, true), (563u16, true)] {
-            let config = ProviderConfig {
-                host: "news.example.com".to_string(),
-                port,
-                tls,
-                username: "synthetic-user".to_string(),
-                password: "synthetic-pass".to_string(),
-                max_connections: 4,
-                allow_insecure_plaintext: false,
-            };
-            let dns = StaticDns {
-                addresses: vec!["93.184.216.34".parse().unwrap()],
-            };
-            let target = config.validate(&dns).expect("allowlisted port validates");
-            assert_eq!(target.port(), port);
-            let dialer = PortDialer {
-                seen: RefCell::new(Vec::new()),
-            };
-            assert!(block_on(dialer.probe(&target, tls)));
-            assert_eq!(
-                dialer.seen.borrow().as_slice(),
-                [(port, tls)],
-                "dialed port must equal the validated target port"
-            );
-        }
-    }
-
-    #[test]
-    fn probe_takes_no_caller_supplied_port() {
-        // Shape pin: the trait, the handler call site, and
-        // the production dialer must never carry a caller-supplied port
-        // again — a reintroduced `port: u16` parameter would let a caller
-        // smuggle a substitute past the validated target. Slice ONLY the
-        // pre-test production source first: this test's own `PortDialer`
-        // above uses the two-argument shape, so searching the whole file
-        // would match the test itself. Comments are stripped next so prose
-        // mentioning a port cannot satisfy the pins.
-        let source = include_str!("handlers.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("test module must exist")
-            .0;
-        let code = strip_line_comments(production);
-        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            norm.contains("fn probe(&self, target: &ValidatedTarget, tls: bool)"),
-            "Dialer::probe must take only (target, tls) — no caller-supplied port",
+        assert_eq!(h.store.audits.borrow().len(), audits, "no audit rows");
+        assert_eq!(
+            h.store.sessions.borrow().len(),
+            sessions,
+            "no session writes"
         );
-        assert!(
-            !norm.contains("port: u16"),
-            "handler production code must not carry a caller-supplied port anywhere",
+        assert_eq!(h.store.rate_limit_slots.borrow().len(), slots, "no budgets");
+        assert_eq!(h.mailer.sent.borrow().len(), mails);
+        assert_eq!(
+            *h.store.native_credential_lookups.borrow(),
+            credential_lookups,
+            "no bearer credential lookup"
         );
+        assert!(h.dialer.seen.borrow().is_empty(), "no probe dial");
         assert!(
-            norm.contains("ctx.dialer.probe(&target, provider.tls).await"),
-            "handler must probe with the validated target only (plus its own tls flag)",
-        );
-        let entry = include_str!("worker_entry.rs");
-        let entry_code = strip_line_comments(entry);
-        let entry_norm = entry_code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            entry_norm.contains("async fn probe(&self, target: &ValidatedTarget, tls: bool)"),
-            "SocketDialer::probe must take only (target, tls)",
-        );
-        assert!(
-            entry_norm.contains("let port = target.port();"),
-            "SocketDialer must dial the validated target's own port",
+            h.store.legacy_vault_users.borrow().is_empty(),
+            "no vault state is created"
         );
     }
 
@@ -20255,9 +20626,6 @@ mod tests {
                 "magic-finish" => {
                     serde_json::from_value::<MagicFinishBody>(wire.clone()).map(|_| ())
                 }
-                "vault-save" | "vault-test" => {
-                    serde_json::from_value::<VaultPutBody>(wire.clone()).map(|_| ())
-                }
                 "credentials-mint" => {
                     serde_json::from_value::<CredentialsMintBody>(wire.clone()).map(|_| ())
                 }
@@ -20274,7 +20642,7 @@ mod tests {
             pinned += 1;
         }
         assert_eq!(
-            pinned, 11,
+            pinned, 9,
             "every body-bearing route (incl. the invite variant and the credentials mint) is pinned"
         );
     }
