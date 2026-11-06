@@ -10,6 +10,93 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import apply_migration
+import apply_migration_runtime_cases as runtime_cases
+
+
+class MirrorPinTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = pathlib.Path(self.dir.name)
+        self.manifest = self.root / "manifest.toml"
+        self.original = runtime_cases.REAL_MANIFEST.read_text(encoding="utf-8")
+        self.manifest.write_text(self.original, encoding="utf-8")
+        for name, _sha in runtime_cases.MIRROR_FILES:
+            source = runtime_cases.REAL_MANIFEST.parent / name
+            (self.root / name).write_bytes(source.read_bytes())
+
+    def test_real_manifest_passes(self):
+        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_appended_app_entry_passes(self):
+        body = b"SELECT 1;\n"
+        name = "9999_app_pin_fixture.sql"
+        (self.root / name).write_bytes(body)
+        self.manifest.write_text(
+            self.original + f'\n[[migration]]\nfile = "{name}"\ntarget = "app"\n'
+            f'sha256 = "{hashlib.sha256(body).hexdigest()}"\n', encoding="utf-8")
+        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_entry_drift_refuses(self):
+        for name, sha in runtime_cases.MIRROR_FILES:
+            for field, before, after in (
+                    ("file", name, "9998_renamed_mirror.sql"),
+                    ("sha256", sha, "0" * 64),
+                    ("target", "mirror", "app")):
+                with self.subTest(file=name, field=field):
+                    blocks = self.original.split("[[migration]]")
+                    index = next(i for i, block in enumerate(blocks)
+                                 if f'file = "{name}"' in block)
+                    blocks[index] = blocks[index].replace(
+                        f'{field} = "{before}"', f'{field} = "{after}"', 1)
+                    self.manifest.write_text(
+                        "[[migration]]".join(blocks), encoding="utf-8")
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_rename_metadata_drift_refuses(self):
+        for name, sha in runtime_cases.MIRROR_FILES:
+            for field, metadata in (
+                    ("renamed_from",
+                     f'[{{ file = "9998_old_mirror.sql", sha256 = "{sha}" }}]'),
+                    ("source_rename_history",
+                     f'[{{ parent = "{"a" * 40}", commit = "{"b" * 40}", '
+                     f'old_path = "migrations/9998_old_mirror.sql", '
+                     f'new_path = "migrations/{name}", '
+                     f'old_sha256 = "{sha}", new_sha256 = "{sha}" }}]')):
+                with self.subTest(file=name, field=field):
+                    changed = self.original.replace(
+                        f'file = "{name}"\n',
+                        f'file = "{name}"\n{field} = {metadata}\n', 1)
+                    self.manifest.write_text(changed, encoding="utf-8")
+                    # Each addition is valid metadata, not a parser rejection.
+                    apply_migration.load_manifest(self.manifest)
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_order_drift_refuses(self):
+        blocks = self.original.split("[[migration]]")
+        indices = [i for i, block in enumerate(blocks) if 'target = "mirror"' in block]
+        for left, right in zip(indices, indices[1:]):
+            with self.subTest(left=left, right=right):
+                reordered = blocks.copy()
+                reordered[left], reordered[right] = reordered[right], reordered[left]
+                self.manifest.write_text(
+                    "[[migration]]".join(reordered), encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                    runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_file_byte_drift_refuses(self):
+        for name, _sha in runtime_cases.MIRROR_FILES:
+            with self.subTest(file=name):
+                path = self.root / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n-- changed fixture bytes\n")
+                try:
+                    with self.assertRaisesRegex(AssertionError, f"{name} bytes changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+                finally:
+                    path.write_bytes(original)
 
 
 class ComposeTests(unittest.TestCase):
@@ -46,15 +133,55 @@ class ComposeTests(unittest.TestCase):
         # the advisory lock + already-recorded guard, then body + insert.
         self.assertIn("pg_advisory_xact_lock", sql)
         # The expected database is pinned inside the transaction.
-        self.assertIn("current_database() <> 'nntune_apply_test'", sql)
+        self.assertIn("current_database() OPERATOR(pg_catalog.<>) 'nntune_apply_test'", sql)
         self.assertIn(apply_migration.WRONG_DATABASE, sql)
         self.assertIn(apply_migration.ALREADY_SAME, sql)
         self.assertIn(apply_migration.ALREADY_DIFFERENT, sql)
         self.assertIn("CREATE TABLE t (id int);", sql)
-        self.assertIn(f"VALUES (\n    '0002_alpha.sql',\n    '{sha}',\n    now(),\n    'operator (test)'\n)", sql)
+        self.assertIn(f"VALUES (\n    '0002_alpha.sql',\n    '{sha}',\n    pg_catalog.now(),\n    'operator (test)'\n)", sql)
         # Plain insert: the in-transaction guard already refused any
         # recorded identity, so ON CONFLICT would only mask a race.
         self.assertNotIn("ON CONFLICT", sql)
+
+    def test_runner_infrastructure_uses_catalog_namespace(self):
+        self.fixture()
+        ddl = apply_migration.ddl_sql("nntune_apply_test")
+        for name in ("now", "aclexplode", "format", "pg_get_userbyid"):
+            with self.subTest(routine=name):
+                self.assertIn(f"pg_catalog.{name}(", ddl)
+                self.assertNotRegex(ddl, rf"(?<![\w.]){name}\s*\(")
+        for name in ("pg_class", "pg_namespace", "pg_attribute"):
+            with self.subTest(catalog=name):
+                self.assertIn(f"pg_catalog.{name}", ddl)
+                self.assertNotRegex(ddl, rf"(?:FROM|JOIN)\s+{name}\b")
+        for record_only in (False, True):
+            sql, *_ = self.compose(record_only=record_only)
+            for label, statement in (("A", ddl), ("B", sql)):
+                with self.subTest(path=label, record_only=record_only):
+                    for name in ("current_database", "pg_advisory_xact_lock"):
+                        self.assertIn(f"pg_catalog.{name}(", statement)
+                        self.assertNotRegex(statement, rf"(?<![\w.]){name}\s*\(")
+            self.assertIn("pg_catalog.now()", sql)
+
+    def test_runner_types_and_comparisons_use_catalog_namespace(self):
+        ddl = apply_migration.ddl_sql("nntune_apply_test")
+        self.assertIn("file       pg_catalog.text PRIMARY KEY", ddl)
+        self.assertIn("applied_at pg_catalog.timestamptz", ddl)
+        self.assertIn("grant_row pg_catalog.record", ddl)
+        self.assertIn("sha256 OPERATOR(pg_catalog.~)", ddl)
+        self.assertIn("a.grantee OPERATOR(pg_catalog.<>) c.relowner", ddl)
+        self.assertIn("t.attnum OPERATOR(pg_catalog.>) 0", ddl)
+        self.assertIn("a.privilege_type OPERATOR(pg_catalog.=) ANY", ddl)
+        self.assertIn("OPERATOR(pg_catalog.||)", ddl)
+        identity = [("0002_alpha.sql", "a" * 64), ("0001_old.sql", "a" * 64)]
+        sql = apply_migration.guard_sql(identity, "nntune_apply_test", [identity])
+        self.assertIn("pg_catalog.current_database() OPERATOR(pg_catalog.<>)", sql)
+        self.assertEqual(sql.count("sha256 OPERATOR(pg_catalog.=)"), 12)
+        self.assertEqual(sql.count("file OPERATOR(pg_catalog.=)"), 16)
+        self.assertIn("SELECT pg_catalog.count(*)", sql)
+        self.assertNotIn(" IN (", sql)
+        self.assertIn("::pg_catalog.timestamptz", apply_migration.insert_sql(
+            "0002_alpha.sql", "a" * 64, "test", applied_at="2026-11-03T00:00:00Z"))
 
     def test_sha_mismatch_refuses(self):
         self.fixture(sha_override="0" * 64)
@@ -79,13 +206,122 @@ class ComposeTests(unittest.TestCase):
         # The guard checks the whole identity, new name included.
         self.assertIn("'0002_alpha.sql'", sql)
 
-    def test_own_transaction_control_requires_record_only(self):
-        self.fixture(body="BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\n")
-        with self.assertRaises(apply_migration.ApplyError):
-            self.compose()
+    def test_safe_outer_envelope_preserves_original_receipt(self):
+        interior = ("\nCREATE TABLE t (note text);\n"
+                    "INSERT INTO t VALUES ('keep   repeated  whitespace; COMMIT;');\n"
+                    "/* keep  comment  spacing */\n")
+        body = "/* outer */ BEGIN;" + interior + "COMMIT; -- end\n"
+        self.fixture(body=body)
+        sql, _, sha, _ = self.compose()
+        self.assertEqual(sha, hashlib.sha256(body.encode()).hexdigest())
+        self.assertEqual(apply_migration.transaction_body(body),
+                         "/* outer */ " + interior + " -- end\n")
+        self.assertIn(interior, sql)
+        self.assertNotIn("/* outer */ BEGIN;", sql)
+        self.assertNotIn("COMMIT; -- end", sql)
+        self.assertIn(f"'{sha}'", sql)
         sql, *_ = self.compose(record_only=True)
         self.assertNotIn("CREATE TABLE t", sql)
-        self.assertIn("INSERT INTO public.schema_migrations", sql)
+
+    def test_unsafe_or_unsupported_envelopes_refuse_even_record_only(self):
+        bodies = (
+            "COMMIT; SELECT 1;", "BEGIN; SELECT 1;", "SELECT 1; COMMIT;",
+            "BEGIN; BEGIN; SELECT 1; COMMIT; COMMIT;",
+            "BEGIN; SELECT 1; COMMIT; SELECT 2;",
+            "BEGIN; SELECT 1; COMMIT; BEGIN; SELECT 2; COMMIT;",
+            "START TRANSACTION; SELECT 1; COMMIT;",
+            "BEGIN WORK; SELECT 1; COMMIT;",
+            "BEGIN; SELECT 1; END;", "BEGIN; SELECT 1; ABORT;",
+            "BEGIN; SELECT 1; COMMIT AND CHAIN;",
+            "BEGIN; SAVEPOINT s; SELECT 1; COMMIT;",
+            "BEGIN; RELEASE SAVEPOINT s; COMMIT;",
+            "BEGIN; ROLLBACK TO SAVEPOINT s; COMMIT;",
+            "PREPARE TRANSACTION 'x';", "COMMIT PREPARED 'x';",
+            "SET TRANSACTION READ ONLY;", "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+            "SELECT 1 \\gexec", "SELECT 1; \\q", "\\i other.sql",
+            "SELECT 'unterminated", 'SELECT "unterminated',
+            "DO $body$ BEGIN NULL; END;", "SELECT 1; /* unterminated",
+            "SELECT 1; /* nested /* comment */", "SELECT 1",
+            "SET standard_conforming_strings = off; SELECT 1;",
+            "RESET ALL;", "DISCARD ALL;", "COPY t FROM STDIN;\n1\n\\.\n",
+            "SELECT U&'unsupported';", "SELECT 1;\x00COMMIT;",
+            "BEGIN; SELECT 1; -- comment\rCOMMIT; SELECT 2;",
+            "SELECT E'one'\n'continued';",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END;",
+            "SELECT unquoted_é;", "SELECT \U0001f642E'unsupported';",
+            "BEGIN ; SELECT 1; COMMIT;",
+        )
+        for body in bodies:
+            for record_only in (False, True):
+                with self.subTest(body=body, record_only=record_only):
+                    self.fixture(body=body)
+                    with self.assertRaises(apply_migration.ApplyError):
+                        self.compose(record_only=record_only)
+
+    def test_lexical_contexts_do_not_create_boundaries(self):
+        bodies = (
+            'BEGIN; CREATE TABLE "COMMIT;" ("BEGIN" text); COMMIT;',
+            "BEGIN; SELECT 'COMMIT; BEGIN; \\q', 'it''s ROLLBACK;'; COMMIT;",
+            "BEGIN; SELECT E'it\\'s COMMIT; \\\\q'; COMMIT;",
+            "/* nested /* COMMIT; */ BEGIN; */ BEGIN; SELECT 1; COMMIT;",
+            "BEGIN; DO $tag$ BEGIN PERFORM 'COMMIT;'; END $tag$; COMMIT;",
+            "-- COMMIT;\nBEGIN /* opening */; SELECT 1; COMMIT /* closing */; -- BEGIN;",
+            'SELECT "BEGIN", "COMMIT", "ROLLBACK" FROM "START TRANSACTION";',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.fixture(body=body)
+                self.compose()
+
+    def test_frozen_mirror_files_compose_without_changing_bytes(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        entries = apply_migration.load_manifest(root / "migrations/manifest.toml")
+        for entry in entries:
+            if entry["target"] != "mirror":
+                continue
+            path = root / "migrations" / entry["file"]
+            before = path.read_bytes()
+            with self.subTest(file=entry["file"]):
+                _, _, sha, target = apply_migration.compose(
+                    path, root / "migrations/manifest.toml", "test",
+                    expect_database="nntune_apply_test")
+                self.assertEqual((sha, target), (entry["sha256"], "mirror"))
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_controlled_child_options_replace_hostile_caller_options(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PGOPTIONS": "-c search_path=hostile -c standard_conforming_strings=off"}):
+            child = apply_migration.connection_env("postgresql://u:p@localhost/app")
+        self.assertIn("search_path=public,pg_catalog", child["PGOPTIONS"])
+        self.assertNotIn("hostile", child["PGOPTIONS"])
+        self.assertIn("standard_conforming_strings=on", child["PGOPTIONS"])
+        self.assertIn("statement_timeout=", child["PGOPTIONS"])
+        self.assertIn("lock_timeout=", child["PGOPTIONS"])
+
+    def test_timeout_error_is_redacted_and_requires_reconciliation(self):
+        from unittest.mock import patch
+        import subprocess
+        with patch.object(apply_migration.subprocess, "run", side_effect=
+                          subprocess.TimeoutExpired("secret-url", 120, stderr="secret-password")):
+            with self.assertRaisesRegex(apply_migration.ApplyError, "reconcile") as caught:
+                apply_migration.psql({}, "SELECT 1;", single_transaction=True)
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_nonzero_exit_guidance_is_useful_and_redacted(self):
+        from unittest.mock import patch
+        import subprocess
+        private = "private-password private-db-statement private-server-address"
+        result = subprocess.CompletedProcess(["psql"], 3, stdout=private, stderr=private)
+        with patch.object(apply_migration.subprocess, "run", return_value=result):
+            with self.assertRaises(apply_migration.ApplyError) as caught:
+                apply_migration.psql({}, "SELECT 1;", single_transaction=True)
+        message = str(caught.exception)
+        self.assertIn("exit code 3", message)
+        self.assertIn("server-side timeout", message)
+        self.assertIn("redacted", message)
+        self.assertIn("reconcile", message)
+        self.assertNotIn("see the operator-side psql output", message)
+        self.assertNotIn("private-", message)
 
     def test_mid_line_transaction_control_is_detected(self):
         self.fixture(body="CREATE TABLE t (id int); COMMIT;\n")
@@ -130,7 +366,7 @@ class ComposeTests(unittest.TestCase):
     def test_record_only_also_pins_database(self):
         self.fixture(body="BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\n")
         sql, *_ = self.compose(record_only=True)
-        self.assertIn("current_database() <> 'nntune_apply_test'", sql)
+        self.assertIn("current_database() OPERATOR(pg_catalog.<>) 'nntune_apply_test'", sql)
 
     def test_guard_requires_earlier_same_target_entries(self):
         bodies = {
@@ -234,8 +470,8 @@ class ComposeTests(unittest.TestCase):
             self.compose("0002_alpha.sql")
 
     def deny_list(self, sql):
-        deny = sql[sql.index("WHERE file IN ("):]
-        return deny[:deny.index(")")]
+        deny = sql[sql.index("WHERE (file OPERATOR(pg_catalog.=)"):]
+        return deny[:deny.index("\n                 AND NOT")]
 
     def test_history_names_feed_the_deny_check_only(self):
         body = "CREATE TABLE t (id int);\n"
@@ -259,7 +495,7 @@ class ComposeTests(unittest.TestCase):
         # prior is also checked for duplicate accepted rows first.
         same = sql.index(f"RAISE EXCEPTION '{apply_migration.ALREADY_SAME}'")
         self.assertLess(sql.index(apply_migration.CONFLICTING_HISTORY), same)
-        self.assertEqual(sql[:same].count(") > 1 THEN"), 2)
+        self.assertEqual(sql[:same].count(") OPERATOR(pg_catalog.>) 1 THEN"), 2)
         self.assertGreater(sql.index(f"RAISE EXCEPTION '{apply_migration.MISSING_PRIOR}'"), same)
 
     def test_multi_hop_history_on_final_entry_and_mirror_excluded(self):
@@ -282,8 +518,8 @@ class ComposeTests(unittest.TestCase):
     def test_guard_rejects_more_than_one_accepted_row(self):
         sql = apply_migration.guard_sql(
             [("0002_a.sql", "1" * 64), ("0001_a.sql", "1" * 64)], "db")
-        self.assertIn(") > 1 THEN", sql)
-        self.assertLess(sql.index(") > 1 THEN"),
+        self.assertIn(") OPERATOR(pg_catalog.>) 1 THEN", sql)
+        self.assertLess(sql.index(") OPERATOR(pg_catalog.>) 1 THEN"),
                         sql.index(f"RAISE EXCEPTION '{apply_migration.ALREADY_SAME}'"))
 
     def test_psql_maps_conflicting_history(self):
@@ -307,11 +543,15 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("aclexplode(t.attacl)", apply_migration.DDL)
         self.assertIn("REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I)",
                       apply_migration.DDL)
-        self.assertIn("a.grantee <> c.relowner", apply_migration.DDL)
+        self.assertIn("a.grantee OPERATOR(pg_catalog.<>) c.relowner", apply_migration.DDL)
         ddl = apply_migration.ddl_sql("nntune_apply_test")
         # The database check precedes CREATE TABLE so a wrong-database
         # run leaves no tracking table behind.
         self.assertLess(ddl.index(apply_migration.WRONG_DATABASE),
+                        ddl.index("CREATE TABLE"))
+        # A uses the same per-transaction lock before bootstrap/ACL writes
+        # to avoid concurrent CREATE/REVOKE catalog-update races.
+        self.assertLess(ddl.index("pg_advisory_xact_lock"),
                         ddl.index("CREATE TABLE"))
 
     def test_main_refuses_url_database_mismatch_before_connecting(self):
