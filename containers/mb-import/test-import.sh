@@ -1257,7 +1257,70 @@ check "rel2: older dump leaves group aliases alone" "1" "$(db -c 'SELECT count(*
 check "rel2: older dump leaves work aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
 check "rel2: older dump leaves label aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
 
-rm -rf "$FIX" "$DUPE" "$FIX-dupe-p2-last" "$FIX-dupe-p2-alias" "$PARTIAL_FIRST" "$PARTIAL_LAST" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old"
+echo "=== 15. all-DLQ phase-2 dumps never prune existing rows, including on resume ==="
+# Mixed-age rows can remain after an interrupted older import. An incoming
+# dump with no loadable rows must not prune them using the stored table max.
+# Reconstruct a committed first chunk to cover resume without timing races.
+DLQ2="$FIX-dlq2"
+rm -rf "$DLQ2"
+cp -R "$REL2" "$DLQ2"
+relation_state() {
+  db -c 'SELECT row_to_json(r) FROM mb_artist_recording r ORDER BY artist_mbid, recording_mbid, link_name;'
+}
+for reason in fk_missing_artist bad_uuid; do
+  python3 - "$DLQ2/mbdump-artist_recording.tsv" "$reason" <<'EOF'
+import sys, uuid
+path, reason = sys.argv[1:]
+parent = str(uuid.UUID(int=999999)) if reason == "fk_missing_artist" else "not-a-uuid"
+with open(path, 'w') as f:
+    for i in (1, 2):
+        f.write(f'{parent}\t{uuid.UUID(int=200000+i)}\tcomposer\t2026-05-04T00:00:00Z\n')
+EOF
+  for completed in 0 1; do
+    reset_db
+    bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
+    db -c "UPDATE mb_artist_recording SET updated_at = '2023-05-04T00:00:00Z' WHERE link_name = 'producer';" >/dev/null
+    before="$(relation_state)"
+    hash="$(dump_id "$DLQ2/mbdump-artist_recording.tsv")"
+    if (( completed == 1 )); then
+      db -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('artist_recording', '$hash', 1) ON CONFLICT (table_name, dump_id) DO UPDATE SET lines_done = 1;" \
+         -c "INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line) VALUES ('artist_recording', '$hash', 1, '$reason', 'seeded first poison chunk');" >/dev/null
+    fi
+    for attempt in first rerun; do
+      if DUMP_SEQ=99 MB_IMPORT_CHUNK_LINES=1 bash "$SELF_DIR/import.sh" "$DLQ2" >"$DLQ2/run.log" 2>&1; then
+        echo "FAIL: all-DLQ phase-2 dump imported ($reason, offset $completed, $attempt)" >&2
+        fail=1
+      fi
+      if ! grep -Fq 'refusing artist_recording dump with no valid rows' "$DLQ2/run.log"; then
+        echo "FAIL: missing all-DLQ refusal ($reason, offset $completed, $attempt)" >&2
+        fail=1
+      fi
+      check "dlq2: existing rows unchanged ($reason, offset $completed, $attempt)" "$before" "$(relation_state)"
+      check "dlq2: cursor complete ($reason, offset $completed, $attempt)" "2" "$(cursor artist_recording "$DLQ2/mbdump-artist_recording.tsv")"
+      check "dlq2: both poison rows retained ($reason, offset $completed, $attempt)" "2" "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name = 'artist_recording' AND dump_id = '$hash' AND reason = '$reason';")"
+      check "dlq2: refused dump never seeds replication ($reason, offset $completed, $attempt)" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
+    done
+  done
+done
+# Negative control: a valid row in a prior chunk still authorizes pruning,
+# even when the last chunk contains only FK orphans and the run was resumed.
+reset_db
+bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
+python3 - "$DLQ2/mbdump-artist_recording.tsv" <<'EOF'
+import sys, uuid
+with open(sys.argv[1], 'w') as f:
+    f.write(f'{uuid.UUID(int=1)}\t{uuid.UUID(int=200001)}\tcomposer\t2026-05-04T00:00:00Z\n')
+    f.write(f'{uuid.UUID(int=999999)}\t{uuid.UUID(int=200002)}\tcomposer\t2026-05-04T00:00:00Z\n')
+EOF
+hash="$(dump_id "$DLQ2/mbdump-artist_recording.tsv")"
+db -c "UPDATE mb_artist_recording SET updated_at = '2026-05-04T00:00:00Z' WHERE link_name = 'composer';" \
+   -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('artist_recording', '$hash', 1) ON CONFLICT (table_name, dump_id) DO UPDATE SET lines_done = 1;" >/dev/null
+MB_IMPORT_CHUNK_LINES=1 bash "$SELF_DIR/import.sh" "$DLQ2" >/dev/null
+check "dlq2: resumed mixed dump still prunes old relations" "1" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "dlq2: resumed mixed dump retains the valid relation" "composer" "$(db -c 'SELECT link_name FROM mb_artist_recording;')"
+check "dlq2: resumed mixed dump completes cursor" "2" "$(cursor artist_recording "$DLQ2/mbdump-artist_recording.tsv")"
+
+rm -rf "$FIX" "$DUPE" "$FIX-dupe-p2-last" "$FIX-dupe-p2-alias" "$PARTIAL_FIRST" "$PARTIAL_LAST" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old" "$DLQ2"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

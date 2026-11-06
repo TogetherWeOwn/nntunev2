@@ -94,7 +94,7 @@ on the decoded value (`src/lib.rs:394-447`).
   (`negative_duration`, `src/lib.rs:506-509`); medium/track positions to a
   non-negative `i16` (`negative_position`, `src/lib.rs:515-517`).
   Booleans accept only the literals `true`/`false`, and ISRCs must match
-  the uppercase 12-character `CCOOOYYYYYYY` shape; anything else is
+  the 12-character `CCOOOYYYYYYY` shape after ASCII uppercasing; anything else is
   `bad_bool` / `bad_isrc` (see `src/lib.rs:489-503`).
   Timestamps must decode to `YYYY-MM-DD`, optionally followed by `T` or
   space plus `HH:MM:SS[.f{1,6}]`; `Z`/`z` may follow either form, while a
@@ -126,7 +126,7 @@ on the decoded value (`src/lib.rs:394-447`).
   — `""` fails for timestamptz and numerics — and abort the chunk
   transaction; the staging table carries no column defaults
   (`CREATE TEMP TABLE stage (LIKE mb_${table})`,
-  `containers/mb-import/import.sh:917`), so no `now()` stamping occurs);
+  `containers/mb-import/import.sh:923`), so no `now()` stamping occurs);
   an empty NOT NULL text column
   passes through as `""` (`src/lib.rs:419-440`).
 
@@ -189,9 +189,12 @@ non-UTF-8 decodings, raw CR/NUL, semantic failures on the decoded value
 (overflow, negative duration/position, impossible dates) under the same
 reason codes as their literal twins. Text columns accept the same escape
 vocabulary but pass the token through untouched. The importer's
-whole-file and per-chunk duplicate checks decode and canonicalize keys
-the same way before comparing, so aliases cannot evade refusal
-(`containers/mb-import/import.sh:240-444,755-786`).
+whole-file duplicate check decodes and canonicalizes all keys before any
+mutation, including text keys such as catalogue numbers, so aliases cannot
+evade refusal (`containers/mb-import/import.sh:240-444`). The per-chunk
+check compares validator-normalized typed keys but raw text tokens; it is
+an additional check, not the decoded-text admission boundary
+(`containers/mb-import/import.sh:755-786`).
 
 ## `mb-validate` binary role
 

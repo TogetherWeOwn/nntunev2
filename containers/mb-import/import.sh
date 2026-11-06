@@ -911,6 +911,12 @@ EOF
     prune_sql=""
     if (( 10#$end == 10#$total )); then
       prune_sql="$final_prune_sql"
+      if [[ -n "$prune_sql" && " $phase2_tables " == *" $table "* ]]; then
+        # Count durable DLQ rows after this chunk's poison insert below:
+        # resume must include earlier chunks, not just this valid.tsv.
+        # An all-DLQ dump is refused after commit, never a deletion snapshot.
+        prune_sql="${prune_sql%;} AND (SELECT COUNT(*) FROM mb_import_dlq WHERE table_name = '$table' AND dump_id = '$dump_id') < $total;"
+      fi
     fi
     advanced="$(psql -q -v ON_ERROR_STOP=1 -tAX <<SQL
 BEGIN;
@@ -919,12 +925,12 @@ CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
 INSERT INTO mb_${table} ($columns, line_no) SELECT $columns, line_no FROM stage
 ON CONFLICT $conflict DO UPDATE SET $upsert
 WHERE mb_${table}.updated_at < EXCLUDED.updated_at;
-$prune_sql
 CREATE TEMP TABLE poison (reason text, line_no bigint, raw text) ON COMMIT DROP;
 \copy poison FROM '$work/poison.tsv' WITH (FORMAT text)
 INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line)
 SELECT '$table', '$dump_id', line_no, reason, raw FROM poison
 ON CONFLICT (table_name, dump_id, line_no) DO NOTHING;
+$prune_sql
 UPDATE mb_import_cursor SET lines_done = $end, updated_at = now()
 WHERE table_name = '$table' AND dump_id = '$dump_id' AND lines_done = $offset
 RETURNING lines_done;

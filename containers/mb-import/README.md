@@ -17,7 +17,7 @@ Container image for the two batch jobs behind `nntunev2-mb`
 
 | Job | Trigger | Script | SLO |
 |---|---|---|---|
-| Initial import | manual Container run | `import.sh <curated-dir>` (twenty-five `mbdump-<table>.tsv` files — the ten base tables (`artist`, `release_group`, `release`, `recording`, `track`, `url`, `artist_url`, `recording_url`, `recording_music_video`, `recording_isrc`) plus the fifteen phase-2 tables (`work`, `label`, `artist_recording`, `artist_release`, `artist_work`, `recording_work`, `recording_recording`, `release_credit`, `artist_alias`, `release_alias`, `recording_alias`, `release_group_alias`, `work_alias`, `label_alias`, `release_label`), required as a group only when any one of them is present; missing base input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity, `url`, `work` and `label` tables, the `(artist, url, link)` / `(recording, url, link)` triples on the URL-relationship tables, the unordered recording pair on `recording_music_video`, the `(recording, isrc)` pair on `recording_isrc`, the `(a, b, link)` triple on the directed relation tables, the `(release, position)` key on `release_credit`, the `(entity, name, locale)` triple on the alias tables, the `(release, label, catalogue)` triple on `release_label`, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same key in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers, literal bools, uppercase ISRCs, the music-video pair sorted like the canonical ETL ordering), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) so per-packet lag accounting has a baseline. (Sources: `import.sh:121` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:139-155,188-199` (all-file and sequence admission); `:685-686` (SHA-256 `dump_id` + cursor insert); `:240-444` (alias-aware whole-file dupe refusal); `:687-701` (cursor read/ahead/complete); `:755-786` (per-chunk dupe check); `:915-938` (one-transaction chunk); `:951-964` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
+| Initial import | manual Container run | `import.sh <curated-dir>` (twenty-five `mbdump-<table>.tsv` files — the ten base tables (`artist`, `release_group`, `release`, `recording`, `track`, `url`, `artist_url`, `recording_url`, `recording_music_video`, `recording_isrc`) plus the fifteen phase-2 tables (`work`, `label`, `artist_recording`, `artist_release`, `artist_work`, `recording_work`, `recording_recording`, `release_credit`, `artist_alias`, `release_alias`, `recording_alias`, `release_group_alias`, `work_alias`, `label_alias`, `release_label`), required as a group only when any one of them is present; missing base input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity, `url`, `work` and `label` tables, the `(artist, url, link)` / `(recording, url, link)` triples on the URL-relationship tables, the unordered recording pair on `recording_music_video`, the `(recording, isrc)` pair on `recording_isrc`, the `(a, b, link)` triple on the directed relation tables, the `(release, position)` key on `release_credit`, the `(entity, name, locale)` triple on the alias tables, the `(release, label, catalogue)` triple on `release_label`, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same key in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers, literal bools, uppercase ISRCs, the music-video pair sorted like the canonical ETL ordering), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) so per-packet lag accounting has a baseline. (Sources: `import.sh:121` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:139-155,188-199` (all-file and sequence admission); `:685-686` (SHA-256 `dump_id` + cursor insert); `:240-444` (alias-aware whole-file dupe refusal); `:687-701` (cursor read/ahead/complete); `:755-786` (per-chunk dupe check); `:921-944` (one-transaction chunk); `:957-970` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
 | Replication | retired (no schedule) | `replicate.sh` refuses every invocation | Hourly Live Data Feed packets carry the NC licence variant and never enter the CC0-only mirror; product reads come from the twice-weekly CC0 core dumps via the initial-import job above. The retired script exits 2 **before** reading secrets, touching the network, or writing any state, preserving the old pending-apply refusal signal for callers that branch on it. The per-packet SLO contract in ADR 0007 (each applied packet within 2 h of publication, evidence in `mb_replication_packet.lag_secs`) stands for whenever packet application returns under a CC0-compatible feed. (Sources: `replicate.sh:1-11` (retirement, exit 2, no state); `docs/adr/0007-mb-mirror.md:24-26` (SLO); `migrations/0017_mb_replication_packet_ledger.sql`; `migrations/0001_mb_mirror.sql:57-65` (state columns).) |
 
 ## Initial dump ETL
@@ -79,13 +79,18 @@ All-file duplicate admission also runs before any database mutation
 escaped newlines distinct. This is admission, **not whole-import atomicity**:
 subsequent row validation or runtime failures can still leave earlier chunks
 committed, with existing resume/DLQ and final-track-prune semantics.
+Phase-2 snapshot pruning requires at least one loadable row in the whole
+dump. Its final transaction counts durable DLQ rows, including earlier
+chunks on resume and the current chunk, before pruning; an all-DLQ dump
+preserves existing relations, records poison/cursor progress, and is
+refused without seeding replication (`import.sh:908-947`).
 
 Optional `DUMP_SEQ` must contain only ASCII decimal digits and fit PostgreSQL
 `INTEGER`, **0..2147483647** (`import.sh:188-199`). Leading zeros are normalized
 before a bounded range check, so arbitrarily long digit strings cannot wrap
 Bash arithmetic. Invalid input is refused before writes. Unset or empty leaves
 replication state alone; zero, equal and older sequences never seed backwards.
-A valid forward sequence seeds only after every table finishes (`import.sh:951-964`).
+A valid forward sequence seeds only after every table finishes (`import.sh:957-970`).
 
 The ETL's positional mapping follows the official
 [MusicBrainz `CreateTables.sql`](https://github.com/metabrainz/musicbrainz-server/blob/master/admin/sql/CreateTables.sql)
@@ -124,7 +129,7 @@ field order; use an extract from the matching schema revision. Derivations:
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
   `import.sh:806` (FK specs);
   `crates/mb-import-validate/src/lib.rs` (`Position` check).)
-- Relationship slices keep only allowlisted link types, resolved from their
+- URL/music-video slices keep only allowlisted link types, resolved from their
   pinned GIDs (artist `youtube` / `youtube music` / `free streaming` /
   `streaming`, recording `free streaming`, recording-recording
   `music video`); a dump missing any pinned GID fails closed, as does a
@@ -139,7 +144,10 @@ field order; use an extract from the matching schema revision. Derivations:
   CHECK's canonical 12-character form. (Sources: `etl.py:113-133` (pinned
   GIDs), `:456-505` (allowlist resolution, kept-link set, empty-slice
   refusal), `:829-899` (url, artist/recording-url, music-video and ISRC
-  projections); `migrations/0030_mb_mirror_w6b.sql`.)
+  projections); `migrations/0030_mb_mirror_w6b.sql`.) Phase-2 directed
+  relations retain every link type present in their input tables, using
+  its resolved name; they are not URL/music-video allowlist slices
+  (`etl.py:904-923`).
 - Orphan references fail the ETL before any curated file is written:
   artist type/area/country, artist-credit artists, group primary types,
   release groups/credits/years, track mediums/recordings, medium releases,
@@ -179,8 +187,8 @@ Reasons are machine-readable: the validator files shape problems as
 loader files FK orphans — a row whose parent was poisoned or never loaded
 (release checks artist and group, track and the relationship/ISRC tables
 check every parent) — as `fk_missing_artist` / `fk_missing_release_group` /
-`fk_missing_release` / `fk_missing_recording` / `fk_missing_url` instead of
-aborting the chunk. (Sources: `crates/mb-import-validate/src/lib.rs:173-189`
+`fk_missing_release` / `fk_missing_recording` / `fk_missing_url` /
+`fk_missing_work` / `fk_missing_label` instead of aborting the chunk. (Sources: `crates/mb-import-validate/src/lib.rs:173-189`
 (reason codes), `:409-418` (`bad_escape` rule);
 `crates/mb-import-validate/src/main.rs:129` (`invalid_encoding` on
 non-UTF-8 bytes); `import.sh:788-904`
