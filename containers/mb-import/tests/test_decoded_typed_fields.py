@@ -25,9 +25,18 @@ import uuid
 A = "abcdef00-0000-4000-8000-000000000001"
 R = "abcdef00-0000-4000-8000-000000000002"
 C = "abcdef00-0000-4000-8000-000000000003"
+G = "abcdef00-0000-4000-8000-000000000004"
+U = "abcdef00-0000-4000-8000-000000000005"
+D = "abcdef00-0000-4000-8000-000000000006"
 MISSING = "abcdef00-0000-4000-8000-000000000099"
 TS = "2024-02-29 12:34:56+00:00"
-TABLES = ("artist", "release", "recording", "track")
+TABLES = ("artist", "release_group", "release", "recording", "track", "url",
+          "artist_url", "recording_url", "recording_music_video", "recording_isrc")
+# Tables whose curated column 2 is a UUID parent (the stub uuid-casts it
+# the way the typed upsert would); release_group names, url urls and
+# recording_isrc codes are not UUIDs and pass through untouched.
+UUID_COL2 = ("release", "recording", "track", "artist_url",
+             "recording_url", "recording_music_video")
 HERE = Path(__file__).resolve()
 IMPORTER = HERE.parents[1] / "import.sh"
 
@@ -94,7 +103,7 @@ def psql_stub():
         state_file.write_text(json.dumps(state))
 
     if "CREATE TEMP TABLE want_parent" in sql:
-        table = re.search(r"FROM mb_(artist|release|recording) p", sql).group(1)
+        table = re.search(r"FROM mb_(artist|release|recording|release_group|url) p", sql).group(1)
         path = re.search(r"\\copy want_parent FROM '([^']+)'", sql).group(1)
         parents = copy_rows(path)
         bad = [line for key, line in parents if str(uuid.UUID(key)) not in state["rows"][table]]
@@ -118,9 +127,12 @@ def psql_stub():
         converted = []
         for fields in stage:
             fields[0] = str(uuid.UUID(fields[0]))
-            if table != "artist" and fields[1] is not None:
+            if table in UUID_COL2 and fields[1] is not None:
                 fields[1] = str(uuid.UUID(fields[1]))
-            numeric = {"artist": [], "release": [4], "recording": [3, 4], "track": [2, 3]}[table]
+            numeric = {"artist": [], "release": [4], "release_group": [],
+                       "recording": [3, 4], "track": [2, 3], "url": [],
+                       "artist_url": [], "recording_url": [],
+                       "recording_music_video": [], "recording_isrc": []}[table]
             for index in numeric:
                 if fields[index] is not None:
                     fields[index] = str(int(fields[index]))
@@ -154,9 +166,16 @@ def psql_stub():
 def literals():
     return {
         "artist": [[A, "Name", "Sort", "Person", "US", TS]],
-        "release": [[R, A, "Title", "Album", "2024", r"\N", TS]],
-        "recording": [[C, R, "Title", "1", "1234", TS]],
+        "release_group": [[G, "Group", A, "Album", TS]],
+        "release": [[R, A, "Title", "Album", "2024", r"\N", G, TS]],
+        "recording": [[C, R, "Title", "1", "1234", TS],
+                      [D, R, "Title 2", "2", "1234", TS]],
         "track": [[R, C, "1", "2", TS]],
+        "url": [[U, "https://example.test/a", TS]],
+        "artist_url": [[A, U, "youtube", TS]],
+        "recording_url": [[C, U, "free streaming", "true", TS]],
+        "recording_music_video": [[C, D, TS]],
+        "recording_isrc": [[C, "USABC2400001", TS]],
     }
 
 
@@ -228,27 +247,30 @@ class ImportDecodedFields(unittest.TestCase):
     def test_escaped_typed_values_resolve_parents_and_emit_copy_safe_rows(self):
         rows = literals()
         rows["artist"][0] = [encoded_uuid(A), r"literal\\N\tname\nend", "Sort", r"\\N", r"\x55S", r"\062024-02-29\04012:34:56+00:00"]
-        rows["release"][0] = [encoded_uuid(R, r"\141"), encoded_uuid(A, r"\141"), "Title", "Album", r"\x32024", r"\N", TS]
+        rows["release"][0] = [encoded_uuid(R, r"\141"), encoded_uuid(A, r"\141"), "Title", "Album", r"\x32024", r"\N", encoded_uuid(G, r"\141"), TS]
         rows["recording"][0] = [encoded_uuid(C), encoded_uuid(R), "Title", r"\061", r"\x31234", TS]
         rows["track"][0] = [encoded_uuid(R), encoded_uuid(C, r"\141"), r"\061", r"\x32", TS]
+        rows["recording_isrc"][0] = [encoded_uuid(C), r"\x75SABC2400001", TS]
         self.write_dump(rows)
         self.assert_success(self.run_import())
         state = self.state()
         self.assertEqual(state["dlq"], {}, "escaped existing parents must not become orphans")
         self.assertEqual(state["rows"]["artist"][A][1:5], ["literal\\N\tname\nend", "Sort", "\\N", "US"])
         self.assertEqual(state["rows"]["release"][R][1], A)
+        self.assertEqual(state["rows"]["release"][R][6], G)
         self.assertEqual(state["rows"]["recording"][C][1:5], [R, "Title", "1", "1234"])
         self.assertEqual(state["rows"]["track"][R + "/1/2"][:4], [R, C, "1", "2"])
+        self.assertEqual(state["rows"]["recording_isrc"][C][1], "USABC2400001")
         for table in TABLES:
-            self.assertEqual(state["cursors"], {t + ":" + self.digest(t): 1 for t in TABLES})
+            self.assertEqual(state["cursors"], {t + ":" + self.digest(t): len(rows[t]) for t in TABLES})
             commits = [e for e in state["events"] if e["kind"] == "commit" and e["table"] == table]
-            self.assertEqual(len(commits), 1)
+            self.assertEqual(len(commits), len(rows[table]))
             self.assertEqual(len(commits[0]["wire"]), 1)
             self.assertEqual(len(commits[0]["wire"][0].split("\t")), len(rows[table][0]) + 1)
             self.assertEqual(commits[0]["stage"][0][-1], "1")
 
     def test_entity_alias_duplicates_are_refused_globally_before_any_target_chunk(self):
-        for table in ("artist", "release", "recording"):
+        for table in ("artist", "release_group", "release", "recording", "url"):
             for spelling in (r"\141", r"\x61"):
                 for chunk in (1, 2):
                     with self.subTest(table=table, spelling=spelling, chunk=chunk):
@@ -300,17 +322,28 @@ class ImportDecodedFields(unittest.TestCase):
     def test_poison_and_fk_orphan_keep_original_tokens_line_numbers_and_resume_accounting(self):
         rows = literals()
         poison = [MISSING, r"original\tname\\N", "Sort", "Person", r"\t", TS]
-        orphan = [MISSING, encoded_uuid(MISSING), r"orphan\nname", "Album", r"\062024", r"\N", TS]
+        group_orphan = [MISSING, "Orphan Group", MISSING, "Album", TS]
+        orphan = [MISSING, encoded_uuid(MISSING), r"orphan\nname", "Album", r"\062024", r"\N", G, TS]
+        url_orphan = [A, MISSING, "youtube", TS]
+        isrc_poison = [C, "BOGUS", TS]
         rows["artist"].append(poison)
+        rows["release_group"].append(group_orphan)
         rows["release"].append(orphan)
+        rows["artist_url"].append(url_orphan)
+        rows["recording_isrc"].append(isrc_poison)
         self.write_dump(rows)
         self.assert_success(self.run_import())
         state = self.state()
         dlq = {x[0]: x for x in state["dlq"].values()}
-        self.assertEqual(set(dlq), {"artist", "release"})
+        self.assertEqual(set(dlq), {"artist", "release_group", "release", "artist_url", "recording_isrc"})
         self.assertEqual(dlq["artist"], ["artist", self.digest("artist"), "2", "bad_country", "\t".join(poison)])
+        self.assertEqual(dlq["release_group"], ["release_group", self.digest("release_group"), "2", "fk_missing_artist", "\t".join(group_orphan)])
         self.assertEqual(dlq["release"], ["release", self.digest("release"), "2", "fk_missing_artist", "\t".join(orphan)])
-        for table, count in (("artist", 2), ("release", 2), ("recording", 1), ("track", 1)):
+        self.assertEqual(dlq["artist_url"], ["artist_url", self.digest("artist_url"), "2", "fk_missing_url", "\t".join(url_orphan)])
+        self.assertEqual(dlq["recording_isrc"], ["recording_isrc", self.digest("recording_isrc"), "2", "bad_isrc", "\t".join(isrc_poison)])
+        for table, count in (("artist", 2), ("release_group", 2), ("release", 2), ("recording", 2),
+                             ("track", 1), ("url", 1), ("artist_url", 2), ("recording_url", 1),
+                             ("recording_music_video", 1), ("recording_isrc", 2)):
             self.assertEqual(state["cursors"][table + ":" + self.digest(table)], count)
             commits = [e for e in state["events"] if e["kind"] == "commit" and e["table"] == table]
             self.assertEqual([(e["offset"], e["end"]) for e in commits], [(i, i + 1) for i in range(count)])

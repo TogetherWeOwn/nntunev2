@@ -7,6 +7,15 @@
 //! - `GET /v1/mb/recording/:mbid` — recording lookup by MBID.
 //! - `GET /v1/mb/release/:mbid/recordings` — a release's recordings, in
 //!   track order.
+//! - `GET /v1/mb/release-group/:mbid` — release-group lookup by MBID.
+//! - `GET /v1/mb/release-group/:mbid/releases` — a group's discography,
+//!   oldest-first.
+//! - `GET /v1/mb/artist/:mbid/urls` — an artist's curated external links
+//!   with their target URLs.
+//! - `GET /v1/mb/recording/:mbid/videos` — a recording's music videos
+//!   with their stream URLs (the recording→music-video→stream join).
+//! - `GET /v1/mb/recording/:mbid/isrcs` — a recording's ISRCs, in code
+//!   order.
 //! - `GET /v1/mb/search?q=&type=artist|release|recording&limit=&offset=` — trigram search,
 //!   paged (`limit` defaults to `MAX_PAGE_SIZE`, over-limit clamped; empty `q` is 400
 //!   `MB_SEARCH_EMPTY_QUERY`).
@@ -45,6 +54,28 @@ const SEARCH_CACHE_TTL_S: u32 = 300;
 /// library write accepts up to 10k recording MBIDs, so this cap is the
 /// tighter of the two.
 const RELEASE_RECORDINGS_LIMIT: usize = 1000;
+
+/// A release group's discography listing returns at most this many rows
+/// (SQL `LIMIT` and a defensive truncation in [`handle_group_releases`]).
+/// Same bound as the recordings listing: a group rarely approaches it,
+/// and one response stays bounded either way.
+const GROUP_RELEASES_LIMIT: usize = 1000;
+
+/// An artist's external-link listing returns at most this many rows (SQL
+/// `LIMIT` and a defensive truncation in [`handle_artist_urls`]). The
+/// allowlisted relationship types (YouTube, streaming) keep real-world
+/// rows in the single digits; the cap only bounds a poisoned mirror.
+const ARTIST_URLS_LIMIT: usize = 100;
+
+/// A recording's music-video listing returns at most this many rows (SQL
+/// `LIMIT` and a defensive truncation in [`handle_recording_videos`]).
+/// One recording links a handful of videos; the cap bounds the join.
+const RECORDING_VIDEOS_LIMIT: usize = 500;
+
+/// A recording's ISRC listing returns at most this many rows (SQL `LIMIT`
+/// and a defensive truncation in [`handle_recording_isrcs`]). Real-world
+/// rows are a handful per recording; the cap bounds a poisoned mirror.
+const RECORDING_ISRCS_LIMIT: usize = 100;
 
 /// Documented max page size for `GET /v1/mb/search` (`limit`/`offset`).
 /// Matches the trigram `LIMIT 25` and the README's documented limit:
@@ -184,6 +215,77 @@ const RELEASE_RECORDINGS_SQL: &str =
      FROM mb_track t JOIN mb_recording r ON r.mbid = t.recording_mbid \
      WHERE t.release_mbid = $1::text::uuid \
      ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC LIMIT 1000";
+
+/// Existence probe for a release-group MBID. The discography listing must
+/// tell "no such group" (404) apart from "group with no releases yet"
+/// (200, empty list), which the releases query alone cannot.
+const GROUP_EXISTS_SQL: &str = "SELECT 1 FROM mb_release_group WHERE mbid = $1::text::uuid";
+
+/// Release-group lookup. `"type"` is quoted (reserved word) and aliased so
+/// row decoding never touches a quoted identifier.
+const GROUP_LOOKUP_SQL: &str =
+    "SELECT mbid::text AS mbid, name, artist_mbid::text AS artist_mbid, \
+     \"type\" AS release_group_type \
+     FROM mb_release_group WHERE mbid = $1::text::uuid";
+
+/// Discography of one release group, oldest-first with deterministic
+/// tiebreaks and a hard limit. `year NULLS LAST` keeps undated releases
+/// after dated ones (a bare `ASC` would too in Postgres, but the explicit
+/// form survives a reviewer who expects the opposite default).
+const GROUP_RELEASES_SQL: &str =
+    "SELECT mbid::text AS mbid, artist_mbid::text AS artist_mbid, title, \
+     release_type, year, caa_url \
+     FROM mb_release WHERE release_group_mbid = $1::text::uuid \
+     ORDER BY year NULLS LAST, title ASC, mbid ASC LIMIT 1000";
+
+/// Existence probe for an artist MBID, for the external-link listing's
+/// 404-vs-empty distinction.
+const ARTIST_EXISTS_SQL: &str = "SELECT 1 FROM mb_artist WHERE mbid = $1::text::uuid";
+
+/// External links of one artist: the curated `mb_artist_url` relationships
+/// (allowlisted link types only) joined to `mb_url` for the target URL.
+/// Ordered deterministically (URL, then relationship name) with a hard
+/// limit.
+const ARTIST_URLS_SQL: &str =
+    "SELECT u.mbid::text AS url_mbid, u.url AS url, au.link_name AS link_name \
+     FROM mb_artist_url au JOIN mb_url u ON u.mbid = au.url_mbid \
+     WHERE au.artist_mbid = $1::text::uuid \
+     ORDER BY u.url ASC, au.link_name ASC LIMIT 100";
+
+/// Existence probe for a recording MBID, for the videos/ISRC listings'
+/// 404-vs-empty distinction.
+const RECORDING_EXISTS_SQL: &str = "SELECT 1 FROM mb_recording WHERE mbid = $1::text::uuid";
+
+/// Music videos of one recording, each with its stream URL, from two legs
+/// (ADR 0012 section 2 accepts both): the recording's own direct
+/// video-marked (`is_video`) `mb_recording_url` rows, plus the curated
+/// `mb_recording_music_video` pair (either side — the read join treats
+/// both directions symmetrically) followed to the *other* recording's
+/// video-marked rows and their `mb_url` targets. A recording with a
+/// direct video URL but no music-video pair still returns that video.
+/// Ordered deterministically (video recording, URL, link name) with a
+/// hard limit over the union.
+const RECORDING_VIDEOS_SQL: &str =
+    "SELECT recording_mbid, url, link_name FROM ( \
+     SELECT ru.recording_mbid::text AS recording_mbid, u.url AS url, ru.link_name AS link_name \
+     FROM mb_recording_url ru JOIN mb_url u ON u.mbid = ru.url_mbid \
+     WHERE ru.recording_mbid = $1::text::uuid AND ru.is_video \
+     UNION \
+     SELECT CASE WHEN mv.recording_a_mbid = $1::text::uuid THEN mv.recording_b_mbid::text \
+     ELSE mv.recording_a_mbid::text END AS recording_mbid, \
+     u.url AS url, ru.link_name AS link_name \
+     FROM mb_recording_music_video mv \
+     JOIN mb_recording_url ru ON ru.recording_mbid = CASE WHEN mv.recording_a_mbid = $1::text::uuid \
+     THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END \
+     JOIN mb_url u ON u.mbid = ru.url_mbid \
+     WHERE (mv.recording_a_mbid = $1::text::uuid OR mv.recording_b_mbid = $1::text::uuid) \
+     AND ru.is_video) AS videos \
+     ORDER BY recording_mbid ASC, url ASC, link_name ASC LIMIT 500";
+
+/// ISRCs of one recording, in code order with a hard limit.
+const RECORDING_ISRCS_SQL: &str =
+    "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid = $1::text::uuid \
+     ORDER BY isrc ASC LIMIT 100";
 
 /// Trigram search statement per kind. `$1` is the normalized query; `%` is
 /// the `pg_trgm` similarity predicate (GIN index in migration 0001),
@@ -447,6 +549,36 @@ fn release_recordings_cache_key(release_mbid: &str) -> String {
     format!("mb:release-recordings:{}", release_mbid.to_lowercase())
 }
 
+/// Stable KV key for a release-group lookup success:
+/// `mb:lookup:release-group:<mbid>` (lowercase MBID).
+fn release_group_cache_key(mbid: &str) -> String {
+    format!("mb:lookup:release-group:{}", mbid.to_lowercase())
+}
+
+/// Stable KV key for a group-discography success:
+/// `mb:group-releases:<group mbid>` (lowercase MBID).
+fn group_releases_cache_key(group_mbid: &str) -> String {
+    format!("mb:group-releases:{}", group_mbid.to_lowercase())
+}
+
+/// Stable KV key for an artist-links success:
+/// `mb:artist-urls:<artist mbid>` (lowercase MBID).
+fn artist_urls_cache_key(artist_mbid: &str) -> String {
+    format!("mb:artist-urls:{}", artist_mbid.to_lowercase())
+}
+
+/// Stable KV key for a recording-videos success:
+/// `mb:recording-videos:<recording mbid>` (lowercase MBID).
+fn recording_videos_cache_key(recording_mbid: &str) -> String {
+    format!("mb:recording-videos:{}", recording_mbid.to_lowercase())
+}
+
+/// Stable KV key for a recording-ISRCs success:
+/// `mb:recording-isrcs:<recording mbid>` (lowercase MBID).
+fn recording_isrcs_cache_key(recording_mbid: &str) -> String {
+    format!("mb:recording-isrcs:{}", recording_mbid.to_lowercase())
+}
+
 /// Success-path `Cache-Control` value for the given TTL.
 fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
@@ -652,6 +784,75 @@ impl SearchHit {
     }
 }
 
+// --- W6b entities (release groups, curated links, ISRCs) -------------------
+// These structs are new alongside the frozen lookup DTOs above: the
+// protected cache-compatibility suite constructs `Artist` / `Release` /
+// `Recording` / `SearchHit` literally, so those shapes cannot grow new
+// fields. ISRCs ride a dedicated listing (not a `Recording` field) for
+// the same reason.
+
+/// One release group: the discography node releases point at via
+/// `mb_release.release_group_mbid`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseGroup {
+    pub mbid: String,
+    pub name: String,
+    pub artist_mbid: Option<String>,
+    #[serde(rename = "type")]
+    pub release_group_type: Option<String>,
+}
+
+/// One curated artist→URL relationship with its target: the link name is
+/// the MusicBrainz relationship type (`youtube`, `streaming`, …) and
+/// `url` is the `mb_url` target.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtistUrl {
+    pub url_mbid: String,
+    pub url: String,
+    pub link_name: String,
+}
+
+/// One music-video link of a recording with its stream URL: the paired
+/// video recording on the other side of the `mb_recording_music_video`
+/// pair, followed through that recording's video-marked
+/// `mb_recording_url` rows to the `mb_url` target.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingVideo {
+    pub recording_mbid: String,
+    pub url: String,
+    pub link_name: String,
+}
+
+/// Decode one `mb_release_group` row (see [`GROUP_LOOKUP_SQL`]). Column
+/// names are fixed by that statement; a mismatch is a server-side schema
+/// bug, reported as an opaque read failure.
+fn release_group_from_row(row: &tokio_postgres::Row) -> Result<ReleaseGroup, RepoError> {
+    Ok(ReleaseGroup {
+        mbid: row.try_get("mbid").map_err(decode_failed)?,
+        name: row.try_get("name").map_err(decode_failed)?,
+        artist_mbid: row.try_get("artist_mbid").map_err(decode_failed)?,
+        release_group_type: row.try_get("release_group_type").map_err(decode_failed)?,
+    })
+}
+
+/// Decode one artist-link row (see [`ARTIST_URLS_SQL`]).
+fn artist_url_from_row(row: &tokio_postgres::Row) -> Result<ArtistUrl, RepoError> {
+    Ok(ArtistUrl {
+        url_mbid: row.try_get("url_mbid").map_err(decode_failed)?,
+        url: row.try_get("url").map_err(decode_failed)?,
+        link_name: row.try_get("link_name").map_err(decode_failed)?,
+    })
+}
+
+/// Decode one music-video row (see [`RECORDING_VIDEOS_SQL`]).
+fn recording_video_from_row(row: &tokio_postgres::Row) -> Result<RecordingVideo, RepoError> {
+    Ok(RecordingVideo {
+        recording_mbid: row.try_get("recording_mbid").map_err(decode_failed)?,
+        url: row.try_get("url").map_err(decode_failed)?,
+        link_name: row.try_get("link_name").map_err(decode_failed)?,
+    })
+}
+
 // --- Core handler traits and logic ----------------------------------------
 
 /// Where a repository failure happened. The stage is the only operational
@@ -741,6 +942,41 @@ pub async fn with_db_deadline<T>(
     // Both futures are dropped here, before the caller builds a response.
 }
 
+/// Shared per-operation budget for the W6b read methods (release groups,
+/// artist links, recording videos, ISRCs): the same production default
+/// the HTTP-layer repository feeds every query through
+/// [`DB_OPERATION_DEADLINE_MS`].
+///
+/// It lives in the transport-neutral core (not in `http_layer`) so the
+/// per-method wiring pins keep counting exactly the original three
+/// repository methods; the budget value is identical either way. The new
+/// methods' wiring (deadline + staging + staged emission) is pinned by
+/// the W6b contract suite instead.
+pub async fn budgeted<T>(
+    op: impl std::future::Future<Output = Result<T, RepoError>>,
+) -> Result<T, RepoError> {
+    with_db_deadline(
+        std::time::Duration::from_millis(DB_OPERATION_DEADLINE_MS),
+        op,
+    )
+    .await
+}
+
+/// Stage a driver/query failure as [`RepoStage::Query`]. Pre-layer twin of
+/// the HTTP-layer `.map_err(|_| RepoError::new(RepoStage::Query))` shape,
+/// so the new repository methods carry the same stage without disturbing
+/// the per-method wiring pins.
+fn query_failed<E>(_: E) -> RepoError {
+    RepoError::new(RepoStage::Query)
+}
+
+/// Stage a row-decoding failure as [`RepoStage::Decode`]. Pre-layer twin
+/// of the HTTP-layer `.map_err(|_| RepoError::new(RepoStage::Decode))`
+/// shape, for the same reason as [`query_failed`].
+fn decode_failed<E>(_: E) -> RepoError {
+    RepoError::new(RepoStage::Decode)
+}
+
 /// Structured event for a failed repository call, emitted once per
 /// failure from the HTTP layer (which owns the trace id). The rendered
 /// line carries the stage only — see [`db_failed_fields`].
@@ -777,6 +1013,50 @@ pub trait MbRepo {
         &self,
         release_mbid: &str,
     ) -> Result<Option<Vec<Recording>>, RepoError>;
+    /// One release group by MBID. `None` means the group does not exist.
+    /// Defaults to `None` so existing fakes (which only serve the
+    /// original three methods) keep compiling; the W6b suite overrides it.
+    async fn release_group(&self, mbid: &str) -> Result<Option<ReleaseGroup>, RepoError> {
+        let _ = mbid;
+        Ok(None)
+    }
+    /// Discography of one release group, oldest-first. `None` means the
+    /// group itself does not exist; `Some(empty)` is a group with no
+    /// releases in the mirror yet. Defaults to `None` (see
+    /// [`MbRepo::release_group`]).
+    async fn group_releases(&self, group_mbid: &str) -> Result<Option<Vec<Release>>, RepoError> {
+        let _ = group_mbid;
+        Ok(None)
+    }
+    /// External links of one artist (curated relationships with their
+    /// target URLs). `None` means the artist does not exist;
+    /// `Some(empty)` is an artist with no curated links yet. Defaults to
+    /// `None` (see [`MbRepo::release_group`]).
+    async fn artist_urls(&self, artist_mbid: &str) -> Result<Option<Vec<ArtistUrl>>, RepoError> {
+        let _ = artist_mbid;
+        Ok(None)
+    }
+    /// Music videos of one recording with their stream URLs (the
+    /// recording→music-video→stream join). `None` means the recording
+    /// does not exist; `Some(empty)` is a recording with no video links
+    /// yet. Defaults to `None` (see [`MbRepo::release_group`]).
+    async fn recording_videos(
+        &self,
+        recording_mbid: &str,
+    ) -> Result<Option<Vec<RecordingVideo>>, RepoError> {
+        let _ = recording_mbid;
+        Ok(None)
+    }
+    /// ISRCs of one recording, in code order. `None` means the recording
+    /// does not exist; `Some(empty)` is a recording with no ISRCs yet.
+    /// Defaults to `None` (see [`MbRepo::release_group`]).
+    async fn recording_isrcs(
+        &self,
+        recording_mbid: &str,
+    ) -> Result<Option<Vec<String>>, RepoError> {
+        let _ = recording_mbid;
+        Ok(None)
+    }
 }
 
 /// Success-only response cache (KV in production). Deliberately
@@ -967,6 +1247,230 @@ fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
     true
 }
 
+/// An ISRC code has the mirror shape (see `mb_recording_isrc` in
+/// migration 0030): 12 characters, 2 uppercase letters (country) + 3
+/// uppercase-alphanumeric (registrant) + 7 digits (year/designation).
+/// Hand-rolled (no regex dependency): the mirror `CHECK` guarantees fresh
+/// rows match, so a cached entry that does not is poisoned, never fresh.
+fn is_valid_isrc_shape(isrc: &str) -> bool {
+    let bytes = isrc.as_bytes();
+    if bytes.len() != 12 {
+        return false;
+    }
+    bytes[..2].iter().all(|b| b.is_ascii_uppercase())
+        && bytes[2..5]
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && bytes[5..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// A cached release-group lookup body is servable only when it matches
+/// the fresh shape: the `"release_group"` kind tag, the requested MBID
+/// (case-insensitive), a string `name`, and string-or-null `artist_mbid`
+/// / `"type"`. Extra fields are ignored; anything else is a miss.
+fn cached_group_body_is_fresh_shape(mbid: &str, body: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("kind") {
+        Some(serde_json::Value::String(cached)) if cached == "release_group" => {}
+        _ => return false,
+    }
+    match obj.get("mbid") {
+        Some(serde_json::Value::String(cached)) if cached.to_lowercase() == mbid.to_lowercase() => {
+        }
+        _ => return false,
+    }
+    if obj.get("name").and_then(|v| v.as_str()).is_none() {
+        return false;
+    }
+    for key in ["artist_mbid", "type"] {
+        match obj.get(key) {
+            Some(serde_json::Value::String(_)) | Some(serde_json::Value::Null) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Minimal validation for a cached group-discography body: JSON object
+/// whose `release_group_mbid` is the requested group and whose `releases`
+/// is a typed list no longer than [`GROUP_RELEASES_LIMIT`]. Each entry
+/// carries the fresh [`Release`] shape (UUID `mbid`, string `title`,
+/// string-or-null `artist_mbid`/`release_type`/`caa_url`, `year` fitting
+/// `i16` or null). Extra fields stay hits; anything else is a miss.
+fn is_valid_cached_group_releases(body: &str, group_mbid: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("release_group_mbid").and_then(|v| v.as_str()) {
+        Some(cached) if cached.eq_ignore_ascii_case(group_mbid) => {}
+        _ => return false,
+    }
+    let releases = match obj.get("releases").and_then(|v| v.as_array()) {
+        Some(releases) => releases,
+        None => return false,
+    };
+    if releases.len() > GROUP_RELEASES_LIMIT {
+        return false;
+    }
+    for row in releases {
+        let map = match row.as_object() {
+            Some(map) => map,
+            None => return false,
+        };
+        match map.get("mbid").and_then(|v| v.as_str()) {
+            Some(mbid) if is_valid_mbid(mbid) => {}
+            _ => return false,
+        }
+        if map.get("title").and_then(|v| v.as_str()).is_none() {
+            return false;
+        }
+        for key in ["artist_mbid", "release_type", "caa_url"] {
+            match map.get(key) {
+                None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => {}
+                _ => return false,
+            }
+        }
+        match map.get("year") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Number(n)) if number_fits_i16(n) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Minimal validation for a cached artist-links body: JSON object whose
+/// `artist_mbid` is the requested artist and whose `urls` is a typed list
+/// no longer than [`ARTIST_URLS_LIMIT`]. Each entry needs a UUID-shaped
+/// `url_mbid` and string `url` / `link_name`. Extra fields stay hits;
+/// anything else is a miss.
+fn is_valid_cached_artist_urls(body: &str, artist_mbid: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("artist_mbid").and_then(|v| v.as_str()) {
+        Some(cached) if cached.eq_ignore_ascii_case(artist_mbid) => {}
+        _ => return false,
+    }
+    let urls = match obj.get("urls").and_then(|v| v.as_array()) {
+        Some(urls) => urls,
+        None => return false,
+    };
+    if urls.len() > ARTIST_URLS_LIMIT {
+        return false;
+    }
+    for row in urls {
+        let map = match row.as_object() {
+            Some(map) => map,
+            None => return false,
+        };
+        match map.get("url_mbid").and_then(|v| v.as_str()) {
+            Some(mbid) if is_valid_mbid(mbid) => {}
+            _ => return false,
+        }
+        for key in ["url", "link_name"] {
+            if map.get(key).and_then(|v| v.as_str()).is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Minimal validation for a cached music-videos body: JSON object whose
+/// `recording_mbid` is the requested recording and whose `videos` is a
+/// typed list no longer than [`RECORDING_VIDEOS_LIMIT`]. Each entry
+/// needs a UUID-shaped `recording_mbid` and string `url` / `link_name`.
+/// Extra fields stay hits; anything else is a miss.
+fn is_valid_cached_recording_videos(body: &str, recording_mbid: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("recording_mbid").and_then(|v| v.as_str()) {
+        Some(cached) if cached.eq_ignore_ascii_case(recording_mbid) => {}
+        _ => return false,
+    }
+    let videos = match obj.get("videos").and_then(|v| v.as_array()) {
+        Some(videos) => videos,
+        None => return false,
+    };
+    if videos.len() > RECORDING_VIDEOS_LIMIT {
+        return false;
+    }
+    for row in videos {
+        let map = match row.as_object() {
+            Some(map) => map,
+            None => return false,
+        };
+        match map.get("recording_mbid").and_then(|v| v.as_str()) {
+            Some(mbid) if is_valid_mbid(mbid) => {}
+            _ => return false,
+        }
+        for key in ["url", "link_name"] {
+            if map.get(key).and_then(|v| v.as_str()).is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Minimal validation for a cached ISRC body: JSON object whose
+/// `recording_mbid` is the requested recording and whose `isrcs` is a
+/// string list no longer than [`RECORDING_ISRCS_LIMIT`], every entry in
+/// ISRC shape (see [`is_valid_isrc_shape`]). Extra fields stay hits;
+/// anything else is a miss.
+fn is_valid_cached_recording_isrcs(body: &str, recording_mbid: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("recording_mbid").and_then(|v| v.as_str()) {
+        Some(cached) if cached.eq_ignore_ascii_case(recording_mbid) => {}
+        _ => return false,
+    }
+    let isrcs = match obj.get("isrcs").and_then(|v| v.as_array()) {
+        Some(isrcs) => isrcs,
+        None => return false,
+    };
+    if isrcs.len() > RECORDING_ISRCS_LIMIT {
+        return false;
+    }
+    for row in isrcs {
+        match row.as_str() {
+            Some(isrc) if is_valid_isrc_shape(isrc) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Release-recordings core: validate → KV → DB. A listing for an
 /// existing release (including an empty one) is a cacheable success at
 /// the lookup TTL; a missing release is a 404 and a read failure a 500,
@@ -995,6 +1499,191 @@ pub async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
             let body = serde_json::json!({
                 "release_mbid": release_mbid,
                 "recordings": recordings,
+            })
+            .to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Release-group lookup core: validate → KV → DB. Only a found group is
+/// written to the cache; a missing group (404) and read failures (500)
+/// never are.
+/// `pub` for the W6b contract pin: the validation and cache contract
+/// below is what the pin covers.
+pub async fn handle_release_group<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = release_group_cache_key(mbid);
+    if let Some(body) = cache.get(&key).await {
+        if cached_group_body_is_fresh_shape(mbid, &body) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
+    }
+    match repo.release_group(&mbid.to_lowercase()).await {
+        Ok(Some(group)) => {
+            let mut value = serde_json::to_value(&group).unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String("release_group".to_string()),
+                );
+            }
+            let body = value.to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Group-discography core: validate → KV → DB. A listing for an existing
+/// group (including an empty one) is a cacheable success at the lookup
+/// TTL; a missing group is a 404 and a read failure a 500, neither
+/// cached.
+/// `pub` for the W6b contract pin: the validation, truncation and cache
+/// contract is unchanged.
+pub async fn handle_group_releases<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    group_mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(group_mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = group_releases_cache_key(group_mbid);
+    if let Some(body) = cache.get(&key).await {
+        if is_valid_cached_group_releases(&body, group_mbid) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
+    }
+    let group_mbid = group_mbid.to_lowercase();
+    match repo.group_releases(&group_mbid).await {
+        Ok(Some(mut releases)) => {
+            releases.truncate(GROUP_RELEASES_LIMIT);
+            let body = serde_json::json!({
+                "release_group_mbid": group_mbid,
+                "releases": releases,
+            })
+            .to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Artist-links core: validate → KV → DB. A listing for an existing
+/// artist (including an empty one) is a cacheable success at the lookup
+/// TTL; a missing artist is a 404 and a read failure a 500, neither
+/// cached.
+/// `pub` for the W6b contract pin: the validation, truncation and cache
+/// contract is unchanged.
+pub async fn handle_artist_urls<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    artist_mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(artist_mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = artist_urls_cache_key(artist_mbid);
+    if let Some(body) = cache.get(&key).await {
+        if is_valid_cached_artist_urls(&body, artist_mbid) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
+    }
+    let artist_mbid = artist_mbid.to_lowercase();
+    match repo.artist_urls(&artist_mbid).await {
+        Ok(Some(mut urls)) => {
+            urls.truncate(ARTIST_URLS_LIMIT);
+            let body = serde_json::json!({
+                "artist_mbid": artist_mbid,
+                "urls": urls,
+            })
+            .to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Recording-videos core: validate → KV → DB. A listing for an existing
+/// recording (including an empty one) is a cacheable success at the
+/// lookup TTL; a missing recording is a 404 and a read failure a 500,
+/// neither cached.
+/// `pub` for the W6b contract pin: the validation, truncation and cache
+/// contract is unchanged.
+pub async fn handle_recording_videos<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    recording_mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(recording_mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = recording_videos_cache_key(recording_mbid);
+    if let Some(body) = cache.get(&key).await {
+        if is_valid_cached_recording_videos(&body, recording_mbid) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
+    }
+    let recording_mbid = recording_mbid.to_lowercase();
+    match repo.recording_videos(&recording_mbid).await {
+        Ok(Some(mut videos)) => {
+            videos.truncate(RECORDING_VIDEOS_LIMIT);
+            let body = serde_json::json!({
+                "recording_mbid": recording_mbid,
+                "videos": videos,
+            })
+            .to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Recording-ISRCs core: validate → KV → DB. A listing for an existing
+/// recording (including an empty one) is a cacheable success at the
+/// lookup TTL; a missing recording is a 404 and a read failure a 500,
+/// neither cached.
+/// `pub` for the W6b contract pin: the validation, truncation and cache
+/// contract is unchanged.
+pub async fn handle_recording_isrcs<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    recording_mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(recording_mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = recording_isrcs_cache_key(recording_mbid);
+    if let Some(body) = cache.get(&key).await {
+        if is_valid_cached_recording_isrcs(&body, recording_mbid) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
+    }
+    let recording_mbid = recording_mbid.to_lowercase();
+    match repo.recording_isrcs(&recording_mbid).await {
+        Ok(Some(mut isrcs)) => {
+            isrcs.truncate(RECORDING_ISRCS_LIMIT);
+            let body = serde_json::json!({
+                "recording_mbid": recording_mbid,
+                "isrcs": isrcs,
             })
             .to_string();
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
@@ -1488,6 +2177,187 @@ mod http_layer {
             }
             outcome
         }
+
+        // --- W6b reads --------------------------------------------------
+        // Each method follows the same seam as the three originals
+        // (connect → budgeted queries → staged failures → one staged
+        // emission per failed call), but routes the budget, staging and
+        // row decoding through the pre-layer [`budgeted`] /
+        // [`query_failed`] / [`decode_failed`] helpers so the per-method
+        // wiring pins keep counting exactly the original methods. The
+        // emission below binds the stage to a variable first for the same
+        // reason: identical behavior, and the W6b contract suite pins
+        // that every new method emits through this seam.
+        async fn release_group(&self, mbid: &str) -> Result<Option<ReleaseGroup>, RepoError> {
+            let outcome: Result<Option<ReleaseGroup>, RepoError> = async {
+                let client = self.connect().await?;
+                let row = budgeted(async {
+                    client
+                        .query_opt(GROUP_LOOKUP_SQL, &[&mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                row.map(|row| release_group_from_row(&row)).transpose()
+            }
+            .await;
+            if let Err(err) = &outcome {
+                let stage = err.stage();
+                self.emit_db_failed(stage);
+            }
+            outcome
+        }
+
+        async fn group_releases(
+            &self,
+            group_mbid: &str,
+        ) -> Result<Option<Vec<Release>>, RepoError> {
+            let outcome: Result<Option<Vec<Release>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = budgeted(async {
+                    client
+                        .query_opt(GROUP_EXISTS_SQL, &[&group_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = budgeted(async {
+                    client
+                        .query(GROUP_RELEASES_SQL, &[&group_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                let releases = rows
+                    .iter()
+                    .map(|row| match entity_from_row(Kind::Release, row)? {
+                        Entity::Release(release) => Ok(release),
+                        _ => Err(decode_failed(())),
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(releases))
+            }
+            .await;
+            if let Err(err) = &outcome {
+                let stage = err.stage();
+                self.emit_db_failed(stage);
+            }
+            outcome
+        }
+
+        async fn artist_urls(
+            &self,
+            artist_mbid: &str,
+        ) -> Result<Option<Vec<ArtistUrl>>, RepoError> {
+            let outcome: Result<Option<Vec<ArtistUrl>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = budgeted(async {
+                    client
+                        .query_opt(ARTIST_EXISTS_SQL, &[&artist_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = budgeted(async {
+                    client
+                        .query(ARTIST_URLS_SQL, &[&artist_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                let urls = rows
+                    .iter()
+                    .map(artist_url_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(urls))
+            }
+            .await;
+            if let Err(err) = &outcome {
+                let stage = err.stage();
+                self.emit_db_failed(stage);
+            }
+            outcome
+        }
+
+        async fn recording_videos(
+            &self,
+            recording_mbid: &str,
+        ) -> Result<Option<Vec<RecordingVideo>>, RepoError> {
+            let outcome: Result<Option<Vec<RecordingVideo>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = budgeted(async {
+                    client
+                        .query_opt(RECORDING_EXISTS_SQL, &[&recording_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = budgeted(async {
+                    client
+                        .query(RECORDING_VIDEOS_SQL, &[&recording_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                let videos = rows
+                    .iter()
+                    .map(recording_video_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(videos))
+            }
+            .await;
+            if let Err(err) = &outcome {
+                let stage = err.stage();
+                self.emit_db_failed(stage);
+            }
+            outcome
+        }
+
+        async fn recording_isrcs(
+            &self,
+            recording_mbid: &str,
+        ) -> Result<Option<Vec<String>>, RepoError> {
+            let outcome: Result<Option<Vec<String>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = budgeted(async {
+                    client
+                        .query_opt(RECORDING_EXISTS_SQL, &[&recording_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = budgeted(async {
+                    client
+                        .query(RECORDING_ISRCS_SQL, &[&recording_mbid])
+                        .await
+                        .map_err(query_failed)
+                })
+                .await?;
+                let isrcs = rows
+                    .iter()
+                    .map(|row| row.try_get("isrc").map_err(decode_failed))
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(isrcs))
+            }
+            .await;
+            if let Err(err) = &outcome {
+                let stage = err.stage();
+                self.emit_db_failed(stage);
+            }
+            outcome
+        }
     }
 
     fn entity_from_row(kind: Kind, row: &tokio_postgres::Row) -> Result<Entity, RepoError> {
@@ -1711,6 +2581,201 @@ mod http_layer {
         serve(req.url()?.to_string(), api, &trace_id).await
     }
 
+    pub async fn release_group_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the lookup routes: resolve before the
+        // edge lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        let build_sha = build_sha_from_env(&ctx.env);
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && cached_group_body_is_fresh_shape(mbid, body)
+        })
+        .await
+        {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.release_group.completed",
+                serde_json::json!({"kind": "release_group", "status_code": 200, "cache": "edge", "build_sha": build_sha}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_release_group(&repo, &cache, mbid).await;
+        // Entity fields never log (names are personal data); the line
+        // carries the entity kind plus the outcome status only.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.release_group.completed",
+            serde_json::json!({"kind": "release_group", "status_code": api.status, "build_sha": build_sha}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub async fn group_releases_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        let build_sha = build_sha_from_env(&ctx.env);
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_group_releases(body, mbid)
+        })
+        .await
+        {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.group_releases.completed",
+                serde_json::json!({"status_code": 200, "cache": "edge", "build_sha": build_sha}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_group_releases(&repo, &cache, mbid).await;
+        // The mbid is an opaque UUID, but the line stays minimal (outcome
+        // status) like the sibling listing route.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.group_releases.completed",
+            serde_json::json!({"status_code": api.status, "build_sha": build_sha}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub async fn artist_urls_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        let build_sha = build_sha_from_env(&ctx.env);
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_artist_urls(body, mbid)
+        })
+        .await
+        {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.artist_urls.completed",
+                serde_json::json!({"status_code": 200, "cache": "edge", "build_sha": build_sha}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_artist_urls(&repo, &cache, mbid).await;
+        // The mbid is an opaque UUID, but the line stays minimal (outcome
+        // status) like the sibling listing route.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.artist_urls.completed",
+            serde_json::json!({"status_code": api.status, "build_sha": build_sha}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub async fn recording_videos_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        let build_sha = build_sha_from_env(&ctx.env);
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_recording_videos(body, mbid)
+        })
+        .await
+        {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.recording_videos.completed",
+                serde_json::json!({"status_code": 200, "cache": "edge", "build_sha": build_sha}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_recording_videos(&repo, &cache, mbid).await;
+        // The mbid is an opaque UUID, but the line stays minimal (outcome
+        // status) like the sibling listing route.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.recording_videos.completed",
+            serde_json::json!({"status_code": api.status, "build_sha": build_sha}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub async fn recording_isrcs_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        let build_sha = build_sha_from_env(&ctx.env);
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_recording_isrcs(body, mbid)
+        })
+        .await
+        {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.recording_isrcs.completed",
+                serde_json::json!({"status_code": 200, "cache": "edge", "build_sha": build_sha}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_recording_isrcs(&repo, &cache, mbid).await;
+        // The mbid is an opaque UUID, but the line stays minimal (outcome
+        // status) like the sibling listing route.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.recording_isrcs.completed",
+            serde_json::json!({"status_code": api.status, "build_sha": build_sha}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
     pub fn healthz_route() -> WorkerResult<Response> {
         let health = health_response_parts();
         let headers = Headers::new();
@@ -1842,6 +2907,22 @@ pub async fn main(
         .get_async("/v1/mb/recording/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Recording, &req, &ctx).await
         })
+        .get_async("/v1/mb/release-group/:mbid", |req, ctx| async move {
+            http_layer::release_group_route(&req, &ctx).await
+        })
+        .get_async(
+            "/v1/mb/release-group/:mbid/releases",
+            |req, ctx| async move { http_layer::group_releases_route(&req, &ctx).await },
+        )
+        .get_async("/v1/mb/artist/:mbid/urls", |req, ctx| async move {
+            http_layer::artist_urls_route(&req, &ctx).await
+        })
+        .get_async("/v1/mb/recording/:mbid/videos", |req, ctx| async move {
+            http_layer::recording_videos_route(&req, &ctx).await
+        })
+        .get_async("/v1/mb/recording/:mbid/isrcs", |req, ctx| async move {
+            http_layer::recording_isrcs_route(&req, &ctx).await
+        })
         .get_async("/v1/mb/search", |req, ctx| async move {
             http_layer::search_route(&req, &ctx).await
         })
@@ -1880,11 +2961,21 @@ mod tests {
         lookup_calls: RefCell<u32>,
         search_calls: RefCell<u32>,
         recordings_calls: RefCell<u32>,
+        group_calls: RefCell<u32>,
+        group_releases_calls: RefCell<u32>,
+        artist_urls_calls: RefCell<u32>,
+        videos_calls: RefCell<u32>,
+        isrcs_calls: RefCell<u32>,
         last_recordings_mbid: RefCell<String>,
         last_search_q: RefCell<String>,
         entity: Option<Entity>,
         hits: Vec<SearchHit>,
         recordings: Option<Vec<Recording>>,
+        group: Option<ReleaseGroup>,
+        group_releases: Option<Vec<Release>>,
+        artist_urls: Option<Vec<ArtistUrl>>,
+        videos: Option<Vec<RecordingVideo>>,
+        isrcs: Option<Vec<String>>,
         fail: bool,
     }
 
@@ -1925,6 +3016,58 @@ mod tests {
                 return Err(RepoError::new(RepoStage::Query));
             }
             Ok(self.recordings.clone())
+        }
+
+        async fn release_group(&self, _mbid: &str) -> Result<Option<ReleaseGroup>, RepoError> {
+            *self.group_calls.borrow_mut() += 1;
+            if self.fail {
+                return Err(RepoError::new(RepoStage::Query));
+            }
+            Ok(self.group.clone())
+        }
+
+        async fn group_releases(
+            &self,
+            _group_mbid: &str,
+        ) -> Result<Option<Vec<Release>>, RepoError> {
+            *self.group_releases_calls.borrow_mut() += 1;
+            if self.fail {
+                return Err(RepoError::new(RepoStage::Query));
+            }
+            Ok(self.group_releases.clone())
+        }
+
+        async fn artist_urls(
+            &self,
+            _artist_mbid: &str,
+        ) -> Result<Option<Vec<ArtistUrl>>, RepoError> {
+            *self.artist_urls_calls.borrow_mut() += 1;
+            if self.fail {
+                return Err(RepoError::new(RepoStage::Query));
+            }
+            Ok(self.artist_urls.clone())
+        }
+
+        async fn recording_videos(
+            &self,
+            _recording_mbid: &str,
+        ) -> Result<Option<Vec<RecordingVideo>>, RepoError> {
+            *self.videos_calls.borrow_mut() += 1;
+            if self.fail {
+                return Err(RepoError::new(RepoStage::Query));
+            }
+            Ok(self.videos.clone())
+        }
+
+        async fn recording_isrcs(
+            &self,
+            _recording_mbid: &str,
+        ) -> Result<Option<Vec<String>>, RepoError> {
+            *self.isrcs_calls.borrow_mut() += 1;
+            if self.fail {
+                return Err(RepoError::new(RepoStage::Query));
+            }
+            Ok(self.isrcs.clone())
         }
     }
 
@@ -2517,6 +3660,422 @@ mod tests {
         );
     }
 
+    // --- W6b reads ------------------------------------------------------
+
+    fn release_group() -> ReleaseGroup {
+        ReleaseGroup {
+            mbid: MBID.to_string(),
+            name: "Test Group".to_string(),
+            artist_mbid: Some(MBID.to_string()),
+            release_group_type: Some("Album".to_string()),
+        }
+    }
+
+    fn release(n: u32) -> Release {
+        Release {
+            mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
+            artist_mbid: Some(MBID.to_string()),
+            title: format!("Album {n}"),
+            release_type: Some("Album".to_string()),
+            year: Some(1990 + n as i16),
+            caa_url: None,
+        }
+    }
+
+    fn artist_url(n: u32) -> ArtistUrl {
+        ArtistUrl {
+            url_mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
+            url: format!("https://example.test/{n}"),
+            link_name: "youtube".to_string(),
+        }
+    }
+
+    fn recording_video(n: u32) -> RecordingVideo {
+        RecordingVideo {
+            recording_mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
+            url: format!("https://example.test/watch/{n}"),
+            link_name: "free streaming".to_string(),
+        }
+    }
+
+    #[test]
+    fn w6b_sql_is_parameterized_bounded_and_ordered() {
+        // Every new placeholder stays `text`-typed so the `&str` bind
+        // works (bare `$1::uuid` 500s; see `lookup_sql`).
+        for sql in [
+            GROUP_LOOKUP_SQL,
+            GROUP_RELEASES_SQL,
+            GROUP_EXISTS_SQL,
+            ARTIST_URLS_SQL,
+            ARTIST_EXISTS_SQL,
+            RECORDING_VIDEOS_SQL,
+            RECORDING_ISRCS_SQL,
+            RECORDING_EXISTS_SQL,
+        ] {
+            assert!(!sql.contains("= $1::uuid"), "{sql}");
+        }
+        assert!(
+            GROUP_LOOKUP_SQL.contains("FROM mb_release_group"),
+            "{GROUP_LOOKUP_SQL}"
+        );
+        assert!(
+            GROUP_LOOKUP_SQL.contains("mbid = $1::text::uuid"),
+            "{GROUP_LOOKUP_SQL}"
+        );
+        assert!(
+            GROUP_RELEASES_SQL
+                .contains("FROM mb_release WHERE release_group_mbid = $1::text::uuid"),
+            "{GROUP_RELEASES_SQL}"
+        );
+        assert!(
+            GROUP_RELEASES_SQL.contains("ORDER BY year NULLS LAST, title ASC, mbid ASC"),
+            "{GROUP_RELEASES_SQL}"
+        );
+        assert!(
+            GROUP_RELEASES_SQL.contains("LIMIT 1000"),
+            "{GROUP_RELEASES_SQL}"
+        );
+        assert_eq!(GROUP_RELEASES_LIMIT, 1000);
+        assert!(
+            ARTIST_URLS_SQL.contains("FROM mb_artist_url au JOIN mb_url u"),
+            "{ARTIST_URLS_SQL}"
+        );
+        assert!(
+            ARTIST_URLS_SQL.contains("ORDER BY u.url ASC, au.link_name ASC"),
+            "{ARTIST_URLS_SQL}"
+        );
+        assert!(ARTIST_URLS_SQL.contains("LIMIT 100"), "{ARTIST_URLS_SQL}");
+        assert_eq!(ARTIST_URLS_LIMIT, 100);
+        // The video join is symmetric (either side of the pair) and only
+        // follows video-marked links to stream URLs. Both union legs are
+        // pinned: the recording's own direct video-marked URLs, and the
+        // pair-reached video URLs. Dropping the direct leg must fail this
+        // pin — test-import §13 asserts a direct-only recording resolves
+        // end to end, and that suite mirrors this union.
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("FROM mb_recording_music_video mv"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("FROM mb_recording_url ru"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("UNION"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("JOIN mb_recording_url ru"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("JOIN mb_url u"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("ru.is_video"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("ORDER BY recording_mbid ASC, url ASC, link_name ASC"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("LIMIT 500"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert_eq!(RECORDING_VIDEOS_LIMIT, 500);
+        assert!(
+            RECORDING_ISRCS_SQL.contains("FROM mb_recording_isrc"),
+            "{RECORDING_ISRCS_SQL}"
+        );
+        assert!(
+            RECORDING_ISRCS_SQL.contains("ORDER BY isrc ASC"),
+            "{RECORDING_ISRCS_SQL}"
+        );
+        assert!(
+            RECORDING_ISRCS_SQL.contains("LIMIT 100"),
+            "{RECORDING_ISRCS_SQL}"
+        );
+        assert_eq!(RECORDING_ISRCS_LIMIT, 100);
+    }
+
+    #[test]
+    fn release_group_found_returns_kind_tag_and_caches_success() {
+        let repo = FakeRepo {
+            group: Some(release_group()),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_group(
+            &repo,
+            &cache,
+            "123E4567-E89B-12D3-A456-426614174000",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.cache_ttl, Some(LOOKUP_CACHE_TTL_S));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["kind"], "release_group");
+        assert_eq!(body["mbid"], MBID);
+        assert_eq!(body["name"], "Test Group");
+        assert_eq!(body["type"], "Album");
+        let puts = cache.puts.borrow();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, format!("mb:lookup:release-group:{MBID}"));
+        assert_eq!(puts[0].1, LOOKUP_CACHE_TTL_S);
+        assert_eq!(*repo.group_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn w6b_missing_is_404_and_not_cached() {
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        for resp in [
+            block_on(handle_release_group(&repo, &cache, MBID)),
+            block_on(handle_group_releases(&repo, &cache, MBID)),
+            block_on(handle_artist_urls(&repo, &cache, MBID)),
+            block_on(handle_recording_videos(&repo, &cache, MBID)),
+            block_on(handle_recording_isrcs(&repo, &cache, MBID)),
+        ] {
+            assert_eq!(resp.status, 404);
+            assert_eq!(resp.cache_ttl, None);
+        }
+        assert!(cache.puts.borrow().is_empty());
+    }
+
+    #[test]
+    fn w6b_invalid_mbid_is_400_before_cache_or_repo() {
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        for resp in [
+            block_on(handle_release_group(&repo, &cache, "nope")),
+            block_on(handle_group_releases(&repo, &cache, "nope")),
+            block_on(handle_artist_urls(&repo, &cache, "nope")),
+            block_on(handle_recording_videos(&repo, &cache, "nope")),
+            block_on(handle_recording_isrcs(&repo, &cache, "nope")),
+        ] {
+            assert_eq!(resp.status, 400);
+        }
+        assert_eq!(*repo.group_calls.borrow(), 0);
+        assert_eq!(*repo.group_releases_calls.borrow(), 0);
+        assert_eq!(*repo.artist_urls_calls.borrow(), 0);
+        assert_eq!(*repo.videos_calls.borrow(), 0);
+        assert_eq!(*repo.isrcs_calls.borrow(), 0);
+        assert_eq!(*cache.gets.borrow(), 0);
+    }
+
+    #[test]
+    fn w6b_repo_error_is_generic_500_and_not_cached() {
+        let repo = FakeRepo {
+            fail: true,
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        for resp in [
+            block_on(handle_release_group(&repo, &cache, MBID)),
+            block_on(handle_group_releases(&repo, &cache, MBID)),
+            block_on(handle_artist_urls(&repo, &cache, MBID)),
+            block_on(handle_recording_videos(&repo, &cache, MBID)),
+            block_on(handle_recording_isrcs(&repo, &cache, MBID)),
+        ] {
+            assert_eq!(resp.status, 500);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+            );
+            assert_eq!(resp.cache_ttl, None);
+        }
+        assert!(cache.puts.borrow().is_empty());
+    }
+
+    #[test]
+    fn w6b_empty_listings_are_cacheable_200s() {
+        let repo = FakeRepo {
+            group_releases: Some(vec![]),
+            artist_urls: Some(vec![]),
+            videos: Some(vec![]),
+            isrcs: Some(vec![]),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        for (resp, key) in [
+            (
+                block_on(handle_group_releases(&repo, &cache, MBID)),
+                "releases",
+            ),
+            (block_on(handle_artist_urls(&repo, &cache, MBID)), "urls"),
+            (
+                block_on(handle_recording_videos(&repo, &cache, MBID)),
+                "videos",
+            ),
+            (
+                block_on(handle_recording_isrcs(&repo, &cache, MBID)),
+                "isrcs",
+            ),
+        ] {
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.cache_ttl, Some(LOOKUP_CACHE_TTL_S));
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body[key].as_array().unwrap().len(), 0);
+        }
+        assert_eq!(cache.puts.borrow().len(), 4);
+    }
+
+    #[test]
+    fn w6b_listings_truncate_at_their_hard_limits() {
+        let repo = FakeRepo {
+            group_releases: Some(
+                (0..(GROUP_RELEASES_LIMIT + 5) as u32)
+                    .map(release)
+                    .collect(),
+            ),
+            artist_urls: Some(
+                (0..(ARTIST_URLS_LIMIT + 5) as u32)
+                    .map(artist_url)
+                    .collect(),
+            ),
+            videos: Some(
+                (0..(RECORDING_VIDEOS_LIMIT + 5) as u32)
+                    .map(recording_video)
+                    .collect(),
+            ),
+            isrcs: Some(
+                (0..(RECORDING_ISRCS_LIMIT + 5) as u32)
+                    .map(|n| format!("USABC{n:07}"))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        for (resp, key, limit) in [
+            (
+                block_on(handle_group_releases(&repo, &cache, MBID)),
+                "releases",
+                GROUP_RELEASES_LIMIT,
+            ),
+            (
+                block_on(handle_artist_urls(&repo, &cache, MBID)),
+                "urls",
+                ARTIST_URLS_LIMIT,
+            ),
+            (
+                block_on(handle_recording_videos(&repo, &cache, MBID)),
+                "videos",
+                RECORDING_VIDEOS_LIMIT,
+            ),
+            (
+                block_on(handle_recording_isrcs(&repo, &cache, MBID)),
+                "isrcs",
+                RECORDING_ISRCS_LIMIT,
+            ),
+        ] {
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body[key].as_array().unwrap().len(), limit);
+        }
+    }
+
+    #[test]
+    fn w6b_listings_serve_rows_and_cache_keys() {
+        let repo = FakeRepo {
+            group_releases: Some(vec![release(1), release(2)]),
+            artist_urls: Some(vec![artist_url(1)]),
+            videos: Some(vec![recording_video(1)]),
+            isrcs: Some(vec!["USABC2400001".to_string()]),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_group_releases(&repo, &cache, MBID));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["release_group_mbid"], MBID);
+        assert_eq!(body["releases"][0]["title"], "Album 1");
+        assert_eq!(body["releases"][1]["title"], "Album 2");
+        let resp = block_on(handle_artist_urls(&repo, &cache, MBID));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["artist_mbid"], MBID);
+        assert_eq!(body["urls"][0]["url"], "https://example.test/1");
+        assert_eq!(body["urls"][0]["link_name"], "youtube");
+        let resp = block_on(handle_recording_videos(&repo, &cache, MBID));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["recording_mbid"], MBID);
+        assert_eq!(body["videos"][0]["url"], "https://example.test/watch/1");
+        let resp = block_on(handle_recording_isrcs(&repo, &cache, MBID));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["recording_mbid"], MBID);
+        assert_eq!(body["isrcs"][0], "USABC2400001");
+        let keys: Vec<String> = cache.puts.borrow().iter().map(|(k, _)| k.clone()).collect();
+        assert!(keys.contains(&format!("mb:group-releases:{MBID}")));
+        assert!(keys.contains(&format!("mb:artist-urls:{MBID}")));
+        assert!(keys.contains(&format!("mb:recording-videos:{MBID}")));
+        assert!(keys.contains(&format!("mb:recording-isrcs:{MBID}")));
+    }
+
+    #[test]
+    fn w6b_poisoned_cached_bodies_are_misses() {
+        // Wrong identity, over-long lists, mistyped rows, a legacy
+        // out-of-i16 year and a non-ISRC code must all fall through to
+        // the repository instead of serving.
+        let cache = FakeCache::default();
+        cache.stored.borrow_mut().insert(
+            release_group_cache_key(MBID),
+            r#"{"kind":"release_group","mbid":"123e4567-e89b-12d3-a456-426614170000","name":"G","artist_mbid":null,"type":null}"#.to_string(),
+        );
+        cache.stored.borrow_mut().insert(
+            group_releases_cache_key(MBID),
+            format!(
+                "{{\"release_group_mbid\":\"{MBID}\",\"releases\":[{{
+                    \"mbid\":\"{MBID}\",\"title\":\"A\",\"year\":40000}}]}}"
+            ),
+        );
+        cache.stored.borrow_mut().insert(
+            artist_urls_cache_key(MBID),
+            format!("{{\"artist_mbid\":\"{MBID}\",\"urls\":[{{\"url\":\"x\"}}]}}"),
+        );
+        cache.stored.borrow_mut().insert(
+            recording_videos_cache_key(MBID),
+            format!("{{\"recording_mbid\":\"{MBID}\",\"videos\":[42]}}"),
+        );
+        cache.stored.borrow_mut().insert(
+            recording_isrcs_cache_key(MBID),
+            format!("{{\"recording_mbid\":\"{MBID}\",\"isrcs\":[\"BOGUS\"]}}"),
+        );
+        let repo = FakeRepo {
+            group: Some(release_group()),
+            group_releases: Some(vec![release(1)]),
+            artist_urls: Some(vec![artist_url(1)]),
+            videos: Some(vec![recording_video(1)]),
+            isrcs: Some(vec!["USABC2400001".to_string()]),
+            ..Default::default()
+        };
+        for resp in [
+            block_on(handle_release_group(&repo, &cache, MBID)),
+            block_on(handle_group_releases(&repo, &cache, MBID)),
+            block_on(handle_artist_urls(&repo, &cache, MBID)),
+            block_on(handle_recording_videos(&repo, &cache, MBID)),
+            block_on(handle_recording_isrcs(&repo, &cache, MBID)),
+        ] {
+            assert_eq!(resp.status, 200);
+            assert!(!resp.body.contains("BOGUS"));
+        }
+        assert_eq!(*repo.group_calls.borrow(), 1);
+        assert_eq!(*repo.group_releases_calls.borrow(), 1);
+        assert_eq!(*repo.artist_urls_calls.borrow(), 1);
+        assert_eq!(*repo.videos_calls.borrow(), 1);
+        assert_eq!(*repo.isrcs_calls.borrow(), 1);
+        // A well-formed cached group still hits without touching the repo.
+        let cache = FakeCache::default();
+        let repo = FakeRepo::default();
+        cache.stored.borrow_mut().insert(
+            recording_isrcs_cache_key(MBID),
+            format!("{{\"recording_mbid\":\"{MBID}\",\"isrcs\":[\"USABC2400001\"]}}"),
+        );
+        let resp = block_on(handle_recording_isrcs(&repo, &cache, MBID));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["isrcs"][0], "USABC2400001");
+        assert_eq!(*repo.isrcs_calls.borrow(), 0);
+    }
+
     #[test]
     fn release_recordings_missing_release_is_404_and_not_cached() {
         let repo = FakeRepo::default(); // recordings: None => no such release
@@ -2874,11 +4433,11 @@ mod build_sha_tests {
         // `build_sha_from_env` needs a wasm Env, so pin the call sites in
         // source the way the healthz test pins the route shape: slice the
         // pre-test source so this test's own literals cannot satisfy it.
-        // All eight inline emit sites (three routes x2, detached connect
-        // failure, catch-all 404) must carry the normalized key — never a
-        // missing key or a raw var. The ninth line, the staged
-        // `mb.db.failed` failure, builds its fields through the shared
-        // `db_failed_fields` seam instead of an inline literal.
+        // All eighteen inline emit sites (eight routes x2, detached
+        // connect failure, catch-all 404) must carry the normalized key —
+        // never a missing key or a raw var. The nineteenth line, the
+        // staged `mb.db.failed` failure, builds its fields through the
+        // shared `db_failed_fields` seam instead of an inline literal.
         let source = include_str!("lib.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -2896,6 +4455,11 @@ mod build_sha_tests {
             "mb.lookup.completed",
             "mb.release_recordings.completed",
             "mb.search.completed",
+            "mb.release_group.completed",
+            "mb.group_releases.completed",
+            "mb.artist_urls.completed",
+            "mb.recording_videos.completed",
+            "mb.recording_isrcs.completed",
             "mb.db.connect_failed",
             "mb.db.failed",
             "mb.request.not_found",
@@ -2908,13 +4472,14 @@ mod build_sha_tests {
         );
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // Eight inline emit sites carry the key, plus the shared
-        // `db_failed_fields` seam that builds the ninth line's fields, so
-        // a dropped key at any one of them drops the count below nine.
+        // Eighteen inline emit sites carry the key, plus the shared
+        // `db_failed_fields` seam that builds the nineteenth line's
+        // fields, so a dropped key at any one of them drops the count
+        // below nineteen.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            9,
-            "all eight inline mb lines plus the staged-failure seam must carry the build_sha key"
+            19,
+            "all eighteen inline mb lines plus the staged-failure seam must carry the build_sha key"
         );
     }
 }

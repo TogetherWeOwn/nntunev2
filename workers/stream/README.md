@@ -351,12 +351,16 @@ meanwhile.
 
 ## Test
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
-cargo fmt --all --check
-```
+Full workspace tests, clippy and wasm checks run in GitHub Actions
+[CI](../../.github/workflows/ci.yml), under `ci-ok`. Push the PR branch and
+open a draft PR while incomplete; cite the exact-head run/job links rather
+than running a local workspace checklist.
+
+Local execution is only for one failing test or crate, using the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only).
+Small Rust reproductions use the bounded Cargo pool; heavy focused work
+uses guarded Boat with `--no-env`, source-only export and cleanup. Neither
+Boat fallback nor a free pool authorizes full workspace verification.
 
 No Cloudflare account, no secrets: the play-path synthetic NNTP server lives
 in `tests/stream_integration.rs` and serves canned yEnc multipart articles;

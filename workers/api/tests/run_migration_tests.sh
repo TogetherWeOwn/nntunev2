@@ -12,7 +12,12 @@ set -euo pipefail
 command -v psql >/dev/null || { echo "psql not found" >&2; exit 1; }
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-psql_run() { psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+# Pin the session search_path for every apply: pre-convention migrations set
+# no search_path of their own, so without this pin an unqualified CREATE TABLE
+# resolves wherever the caller's role points. This wrapper (not a one-off) is
+# the required way to apply any pre-convention file in every environment;
+# new migrations carry their own in-file SET (see migrations/README.md).
+psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 shopt -s nullglob
 migrations=("$root"/migrations/*.sql)

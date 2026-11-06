@@ -81,7 +81,6 @@ struct FakeStore {
     magic: RefCell<HashMap<String, auth::MagicLinkRecord>>,
     invites: RefCell<HashMap<String, auth::InviteRecord>>,
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
-    vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     audits: RefCell<Vec<vault::AuditEvent>>,
     native_credentials: RefCell<HashMap<String, handlers::NativeCredentialRow>>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
@@ -233,24 +232,6 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn acquire_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-        _lease_secs: u64,
-        _max_concurrency: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        Ok(true)
-    }
-
-    async fn release_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-    ) -> Result<(), handlers::StoreError> {
-        Ok(())
-    }
-
     async fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -333,29 +314,6 @@ impl handlers::Store for FakeStore {
                 row.revoked = true;
             }
         }
-        Ok(())
-    }
-
-    async fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        Ok(self.vaults.borrow().get(user_id).cloned())
-    }
-
-    async fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        self.vaults
-            .borrow_mut()
-            .insert(user_id.to_string(), row.clone());
-        Ok(())
-    }
-
-    async fn delete_vault(&self, user_id: &str) -> Result<(), handlers::StoreError> {
-        self.vaults.borrow_mut().remove(user_id);
         Ok(())
     }
 
@@ -590,7 +548,13 @@ mod surface_acceptance {
             ("GET", "/v1/playlists"),
             ("POST", "/v1/playlists"),
             ("PATCH", "/v1/playlists/synthetic"),
-            ("POST", "/v1/plays"),
+            // `POST /v1/plays` left this list when the session-served
+            // grant-issuance route landed: header-absent callers now
+            // reach the cookie handler (401/402/200), so the absent
+            // posture is no longer the plain 404. The surviving gate
+            // invariant — a PRESENTED invalid bearer still plain-404s
+            // with no cookie rescue — is pinned by the handlers suite
+            // (`play_issue_presented_invalid_bearer_still_plain_404`).
             ("GET", "/v1/stream"),
             ("POST", "/v1/ingest"),
             ("GET", "/v1/not-a-route"),
@@ -756,9 +720,6 @@ mod surface_acceptance {
             "/v1/session/refresh",
             "/v1/session/logout",
             "/v1/session/revoke-all",
-            "/v1/vault",
-            "/v1/vault/test",
-            "/v1/vault/test-connection",
             "/v1/credentials",
             "/v1/credentials/synthetic-id",
             // Scope-map-served native paths.
@@ -789,6 +750,10 @@ mod surface_acceptance {
         for path in [
             "/v1/not-a-route",
             "/nope",
+            // Retired user-credential routes stay unserved.
+            "/v1/vault",
+            "/v1/vault/test",
+            "/v1/vault/test-connection",
             "/v1/playlists/playlist-synthetic/tracks",
             "/v1/playlists/playlist-synthetic/tracks/track-synthetic",
             "/v1/playlists/playlist-synthetic/",

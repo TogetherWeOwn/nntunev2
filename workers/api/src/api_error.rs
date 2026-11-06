@@ -47,6 +47,14 @@ pub const REGISTRY: &[CodeSpec] = &[
         status: 402,
         retryable: false,
     },
+    // Registered ahead of the grant-issuance gate that emits it (the
+    // parity test does not assert a current emitter) so clients can build
+    // the never-subscribed / lapsed paywall states against the real code.
+    CodeSpec {
+        code: "subscription_required",
+        status: 402,
+        retryable: false,
+    },
     CodeSpec {
         code: "forbidden",
         status: 403,
@@ -65,6 +73,11 @@ pub const REGISTRY: &[CodeSpec] = &[
     CodeSpec {
         code: "conflict",
         status: 409,
+        retryable: false,
+    },
+    CodeSpec {
+        code: "payload_too_large",
+        status: 413,
         retryable: false,
     },
     CodeSpec {
@@ -156,6 +169,9 @@ impl ApiError {
     pub fn plan_limit_exceeded(message: impl Into<String>) -> Self {
         Self::by_code("plan_limit_exceeded", message)
     }
+    pub fn subscription_required(message: impl Into<String>) -> Self {
+        Self::by_code("subscription_required", message)
+    }
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::by_code("forbidden", message)
     }
@@ -167,6 +183,9 @@ impl ApiError {
     }
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::by_code("conflict", message)
+    }
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::by_code("payload_too_large", message)
     }
     pub fn validation_failed(message: impl Into<String>) -> Self {
         Self::by_code("validation_failed", message)
@@ -335,6 +354,10 @@ mod tests {
         let plan = ApiError::plan_limit_exceeded("plan limit reached");
         assert_eq!((plan.status, plan.retryable), (402, false));
         assert_eq!(body(&plan)["code"], "plan_limit_exceeded");
+        let sub = ApiError::subscription_required("subscription required");
+        assert_eq!((sub.status, sub.retryable), (402, false));
+        assert_eq!(body(&sub)["code"], "subscription_required");
+        assert_eq!(sub.message, "subscription required");
         let rate = ApiError::rate_limited("too many requests");
         assert_eq!((rate.status, rate.retryable), (429, true));
         assert_eq!(body(&rate)["code"], "rate_limited");

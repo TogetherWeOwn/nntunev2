@@ -77,7 +77,8 @@ test('[BA-R01] a repeated identical outcome is re-announced through the shared n
 	expect(repeatedSelection, 'a second "Selection cleared" must re-render the live node').toBeGreaterThan(0);
 	await expect(node).toHaveText('Selection cleared');
 
-	const field = page.getByRole('searchbox', { name: /find|search/i });
+	// Page main only: the app-shell top bar carries its own Search field.
+	const field = page.getByRole('main').getByRole('searchbox', { name: /find|search/i });
 	const clearSearch = page.getByRole('button', { name: 'Clear search', exact: true }).first();
 	await field.fill('tune');
 	await clearSearch.click();

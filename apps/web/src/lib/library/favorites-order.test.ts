@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { moveFavoriteId } from './favorites-order.js';
+import { moveFavoriteId, restoreFavoriteId, type FavoriteRestoreAnchor } from './favorites-order.js';
 
 /**
  * Builder-owned direct pure-move guards for the seam the browser
@@ -71,6 +71,65 @@ describe('moveFavoriteId', () => {
 		]);
 	});
 
+describe('restoreFavoriteId', () => {
+	// Two adjacent removals undone in either order must restore the exact
+	// original order, so queuing favorites keeps star order: anchors prefer
+	// the surviving successor (the stable right edge after removals shift
+	// later elements left), then the predecessor, then the clamped index.
+	const anchor = (list: readonly string[], id: string): FavoriteRestoreAnchor => {
+		const previousIndex = list.indexOf(id);
+		return {
+			previousIndex,
+			predecessor: previousIndex > 0 ? list[previousIndex - 1] : null,
+			successor: previousIndex >= 0 && previousIndex < list.length - 1 ? list[previousIndex + 1] : null
+		};
+	};
+
+	it('restores two adjacent removals undone in removal order', () => {
+		const start = ['A', 'B', 'C', 'D'];
+		const undoB = anchor(start, 'B');
+		const afterB = start.filter((id) => id !== 'B');
+		const undoC = anchor(afterB, 'C');
+		const afterBoth = afterB.filter((id) => id !== 'C');
+		expect(afterBoth).toEqual(['A', 'D']);
+		const restoredB = restoreFavoriteId(afterBoth, 'B', undoB);
+		expect(restoredB).toEqual(['A', 'B', 'D']);
+		expect(restoreFavoriteId(restoredB, 'C', undoC)).toEqual(['A', 'B', 'C', 'D']);
+	});
+
+	it('restores two adjacent removals undone in reverse order', () => {
+		const start = ['A', 'B', 'C', 'D'];
+		const undoB = anchor(start, 'B');
+		const afterB = start.filter((id) => id !== 'B');
+		const undoC = anchor(afterB, 'C');
+		const afterBoth = afterB.filter((id) => id !== 'C');
+		const restoredC = restoreFavoriteId(afterBoth, 'C', undoC);
+		expect(restoredC).toEqual(['A', 'C', 'D']);
+		expect(restoreFavoriteId(restoredC, 'B', undoB)).toEqual(['A', 'B', 'C', 'D']);
+	});
+
+	it('is idempotent when the id is already present and never mutates inputs', () => {
+		const stored = Object.freeze(['A', 'B', 'C']);
+		const next = restoreFavoriteId(stored, 'B', {
+			previousIndex: 1,
+			predecessor: 'A',
+			successor: 'C'
+		});
+		expect(next).toBe(stored);
+		expect(stored).toEqual(['A', 'B', 'C']);
+	});
+
+	it('falls back to the clamped index when both neighbors are gone', () => {
+		expect(
+			restoreFavoriteId(['X'], 'B', { previousIndex: 1, predecessor: null, successor: null })
+		).toEqual(['X', 'B']);
+		expect(
+			restoreFavoriteId([], 'A', { previousIndex: 0, predecessor: null, successor: null })
+		).toEqual(['A']);
+	});
+});
+
+describe('moveFavoriteId edge cases', () => {
 	it('never mutates frozen inputs and preserves exact membership', () => {
 		const stored = Object.freeze(['gone-first', 'arr-z', 'gone-between', 'arr-a', 'arr-m']);
 		const visible = Object.freeze(['arr-z', 'arr-a', 'arr-m']);
@@ -80,4 +139,5 @@ describe('moveFavoriteId', () => {
 		expect(visible).toEqual(['arr-z', 'arr-a', 'arr-m']);
 		expect([...next].sort()).toEqual([...stored].sort());
 	});
+});
 });

@@ -11,11 +11,10 @@
 //! Topology: the route reports each interval to the per-user `NntpPool`
 //! Durable Object (`POST /delivered`, [`crate::routes::DELIVERED_PATH`]),
 //! which is the per-user accounting owner. This module defines the
-//! handoff shape only — interval-union merging per play, persistence, and
-//! the flush to the api Worker's ledger endpoint land with the
-//! enforcement and meter card behind this same envelope, so the
-//! Durable Object route here validates and acknowledges (`202`) without
-//! storing. Duplicate delivery is safe by design: the meter merges unions
+//! handoff shape and its validation; the DO merges intervals into a
+//! union per play, persists the book, and flushes cumulative windows
+//! to the api Worker's ledger endpoint ([`crate::meter_sink`]).
+//! Duplicate delivery is safe by design: the meter merges unions
 //! per `play_id`, so re-reporting an overlapping span adds zero.
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +40,14 @@ pub struct DeliveredInterval {
     pub start: u64,
     /// Exclusive end: `start + bytes_written`.
     pub end: u64,
+    /// The served file's confirmed total size, when the serving path
+    /// knows it (the wasm play route reads the R2 blob length; the
+    /// portable core does not, and leaves `None`). The meter sink
+    /// forwards it to the api derivation as the proportional input;
+    /// the api falls back to its own metadata when absent. `None`
+    /// pre-dates the field on the wire, hence the serde default.
+    #[serde(default)]
+    pub file_bytes: Option<u64>,
 }
 
 impl DeliveredInterval {
@@ -128,12 +135,22 @@ pub fn parse_delivered_report(
     if report.is_empty() {
         return Err(ProbeError::BadRequest("empty delivered interval"));
     }
+    // A confirmed size of zero, or one smaller than the span just
+    // written from that file, is a serving bug: refuse it here rather
+    // than let it poison the play's derivation snapshots downstream.
+    if let Some(file_bytes) = report.file_bytes {
+        if file_bytes == 0 || file_bytes < report.end {
+            return Err(ProbeError::BadRequest("impossible file_bytes"));
+        }
+    }
     Ok(report)
 }
 
-/// Serve one delivered report end to end: validate `body` for
-/// `pool_user`'s pool and acknowledge it. Accounting (union per play,
-/// persistence, ledger flush) belongs to that card, behind this envelope.
+/// Validate one delivered report for `pool_user`'s pool and render
+/// the acknowledge/refuse reply. The runtime calls
+/// [`parse_delivered_report`] directly so it can account the parsed
+/// interval ([`crate::meter_sink::MeterBook`]) before acknowledging;
+/// this shape stays as the validation-only pin for the envelope.
 pub fn serve_delivered(pool_user: &str, body: &[u8]) -> DeliveredReply {
     DeliveredReply::from(parse_delivered_report(body, pool_user).map(|_| ()))
 }
@@ -239,6 +256,32 @@ mod tests {
         );
         assert!(parse_delivered_report(b"not json", "user-1").is_err());
         assert!(parse_delivered_report(b"{}", "user-1").is_err());
+    }
+
+    #[test]
+    fn file_bytes_is_optional_and_must_be_possible() {
+        // Pre-field wire shape (no file_bytes) still parses as None.
+        let parsed =
+            parse_delivered_report(&report_body("user-1", "play-7", "track-9", 0, 25), "user-1")
+                .expect("legacy shape");
+        assert_eq!(parsed.file_bytes, None);
+        for (file_bytes, ok) in [(1_000u64, true), (25, true), (24, false), (0, false)] {
+            let body = serde_json::json!({
+                "user_id": "user-1",
+                "play_id": "play-7",
+                "track_id": "track-9",
+                "start": 0,
+                "end": 25,
+                "file_bytes": file_bytes,
+            })
+            .to_string()
+            .into_bytes();
+            let parsed = parse_delivered_report(&body, "user-1");
+            assert_eq!(parsed.is_ok(), ok, "file_bytes={file_bytes}");
+            if ok {
+                assert_eq!(parsed.expect("ok").file_bytes, Some(file_bytes));
+            }
+        }
     }
 
     #[test]

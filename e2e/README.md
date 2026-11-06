@@ -64,6 +64,48 @@ the activation checklist is accurate:
   endpoints, and usage-meter enforcement still depend on their venture
   slices; the journey specs expose those missing backend behaviors directly.
 
+## Track interaction hooks
+
+Track menus and selection add hooks without renaming the existing library,
+queue, audio or metering contracts. `helpers/contract.ts` registers
+`track-more`, `favorite-more` and `track-selection-toolbar` on the library, and
+`queue-more`, `queue-drop-target` and `queue-selection-toolbar` on the shared
+queue panel. `track-context-menu` belongs to the shared top-layer menu;
+only an open menu renders it. Scope row actions by the existing stable
+`data-id` (library) or `data-track-id` (queue), never by row position.
+The queue selection toolbar renders only while tracks are selected.
+
+`apps/web/src/lib/contract.test.ts` checks both route and shared-component
+sources for these declarations. Browser coverage lives in
+`apps/web/tests/track-interactions.spec.ts`; it complements rather than
+replaces the existing range-selection and playback journey suites.
+
+Queue insertion/reordering and Select remain metadata-only. The separate
+Play now menu action is an explicit transport gesture: it hydrates only the
+selected track, attempts playback once, and reports blocked or streamless
+outcomes without retrying. Batch Play now arranges the whole displayed selection,
+including the old current track when selected. Queue toolbar moves and Play next
+retain queue order even when checkboxes were activated in reverse order.
+Later queue/auth changes invalidate pending playback feedback. Done restores stranded focus to a surviving control rather than the
+page body; group drops resolve insertion boundaries outside the moving IDs.
+Copy link is inline rather than a one-choice submenu. The playlist slot
+is reserved and disabled with a "Not available yet" hint; backend routes
+and a playlist picker are pending. Arrow keys can discover the slot, but
+activation changes nothing and type-ahead skips it. Touch queue
+grips autoscroll the nearest scrolling pane while held at its edge; drop,
+Escape, hidden-page and unmount cleanup stop the animation.
+Pending long-presses cancel on page blur, hiding, scroll or pointer release
+outside the row; a hidden page also invalidates native drag tokens before
+any later drop. Unit tests cover gesture lifecycle cleanup, and browser
+coverage includes interruption cases plus open-menu/batch-selection axe scans
+at desktop and narrow widths. Those scans reject serious/critical findings;
+they do not replace manual keyboard, touch or assistive-technology review.
+
+These UI changes follow **AGENTS.md — Clean-room, YouTube and MetaBrainz
+guardrails**: original presentation, existing semantic colours, no changes to
+embedded video or catalogue licensing. Offline interaction tests are not
+staging ingest→play→meter acceptance evidence.
+
 ## Player contract migration (app-shell redesign, design spec v1)
 
 The custom player bar replaces the native `<audio controls>` timeline this
@@ -118,24 +160,22 @@ B8 feeds the signed-URL vectors to staging and compares the wire verdicts
 against the matrix expectations. Vector ids (`botgrant-NNN`, `boturl-NNN`,
 `botmx-NNN`) are stable and citable; fixtures name secrets only.
 
-## Run locally
+## Run in GitHub Actions
 
-```sh
-cd e2e
-npm ci
-npx playwright install --with-deps chromium
-STAGING_BASE_URL=https://staging.example \
-  CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
-  CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
-  SYNTHETIC_NNTP_HOST='<synthetic fixture host>' \
-  SYNTHETIC_NNTP_PORT='563' \
-  SYNTHETIC_NNTP_USER='<test user>' \
-  SYNTHETIC_NNTP_PASS='<from ~/secure-drop>' \
-  npm run e2e:staging
-```
+Push the PR branch and open a draft PR while work is incomplete. The
+`e2e-lint` job in [CI](../.github/workflows/ci.yml) runs harness typechecking,
+offline self-tests and spec discovery as part of `ci-ok`; these are not a
+local CI-mirror checklist. Full staging journeys run only through the
+post-deploy Actions path described below, not from a local shell.
 
-Smoke only: `npm run e2e:smoke`. Validate without staging: `npm run typecheck`,
-`npm run test:unit`, and `npm run e2e:list`.
+Local tests are limited to focused reproduction of one failing test from
+an Actions job. Select that test explicitly rather than invoking the full
+`test:unit`, `e2e:staging` or smoke suite. Heavy focused reproduction must
+use the guarded `boat` PATH wrapper with `--no-env`, source-only export and
+verified cleanup; do not forward staging or host credentials. A fallback
+cannot authorize a full suite or heavy raw-host run. If the reproduction
+cannot meet these limits, use Actions or route its actual prerequisite.
+See [verification policy](../CONTRIBUTING.md#verification-github-actions-first).
 
 If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
@@ -157,9 +197,9 @@ npm-based harness (`e2e/package-lock.json`).
 | `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the library-arrival spec (`signup-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for provider 430 control | Real staging NNTP provider (a real service despite the `SYNTHETIC_` names — rename needs an operator; defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the provider allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a transport the endpoint helper cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for provider 430 control | No default — fail closed when missing. |
-| `TEST_NZB_PATH` | post-deploy journey | Runtime path of the secret-held real-NZB subset staged by the workflow prepare step (`RUNNER_TEMP` only). Legs ingest it via `requireRealNzbFixture()` and decoded-audio legs skip by name; unset → the run fails red (no synthetic fallback since TWO-1169). Never set locally. |
-| `REAL_NZB_MODE` | CI only | `true` when the prepare step staged the real NZB; drives the journey gate's extended allow-list instead of the standard single-fixme budget. |
-| `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | CI workflow secrets only | Halves of the xz-compressed, base64-encoded real NZB (48 KB secret cap). Rebuilt into `RUNNER_TEMP` only with a SHA-256 prefix check, truncated to one whole data file, then the full NZB is deleted. Secret names only, never values. |
+| `TEST_NZB_PATH` | retired | Runtime path of the former secret-held real-NZB staging fixture. That leg is retired under the CC0-only fixture rule (`docs/fixture-audio-licences.md`): no workflow sets this anymore, staging ingests no NZB, and the legs that needed an uploaded track skip by name until admin ingest can seed a curated track. Never set. |
+| `REAL_NZB_MODE` | retired | Former journey-gate mode flag for the retired real-NZB leg. No workflow sets it; the gate's standard eleven-skip budget governs every run. |
+| `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | retired | Former NZB fixture secrets for the retired staging leg. No workflow references them; the operator deletes them. |
 
 How the suite uses them:
 
@@ -212,7 +252,7 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Form-to-library arrival is asserted by `signup-arrival.spec.ts`: the
+  Form-to-billing arrival is asserted by `signup-arrival.spec.ts`: the
   code-plus-passkey finish retrieves the code from the staging-only
   `POST /api/test-codes` seam, which is live on staging
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
@@ -226,45 +266,37 @@ How the suite uses them:
   legs in its isolated group, so a red-by-design capped-account failure
   skips no other verdict. The stream
   leg requires the seam to pre-seed a streamable track on its capped account:
-  there is no user-ingest path left that could fill it. An unavailable
-  over-limit seam fails instead of skipping — locally and on CI — so
-  plan-limit enforcement can never pass unexercised. Each leg asserts the
+  there is no user-ingest path left that could fill it, so the leg currently
+  skips by name with the other parked legs (below) until admin ingest can
+  seed a curated track. When it runs, an unavailable over-limit seam fails
+  instead of skipping — locally and on CI — so plan-limit enforcement can
+  never pass unexercised. Each leg asserts the
   full refusal verdict (`assertPlanLimitRefusal` in `helpers/contract.ts`):
   402/429 status, limit + reset headers (429 additionally requires
   `retry-after`), the status-consistent limit code (`plan_limit_exceeded` on
   402, `rate_limited` on 429) with a present, status-consistent retryable
   flag, the upgrade CTA pointer (a matching key whose value points at
   `/pricing`), and no secret leakage.
-- Staging real-NZB mode (secret-held RAR set, the only journey mode since
-  TWO-1169 deleted every checked-in NZB): the post-deploy journey ingests a
-  real NZB staged by the workflow. The full NZB is xz-compressed,
-  base64-encoded and split across the `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` repo
-  secrets (secret names only, never values); the e2e job's prepare step
-  rebuilds it into `RUNNER_TEMP` alone with a SHA-256 prefix check,
-  truncates it with `scripts/prepare-real-nzb.mjs` to the first non-PAR2
-  file (verbatim, all segments — one whole data file, so ingest stays off
-  the repair path and the run avoids pulling the full release), then deletes
-  the full NZB. Unset halves fail the job red instead of minting synthetic
-  evidence. Legs resolve the upload lazily via `requireRealNzbFixture()`
-  over `TEST_NZB_PATH` (`helpers/real-nzb-fixture.ts`) — a missing staging
-  fails the run, never a silent pass. Owner rule (public repo): no NZB
-  bytes, message-IDs, subjects, file names or segment lists in the repo or
-  public logs — the prepare step prints only file counts, skips carry a
-  static reason, failure artifacts stay sanitized junit-only, and the full
-  NZB never leaves `RUNNER_TEMP`. Honest scope: the real NZB is a RAR/PAR2
-  set and the ingest pipeline has no RAR read (transcode inputs skip
-  non-audio files), so an RAR-only subset fails permanent at transcode
-  before any library row is written — there is currently no completable
-  ingest. Live legs in real-NZB mode are signup, library arrival,
-  returning-user login, the provider 430 control and the stream plan-limit
-  refusal leg; the user-NZB legs (ingest completion in both spec files,
-  reload, Range, meter, playback, seek, Media Session, queue order) skip by
-  name under TWO-1635 — user NZB ingest is retired, so they wait for admin
-  ingest to seed a curated track on staging, not for RAR read (RAR-set
-  legs additionally keep their TWO-1174 park). The journey gate budgets
-  that fixed allow-list via `REAL_NZB_MODE` instead of the standard
-  ten-skip budget (fixme plus nine parked legs); any failure or off-list
-  skip still fails the run in both modes.
+- Staging real-NZB mode is retired: the post-deploy journey used to ingest
+  a secret-held real NZB rebuilt from repo secrets into `RUNNER_TEMP`.
+  Under the CC0-only fixture rule (`docs/fixture-audio-licences.md`) no
+  workflow stages or ingests an NZB anymore — there are no checked-in NZB
+  fixtures (TWO-1169) and no NZB fixture secrets are referenced, so the
+  operator can delete them without failing a check. Live legs are signup,
+  library arrival, returning-user login and the provider 430 control; the
+  user-NZB legs (ingest completion in both spec files, reload, Range,
+  meter, playback, seek, Media Session, queue order) plus the stream
+  plan-limit refusal leg — which needs a pre-seeded streamable track —
+  skip by name under TWO-1635. User NZB ingest is retired, so they wait
+  for admin ingest to seed a curated track on staging (RAR-set legs
+  additionally keep their TWO-1174 park). The journey gate budgets the
+  fixed standard allow-list of eleven skips (fixme plus the ten parked
+  legs); any failure or off-list skip still fails the run. The dormant
+  resolver (`helpers/real-nzb-fixture.ts`), the truncation script
+  (`scripts/prepare-real-nzb.mjs`) and the gate's `REAL_NZB_MODE` branch
+  stay only until the parked specs un-park or are deleted; owner rule
+  (public repo) still holds — no NZB bytes, message-IDs, subjects, file
+  names or segment lists in the repo or public logs.
 - Provider budget + 430 control: the staging NNTP provider is a shared
   account with production, so each run holds at most a trickle of
   connections. The workflow concurrency group (`e2e-staging`,
@@ -340,6 +372,13 @@ How the suite uses them:
   enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
+
+For PR CI, record the full reviewed head SHA plus exact-head Actions run
+and `e2e-lint`/`ci-ok` job URLs and conclusions, following
+[the evidence contract](../CONTRIBUTING.md#evidence-for-review-and-release).
+Reviewers and the Release Manager accept those links as CI evidence, not
+local full-suite transcripts. They do not replace the same-deployed-build
+journey, authorized production promotion, migration or rollback gates.
 
 On failure CI sanitizes then uploads `test-results/` only (7 days, junit).
 Raw traces and screenshots are disabled: tracing records request

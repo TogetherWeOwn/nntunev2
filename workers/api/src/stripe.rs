@@ -221,6 +221,22 @@ pub fn retrieve_checkout_session_request(session_id: &str) -> StripeRequest {
     }
 }
 
+/// `POST /v1/checkout/sessions/{id}/expire`: deliberately retire an open
+/// session before a replacement mints under a fresh operation id (price
+/// mismatch repair, dead-session replacement). Expiry is idempotent by
+/// nature — an already-expired session answers 200 with that state, so no
+/// idempotency key rides along. Expiring a complete session is a Stripe
+/// 400, which callers treat as money-landed (reconcile) or retryable,
+/// never as a green light to mint beside it.
+pub fn expire_checkout_session_request(session_id: &str) -> StripeRequest {
+    StripeRequest {
+        method: "POST",
+        path: format!("/v1/checkout/sessions/{}/expire", form_escape(session_id)),
+        idempotency_key: None,
+        body: String::new(),
+    }
+}
+
 /// `GET /v1/subscriptions/{id}`.
 pub fn retrieve_subscription_request(subscription_id: &str) -> StripeRequest {
     StripeRequest {
@@ -679,6 +695,10 @@ pub trait StripeTransport {
         &self,
         session_id: String,
     ) -> Pin<Box<dyn Future<Output = StripeResult<CheckoutSession>> + '_>>;
+    fn expire_checkout_session(
+        &self,
+        session_id: String,
+    ) -> Pin<Box<dyn Future<Output = StripeResult<CheckoutSession>> + '_>>;
     fn retrieve_subscription(
         &self,
         subscription_id: String,
@@ -726,6 +746,12 @@ impl StripeTransport for NoStripeTransport {
         Box::pin(async { Err(StripeError::transport()) })
     }
     fn retrieve_checkout_session(
+        &self,
+        _session_id: String,
+    ) -> Pin<Box<dyn Future<Output = StripeResult<CheckoutSession>> + '_>> {
+        Box::pin(async { Err(StripeError::transport()) })
+    }
+    fn expire_checkout_session(
         &self,
         _session_id: String,
     ) -> Pin<Box<dyn Future<Output = StripeResult<CheckoutSession>> + '_>> {
@@ -1036,6 +1062,18 @@ mod tests {
             "/v1/subscriptions/sub_123"
         );
         assert_eq!(cancel_subscription_request("sub_123").method, "DELETE",);
+    }
+
+    #[test]
+    fn expire_session_posts_to_the_session_expire_path() {
+        let req = expire_checkout_session_request("cs_test_123");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/checkout/sessions/cs_test_123/expire");
+        assert_eq!(req.idempotency_key, None, "expiry converges on the object");
+        assert_eq!(
+            expire_checkout_session_request("cs a/b").path,
+            "/v1/checkout/sessions/cs%20a%2Fb/expire"
+        );
     }
 
     #[test]

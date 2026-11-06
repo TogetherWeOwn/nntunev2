@@ -481,7 +481,12 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
-            if path == "/v1/me" || path == "/v1/indexers" || path == "/v1/vault" {
+            if path == "/v1/me" || path == "/v1/indexers" {
+                return SessionOnly;
+            }
+            // Billing/usage display reads: session-only like checkout —
+            // API keys never see plan, usage, or subscription state.
+            if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
                 return SessionOnly;
             }
             if path == "/v1/credentials" {
@@ -494,6 +499,33 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // never bearer.
             if path == "/v1/admin/settings" {
                 return SessionOnly;
+            }
+            // Admin ingest reads (migration 0034): the exact list path
+            // (the entry preserves its query string, so the filter and
+            // window survive the runtime's query strip) plus one
+            // single-segment job id. Deeper shapes deny here, before
+            // any spend.
+            if path == "/v1/admin/ingest"
+                || path.starts_with("/v1/admin/ingest?")
+                || one_segment_after("/v1/admin/ingest/", path)
+            {
+                return SessionOnly;
+            }
+            // Admin invite list (migration 0033): the bare path, or
+            // one filter pair (`status/{s}` / `issuer/{id}`). Deeper
+            // shapes deny here, before any spend.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((filter, value)) = rest.split_once('/') {
+                    if matches!(filter, "status" | "issuer")
+                        && !value.is_empty()
+                        && !value.contains('/')
+                    {
+                        return SessionOnly;
+                    }
+                }
             }
             Deny
         }
@@ -525,20 +557,32 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Session-only writes (never reachable by bearer).
             if path == "/v1/indexers"
-                || path == "/v1/vault/test"
-                || path == "/v1/vault/test-connection"
                 || path == "/v1/credentials"
                 || path == "/v1/auth/passkey/login/start"
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/billing/portal"
+                || path == "/v1/admin/ingest"
             {
                 return SessionOnly;
             }
             if let Some(rest) = path.strip_prefix("/v1/libraries/") {
                 if let Some((id, tail)) = rest.split_once('/') {
                     if !id.is_empty() && tail == "members" {
+                        return SessionOnly;
+                    }
+                }
+            }
+            // Admin invite writes (migration 0033): issue at the bare
+            // path, revoke at `{id}/revoke`. Session-only, like the
+            // rest of the admin surface.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((id, tail)) = rest.split_once('/') {
+                    if !id.is_empty() && tail == "revoke" {
                         return SessionOnly;
                     }
                 }
@@ -552,7 +596,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" || path == "/v1/vault" {
+            if path == "/v1/me" {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one

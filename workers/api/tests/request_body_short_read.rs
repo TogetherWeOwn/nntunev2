@@ -118,7 +118,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
         collected,
         handlers::Request {
             method: "POST".to_string(),
-            path: "/v1/vault/test".to_string(),
+            path: "/v1/session/refresh".to_string(),
             cookie: None,
             origin: None,
             authorization: None,

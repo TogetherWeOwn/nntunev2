@@ -44,12 +44,12 @@
 //!
 //! Envelope boundary (spec §7: KEK never in ingest): this module pins the
 //! `nzb_ref_*` companion contract — v2 as a SQL literal, lengths, versions —
-//! and validates bound values, but it never mints. Minting reuses the vault
-//! envelope code (`workers/api/src/vault.rs::encrypt_vault`, fresh DEK per
-//! row: 32-byte DEK + 16-byte tag = the 48-byte `*_dek_wrapped` the schema
-//! CHECKs) and lands with the providers-minting sibling, which assigns the
-//! `nzb_ref_payload_format` number alongside the sealed payload shape. The
-//! wire-up binds this module's [`TrackSourceParams`] from that mint output.
+//! and validates bound values, but it never mints. OriginalSourceV1 is
+//! prepared by [`original_source_for_track`] after the natural-key winner
+//! is selected. API `original_source::seal_original_source` owns the v2
+//! shared-source envelope, not the legacy user-bound `encrypt_vault` helper.
+//! The wire-up binds [`TrackSourceParams`] from that mint output; no keys
+//! enter ingest. Publication still belongs to the existing fenced transaction.
 //!
 //! Both statements select through the publishing-job `writer_fence` (the
 //! `ingest_jobs` row `FOR SHARE`, ADR 0002 rule 3), so no track row appears
@@ -74,7 +74,10 @@
 //! either a benign replay or a fenced job; the consumer separates them with
 //! the PK selects plus [`classify_track_zero_rows`], never by assuming.
 
-use nntune_core::nzb::File;
+use nntune_core::{
+    nzb::File,
+    original_source::{OriginalSource, RangeHint, SourceError},
+};
 
 use crate::jobs::validate_job_id;
 use crate::matching::MbRecording;
@@ -293,6 +296,70 @@ pub fn upsert_track_sql() -> &'static str {
 /// downstream FKs (`track_sources`, `track_media`).
 pub fn select_track_id_by_position_sql() -> &'static str {
     "SELECT id FROM tracks WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3"
+}
+
+/// Winning DB-selected track, never a proposed id from before an upsert.
+/// The transaction adapter supplies this projection after the job fence.
+pub struct SourceTrack<'a> {
+    pub id: &'a str,
+    pub release_id: &'a str,
+    pub medium_no: i32,
+    pub track_no: i32,
+    pub recording_id: &'a str,
+}
+
+pub fn select_track_for_source_sql() -> &'static str {
+    "SELECT id::text, release_id::text, medium_no, track_no, mbid::text FROM tracks WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3"
+}
+
+/// Derive the file selection again from trusted job/match data, then compare
+/// every natural identity component with the winning persisted track. No
+/// caller-controlled ordinal or article list is accepted as a shortcut.
+#[allow(clippy::too_many_arguments)]
+pub fn original_source_for_track(
+    persisted_job_id: &str,
+    release_id: &str,
+    files: &[File],
+    recordings: &[MbRecording],
+    selected: &SourceTrack<'_>,
+    decoded_file_size: u64,
+    range_hint: Option<RangeHint>,
+) -> Result<OriginalSource, SourceError> {
+    if !validate_job_id(persisted_job_id) || files.len() > nntune_core::nzb::MAX_FILES {
+        return Err(SourceError::Binding);
+    }
+    let mut ordinals = std::collections::HashSet::new();
+    if files
+        .iter()
+        .any(|f| f.ordinal >= nntune_core::nzb::MAX_FILES || !ordinals.insert(f.ordinal))
+    {
+        return Err(SourceError::Binding);
+    }
+    let derived =
+        derive_track_rows(Some(release_id), files, recordings).map_err(|_| SourceError::Binding)?;
+    let row = derived
+        .rows
+        .iter()
+        .find(|r| r.medium_no == selected.medium_no && r.track_no == selected.track_no)
+        .ok_or(SourceError::Binding)?;
+    // Postgres UUID::text canonicalizes hex case; compare the validated
+    // identities, not the match response's original spelling.
+    if !row.release_id.eq_ignore_ascii_case(selected.release_id)
+        || !row.mbid.eq_ignore_ascii_case(selected.recording_id)
+    {
+        return Err(SourceError::Binding);
+    }
+    let file = files
+        .iter()
+        .find(|f| f.ordinal == row.file_ordinal)
+        .ok_or(SourceError::Binding)?;
+    OriginalSource::from_file(
+        selected.id,
+        persisted_job_id,
+        file,
+        decoded_file_size,
+        range_hint,
+    )
 }
 
 /// One `track_sources` row's bound values, in

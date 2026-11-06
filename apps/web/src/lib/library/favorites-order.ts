@@ -12,6 +12,51 @@
 export type FavoriteMoveDirection = 'up' | 'down';
 
 /**
+ * Anchor captured at removal time so a later Undo restores the removed id
+ * near its original slot: the neighbors in the list as it was immediately
+ * before this removal, plus the numeric index there as a last resort.
+ */
+export interface FavoriteRestoreAnchor {
+	previousIndex: number;
+	predecessor: string | null;
+	successor: string | null;
+}
+
+/**
+ * Reinsert a removed favorite `id` into the stored order. Successor first:
+ * removals shift later elements left, so the surviving successor is the
+ * stable right edge — restoring after it (removal order or reverse) keeps
+ * adjacent Undos from swapping. Then the predecessor, then the clamped
+ * index when both neighbors are gone. A present id is a no-op returning
+ * `stored` itself, so callers can skip persistence with a reference check.
+ * Never mutates its inputs.
+ */
+export function restoreFavoriteId(
+	stored: readonly string[],
+	id: string,
+	anchor: FavoriteRestoreAnchor
+): readonly string[] {
+	if (stored.includes(id)) return stored;
+	const next = [...stored];
+	if (anchor.successor !== null) {
+		const at = next.indexOf(anchor.successor);
+		if (at >= 0) {
+			next.splice(at, 0, id);
+			return next;
+		}
+	}
+	if (anchor.predecessor !== null) {
+		const at = next.indexOf(anchor.predecessor);
+		if (at >= 0) {
+			next.splice(at + 1, 0, id);
+			return next;
+		}
+	}
+	next.splice(Math.min(Math.max(anchor.previousIndex, 0), next.length), 0, id);
+	return next;
+}
+
+/**
  * Swap the visible favorite `id` with its visible neighbor in `direction`,
  * in their existing slots of the complete stored array. Ids absent from
  * `visibleIds` stay at their existing slots; membership is unchanged.

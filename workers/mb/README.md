@@ -3,8 +3,10 @@
 Rust (`workers-rs` → `wasm32`) read API over the `nntunev2-mb` Postgres
 database (via Hyperdrive). Schema: `migrations/0001_mb_mirror.sql`
 (mirror tables plus the single-row `mb_import_state` snapshot),
-`0016_mb_track.sql` (`mb_track` listing source) and
-`0017_mb_replication_packet_ledger.sql` (per-packet SLO ledger).
+`0016_mb_track.sql` (`mb_track` listing source),
+`0017_mb_replication_packet_ledger.sql` (per-packet SLO ledger) and
+`0030_mb_mirror_w6b.sql` (release groups, curated URL relationships,
+music-video pairs and ISRCs).
 Decision: `docs/adr/0007-mb-mirror.md`.
 
 ## Endpoints
@@ -16,13 +18,21 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
 | `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release in album order (`medium_no`, then `track_no`, then MBID), listed from `mb_track` membership, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
+| `GET` | `/v1/mb/release-group/:mbid` | Release-group lookup; success is the flat group fields (`mbid`, `name`, `artist_mbid`, `type`) plus `"kind": "release_group"`; same caching as other lookups |
+| `GET` | `/v1/mb/release-group/:mbid/releases` | Discography: releases of the group oldest-first (`year NULLS LAST`, then title, then MBID), `LIMIT 1000`; success is `{"release_group_mbid", "releases": [...]}` with release rows shaped like release lookups; existing group with no releases is `200` with an empty list, missing group is `404`; same caching as lookups |
+| `GET` | `/v1/mb/artist/:mbid/urls` | Curated external links (allowlisted relationship names only): `{"artist_mbid", "urls": [{"url_mbid", "url", "link_name"}]}`, ordered by URL then link name, `LIMIT 100`; missing artist is `404`, an artist with no curated links is `200` with an empty list; same caching as lookups |
+| `GET` | `/v1/mb/recording/:mbid/videos` | Music videos: the recording's `music video` pairs (either direction) joined to the other side's video-marked stream URLs: `{"recording_mbid", "videos": [{"recording_mbid", "url", "link_name"}]}` ordered by video recording, URL, link name, `LIMIT 500`; missing recording is `404`, no videos is `200` with an empty list; same caching as lookups |
+| `GET` | `/v1/mb/recording/:mbid/isrcs` | ISRCs in code order: `{"recording_mbid", "isrcs": [...]}` (uppercase canonical codes); `LIMIT 100`; missing recording is `404`, no ISRCs is `200` with an empty list; same caching as lookups |
 | `GET` | `/v1/mb/search?q=&type=&limit=&offset=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity; paged: `limit` defaults to `MAX_PAGE_SIZE` (25), over-limit clamped (never rejected), `limit=0` is `400`, `offset` defaults to 0 and is capped at `MAX_SEARCH_OFFSET` (1000, 40 pages at 25) — above the cap short-circuits to a 200 with `"results": []` and the effective offset echoed without touching KV or Postgres, at or below the cap queries as before; past-the-end (at or below the cap) is a 200 with `"results": []`; success `Cache-Control: public, max-age=300` |
 
 (Table sources: routes `workers/mb/src/lib.rs:1132-1159`; healthz
 `lib.rs:424-431,1049-1058`; lookup SQL/TTL `lib.rs:39-40,129-151`;
 recordings SQL `lib.rs:155-171` plus repo `lib.rs:874-895`; search
 validation/SQL `lib.rs:545-613,184-207`; `Cache-Control` rendering
-`lib.rs:943-972`.)
+`lib.rs:943-972`; W6b routes `lib.rs:2902-2915`; W6b SQL
+`lib.rs:219-283`; W6b DTOs/decoders `lib.rs:789-850`;
+W6b trait defaults `lib.rs:1011-1055` and repository
+`lib.rs:2183-2353`; W6b handlers `lib.rs:1509,1547,1584,1621,1658`.)
 
 Errors are JSON (`{"code", "message", "retryable"}`) with `Cache-Control: no-store`:
 malformed `:mbid` (must be UUID), unknown `type`, and short/long/control-character queries
@@ -56,7 +66,13 @@ score; release-recordings success is `{"release_mbid",
 with its medium position — unlike `mb_recording.release_mbid`, which
 keeps one canonical release per recording and would drop a reissue's
 shared tracks; a bare recording lookup answers `medium_no: null`.
-Interactive reads never call musicbrainz.org.
+W6b reads follow the same pattern: the group lookup returns the flat
+group fields plus `"kind"`; each listing returns its parent MBID plus a
+typed array (`releases` shaped like release rows, `urls`/`videos`
+with the row's own recording/url MBID, URL and link name, `isrcs` as
+plain canonical codes). A listing for a missing entity is `404`; an
+existing entity with zero rows is a cacheable `200` with an empty
+array. Interactive reads never call musicbrainz.org.
 (Sources: `"kind"` tag `workers/mb/src/lib.rs:294-319`; search hits
 `lib.rs:322-360`; recordings envelope `lib.rs:490-517`; null medium on
 bare lookups `lib.rs:140-147`; `mb_track` rationale
@@ -76,6 +92,20 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   release with zero recordings is a cacheable success; a missing
   release (`404`) is not cached.
   (Sources: key `lib.rs:250-252`; core `lib.rs:490-517`.)
+- W6b reads: KV keys `mb:lookup:release-group:<mbid>`,
+  `mb:group-releases:<mbid>`, `mb:artist-urls:<mbid>`,
+  `mb:recording-videos:<mbid>` and `mb:recording-isrcs:<mbid>`
+  (lowercase MBID), same 24 h TTL and edge treatment as lookups. An
+  existing entity with zero rows is a cacheable success; a missing
+  entity (`404`) is not cached. Cached bodies are validated like the
+  other kinds: the group body needs `"kind": "release_group"` with the
+  request MBID; listings must be typed arrays within their hard caps —
+  1000 group releases (release-shaped rows), 100 artist URLs, 500
+  recording videos, 100 ISRCs (uppercase canonical shape) — with
+  UUID-shaped ids and string URLs/names. Anything else is a miss that
+  falls through to the repository.
+  (Sources: keys `lib.rs:544-571`; validators `lib.rs:1247-1464`;
+  handlers `lib.rs:1509,1547,1584,1621,1658`.)
 - Search: KV key `mb:search:<kind>:<normalized q>:<limit>:<offset>`
   (query trimmed, lowercased, whitespace collapsed; SQL binds the same
   normalized value), 5 min TTL, so one page can never serve another
@@ -124,7 +154,7 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   (Sources: buckets `workers/mb/src/lib.rs:62-66`;
   `workers/mb/wrangler.toml:53-58,75-77,100-102`;
   `docs/ops.md:63-64,330,373`;
-  `docs/adr/0003-cache-scope.md:38-44`; JSON-only routes `lib.rs:1132-1159`.)
+  `docs/adr/0003-cache-scope.md:69-77`; JSON-only routes `lib.rs:1132-1159`.)
 
 ## p95 methodology (acceptance input)
 
@@ -211,6 +241,13 @@ log cap `replication.rs:14-19`.)
 
 Core MusicBrainz data is CC0; CAA images follow their per-image terms.
 Commercial use notes the MetaBrainz support tier (see ADR 0007).
+The W6b slice (release groups, URL relationships, music-video pairs,
+ISRCs) is core CC0 data mirrored from the twice-weekly CC0 dumps on
+the same terms: NC-licensed supplementary data (tags/genre
+associations, ratings, annotations) is excluded at import and never
+enters the mirror. Serve product reads from the mirror, not the live
+API (at most 1 request/second per IP with a descriptive `nntune/<version>
+( <contact> )` `User-Agent` for any live calls).
 
 ## Dev
 
