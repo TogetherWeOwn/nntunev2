@@ -415,14 +415,88 @@ renumbers a file that staging already has, the rename must be
 comment — and its manifest entry records the original name with the
 entry's own sha as
 `renamed_from = [{ file = "<old>", sha256 = "<same sha>" }]`; the gate
-then recognises the old row as that entry's apply. The
-`migrations-staging` PR check fails a rename that lacks this history,
-and the migrations gate rejects an alias whose sha differs from the
-entry's (a different sha would certify bytes never applied).
-History is append-only — never rewrite or delete a `schema_migrations`
-row to make a rename fit, and the migrations gate's drift check
-rejects removing or changing a `renamed_from` entry that exists on
-the base branch (additions are fine).
+then recognises the old row as that entry's apply. The migrations gate
+and staging loader reject an alias whose sha differs from the entry's.
+The `migrations-staging` PR check additionally proves each new alias's
+actual old Git blob has those bytes: copying today's hash onto a
+historical name is not provenance.
+
+Source lineage is separate. A file created, renamed, edited and renamed
+again within a PR records every differing-byte edge on its **final**
+manifest entry as structured `source_rename_history` tables:
+
+```toml
+# Within the final [[migration]] entry:
+[[migration.source_rename_history]]
+parent = "<full 40-character parent commit ID>"
+commit = "<full 40-character child commit ID>"
+old_path = "migrations/0001_example.sql"
+new_path = "migrations/0002_example.sql"
+old_sha256 = "<SHA-256 of the actual old blob at parent>"
+new_sha256 = "<SHA-256 of the actual new blob at commit>"
+```
+
+These six fields describe source evidence only. They never satisfy an
+applied migration or an ordered prior, enter backfill rows, or allow a
+history-only name to be applied. Keep byte-identical `renamed_from`
+identities separate; do not reclassify existing applied aliases. Both
+alias and source metadata are append-only against the pinned common
+merge base of the target and PR head. Target-only additions after divergence
+are not PR deletions; no merge from the target is required to hide them.
+Neither field permits editing/removing a base migration, changing its target,
+renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
+
+The secretless PR gate loads its checker and its stdlib-only
+`migration_history.py` import from a separate checkout of the event's full
+trusted **base SHA**. The PR **head SHA** is checked out with full Git
+history under a different root, used only as evidence through `--root`;
+no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+excludes the working directory, `PYTHONPATH` and user-site imports, then
+adds only the trusted checker directory. The checker runs outside both
+checkouts with no API token in its environment; Git ignores global/system
+configuration and disables hooks and filesystem-monitor commands. The
+PR tree cannot supply Git's local configuration, which checkout creates.
+The checked-out head supplies the manifest while pinned Git objects supply
+SQL bytes and ancestry. A PR predating the checker can therefore be
+validated without executing its Python files. Missing trusted checker code,
+manifest, pinned Git objects or API evidence fails closed: there is no
+fallback to PR code and no missing-file pass. This compatibility boundary
+does not grant old heads an exception to the manifest or lineage contract.
+
+The secretless PR gate retains **both** coverage sources: complete,
+paginated net PR-file mappings and every per-parent Git rename in the
+pinned base-to-head ancestry. Net mappings are not invented direct
+historical edges. The collector hashes actual old/new blobs and final
+bytes, tracks commit/path identities through ordinary intervening edits,
+and resolves every edge to exactly one final entry. An ambiguous merge,
+independent lineage reusing a ledger name, missing intermediate/tail,
+unreachable/forged evidence, invalid path/type, or truncated API/Git
+input refuses. New metadata is proved in the PR that adds it; immutable
+base metadata retains that proof after squash merge, even though the
+original PR commits need not remain ancestors of the new default head.
+`migration_history.py` declares hard bounds: 512 commits, 2048 edges,
+fewer than 3000 API files, 3000 migration paths per snapshot/diff,
+2 MB per input/blob, 8 MB per Git response, 128 MB aggregate Git output,
+100000 lineage states, 250000 event references, and 20 seconds per Git
+command. Exceeding a bound refuses rather than truncates evidence.
+
+Inside the existing advisory-locked apply transaction, rows under any
+historical source name are **deny-only** evidence: any non-permitted
+identity refuses before SQL or a ledger insert, including `--record-only`.
+Conflicts and duplicate current/alias rows are checked **before** an
+already-applied no-op, for the selected entry and earlier same-target
+priors. A good current row cannot hide conflicting history. Staging still
+requires exactly one current or genuine byte-identical alias row per app
+entry; differing historical rows, current-plus-history, duplicate aliases,
+unknown rows and missing entries fail exactly as before.
+
+If staging has no historical conflicting row, use the normal authorized
+apply/proof route for the exact current bytes. If any conflicting row
+exists, stop that apply and obtain a separately reviewed forward-repair
+or environment decision. Never reset a database, rewrite/delete ledger
+rows, bless changed bytes with `--record-only`, or generate fake backfill
+rows to make a gate green. Source metadata is not staging proof or a
+release/deployment authorization.
 
 Tracking began with the 2026-11-03 backfill
 (`docs/ops/schema-migrations-backfill-2026-11-03-app.sql` and
@@ -760,13 +834,20 @@ without a tag. Production therefore only ever deploys on the release path
 only (`environment: staging` on both deploy jobs). No other GitHub
 environment exists on this repo.
 
-- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
-  pull requests, not on `main`: record the PR whose squash commit is the
-  promotion SHA, and that they were green on that PR's final head
-  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
-  or recorded as a flake/quarantine decision with a card link, never
-  dismissed.
+- [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
+  URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
+  CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
+  never in a local CI mirror. Reviewers and the Release Manager accept
+  these exact-head links as CI evidence, not local full-suite transcripts
+  ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
+  `migrations-staging` and `Devin Review` report on pull requests, not on
+  `main`: record the PR whose squash commit is the promotion SHA, and that
+  they were green on that PR's final head. Answer any advisory CodeRabbit
+  findings without waiting for it. Required checks and review/release
+  gates are unchanged; this evidence does not authorize production or
+  replace the staging, migration and rollback boxes below. A red required
+  check is fixed in code or recorded as a flake/quarantine decision with
+  a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:233-241` runs

@@ -22,6 +22,9 @@ Covered:
   controlled session settings even under hostile parent ``PGOPTIONS``,
   observed from the backend, for apply, ``--record-only`` and
   already-recorded runs;
+- application-schema objects with matching routine, catalog, type and
+  operator names leave actual normal, record-only and existing-receipt
+  paths using the runner-owned tracking table and catalog behavior;
 - a wrong ``--expect-database`` that bypasses the URL precheck is
   refused inside the transaction on both A and B;
 - server-side statement timeout rollback, a committed apply whose
@@ -77,10 +80,11 @@ HOSTILE_PGOPTIONS = ("-c search_path=pg_temp -c statement_timeout=1 "
                      "-c idle_in_transaction_session_timeout=1")
 
 PROBE = (
-    "SELECT 'PROBE|' || current_setting('search_path') || '|' || "
-    "(SELECT string_agg(setting, ',' ORDER BY name) FROM pg_settings "
-    "WHERE name IN ('idle_in_transaction_session_timeout', 'lock_timeout', "
-    "'statement_timeout')) || '|' || current_setting('standard_conforming_strings');\n"
+    "SELECT 'PROBE|' || pg_catalog.current_setting('search_path') || '|' || "
+    "(SELECT pg_catalog.string_agg(setting, ',' ORDER BY name) FROM pg_catalog.pg_settings "
+    "WHERE name OPERATOR(pg_catalog.=) ANY (ARRAY["
+    "'idle_in_transaction_session_timeout', 'lock_timeout', 'statement_timeout'])) "
+    "|| '|' || pg_catalog.current_setting('standard_conforming_strings');\n"
 )
 
 FINGERPRINT_SQL = r"""
@@ -170,24 +174,26 @@ def fresh_database(env, name):
 
 
 class Files:
-    """Throwaway migration files plus a manifest; one target per file so
-    the prior-history guard never couples unrelated cases."""
+    """Throwaway files with independent, valid app manifests so the
+    prior-history guard never couples unrelated cases."""
 
     def __init__(self, root, files):
         self.root = pathlib.Path(root)
-        manifest = ""
+        self.manifests = {}
         for index, (name, body) in enumerate(files.items()):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
             (self.root / name).write_bytes(data)
-            manifest += (f'[[migration]]\nfile = "{name}"\ntarget = "t{index}"\n'
-                         f'sha256 = "{hashlib.sha256(data).hexdigest()}"\n')
-        self.manifest = self.root / "manifest.toml"
-        self.manifest.write_text(manifest, encoding="utf-8")
+            manifest = (f'[[migration]]\nfile = "{name}"\ntarget = "app"\n'
+                        f'sha256 = "{hashlib.sha256(data).hexdigest()}"\n')
+            path = self.root / f"manifest-{index}.toml"
+            path.write_text(manifest, encoding="utf-8")
+            self.manifests[name] = path
+        self.manifest = next(iter(self.manifests.values()))
 
     def argv(self, name, database, record_only=False, manifest=None,
              applied_by="runtime-fixture"):
         argv = ["--file", str(self.root / name),
-                "--manifest", str(manifest or self.manifest),
+                "--manifest", str(manifest or self.manifests[name]),
                 "--applied-by", applied_by, "--expect-database", database]
         if record_only:
             argv.append("--record-only")
@@ -525,6 +531,139 @@ def case_controlled_session(env):
     log("controlled-session-settings-observed-in-backend")
 
 
+def case_application_namespace(env):
+    """Search-path pin isolates runner from application-schema objects."""
+    base = _base()
+    database, role = "nntune_rt_namespace", "apply_rt_namespace_reader"
+    with fresh_database(env, database) as (nenv, url), \
+            tempfile.TemporaryDirectory() as tmp:
+        base.run_psql(nenv, """
+            CREATE TABLE public.namespace_calls (note pg_catalog.text);
+            CREATE FUNCTION public.current_database() RETURNS pg_catalog.name
+                LANGUAGE sql AS $$ SELECT 'application_fixture'::pg_catalog.name $$;
+            CREATE FUNCTION public.now() RETURNS pg_catalog.timestamptz
+                LANGUAGE sql AS $$ SELECT '2000-01-01Z'::pg_catalog.timestamptz $$;
+            CREATE FUNCTION public.pg_advisory_xact_lock(pg_catalog.int8) RETURNS void
+                LANGUAGE sql AS $$ SELECT pg_catalog.pg_sleep(0) $$;
+            CREATE TABLE public.pg_class (
+                oid pg_catalog.oid, relnamespace pg_catalog.oid, relname pg_catalog.name,
+                relowner pg_catalog.oid, relacl pg_catalog.aclitem[]);
+            CREATE TABLE public.pg_namespace (oid pg_catalog.oid, nspname pg_catalog.name);
+            CREATE TABLE public.pg_attribute (
+                attrelid pg_catalog.oid, attname pg_catalog.name, attnum pg_catalog.int2,
+                attisdropped pg_catalog.bool, attacl pg_catalog.aclitem[]);
+            CREATE DOMAIN public.text AS pg_catalog.text;
+            CREATE DOMAIN public.timestamptz AS pg_catalog.timestamptz;
+            CREATE TYPE public.record AS (note pg_catalog.text);
+            CREATE FUNCTION public.namespace_equal(pg_catalog.text, pg_catalog.text)
+                RETURNS pg_catalog.bool LANGUAGE plpgsql AS $$
+                BEGIN
+                    INSERT INTO public.namespace_calls VALUES ('equal');
+                    RETURN $1 OPERATOR(pg_catalog.=) $2;
+                END $$;
+            CREATE OPERATOR public.= (
+                LEFTARG = pg_catalog.text, RIGHTARG = pg_catalog.text,
+                FUNCTION = public.namespace_equal);
+        """)
+        # Positive fixture control: these objects really are selected by
+        # an unqualified application-schema session, not inert test data.
+        assert base.scalar(nenv, """
+            SET search_path = public,pg_catalog;
+            SELECT current_database();""") == "application_fixture"
+        assert base.scalar(nenv, """
+            BEGIN;
+            SET LOCAL search_path = public,pg_catalog;
+            SELECT 'a'::pg_catalog.text = 'a'::pg_catalog.text;
+            SELECT pg_catalog.count(*) FROM public.namespace_calls;
+            ROLLBACK;""") == "t\n1"
+        assert count(nenv, "public.namespace_calls") == "0"
+        files = Files(tmp, {
+            "0002_namespace.sql": (
+                "CREATE TABLE public.namespace_effect (held pg_catalog.bool);\n"
+                "INSERT INTO public.namespace_effect SELECT EXISTS (\n"
+                "  SELECT 1 FROM pg_catalog.pg_locks\n"
+                "  WHERE locktype OPERATOR(pg_catalog.=) 'advisory' AND granted\n"
+                "    AND objid = 7271901 AND pid = pg_catalog.pg_backend_pid());\n"),
+            "0003_namespace.sql": (
+                "CREATE TABLE public.namespace_recorded (id pg_catalog.int4);\n"
+                "INSERT INTO public.namespace_recorded VALUES (7);\n"),
+        })
+        hostile = {"PGOPTIONS": HOSTILE_PGOPTIONS}
+        with spying() as spy:
+            rc, out, _err = inproc(
+                url, files.argv("0002_namespace.sql", database), parent_env=hostile)
+        assert rc == 0 and "recorded for" in out, "namespace normal apply failed"
+        assert len(spy.calls) == 2
+        for label, call in zip(("namespace-apply-A", "namespace-apply-B"), spy.calls):
+            assert call["rc"] == 0
+            assert_controlled(call, label)
+        assert base.scalar(nenv, "SELECT held FROM public.namespace_effect;") == "t"
+        assert base.scalar(nenv, """
+            SELECT pg_catalog.string_agg(a.attname || ':' || a.atttypid::pg_catalog.text,
+                                         ',' ORDER BY a.attname)
+            FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid = 'public.schema_migrations'::pg_catalog.regclass
+              AND a.attnum > 0 AND NOT a.attisdropped;""") == (
+                  "applied_at:1184,applied_by:25,file:25,sha256:25")
+        assert base.scalar(nenv, """
+            SELECT pg_catalog.bool_and(applied_at > '2000-01-02Z'::pg_catalog.timestamptz)
+            FROM public.schema_migrations;""") == "t"
+
+        # The record-only fixture was independently applied; B must leave
+        # its non-idempotent body alone while recording the original hash.
+        raw_apply(nenv, files.root / "0003_namespace.sql")
+        base.run_psql(env, f"CREATE ROLE {role};")
+        try:
+            for name, record_only, already in (
+                    ("0003_namespace.sql", True, False),
+                    ("0002_namespace.sql", False, True),
+                    ("0003_namespace.sql", True, True)):
+                base.run_psql(nenv, f"""
+                    GRANT SELECT, INSERT ON public.schema_migrations TO {role};
+                    GRANT SELECT (file), UPDATE (sha256)
+                        ON public.schema_migrations TO {role};""")
+                before = receipt_rows(nenv)
+                with spying() as spy:
+                    rc, out, _err = inproc(
+                        url, files.argv(name, database, record_only=record_only),
+                        parent_env=hostile)
+                assert rc == 0, "namespace record/no-op apply failed"
+                assert len(spy.calls) == 2 and spy.calls[0]["rc"] == 0
+                assert (spy.calls[1]["rc"] != 0) == already
+                if already:
+                    assert "already recorded" in out
+                    assert receipt_rows(nenv) == before
+                for label, call in zip(("namespace-record-A", "namespace-record-B"),
+                                       spy.calls):
+                    assert_controlled(call, label)
+                # A must find the actual catalogs and revoke both write
+                # grants, even when B takes the existing-receipt path.
+                assert base.scalar(nenv, f"""
+                    SELECT pg_catalog.has_table_privilege('{role}',
+                        'public.schema_migrations', 'SELECT')
+                       AND pg_catalog.has_column_privilege('{role}',
+                        'public.schema_migrations', 'file', 'SELECT');""") == "t"
+                base.assert_psql_fails(nenv, f"""
+                    SET ROLE {role};
+                    INSERT INTO public.schema_migrations (file, sha256, applied_by)
+                    VALUES ('0099_no_write.sql', '{'a' * 64}', 'fixture');""")
+                base.assert_psql_fails(nenv, f"""
+                    SET ROLE {role};
+                    UPDATE public.schema_migrations SET sha256 = '{'b' * 64}';""")
+                assert count(nenv, "public.namespace_effect") == "1"
+                assert base.scalar(nenv, "SELECT id FROM public.namespace_recorded;") == "7"
+                assert count(nenv, "public.schema_migrations") == "2"
+                assert count(nenv, "public.namespace_calls") == "0"
+            for name in files.manifests:
+                sha = hashlib.sha256((files.root / name).read_bytes()).hexdigest()
+                assert base.scalar(nenv, f"SELECT sha256 FROM public.schema_migrations "
+                                        f"WHERE file = '{name}';") == sha
+        finally:
+            base.run_psql(nenv, f"DROP OWNED BY {role};")
+            base.run_psql(env, f"DROP ROLE {role};")
+    log("application-namespace-independent-runner-paths")
+
+
 def case_wrong_expected_database(env):
     am = _am()
     body = "CREATE TABLE wrongdb_effect (id int);\n"
@@ -761,7 +900,8 @@ def run(env, test_env):
     """Entry point; ``test_env`` (the suite's database) is not reused."""
     assert test_env.get("PGDATABASE") != env.get("PGDATABASE")
     for case in (case_mirror_five, case_concurrent, case_injected_failures,
-                 case_controlled_session, case_wrong_expected_database,
+                 case_controlled_session, case_application_namespace,
+                 case_wrong_expected_database,
                  case_timeout_and_unknown_commit, case_wrappers, case_noop_acl):
         case(env)
 

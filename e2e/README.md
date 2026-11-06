@@ -64,6 +64,48 @@ the activation checklist is accurate:
   endpoints, and usage-meter enforcement still depend on their venture
   slices; the journey specs expose those missing backend behaviors directly.
 
+## Track interaction hooks
+
+Track menus and selection add hooks without renaming the existing library,
+queue, audio or metering contracts. `helpers/contract.ts` registers
+`track-more`, `favorite-more` and `track-selection-toolbar` on the library, and
+`queue-more`, `queue-drop-target` and `queue-selection-toolbar` on the shared
+queue panel. `track-context-menu` belongs to the shared top-layer menu;
+only an open menu renders it. Scope row actions by the existing stable
+`data-id` (library) or `data-track-id` (queue), never by row position.
+The queue selection toolbar renders only while tracks are selected.
+
+`apps/web/src/lib/contract.test.ts` checks both route and shared-component
+sources for these declarations. Browser coverage lives in
+`apps/web/tests/track-interactions.spec.ts`; it complements rather than
+replaces the existing range-selection and playback journey suites.
+
+Queue insertion/reordering and Select remain metadata-only. The separate
+Play now menu action is an explicit transport gesture: it hydrates only the
+selected track, attempts playback once, and reports blocked or streamless
+outcomes without retrying. Batch Play now arranges the whole displayed selection,
+including the old current track when selected. Queue toolbar moves and Play next
+retain queue order even when checkboxes were activated in reverse order.
+Later queue/auth changes invalidate pending playback feedback. Done restores stranded focus to a surviving control rather than the
+page body; group drops resolve insertion boundaries outside the moving IDs.
+Copy link is inline rather than a one-choice submenu. The playlist slot
+is reserved and disabled with a "Not available yet" hint; backend routes
+and a playlist picker are pending. Arrow keys can discover the slot, but
+activation changes nothing and type-ahead skips it. Touch queue
+grips autoscroll the nearest scrolling pane while held at its edge; drop,
+Escape, hidden-page and unmount cleanup stop the animation.
+Pending long-presses cancel on page blur, hiding, scroll or pointer release
+outside the row; a hidden page also invalidates native drag tokens before
+any later drop. Unit tests cover gesture lifecycle cleanup, and browser
+coverage includes interruption cases plus open-menu/batch-selection axe scans
+at desktop and narrow widths. Those scans reject serious/critical findings;
+they do not replace manual keyboard, touch or assistive-technology review.
+
+These UI changes follow **AGENTS.md — Clean-room, YouTube and MetaBrainz
+guardrails**: original presentation, existing semantic colours, no changes to
+embedded video or catalogue licensing. Offline interaction tests are not
+staging ingest→play→meter acceptance evidence.
+
 ## Player contract migration (app-shell redesign, design spec v1)
 
 The custom player bar replaces the native `<audio controls>` timeline this
@@ -118,24 +160,22 @@ B8 feeds the signed-URL vectors to staging and compares the wire verdicts
 against the matrix expectations. Vector ids (`botgrant-NNN`, `boturl-NNN`,
 `botmx-NNN`) are stable and citable; fixtures name secrets only.
 
-## Run locally
+## Run in GitHub Actions
 
-```sh
-cd e2e
-npm ci
-npx playwright install --with-deps chromium
-STAGING_BASE_URL=https://staging.example \
-  CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
-  CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
-  SYNTHETIC_NNTP_HOST='<synthetic fixture host>' \
-  SYNTHETIC_NNTP_PORT='563' \
-  SYNTHETIC_NNTP_USER='<test user>' \
-  SYNTHETIC_NNTP_PASS='<from ~/secure-drop>' \
-  npm run e2e:staging
-```
+Push the PR branch and open a draft PR while work is incomplete. The
+`e2e-lint` job in [CI](../.github/workflows/ci.yml) runs harness typechecking,
+offline self-tests and spec discovery as part of `ci-ok`; these are not a
+local CI-mirror checklist. Full staging journeys run only through the
+post-deploy Actions path described below, not from a local shell.
 
-Smoke only: `npm run e2e:smoke`. Validate without staging: `npm run typecheck`,
-`npm run test:unit`, and `npm run e2e:list`.
+Local tests are limited to focused reproduction of one failing test from
+an Actions job. Select that test explicitly rather than invoking the full
+`test:unit`, `e2e:staging` or smoke suite. Heavy focused reproduction must
+use the guarded `boat` PATH wrapper with `--no-env`, source-only export and
+verified cleanup; do not forward staging or host credentials. A fallback
+cannot authorize a full suite or heavy raw-host run. If the reproduction
+cannot meet these limits, use Actions or route its actual prerequisite.
+See [verification policy](../CONTRIBUTING.md#verification-github-actions-first).
 
 If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
@@ -212,7 +252,7 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Form-to-library arrival is asserted by `signup-arrival.spec.ts`: the
+  Form-to-billing arrival is asserted by `signup-arrival.spec.ts`: the
   code-plus-passkey finish retrieves the code from the staging-only
   `POST /api/test-codes` seam, which is live on staging
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
@@ -332,6 +372,13 @@ How the suite uses them:
   enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
+
+For PR CI, record the full reviewed head SHA plus exact-head Actions run
+and `e2e-lint`/`ci-ok` job URLs and conclusions, following
+[the evidence contract](../CONTRIBUTING.md#evidence-for-review-and-release).
+Reviewers and the Release Manager accept those links as CI evidence, not
+local full-suite transcripts. They do not replace the same-deployed-build
+journey, authorized production promotion, migration or rollback gates.
 
 On failure CI sanitizes then uploads `test-results/` only (7 days, junit).
 Raw traces and screenshots are disabled: tracing records request

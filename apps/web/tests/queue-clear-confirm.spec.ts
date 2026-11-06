@@ -124,18 +124,22 @@ function cancelButton(page: Page): Locator {
 const IRREVERSIBLE = /cannot be undone|irreversible|permanently|no undo/i;
 
 function clearDialog(page: Page): Locator {
-	// Any container holding BOTH the irreversibility disclosure and removal
-	// language. The triggers ("Clear queue") never carry the former, so this
-	// cannot match a trigger; no dialog role is required of the Builder.
+	// The confirm is a fieldset (role group), not a div/dialog: locate the
+	// Builder's own confirm hook and assert it holds BOTH the
+	// irreversibility disclosure and removal language together. The
+	// triggers ("Clear queue") never carry the former, so this cannot
+	// match a trigger; the app-shell top bar lives outside the page main.
 	return page
-		.locator('div, section, dialog, [role="dialog"], [role="alertdialog"]')
+		.getByRole('main')
+		.getByTestId('queue-clear-confirm')
 		.filter({ hasText: IRREVERSIBLE })
 		.filter({ hasText: /remov|clear|delet|wip/i });
 }
 
 function trimDialog(page: Page): Locator {
 	return page
-		.locator('div, section, dialog, [role="dialog"], [role="alertdialog"]')
+		.getByRole('main')
+		.getByTestId('queue-clear-confirm')
 		.filter({ hasText: IRREVERSIBLE })
 		.filter({ hasText: /upcoming/i });
 }

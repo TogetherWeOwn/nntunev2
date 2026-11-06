@@ -43,19 +43,15 @@ describe('explicit paywall retry actions', () => {
 		expect(retry).not.toHaveBeenCalled();
 	});
 
-	it('forwards the provider UI action, without automatically replaying the request', async () => {
-		const retry = vi.fn();
+	it('publishes the limit through the client without automatically replaying the request', async () => {
 		const fetchFn = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 'rate_limited' }), {
 			status: 429, headers: { 'content-type': 'application/json', 'Retry-After': '0' }
 		}));
 		const client = new ApiClient({ baseUrl: 'https://api.example.test', fetchFn });
-		const failure = await client.testProviderConnection({
-			host: 'news.example.test', port: 563, tls: true, allow_insecure_plaintext: false,
-			username: 'fixture-reader', password: 'fixture-password', max_connections: 4
-		}, retry).catch((error: unknown) => error);
+		const failure = await client.requestMagicLink('alice@example.test').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
-		expect((failure as ApiError).paywall?.retry).toBe(retry);
+		expect((failure as ApiError).paywall).not.toBeNull();
+		expect((failure as ApiError).paywall?.retry).toBeUndefined();
 		expect(fetchFn).toHaveBeenCalledTimes(1);
-		expect(retry).not.toHaveBeenCalled();
 	});
 });

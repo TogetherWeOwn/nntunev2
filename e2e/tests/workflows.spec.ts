@@ -107,9 +107,13 @@ test.describe('ci-ok aggregate', () => {
   for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
-      const needs = JSON.stringify({ placeholder: { result: 'success' }, 'e2e-lint': { result } }, null, 2);
+      const needs = JSON.stringify({
+        placeholder: { result: 'success' },
+        'public-pr-security': { result: 'success' },
+        'e2e-lint': { result },
+      }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs });
+      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
@@ -280,7 +284,7 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).toContain('TESTIDS.signupSubmit');
     expect(helper).toContain('TESTIDS.signupError');
     // The real page is two-step: the helper asserts the emailed-code step
-    // (magic_code form), never library arrival — asserting the library
+    // (magic_code form), never billing arrival — asserting billing
     // without the code-retrieval seam reds every configured run.
     expect(helper).toContain('magic_code');
     expect(helper).not.toContain('TESTIDS.byopHost');
@@ -290,28 +294,30 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).not.toContain('qaAuthHeader');
   });
 
-  // Library-arrival leg: the new spec proves the real form reaches
-  // `/library` via the virtual authenticator + the staging-only code seam.
+  // Billing-arrival leg: the new spec proves the real form reaches
+  // `/account/billing` via the virtual authenticator + the staging-only code seam.
   // These pins keep it honest offline: still no mint, still skip-green
   // pre-deploy, still names-only diagnostics — while the arrival assertion
   // lives in the NEW helper (the shared helper above must keep asserting the
-  // `magic_code` step only, never the library).
-  test('library-arrival case reaches the library with no account-seam mint', () => {
+  // `magic_code` step only, never billing).
+  test('billing-arrival case reaches billing with no account-seam mint', () => {
     const spec = readFileSync(new URL('../tests/signup-arrival.spec.ts', import.meta.url), 'utf8');
-    const marker = "test('public UI signup with virtual authenticator reaches the library'";
+    const marker = "test('public UI signup with virtual authenticator reaches billing'";
     const start = spec.indexOf(marker);
-    expect(start, 'library-arrival case is missing').toBeGreaterThan(-1);
+    expect(start, 'billing-arrival case is missing').toBeGreaterThan(-1);
     const rest = spec.slice(start + marker.length);
     const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
     const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
     // Null identity = Access pair only: the page starts unauthenticated, so
     // the form is the only account-creation path even with QA_AUTH_TOKEN set.
     expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
-    expect(dedicated).toContain('submitPublicUiSignupToLibrary(page, request, baseURL)');
-    // Arrival asserted at the spec level too (landed URL + library heading).
-    expect(dedicated).toContain("'/library'");
+    expect(dedicated).toContain('submitPublicUiSignupToBilling(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + billing heading).
+    expect(dedicated).toContain("'/account/billing'");
     expect(dedicated).toContain('page.url()');
-    expect(dedicated).toContain("toContainText('Library'");
+    expect(dedicated).toContain("toContainText('Billing'");
+    expect(dedicated).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(dedicated).toContain("page.getByRole('link', { name: 'See plans', exact: true })).toBeVisible()");
     // Never the mint seam: arrival must come from the public form.
     expect(dedicated).not.toContain('tryMintTestAccount');
     expect(dedicated).not.toContain('API.testAccounts');
@@ -323,13 +329,13 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(dedicated).toContain('annotateSignupPath');
   });
 
-  test('library-arrival helper completes the form via the code seam and virtual authenticator', () => {
+  test('billing-arrival helper completes the form via the code seam and virtual authenticator', () => {
     const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
-    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToLibrary');
-    expect(helperStart, 'library-arrival helper is missing').toBeGreaterThan(-1);
-    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToLibrary'.length);
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToBilling');
+    expect(helperStart, 'billing-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToBilling'.length);
     const nextExport = helperRest.search(/\nexport /);
-    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToLibrary'.length + nextExport);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToBilling'.length + nextExport);
     // Real form, both steps: email submit then the emailed-code field.
     expect(helper).toContain('`${baseURL}/signup`');
     expect(helper).toContain('TESTIDS.signupEmail');
@@ -342,10 +348,13 @@ test.describe('public UI signup coverage (static pin)', () => {
     // Passkey finish runs against a virtual authenticator, not hardware
     // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
     expect(helper).toContain('enableVirtualAuthenticator');
-    // Library arrival asserted here (unlike the shared helper above).
-    expect(helper).toContain("'/library'");
+    // Billing arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/account/billing'");
     expect(helper).toContain('page.url()');
-    expect(helper).toContain("toContainText('Library'");
+    expect(helper).toContain("toContainText('Billing'");
+    expect(helper).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(helper).toContain("page.getByRole('link', { name: 'See plans', exact: true })");
+    expect(helper).toContain('authenticated billing action not visible after public UI signup');
     // Never the mint seam in the arrival path.
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
@@ -949,7 +958,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
     expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
-    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
     const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
@@ -1028,7 +1037,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
     for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
       const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
-      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      const calls = [...workflow.matchAll(/uses: [.$]\/\.github\/workflows\/e2e-staging\.yml\b/g)].length;
       expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
     }
   });
@@ -2189,8 +2198,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
     // gate must never pass --allow-skip in a real deploy.
     const allowSkipMutant = jobsBody.replace(
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING" --allow-skip',
     );
     // Api lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
@@ -2473,6 +2482,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       weakenedRegexMutant,
       weakenedExactHostMutant,
     ]) {
+      expect(mutant, 'mutation must change the workflow').not.toBe(jobsBody);
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.

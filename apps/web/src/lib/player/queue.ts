@@ -119,6 +119,47 @@ export function addTrack(state: QueueState, track: Track): QueueState {
 	};
 }
 
+/**
+ * Insert a known set of tracks before a stable queue id (null = end).
+ * Existing slots keep their metadata; repeated ids move once, in input order.
+ * The current identity survives, including when it is one of the moved rows.
+ * A stale destination or a destination inside the moving set is a no-op.
+ */
+export function insertTracks(
+	state: QueueState,
+	incoming: readonly Track[],
+	beforeId: string | null = null
+): QueueState {
+	const existing = new Map(state.tracks.map((track) => [track.id, track]));
+	if (beforeId !== null && !existing.has(beforeId)) return state;
+	const moving = new Map<string, Track>();
+	for (const track of incoming) {
+		if (!track.id || moving.has(track.id)) continue;
+		moving.set(track.id, existing.get(track.id) ?? track);
+	}
+	if (moving.size === 0 || (beforeId !== null && moving.has(beforeId))) return state;
+	const remaining = state.tracks.filter((track) => !moving.has(track.id));
+	const at = beforeId === null ? remaining.length : remaining.findIndex((track) => track.id === beforeId);
+	const tracks = [...remaining.slice(0, at), ...moving.values(), ...remaining.slice(at)];
+	if (tracks.length === state.tracks.length && tracks.every((track, index) => track === state.tracks[index])) {
+		return state;
+	}
+	const currentId = currentTrack(state)?.id;
+	return {
+		tracks,
+		currentIndex: currentId === undefined ? 0 : tracks.findIndex((track) => track.id === currentId)
+	};
+}
+
+/** Place known tracks immediately after the current one, never moving current. */
+export function insertTracksNext(state: QueueState, incoming: readonly Track[]): QueueState {
+	const currentId = currentTrack(state)?.id;
+	const tracks = incoming.filter((track) => track.id !== currentId);
+	const moving = new Set(tracks.map((track) => track.id));
+	const next = state.tracks.slice(state.currentIndex + 1).find((track) => !moving.has(track.id));
+	return insertTracks(state, tracks, next?.id ?? null);
+}
+
 export function clearQueue(state: QueueState): QueueState {
 	if (state.tracks.length === 0) return state;
 	return { tracks: [], currentIndex: -1 };

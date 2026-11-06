@@ -588,6 +588,17 @@ test.describe('anonymousGet (no credentials, no follow)', () => {
 });
 
 test.describe('readApiBody', () => {
+  test('body-read errors are discarded without exposing their message or cause', async () => {
+    const sentinel = 'synthetic-body-read-secret';
+    const raw = Object.assign(new Error(sentinel), { cause: new Error(sentinel) });
+    const body = await readApiBody({
+      status: () => 200,
+      headers: () => ({}),
+      text: async () => { throw raw; },
+    }, 'https://fixture.invalid/probe', 'body-read');
+    expect(body).toBe('');
+  });
+
   test('returns the body text for a clean response', async () => {
     const body = await readApiBody(
       {
@@ -1639,7 +1650,7 @@ test.describe('signupInlineErrorMessage names the registerStart status', () => {
   // Static pin: both public-signup helpers must assert the inline error
   // through the formatter, so reverting either one to a constant message
   // (losing the status on a red staging leg) fails offline.
-  for (const name of ['submitPublicUiSignup', 'submitPublicUiSignupToLibrary']) {
+  for (const name of ['submitPublicUiSignup', 'submitPublicUiSignupToBilling']) {
     test(`${name} asserts the inline error with the registerStart status`, () => {
       const source = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
       const marker = `export async function ${name}(`;

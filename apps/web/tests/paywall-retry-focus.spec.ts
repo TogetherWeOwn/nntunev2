@@ -1,13 +1,25 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function reachProviderTest(page: Page): Promise<void> {
-	await page.goto('/onboarding/provider');
-	await page.locator('[name=host]').fill('news.example.test');
-	await page.locator('[name=username]').fill('fixture-reader');
-	await page.locator('[name=password]').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue', exact: true }).click();
-	await page.getByRole('button', { name: 'Continue', exact: true }).click();
-	await expect(page.getByTestId('byop-test-connection')).toBeVisible();
+const SUBSCRIPTION_OK = {
+	state: 'active',
+	planId: 'free',
+	status: 'active',
+	currentPeriodEnd: null,
+	cancelAtPeriodEnd: false
+};
+const USAGE_OK = {
+	period: '2026-10',
+	resetsAt: '2026-11-01T00:00:00.000Z',
+	streamSecondsMonth: 0,
+	concurrentNow: 0,
+	libraryTracks: 0,
+	ingestToday: 0
+};
+
+async function mockUsageOk(page: Page): Promise<void> {
+	await page.route('**/v1/me/usage', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(USAGE_OK) })
+	);
 }
 
 function deferred() {
@@ -16,39 +28,48 @@ function deferred() {
 	return { promise, resolve };
 }
 
-test('Retry keeps meaningful focus while the repeated provider test is pending', async ({ page }) => {
-	let requests = 0;
+test('Retry keeps meaningful focus while the repeated billing load is pending', async ({ page }) => {
+	let subscriptionCalls = 0;
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
-	await page.route('**/v1/vault/test', async (route) => {
-		requests += 1;
-		if (requests > 1) await gate;
-		await route.fulfill({
-			status: requests === 1 ? 429 : 200,
-			headers: { 'content-type': 'application/json', 'Retry-After': '0' },
-			body: JSON.stringify(requests === 1 ? { code: 'rate_limited' } : { ok: true, latencyMs: 12 })
-		});
+	await page.route('**/v1/me/subscription', async (route) => {
+		subscriptionCalls += 1;
+		if (subscriptionCalls === 1) {
+			await route.fulfill({
+				status: 429,
+				headers: { 'content-type': 'application/json', 'Retry-After': '0' },
+				body: JSON.stringify({ code: 'rate_limited' })
+			});
+		} else {
+			await gate;
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify(SUBSCRIPTION_OK)
+			});
+		}
 	});
+	await mockUsageOk(page);
 	try {
-		await page.goto('/onboarding/provider');
-		await page.locator('[name=host]').fill('news.example.test');
-		await page.locator('[name=username]').fill('fixture-reader');
-		await page.locator('[name=password]').fill('fixture-password');
-		await page.getByRole('button', { name: 'Continue', exact: true }).click();
-		await page.getByRole('button', { name: 'Continue', exact: true }).click();
-		await page.getByRole('button', { name: 'Test connection', exact: true }).click();
+		await page.goto('/account/billing');
 		const dialog = page.getByRole('dialog');
 		await expect(dialog).toBeVisible();
+		// The modal Retry carries no retry action: it only dismisses.
 		await dialog.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(dialog).toBeHidden();
-		await expect(page.getByTestId('byop-test-connection')).toBeDisabled();
-		await expect(page.getByRole('main')).toBeFocused();
-		expect(requests).toBe(2);
+		expect(subscriptionCalls).toBe(1);
+		// The explicit page Retry reruns the loader; the held response keeps
+		// the control mounted and focused while the reattempt is pending.
+		const retry = page.getByRole('button', { name: 'Retry', exact: true });
+		await retry.click();
+		await expect.poll(() => subscriptionCalls).toBe(2);
+		await expect(retry).toBeFocused();
 	} finally {
 		release();
 	}
-	await expect(page.getByTestId('byop-save')).toBeVisible();
-	expect(requests).toBe(2);
+	await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	expect(subscriptionCalls).toBe(2);
 });
 
 test('Retry without a UI action dismisses and restores meaningful focus, without replay', async ({ page }) => {
@@ -76,77 +97,94 @@ test('Retry without a UI action dismisses and restores meaningful focus, without
 test('Retry stays disabled throughout a known wait and sends only an explicit ready retry', async ({ page }) => {
 	const start = new Date('2026-10-19T12:00:00Z');
 	await page.clock.install({ time: start });
-	let requests = 0;
-	await page.route('**/v1/vault/test', (route) => {
-		requests += 1;
-		return route.fulfill({
-			status: requests === 1 ? 429 : 200,
-			headers: { 'content-type': 'application/json', 'Retry-After': '30' },
-			body: JSON.stringify(requests === 1 ? { code: 'rate_limited' } : { ok: true, latencyMs: 12 })
-		});
+	let subscriptionCalls = 0;
+	await page.route('**/v1/me/subscription', (route) => {
+		subscriptionCalls += 1;
+		return route.fulfill(
+			subscriptionCalls === 1
+				? {
+					status: 429,
+					headers: { 'content-type': 'application/json', 'Retry-After': '30' },
+					body: JSON.stringify({ code: 'rate_limited' })
+				}
+				: {
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify(SUBSCRIPTION_OK)
+				}
+		);
 	});
-	await reachProviderTest(page);
+	await mockUsageOk(page);
+	// Pause before navigation: the loader fires on goto, and the deadline
+	// is wall-clock from the limit response.
 	await page.clock.pauseAt(new Date(start.getTime() + 300_000));
-	await page.getByTestId('byop-test-connection').click();
+	await page.goto('/account/billing');
 	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
 	const retry = dialog.getByRole('button', { name: 'Retry', exact: true });
 	await expect(page.getByTestId('paywall-countdown')).toHaveText('Try again in 30 seconds.');
 	await expect(retry).toBeDisabled();
 	// A real pointer activation of the disabled control must neither close nor submit.
 	await retry.click({ force: true });
 	await expect(dialog).toBeVisible();
-	expect(requests).toBe(1);
+	expect(subscriptionCalls).toBe(1);
 	await page.clock.runFor(29_000);
 	await expect(page.getByTestId('paywall-countdown')).toHaveText('Try again in 1 second.');
 	await expect(retry).toBeDisabled();
 	await page.clock.runFor(1_000);
 	await expect(retry).toBeEnabled();
-	expect(requests).toBe(1);
+	expect(subscriptionCalls).toBe(1);
+	// The ready modal Retry only dismisses (no retry action is attached);
+	// the explicit page Retry is the single resubmission.
 	await retry.click();
 	await expect(dialog).toBeHidden();
-	await expect(page.getByTestId('byop-save')).toBeVisible();
-	expect(requests).toBe(2);
+	expect(subscriptionCalls).toBe(1);
+	await page.getByRole('button', { name: 'Retry', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+	expect(subscriptionCalls).toBe(2);
 });
 
-test('Retry from a provider page that unmounted never replays its credential-bearing request', async ({ page }) => {
-	await page.addInitScript(() => {
-		sessionStorage.setItem('nntune:signed-in-email', 'fixture@example.test');
-	});
-	let requests = 0;
-	await page.route('**/v1/vault/test', (route) => {
-		requests += 1;
+test('Retry from a billing page that unmounted never replays its portal request', async ({ page }) => {
+	let portalCalls = 0;
+	await page.route('**/v1/me/subscription', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(SUBSCRIPTION_OK) })
+	);
+	await mockUsageOk(page);
+	await page.route('**/v1/billing/portal', (route) => {
+		portalCalls += 1;
 		return route.fulfill({
 			status: 429,
 			headers: { 'content-type': 'application/json', 'Retry-After': '0' },
 			body: JSON.stringify({ code: 'rate_limited' })
 		});
 	});
-	await reachProviderTest(page);
-	// Build forward history through the real client-side link, not a document load.
-	await page.getByRole('link', { name: 'sign in again', exact: true }).click();
-	await expect(page).toHaveURL(/\/login\/?$/);
-	await page.goBack();
-	await expect(page).toHaveURL(/\/onboarding\/byop\/?$/);
-	await page.locator('[name=host]').fill('news.example.test');
-	await page.locator('[name=username]').fill('fixture-reader');
-	await page.locator('[name=password]').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue', exact: true }).click();
-	await page.getByRole('button', { name: 'Continue', exact: true }).click();
-	await page.getByTestId('byop-test-connection').click();
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+	);
+	// Build history with a client-side link so the layout (and its modal)
+	// stays mounted; a document load would restore a layout without one.
+	await page.goto('/library');
+	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();
+	await expect(page).toHaveURL(/\/account\/billing\/?$/);
+	const opener = page.getByRole('button', { name: 'Manage billing', exact: true });
+	await opener.click();
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
-	await page.goForward();
-	await expect(page).toHaveURL(/\/login\/?$/);
-	await expect(page.getByTestId('byop-test-connection')).toHaveCount(0);
-	// The layout-owned modal survives; the provider component and its opener do not.
+	// Leave through history: the layout-owned modal survives; the billing
+	// component and its opener do not.
+	await page.goBack();
+	await expect(page).toHaveURL(/\/library\/?$/);
+	await expect(opener).toHaveCount(0);
 	await expect(dialog).toBeVisible();
-	const replay = page.waitForRequest('**/v1/vault/test', { timeout: 1_000 })
+	const replay = page
+		.waitForRequest('**/v1/billing/portal', { timeout: 1_000 })
 		.then(() => true, () => false);
 	await dialog.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expect(dialog).toBeHidden();
 	await expect(page.getByRole('main')).toBeFocused();
 	expect(await replay).toBe(false);
-	expect(requests).toBe(1);
+	expect(portalCalls).toBe(1);
 });
 
 test('equal-text replacements each deliver a new live announcement and shown event', async ({ page }) => {

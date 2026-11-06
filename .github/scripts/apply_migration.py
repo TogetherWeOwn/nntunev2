@@ -37,11 +37,13 @@ import argparse
 import hashlib
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
-import tomllib
 import urllib.parse
+
+import migration_history
 
 # The tracking table's rows are deploy proof for the staging gate, so
 # its write privileges are pinned here. The dated backfill generator
@@ -127,6 +129,7 @@ ALREADY_SAME = "schema-migrations: already recorded"
 ALREADY_DIFFERENT = "schema-migrations: recorded with a different sha256"
 WRONG_DATABASE = "schema-migrations: unexpected database"
 MISSING_PRIOR = "schema-migrations: earlier migration not recorded"
+CONFLICTING_HISTORY = "schema-migrations: conflicting recorded history"
 
 FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
 DATABASE_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -273,10 +276,16 @@ def transaction_body(body):
 
 def load_manifest(manifest_path):
     try:
-        data = tomllib.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        return migration_history.parse_manifest(migration_history.read_input(manifest_path))
+    except migration_history.HistoryError as exc:
         raise ApplyError(f"cannot read manifest: {exc}") from exc
-    return data.get("migration", [])
+
+
+def validate_entries(entries):
+    try:
+        return migration_history.validate_entries(entries)
+    except migration_history.HistoryError as exc:
+        raise ApplyError(f"invalid manifest: {exc}") from exc
 
 
 def entry_identity(entry):
@@ -296,6 +305,7 @@ def resolve_entry(entries, filename, sha256):
     an apply can never skip or reorder history (the mirror target has
     no downstream gate that would catch a gap).
     """
+    validate_entries(entries)
     for index, entry in enumerate(entries):
         identity = entry_identity(entry)
         if dict(identity).get(filename) is not None:
@@ -365,22 +375,60 @@ def ddl_sql(expected_database):
             + DDL + "\n")
 
 
-def guard_sql(identity, expected_database, priors=()):
+def history_names_for(entries, identity):
+    """Basenames of every source-history edge of the selected entry and
+    of each earlier same-target entry.
+
+    The selected entry is found by its identity in the full entry list.
+    Edges are taken exactly as attached to those entries (both paths),
+    with no inference from other names. Source history is a deny-list
+    input only: it never makes any name part of an identity and never
+    satisfies a prior.
+    """
+    index = next(i for i, entry in enumerate(entries)
+                 if entry_identity(entry) == identity)
+    target = entries[index]["target"]
+    found = set()
+    for entry in entries[:index + 1]:
+        if entry["target"] != target:
+            continue
+        for edge in entry.get("source_rename_history", []):
+            found.add(posixpath.basename(edge["old_path"]))
+            found.add(posixpath.basename(edge["new_path"]))
+    return tuple(sorted(found))
+
+
+def guard_sql(identity, expected_database, priors=(), history_names=()):
     """Abort the transaction on a wrong DB or bad recording state.
 
     The marker texts are ours, so the caller can tell "already applied
     with these bytes" (a no-op) from a conflicting record (refuse)
     without rendering database output. Priors are earlier same-target
     identities; each must already be recorded, under any of its names,
-    before this migration may apply.
+    before this migration may apply. ``history_names`` are the historical
+    source names attached to this entry and its earlier same-target
+    entries; the current and alias names of the priors are denied too. A row under one of them,
+    or under an identity name, is refused unless it is a permitted
+    (file, sha256) pair, whatever else is recorded. History never adds
+    a permitted pair and never satisfies a prior.
     """
     def pairs_of(pairs):
         return " OR ".join(
             f"(file OPERATOR(pg_catalog.=) {quote_literal(name)} "
             f"AND sha256 OPERATOR(pg_catalog.=) '{sha}')" for name, sha in pairs)
 
+    permitted = list(identity) + [pair for prior in priors for pair in prior]
+    denied = sorted({name for pairs in (identity, *priors) for name, _sha in pairs}
+                    | set(history_names))
+    duplicate_checks = "".join(f"""
+    IF (SELECT pg_catalog.count(*) FROM public.schema_migrations
+        WHERE {pairs_of(pairs)}) OPERATOR(pg_catalog.>) 1 THEN
+        RAISE EXCEPTION '{CONFLICTING_HISTORY}';
+    END IF;""" for pairs in (identity, *priors))
     names = " OR ".join(
         f"file OPERATOR(pg_catalog.=) {quote_literal(name)}" for name, _sha in identity)
+    denied_names = " OR ".join(
+        f"file OPERATOR(pg_catalog.=) {quote_literal(name)}" for name in denied)
     prior_checks = "".join(f"""
     IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
                WHERE {pairs_of(prior)}) THEN
@@ -392,6 +440,12 @@ BEGIN
     IF pg_catalog.current_database() OPERATOR(pg_catalog.<>) {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
+    IF EXISTS (SELECT 1 FROM public.schema_migrations
+               WHERE ({denied_names})
+                 AND NOT ({pairs_of(permitted)})) THEN
+        RAISE EXCEPTION '{CONFLICTING_HISTORY}';
+    END IF;
+    {duplicate_checks.strip()}
     IF EXISTS (SELECT 1 FROM public.schema_migrations
                WHERE {pairs_of(identity)}) THEN
         RAISE EXCEPTION '{ALREADY_SAME}';
@@ -417,13 +471,14 @@ def compose(file_path, manifest_path, applied_by, record_only=False,
     except OSError as exc:
         raise ApplyError(f"cannot read migration: {exc}") from exc
     sha256 = hashlib.sha256(contents).hexdigest()
-    target, identity, priors = resolve_entry(
-        load_manifest(manifest_path), filename, sha256)
+    entries = load_manifest(manifest_path)
+    target, identity, priors = resolve_entry(entries, filename, sha256)
+    history_names = history_names_for(entries, identity)
     try:
         body = transaction_body(contents.decode("utf-8"))
     except UnicodeError as exc:
         raise ApplyError("migration must be valid UTF-8") from exc
-    parts = [guard_sql(identity, expect_database, priors)]
+    parts = [guard_sql(identity, expect_database, priors, history_names)]
     if not record_only:
         parts.append(body.rstrip() + "\n")
     parts.append(insert_sql(filename, sha256, applied_by, on_conflict=False))
@@ -490,6 +545,10 @@ def psql(child, sql, single_transaction=False):
         if WRONG_DATABASE in result.stderr:
             raise ApplyError(
                 "connected database does not match --expect-database; refusing")
+        if CONFLICTING_HISTORY in result.stderr:
+            raise ApplyError(
+                "recorded history conflicts with the manifest or source "
+                "rename history; refusing")
         if MISSING_PRIOR in result.stderr:
             raise ApplyError(
                 "an earlier same-target migration is not recorded; "

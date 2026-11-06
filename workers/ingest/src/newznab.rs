@@ -1,30 +1,32 @@
-//! Newznab search for BYO indexers.
+//! Newznab search for the admin-ingest indexer.
 //!
-//! Security contract (see the vault card: raw provider/indexer keys live in
-//! the BYOP vault, never in repo, logs, or API bodies):
+//! ADMIN-INGEST-ONLY BOUNDARY. The base URL is operator configuration for
+//! the admin-ingest path, never a user-supplied value. Raw indexer keys
+//! are service-held admin-ingest secrets: they live in the admin-ingest
+//! secret path, never in repo, logs, or API bodies, and never in a user
+//! vault.
 //!
 //! - [`build_search_url`] builds the query URL **without** the key.
-//! - [`inject_api_key`] adds `&apikey=` server-side from the vault binding,
-//!   at request time only.
+//! - [`inject_api_key`] adds `&apikey=` server-side from the service-held
+//!   admin-ingest key, at request time only.
 //! - [`redact_api_key`] scrubs the key for logs. Log the redacted URL only.
 //! - `http://` indexer URLs are refused: the key would travel in cleartext.
 
 /// Documented worker/API error code for a stale *indexer* API key (S7).
 /// Deliberately distinct from the NNTP provider's `provider_auth_expired`
 /// (`nntune-core`, `workers/api`, `workers/stream`): the two secrets are
-/// fixed through different prompts, and provider rotation preserves the
-/// indexer key verbatim. The web app answers this code with copy asking
-/// for the indexer API key, never the provider password. Safe to log and
-/// to return in error bodies.
+/// rotated through different operator paths, and provider rotation
+/// preserves the indexer key verbatim. Remediation is operator rotation
+/// through the admin-ingest secret path, never a user prompt: there is no
+/// user re-entry flow. Safe to log and to return in error bodies.
 pub const INDEXER_AUTH_EXPIRED_CODE: &str = "indexer_auth_expired";
 
 /// True when an indexer HTTP status means the stored API key was rejected
-/// and the user must re-enter it (S7). Only 401 maps here: 403 from an
-/// indexer is routinely a rate limit, WAF, or blocked account rather than
-/// a bad key, so it must not trigger a credential prompt. Every other
-/// status stays a generic failure. The caller returns
-/// [`INDEXER_AUTH_EXPIRED_CODE`] and MUST NOT include the key, the URL, or
-/// the upstream body.
+/// (S7). Only 401 maps here: 403 from an indexer is routinely a rate
+/// limit, WAF, or blocked account rather than a bad key, so it must not
+/// be read as a stale key. Every other status stays a generic failure.
+/// The caller returns [`INDEXER_AUTH_EXPIRED_CODE`] and MUST NOT include
+/// the key, the URL, or the upstream body.
 pub fn is_indexer_auth_failure(http_status: u16) -> bool {
     http_status == 401
 }
@@ -122,10 +124,12 @@ fn endpoint_for_base(base: &str) -> String {
 
 /// Build the `https://{indexer}/api?...` query URL **without** the key.
 ///
-/// A saved base URL that already ends at the API endpoint is preserved (see
-/// [`endpoint_for_base`]); otherwise one `/api` segment is appended.
-/// Returns an error for empty queries, out-of-range limits, http URLs,
-/// and credential-embedding hosts.
+/// `params.base_url` is operator configuration for the admin-ingest path,
+/// never a user-supplied value: a user-supplied base URL must never be
+/// fetched server-side. A configured base URL that already ends at the API
+/// endpoint is preserved (see [`endpoint_for_base`]); otherwise one `/api`
+/// segment is appended. Returns an error for empty queries, out-of-range
+/// limits, http URLs, and credential-embedding hosts.
 pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static str> {
     let base = check_base_url(params.base_url)?;
     let q = params.query.trim();
@@ -163,10 +167,12 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
     Ok(url)
 }
 
-/// Append the vault-resolved key at request time. Never log the result.
+/// Append the service-held admin-ingest key at request time. Never log
+/// the result.
 ///
-/// Honors the saved-key contract the vault and setup wizard enforce: a
-/// nonempty key of at most 1024 UTF-8 bytes (`str::len` is byte length).
+/// The only contract is length: a nonempty key of at most 1024 UTF-8
+/// bytes (`str::len` is byte length). The key comes from the
+/// admin-ingest secret path, never from user input or a user vault.
 pub fn inject_api_key(url_without_key: &str, api_key: &str) -> Result<String, &'static str> {
     if api_key.is_empty() || api_key.len() > 1024 {
         return Err("api key must be 1..=1024 bytes");
