@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import filecmp
+import gzip
 import hashlib
+import io
 import os
 import sqlite3
 import sys
@@ -115,10 +117,40 @@ def required_int(field: str, context: str) -> int:
         raise ValueError(f"{context}: invalid integer {parsed!r}") from exc
 
 
+# Disk-bounded mode (R2 snapshot spike, `stream_extract.py`): inputs may be
+# `<table>.gz` instead of `<table>`, MB_ETL_CONSUME_INPUTS=1 deletes each
+# input once it is fully loaded, and MB_ETL_GZIP_OUTPUT=1 writes the curated
+# files as `mbdump-<table>.tsv.gz`. All three are off by default, so the
+# importer's plain-file contract is unchanged.
+CONSUME_INPUTS = os.environ.get("MB_ETL_CONSUME_INPUTS") == "1"
+GZIP_OUTPUT = os.environ.get("MB_ETL_GZIP_OUTPUT") == "1"
+OUTPUT_SUFFIX = ".tsv.gz" if GZIP_OUTPUT else ".tsv"
+
+
+def open_input(path: Path):
+    if path.is_file():
+        return path, path.open("r", encoding="utf-8", newline="")
+    packed = path.with_name(path.name + ".gz")
+    if packed.is_file():
+        return packed, gzip.open(packed, "rt", encoding="utf-8", newline="")
+    raise ValueError(f"missing input file: {path}")
+
+
+def open_output(path: Path):
+    if GZIP_OUTPUT:
+        # mtime=0 keeps the bytes reproducible for the same-DUMP_TS reuse check.
+        packed = gzip.GzipFile(path, "wb", compresslevel=1, mtime=0)
+        return io.TextIOWrapper(packed, encoding="utf-8", newline="")
+    return path.open("w", encoding="utf-8", newline="")
+
+
+def curated_name(table: str) -> str:
+    return f"mbdump-{table}{OUTPUT_SUFFIX}"
+
+
 def rows(path: Path, expected: int):
-    if not path.is_file():
-        raise ValueError(f"missing input file: {path}")
-    with path.open("r", encoding="utf-8", newline="") as source:
+    actual, source = open_input(path)
+    with source:
         for line_number, line in enumerate(source, 1):
             if line.endswith("\n"):
                 line = line[:-1]
@@ -130,6 +162,8 @@ def rows(path: Path, expected: int):
                     f"{path}: row {line_number}: expected {expected} fields, got {len(fields)}"
                 )
             yield fields
+    if CONSUME_INPUTS:
+        actual.unlink()
 
 
 def load(db: sqlite3.Connection, path: Path, expected: int, select_positions: tuple[int, ...], table: str, columns: str, convert=None) -> int:
@@ -208,7 +242,7 @@ def validate_timestamp(timestamp: str) -> str:
 
 def insert_select(db: sqlite3.Connection, query: str, output_path: Path, updated_at: str, row_transform=None) -> int:
     count = 0
-    with output_path.open("w", encoding="utf-8", newline="") as output:
+    with open_output(output_path) as output:
         for row in db.execute(query):
             fields = row_transform(row) if row_transform else row
             output.write("\t".join(NULL if item is None else str(item) for item in (*fields, updated_at)) + "\n")
@@ -461,7 +495,7 @@ def main() -> int:
                     LEFT JOIN area ar ON ar.id=i.area
                     ORDER BY a.id
                 """
-                artist_count = insert_select(db, artist_query, output_dir / "mbdump-artist.tsv", updated_at)
+                artist_count = insert_select(db, artist_query, output_dir / curated_name("artist"), updated_at)
                 release_group_query = """
                     SELECT g.gid,g.name,a.gid,pt.name
                     FROM release_group g
@@ -471,7 +505,7 @@ def main() -> int:
                     LEFT JOIN release_group_primary_type pt ON pt.id=g.type_id
                     ORDER BY g.id
                 """
-                release_group_count = insert_select(db, release_group_query, output_dir / "mbdump-release_group.tsv", updated_at)
+                release_group_count = insert_select(db, release_group_query, output_dir / curated_name("release_group"), updated_at)
                 release_query = """
                     SELECT r.gid,a.gid,r.name,pt.name,
                            (SELECT MIN(year) FROM (SELECT rc.year FROM release_country rc WHERE rc.release=r.id UNION ALL SELECT ruc.year FROM release_unknown_country ruc WHERE ruc.release=r.id) WHERE year IS NOT NULL),
@@ -487,7 +521,7 @@ def main() -> int:
                 release_count = insert_select(
                     db,
                     release_query,
-                    output_dir / "mbdump-release.tsv",
+                    output_dir / curated_name("release"),
                     updated_at,
                     lambda row: (row[0], row[1], row[2], row[3], row[4], f"https://coverartarchive.org/release/{row[0]}/front-250", row[5]),
                 )
@@ -518,7 +552,7 @@ def main() -> int:
                 """).fetchone()
                 if missing_release:
                     raise ValueError(f"recording {missing_release[0]} resolves to missing release {missing_release[1]}")
-                recording_count = insert_select(db, recording_query, output_dir / "mbdump-recording.tsv", updated_at)
+                recording_count = insert_select(db, recording_query, output_dir / curated_name("recording"), updated_at)
                 # Every track appearance becomes one membership row, unlike
                 # the canonical single release on the recording row above:
                 # a recording shared with a reissue/compilation is listed
@@ -534,13 +568,13 @@ def main() -> int:
                     JOIN recording rec ON rec.id=t.recording
                     ORDER BY rel.id,m.position,t.position,t.id
                 """
-                track_count = insert_select(db, track_query, output_dir / "mbdump-track.tsv", updated_at)
+                track_count = insert_select(db, track_query, output_dir / curated_name("track"), updated_at)
                 # URLs: only the allowlisted relationship targets the `url`
                 # load kept.
                 url_query = """
                     SELECT gid,url FROM url ORDER BY id
                 """
-                url_count = insert_select(db, url_query, output_dir / "mbdump-url.tsv", updated_at)
+                url_count = insert_select(db, url_query, output_dir / curated_name("url"), updated_at)
                 # Relationship pairs, deduplicated: one curated row per
                 # (entity, url, link type). The joins are total: the
                 # reference checks above already rejected orphans, and every
@@ -555,7 +589,7 @@ def main() -> int:
                     JOIN link_type lt ON lt.id=k.link_type
                     ORDER BY a.gid,u.gid,lt.name
                 """
-                artist_url_count = insert_select(db, artist_url_query, output_dir / "mbdump-artist_url.tsv", updated_at)
+                artist_url_count = insert_select(db, artist_url_query, output_dir / curated_name("artist_url"), updated_at)
                 # is_video marks links carrying the "video" attribute: the
                 # music-video -> stream join follows only those URLs. One row
                 # per (recording, url, link type): when the same triple is
@@ -575,7 +609,7 @@ def main() -> int:
                     ORDER BY rec.gid,u.gid,lt.name
                 """
                 recording_url_count = 0
-                with (output_dir / "mbdump-recording_url.tsv").open("w", encoding="utf-8", newline="") as output:
+                with open_output(output_dir / curated_name("recording_url")) as output:
                     for row in db.execute(recording_url_query, (video_attr_id,)):
                         is_video = "true" if row[3] else "false"
                         output.write("\t".join(NULL if item is None else str(item) for item in (*row[:3], is_video, updated_at)) + "\n")
@@ -594,7 +628,7 @@ def main() -> int:
                     WHERE r0.id != r1.id
                     ORDER BY 1,2
                 """
-                music_video_count = insert_select(db, music_video_query, output_dir / "mbdump-recording_music_video.tsv", updated_at)
+                music_video_count = insert_select(db, music_video_query, output_dir / curated_name("recording_music_video"), updated_at)
                 # ISRCs, deduplicated and uppercased (the mirror CHECK
                 # requires the canonical 12-character uppercase form).
                 isrc_query = """
@@ -603,7 +637,7 @@ def main() -> int:
                     JOIN recording rec ON rec.id=i.recording
                     ORDER BY rec.gid,2
                 """
-                isrc_count = insert_select(db, isrc_query, output_dir / "mbdump-recording_isrc.tsv", updated_at)
+                isrc_count = insert_select(db, isrc_query, output_dir / curated_name("recording_isrc"), updated_at)
 
                 for table, input_count, output_count in (
                     ("artist", counts["artist"], artist_count),
@@ -639,7 +673,7 @@ def main() -> int:
             snapshot = dump_dir / snapshot_name
             if snapshot.exists():
                 for table in ("artist", "release_group", "release", "recording", "track", "url", "artist_url", "recording_url", "recording_music_video", "recording_isrc"):
-                    name = f"mbdump-{table}.tsv"
+                    name = curated_name(table)
                     if not filecmp.cmp(output_dir / name, snapshot / name, shallow=False):
                         raise ValueError("this DUMP_TS already has different curated output; use a new timestamp")
             else:

@@ -42,6 +42,13 @@ mod api_error;
 use api_error::ApiError;
 
 pub mod replication;
+pub mod snapshot;
+
+/// Backend selector var. Unset (every deployed environment) keeps the
+/// Hyperdrive repository; `r2snapshot` routes to the phase 0 spike backend
+/// ([`snapshot`]), which only the spike measurement Worker sets.
+pub const MB_BACKEND_VAR: &str = "MB_BACKEND";
+pub const MB_BACKEND_R2_SNAPSHOT: &str = "r2snapshot";
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
@@ -2893,6 +2900,15 @@ pub async fn main(
     env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if env
+        .var(MB_BACKEND_VAR)
+        .map(|v| v.to_string())
+        .ok()
+        .as_deref()
+        == Some(MB_BACKEND_R2_SNAPSHOT)
+    {
+        return snapshot::spike_fetch(req, env).await;
+    }
     worker::Router::new()
         .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
