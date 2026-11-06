@@ -273,6 +273,11 @@ ADMISSION_EXPECTED = {
         "sealed::postgres_sealed_plan_concurrent_writers_converge_without_resealing",
         "sealed::postgres_sealed_plan_immutability_and_migration_replay_preserve_custody",
         "sealed::postgres_sealed_plan_unknown_wrong_key_and_cross_row_envelopes_fail_closed",
+        "sealed::preparation::postgres_private_preparation_composes_actual_sealed_plan_startup_and_readonly_recovery",
+        "sealed::preparation::postgres_private_preparation_exact_replay_keeps_envelope_and_divergence_refuses",
+        "sealed::preparation::postgres_private_preparation_malformed_and_foreign_provenance_write_nothing",
+        "sealed::preparation::postgres_private_preparation_open_requires_exact_dispatch_plan_version_and_digest",
+        "sealed::preparation::postgres_private_preparation_rechecks_role_after_unlocked_private_open",
     )
 }
 

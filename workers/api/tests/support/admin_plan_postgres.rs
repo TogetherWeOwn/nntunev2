@@ -11,6 +11,9 @@ use crate::rotation::KekSource;
 use tokio_postgres::Client;
 use zeroize::Zeroizing;
 
+#[path = "admin_preparation_postgres.rs"]
+mod preparation;
+
 const MODE: PlanMode = PlanMode::PreparationOnly;
 
 struct Keys(Zeroizing<[u8; 32]>);

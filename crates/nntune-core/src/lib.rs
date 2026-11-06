@@ -45,6 +45,7 @@ pub mod nzb_writer;
 pub mod original_source;
 pub mod par2;
 pub mod pinned_transport;
+pub mod preparation_plan;
 pub mod rng;
 pub mod segment_identity;
 pub mod transcode;

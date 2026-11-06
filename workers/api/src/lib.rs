@@ -24,6 +24,7 @@ mod field_envelope;
 pub mod handlers;
 pub mod ingest_grant;
 pub mod ingest_plan;
+pub mod ingest_plan_service;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;

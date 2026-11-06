@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 
+#[path = "posted_generation_preparation.rs"]
+pub mod preparation;
 #[path = "posted_generation_storage.rs"]
 pub mod storage;
 

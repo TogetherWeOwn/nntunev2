@@ -2083,6 +2083,25 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
             return;
         }
     };
+    // Opaque preparation pointers never enter the old search/upload parser.
+    // In preparation-only mode legacy payloads also refuse, not fallback.
+    use crate::posted_generations::dispatch::{preparation, DispatchMode, DispatchPointer};
+    let generation_shape = value.get("version").is_some() || value.get("id").is_some();
+    let preparation_mode = preparation::mode(env);
+    if generation_shape || preparation_mode != Ok(DispatchMode::Disabled) {
+        let recovered = match serde_json::from_value::<DispatchPointer>(value) {
+            Ok(pointer) if preparation_mode == Ok(DispatchMode::PreparationOnly) => {
+                preparation::recover_delivery(env, &pointer).await.is_ok()
+            }
+            _ => false,
+        };
+        if recovered {
+            raw.ack();
+        } else {
+            retry_raw(&raw, UNPERSISTED_RETRY_SECS);
+        }
+        return;
+    }
     let mut msg = match serde_json::from_value::<QueueMsg>(value) {
         Ok(msg) => msg,
         Err(_) => {
