@@ -289,5 +289,5 @@ guard, final-chunk prune); `test-import.sh:819-835` (older dump leaves rows alon
 `migrations/0016_mb_track.sql:38-43` (check swaps);
 `migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps);
 `migrations/0030_mb_mirror_w6b.sql:103-114` (`table_name` check extension);
-`migrations/0035_mb_mirror_phase2_relations.sql:241-264` (`table_name` check extension),
+`migrations/0035_mb_mirror_phase2_relations.sql:243-252,255-264` (`table_name` check extension),
 `:265-267` (runner-owned atomic validation and receipt).)
