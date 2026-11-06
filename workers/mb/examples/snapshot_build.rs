@@ -17,7 +17,7 @@
 use nntune_mb::snapshot::{
     deflate_block, encode_idx_entry, idx_object, key_bucket, mbid_bucket, title_key, word_key,
     words, ArtistRow, BlockRef, Posting, RecordingRow, ReleaseRow, BUCKETS, IDX_ENTRY_LEN, IDX_LEN,
-    MAX_BLOCK_BYTES, MAX_PART_BYTES, MAX_TITLE_POSTINGS, MAX_WORD_POSTINGS, SEARCH_KIND,
+    MAX_PART_BYTES, MAX_SNAPSHOT_BLOCK_BYTES, MAX_TITLE_POSTINGS, MAX_WORD_POSTINGS, SEARCH_KIND,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -240,9 +240,9 @@ impl KindWriter {
             plain.push_str(value);
             plain.push('\n');
         }
-        if plain.len() > MAX_BLOCK_BYTES {
+        if plain.len() > MAX_SNAPSHOT_BLOCK_BYTES {
             return Err(format!(
-                "{}: bucket {bucket} is {} bytes, above the {MAX_BLOCK_BYTES}-byte block cap",
+                "{}: bucket {bucket} is {} bytes, above the {MAX_SNAPSHOT_BLOCK_BYTES}-byte block cap",
                 self.stem,
                 plain.len()
             ));

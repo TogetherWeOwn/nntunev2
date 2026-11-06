@@ -37,7 +37,7 @@ pub const IDX_ENTRY_LEN: usize = 16;
 pub const IDX_LEN: usize = BUCKETS * IDX_ENTRY_LEN;
 /// Inflated block cap: a corrupt or hostile block cannot exhaust isolate
 /// memory. The builder refuses to write a block above it.
-pub const MAX_BLOCK_BYTES: usize = 8 << 20;
+pub const MAX_SNAPSHOT_BLOCK_BYTES: usize = 8 << 20;
 /// `pg_trgm.similarity_threshold` default: the `%` predicate's floor.
 pub const SEARCH_MIN_SCORE: f32 = 0.3;
 /// Word keys fetched per search, longest words first (longer words are
@@ -127,9 +127,9 @@ pub fn deflate_block(plain: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec(plain, 6)
 }
 
-/// Inflate one block, refusing anything above [`MAX_BLOCK_BYTES`].
+/// Inflate one block, refusing anything above [`MAX_SNAPSHOT_BLOCK_BYTES`].
 pub fn inflate_block(raw: &[u8]) -> Option<Vec<u8>> {
-    miniz_oxide::inflate::decompress_to_vec_with_limit(raw, MAX_BLOCK_BYTES).ok()
+    miniz_oxide::inflate::decompress_to_vec_with_limit(raw, MAX_SNAPSHOT_BLOCK_BYTES).ok()
 }
 
 /// The value for `key` in an inflated block (`key\tvalue` lines). Blocks are
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn inflate_refuses_oversized_blocks() {
-        let big = vec![b'a'; MAX_BLOCK_BYTES + 1];
+        let big = vec![b'a'; MAX_SNAPSHOT_BLOCK_BYTES + 1];
         assert!(inflate_block(&deflate_block(&big)).is_none());
         assert_eq!(inflate_block(&deflate_block(b"k\tv\n")).unwrap(), b"k\tv\n");
     }
