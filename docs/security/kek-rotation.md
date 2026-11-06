@@ -272,10 +272,10 @@ Per row (either table):
 2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, dek_aad(user, current), DEK)`
    via `vault::rewrap_dek` (never rebuild AAD by hand). For a
    `providers` row the same step re-wraps under the v2 DEK AAD (bound
-   to user + row + KEK version, `workers/api/src/providers.rs`),
+   to user + row + KEK version, `workers/api/src/field_envelope.rs`, `Context::aad`),
    never the v1 helper. The provider-specific same-DEK re-wrap helper
    is still a prerequisite for that runner extension; do not substitute
-   `encrypt_provider_creds` (it generates a new DEK and payload), and
+   `field_envelope::seal` (it generates a new DEK and payload), and
    never hand-roll the private v2 AAD. Until the helper lands, provider
    re-wrap is unavailable and the combined retire gate remains closed.
 3. Conditional write — a compare-and-swap on the captured envelope,
@@ -532,7 +532,7 @@ Instead:
    against the current envelope, and the newer envelope is never
    overwritten. Every `providers` row at the exposed version gets the
    same re-key (new random DEK, payload re-encrypted, wrap under
-   KEK[M] with the v2 DEK AAD via `providers::encrypt_provider_creds`,
+   KEK[M] with the v2 DEK AAD via `field_envelope::seal`,
    same captured-envelope CAS as the §6 providers UPDATE): the minted
    copies keep DEKs wrapped under the exposed key until they do.
 3. Treat provider and indexer credentials in ANY pre-rotation snapshot,

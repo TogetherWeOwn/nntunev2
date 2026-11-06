@@ -187,19 +187,22 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
 async function mockAccountApis(page: Page): Promise<void> {
-	await page.route('**/v1/vault', (route) =>
+	await page.route('**/v1/me/*', (route) =>
+		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
+	);
+	await page.route('**/v1/me/subscription', (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: 'application/json',
 			body: JSON.stringify({
-				provider_configured: false,
-				indexer_configured: false,
-				updated_at: 0
+				state: 'no_subscription',
+				planId: null,
+				status: null,
+				currentPeriodEnd: null,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
 			})
 		})
-	);
-	await page.route('**/v1/me/*', (route) =>
-		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
 	);
 }
 
@@ -1022,7 +1025,7 @@ test('[NAV-02b v2] account and settings pages mark the account-menu entry, not t
 }) => {
 	await mockLibrary(page, 200, []);
 	await mockAccountApis(page);
-	for (const path of ['/account/billing', '/account/security', '/account/provider']) {
+	for (const path of ['/account/billing', '/account/security']) {
 		await page.goto(path);
 		await expectShellPresent(page, path);
 		await expectCurrentDestination(page, path, 'Account');
@@ -1526,7 +1529,7 @@ test('[NAV-18 v2] native links plus design-token styling, design route-table all
 	// The design route table (design spec v1 §2). Demo routes are absent
 	// on purpose: they are unlinked (NAV-10 v2).
 	const ROUTE_TABLE =
-		/^\/(home|search(\/.*)?|library(\/.*)?|artist\/[^/]+(\/.*)?|album\/[^/]+|playlist\/[^/]+|track\/[^/]+|genre\/[^/]+|section\/[^/]+|queue|now-playing|settings(\/.*)?|account(\/.*)?|onboarding\/byop|pricing|login|signup|auth\/magic)?$/;
+		/^\/(home|search(\/.*)?|library(\/.*)?|artist\/[^/]+(\/.*)?|album\/[^/]+|playlist\/[^/]+|track\/[^/]+|genre\/[^/]+|section\/[^/]+|queue|now-playing|settings(\/.*)?|account(\/.*)?|pricing|login|signup|auth\/magic)?$/;
 	for (const link of hrefs) {
 		expect(
 			link.tag,

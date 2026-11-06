@@ -1,23 +1,49 @@
 # NNTune v2 agent notes
 
+## CI and verification location
+
+Full test suites and CI gates run on GitHub Actions, never as local
+full-suite or CI-mirror commands on the shared host. Push the PR branch
+and open a draft PR while incomplete; the actual workflow is
+`.github/workflows/ci.yml` with the aggregate `ci-ok` gate.
+[CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first)
+defines focused reproduction, guarded Boat use and exact-head Actions
+run/job evidence for reviewers and the Release Manager. Local transcripts
+are not CI evidence; required checks and review/release gates stay intact.
+
+Local test execution is allowed only for focused reproduction of one
+failing test or crate. Heavy focused work uses the guarded `boat` PATH
+wrapper with sizing/budget/security controls, `--no-env`, a source-only
+export and verified cleanup. Boat fallback never permits a full suite,
+CI mirror or heavy raw-host build; defer to Actions if a permitted
+focused fallback is unavailable.
+
 ## Local Rust builds: the bounded Cargo pool
 
-Compiling Cargo commands never use a per-worktree `target/`. They go
-through the bounded slot pool in `scripts/cargo_cache.py`, either
-directly or via the host `cargo` shim (which routes automatically when
-that file exists):
+Only small focused Rust reproductions belong in this host pool. Compiling
+Cargo commands never use a per-worktree `target/`. They go through the
+bounded slot pool in `scripts/cargo_cache.py`, either directly or via the
+host `cargo` shim (which routes automatically when that file exists):
 
 ```sh
-python3 scripts/cargo_cache.py run -- check
-python3 scripts/cargo_cache.py run -- test
-python3 scripts/cargo_cache.py run -- clippy --all-targets -- -D warnings
-python3 scripts/cargo_cache.py run -- build
+# Copy both the package and fully qualified harness test name from the failing Actions job.
+python3 scripts/cargo_cache.py run -- test -p <failing_package> <fully_qualified_test_name> -- --exact
+# Or reproduce the one failing standalone crate, not every manifest:
+python3 scripts/cargo_cache.py run -- test --manifest-path <failing_crate_manifest>
 ```
 
-Per-manifest crates work the same way, e.g. `run -- test
---manifest-path workers/api/Cargo.toml`. `run -- fmt` is allowed;
-bare `cargo fmt` does not compile and may run directly, but prefer the
-wrapper for consistency.
+Replace the placeholders before running. Use the full module-qualified name
+(for example, `transcode::tests::ffmpeg_argv_is_pinned`), not just the
+function name. If the job selects a feature or test target, retain that
+selection for the failing test. Confirm the intended test actually ran:
+zero matching tests is not a successful reproduction, even with exit 0.
+For a standalone-crate failure, take its manifest path from that Actions job.
+
+Keep any `check`, `clippy` or `build` reproduction scoped to that same
+failing crate; heavy work goes through Boat, not this pool. `run -- fmt`
+is allowed; bare `cargo fmt` does not compile and may run directly, but
+prefer the wrapper for consistency. The pool is a resource guard, not
+permission for broad local verification or a full-suite fallback.
 
 Pool facts:
 

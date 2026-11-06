@@ -46,28 +46,29 @@ async function pauseClock(page: Page): Promise<void> {
 	await page.clock.pauseAt(new Date(T0.getTime() + PAUSE_AFTER_MS));
 }
 
-async function toConnectionTestStep(page: Page): Promise<void> {
-	await page.goto('/onboarding/provider');
-	await page.locator('input[name="host"]').fill('news.example.com');
-	await page.locator('input[name="username"]').fill('alice');
-	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await expect(page.getByRole('button', { name: /test connection/i })).toBeVisible();
-}
+const USAGE_OK = {
+	period: '2026-10',
+	resetsAt: '2026-11-01T00:00:00.000Z',
+	streamSecondsMonth: 0,
+	concurrentNow: 0,
+	libraryTracks: 0,
+	ingestToday: 0
+};
 
 /**
- * Route the wizard's connection test to a mocked 429 and open the paywall
- * with the fake clock already paused, so the wait starts at a known time.
- * Returns a counter of how many times the mutation endpoint was hit.
+ * Route the billing loader's subscription read to a mocked 429 and open
+ * the paywall with the fake clock already paused, so the wait starts at a
+ * known time. Returns a counter of subscription reads. The clock must be
+ * paused before navigation: the loader fires on goto, and the modal's
+ * deadline is wall-clock from the limit response.
  */
-async function showWizardPaywall(
+async function showBillingPaywall(
 	page: Page,
 	retryAfter: string | null
 ): Promise<{ requests: () => number }> {
-	let requests = 0;
-	await page.route('**/v1/vault/test', async (route) => {
-		requests += 1;
+	let subscriptionCalls = 0;
+	await page.route('**/v1/me/subscription', async (route) => {
+		subscriptionCalls += 1;
 		await route.fulfill({
 			status: 429,
 			headers: {
@@ -77,11 +78,13 @@ async function showWizardPaywall(
 			body: JSON.stringify({ code: 'rate_limited', message: 'limit reached' })
 		});
 	});
-	await toConnectionTestStep(page);
+	await page.route('**/v1/me/usage', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(USAGE_OK) })
+	);
 	await pauseClock(page);
-	await page.getByRole('button', { name: /test connection/i }).click();
+	await page.goto('/account/billing');
 	await expect(page.getByRole('dialog')).toBeVisible();
-	return { requests: () => requests };
+	return { requests: () => subscriptionCalls };
 }
 
 test('45s wait counts elapsed time: one callback after a 60s jump permits retry', async ({
@@ -89,7 +92,7 @@ test('45s wait counts elapsed time: one callback after a 60s jump permits retry'
 }) => {
 	await installClock(page);
 	await collectPaywallEvents(page);
-	const vault = await showWizardPaywall(page, '45');
+	const billing = await showBillingPaywall(page, '45');
 
 	const countdown = page.getByTestId('paywall-countdown');
 	await expect(countdown).toHaveText('Try again in 45 seconds.');
@@ -120,7 +123,7 @@ test('45s wait counts elapsed time: one callback after a 60s jump permits retry'
 		code: 'rate_limited',
 		retryAfterSeconds: 45
 	});
-	expect(vault.requests()).toBe(1);
+	expect(billing.requests()).toBe(1);
 });
 
 test('a new limit response while the modal stays open establishes a fresh deadline', async ({
@@ -243,7 +246,7 @@ test('unknown wait keeps current copy, shows no countdown, and never auto-retrie
 }) => {
 	await installClock(page);
 	await collectPaywallEvents(page);
-	const vault = await showWizardPaywall(page, null);
+	const billing = await showBillingPaywall(page, null);
 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toContainText('Please slow down a little');
@@ -253,17 +256,18 @@ test('unknown wait keeps current copy, shows no countdown, and never auto-retrie
 	// Time passing invents no countdown and retries nothing.
 	await page.clock.fastForward(60_000);
 	await expect(page.getByTestId('paywall-countdown')).toHaveCount(0);
-	expect(vault.requests()).toBe(1);
+	expect(billing.requests()).toBe(1);
 
-	// Dismissal still returns to the wizard.
+	// Dismissal still returns to billing.
 	await dialog.getByRole('button', { name: /not now/i }).click();
 	await expect(dialog).toBeHidden();
+	await expect(page).toHaveURL(/\/account\/billing\/?$/);
 });
 
 test('zero wait reads try-again-now and never counts negative', async ({ page }) => {
 	await installClock(page);
 	await collectPaywallEvents(page);
-	await showWizardPaywall(page, '0');
+	await showBillingPaywall(page, '0');
 
 	const countdown = page.getByTestId('paywall-countdown');
 	await expect(countdown).toHaveText('You can try again now.');
@@ -279,7 +283,7 @@ test('dismissed paywall stays gone: its timer is disposed with the modal', async
 
 	await installClock(page);
 	await collectPaywallEvents(page);
-	const vault = await showWizardPaywall(page, '45');
+	const billing = await showBillingPaywall(page, '45');
 	await expect(page.getByTestId('paywall-countdown')).toHaveText('Try again in 45 seconds.');
 
 	await page.getByRole('dialog').getByRole('button', { name: /not now/i }).click();
@@ -291,6 +295,6 @@ test('dismissed paywall stays gone: its timer is disposed with the modal', async
 	await expect(page.getByRole('dialog')).toHaveCount(0);
 	await expect(page.getByTestId('paywall-countdown')).toHaveCount(0);
 	expect(await paywallEvents(page)).toHaveLength(1);
-	expect(vault.requests()).toBe(1);
+	expect(billing.requests()).toBe(1);
 	expect(pageErrors).toEqual([]);
 });

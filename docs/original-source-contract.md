@@ -161,6 +161,132 @@ later integrations without making a hint a new publication authority. An
 error after streaming output requires the response authority to abort, never
 claim a complete file or retry bytes into the same response.
 
+## Async reader and off-route response adapter
+
+`original_source::reader::RangeReader::new/next_reference/push` is the shared
+incremental reader for synchronous and asynchronous consumers. `read_range`
+uses that same state machine; `AsyncRangeReader` only adapts asynchronous article
+fetches, cancellation and bounded output scheduling. There is one bounded decode,
+final-first proof, aggregate budget and contiguous prefix implementation.
+
+A successful `push` can emit both the current and retained final article slices.
+The async wrapper queues at most two article-sized slices and releases one per
+pull, with no new dispatch while buffered output remains. Cancellation is checked
+again before buffered output, including the retained final slice. A failed push
+poisons the incremental reader; fetch failure or a dropped pending await also
+permanently stops the async wrapper. Neither permits retry after uncertainty.
+When skipping a prefix, the async wrapper self-wakes and yields after each
+non-emitting prefix article, even if the supplier is immediately ready. The
+initial final-part proof and first prefix article may share a poll; each further
+skipped article returns control to the executor before the next fetch. This is
+cooperative polling, not proof of host-event-loop or timer fairness. Dropping a
+pull at this yield also stops it permanently.
+`AsyncArticleSource` supplies one bounded encoded article by trusted
+source index; it owns wire collection limits, its operation timer and account
+physical-close/capacity obligations. `AsyncReadControl` combines boundary checks
+with a wakeable cancellation/deadline signal, so a pending fetch can be dropped.
+A failed or dropped pending pull stops the reader permanently: no retry after
+an uncertain operation. Dropping an unpolled pull performs no I/O.
+
+`workers/stream/src/original_play.rs` is an **off-route** response driver, not a
+public miss-path installation. `authorize_original` verifies the v2 capability
+before a caller resolves the source. After resolution, `prepare` rechecks the
+request authority and track binding and reuses the existing HTTP range parser.
+Its request control must wake at grant expiry as well as cancellation/deadlines;
+the future production account supplier still owns its at-most-20-second timer.
+The API remains the sole source envelope/key/database owner. No new service
+wire shape, source resolver, account registry or provider config is introduced.
+
+A returned chunk is not delivery evidence. The response adapter acknowledges
+only the ordered prefix accepted by its writer using `written(n)`, then either
+acknowledges the rest before pulling again or drops the response. `finish`,
+`abort`, errors and drop settle at most one interval of acknowledged bytes;
+zero bytes emit none. Verification/prefix bytes and unacknowledged pulls never
+count. There is no cache-fill drain, speculative prefetch or account release in
+this driver. An article/source failure does not establish unknown-track 404.
+
+`OriginalPlay::pump` owns an ordered, wakeable `OriginalWriter` until close.
+It awaits each accepted prefix before pulling another article, observes reader
+disconnect during both pending article and writer operations, and races request
+cancellation/expiry against each write and close. Dropping even an unpolled pump
+aborts its writer without source I/O; an error or uncertain write is never retried.
+A failed close still reports only the bytes already acknowledged.
+
+The off-route wasm `original_play::worker::response_channel` pairs the prepared
+response with the pinned SDK's fixed-length Web Stream and a concrete writer.
+It copies at most one bounded slice into a JS chunk, waits for that write promise,
+and only then acknowledges it. Its `closed` promise wakes pending article, write
+and close operations on reader disconnect; a rejected promise cancels in every
+phase. A fulfilled
+`closed` promise after our close starts is not cancellation: the separate close
+promise still determines completion. Its settlement is cached, never re-polled.
+Drop requests an idempotent writer abort. Promise resolution
+means sink acceptance, not proof of remote TCP receipt. The caller must return
+the response concurrently with pumping, provide a wakeable request/grant control
+and persist delivered reports; no public runtime caller or account supplier is installed.
+
+`prepare_owned` uses the same checked response plan as `prepare`, but retains
+an immutable `Rc<OriginalSource>`. It accepts either a validated source value
+(allocated once) or the supplier's existing request-local `Rc` (no deep clone or
+second lookup). Its `OwnedOriginalPlay::pump` constructs the single shared reader
+inside the enclosing task. `pump_owned` also retains the transport, request
+control and delivered sink, installing the writer abort guard **before** the
+scheduler wraps the future. Even an unpolled task drop therefore aborts the
+writer with no article/write/close I/O or interval. Both entry points use the
+same pump and acknowledged-prefix settlement; expiry is rechecked on first
+output work after scheduling.
+
+Shared source ownership does not make borrowed pool inputs static. The existing
+pool owner must still supply owned registry/accounts/channel keys/clock/signals
+and operation timer, retaining the same request authority through task cleanup.
+Synthetic retained-input fixtures cover source-allocation retention, refusal
+release, unpolled drop and pending article/write/close drop/cancellation with one
+ACK-prefix interval. They are not production pool-task or actual Worker proof.
+
+The off-route wasm `schedule_response` creates the fixed-length channel, moves
+the source/supplier/control/writer into a `Context::wait_until` task, and returns
+the response without awaiting the backpressured pump. Its `DeliveredSink`
+forwards the one settled interval through a separate `wait_until` call to the
+existing runtime reporter and bounded retries; it adds no meter, retry policy,
+wire format or account-release action. Source lookup and account construction
+remain with their existing owners. The scheduler accepts the existing
+`OriginalControl` trait rather than requiring a separate concrete control. A
+production supplier and response must share the same checked request authority
+through thin forwarding; do not create a second clock watermark or cancellation
+authority during composition. That forwarding is not installed here. Nothing
+calls this scheduler from the public fetch path. Runtime task limits, nested
+report scheduling and disconnect/report
+durability still require actual Worker qualification; static compilation and
+owned-task fixtures do not establish them.
+
+`WorkerOriginalControl::new` binds the verified grant expiry and incoming
+request's abort signal before source resolution. The request owns the abort
+listener and an absolute-expiry timer; drop removes the listener and cancels a
+pending SDK delay. Timer delays are computed when polled and clamped to the
+SDK's signed timeout range, so delayed polling cannot extend the grant. A stable
+wake relay forwards both abort and timer events to the latest task waker, even
+when the SDK delay keeps its first registration. The portable
+`OriginalRequestControl` tests the relay and terminal expiry with injected
+clocks/timers; neither a cancellation handle nor the control releases account
+capacity. The supplier's operation timer is still separate. This wrapper is
+not called by any public fetch handler, and actual Worker signal/timer behavior
+remains unqualified.
+
+Generated async fixtures exercise lazy full/range output, hint fallback,
+endpoint/CRC/budget failures, wakeable pending cancellation, dropped pulls,
+grant expiry after awaits and partial-writer accounting. Writer fakes cover
+backpressure, partial/invalid acknowledgements, disconnect races, dropped pumps,
+article/write/close failures and exactly-once settlement. Control fakes store and
+replace the task waker: cancellation and grant expiry explicitly wake pending
+articles, writes and closes, win ready write/close races, and preserve only the
+acknowledged range prefix. Pending close also covers writer wake-to-success and
+drop-to-abort. These are synthetic events, not real Worker timer or AbortSignal
+qualification. Existing cache-hit and public-route fixtures remain regressions,
+not evidence of a newly wired
+original-source route. Actual source/catalogue/account composition, Worker
+writer/abort behavior, R2 misses and cold-cache end-to-end operation remain
+unimplemented/unqualified here. Compile-time dialing/ingress gates are unchanged.
+
 ## Acceptance boundary and verification
 
 Generated/redacted fixtures cover persisted per-track/file readback, interleaved

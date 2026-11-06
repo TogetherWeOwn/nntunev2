@@ -22,15 +22,13 @@ const ROUTES = [
 	'/auth/magic',
 	'/account/security',
 	'/account/billing',
-	'/account/provider',
 	'/demo/player',
 	'/home',
 	'/search',
 	'/settings',
 	'/library',
 	'/library/liked',
-	'/library/recent',
-	'/onboarding/byop'
+	'/library/recent'
 ] as const;
 
 const MOBILE_ROUTES = new Set<string>(['/demo/player', '/library']);

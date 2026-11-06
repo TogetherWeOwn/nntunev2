@@ -18,8 +18,8 @@ import {
 // `POST /v1/auth/magic/finish`, as `login-magic-link.spec.ts` does). The
 // assertions below are the whole contract — the second cookie reads 200
 // pre-revoke, revoke-all answers 200 `{ok:true}` with a clearing
-// `Set-Cookie`, then the caller's vault read and session refresh are 401
-// AND the second cookie's vault read is 401. A single-session-logout mutant
+// `Set-Cookie`, then the caller's plans read and session refresh are 401
+// AND the second cookie's plans read is 401. A single-session-logout mutant
 // (`revoke_session` for the caller only) keeps the caller legs green but
 // leaves the second cookie live, so the final leg is what pins `everywhere`.
 // Page behavior (confirm dialog, redirect, 401 notice) is pinned offline by
@@ -215,25 +215,25 @@ test('sign-out-everywhere revokes the session and closes follow-up checks', asyn
     finishHeaders['set-cookie'] ?? '',
     'security-sign-out-everywhere-second-finish',
   );
-  const secondVaultBefore = await apiGet(
+  const secondPlansBefore = await apiGet(
     request,
-    `${baseURL}/v1/vault`,
+    `${baseURL}/v1/plans`,
     cookieHeadersForValue(secondSession),
-    'security-sign-out-everywhere-second-vault-before',
+    'security-sign-out-everywhere-second-plans-before',
   );
-  const secondVaultBeforeBody = await secondVaultBefore.text().catch(() => '');
+  const secondPlansBeforeBody = await secondPlansBefore.text().catch(() => '');
   assertNoAccessWall(
     {
-      status: secondVaultBefore.status(),
-      headers: secondVaultBefore.headers(),
-      bodyText: secondVaultBeforeBody,
-      url: 'vault',
+      status: secondPlansBefore.status(),
+      headers: secondPlansBefore.headers(),
+      bodyText: secondPlansBeforeBody,
+      url: 'plans',
     },
-    'security-sign-out-everywhere-second-vault-before',
+    'security-sign-out-everywhere-second-plans-before',
   );
   expect(
-    secondVaultBefore.status(),
-    'second session vault read must answer 200 before revoke-all',
+    secondPlansBefore.status(),
+    'second session plans read must answer 200 before revoke-all',
   ).toBe(200);
 
   // 2. Revoke-all answers 200 with a clearing Set-Cookie. Boolean expects
@@ -278,18 +278,18 @@ test('sign-out-everywhere revokes the session and closes follow-up checks', asyn
 
   // 3. The caller's next authenticated request is 401: the revoked cookie
   // no longer verifies against any live server row.
-  const vault = await apiGet(
+  const plans = await apiGet(
     request,
-    `${baseURL}/v1/vault`,
+    `${baseURL}/v1/plans`,
     sessionCookieHeaders(account),
-    'security-sign-out-everywhere-vault',
+    'security-sign-out-everywhere-plans',
   );
-  const vaultBody = await vault.text().catch(() => '');
+  const plansBody = await plans.text().catch(() => '');
   assertNoAccessWall(
-    { status: vault.status(), headers: vault.headers(), bodyText: vaultBody, url: 'vault' },
-    'security-sign-out-everywhere-vault',
+    { status: plans.status(), headers: plans.headers(), bodyText: plansBody, url: 'plans' },
+    'security-sign-out-everywhere-plans',
   );
-  expect(vault.status(), 'vault read with the revoked session must answer 401').toBe(401);
+  expect(plans.status(), 'plans read with the revoked session must answer 401').toBe(401);
 
   // 4. Second live check: session refresh with the same revoked cookie is
   // also 401 — no rotation path survives the sweep.
@@ -312,28 +312,28 @@ test('sign-out-everywhere revokes the session and closes follow-up checks', asyn
   );
   expect(refresh.status(), 'session refresh with the revoked session must answer 401').toBe(401);
 
-  // 5. The everywhere proof: the second session's vault read is 401 too. A
+  // 5. The everywhere proof: the second session's plans read is 401 too. A
   // single-session-logout mutant (revoking only the caller's row) keeps legs
   // 3–4 green while this leg stays 200, so this is the assertion that pins
   // sign-out-everywhere rather than single-session logout.
-  const secondVaultAfter = await apiGet(
+  const secondPlansAfter = await apiGet(
     request,
-    `${baseURL}/v1/vault`,
+    `${baseURL}/v1/plans`,
     cookieHeadersForValue(secondSession),
-    'security-sign-out-everywhere-second-vault-after',
+    'security-sign-out-everywhere-second-plans-after',
   );
-  const secondVaultAfterBody = await secondVaultAfter.text().catch(() => '');
+  const secondPlansAfterBody = await secondPlansAfter.text().catch(() => '');
   assertNoAccessWall(
     {
-      status: secondVaultAfter.status(),
-      headers: secondVaultAfter.headers(),
-      bodyText: secondVaultAfterBody,
-      url: 'vault',
+      status: secondPlansAfter.status(),
+      headers: secondPlansAfter.headers(),
+      bodyText: secondPlansAfterBody,
+      url: 'plans',
     },
-    'security-sign-out-everywhere-second-vault-after',
+    'security-sign-out-everywhere-second-plans-after',
   );
   expect(
-    secondVaultAfter.status(),
-    'second session vault read must answer 401 after revoke-all',
+    secondPlansAfter.status(),
+    'second session plans read must answer 401 after revoke-all',
   ).toBe(401);
 });

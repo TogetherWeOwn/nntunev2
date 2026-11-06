@@ -57,8 +57,8 @@ const CANONICAL_ROUTE: Record<Scope, { method: 'GET' | 'POST'; path: string }> =
 const SESSION_ONLY_PATHS = [
   '/v1/me',
   '/v1/indexers',
-  '/v1/vault',
-  '/v1/vault/test-connection',
+  '/v1/plans',
+  '/v1/me/usage',
   '/v1/credentials',
 ];
 

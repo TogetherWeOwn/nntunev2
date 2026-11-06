@@ -41,16 +41,20 @@ failures return stable retryable codes and persist nothing. (Sources: `container
 
 ## Build
 
-From the repo root (build context is the repo root):
+The build context is the repo root. In GitHub Actions,
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) job
+`repair-container` pins `--locked`, runs the runtime-user pin tests, builds
+the image from a clean checkout and smoke-tests it. The native tests (fake
+`par2` fixtures, real `prlimit` wrapping) run in the workspace
+`rust test (native)` job.
 
-```sh
-docker build -f containers/repair/Dockerfile -t nntune-repair:dev .
-```
-
-Native tests (fake `par2` fixtures, real `prlimit` wrapping):
-
-```sh
-cargo test -p nntune-repair-server
-```
+Local runs are only for focused reproduction of one failing test or crate:
+small Rust work goes through the bounded pool
+(`python3 scripts/cargo_cache.py run -- test ...`), and heavy focused work goes
+through the guarded `boat` PATH wrapper with `--no-env` and a source-only
+export, with cleanup verified. Do not run the full suite, a CI mirror, or an
+image build locally, including under Boat or a fallback; if no compliant path
+is available, defer to Actions. See the
+[focused reproduction policy](../../CONTRIBUTING.md#focused-reproduction-only).
 
 (Sources: `containers/repair/Dockerfile:3` (repo-root context); `containers/repair/tests/repair_server.rs:1-5` (fake `par2`, real `prlimit` invocation); `containers/repair/Cargo.toml:2` (package name).)

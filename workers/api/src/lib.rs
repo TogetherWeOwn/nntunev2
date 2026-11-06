@@ -34,7 +34,6 @@ pub mod original_source;
 pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
-pub mod providers;
 pub mod random;
 pub mod rate_limit;
 pub mod rotation;

@@ -274,7 +274,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         "user_by_email",
         "replace_session_after_reauthentication",
         "reserve_rate_limit_pair",
-        "release_test_connection_lease",
+        "reap_unverified_users",
     ] {
         assert!(
             names.contains(&anchor),
@@ -471,7 +471,7 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
     // legs run must stay unnamed too: the redemption transaction's claim,
     // session insert and audit insert (in `magic_redemption.rs`, not
     // `worker_entry.rs`), plus the Store methods the legs hit next —
-    // the session and vault reads behind `authenticate`/`GET /v1/vault`,
+    // the session read behind `authenticate`,
     // and the two revoke-all sweeps. The finish path's rate-limit claim
     // and `magic_by_hash` are already pinned by the signup test above.
     const NAMED: [&str; 7] = [
@@ -493,7 +493,6 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .0;
     for name in [
         "session_by_id",
-        "vault_by_user",
         "revoke_all_sessions",
         "revoke_all_native_credentials",
     ] {
