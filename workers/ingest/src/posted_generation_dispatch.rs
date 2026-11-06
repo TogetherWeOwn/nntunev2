@@ -29,11 +29,47 @@ pub enum DispatchMode {
 
 /// Only these two fields cross the Queue boundary. Possession is not authority;
 /// only the trusted internal DB/Queue binding may invoke the recovery adapter.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct DispatchPointer {
     version: u8,
     id: String,
+}
+
+impl<'de> Deserialize<'de> for DispatchPointer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PointerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PointerVisitor {
+            type Value = DispatchPointer;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a dispatch pointer object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Fields {
+                    version: u8,
+                    id: String,
+                }
+
+                let fields =
+                    Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(DispatchPointer {
+                    version: fields.version,
+                    id: fields.id,
+                })
+            }
+        }
+
+        // Derived struct deserialization also accepts positional sequences.
+        // The Queue wire contract requires a map with the two named fields.
+        deserializer.deserialize_map(PointerVisitor)
+    }
 }
 
 impl fmt::Debug for DispatchPointer {

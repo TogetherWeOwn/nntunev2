@@ -782,7 +782,7 @@ fn postgres_dispatch_pointer_wire_form_rejects_unknown_forged_and_missing_fields
         assert!(round == p);
 
         let id = id_of(&p);
-        for rejected in [
+        for (index, rejected) in [
             serde_json::json!({"version": 1, "id": id, "job_id": fx.job}),
             serde_json::json!({"version": 1, "id": id, "attempt": 1}),
             serde_json::json!({"version": 1, "id": id, "token": "x"}),
@@ -794,9 +794,25 @@ fn postgres_dispatch_pointer_wire_form_rejects_unknown_forged_and_missing_fields
             serde_json::json!({"version": 1, "id": 7}),
             serde_json::json!({"version": 300, "id": id}),
             serde_json::json!([1, id]),
+            serde_json::json!([]),
+            serde_json::json!([1, id, "extra"]),
+            serde_json::json!(true),
             serde_json::json!(id),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                serde_json::from_value::<DispatchPointer>(rejected).is_err(),
+                "malformed pointer case {index} was accepted"
+            );
+        }
+        // Raw JSON preserves duplicate keys, unlike serde_json::Value.
+        for duplicate in [
+            r#"{"version":1,"version":1,"id":"opaque"}"#,
+            r#"{"version":1,"id":"opaque","id":"other"}"#,
         ] {
-            assert!(serde_json::from_value::<DispatchPointer>(rejected).is_err());
+            assert!(serde_json::from_str::<DispatchPointer>(duplicate).is_err());
         }
 
         // Shape-valid forgeries deserialize but carry no authority.
@@ -1593,13 +1609,40 @@ fn postgres_dispatch_trigger_injection_rolls_back_and_immutability_survives_migr
         )
         .await
         .quiet("dispatch true no-op");
-        expect_db_error(
-            db.execute("DELETE FROM ingest_jobs WHERE id = $1", &[&fx.job])
-                .await,
-            &SqlState::FOREIGN_KEY_VIOLATION,
-            None,
-            "job delete under dispatch",
+        // Isolate the new FK: no receipt/attempt exists, and the original's
+        // older RESTRICT FK must not mask the dispatch constraint. Roll back
+        // the temporary original removal along with the refused job deletion.
+        let retained = admin_fx(&db).await;
+        let ro = objects(&retained, SMALL);
+        let rp = must_prep(&mut db, &retained, "op-a", 0, &prepared(&ro, 0)).await;
+        assert_eq!(receipts(&db, &retained).await, 0);
+        assert_eq!(attempts(&db, &retained).await, 0);
+        let retained_before = state(&db, &retained).await;
+        let tx = db
+            .transaction()
+            .await
+            .quiet("begin isolated dispatch FK check");
+        assert_eq!(
+            tx.execute(
+                "DELETE FROM ingest_originals WHERE job_id = $1",
+                &[&retained.job]
+            )
+            .await
+            .quiet("temporarily remove competing original FK"),
+            1
         );
+        let error = tx
+            .execute("DELETE FROM ingest_jobs WHERE id = $1", &[&retained.job])
+            .await
+            .expect_err("dispatch FK must retain the job");
+        let error = error.as_db_error().expect("dispatch FK database error");
+        assert!(error.code() == &SqlState::RESTRICT_VIOLATION);
+        assert!(error.constraint() == Some("ingest_file_dispatches_job_id_fkey"));
+        tx.rollback()
+            .await
+            .quiet("restore isolated dispatch FK fixture");
+        assert!(retained_before == state(&db, &retained).await);
+        assert!(rp == must_prep(&mut db, &retained, "op-a", 0, &prepared(&ro, 0)).await);
         let key = format!("admin:{}", fx.hash);
         let insert = "INSERT INTO ingest_file_dispatches (job_id, operation_key, owner_id, \
              admission_key, original_sha256, file_index, expected_attempt, object_id, \
