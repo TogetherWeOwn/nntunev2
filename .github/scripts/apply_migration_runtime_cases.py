@@ -10,9 +10,9 @@ endpoint is contacted; credentials come from ``env`` only.
 
 Covered:
 
-- the five frozen mirror migrations, applied in manifest order with the
+- the six frozen mirror migrations, applied in manifest order with the
   repository manifest, match an independent raw ``psql`` apply of the
-  same files (catalog fingerprint) and re-running all five changes
+  same files (catalog fingerprint) and re-running all six changes
   nothing;
 - real concurrent CLI applies of one non-idempotent file produce one
   effect and one receipt;
@@ -63,6 +63,28 @@ MIRROR_FILES = [
      "62ceb24df9c5ea7032fc3cf4e48e5e10f87d909639fa469ed79b4dfcd92009d6"),
     ("0030_mb_mirror_w6b.sql",
      "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"),
+    ("0035_mb_mirror_phase2_relations.sql",
+     "15f8834a1d33a353b0863e7a4767ca4b99658c19cff7d2f1f07d5583c55c61dd"),
+]
+PHASE2_SOURCE_HISTORY = [
+    {"parent": "95b1cdc81bcd070b2004ba321b47470542027777",
+     "commit": "e0eb63967335f8996bb856111636ba91cd74fa49",
+     "old_path": "migrations/0031_mb_mirror_phase2_relations.sql",
+     "new_path": "migrations/0033_mb_mirror_phase2_relations.sql",
+     "old_sha256": "af91df547dd324a3f576f673fea0f848e9f51f25f57ac36a1f19557949ae0266",
+     "new_sha256": "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"},
+    {"parent": "c0c34e0fc823e57ef7762f634d092dd17276d0c2",
+     "commit": "dc38e5b8d519333f707c6e4b3ae86dc20c9e1e34",
+     "old_path": "migrations/0033_mb_mirror_phase2_relations.sql",
+     "new_path": "migrations/0034_mb_mirror_phase2_relations.sql",
+     "old_sha256": "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d",
+     "new_sha256": "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"},
+    {"parent": "5b8cc823467a3f6d9cab0fba85ff271c8324b629",
+     "commit": "f151b1e2b34d131642938a5982997bb8bc21b5b0",
+     "old_path": "migrations/0034_mb_mirror_phase2_relations.sql",
+     "new_path": "migrations/0035_mb_mirror_phase2_relations.sql",
+     "old_sha256": "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89",
+     "new_sha256": "a630856126faff99e875c3877c8b9d53396b4679dde5eea4b1ee08fb7f4486c1"},
 ]
 
 ADVISORY_KEY = 7271901
@@ -311,7 +333,8 @@ def mirror_seed(env):
 
 def raw_apply(env, path):
     result = subprocess.run(
-        list(_base().ARGS), input=pathlib.Path(path).read_text(encoding="utf-8"),
+        [*_base().ARGS, "--single-transaction"],
+        input=pathlib.Path(path).read_text(encoding="utf-8"),
         env={**env, "PGOPTIONS": "-c search_path=public,pg_catalog"},
         text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, f"raw reference apply of {path.name} failed"
@@ -324,17 +347,18 @@ def assert_frozen_mirror(manifest):
     # may evolve independently of this mirror-only runtime scenario.
     entries = _am().load_manifest(manifest)
     mirror = [e for e in entries if e["target"] == "mirror"]
-    # These frozen entries have no rename metadata; compare whole records so
-    # additions cannot change accepted aliases or source-history deny-lists.
+    # Compare whole records, including the phase-2 source-only rename history,
+    # so accepted aliases and source-history deny-lists cannot drift.
     expected = [{"file": name, "sha256": sha, "target": "mirror"}
                 for name, sha in MIRROR_FILES]
+    expected[-1]["source_rename_history"] = PHASE2_SOURCE_HISTORY
     assert mirror == expected, "repository mirror manifest entries changed"
     for name, sha in MIRROR_FILES:
         data = (manifest.parent / name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha, f"{name} bytes changed"
 
 
-def case_mirror_five(env):
+def case_mirror_six(env):
     assert_frozen_mirror(REAL_MANIFEST)
 
     with fresh_database(env, "nntune_rt_mirror_ref") as (ref_env, _ref_url):
@@ -385,13 +409,13 @@ def case_mirror_five(env):
                              "--expect-database", database])
             assert proc.returncode == 0 and "already recorded" in proc.stdout, name
         assert receipt_rows(menv) == before_rows, "re-run changed the ledger"
-        assert count(menv, "public.schema_migrations") == "5"
+        assert count(menv, "public.schema_migrations") == "6"
         assert catalog_fingerprint(menv) == before_fp == reference
         assert mirror_seed(menv) == reference_seed, "re-run changed deterministic seed"
         assert _base().scalar(menv,
             "SELECT row_to_json(s)::text FROM public.mb_import_state s ORDER BY id;") \
             == before_seed, "re-run changed seed rows (including generated timestamp)"
-    log("mirror-five-ordered-and-idempotent")
+    log("mirror-six-ordered-and-idempotent")
 
 
 def case_concurrent(env):
@@ -902,7 +926,7 @@ def case_noop_acl(env):
 def run(env, test_env):
     """Entry point; ``test_env`` (the suite's database) is not reused."""
     assert test_env.get("PGDATABASE") != env.get("PGDATABASE")
-    for case in (case_mirror_five, case_concurrent, case_injected_failures,
+    for case in (case_mirror_six, case_concurrent, case_injected_failures,
                  case_controlled_session, case_application_namespace,
                  case_wrong_expected_database,
                  case_timeout_and_unknown_commit, case_wrappers, case_noop_acl):

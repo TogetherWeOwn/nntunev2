@@ -6,7 +6,9 @@ database (via Hyperdrive). Schema: `migrations/0001_mb_mirror.sql`
 `0016_mb_track.sql` (`mb_track` listing source),
 `0017_mb_replication_packet_ledger.sql` (per-packet SLO ledger) and
 `0030_mb_mirror_w6b.sql` (release groups, curated URL relationships,
-music-video pairs and ISRCs).
+music-video pairs and ISRCs) and `0035_mb_mirror_phase2_relations.sql`
+(artist/recording/release relations, release credits, aliases, labels
+with catalogue numbers, works).
 Decision: `docs/adr/0007-mb-mirror.md`.
 
 ## Endpoints
@@ -245,9 +247,13 @@ The W6b slice (release groups, URL relationships, music-video pairs,
 ISRCs) is core CC0 data mirrored from the twice-weekly CC0 dumps on
 the same terms: NC-licensed supplementary data (tags/genre
 associations, ratings, annotations) is excluded at import and never
-enters the mirror. Serve product reads from the mirror, not the live
-API (at most 1 request/second per IP with a descriptive `nntune/<version>
-( <contact> )` `User-Agent` for any live calls).
+enters the mirror. The phase-2 slice (artist/recording/release
+relations, release credits, aliases, labels + catalogue numbers,
+works) is likewise core CC0 dump data only — no tag/genre, rating,
+annotation or Live Data Feed input — sitting behind the mirror for
+catalogue reads to build on. Serve product reads from the mirror, not
+the live API (at most 1 request/second per IP with a descriptive
+`nntune/<version> ( <contact> )` `User-Agent` for any live calls).
 
 ## Dev
 

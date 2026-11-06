@@ -1,0 +1,5 @@
+700	10	First Alias	en	0	2025-01-01 00:00:00+00	\N	Alias, First	\N	\N	\N	\N	\N	\N	t	f
+701	10	First Alias	en	0	2025-01-01 00:00:00+00	\N	Alias, First Z	\N	\N	\N	\N	\N	\N	f	f
+702	20	Second Alias	\N	0	2025-01-01 00:00:00+00	\N	Alias, Second	\N	\N	\N	\N	\N	\N	f	f
+703	10	First\040Alias	en	0	2025-01-01 00:00:00+00	\N	Alias, First Collide	\N	\N	\N	\N	\N	\N	f	f
+704	20	Second Alias	\145n	0	2025-01-01 00:00:00+00	\N	Alias, Second	\N	\N	\N	\N	\N	\N	f	f

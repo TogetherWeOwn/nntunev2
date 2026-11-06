@@ -16,7 +16,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  mb-validate --table artist|release_group|release|recording|track|url|artist_url|recording_url|recording_music_video|recording_isrc --in <tsv> \\\n      --valid-out <tsv> --poison-out <tsv> --line-offset <n>\n  mb-validate --plan --completed <n> --total <n> --size <n>"
+        "usage:\n  mb-validate --table artist|release_group|release|recording|track|url|artist_url|recording_url|recording_music_video|recording_isrc|work|label|artist_recording|artist_release|artist_work|recording_work|recording_recording|release_credit|artist_alias|release_alias|recording_alias|release_group_alias|work_alias|label_alias|release_label --in <tsv> \\\n      --valid-out <tsv> --poison-out <tsv> --line-offset <n>\n  mb-validate --plan --completed <n> --total <n> --size <n>"
     );
     std::process::exit(2);
 }

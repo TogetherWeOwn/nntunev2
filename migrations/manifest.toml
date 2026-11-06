@@ -167,3 +167,32 @@ sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
 file = "0034_admin_ingest.sql"
 target = "app"
 sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"
+
+[[migration]]
+file = "0035_mb_mirror_phase2_relations.sql"
+target = "mirror"
+sha256 = "15f8834a1d33a353b0863e7a4767ca4b99658c19cff7d2f1f07d5583c55c61dd"
+
+[[migration.source_rename_history]]
+parent = "95b1cdc81bcd070b2004ba321b47470542027777"
+commit = "e0eb63967335f8996bb856111636ba91cd74fa49"
+old_path = "migrations/0031_mb_mirror_phase2_relations.sql"
+new_path = "migrations/0033_mb_mirror_phase2_relations.sql"
+old_sha256 = "af91df547dd324a3f576f673fea0f848e9f51f25f57ac36a1f19557949ae0266"
+new_sha256 = "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"
+
+[[migration.source_rename_history]]
+parent = "c0c34e0fc823e57ef7762f634d092dd17276d0c2"
+commit = "dc38e5b8d519333f707c6e4b3ae86dc20c9e1e34"
+old_path = "migrations/0033_mb_mirror_phase2_relations.sql"
+new_path = "migrations/0034_mb_mirror_phase2_relations.sql"
+old_sha256 = "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"
+new_sha256 = "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"
+
+[[migration.source_rename_history]]
+parent = "5b8cc823467a3f6d9cab0fba85ff271c8324b629"
+commit = "f151b1e2b34d131642938a5982997bb8bc21b5b0"
+old_path = "migrations/0034_mb_mirror_phase2_relations.sql"
+new_path = "migrations/0035_mb_mirror_phase2_relations.sql"
+old_sha256 = "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"
+new_sha256 = "a630856126faff99e875c3877c8b9d53396b4679dde5eea4b1ee08fb7f4486c1"

@@ -106,6 +106,7 @@ case "$sql" in
   *"SELECT lines_done FROM mb_import_cursor"*) printf '%s\n' "${FAKE_LINES_DONE:-0}" ;;
   *"SELECT count(*) FROM mb_import_dlq"*) printf '%s\n' "${FAKE_POISON_COUNT:-0}" ;;
   *"SELECT last_packet FROM mb_import_state"*) printf '%s\n' "${FAKE_LAST_PACKET:-0}" ;;
+  *"FROM information_schema.tables"*) printf '%s\n' "${FAKE_PHASE2_TABLES_PRESENT:-15}" ;;
   *"CREATE TEMP TABLE want_parent"*)
     # Only report the orphan while its line_no is still among the queried
     # parents: track probes twice (one per parent) and a row split out by
@@ -369,7 +370,9 @@ assert_no_leftover_secret_files() { # scenario-dir
 
 # ---------------------------------------------------------------- harness
 make_dump() { # dump-dir : 3 valid rows per table (three recordings, so the
-  # music-video file holds one row per unordered recording pair)
+  # music-video file holds one row per unordered recording pair), plus
+  # one valid row per phase-2 table so the hygiene run covers the new
+  # cursor/FK/chunk call sites too
   local d="$1"; mkdir -p "$d"
   printf '00000000-0000-0000-0000-000000000001\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000002\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000003\tBand 3\t3, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n' >"$d/mbdump-artist.tsv"
   printf '00000000-0000-0000-0000-000000010001\tGroup 1\t00000000-0000-0000-0000-000000000001\tAlbum\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000010002\tGroup 2\t00000000-0000-0000-0000-000000000002\tAlbum\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000010003\tGroup 3\t00000000-0000-0000-0000-000000000003\tAlbum\t2024-05-01T12:00:00Z\n' >"$d/mbdump-release_group.tsv"
@@ -381,6 +384,21 @@ make_dump() { # dump-dir : 3 valid rows per table (three recordings, so the
   printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000030001\tfree streaming\ttrue\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000030002\tfree streaming\tfalse\t2024-05-04T00:00:00Z\n00000000-0000-0000-0000-000000020003\t00000000-0000-0000-0000-000000030003\tfree streaming\ttrue\t2024-05-04T00:00:00Z\n' >"$d/mbdump-recording_url.tsv"
   printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020002\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020003\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000020003\t2024-05-05T00:00:00Z\n' >"$d/mbdump-recording_music_video.tsv"
   printf '00000000-0000-0000-0000-000000020001\tUSABC2400001\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020002\tUSABC2400002\t2024-05-05T00:00:00Z\n00000000-0000-0000-0000-000000020003\tUSABC2400003\t2024-05-05T00:00:00Z\n' >"$d/mbdump-recording_isrc.tsv"
+  printf '00000000-0000-0000-0000-000000040001\tWork 1\tSong\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000040002\tWork 2\tSong\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000040003\tWork 3\tSong\t2024-05-06T00:00:00Z\n' >"$d/mbdump-work.tsv"
+  printf '00000000-0000-0000-0000-000000050001\tLabel 1\t1901\tProduction\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000050002\tLabel 2\t1902\tProduction\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000050003\tLabel 3\t1903\tProduction\t2024-05-06T00:00:00Z\n' >"$d/mbdump-label.tsv"
+  printf '00000000-0000-0000-0000-000000000001\t00000000-0000-0000-0000-000000020001\tcomposer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000002\t00000000-0000-0000-0000-000000020002\tproducer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000003\t00000000-0000-0000-0000-000000020003\tlyricist\t2024-05-06T00:00:00Z\n' >"$d/mbdump-artist_recording.tsv"
+  printf '00000000-0000-0000-0000-000000000001\t00000000-0000-0000-0000-000000010001\tproducer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000002\t00000000-0000-0000-0000-000000010002\tcomposer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000003\t00000000-0000-0000-0000-000000010003\tlyricist\t2024-05-06T00:00:00Z\n' >"$d/mbdump-artist_release.tsv"
+  printf '00000000-0000-0000-0000-000000000001\t00000000-0000-0000-0000-000000040001\tlyricist\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000002\t00000000-0000-0000-0000-000000040002\tcomposer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000003\t00000000-0000-0000-0000-000000040003\tproducer\t2024-05-06T00:00:00Z\n' >"$d/mbdump-artist_work.tsv"
+  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000040001\tperformance\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000040002\tperformer\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020003\t00000000-0000-0000-0000-000000040003\tcomposer\t2024-05-06T00:00:00Z\n' >"$d/mbdump-recording_work.tsv"
+  printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020002\tcover\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000020003\tremix\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000020003\tmedley\t2024-05-06T00:00:00Z\n' >"$d/mbdump-recording_recording.tsv"
+  printf '00000000-0000-0000-0000-000000010001\t0\t00000000-0000-0000-0000-000000000001\tCredit 1\t & \t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010002\t0\t00000000-0000-0000-0000-000000000002\tCredit 2\t & \t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010003\t0\t00000000-0000-0000-0000-000000000003\tCredit 3\t & \t2024-05-06T00:00:00Z\n' >"$d/mbdump-release_credit.tsv"
+  printf '00000000-0000-0000-0000-000000000001\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000002\tBand 2 Alt\ten\t2 Alt, Band\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000003\tBand 3 Alt\ten\t3 Alt, Band\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-artist_alias.tsv"
+  printf '00000000-0000-0000-0000-000000010001\tAlbum 1 Alt\ten\t1 Alt, Album\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010002\tAlbum 2 Alt\ten\t2 Alt, Album\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010003\tAlbum 3 Alt\ten\t3 Alt, Album\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-release_alias.tsv"
+  printf '00000000-0000-0000-0000-000000020001\tTrack 1 Alt\ten\t1 Alt, Track\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020002\tTrack 2 Alt\ten\t2 Alt, Track\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000020003\tTrack 3 Alt\ten\t3 Alt, Track\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-recording_alias.tsv"
+  printf '00000000-0000-0000-0000-000000010001\tGroup 1 Alt\ten\t1 Alt, Group\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010002\tGroup 2 Alt\ten\t2 Alt, Group\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010003\tGroup 3 Alt\ten\t3 Alt, Group\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-release_group_alias.tsv"
+  printf '00000000-0000-0000-0000-000000040001\tWork 1 Alt\ten\t1 Alt, Work\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000040002\tWork 2 Alt\ten\t2 Alt, Work\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000040003\tWork 3 Alt\ten\t3 Alt, Work\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-work_alias.tsv"
+  printf '00000000-0000-0000-0000-000000050001\tLabel 1 Alt\ten\t1 Alt, Label\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000050002\tLabel 2 Alt\ten\t2 Alt, Label\tfalse\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000050003\tLabel 3 Alt\ten\t3 Alt, Label\tfalse\t2024-05-06T00:00:00Z\n' >"$d/mbdump-label_alias.tsv"
+  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000050001\tCAT-001\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000050002\tCAT-002\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000010003\t00000000-0000-0000-0000-000000050003\tCAT-003\t2024-05-06T00:00:00Z\n' >"$d/mbdump-release_label.tsv"
 }
 
 # run_import <name> ; scenario knobs via FAKE_* / DUMP_SEQ in the caller env
@@ -462,6 +480,7 @@ for case_name in plain encoded; do
   check_eq "import full [$case_name]: exit" "0" "$run_exit"
   check_file_contains "import full [$case_name]: completes" "$scenario_dir/stdout" "import: done"
   check_file_contains "import full [$case_name]: seeds replication state" "$scenario_dir/stdout" "seeded mb_import_state.last_packet=500"
+  check_sql_at_least "import full [$case_name]: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
   check_sql_at_least "import full [$case_name]: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 4
   check_sql_at_least "import full [$case_name]: cursor read ran per table" "$capture_dir" "SELECT lines_done FROM mb_import_cursor" 4
   check_sql_at_least "import full [$case_name]: FK parent probe ran for release+recording+track(x2)" "$capture_dir" "CREATE TEMP TABLE want_parent" 4
@@ -486,6 +505,7 @@ echo "=== already-complete import: skip path, older DUMP_SEQ never rewinds ==="
 prep_scenario "import-complete-plain"
 run_import FAKE_LINES_DONE=3 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=7 FAKE_FK_BAD= DUMP_SEQ=5
 check_eq "import complete: exit" "0" "$run_exit"
+check_sql_at_least "import complete: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
 check_file_contains "import complete: skip reported" "$scenario_dir/stdout" "already complete"
 check_file_contains "import complete: older seed leaves state untouched" "$scenario_dir/stderr" "leaving state untouched"
 check_eq "import complete: no chunk transaction" "0" "$(count_sql "$capture_dir" "RETURNING lines_done")"
@@ -501,6 +521,7 @@ check_eq "import fk: exit" "0" "$run_exit"
 check_file_contains "import fk: orphan routing reported (artist parent)" "$scenario_dir/stdout" "fk_missing_artist"
 check_file_contains "import fk: orphan routing reported (release parent)" "$scenario_dir/stdout" "fk_missing_release"
 check_file_contains "import fk: completes" "$scenario_dir/stdout" "import: done"
+check_sql_at_least "import fk: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
 check_file_not_contains "import fk: no DUMP_SEQ seed claimed" "$scenario_dir/stdout" "seeded mb_import_state.last_packet"
 if [[ -s "$capture_dir/python.count" ]]; then ok "import fk: python3 FK-split child ran (argv captured)"; else bad "import fk: python3 FK-split child never ran"; fi
 common_post_checks
@@ -511,6 +532,85 @@ FAKE_LAST_PACKET=41 run_replicate 99
 check_eq "replicate gap: exit" "2" "$run_exit"
 check_file_contains "replicate gap: retirement reported" "$scenario_dir/stderr" "retired"
 retired_post_checks "$scenario_dir" "$capture_dir"
+
+echo "=== empty release_credit with nonempty release: refused before any mutation ==="
+prep_scenario "import-empty-credit-plain"
+: > "$scenario_dir/dump/mbdump-release_credit.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import empty credit: exit" "1" "$run_exit"
+check_file_contains "import empty credit: refusal reported" "$scenario_dir/stderr" "refusing empty mbdump-release_credit.tsv"
+check_eq "import empty credit: no chunk transaction" "0" "$(count_sql "$capture_dir" "RETURNING lines_done")"
+check_eq "import empty credit: no schema gate (refused before any mutation)" "0" "$(count_sql "$capture_dir" "FROM information_schema.tables")"
+assert_no_sentinels_in_file "script output [$url_case]" "$scenario_dir/stdout"
+assert_no_sentinels_in_file "script output [$url_case]" "$scenario_dir/stderr"
+assert_no_leftover_secret_files "$scenario_dir"
+
+echo "=== empty recording_recording with nonempty credit: legitimate empty still skips ==="
+prep_scenario "import-empty-song-relation-plain"
+: > "$scenario_dir/dump/mbdump-recording_recording.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import empty song-relation: exit" "0" "$run_exit"
+check_file_contains "import empty song-relation: completes" "$scenario_dir/stdout" "import: done"
+check_file_contains "import empty song-relation: skip reported" "$scenario_dir/stdout" "recording_recording dump is empty"
+check_sql_at_least "import empty song-relation: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
+common_post_checks
+
+# Refused runs must not have issued any mutating SQL: no cursor creation,
+# no chunk transaction, no replication-state write, no truncate/delete.
+assert_no_mutation_sql() { # desc capture-dir
+  local needle
+  for needle in "INSERT INTO mb_import_cursor" "RETURNING lines_done" "UPDATE mb_import_state SET last_packet" "TRUNCATE" "DELETE FROM"; do
+    check_eq "$1: no '$needle' SQL" "0" "$(count_sql "$2" "$needle")"
+  done
+}
+refused_post_checks() { # scenario-dir
+  assert_no_sentinels_in_file "script output [$url_case]" "$1/stdout"
+  assert_no_sentinels_in_file "script output [$url_case]" "$1/stderr"
+  assert_no_leftover_secret_files "$1"
+}
+phase2_file_tables="work label artist_recording artist_release artist_work recording_work recording_recording release_credit artist_alias release_alias recording_alias release_group_alias work_alias label_alias release_label"
+
+echo "=== legacy base-only snapshot (no phase-2 files): still imports, no schema gate ==="
+prep_scenario "import-base-only-plain"
+for t in $phase2_file_tables; do rm -f "$scenario_dir/dump/mbdump-$t.tsv"; done
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import base-only: exit" "0" "$run_exit"
+check_file_contains "import base-only: completes" "$scenario_dir/stdout" "import: done"
+check_eq "import base-only: no phase-2 schema gate" "0" "$(count_sql "$capture_dir" "FROM information_schema.tables")"
+check_sql_at_least "import base-only: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 4
+check_sql_at_least "import base-only: chunk transaction ran per table" "$capture_dir" "RETURNING lines_done" 4
+check_eq "import base-only: no phase-2 cursor" "0" "$(count_sql "$capture_dir" "'work'")"
+common_post_checks
+
+echo "=== phase-2 snapshot with only 14/15 phase-2 tables in the database: refused before any mutation ==="
+prep_scenario "import-phase2-14-plain"
+run_import FAKE_PHASE2_TABLES_PRESENT=14 FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import 14/15 tables: exit" "1" "$run_exit"
+check_file_contains "import 14/15 tables: refusal reported" "$scenario_dir/stderr" "refusing phase-2 snapshot (14/15 phase-2 tables present"
+check_sql_at_least "import 14/15 tables: schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
+assert_no_mutation_sql "import 14/15 tables" "$capture_dir"
+refused_post_checks "$scenario_dir"
+
+# Duplicate-key serialization must be unambiguous: keys (name, locale) =
+# ('a/b', 'c') and ('a', 'b/c') are distinct rows of the same artist and
+# must not collide when the key parts are joined for the duplicate scan.
+echo "=== alias keys that differ only by slash placement are distinct: accepted ==="
+prep_scenario "import-alias-slash-plain"
+printf '00000000-0000-0000-0000-000000000001\ta/b\tc\t1 Alt, Band\ttrue\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000001\ta\tb/c\t1 Alt, Band\tfalse\t2024-05-06T00:00:00Z\n' >"$scenario_dir/dump/mbdump-artist_alias.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import alias slash keys: exit" "0" "$run_exit"
+check_file_not_contains "import alias slash keys: no duplicate reported" "$scenario_dir/stderr" "duplicate key"
+check_file_contains "import alias slash keys: completes" "$scenario_dir/stdout" "import: done"
+common_post_checks
+
+echo "=== true duplicate alias key is refused before any mutation ==="
+prep_scenario "import-alias-dupe-plain"
+printf '00000000-0000-0000-0000-000000000001\ta/b\tc\t1 Alt, Band\ttrue\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000001\ta/b\tc\tOther, Band\tfalse\t2024-05-06T00:00:00Z\n' >"$scenario_dir/dump/mbdump-artist_alias.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import alias dupe: exit" "1" "$run_exit"
+check_file_contains "import alias dupe: duplicate reported" "$scenario_dir/stderr" "duplicate key"
+assert_no_mutation_sql "import alias dupe" "$capture_dir"
+refused_post_checks "$scenario_dir"
 
 echo
 echo "test-argv-hygiene: $passes passed, $failures failed"

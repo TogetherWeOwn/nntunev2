@@ -70,6 +70,66 @@ fn valid_recording_isrc() -> String {
     format!("{MBID}\tUSABC2400001\t{TS}")
 }
 
+fn valid_work() -> String {
+    format!("{MBID}\tA Song\tSong\t{TS}")
+}
+
+fn valid_label() -> String {
+    format!("{MBID}\tA Label\t1903\tProduction\t{TS}")
+}
+
+fn valid_artist_recording() -> String {
+    format!("{MBID}\t{MBID2}\tcomposer\t{TS}")
+}
+
+fn valid_artist_release() -> String {
+    format!("{MBID}\t{MBID2}\tproducer\t{TS}")
+}
+
+fn valid_artist_work() -> String {
+    format!("{MBID}\t{MBID2}\tlyricist\t{TS}")
+}
+
+fn valid_recording_work() -> String {
+    format!("{MBID}\t{MBID2}\tperformance\t{TS}")
+}
+
+fn valid_recording_recording() -> String {
+    format!("{MBID}\t{MBID2}\tcover\t{TS}")
+}
+
+fn valid_release_credit() -> String {
+    format!("{MBID}\t0\t{MBID2}\tThe Band\t & \t{TS}")
+}
+
+fn valid_artist_alias() -> String {
+    format!("{MBID}\tThe Bandz\ten\tBandz, The\ttrue\t{TS}")
+}
+
+fn valid_release_alias() -> String {
+    format!("{MBID}\tAlbum Alt\ten\tAlt, Album\tfalse\t{TS}")
+}
+
+fn valid_recording_alias() -> String {
+    format!("{MBID}\tTrack Alt\ten\tAlt, Track\tfalse\t{TS}")
+}
+
+fn valid_release_group_alias() -> String {
+    format!("{MBID}\tGroup Alt\ten\tAlt, Group\tfalse\t{TS}")
+}
+
+fn valid_work_alias() -> String {
+    format!("{MBID}\tSong Alt\ten\tAlt, Song\tfalse\t{TS}")
+}
+
+fn valid_label_alias() -> String {
+    format!("{MBID}\tLabel Alt\ten\tAlt, Label\tfalse\t{TS}")
+}
+
+fn valid_release_label() -> String {
+    format!("{MBID}\t{MBID2}\tCAT-001\t{TS}")
+}
+
 #[test]
 fn reason_literal_values() {
     assert_eq!(reason::COLUMN_COUNT, "column_count");
@@ -206,6 +266,21 @@ fn valid_row_per_table_passes_with_line_no_appended() {
         (Table::RecordingUrl, valid_recording_url()),
         (Table::RecordingMusicVideo, valid_recording_music_video()),
         (Table::RecordingIsrc, valid_recording_isrc()),
+        (Table::Work, valid_work()),
+        (Table::Label, valid_label()),
+        (Table::ArtistRecording, valid_artist_recording()),
+        (Table::ArtistRelease, valid_artist_release()),
+        (Table::ArtistWork, valid_artist_work()),
+        (Table::RecordingWork, valid_recording_work()),
+        (Table::RecordingRecording, valid_recording_recording()),
+        (Table::ReleaseCredit, valid_release_credit()),
+        (Table::ArtistAlias, valid_artist_alias()),
+        (Table::ReleaseAlias, valid_release_alias()),
+        (Table::RecordingAlias, valid_recording_alias()),
+        (Table::ReleaseGroupAlias, valid_release_group_alias()),
+        (Table::WorkAlias, valid_work_alias()),
+        (Table::LabelAlias, valid_label_alias()),
+        (Table::ReleaseLabel, valid_release_label()),
     ] {
         let want = format!("{raw}\t21");
         assert_eq!(validate_line(table, 21, &raw), Ok(want), "{table:?}");

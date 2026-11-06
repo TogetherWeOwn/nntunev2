@@ -65,7 +65,17 @@ class MirrorPinTests(unittest.TestCase):
                      f'new_path = "migrations/{name}", '
                      f'old_sha256 = "{sha}", new_sha256 = "{sha}" }}]')):
                 with self.subTest(file=name, field=field):
-                    changed = self.original.replace(
+                    original = self.original
+                    if field == "source_rename_history":
+                        # Replace existing nested history rather than produce
+                        # invalid TOML by defining the same key twice.
+                        blocks = original.split("[[migration]]")
+                        index = next(i for i, block in enumerate(blocks)
+                                     if f'file = "{name}"' in block)
+                        blocks[index] = blocks[index].split(
+                            "[[migration.source_rename_history]]", 1)[0]
+                        original = "[[migration]]".join(blocks)
+                    changed = original.replace(
                         f'file = "{name}"\n',
                         f'file = "{name}"\n{field} = {metadata}\n', 1)
                     self.manifest.write_text(changed, encoding="utf-8")
@@ -73,6 +83,18 @@ class MirrorPinTests(unittest.TestCase):
                     apply_migration.load_manifest(self.manifest)
                     with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
                         runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_phase2_source_history_drift_refuses(self):
+        marker = "[[migration.source_rename_history]]"
+        for mutation, changed in (
+                ("removed", self.original.split(marker, 1)[0]),
+                ("changed", self.original.replace(
+                    runtime_cases.PHASE2_SOURCE_HISTORY[0]["parent"], "c" * 40, 1))):
+            with self.subTest(mutation=mutation):
+                self.manifest.write_text(changed, encoding="utf-8")
+                apply_migration.load_manifest(self.manifest)
+                with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                    runtime_cases.assert_frozen_mirror(self.manifest)
 
     def test_mirror_order_drift_refuses(self):
         blocks = self.original.split("[[migration]]")

@@ -5,7 +5,10 @@
 # on PATH (or MB_VALIDATE_BIN), plus DATABASE_URL to a SCRATCH database.
 # DESTRUCTIVE: truncates mb_artist/mb_release_group/mb_release/mb_recording/
 # mb_track/mb_url/mb_artist_url/mb_recording_url/mb_recording_music_video/
-# mb_recording_isrc/mb_import_dlq and
+# mb_recording_isrc/mb_work/mb_label/mb_artist_recording/mb_artist_release/
+# mb_artist_work/mb_recording_work/mb_recording_recording/mb_release_credit/
+# mb_artist_alias/mb_release_alias/mb_recording_alias/mb_release_group_alias/
+# mb_work_alias/mb_label_alias/mb_release_label/mb_import_dlq and
 # resets mb_import_cursor/mb_import_state, so it refuses to run unless
 # ALLOW_TEST_TRUNCATE=1 is set. Never point it at staging or production.
 set -euo pipefail
@@ -45,7 +48,7 @@ check() {
 }
 
 reset_db() {
-  db -c "TRUNCATE mb_track, mb_recording_isrc, mb_recording_music_video, mb_recording_url, mb_artist_url, mb_recording, mb_release, mb_url, mb_release_group, mb_artist, mb_import_dlq;" \
+  db -c "TRUNCATE mb_track, mb_recording_isrc, mb_recording_music_video, mb_recording_url, mb_artist_url, mb_recording, mb_release, mb_url, mb_release_group, mb_artist, mb_release_label, mb_label_alias, mb_work_alias, mb_release_group_alias, mb_recording_alias, mb_release_alias, mb_artist_alias, mb_release_credit, mb_recording_recording, mb_recording_work, mb_artist_work, mb_artist_release, mb_artist_recording, mb_label, mb_work, mb_import_dlq;" \
      -c "UPDATE mb_import_cursor SET lines_done = 0;" \
      -c "UPDATE mb_import_state SET last_packet = 0, last_applied_at = NULL, lag_seconds = NULL;" >/dev/null
 }
@@ -104,6 +107,54 @@ with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
         # uppercase mirror form, which the suite asserts below.
         f.write(f'{eid(200000+i)}\tusabc{i:07d}\t2024-05-02T00:00:00Z\n')
     f.write(f'{eid(200001)}\tBOGUS\t2024-05-02T00:00:00Z\n')
+N_WRK, N_LBL = 20, 10
+with open(f'{d}/mbdump-work.tsv', 'w') as f:
+    for i in range(1, N_WRK + 1):
+        typ = '\\N' if i % 5 == 0 else 'Song'
+        f.write(f'{eid(700000+i)}\tWork {i}\t{typ}\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label.tsv', 'w') as f:
+    for i in range(1, N_LBL + 1):
+        code, typ = ('\\N', '\\N') if i % 5 == 0 else (str(1000+i), 'Production')
+        f.write(f'{eid(800000+i)}\tLabel {i}\t{code}\t{typ}\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
+    for i in range(1, N_ART + 1):
+        f.write(f'{eid(i)}\t{eid(200000 + (i % N_REC) + 1)}\tcomposer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
+    for i in range(1, N_REL + 1):
+        f.write(f'{eid((i % N_ART) + 1)}\t{eid(100000+i)}\tproducer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
+    for i in range(1, N_WRK + 1):
+        f.write(f'{eid(i)}\t{eid(700000 + (i % N_WRK) + 1)}\tlyricist\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
+    for i in range(1, N_REC + 1):
+        f.write(f'{eid(200000+i)}\t{eid(700000 + (i % N_WRK) + 1)}\tperformance\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
+    for i in range(1, N_REC // 2 + 1):
+        f.write(f'{eid(200000+i)}\t{eid(200000 + ((i + N_REC // 2 - 1) % N_REC) + 1)}\tcover\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
+    for i in range(1, N_REL + 1):
+        f.write(f'{eid(100000+i)}\t0\t{eid((i % N_ART) + 1)}\tCredit {i}\t & \t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
+    for i in range(1, N_ART + 1):
+        f.write(f'{eid(i)}\tBand {i} Alt\ten\t{i} Alt, Band\ttrue\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
+    for i in range(1, N_REL + 1):
+        f.write(f'{eid(100000+i)}\tAlbum {i} Alt\ten\t{i} Alt, Album\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
+    for i in range(1, N_REC + 1):
+        f.write(f'{eid(200000+i)}\tTrack {i} Alt\ten\t{i} Alt, Track\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
+    for i in range(1, N_GRP + 1):
+        f.write(f'{eid(400000+i)}\tGroup {i} Alt\ten\t{i} Alt, Group\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
+    for i in range(1, N_WRK + 1):
+        f.write(f'{eid(700000+i)}\tWork {i} Alt\ten\t{i} Alt, Work\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
+    for i in range(1, N_LBL + 1):
+        f.write(f'{eid(800000+i)}\tLabel {i} Alt\ten\t{i} Alt, Label\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
+    for i in range(1, N_REL + 1):
+        f.write(f'{eid(100000+i)}\t{eid(800000 + (i % N_LBL) + 1)}\tCAT-{i:03d}\t2024-05-04T00:00:00Z\n')
 EOF
 
 echo "--- target: $(db -c "SELECT current_database() || chr(47) || current_user || '@' || coalesce(inet_server_addr()::text, 'socket');")"
@@ -122,6 +173,21 @@ check "artist urls loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist_url;')
 check "recording urls loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
 check "music videos loaded" "30" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
 check "isrcs loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+check "works loaded" "20" "$(db -c 'SELECT count(*) FROM mb_work;')"
+check "labels loaded" "10" "$(db -c 'SELECT count(*) FROM mb_label;')"
+check "artist recordings loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "artist releases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "artist works loaded" "20" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "recording works loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "song relations loaded" "30" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "release credits loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "artist aliases loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "release aliases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "recording aliases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "release group aliases loaded" "30" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "work aliases loaded" "20" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "label aliases loaded" "10" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+check "release labels loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
 check "isrcs stored uppercase" "USABC0000001" "$(db -c "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
 check "shared recording keeps both memberships" "2" \
   "$(db -c "SELECT count(*) FROM mb_track WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
@@ -135,6 +201,21 @@ check "artist url cursor" "121" "$(cursor artist_url "$FIX/mbdump-artist_url.tsv
 check "recording url cursor" "61" "$(cursor recording_url "$FIX/mbdump-recording_url.tsv")"
 check "music video cursor" "31" "$(cursor recording_music_video "$FIX/mbdump-recording_music_video.tsv")"
 check "isrc cursor" "61" "$(cursor recording_isrc "$FIX/mbdump-recording_isrc.tsv")"
+check "work cursor" "20" "$(cursor work "$FIX/mbdump-work.tsv")"
+check "label cursor" "10" "$(cursor label "$FIX/mbdump-label.tsv")"
+check "artist recording cursor" "120" "$(cursor artist_recording "$FIX/mbdump-artist_recording.tsv")"
+check "artist release cursor" "60" "$(cursor artist_release "$FIX/mbdump-artist_release.tsv")"
+check "artist work cursor" "20" "$(cursor artist_work "$FIX/mbdump-artist_work.tsv")"
+check "recording work cursor" "60" "$(cursor recording_work "$FIX/mbdump-recording_work.tsv")"
+check "song relation cursor" "30" "$(cursor recording_recording "$FIX/mbdump-recording_recording.tsv")"
+check "release credit cursor" "60" "$(cursor release_credit "$FIX/mbdump-release_credit.tsv")"
+check "artist alias cursor" "120" "$(cursor artist_alias "$FIX/mbdump-artist_alias.tsv")"
+check "release alias cursor" "60" "$(cursor release_alias "$FIX/mbdump-release_alias.tsv")"
+check "recording alias cursor" "60" "$(cursor recording_alias "$FIX/mbdump-recording_alias.tsv")"
+check "release group alias cursor" "30" "$(cursor release_group_alias "$FIX/mbdump-release_group_alias.tsv")"
+check "work alias cursor" "20" "$(cursor work_alias "$FIX/mbdump-work_alias.tsv")"
+check "label alias cursor" "10" "$(cursor label_alias "$FIX/mbdump-label_alias.tsv")"
+check "release label cursor" "60" "$(cursor release_label "$FIX/mbdump-release_label.tsv")"
 check "dlq rows" "10" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "dlq reasons" "bad_uuid,bad_timestamp,column_count,bad_uuid,bad_isrc,column_count,bad_bool,bad_uuid,bad_uuid,bad_timestamp" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
@@ -151,9 +232,9 @@ check "operator DLQ query works" "1" \
   "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name='artist' AND reason='bad_uuid';")"
 
 echo "=== 2. rerun over same dump: zero dupes, zero movement ==="
-before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_work), (SELECT count(*) FROM mb_label), (SELECT count(*) FROM mb_artist_recording), (SELECT count(*) FROM mb_artist_release), (SELECT count(*) FROM mb_artist_work), (SELECT count(*) FROM mb_recording_work), (SELECT count(*) FROM mb_recording_recording), (SELECT count(*) FROM mb_release_credit), (SELECT count(*) FROM mb_artist_alias), (SELECT count(*) FROM mb_release_alias), (SELECT count(*) FROM mb_recording_alias), (SELECT count(*) FROM mb_release_group_alias), (SELECT count(*) FROM mb_work_alias), (SELECT count(*) FROM mb_label_alias), (SELECT count(*) FROM mb_release_label), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
-after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_work), (SELECT count(*) FROM mb_label), (SELECT count(*) FROM mb_artist_recording), (SELECT count(*) FROM mb_artist_release), (SELECT count(*) FROM mb_artist_work), (SELECT count(*) FROM mb_recording_work), (SELECT count(*) FROM mb_recording_recording), (SELECT count(*) FROM mb_release_credit), (SELECT count(*) FROM mb_artist_alias), (SELECT count(*) FROM mb_release_alias), (SELECT count(*) FROM mb_recording_alias), (SELECT count(*) FROM mb_release_group_alias), (SELECT count(*) FROM mb_work_alias), (SELECT count(*) FROM mb_label_alias), (SELECT count(*) FROM mb_release_label), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 check "rerun changes nothing" "$before" "$after"
 
 echo "=== 3. same-sized newer dump upserts rows and isolates cursor/DLQ ==="
@@ -174,7 +255,7 @@ EOF
 [[ "$(wc -c <"$FIX/mbdump-artist.tsv")" == "$(wc -c <"$NEWER/mbdump-artist.tsv")" ]]
 bash "$SELF_DIR/import.sh" "$NEWER" >/dev/null
 check "new dump updates existing artist" "Band 9|2025-05-01 12:00:00+00"   "$(db -c "SELECT name || '|' || updated_at FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000001';")"
-check "new dump preserves table row counts" "120|30|60|60|61|10|120|60|30|60"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release_group) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording) || chr(124) || (SELECT count(*) FROM mb_track) || chr(124) || (SELECT count(*) FROM mb_url) || chr(124) || (SELECT count(*) FROM mb_artist_url) || chr(124) || (SELECT count(*) FROM mb_recording_url) || chr(124) || (SELECT count(*) FROM mb_recording_music_video) || chr(124) || (SELECT count(*) FROM mb_recording_isrc);')"
+check "new dump preserves table row counts" "120|30|60|60|61|10|120|60|30|60|20|10|120|60|20|60|30|60|120|60|60|30|20|10|60"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release_group) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording) || chr(124) || (SELECT count(*) FROM mb_track) || chr(124) || (SELECT count(*) FROM mb_url) || chr(124) || (SELECT count(*) FROM mb_artist_url) || chr(124) || (SELECT count(*) FROM mb_recording_url) || chr(124) || (SELECT count(*) FROM mb_recording_music_video) || chr(124) || (SELECT count(*) FROM mb_recording_isrc) || chr(124) || (SELECT count(*) FROM mb_work) || chr(124) || (SELECT count(*) FROM mb_label) || chr(124) || (SELECT count(*) FROM mb_artist_recording) || chr(124) || (SELECT count(*) FROM mb_artist_release) || chr(124) || (SELECT count(*) FROM mb_artist_work) || chr(124) || (SELECT count(*) FROM mb_recording_work) || chr(124) || (SELECT count(*) FROM mb_recording_recording) || chr(124) || (SELECT count(*) FROM mb_release_credit) || chr(124) || (SELECT count(*) FROM mb_artist_alias) || chr(124) || (SELECT count(*) FROM mb_release_alias) || chr(124) || (SELECT count(*) FROM mb_recording_alias) || chr(124) || (SELECT count(*) FROM mb_release_group_alias) || chr(124) || (SELECT count(*) FROM mb_work_alias) || chr(124) || (SELECT count(*) FROM mb_label_alias) || chr(124) || (SELECT count(*) FROM mb_release_label);')"
 check "new dump starts an independent cursor" "123" "$(cursor artist "$NEWER/mbdump-artist.tsv")"
 check "DLQ retains poison from both dumps" "13" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "same line poison is keyed by dump" "2" \
@@ -230,7 +311,22 @@ else
   rurl_at="$(cursor recording_url "$FIX/mbdump-recording_url.tsv")"
   mv_at="$(cursor recording_music_video "$FIX/mbdump-recording_music_video.tsv")"
   isrc_at="$(cursor recording_isrc "$FIX/mbdump-recording_isrc.tsv")"
-  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" && "$trk_at" == "61" && "$rg_at" == "31" && "$url_at" == "11" && "$aurl_at" == "121" && "$rurl_at" == "61" && "$mv_at" == "31" && "$isrc_at" == "61" ]]; then
+  wrk_at="$(cursor work "$FIX/mbdump-work.tsv")"
+  lbl_at="$(cursor label "$FIX/mbdump-label.tsv")"
+  ar_at="$(cursor artist_recording "$FIX/mbdump-artist_recording.tsv")"
+  arel_at="$(cursor artist_release "$FIX/mbdump-artist_release.tsv")"
+  aw_at="$(cursor artist_work "$FIX/mbdump-artist_work.tsv")"
+  rw_at="$(cursor recording_work "$FIX/mbdump-recording_work.tsv")"
+  rr_at="$(cursor recording_recording "$FIX/mbdump-recording_recording.tsv")"
+  rc_at="$(cursor release_credit "$FIX/mbdump-release_credit.tsv")"
+  aa_at="$(cursor artist_alias "$FIX/mbdump-artist_alias.tsv")"
+  rala_at="$(cursor release_alias "$FIX/mbdump-release_alias.tsv")"
+  rcal_at="$(cursor recording_alias "$FIX/mbdump-recording_alias.tsv")"
+  rga_at="$(cursor release_group_alias "$FIX/mbdump-release_group_alias.tsv")"
+  wa_at="$(cursor work_alias "$FIX/mbdump-work_alias.tsv")"
+  la_at="$(cursor label_alias "$FIX/mbdump-label_alias.tsv")"
+  rl_at="$(cursor release_label "$FIX/mbdump-release_label.tsv")"
+  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" && "$trk_at" == "61" && "$rg_at" == "31" && "$url_at" == "11" && "$aurl_at" == "121" && "$rurl_at" == "61" && "$mv_at" == "31" && "$isrc_at" == "61" && "$wrk_at" == "20" && "$lbl_at" == "10" && "$ar_at" == "120" && "$arel_at" == "60" && "$aw_at" == "20" && "$rw_at" == "60" && "$rr_at" == "30" && "$rc_at" == "60" && "$aa_at" == "120" && "$rala_at" == "60" && "$rcal_at" == "60" && "$rga_at" == "30" && "$wa_at" == "20" && "$la_at" == "10" && "$rl_at" == "60" ]]; then
     echo "FAIL: import completed before kill -9 (nothing to resume)" >&2
     kill -- "-$imp" 2>/dev/null || true
     wait "$imp" 2>/dev/null || true
@@ -249,8 +345,8 @@ else
       fail=1
     else
       echo "killed mid-flight at cursor artist=$killed_at release=$rel_at recording=$rec_at track=$trk_at (signal, wait=$kstatus); resuming"
-      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc);')"
-      if [[ "$partial" == "120|60|60|61|30|10|120|60|30|60" ]]; then
+      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_work), (SELECT count(*) FROM mb_label), (SELECT count(*) FROM mb_artist_recording), (SELECT count(*) FROM mb_artist_release), (SELECT count(*) FROM mb_artist_work), (SELECT count(*) FROM mb_recording_work), (SELECT count(*) FROM mb_recording_recording), (SELECT count(*) FROM mb_release_credit), (SELECT count(*) FROM mb_artist_alias), (SELECT count(*) FROM mb_release_alias), (SELECT count(*) FROM mb_recording_alias), (SELECT count(*) FROM mb_release_group_alias), (SELECT count(*) FROM mb_work_alias), (SELECT count(*) FROM mb_label_alias), (SELECT count(*) FROM mb_release_label);')"
+      if [[ "$partial" == "120|60|60|61|30|10|120|60|30|60|20|10|120|60|20|60|30|60|120|60|60|30|20|10|60" ]]; then
         echo "FAIL: kill left nothing to resume ($partial already fully loaded)" >&2
         fail=1
       else
@@ -265,11 +361,31 @@ else
         check "resume: recording urls" "60" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
         check "resume: music videos" "30" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
         check "resume: isrcs" "60" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+        check "resume: works" "20" "$(db -c 'SELECT count(*) FROM mb_work;')"
+        check "resume: labels" "10" "$(db -c 'SELECT count(*) FROM mb_label;')"
+        check "resume: artist recordings" "120" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+        check "resume: artist releases" "60" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+        check "resume: artist works" "20" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+        check "resume: recording works" "60" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+        check "resume: song relations" "30" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+        check "resume: release credits" "60" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+        check "resume: artist aliases" "120" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+        check "resume: release aliases" "60" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+        check "resume: recording aliases" "60" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+        check "resume: release group aliases" "30" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+        check "resume: work aliases" "20" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+        check "resume: label aliases" "10" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+        check "resume: release labels" "60" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
         check "resume: dlq" "10" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
         check "resume: artist dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_artist GROUP BY mbid HAVING count(*)>1) d;')"
         check "resume: release dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_release GROUP BY mbid HAVING count(*)>1) d;')"
         check "resume: recording dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_recording GROUP BY mbid HAVING count(*)>1) d;')"
+        check "resume: relation dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT artist_mbid, recording_mbid, link_name FROM mb_artist_recording GROUP BY 1, 2, 3 HAVING count(*)>1) d;')"
+        check "resume: credit dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT release_mbid, position FROM mb_release_credit GROUP BY 1, 2 HAVING count(*)>1) d;')"
+        check "resume: alias dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT artist_mbid, name, locale FROM mb_artist_alias GROUP BY 1, 2, 3 HAVING count(*)>1) d;')"
         check "resume: artist cursor" "123" "$(cursor artist "$FIX/mbdump-artist.tsv")"
+        check "resume: work cursor" "20" "$(cursor work "$FIX/mbdump-work.tsv")"
+        check "resume: release label cursor" "60" "$(cursor release_label "$FIX/mbdump-release_label.tsv")"
       fi
     fi
   fi
@@ -296,8 +412,83 @@ if MB_IMPORT_CHUNK_LINES=10 bash "$SELF_DIR/import.sh" "$DUPE" >/dev/null 2>&1; 
 else
   echo "ok: dupe dump refused"
 fi
-check "dupe: cursor remains at zero" "0" "$(cursor artist "$DUPE/mbdump-artist.tsv")"
+check "dupe: no cursor created" "0" "$(db -c "SELECT count(*) FROM mb_import_cursor WHERE table_name='artist' AND dump_id='$(dump_id "$DUPE/mbdump-artist.tsv")';")"
 check "dupe: no rows loaded" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+
+echo "=== 5b. phase-2 duplicate / partial snapshots are refused with all state unchanged ==="
+# Full-state fingerprint: every mirror table (base + phase 2), the import
+# cursor, the DLQ and the replication state. Row content is hashed, so a
+# refused import that mutated, inserted or deleted anything (including a
+# cursor row for the refused dump's id) changes the fingerprint. The
+# duplicate scan must run before ALL database mutation and cursor inserts,
+# so a duplicate in a LATE phase-2 table must not leave earlier tables
+# loaded or cursors created.
+ALL_MIRROR_TABLES="mb_artist mb_release_group mb_release mb_recording mb_track mb_url mb_artist_url mb_recording_url mb_recording_music_video mb_recording_isrc mb_work mb_label mb_artist_recording mb_artist_release mb_artist_work mb_recording_work mb_recording_recording mb_release_credit mb_artist_alias mb_release_alias mb_recording_alias mb_release_group_alias mb_work_alias mb_label_alias mb_release_label mb_import_cursor mb_import_dlq mb_import_state"
+state_fingerprint() {
+  local t
+  for t in $ALL_MIRROR_TABLES; do
+    printf '%s=%s\n' "$t" "$(db -c "SELECT count(*) || ':' || coalesce(md5(string_agg(x::text, E'\\n' ORDER BY x::text)), '') FROM $t x;")"
+  done
+}
+# refuse_unchanged <label> <dump-dir> <stderr-pattern>
+refuse_unchanged() {
+  local label="$1" dir="$2" pattern="$3" before after rc=0 errf
+  errf="$(mktemp)"
+  before="$(state_fingerprint)"
+  DUMP_SEQ=500 MB_IMPORT_CHUNK_LINES=10 bash "$SELF_DIR/import.sh" "$dir" >/dev/null 2>"$errf" || rc=$?
+  after="$(state_fingerprint)"
+  if [[ "$rc" == "0" ]]; then
+    echo "FAIL: $label imported without error" >&2
+    fail=1
+  else
+    echo "ok: $label refused (exit $rc)"
+  fi
+  if grep -q -- "$pattern" "$errf"; then
+    echo "ok: $label refusal message matches '$pattern'"
+  else
+    echo "FAIL: $label refusal message missing '$pattern'" >&2
+    sed 's/^/  stderr: /' "$errf" >&2
+    fail=1
+  fi
+  rm -f "$errf"
+  check "$label: rows, cursors, DLQ and replication state unchanged (incl. phase-2 tables)" "$before" "$after"
+}
+# Phase-2 duplicate snapshots: the rest of the dump is the valid FIX
+# snapshot, so earlier tables would load fully before the duplicate table
+# is reached if the scan ran lazily.
+make_dupe_p2() { # dir table  (append an exact copy of the first row)
+  rm -rf "$1"
+  mkdir -p "$1"
+  cp "$FIX"/mbdump-*.tsv "$1/"
+  head -n 1 "$1/mbdump-$2.tsv" >>"$1/mbdump-$2.tsv"
+}
+make_dupe_p2 "$FIX-dupe-p2-last" release_label
+make_dupe_p2 "$FIX-dupe-p2-alias" artist_alias
+# Partial phase-2 snapshots: one phase-2 file missing, first / last in order.
+PARTIAL_FIRST="$FIX-partial-first"
+PARTIAL_LAST="$FIX-partial-last"
+for p in "$PARTIAL_FIRST" "$PARTIAL_LAST"; do
+  rm -rf "$p"
+  mkdir -p "$p"
+  cp "$FIX"/mbdump-*.tsv "$p/"
+done
+rm "$PARTIAL_FIRST/mbdump-work.tsv"
+rm "$PARTIAL_LAST/mbdump-release_label.tsv"
+
+for start in empty loaded; do
+  reset_db
+  if [[ "$start" == "loaded" ]]; then
+    bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
+  fi
+  refuse_unchanged "dupe phase-2 release_label [$start start]" "$FIX-dupe-p2-last" "duplicate key"
+  refuse_unchanged "dupe phase-2 artist_alias [$start start]" "$FIX-dupe-p2-alias" "duplicate key"
+  refuse_unchanged "partial snapshot missing work [$start start]" "$PARTIAL_FIRST" "phase-2 tables import as a group"
+  refuse_unchanged "partial snapshot missing release_label [$start start]" "$PARTIAL_LAST" "phase-2 tables import as a group"
+done
+# Base-only (pre-phase-2) duplicate refusal stays covered by section 5
+# above; assert it here with the same full-state fingerprint too.
+reset_db
+refuse_unchanged "dupe base-only artist" "$DUPE" "duplicate key"
 
 echo "=== 6. cursor ahead of dump is refused ==="
 reset_db
@@ -361,6 +552,51 @@ with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
 with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
     f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
     f.write(f'{eid(575757)}\tUSABC2400002\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-work.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tGood Work\tSong\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tGood Label\t1903\tProduction\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(200001)}\tcomposer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(634343)}\tcomposer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(100001)}\tproducer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(614141)}\t{eid(100001)}\tproducer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(700001)}\tlyricist\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(644444)}\tlyricist\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(700001)}\tperformance\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(634343)}\t{eid(700001)}\tperformance\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200003)}\tcover\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200001)}\t{eid(634343)}\tcover\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t0\t{eid(1)}\tCredit 1\t & \t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(624242)}\t0\t{eid(1)}\tOrphan Credit\t & \t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t1\t{eid(614141)}\tOrphan Credit\t & \t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(614141)}\tOrphan Alt\ten\tAlt, Orphan\ttrue\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\tGood Album Alt\ten\tAlt, Good Album\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(624242)}\tOrphan Alt\ten\tAlt, Orphan\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tGood Track Alt\ten\tAlt, Good Track\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(634343)}\tOrphan Alt\ten\tAlt, Orphan\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGood Group Alt\ten\tAlt, Good Group\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(654545)}\tOrphan Alt\ten\tAlt, Orphan\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tGood Work Alt\ten\tAlt, Good Work\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(644444)}\tOrphan Alt\ten\tAlt, Orphan\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tGood Label Alt\ten\tAlt, Good Label\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(664646)}\tOrphan Alt\ten\tAlt, Orphan\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(800001)}\tCAT-001\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(624242)}\t{eid(800001)}\tCAT-002\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(664646)}\tCAT-003\t2024-05-04T00:00:00Z\n')
 EOF
 # Old behavior: the orphan's REFERENCES violation rolled back the whole
 # chunk, the cursor never advanced, and the row was never DLQ'd. Now the
@@ -383,6 +619,21 @@ check "fk: artist urls loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;
 check "fk: recording urls loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
 check "fk: music videos loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
 check "fk: isrcs loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+check "fk: works loaded" "1" "$(db -c 'SELECT count(*) FROM mb_work;')"
+check "fk: labels loaded" "1" "$(db -c 'SELECT count(*) FROM mb_label;')"
+check "fk: artist recordings loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "fk: artist releases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "fk: artist works loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "fk: recording works loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "fk: song relations loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "fk: release credits loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "fk: artist aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "fk: release aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "fk: recording aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "fk: release group aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "fk: work aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "fk: label aliases loaded" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+check "fk: release labels loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
 check "fk: artist cursor" "2" "$(cursor artist "$FKDIR/mbdump-artist.tsv")"
 check "fk: release group cursor" "2" "$(cursor release_group "$FKDIR/mbdump-release_group.tsv")"
 check "fk: release cursor" "4" "$(cursor release "$FKDIR/mbdump-release.tsv")"
@@ -393,11 +644,28 @@ check "fk: artist url cursor" "2" "$(cursor artist_url "$FKDIR/mbdump-artist_url
 check "fk: recording url cursor" "2" "$(cursor recording_url "$FKDIR/mbdump-recording_url.tsv")"
 check "fk: music video cursor" "2" "$(cursor recording_music_video "$FKDIR/mbdump-recording_music_video.tsv")"
 check "fk: isrc cursor" "2" "$(cursor recording_isrc "$FKDIR/mbdump-recording_isrc.tsv")"
-check "fk: dlq rows" "11" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
-check "fk: dlq reasons" "bad_uuid,fk_missing_url,fk_missing_release,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_artist,fk_missing_release_group,fk_missing_artist,fk_missing_release,fk_missing_recording" \
+check "fk: work cursor" "1" "$(cursor work "$FKDIR/mbdump-work.tsv")"
+check "fk: label cursor" "1" "$(cursor label "$FKDIR/mbdump-label.tsv")"
+check "fk: artist recording cursor" "2" "$(cursor artist_recording "$FKDIR/mbdump-artist_recording.tsv")"
+check "fk: artist release cursor" "2" "$(cursor artist_release "$FKDIR/mbdump-artist_release.tsv")"
+check "fk: artist work cursor" "2" "$(cursor artist_work "$FKDIR/mbdump-artist_work.tsv")"
+check "fk: recording work cursor" "2" "$(cursor recording_work "$FKDIR/mbdump-recording_work.tsv")"
+check "fk: song relation cursor" "2" "$(cursor recording_recording "$FKDIR/mbdump-recording_recording.tsv")"
+check "fk: release credit cursor" "3" "$(cursor release_credit "$FKDIR/mbdump-release_credit.tsv")"
+check "fk: artist alias cursor" "2" "$(cursor artist_alias "$FKDIR/mbdump-artist_alias.tsv")"
+check "fk: release alias cursor" "2" "$(cursor release_alias "$FKDIR/mbdump-release_alias.tsv")"
+check "fk: recording alias cursor" "2" "$(cursor recording_alias "$FKDIR/mbdump-recording_alias.tsv")"
+check "fk: release group alias cursor" "2" "$(cursor release_group_alias "$FKDIR/mbdump-release_group_alias.tsv")"
+check "fk: work alias cursor" "2" "$(cursor work_alias "$FKDIR/mbdump-work_alias.tsv")"
+check "fk: label alias cursor" "2" "$(cursor label_alias "$FKDIR/mbdump-label_alias.tsv")"
+check "fk: release label cursor" "3" "$(cursor release_label "$FKDIR/mbdump-release_label.tsv")"
+check "fk: dlq rows" "26" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "fk: dlq reasons" "bad_uuid,fk_missing_artist,fk_missing_recording,fk_missing_artist,fk_missing_url,fk_missing_work,fk_missing_label,fk_missing_release,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_artist,fk_missing_release_group,fk_missing_release,fk_missing_release,fk_missing_artist,fk_missing_artist,fk_missing_release_group,fk_missing_release,fk_missing_label,fk_missing_release,fk_missing_recording,fk_missing_work" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
 check "fk: orphan raw keeps dump key" "$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')" \
   "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='fk_missing_artist' AND table_name='release';")"
+check "fk: phase-2 orphan raw keeps dump key" "$(python3 -c 'import uuid; print(uuid.UUID(int=624242))')" \
+  "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='fk_missing_release' AND table_name='release_credit';")"
 
 echo "=== 9. validator write failure exits non-zero ==="
 # A short valid.tsv with a 0 exit would advance the cursor past rows that
@@ -485,7 +753,7 @@ else
   echo "ok: all-poison rerun refused on already-complete path"
 fi
 check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
-check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release_group) + (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track) + (SELECT count(*) FROM mb_url) + (SELECT count(*) FROM mb_artist_url) + (SELECT count(*) FROM mb_recording_url) + (SELECT count(*) FROM mb_recording_music_video) + (SELECT count(*) FROM mb_recording_isrc);')"
+check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release_group) + (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track) + (SELECT count(*) FROM mb_url) + (SELECT count(*) FROM mb_artist_url) + (SELECT count(*) FROM mb_recording_url) + (SELECT count(*) FROM mb_recording_music_video) + (SELECT count(*) FROM mb_recording_isrc) + (SELECT count(*) FROM mb_work) + (SELECT count(*) FROM mb_label) + (SELECT count(*) FROM mb_artist_recording) + (SELECT count(*) FROM mb_artist_release) + (SELECT count(*) FROM mb_artist_work) + (SELECT count(*) FROM mb_recording_work) + (SELECT count(*) FROM mb_recording_recording) + (SELECT count(*) FROM mb_release_credit) + (SELECT count(*) FROM mb_artist_alias) + (SELECT count(*) FROM mb_release_alias) + (SELECT count(*) FROM mb_recording_alias) + (SELECT count(*) FROM mb_release_group_alias) + (SELECT count(*) FROM mb_work_alias) + (SELECT count(*) FROM mb_label_alias) + (SELECT count(*) FROM mb_release_label);')"
 check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
 echo "=== 11. changed tracks: repoint replaces, dropped position is pruned ==="
@@ -791,7 +1059,268 @@ check "rel: older dump leaves recording urls alone" "3" "$(db -c 'SELECT count(*
 check "rel: older dump leaves pairs alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
 check "rel: older dump leaves isrcs alone" "2" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old"
+echo "=== 14. dropped phase-2 rows are pruned; older dump moves nothing back ==="
+# Same per-parent newest-dump prune pattern as the relationship tables in
+# 13, extended to the phase-2 relations, credits, aliases and
+# release-label edges: a newer dump that drops a song-relation link, a
+# song-relation pair, a credit position, an alias or a label edge must
+# stop serving it, and an older dump (new bytes, older timestamps) must
+# neither roll rows back nor resurrect pruned rows.
+reset_db
+REL2="$FIX-rel2"
+rm -rf "$REL2" "$REL2-newer" "$REL2-old"
+mkdir -p "$REL2"
+python3 - "$REL2" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+    f.write(f'{eid(2)}\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(400002)}\tGroup 2\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(2)}\tAlbum 2\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/good\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-work.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tWork 1\tSong\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(700002)}\tWork 2\tSong\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tLabel 1\t1903\tProduction\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(800002)}\tLabel 2\t1904\tProduction\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(200001)}\tcomposer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(200002)}\tproducer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(200003)}\tperformer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(100001)}\tproducer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(100002)}\tproducer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(700001)}\tlyricist\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(700001)}\tcomposer\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(700001)}\tperformance\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(700001)}\tarrangement\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\tcover\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200001)}\t{eid(200003)}\tcover\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(200003)}\tmedley\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t0\t{eid(1)}\tCredit 1\t & \t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t1\t{eid(1)}\tCredit 2\t & \t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t0\t{eid(2)}\tCredit 9\t & \t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(1)}\tB1\ten\tB1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\tBand 2 Alt\ten\tAlt, Band 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\tAlbum Alt\ten\tAlt, Album\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\tAlbum 2 Alt\ten\tAlt, Album 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tTrack 1 Alt\ten\tAlt, Track 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tTrack 2 Alt\ten\tAlt, Track 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1 Alt\ten\tAlt, Group 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(400002)}\tGroup 2 Alt\ten\tAlt, Group 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tWork 1 Alt\ten\tAlt, Work 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(700002)}\tWork 2 Alt\ten\tAlt, Work 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tLabel 1 Alt\ten\tAlt, Label 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(800002)}\tLabel 2 Alt\ten\tAlt, Label 2\tfalse\t2024-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(800001)}\tCAT-001\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(800002)}\tCAT-002\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(800001)}\tCAT-009\t2024-05-04T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
+check "rel2: artist recordings before" "3" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "rel2: song relations before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "rel2: release credits before" "3" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "rel2: artist aliases before" "3" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "rel2: release labels before" "3" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
+cp -R "$REL2" "$REL2-newer"
+python3 - "$REL2-newer" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+# Full newer snapshot: the producer link, the (200001, 200002) pair,
+# credit position 1, the B1 alias and the CAT-002 edge are dropped, and one
+# parent per phase-2 table loses every edge (artist 2, release 100002,
+# recording 200002, group 400002, work 700002, label 800002 and the
+# (200002, 200003) pair whose both endpoints vanish). Every surviving row
+# carries a newer timestamp so the snapshot prunes fire.
+with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(200001)}\tcomposer\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(100001)}\tproducer\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(700001)}\tlyricist\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(700001)}\tperformance\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200003)}\tcover\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t0\t{eid(1)}\tCredit 1\t & \t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\tAlbum Alt\ten\tAlt, Album\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tTrack 1 Alt\ten\tAlt, Track 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1 Alt\ten\tAlt, Group 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tWork 1 Alt\ten\tAlt, Work 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tLabel 1 Alt\ten\tAlt, Label 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(800001)}\tCAT-001\t2025-05-04T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL2-newer" >/dev/null
+check "rel2: dropped relation link pruned" "1" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "rel2: surviving relation link kept" "composer" "$(db -c "SELECT link_name FROM mb_artist_recording WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=1))')';")"
+check "rel2: dropped pair pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_recording WHERE recording_a_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')' AND recording_b_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')';")"
+check "rel2: surviving pair kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "rel2: dropped credit position pruned" "1" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "rel2: surviving credit position kept" "0" "$(db -c "SELECT position FROM mb_release_credit WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100001))')';")"
+check "rel2: dropped alias pruned" "1" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "rel2: surviving alias kept" "Band 1 Alt" "$(db -c "SELECT name FROM mb_artist_alias WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=1))')';")"
+check "rel2: dropped label edge pruned" "1" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
+check "rel2: surviving label edge kept" "CAT-001" "$(db -c "SELECT catalog_number FROM mb_release_label WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100001))')';")"
+# A parent the newer snapshot drops entirely must lose its old rows too:
+# the snapshot prune keys on the table max, not on the parent's own rows.
+check "rel2: vanished artist loses relation links" "0" "$(db -c "SELECT count(*) FROM mb_artist_recording WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving artist release link kept" "1" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "rel2: vanished artist loses release links" "0" "$(db -c "SELECT count(*) FROM mb_artist_release WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving artist work link kept" "1" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "rel2: vanished artist loses work links" "0" "$(db -c "SELECT count(*) FROM mb_artist_work WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving recording work link kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "rel2: vanished recording loses work links" "0" "$(db -c "SELECT count(*) FROM mb_recording_work WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')';")"
+check "rel2: pair with both endpoints vanished pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_recording WHERE recording_a_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')' AND recording_b_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')';")"
+check "rel2: vanished release loses credits" "0" "$(db -c "SELECT count(*) FROM mb_release_credit WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
+check "rel2: vanished artist loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_artist_alias WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving release alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "rel2: vanished release loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_release_alias WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
+check "rel2: surviving recording alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "rel2: vanished recording loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_recording_alias WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')';")"
+check "rel2: surviving group alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "rel2: vanished group loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_release_group_alias WHERE release_group_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=400002))')';")"
+check "rel2: surviving work alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "rel2: vanished work loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_work_alias WHERE work_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=700002))')';")"
+check "rel2: surviving label alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+check "rel2: vanished label loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_label_alias WHERE label_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=800002))')';")"
+check "rel2: vanished release loses label edges" "0" "$(db -c "SELECT count(*) FROM mb_release_label WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
+# An older dump (new bytes, older timestamps) must neither roll rows back
+# nor resurrect pruned rows: the forward-only upsert guard and the
+# snapshot prunes both refuse to move backwards.
+cp -R "$REL2" "$REL2-old"
+python3 - "$REL2-old" <<'EOF'
+import sys
+from pathlib import Path
+d = Path(sys.argv[1])
+for name in ("mbdump-artist_recording.tsv", "mbdump-recording_recording.tsv",
+             "mbdump-release_credit.tsv", "mbdump-artist_alias.tsv",
+             "mbdump-release_label.tsv"):
+    p = d / name
+    p.write_text(p.read_text().replace("2024-05-04T00:00:00Z", "2024-06-04T00:00:00Z"))
+EOF
+bash "$SELF_DIR/import.sh" "$REL2-old" >/dev/null
+check "rel2: older dump leaves relation links alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "rel2: older dump leaves pairs alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "rel2: older dump leaves credits alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "rel2: older dump leaves aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "rel2: older dump leaves label edges alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
+check "rel2: older dump leaves release links alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "rel2: older dump leaves work links alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "rel2: older dump leaves recording work links alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "rel2: older dump leaves release aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "rel2: older dump leaves recording aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "rel2: older dump leaves group aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "rel2: older dump leaves work aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "rel2: older dump leaves label aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+
+echo "=== 15. all-DLQ phase-2 dumps never prune existing rows, including on resume ==="
+# Mixed-age rows can remain after an interrupted older import. An incoming
+# dump with no loadable rows must not prune them using the stored table max.
+# Reconstruct a committed first chunk to cover resume without timing races.
+DLQ2="$FIX-dlq2"
+rm -rf "$DLQ2"
+cp -R "$REL2" "$DLQ2"
+relation_state() {
+  db -c 'SELECT row_to_json(r) FROM mb_artist_recording r ORDER BY artist_mbid, recording_mbid, link_name;'
+}
+for reason in fk_missing_artist bad_uuid; do
+  python3 - "$DLQ2/mbdump-artist_recording.tsv" "$reason" <<'EOF'
+import sys, uuid
+path, reason = sys.argv[1:]
+parent = str(uuid.UUID(int=999999)) if reason == "fk_missing_artist" else "not-a-uuid"
+with open(path, 'w') as f:
+    for i in (1, 2):
+        f.write(f'{parent}\t{uuid.UUID(int=200000+i)}\tcomposer\t2026-05-04T00:00:00Z\n')
+EOF
+  for completed in 0 1; do
+    reset_db
+    bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
+    db -c "UPDATE mb_artist_recording SET updated_at = '2023-05-04T00:00:00Z' WHERE link_name = 'producer';" >/dev/null
+    before="$(relation_state)"
+    hash="$(dump_id "$DLQ2/mbdump-artist_recording.tsv")"
+    if (( completed == 1 )); then
+      db -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('artist_recording', '$hash', 1) ON CONFLICT (table_name, dump_id) DO UPDATE SET lines_done = 1;" \
+         -c "INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line) VALUES ('artist_recording', '$hash', 1, '$reason', 'seeded first poison chunk');" >/dev/null
+    fi
+    for attempt in first rerun; do
+      if DUMP_SEQ=99 MB_IMPORT_CHUNK_LINES=1 bash "$SELF_DIR/import.sh" "$DLQ2" >"$DLQ2/run.log" 2>&1; then
+        echo "FAIL: all-DLQ phase-2 dump imported ($reason, offset $completed, $attempt)" >&2
+        fail=1
+      fi
+      if ! grep -Fq 'refusing artist_recording dump with no valid rows' "$DLQ2/run.log"; then
+        echo "FAIL: missing all-DLQ refusal ($reason, offset $completed, $attempt)" >&2
+        fail=1
+      fi
+      check "dlq2: existing rows unchanged ($reason, offset $completed, $attempt)" "$before" "$(relation_state)"
+      check "dlq2: cursor complete ($reason, offset $completed, $attempt)" "2" "$(cursor artist_recording "$DLQ2/mbdump-artist_recording.tsv")"
+      check "dlq2: both poison rows retained ($reason, offset $completed, $attempt)" "2" "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name = 'artist_recording' AND dump_id = '$hash' AND reason = '$reason';")"
+      check "dlq2: refused dump never seeds replication ($reason, offset $completed, $attempt)" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
+    done
+  done
+done
+# Negative control: a valid row in a prior chunk still authorizes pruning,
+# even when the last chunk contains only FK orphans and the run was resumed.
+reset_db
+bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
+python3 - "$DLQ2/mbdump-artist_recording.tsv" <<'EOF'
+import sys, uuid
+with open(sys.argv[1], 'w') as f:
+    f.write(f'{uuid.UUID(int=1)}\t{uuid.UUID(int=200001)}\tcomposer\t2026-05-04T00:00:00Z\n')
+    f.write(f'{uuid.UUID(int=999999)}\t{uuid.UUID(int=200002)}\tcomposer\t2026-05-04T00:00:00Z\n')
+EOF
+hash="$(dump_id "$DLQ2/mbdump-artist_recording.tsv")"
+db -c "UPDATE mb_artist_recording SET updated_at = '2026-05-04T00:00:00Z' WHERE link_name = 'composer';" \
+   -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('artist_recording', '$hash', 1) ON CONFLICT (table_name, dump_id) DO UPDATE SET lines_done = 1;" >/dev/null
+MB_IMPORT_CHUNK_LINES=1 bash "$SELF_DIR/import.sh" "$DLQ2" >/dev/null
+check "dlq2: resumed mixed dump still prunes old relations" "1" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "dlq2: resumed mixed dump retains the valid relation" "composer" "$(db -c 'SELECT link_name FROM mb_artist_recording;')"
+check "dlq2: resumed mixed dump completes cursor" "2" "$(cursor artist_recording "$DLQ2/mbdump-artist_recording.tsv")"
+
+rm -rf "$FIX" "$DUPE" "$FIX-dupe-p2-last" "$FIX-dupe-p2-alias" "$PARTIAL_FIRST" "$PARTIAL_LAST" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old" "$DLQ2"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1
