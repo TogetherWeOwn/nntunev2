@@ -53,6 +53,7 @@ pub mod queue;
 pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
+pub mod retention;
 pub mod retry;
 pub mod track_writers;
 pub mod transcode;
