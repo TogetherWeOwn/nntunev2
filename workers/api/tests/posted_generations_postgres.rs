@@ -31,7 +31,11 @@ use std::sync::RwLock;
 use std::time::Duration;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Client, Config};
+
+#[path = "support/posted_generation_database.rs"]
+mod posted_generation_database;
+use posted_generation_database::{connect, validate_disposable_database_config, Quiet};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MIGRATION_0037: &str = include_str!("../../../migrations/0037_posted_file_generations.sql");
@@ -121,26 +125,6 @@ fn run_test(test: impl Future<Output = ()>) {
 
 // ---- configuration guard (no socket, no credentials read) ----------------
 
-fn validate_disposable_database_config(config: &Config) -> Result<(), &'static str> {
-    if config.get_dbname() != Some("nntune_ci") {
-        return Err("only the explicitly named disposable nntune_ci database is permitted");
-    }
-    if !config.get_hostaddrs().is_empty() {
-        return Err("hostaddr overrides are not permitted for the disposable test service");
-    }
-    if config.get_hosts().len() != 1 {
-        return Err("one disposable test host only");
-    }
-    match &config.get_hosts()[0] {
-        tokio_postgres::config::Host::Tcp(host)
-            if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") =>
-        {
-            Ok(())
-        }
-        _ => Err("only the loopback disposable TCP test service is permitted"),
-    }
-}
-
 #[test]
 fn disposable_config_accepts_only_single_loopback_nntune_ci() {
     for input in [
@@ -175,52 +159,7 @@ fn disposable_config_rejects_hostaddr_nonloopback_multihost_and_wrong_database()
     }
 }
 
-fn database_config() -> Config {
-    let url = std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        panic!("NNTUNE_TEST_DATABASE_URL is required; database tests never silently skip")
-    });
-    let config = url
-        .parse::<Config>()
-        .unwrap_or_else(|_| panic!("NNTUNE_TEST_DATABASE_URL is not a valid configuration"));
-    if let Err(reason) = validate_disposable_database_config(&config) {
-        panic!("{reason}");
-    }
-    config
-}
-
 // ---- small helpers that never print database detail ----------------------
-
-trait Quiet<T> {
-    fn quiet(self, ctx: &'static str) -> T;
-}
-
-impl<T> Quiet<T> for Result<T, tokio_postgres::Error> {
-    fn quiet(self, ctx: &'static str) -> T {
-        match self {
-            Ok(value) => value,
-            Err(_) => panic!("{ctx}"),
-        }
-    }
-}
-
-async fn connect() -> Client {
-    let config = database_config();
-    let (client, connection) = config
-        .connect(NoTls)
-        .await
-        .unwrap_or_else(|_| panic!("connect disposable PostgreSQL"));
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(
-            "SET statement_timeout = '10s'; SET lock_timeout = '10s'; \
-             SET idle_in_transaction_session_timeout = '15s'",
-        )
-        .await
-        .quiet("bound disposable database operations");
-    client
-}
 
 async fn count(db: &Client, sql: &str, params: &[&(dyn ToSql + Sync)]) -> i64 {
     db.query_one(sql, params).await.quiet("count query").get(0)

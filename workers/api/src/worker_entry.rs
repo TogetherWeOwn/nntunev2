@@ -5571,6 +5571,10 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
 }
 
+#[cfg(all(test, feature = "postgres-tests"))]
+#[path = "../tests/support/admin_dispatch_postgres.rs"]
+mod admin_dispatch_postgres;
+
 #[cfg(test)]
 mod tests {
     use super::*;

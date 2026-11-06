@@ -251,6 +251,19 @@ EXPECTED = {
 }
 
 
+ADMISSION_PREFIX = "worker_entry::admin_dispatch_postgres::"
+ADMISSION_EXPECTED = {
+    ADMISSION_PREFIX + name for name in (
+        "postgres_real_admission_dispatch_replays_original_after_client_drop",
+        "postgres_real_admission_rejection_cannot_prepare_or_start",
+        "postgres_real_admission_demoted_and_deleting_actors_leave_no_dispatchable_job",
+        "postgres_real_admission_duplicate_actor_never_rebinds_original_dispatch_owner",
+        "postgres_real_admission_audit_error_rolls_back_before_dispatch_and_retry_keeps_identity",
+        "postgres_real_admission_concurrent_replay_and_duplicate_send_keep_one_attempt",
+    )
+}
+
+
 def main():
     if (
         os.environ.get("GITHUB_ACTIONS") != "true"
@@ -259,27 +272,31 @@ def main():
         sys.exit("The full posted-generation bank runs only on GitHub-hosted Actions")
     if not os.environ.get("NNTUNE_TEST_DATABASE_URL"):
         sys.exit("NNTUNE_TEST_DATABASE_URL is required; the bank cannot skip")
-    command = [
+    common = [
         "cargo", "test", "--locked", "--manifest-path", "workers/api/Cargo.toml",
-        "--features", "postgres-tests", "--test", "posted_generations_postgres",
+        "--features", "postgres-tests",
     ]
-    listing = subprocess.run(
-        command + ["--", "--list"], cwd=ROOT, text=True,
-        stdout=subprocess.PIPE, check=True,
-    ).stdout
-    actual = {
-        line.removesuffix(": test") for line in listing.splitlines()
-        if line.endswith(": test")
-    }
-    if actual != EXPECTED:
-        sys.exit("Posted-generation test inventory changed or did not compile completely")
+    command = common + ["--test", "posted_generations_postgres"]
+    admission = common + ["--lib", ADMISSION_PREFIX]
+    for bank, expected in [(command, EXPECTED), (admission, ADMISSION_EXPECTED)]:
+        listing = subprocess.run(
+            bank + ["--", "--list"], cwd=ROOT, text=True,
+            stdout=subprocess.PIPE, check=True,
+        ).stdout
+        actual = {
+            line.removesuffix(": test") for line in listing.splitlines()
+            if line.endswith(": test")
+        }
+        if actual != expected:
+            sys.exit("Posted-generation test inventory changed or did not compile completely")
     phases = [
-        (["--skip", RETIREMENT_CASE], EXPECTED - {RETIREMENT_CASE}),
-        (["--exact", RETIREMENT_CASE], {RETIREMENT_CASE}),
+        (command, ["--skip", RETIREMENT_CASE], EXPECTED - {RETIREMENT_CASE}),
+        (admission, [], ADMISSION_EXPECTED),
+        (command, ["--exact", RETIREMENT_CASE], {RETIREMENT_CASE}),
     ]
-    for filters, required in phases:
+    for bank, filters, required in phases:
         result = subprocess.run(
-            command + ["--", "--test-threads=1", *filters], cwd=ROOT, text=True,
+            bank + ["--", "--test-threads=1", *filters], cwd=ROOT, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=180,
         )
         output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
@@ -291,7 +308,8 @@ def main():
         for name in required:
             if not re.search(r"(?m)^test " + re.escape(name) + r" \.\.\. ok$", output):
                 sys.exit("A required posted-generation case did not execute and pass")
-    print(f"Posted-generation preparation: {len(EXPECTED)} required cases passed", flush=True)
+    total = len(EXPECTED) + len(ADMISSION_EXPECTED)
+    print(f"Posted-generation preparation: {total} required cases passed", flush=True)
 
 
 if __name__ == "__main__":
