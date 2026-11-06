@@ -11,7 +11,9 @@
 #   sampled every 5 s.
 # - Memory/CPU: `docker run --cpus 4 --memory 12g --memory-swap 12g`; peak
 #   is the container cgroup's memory.peak (cgroup v2), sampled every 5 s,
-#   and an OOM kill is reported.
+#   and an OOM kill is reported. memory.peak includes page cache, so an
+#   I/O-heavy build pins it at the limit; peak anonymous memory (`anon` in
+#   memory.stat) is sampled alongside as the working-set figure.
 # CPU speed is the GitHub runner's, not Cloudflare's; the report says so.
 set -euo pipefail
 
@@ -32,13 +34,17 @@ cid=$(docker run -d --cpus 4 --memory 12g --memory-swap 12g \
   "$image" bash /src/workers/mb/spike/build.sh)
 cgroup=/sys/fs/cgroup/system.slice/docker-${cid}.scope
 start=$(date -u +%s)
-peak_disk=0 peak_mem=0
+peak_disk=0 peak_mem=0 peak_anon=0
 while [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = "true" ]; do
   used=$(df -B1 --output=used "$mount" | tail -1 | tr -d ' ')
   [ "$used" -gt "$peak_disk" ] && peak_disk=$used
   if [ -r "$cgroup/memory.peak" ]; then
     mem=$(cat "$cgroup/memory.peak")
     [ "$mem" -gt "$peak_mem" ] && peak_mem=$mem
+  fi
+  if [ -r "$cgroup/memory.stat" ]; then
+    anon=$(awk '$1 == "anon" {print $2}' "$cgroup/memory.stat")
+    [ "${anon:-0}" -gt "$peak_anon" ] && peak_anon=$anon
   fi
   sleep 5
 done
@@ -49,7 +55,7 @@ docker logs "$cid" > "$(dirname "$out")/build.log" 2>&1 || true
 docker rm "$cid" > /dev/null
 
 M_START=$start M_END=$end M_PEAK_DISK=$peak_disk M_DISK_BASE=$disk_base \
-M_DISK_SIZE=$disk_size M_PEAK_MEM=$peak_mem M_EXIT=$exit_code M_OOM=$oom \
+M_DISK_SIZE=$disk_size M_PEAK_MEM=$peak_mem M_PEAK_ANON=$peak_anon M_EXIT=$exit_code M_OOM=$oom \
 python3 - "$out" "$mount/phases.tsv" <<'PY'
 import json, os, sys
 out, phases_path = sys.argv[1], sys.argv[2]
@@ -68,6 +74,7 @@ result = {
     "peak_disk_bytes": peak_disk,
     "disk_cap_bytes": int(env["M_DISK_SIZE"]),
     "peak_memory_bytes": int(env["M_PEAK_MEM"]),
+    "peak_anon_memory_bytes": int(env["M_PEAK_ANON"]),
     "memory_cap_bytes": 12 * 1024**3,
     "phases": phases,
 }

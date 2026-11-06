@@ -66,12 +66,12 @@ FIELD_COUNTS = {
     "l_artist_url": 9,
     "l_recording_url": 9,
     "l_recording_recording": 9,
-    # Upstream isrc is (id, recording, isrc, source, edits_pending,
-    # created): six columns. The curated projection only keeps the
-    # (recording, isrc) pair (positions 2, 3), but the row validator must
-    # accept the full upstream width or the first real ISRC row aborts
-    # the ETL.
-    "isrc": 6,
+    # Upstream isrc is (id, recording, isrc, edits_pending, created): five
+    # columns since upstream dropped `source` (the real 20261104 dump has
+    # five). The curated projection only keeps the (recording, isrc) pair
+    # (positions 2, 3), but the row validator must accept the full
+    # upstream width or the first real ISRC row aborts the ETL.
+    "isrc": 5,
 }
 
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz

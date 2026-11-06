@@ -161,7 +161,7 @@ jobs:
           {
             echo "## mb-snapshot-spike (${MB_DUMP})"
             for f in build.json snapshot-size.txt recall.md bench.json; do
-              [ -f "$out/$f" ] && { echo "### $f"; echo '```'; cat "$out/$f"; echo '```'; }
+              if [ -f "$out/$f" ]; then echo "### $f"; echo '```'; cat "$out/$f"; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
