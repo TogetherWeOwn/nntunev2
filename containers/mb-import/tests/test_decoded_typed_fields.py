@@ -296,16 +296,26 @@ class ImportDecodedFields(unittest.TestCase):
                     duplicate[field] = alias
                     rows["track"].append(duplicate)
                     self.write_dump(rows)
+                    cursor = "track:" + self.digest("track")
                     if completed:
                         state = self.state()
-                        state["cursors"]["track:" + self.digest("track")] = 1
+                        state["cursors"][cursor] = 1
                         state["rows"]["track"][R + "/1/2"] = [R, C, "1", "2", TS, "1"]
                         self.state_path.write_text(json.dumps(state))
+                    before = self.state()
                     result = self.run_import(chunk=1)
                     self.assertNotEqual(result.returncode, 0, "track key alias must refuse")
                     self.assertIn("duplicate key", result.stderr, result.stdout + result.stderr)
-                    self.assertEqual(self.state()["cursors"]["track:" + self.digest("track")], completed)
-                    self.assertFalse(any(e["kind"] == "commit" and e["table"] == "track" for e in self.state()["events"]))
+                    after = self.state()
+                    # All-file admission refuses before any psql call: rows,
+                    # cursors, DLQ and events are byte-for-byte the pre-run state
+                    # for both a fresh and a partially completed start.
+                    self.assertEqual(after, before, "refusal must not touch rows, cursors, DLQ or events")
+                    if completed:
+                        self.assertEqual(after["cursors"][cursor], completed)
+                    else:
+                        self.assertNotIn(cursor, after["cursors"], "refusal must precede the cursor INSERT")
+                    self.assertFalse(any(e["kind"] == "commit" and e["table"] == "track" for e in after["events"]))
 
     def test_literal_duplicates_still_refuse_but_distinct_keys_do_not(self):
         for table in TABLES:
