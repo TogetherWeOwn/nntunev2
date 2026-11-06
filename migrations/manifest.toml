@@ -328,3 +328,8 @@ sha256 = "cff05303ae7f254757b82ba5d842179dc6b3324a22127401aac7b28d3ed4b28c"
 file = "0047_ingest_file_dispatch.sql"
 target = "app"
 sha256 = "f77b0f38817172515b09b36fd1b8b9c2120101603a2168fb217bb3c042a39673"
+
+[[migration]]
+file = "0048_ingest_preparation_plans.sql"
+target = "app"
+sha256 = "3edeabd43ee56c60ebfa7ebf167dc6bfc62dae4c526216dcd90df1a5b60c91c6"

@@ -26,6 +26,9 @@ use database::{connect, Quiet};
 
 const MODE: DispatchMode = DispatchMode::PreparationOnly;
 
+#[path = "admin_plan_postgres.rs"]
+mod sealed;
+
 fn run(test: impl Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

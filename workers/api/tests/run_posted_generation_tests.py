@@ -266,6 +266,13 @@ ADMISSION_EXPECTED = {
         "postgres_real_admission_duplicate_actor_never_rebinds_original_dispatch_owner",
         "postgres_real_admission_audit_error_rolls_back_before_dispatch_and_retry_keeps_identity",
         "postgres_real_admission_concurrent_replay_and_duplicate_send_keep_one_attempt",
+        "sealed::postgres_sealed_plan_restart_replays_exact_envelope_and_prior_key",
+        "sealed::postgres_sealed_plan_disabled_invalid_and_unadmitted_write_nothing",
+        "sealed::postgres_sealed_plan_divergent_replay_provenance_and_version_refuse",
+        "sealed::postgres_sealed_plan_current_admission_fences_both_entries",
+        "sealed::postgres_sealed_plan_concurrent_writers_converge_without_resealing",
+        "sealed::postgres_sealed_plan_immutability_and_migration_replay_preserve_custody",
+        "sealed::postgres_sealed_plan_unknown_wrong_key_and_cross_row_envelopes_fail_closed",
     )
 }
 
