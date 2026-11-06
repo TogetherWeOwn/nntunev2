@@ -21,7 +21,7 @@ function restartFixture() {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'retireQueueWork', 'sourceProjections', 'syncMiniPlayerHint',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'retireQueueWork', 'sourceProjections', 'libraryInputCurrent', 'syncMiniPlayerHint',
 		'applyShareLink', 'applyPendingShareSeek', 'supersedePositionSeek', 'supersedeShareSeek'
 	]);
 	const handlers = parsed.statements.filter((node) =>
@@ -69,7 +69,7 @@ function restartFixture() {
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
-		let queueConfirmGeneration = 0, libraryInputOwner = null;
+		let queueConfirmGeneration = 0, libraryInputOwner = player.sourceInputOwner();
 		let queueAnnouncement = '';
 		const restartSupersededSources = new Set();
 		let playEpoch = 0;

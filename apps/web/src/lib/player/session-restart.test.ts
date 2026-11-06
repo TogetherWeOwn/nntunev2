@@ -324,6 +324,47 @@ for (const point of ['before-intent', 'getter', 'setter', 'reset-publication'] a
 	}
 }
 
+for (const point of ['before-intent', 'getter', 'setter', 'publication'] as const) {
+	for (const boundary of ['source', 'url', 'auth', 'reattach', 'destroy', 'nested'] as const) {
+		test(`relative jump fences ${boundary} reentry at ${point}`, () => {
+			const { session, audio } = setup();
+			session.jumpRelative('forward');
+			const before = session.snapshot();
+			let armed = true;
+			let position = 40;
+			const writes: number[] = [];
+			const reenter = () => {
+				if (!armed) return;
+				armed = false;
+				if (boundary === 'source') session.setQueue(createQueue([B]));
+				if (boundary === 'url') session.setQueue(createQueue([{ ...A, streamUrl: '/new-a' }]));
+				if (boundary === 'auth') session.resetAtAuthBoundary();
+				if (boundary === 'destroy') session.destroy();
+				if (boundary === 'reattach') session.attach(audio.element);
+				if (boundary === 'nested') session.jumpRelative('forward');
+			};
+			Object.defineProperty(audio, 'currentTime', {
+				get: () => { if (point === 'getter') reenter(); return position; },
+				set: (value: number) => { writes.push(value); position = value; if (point === 'setter') reenter(); }
+			});
+			if (point === 'before-intent') session.onBeforePositionIntent(reenter);
+			const unsubscribe = session.subscribe((state) => {
+				if (point === 'publication' && state.jumpStatusVersion === before.jumpStatusVersion + 1) reenter();
+			});
+			session.jumpRelative('back');
+			if (boundary === 'nested') {
+				expect(session.snapshot().jumpStatus).toMatch(/^Forward 10 seconds, now at /);
+				expect(session.snapshot().jumpStatusVersion).toBe(before.jumpStatusVersion + (point === 'publication' ? 2 : 1));
+			} else expect(session.snapshot().jumpStatus).toBe('');
+			if (point === 'before-intent' || point === 'getter') expect(writes).not.toContain(30);
+			else expect(writes.filter((value) => value === 30)).toHaveLength(1);
+			expect(session.snapshot().restartVersion).toBe(before.restartVersion);
+			unsubscribe();
+			session.destroy();
+		});
+	}
+}
+
 test('old detach cannot retire the same element in a new attachment incarnation', () => {
 	const { session, audio, detach } = setup();
 	const nextDetach = session.attach(audio.element);
