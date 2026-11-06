@@ -4,7 +4,8 @@
 use super::{admin_ingest_upload_on, attempt, connect, owner, run, stored, Quiet};
 use crate::admin_ingest::AdminIngestAttempt;
 use crate::ingest_plan::{
-    freeze_plan, read_plan, OpenedPlan, PlanError, PlanMode, PlanRequest, MAX_PLAN_BYTES,
+    freeze_plan, read_plan, OpenedPlan, PlanError, PlanMode, PlanRequest,
+    MAX_PREPARATION_PLAN_BYTES,
 };
 use crate::rotation::KekSource;
 use tokio_postgres::Client;
@@ -180,7 +181,7 @@ fn postgres_sealed_plan_disabled_invalid_and_unadmitted_write_nothing() {
             freeze_plan(&mut db, MODE, &keys, 1, &plan, &[]).await,
             Err(PlanError::Invalid)
         ));
-        let oversized = Zeroizing::new(vec![0_u8; MAX_PLAN_BYTES + 1]);
+        let oversized = Zeroizing::new(vec![0_u8; MAX_PREPARATION_PLAN_BYTES + 1]);
         assert!(matches!(
             freeze_plan(&mut db, MODE, &keys, 1, &plan, &oversized).await,
             Err(PlanError::Invalid)
@@ -236,8 +237,8 @@ fn postgres_sealed_plan_divergent_replay_provenance_and_version_refuse() {
 fn postgres_sealed_plan_current_admission_fences_both_entries() {
     run(async {
         for mutation in [
-            "UPDATE users SET role = 'user' WHERE id = $1",
-            "UPDATE users SET deleting_at = 1700000001 WHERE id = $1",
+            "UPDATE users SET role = 'member' WHERE id = $1",
+            "UPDATE users SET deleting_at = to_timestamp(1700000001) WHERE id = $1",
             "UPDATE ingest_jobs SET status = 'failed', failure_reason = 'empty' WHERE user_id = $1",
             "UPDATE ingest_originals SET nzb_bytes = nzb_bytes + 1 WHERE job_id IN (SELECT id FROM ingest_jobs WHERE user_id = $1)",
         ] {
@@ -245,7 +246,13 @@ fn postgres_sealed_plan_current_admission_fences_both_entries() {
             let bytes = payload();
             let plan = request(&input, "plan-one");
             let frozen = present(ok(freeze_plan(&mut db, MODE, &keys, 1, &plan, &bytes).await));
-            db.execute(mutation, &[&input.actor_user_id]).await.quiet("change current admission fence");
+            assert_eq!(
+                db.execute(mutation, &[&input.actor_user_id])
+                    .await
+                    .quiet("change current admission fence"),
+                1,
+                "each control must change exactly one admitted row"
+            );
             let before = snapshot(&db, &input.job_id).await;
             assert!(ok(freeze_plan(&mut db, MODE, &keys, 1, &plan, &bytes).await).is_none());
             assert!(ok(read_plan(&mut db, MODE, &keys, &plan, frozen.id(), frozen.version()).await).is_none());

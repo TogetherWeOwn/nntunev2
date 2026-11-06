@@ -20,7 +20,7 @@ use std::fmt;
 use tokio_postgres::{Client, Row, Transaction};
 use zeroize::Zeroizing;
 
-pub const MAX_PLAN_BYTES: usize = 1_048_576;
+pub const MAX_PREPARATION_PLAN_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlanMode {
@@ -200,7 +200,7 @@ async fn load(
     let size: i32 = meta.get("plaintext_bytes");
     let stored_kek: i32 = meta.get("kek_version");
     let kek_version = u32::try_from(stored_kek).map_err(|_| PlanError::Invalid)?;
-    if !(1..=MAX_PLAN_BYTES as i32).contains(&size)
+    if !(1..=MAX_PREPARATION_PLAN_BYTES as i32).contains(&size)
         || meta.get::<_, i16>("envelope_version") != 2
         || meta.get::<_, i16>("payload_format") != 1
         || meta.get::<_, i32>("encrypted_len") != size + 16
@@ -266,7 +266,7 @@ pub async fn freeze_plan(
         return Ok(None);
     }
     let id = input.id()?;
-    if canonical_plan.is_empty() || canonical_plan.len() > MAX_PLAN_BYTES {
+    if canonical_plan.is_empty() || canonical_plan.len() > MAX_PREPARATION_PLAN_BYTES {
         return Err(PlanError::Invalid);
     }
     let tx = client.transaction().await.map_err(|_| PlanError::Store)?;
