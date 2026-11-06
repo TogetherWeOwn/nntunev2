@@ -54,6 +54,26 @@ class MirrorPinTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
                         runtime_cases.assert_frozen_mirror(self.manifest)
 
+    def test_mirror_rename_metadata_drift_refuses(self):
+        for name, sha in runtime_cases.MIRROR_FILES:
+            for field, metadata in (
+                    ("renamed_from",
+                     f'[{{ file = "9998_old_mirror.sql", sha256 = "{sha}" }}]'),
+                    ("source_rename_history",
+                     f'[{{ parent = "{"a" * 40}", commit = "{"b" * 40}", '
+                     f'old_path = "migrations/9998_old_mirror.sql", '
+                     f'new_path = "migrations/{name}", '
+                     f'old_sha256 = "{sha}", new_sha256 = "{sha}" }}]')):
+                with self.subTest(file=name, field=field):
+                    changed = self.original.replace(
+                        f'file = "{name}"\n',
+                        f'file = "{name}"\n{field} = {metadata}\n', 1)
+                    self.manifest.write_text(changed, encoding="utf-8")
+                    # Each addition is valid metadata, not a parser rejection.
+                    apply_migration.load_manifest(self.manifest)
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+
     def test_mirror_order_drift_refuses(self):
         blocks = self.original.split("[[migration]]")
         indices = [i for i, block in enumerate(blocks) if 'target = "mirror"' in block]

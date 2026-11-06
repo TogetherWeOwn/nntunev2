@@ -323,8 +323,12 @@ def assert_frozen_mirror(manifest):
     # Pin only the ordered mirror entries and their bytes; app migrations
     # may evolve independently of this mirror-only runtime scenario.
     entries = _am().load_manifest(manifest)
-    mirror = [(e["file"], e["sha256"]) for e in entries if e["target"] == "mirror"]
-    assert mirror == MIRROR_FILES, "repository mirror manifest entries changed"
+    mirror = [e for e in entries if e["target"] == "mirror"]
+    # These frozen entries have no rename metadata; compare whole records so
+    # additions cannot change accepted aliases or source-history deny-lists.
+    expected = [{"file": name, "sha256": sha, "target": "mirror"}
+                for name, sha in MIRROR_FILES]
+    assert mirror == expected, "repository mirror manifest entries changed"
     for name, sha in MIRROR_FILES:
         data = (manifest.parent / name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha, f"{name} bytes changed"
