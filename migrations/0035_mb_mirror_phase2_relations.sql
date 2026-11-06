@@ -1,7 +1,7 @@
 -- 0035_mb_mirror_phase2_relations.sql: artist/recording/release relations
 -- (credits, song relations), aliases, labels + catalogue numbers, works.
 SET search_path = public, pg_catalog;
-BEGIN;
+-- Apply with the manifest runner; it owns the atomic transaction + receipt.
 --
 -- Phase-2 slice of the CC0-only mirror (ADR 0007): the importer/ETL learn
 -- fifteen curated tables behind the existing mirror. Every input is
@@ -37,9 +37,9 @@ BEGIN;
 -- Replay-safety: every statement is IF NOT EXISTS / additive; the
 -- table_name CHECKs swap in place like 0016/0030 (Postgres auto-named
 -- column checks from 0014/0016 are replaced, never edited). The swaps use
--- NOT VALID plus a post-COMMIT VALIDATE CONSTRAINT each, so the swap never
--- scans the cursor/DLQ tables under lock; re-running VALIDATE on an
--- already-valid constraint is a no-op success.
+-- NOT VALID plus VALIDATE CONSTRAINT in the runner's atomic transaction.
+-- Validation retains the swap locks until commit: pause imports and allow
+-- for the cursor/DLQ scan. Re-running validation is a no-op success.
 
 -- Works (compositions) and labels come first: the relation and
 -- release-label tables below reference them. work_type / label_type are
@@ -236,8 +236,8 @@ CREATE INDEX IF NOT EXISTS mb_label_alias_name_trgm_idx
 
 -- The import cursor/DLQ table_name checks (migrations 0014, 0016, 0030;
 -- Postgres auto-named column checks) learn the fifteen phase-2 tables. The
--- swaps are NOT VALID inside the transaction and validated after COMMIT, so
--- the swap never scans the cursor/DLQ tables under the swap lock.
+-- swaps and validation share the runner's transaction and checksum receipt.
+-- Their locks remain held through validation; apply with imports paused.
 ALTER TABLE public.mb_import_cursor DROP CONSTRAINT IF EXISTS mb_import_cursor_table_name_check;
 ALTER TABLE public.mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_check
     CHECK (table_name IN ('artist', 'release', 'recording', 'track',
@@ -262,6 +262,6 @@ ALTER TABLE public.mb_import_dlq ADD CONSTRAINT mb_import_dlq_table_name_check
                           'artist_alias', 'release_alias', 'recording_alias',
                           'release_group_alias', 'work_alias', 'label_alias',
                           'release_label')) NOT VALID;
-COMMIT;
+-- The manifest runner commits effects and receipt together after validation.
 ALTER TABLE public.mb_import_cursor VALIDATE CONSTRAINT mb_import_cursor_table_name_check;
 ALTER TABLE public.mb_import_dlq VALIDATE CONSTRAINT mb_import_dlq_table_name_check;

@@ -230,7 +230,7 @@ routing across every parent, and the newer/older-changed-dump and
 split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:162-1258` (suites 1-14, including phase-2 refusal controls);
-`.github/workflows/ci.yml:900-951`.)
+`.github/workflows/ci.yml:900-953`.)
 
 The shipped CI image carries `mb-validate`.
 The Docker build and import test suite run in the GitHub Actions
@@ -279,13 +279,15 @@ old row, leaving a visible gap rather than a stale recording. No
 data-destroying migrations in this path; 0014/0016 swap constraints in
 place (cursor PK, DLQ unique, `table_name` checks), and 0030 adds its six
 tables the same way (extending the cursor/DLQ `table_name` checks in
-place), as does 0035 with its fifteen phase-2 tables (swapped `NOT VALID`
-inside the transaction, validated after `COMMIT`, so the swap never scans
-the cursor/DLQ tables under lock). (Sources: `import.sh:634-655`
+place), as does 0035 with its fifteen phase-2 tables. Apply 0035 through
+the manifest runner: table creation, check swaps, validation and the checksum
+receipt share one atomic transaction. Validation retains the swap locks until
+commit, so pause imports and allow for the cursor/DLQ scan. A direct fixture
+apply must use `psql --single-transaction`; do not use a bare `psql -f`. (Sources: `import.sh:634-655`
 (prune, DLQ gap), `:915-935` (single transaction, forward-only
 guard, final-chunk prune); `test-import.sh:819-835` (older dump leaves rows alone);
 `migrations/0016_mb_track.sql:38-43` (check swaps);
 `migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps);
 `migrations/0030_mb_mirror_w6b.sql:103-114` (`table_name` check extension);
-`migrations/0035_mb_mirror_phase2_relations.sql:242-259` (`table_name` check extension),
-`:266-267` (post-`COMMIT` validation).)
+`migrations/0035_mb_mirror_phase2_relations.sql:241-264` (`table_name` check extension),
+`:265-267` (runner-owned atomic validation and receipt).)

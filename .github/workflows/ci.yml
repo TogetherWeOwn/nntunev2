@@ -933,7 +933,9 @@ jobs:
       # 0030 + phase-2 relations slice 0035); app migrations need the
       # full app schema and run in api-migrations.
       - name: Apply mirror migrations
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0030_mb_mirror_w6b.sql -f migrations/0035_mb_mirror_phase2_relations.sql
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0030_mb_mirror_w6b.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f migrations/0035_mb_mirror_phase2_relations.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
           # These pre-convention migrations carry no search_path header, so pin
