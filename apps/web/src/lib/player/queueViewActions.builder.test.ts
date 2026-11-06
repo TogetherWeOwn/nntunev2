@@ -101,6 +101,94 @@ it('Copy uses the session clipboard controller without selecting the row', async
 	player.destroy();
 });
 
+it('insertion dispatches current IDs and paired metadata/source input through the mounted producer only', async () => {
+	const { player, actions } = setup();
+	const received = vi.fn((ids: readonly string[], beforeId: string | null) => {
+		const tracks = ids.map((id) => ({ id, title: id.toUpperCase(), artist: '', streamUrl: '' }));
+		player.insertQueuedTracks(tracks, beforeId, { owner: player.sourceInputOwner(),
+			tracks: ids.map((id) => ({ id, streamUrl: `/source/${id}` })) });
+	});
+	const stop = player.onQueueInsert(received);
+	actions.oninsert(['x', 'x'], 'c');
+	expect(received).toHaveBeenCalledExactlyOnceWith(['x'], 'c');
+	expect(player.snapshot().queue.tracks.map((track) => track.id)).toEqual(['a', 'b', 'x', 'c', 'd']);
+	expect(currentTrack(player.snapshot().queue)?.id).toBe('b');
+	expect(player.snapshot().queue.tracks.find((track) => track.id === 'x')?.streamUrl).toBe('');
+	expect(player.snapshot().queueFeedback).toBe('Added 1 to the queue.');
+	stop();
+	actions.oninsert(['y'], null);
+	expect(received).toHaveBeenCalledTimes(1);
+	actions.onplaynow('x');
+	await Promise.resolve();
+	expect(currentTrack(player.snapshot().queue)?.streamUrl).toBe('/source/x');
+	expect(player.snapshot().queueFeedback).toBe('Selected X, paused: playback was blocked.');
+	player.destroy();
+});
+
+it.each([
+	['reorder', (a: ReturnType<typeof queueViewActions>) => a.onreorder(['d', 'c'], 'a'), ['c', 'd', 'a', 'b'], 'Queue order updated.'],
+	['play next IDs', (a: ReturnType<typeof queueViewActions>) => a.onplaynextids(['d']), ['a', 'b', 'd', 'c'], 'Tracks placed next in the queue.'],
+	['remove IDs', (a: ReturnType<typeof queueViewActions>) => a.onremoveids(['a']), ['b', 'c', 'd'], '1 selected track removed from queue.']
+] as const)('%s uses explicit live operands without replacing hidden selection', (_label, run, ids, feedback) => {
+	const { player, actions } = setup();
+	player.setQueueFilter('');
+	player.toggleQueueSelection('c');
+	player.setQueueFilter('D');
+	const selection = player.snapshot().queueSelection;
+	const seen: string[][] = [];
+	const stop = player.subscribe((snapshot) => { seen.push([...snapshot.queueSelection.ids]); });
+	run(actions);
+	expect(player.snapshot().queue.tracks.map((track) => track.id)).toEqual(ids);
+	expect(currentTrack(player.snapshot().queue)?.id).toBe('b');
+	expect(player.snapshot().queueSelection).toEqual(selection);
+	expect(seen.every((ids) => ids.join(',') === 'c')).toBe(true);
+	expect(player.snapshot().queueFeedback).toBe(feedback);
+	stop();
+	player.destroy();
+});
+
+it('the actual Favorites callback toggles one authoritative membership shared with other surfaces', () => {
+	const { player, actions } = setup();
+	actions.onfavoriteids(['a', 'b']);
+	expect(player.snapshot().favorites).toEqual(['a', 'b']);
+	expect(player.snapshot().queueFeedback).toBe('Starred 1 track; 1 was already starred.');
+	actions.onfavoriteids(['a', 'b']);
+	expect(player.snapshot().favorites).toEqual([]);
+	expect(player.snapshot().queueFeedback).toBe('Removed 2 tracks from favorites.');
+	player.destroy();
+});
+
+it.each(['loading', 'destroyed'] as const)('all six incoming callbacks reject a %s action without dispatch or revival', async (boundary) => {
+	const { player, actions } = setup();
+	const producer = vi.fn();
+	player.onQueueInsert(producer);
+	if (boundary === 'loading') player.setQueueLiveRegions(false);
+	else player.destroy();
+	const before = player.snapshot();
+	actions.oninsert(['x'], null);
+	actions.onreorder(['d'], 'a');
+	actions.onplaynextids(['d']);
+	actions.onremoveids(['a']);
+	actions.onplaynow('a');
+	actions.onfavoriteids(['a']);
+	await Promise.resolve();
+	expect(producer).not.toHaveBeenCalled();
+	expect(player.snapshot()).toBe(before);
+	player.destroy();
+});
+
+it('invalid insertion and reorder targets never become an end-of-queue fallback', () => {
+	const { player, actions } = setup();
+	const producer = vi.fn();
+	player.onQueueInsert(producer);
+	const before = player.snapshot();
+	actions.oninsert(['x'], 'removed');
+	actions.onreorder(['d'], 'removed');
+	expect(producer).not.toHaveBeenCalled();
+	expect(player.snapshot()).toBe(before);
+	player.destroy();
+});
+
 it('old view callbacks cannot revive a destroyed owner', () => {
 	const { player, actions } = setup();
 	player.destroy();

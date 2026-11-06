@@ -53,8 +53,8 @@ describe('shared shell markup', () => {
 			}
 		}
 		for (const anchor of ['rail', 'topbar']) {
-			expect(body).toContain(`data-create-anchor="${anchor}"`);
-			expect(body).toContain(`aria-controls="nt-create-menu-${anchor}"`);
+			expect(body).not.toContain(`data-create-anchor="${anchor}"`);
+			expect(body).not.toContain(`aria-controls="nt-create-menu-${anchor}"`);
 			expect(body).not.toContain(`id="nt-create-menu-${anchor}"`);
 		}
 		expect(body).not.toContain('role="menuitem"');

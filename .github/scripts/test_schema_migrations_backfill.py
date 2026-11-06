@@ -5,6 +5,7 @@ import pathlib
 import re
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,6 +36,13 @@ class BackfillTests(unittest.TestCase):
         expected = [(name, sha, ()) for name, sha in backfill.rows_for("app")]
         self.assertTrue(gate.compare(expected, rendered_rows("app")))
         self.assertEqual(len(rendered_rows("app")), 25)
+
+    def test_source_metadata_cannot_supply_backfill_proof(self):
+        before = {target: backfill.render(target) for target in backfill.TARGETS}
+        # Any manifest read would be a regression: backfill must remain frozen,
+        # not reinterpret arbitrary source metadata as an applied identity.
+        with mock.patch.object(pathlib.Path, "read_text", side_effect=AssertionError("manifest read")):
+            self.assertEqual(before, {target: backfill.render(target) for target in backfill.TARGETS})
 
     def test_frozen_state_covers_0001_to_0029(self):
         rows = rendered_rows("app") + rendered_rows("mirror")

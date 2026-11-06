@@ -6,7 +6,7 @@ import { openQueue } from './helpers/queue-host';
  * an explicit repeat Off/One/Queue control on `/library`. The Builder wires
  * `/library` to satisfy this file plus
  * `src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts` and must not
- * edit either file, except for the narrow TWO-2218-authorized W11 owner-chain
+ * edit either file, except for the narrowly authorized W11 owner-chain
  * header and media-fixture lifecycle migration. Every behavior and expected
  * outcome below stays protected; independent final review remains required.
  *

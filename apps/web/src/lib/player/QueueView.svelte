@@ -15,6 +15,13 @@
 		state={$player.queue}
 		selection={$player.queueSelection}
 		selectionControls={player}
+		interactionsUnavailable={!$player.queueLiveRegions}
+		oninsert={actions.oninsert}
+		onreorder={actions.onreorder}
+		onplaynextids={actions.onplaynextids}
+		onremoveids={actions.onremoveids}
+		onplaynow={actions.onplaynow}
+		onfavoriteids={actions.onfavoriteids}
 		showTransport={!currentTrack($player.queue)?.streamUrl}
 		showAnnouncement={false}
 		favoriteIds={favorites}
@@ -41,5 +48,5 @@
 	div { --nt-library-row-padding: 0.25rem; }
 	div[data-density='compact'] { --nt-library-row-padding: 0; }
 	div :global(.queue-row) { padding-block: var(--nt-library-row-padding); }
-	div :global(.queue-row button:not(.queue-star)) { min-width: 24px; min-height: 24px; }
+	div :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) { min-width: 24px; min-height: 24px; }
 </style>

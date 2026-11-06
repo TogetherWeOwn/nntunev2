@@ -10,7 +10,7 @@ const ITEMS = ['a', 'b', 'c', 'd'].map((id) => ({
 }));
 const row = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="batch-${id}"]`);
 const pick = (page: Page, id: string) => row(page, id).getByRole('checkbox');
-const actions = (page: Page) => page.getByTestId('queue-selection-actions');
+const actions = (page: Page) => page.getByTestId('queue-selection-toolbar');
 
 async function setup(page: Page, playing = false) {
 	const errors: string[] = [];
@@ -91,7 +91,7 @@ for (const width of [390, 1280]) {
 			expect(await page.getByTestId('queue-item').evaluateAll((rows) => rows.map((el) => el.getAttribute('data-track-id'))))
 				.toEqual(['batch-a', 'batch-b', 'batch-d', 'batch-c']);
 			await page.getByLabel('Filter queue', { exact: true }).fill('Batch B');
-			const remove = actions(page).getByRole('button', { name: 'Remove', exact: true });
+			const remove = actions(page).getByRole('button', { name: 'Remove selected from queue', exact: true });
 			await remove.focus();
 			await page.keyboard.press('Enter');
 			await expect(page.getByTestId('queue-announcement')).toHaveText('Removed 2 tracks from the queue.');
@@ -127,7 +127,7 @@ test('native checkbox ranges, scoped Select All, Done and repeated keyboard remo
 	await expect(pick(page, 'b')).toBeChecked();
 	await page.keyboard.press('ControlOrMeta+a');
 	for (const id of ['a', 'b', 'c', 'd']) await expect(pick(page, id)).toBeChecked();
-	await actions(page).getByRole('button', { name: 'Remove', exact: true }).focus();
+	await actions(page).getByRole('button', { name: 'Remove selected from queue', exact: true }).focus();
 	await page.keyboard.press('Enter');
 	await expect(page.getByTestId('queue-empty-focus')).toBeFocused();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
@@ -144,7 +144,7 @@ test('bulk removal keeps the next live checkbox focused and selection survives a
 	await openQueue(page);
 	await expect(pick(page, 'b')).toBeChecked();
 	await expect(pick(page, 'c')).toBeChecked();
-	await actions(page).getByRole('button', { name: 'Remove', exact: true }).focus();
+	await actions(page).getByRole('button', { name: 'Remove selected from queue', exact: true }).focus();
 	await page.keyboard.press('Enter');
 	await expect(pick(page, 'd')).toBeFocused();
 	await expect(actions(page)).toContainText('0 selected');
@@ -160,7 +160,7 @@ for (const width of [320, 390, 1280]) {
 			await setup(page);
 			await page.getByLabel('Appearance', { exact: true }).selectOption(appearance);
 			await pick(page, 'b').click();
-			await actions(page).getByRole('button', { name: 'Remove', exact: true }).focus();
+			await actions(page).getByRole('button', { name: 'Remove selected from queue', exact: true }).focus();
 			await page.keyboard.press('Tab');
 			const done = actions(page).getByRole('button', { name: 'Done', exact: true });
 			await expect(done).toBeFocused();

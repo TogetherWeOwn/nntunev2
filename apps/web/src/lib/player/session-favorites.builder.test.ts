@@ -242,3 +242,145 @@ describe('session favorites', () => {
 		expect(local.values.get(REPEAT_KEY)).toBe('queue');
 	});
 });
+
+describe('Favorites synchronous retirement fences', () => {
+	it.each(['auth', 'destroy', 'favorites', 'queue'] as const)('does not persist or report success after a %s subscriber supersedes publication', (boundary) => {
+		const { session, local } = setup();
+		session.initializeFavorites();
+		let armed = false;
+		const stop = session.subscribe((snapshot) => {
+			if (!armed || !snapshot.favorites.includes('a')) return;
+			armed = false;
+			if (boundary === 'auth') session.resetAtAuthBoundary();
+			else if (boundary === 'destroy') session.destroy();
+			else if (boundary === 'favorites') session.setFavorites(['c']);
+			else session.setQueue(createQueue([C]));
+		});
+		armed = true;
+		expect(session.toggleQueuedFavorite('a')).toBe(false);
+		expect(session.snapshot().queueFeedback).toBe('');
+		if (boundary === 'favorites') {
+			expect(favs(session)).toEqual(['c']);
+			expect(stored(local)).toEqual(['c']);
+		} else {
+			expect(stored(local)).toBeUndefined();
+			if (boundary === 'queue') expect(session.snapshot().queue).toEqual(createQueue([C]));
+			else expect(favs(session)).toEqual([]);
+		}
+		stop();
+		session.destroy();
+	});
+
+	it('a scoped-key read that resets auth cannot write the outgoing Favorites into either context', () => {
+		const { session, sessionStore, local } = setup();
+		session.initializeFavorites();
+		const read = sessionStore.storage.getItem;
+		let armed = true;
+		sessionStore.storage.getItem = (key) => {
+			const value = read(key);
+			if (armed && key === LIBRARY_AUTH_CONTEXT_KEY) {
+				armed = false;
+				session.resetAtAuthBoundary();
+				sessionStore.values.set(LIBRARY_AUTH_CONTEXT_KEY, 'ctx-2');
+			}
+			return value;
+		};
+		expect(session.toggleQueuedFavorite('a')).toBe(false);
+		expect(stored(local)).toBeUndefined();
+		expect(stored(local, 'ctx-2')).toBeUndefined();
+		expect(favs(session)).toEqual([]);
+		expect(session.snapshot().queueFeedback).toBe('');
+		session.destroy();
+	});
+
+	it('an old bootstrap read cannot republish Favorites after auth reset', () => {
+		const { session, local } = setup();
+		local.values.set(keyFor('ctx-1'), JSON.stringify(['a']));
+		const read = local.storage.getItem;
+		let armed = true;
+		local.storage.getItem = (key) => {
+			const value = read(key);
+			if (armed && key === keyFor('ctx-1')) {
+				armed = false;
+				session.resetAtAuthBoundary();
+			}
+			return value;
+		};
+		session.initializeFavorites();
+		expect(favs(session)).toEqual([]);
+		expect(session.setFavorites(['b'])).toBe(false);
+		expect(stored(local)).toBeUndefined();
+		session.destroy();
+	});
+
+	it('retirement during queue feedback suppresses all queued-Favorites route aftermath', () => {
+		const { session } = setup();
+		session.initializeFavorites();
+		const aftermath: string[] = [];
+		session.onQueuedFavorite((id) => { aftermath.push(id); });
+		let armed = false;
+		const stop = session.subscribe((snapshot) => {
+			if (!armed || snapshot.queueFeedback !== 'Starred Track A') return;
+			armed = false;
+			session.resetAtAuthBoundary();
+		});
+		armed = true;
+		expect(session.toggleQueuedFavorite('a')).toBe(false);
+		expect(aftermath).toEqual([]);
+		expect(session.snapshot().queueFeedback).toBe('');
+		stop();
+		session.destroy();
+	});
+
+	it('the first retiring aftermath listener fences the remaining old-action listeners', () => {
+		const { session } = setup();
+		session.initializeFavorites();
+		const aftermath: string[] = [];
+		session.onQueuedFavorite(() => { aftermath.push('first'); session.resetAtAuthBoundary(); });
+		session.onQueuedFavorite(() => { aftermath.push('stale'); });
+		expect(session.toggleQueuedFavorite('a')).toBe(false);
+		expect(aftermath).toEqual(['first']);
+		expect(favs(session)).toEqual([]);
+		expect(session.snapshot().queueFeedback).toBe('');
+		session.destroy();
+	});
+
+	it('an old bootstrap read cannot overwrite a newer synchronous Favorites action', () => {
+		const { session, local } = setup();
+		local.values.set(keyFor('ctx-1'), JSON.stringify(['a']));
+		const read = local.storage.getItem;
+		let armed = true;
+		local.storage.getItem = (key) => {
+			const value = read(key);
+			if (armed && key === keyFor('ctx-1')) {
+				armed = false;
+				session.setFavorites(['c']);
+			}
+			return value;
+		};
+		session.initializeFavorites();
+		expect(favs(session)).toEqual(['c']);
+		expect(stored(local)).toEqual(['c']);
+		session.destroy();
+	});
+});
+
+describe('incoming Favorites action intent', () => {
+	it.each([false, true])('add-only and toggle remain distinct with refused persistence=%s', (refused) => {
+		const { session, local } = setup();
+		session.initializeFavorites();
+		session.toggleFavorite('a');
+		local.failWrites.value = refused;
+		expect(session.favoriteQueuedIds(['a', 'b'], 'add')).toBe(true);
+		expect(favs(session)).toEqual(['a', 'b']);
+		expect(session.snapshot().queueFeedback).toBe('Starred 1 track; 1 was already starred.');
+		expect(stored(local)).toEqual(refused ? ['a'] : ['a', 'b']);
+		expect(session.favoriteQueuedIds(['a', 'b'], 'add')).toBe(true);
+		expect(favs(session)).toEqual(['a', 'b']);
+		expect(session.favoriteQueuedIds(['a', 'b'])).toBe(true);
+		expect(favs(session)).toEqual([]);
+		expect(session.snapshot().queueFeedback).toBe('Removed 2 tracks from favorites.');
+		expect(stored(local)).toEqual(refused ? ['a'] : []);
+		session.destroy();
+	});
+});

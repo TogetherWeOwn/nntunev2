@@ -11,7 +11,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * ── Contract renegotiation for the app-shell redesign (design spec v1) ──
  *
- * The horizontal three-link shell (Library / Select NZB locally / Account)
+ * The horizontal two-link shell (Library / Account)
  * is replaced by a three-pane app shell on desktop (top bar, left rail,
  * main view, optional right panel, player bar) and a mobile shell (compact
  * top bar, tab bar, mini-player). This file is the open renegotiation of
@@ -38,9 +38,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Why each changed case changed (design spec v1 §14):
  *   NAV-01  the shell's job is now app navigation: the `Primary` landmark
- *           owns Home / Search / Your Library; import becomes a library
- *           task (Library create menu), Account moves to the account menu.
- *           Buttons (back/forward/create/menus) legitimately exist, so
+ *           owns Home / Search / Your Library; Account moves to the account
+ *           menu. User NZB import and its import-only Create menu retire.
+ *           Buttons (back/forward/menus) legitimately exist, so
  *           "zero buttons in nav" becomes "every primary destination is a
  *           native link, visible without opening anything".
  *   NAV-02  marker rules generalise to the new route table; exact rules in
@@ -66,7 +66,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   - Current-marker rules (longest pathname-boundary match wins):
  *       /home                → Home
  *       /search, /search/…   → Search
- *       /library, /library/… → Your Library (incl. liked, recent, import)
+ *       /library, /library/… → Your Library (incl. liked, recent)
  *       /account/…           → no Primary marker; the "Account" entry of
  *                              the opened account menu carries
  *                              aria-current="page"; the account subnav
@@ -77,8 +77,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *     Public routes (/, /login, /pricing, /signup, /demo/…) render the
  *     public header, not the app shell: no `Primary` landmark there.
  *   - The account-menu button's accessible name is "Account menu"; the
- *     rail create button's is "Create"; its import entry is a menuitem
- *     named "Import NZB file". (Icon buttons are named by action.)
+ *     import-only Create control is retired. (Icon buttons are named by action.)
  *   - `data-testid="shell-topbar"` marks the top bar in BOTH shells (app
  *     and public header), so "some shell chrome is present" is testable
  *     on public routes too.
@@ -129,7 +128,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   NAV-08d links stay discoverable with a cached (stale) library
  *   NAV-09  navigating emits no mutating or off-origin requests
  *   NAV-10  no demo/playback promises in shell chrome     [v1 + v2]
- *   NAV-11  shell navigation preserves the local-only import disclosure
+ *   NAV-11  retired local import: no shell entry, no route, no hooks
  *   NAV-12  account subnav keeps working alongside the shell nav
  *   NAV-13  paywall close keeps focus restoration and modal isolation (Tab + Shift+Tab) with nav
  *   NAV-14  paywall upgrade navigation keeps the shell and a sane focus target
@@ -159,8 +158,7 @@ const SHELL_BUILDER = 'Builder (app shell): see the v2 contract in this file hea
 
 /**
  * The shell nav, located by its landmark name. The old locator keyed on
- * owning the /library/import link; that link leaves the landmark in the
- * new shell (import becomes a library task), so the landmark is now
+ * owning the retired import link; the landmark is now
  * located the way assistive technology finds it. `getByRole` only matches
  * the accessibility tree, so a CSS-hidden per-breakpoint duplicate does
  * not double-count.
@@ -189,19 +187,22 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
 async function mockAccountApis(page: Page): Promise<void> {
-	await page.route('**/v1/vault', (route) =>
+	await page.route('**/v1/me/*', (route) =>
+		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
+	);
+	await page.route('**/v1/me/subscription', (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: 'application/json',
 			body: JSON.stringify({
-				provider_configured: false,
-				indexer_configured: false,
-				updated_at: 0
+				state: 'no_subscription',
+				planId: null,
+				status: null,
+				currentPeriodEnd: null,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
 			})
 		})
-	);
-	await page.route('**/v1/me/*', (route) =>
-		route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
 	);
 }
 
@@ -248,18 +249,7 @@ function accountMenuButton(page: Page): Locator {
 	return page.getByRole('button', { name: 'Account menu', exact: true });
 }
 
-/** Navigate to the local NZB selection page through the shell, either generation. */
-async function goToImport(page: Page): Promise<void> {
-	// Import is a library task, reached from the rail Create menu.
-	await page.getByRole('button', { name: 'Create', exact: true }).click();
-	await page
-		.getByRole('menuitem', { name: /Import NZB file/ })
-		.or(page.getByRole('link', { name: /Import NZB file/ }))
-		.first()
-		.click();
-}
-
-/** Navigate to the account area through the shell, either generation. */
+/** Navigate to the account area through the shell. */
 async function goToAccount(page: Page): Promise<void> {
 	// Account lives in the top-bar account menu.
 	await accountMenuButton(page).click();
@@ -365,6 +355,26 @@ async function tabUntilFocused(page: Page, target: Locator, maxTabs = 60): Promi
 	return false;
 }
 
+/** Focus some shell link by keyboard traversal from the page start. */
+async function focusShellLink(page: Page): Promise<void> {
+	await page.keyboard.press('Tab'); // skip link
+	// Probe presence first (the goToAccount pattern): evaluating
+	// an absent locator inside tabUntilFocused waits out the timeout on
+	// every tab, so on public-header routes (no Primary landmark, e.g.
+	// /demo/player in v2) the fallback must be chosen up front, not after
+	// 30 timed-out probes.
+	let reached = false;
+	if ((await libraryDestinationLink(page).count()) > 0) {
+		reached = await tabUntilFocused(page, libraryDestinationLink(page), 30);
+	}
+	if (!reached) {
+		// Public header (no Primary nav): its first link serves the same
+		// "a focused shell link is not a typing target" purpose.
+		reached = await tabUntilFocused(page, page.locator('header a[href]').first(), 30);
+	}
+	expect(reached, 'expected keyboard traversal to reach a shell link').toBe(true);
+}
+
 /**
  * The focused skip link must be visibly revealed, not just focused:
  * `toBeVisible` passes for an off-viewport transform, so assert the rendered
@@ -418,18 +428,14 @@ test('[NAV-03] client-side navigation updates the marker without a reload', asyn
 	await mockLibrary(page, 200, []);
 	await mockAccountApis(page);
 	// Starts on an app route (not `/`): in the new shell `/` is the public
-	// landing without the Primary landmark. The journey — library → import
-	// → account, markers following, no reload — is unchanged.
+	// landing without the Primary landmark. The journey — library → account, markers
+	// following, no reload — preserves the surviving destinations.
 	await page.goto('/library');
 	await expectShellPresent(page, '/library');
 	await expectCurrentDestination(page, '/library', 'Library');
 	await page.evaluate(() => {
 		(window as unknown as { __shellNavMarker: string }).__shellNavMarker = 'still-here';
 	});
-
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
-	await expectCurrentDestination(page, '/library/import (client nav)', 'Library');
 
 	await goToAccount(page);
 	await expect(page).toHaveURL(/\/account/);
@@ -466,7 +472,7 @@ for (const width of [1280, 390]) {
 		await page.setViewportSize({ width, height: 800 });
 		await mockLibrary(page, 200, []);
 		await mockAccountApis(page);
-		for (const path of ['/library', '/library/import', '/account/billing']) {
+		for (const path of ['/library', '/library/liked', '/account/billing']) {
 			await page.goto(path);
 			await expect(
 				skipLink(page),
@@ -556,38 +562,41 @@ for (const width of [1280, 390]) {
 }
 
 test('[NAV-08a] links stay discoverable with a populated library', async ({ page }) => {
+	await mockAccountApis(page);
 	await mockLibrary(page, 200, LIBRARY_ITEMS);
 	await page.goto('/library');
 	await expect(page.getByTestId('library-list')).toBeVisible();
 	await expect(page.getByTestId('library-item')).toHaveCount(2);
 	await expectShellPresent(page, 'populated /library');
 	await expectShellDestinationsDiscoverable(page, 'library state under test');
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
-	await expect(page.getByTestId('import-file')).toBeVisible();
+	await goToAccount(page);
+	await expect(page).toHaveURL(/\/account\/billing$/);
 });
 
 test('[NAV-08b] links stay discoverable with an empty library', async ({ page }) => {
+	await mockAccountApis(page);
 	await mockLibrary(page, 200, []);
 	await page.goto('/library');
 	await expect(page.getByRole('main')).toContainText(/library is empty/i);
 	await expectShellPresent(page, 'empty /library');
 	await expectShellDestinationsDiscoverable(page, 'library state under test');
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await goToAccount(page);
+	await expect(page).toHaveURL(/\/account\/billing$/);
 });
 
 test('[NAV-08c] links stay discoverable with an unavailable library', async ({ page }) => {
+	await mockAccountApis(page);
 	await mockLibrary(page, 404, { error: 'not found' });
 	await page.goto('/library');
 	await expect(page.getByRole('main')).toContainText(/not available yet/i);
 	await expectShellPresent(page, 'unavailable /library');
 	await expectShellDestinationsDiscoverable(page, 'library state under test');
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await goToAccount(page);
+	await expect(page).toHaveURL(/\/account\/billing$/);
 });
 
 test('[NAV-08d] links stay discoverable with a cached (stale) library', async ({ page }) => {
+	await mockAccountApis(page);
 	let calls = 0;
 	await page.route('**/api/library', (route) => {
 		calls += 1;
@@ -606,8 +615,8 @@ test('[NAV-08d] links stay discoverable with a cached (stale) library', async ({
 	await expect(page.getByTestId('library-list')).toBeVisible();
 	await expectShellPresent(page, 'cached /library');
 	await expectShellDestinationsDiscoverable(page, 'library state under test');
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await goToAccount(page);
+	await expect(page).toHaveURL(/\/account\/billing$/);
 });
 
 test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
@@ -633,8 +642,6 @@ test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
 		// navigation; this case pins link/menu navigation only.
 		await page.goto('/library');
 		await expectShellPresent(page, '/library');
-		await goToImport(page);
-		await expect(page).toHaveURL(/\/library\/import$/);
 		await goToAccount(page);
 		await expect(page).toHaveURL(/\/account/);
 		await libraryDestinationLink(page).click();
@@ -657,38 +664,37 @@ test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
 	).toEqual([]);
 });
 
-test('[NAV-11] shell navigation preserves the local-only import disclosure', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/library');
-	await expectShellPresent(page, '/library');
-	await goToImport(page);
-	await expect(page).toHaveURL(/\/library\/import$/);
+for (const width of [1280, 390]) {
+	test(`[NAV-11 ${width}px] retired local import: no shell entry, no route, no hooks`, async ({ page }) => {
+		await page.setViewportSize({ width, height: 800 });
+		await mockLibrary(page, 200, []);
+		await page.goto('/library');
+		await expectShellPresent(page, '/library');
+		await expect(page.getByRole('main')).toContainText(/library is empty/i);
 
-	const input = page.getByTestId('import-file');
-	await expect(input).toBeVisible();
-	await expect(input).toHaveAttribute('type', 'file');
-	await expect(input).toHaveAttribute('accept', '.nzb');
-	await expect(page.getByTestId('import-status')).toHaveCount(0);
-	const copy = await page.getByRole('main').innerText();
-	expect(copy).toMatch(/\blocal(?:ly)?\b/i);
-	expect(
-		copy,
-		'expected the import page reached via the shell to keep its no-upload disclosure. ' +
-			'Builder: do not touch import copy or behavior.'
-	).toMatch(/does not upload/i);
+		const importName = /\bimport\b|select nzb/i;
+		await expect(
+			page.locator('a[href^="/library/import"]'),
+			'expected no link to the retired import route anywhere on /library (shell or empty state). ' +
+				'Builder: remove the import entry points.'
+		).toHaveCount(0);
+		await expect(shellNav(page).getByRole('link', { name: importName })).toHaveCount(0);
+		await expect(page.getByRole('main').getByRole('link', { name: importName })).toHaveCount(0);
+		await expect(page.getByRole('button', { name: 'Create', exact: true })).toHaveCount(0);
 
-	await input.setInputFiles({
-		name: 'shell-nav-local.nzb',
-		mimeType: 'application/x-nzb',
-		buffer: Buffer.from('<?xml version="1.0"?><nzb></nzb>')
+		for (const path of ['/library/import', '/library/import/extra']) {
+			const response = await page.goto(path);
+			expect(
+				response?.status(),
+				`expected ${path} to be gone (404). Builder: delete the import route.`
+			).toBe(404);
+			for (const hook of ['import-file', 'import-status']) {
+				await expect(page.getByTestId(hook)).toHaveCount(0);
+			}
+		}
 	});
-	const status = page.getByTestId('import-status');
-	await expect(status).toBeVisible();
-	await expect(status).toHaveAttribute('role', 'status');
-	await expect(status).toContainText(/selected locally/i);
-});
+
+}
 
 test('[NAV-12] account subnav keeps working alongside the shell nav', async ({ page }) => {
 	await mockAccountApis(page);
@@ -972,8 +978,7 @@ test('[NAV-02a v2] direct load marks Home, Search and Your Library by route segm
 		['/search/shell%20band', 'Search'],
 		['/library', 'Library'],
 		['/library/liked', 'Library'],
-		['/library/recent', 'Library'],
-		['/library/import', 'Library']
+		['/library/recent', 'Library']
 	];
 	for (const [path, destination] of cases) {
 		await page.goto(path);
@@ -988,7 +993,7 @@ test('[NAV-02b v2] account and settings pages mark the account-menu entry, not t
 }) => {
 	await mockLibrary(page, 200, []);
 	await mockAccountApis(page);
-	for (const path of ['/account/billing', '/account/security', '/account/provider']) {
+	for (const path of ['/account/billing', '/account/security']) {
 		await page.goto(path);
 		await expectShellPresent(page, path);
 		await expectCurrentDestination(page, path, 'Account');
@@ -1021,9 +1026,9 @@ test('[NAV-02c v2] entity and look-alike routes mark no primary destination', as
 // [gate: app shell]
 test('[NAV-02d v2] nested paths match by pathname boundary', async ({ page }) => {
 	await mockLibrary(page, 200, []);
-	await page.goto('/library/import/extra');
-	await expectShellPresent(page, '/library/import/extra');
-	await expectCurrentDestination(page, '/library/import/extra', 'Library');
+	await page.goto('/library/liked/extra');
+	await expectShellPresent(page, '/library/liked/extra');
+	await expectCurrentDestination(page, '/library/liked/extra', 'Library');
 
 	await page.goto('/search/shell%20band/tracks');
 	await expectCurrentDestination(page, '/search/shell band/tracks', 'Search');
@@ -1492,7 +1497,7 @@ test('[NAV-18 v2] native links plus design-token styling, design route-table all
 	// The design route table (design spec v1 §2). Demo routes are absent
 	// on purpose: they are unlinked (NAV-10 v2).
 	const ROUTE_TABLE =
-		/^\/(home|search(\/.*)?|library(\/.*)?|artist\/[^/]+(\/.*)?|album\/[^/]+|playlist\/[^/]+|track\/[^/]+|genre\/[^/]+|section\/[^/]+|queue|now-playing|settings(\/.*)?|account(\/.*)?|onboarding\/byop|pricing|login|signup|auth\/magic)?$/;
+		/^\/(home|search(\/.*)?|library(\/.*)?|artist\/[^/]+(\/.*)?|album\/[^/]+|playlist\/[^/]+|track\/[^/]+|genre\/[^/]+|section\/[^/]+|queue|now-playing|settings(\/.*)?|account(\/.*)?|pricing|login|signup|auth\/magic)?$/;
 	for (const link of hrefs) {
 		expect(
 			link.tag,

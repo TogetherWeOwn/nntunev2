@@ -285,6 +285,8 @@ test('LIBTITLE-16 SPA navigation owns the destination title and retains session 
 	};
 	await expectRetained();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
+	// User NZB import retired: the SPA leg runs through Account
+	// billing instead of the deleted /library/import route.
 	const primary = page.getByRole('navigation', { name: 'Primary' });
 	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
 	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();

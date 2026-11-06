@@ -78,6 +78,102 @@ async function navigate(page: Page, path: 'home' | 'library') {
 	await expect(page).toHaveURL(new RegExp(`/${path}$`));
 }
 
+for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as const) {
+	test(`metadata-only queued Play survives actual Library teardown: ${outcome}`, async ({ page }) => {
+		const errors: string[] = [];
+		const requests: string[] = [];
+		page.on('pageerror', (error) => errors.push(error.message));
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await page.addInitScript((outcome) => {
+			const scope = window as unknown as { queuedPlayCalls: number; finishQueuedPlay?: () => void; teardownMarker: string };
+			scope.queuedPlayCalls = 0;
+			const nativePlay = HTMLMediaElement.prototype.play;
+			HTMLMediaElement.prototype.play = function () {
+				scope.queuedPlayCalls += 1;
+				if (outcome === 'blocked') return Promise.reject(new DOMException('Blocked', 'NotAllowedError'));
+				const played = nativePlay.call(this);
+				return outcome === 'superseded' ? played.then(() => new Promise<void>((resolve) => {
+					scope.finishQueuedPlay = resolve;
+				})) : played;
+			};
+		}, outcome);
+		const items = [
+			{ id: 'dawn', title: 'Dawn Chorus', ...(outcome === 'no-stream' ? {} : { streamUrl: '/test-audio/teardown-dawn' }) },
+			{ id: 'coral', title: 'Coral Night' }
+		];
+		await page.route('**/api/library', (route) => route.fulfill({ json: items }));
+		const wav = silentWav();
+		await page.route('**/test-audio/**', (route) => {
+			requests.push(route.request().url());
+			const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range ?? '');
+			const start = range ? Number(range[1]) : 0;
+			const end = range?.[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
+			return route.fulfill({ status: range ? 206 : 200, contentType: 'audio/wav', body: wav.subarray(start, end + 1),
+				headers: { 'Accept-Ranges': 'bytes', 'Content-Length': String(end - start + 1),
+					...(range ? { 'Content-Range': `bytes ${start}-${end}/${wav.length}` } : {}) } });
+		});
+		await page.goto('/library');
+		await expect(page.getByTestId('library-item')).toHaveCount(2);
+		const dawn = page.locator('[data-testid="library-item"][data-id="dawn"]');
+		await dawn.getByTestId('track-more').click();
+		await page.getByTestId('track-context-menu').getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
+		await page.locator('[data-testid="library-item"][data-id="coral"]').locator('.nt-library-row').click();
+		await expect(page.getByTestId('audio-player')).toHaveCount(0);
+		expect(requests).toEqual([]);
+		expect(await page.evaluate(() => (window as unknown as { queuedPlayCalls: number }).queuedPlayCalls)).toBe(0);
+		await page.evaluate(() => { (window as unknown as { teardownMarker: string }).teardownMarker = 'same-document'; });
+		await navigate(page, 'home');
+		await expect(page.getByRole('heading', { name: 'Library', exact: true })).toHaveCount(0);
+		await expect(page.getByTestId('library-item')).toHaveCount(0);
+		expect(await page.evaluate(() => (window as unknown as { teardownMarker: string }).teardownMarker)).toBe('same-document');
+		await openQueue(page);
+		const panel = page.getByTestId('queue-panel');
+		const row = (id: string) => panel.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
+		await expect(panel).toHaveCount(1);
+		await expect(row('dawn')).toHaveAttribute('aria-current', 'true');
+		await expect(page.getByTestId('audio-player')).toHaveCount(0);
+		expect(requests).toEqual([]);
+		await row('dawn').getByTestId('queue-more').click();
+		await page.getByTestId('track-context-menu').getByRole('menuitem', { name: 'Play now', exact: true }).click();
+		await expect(row('dawn')).toHaveAttribute('aria-current', 'true');
+		await expect.poll(() => page.evaluate(() => (window as unknown as { queuedPlayCalls: number }).queuedPlayCalls))
+			.toBe(outcome === 'no-stream' ? 0 : 1);
+		const audio = page.getByTestId('audio-player');
+		if (outcome === 'no-stream') {
+			await expect(audio).toHaveCount(0);
+			await expect(page.getByTestId('queue-announcement')).toHaveText('Selected Dawn Chorus; no stream to play.');
+			expect(requests).toEqual([]);
+		} else {
+			await expect(audio).toHaveAttribute('src', '/test-audio/teardown-dawn');
+			await expect(audio).toHaveJSProperty('readyState', 4);
+			expect(requests.length).toBeGreaterThan(0);
+			expect(requests.every((url) => url.endsWith('/teardown-dawn'))).toBe(true);
+			if (outcome === 'blocked') {
+				await expect(audio).toHaveJSProperty('paused', true);
+				await expect(page.getByTestId('queue-announcement')).toHaveText('Selected Dawn Chorus, paused: playback was blocked.');
+			} else {
+				await expect(audio).toHaveJSProperty('paused', false);
+				await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.currentTime)).toBeGreaterThan(0.2);
+				if (outcome === 'accepted') {
+					await expect(page.getByTestId('queue-announcement')).toHaveText('Playing Dawn Chorus.');
+				} else {
+					await expect.poll(() => page.evaluate(() => typeof (window as unknown as { finishQueuedPlay?: () => void }).finishQueuedPlay)).toBe('function');
+					await row('coral').getByRole('button', { name: 'Select Coral Night', exact: true }).click();
+					const winning = await page.getByTestId('queue-announcement').textContent();
+					expect(winning).toBe('Selected Coral Night');
+					await page.evaluate(() => (window as unknown as { finishQueuedPlay: () => void }).finishQueuedPlay());
+					await expect(page.getByTestId('queue-announcement')).toHaveText(winning!);
+					await expect(row('coral')).toHaveAttribute('aria-current', 'true');
+					await expect(audio).toHaveCount(0);
+				}
+			}
+		}
+		expect(await panel.getByTestId('queue-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')))).toEqual(['dawn', 'coral']);
+		expect(await page.evaluate(() => (window as unknown as { queuedPlayCalls: number }).queuedPlayCalls)).toBe(outcome === 'no-stream' ? 0 : 1);
+		expect(errors).toEqual([]);
+	});
+}
+
 test('queue-only Next from a metadata-only selection retains the playable track resume point', async ({ page }) => {
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));

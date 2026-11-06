@@ -3,35 +3,27 @@ import { describe, expect, it } from 'vitest';
 // Single source of truth lives in the e2e harness: if the app drifts
 // (renamed hook), this test names the missing contract key — the failure
 // IS the signal, not noise. Test-only import; never bundled into the app.
-import { SUPPORTED_NNTP_PORTS, TESTIDS } from '../../../../e2e/helpers/contract.js';
-import { ALLOWED_NNTP_PORTS } from './vault-validation.js';
+import { TESTIDS } from '../../../../e2e/helpers/contract.js';
 
 // Acceptance-owner protection remains in force. Engineering Lead authorized
 // a one-time same-PR exception for player/queue physical owner mappings and
-// connection assertions only. Hook values and behavior vectors stay unchanged;
-// independent equivalence review is required.
-const sources = import.meta.glob(['../routes/**/*.svelte', './player/*.svelte'], {
+// connection assertions only, including the six incoming intent connections.
+// Hook values and behavior vectors stay unchanged; independent equivalence
+// review against both baselines is required.
+const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.svelte', './player/*.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
 }) as Record<string, string>;
 
-const routeForTestId: Record<keyof typeof TESTIDS, string> = {
+// Legacy API fixtures retain the retired hooks; active web hooks still
+// require a markup pin while the end-to-end contract is migrated.
+type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus' | `byop${string}`>;
+const routeForTestId: Record<ActiveTestId, string> = {
 	appRoot: '../routes/+page.svelte',
 	signupEmail: '../routes/signup/+page.svelte',
 	signupSubmit: '../routes/signup/+page.svelte',
 	signupError: '../routes/signup/+page.svelte',
-	byopHost: '../routes/onboarding/byop/+page.svelte',
-	byopPort: '../routes/onboarding/byop/+page.svelte',
-	byopUser: '../routes/onboarding/byop/+page.svelte',
-	byopPass: '../routes/onboarding/byop/+page.svelte',
-	byopTls: '../routes/onboarding/byop/+page.svelte',
-	byopConnections: '../routes/onboarding/byop/+page.svelte',
-	byopTest: '../routes/onboarding/byop/+page.svelte',
-	byopSave: '../routes/onboarding/byop/+page.svelte',
-	byopStatus: '../routes/onboarding/byop/+page.svelte',
-	importFile: '../routes/library/import/+page.svelte',
-	importStatus: '../routes/library/import/+page.svelte',
 	libraryItem: '../routes/library/+page.svelte',
 	libraryList: '../routes/library/+page.svelte',
 	libraryStaleBadge: '../routes/library/+page.svelte',
@@ -40,6 +32,13 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	playerPlayPause: './player/PlayerTransport.svelte',
 	playerSeek: './player/PlayerTransport.svelte',
 	playerVolume: './player/PlayerTransport.svelte',
+	trackContextMenu: './interactions/ContextMenu.svelte',
+	trackMore: '../routes/library/+page.svelte',
+	favoriteMore: '../routes/library/+page.svelte',
+	trackSelectionToolbar: '../routes/library/+page.svelte',
+	queueDropTarget: './player/PlayerQueue.svelte',
+	queueMore: './player/PlayerQueue.svelte',
+	queueSelectionToolbar: './player/PlayerQueue.svelte',
 	usageMeter: '../routes/library/+page.svelte',
 	// Playable selections use the layout-owned transport; the library queue
 	// retains its empty/unavailable fallback without duplicating either hook.
@@ -57,9 +56,30 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	miniPlayer: '../routes/+layout.svelte'
 };
 
-describe('e2e NNTP port allowlist', () => {
-	it('matches the app/API allowlist (no drift between the copies)', () => {
-		expect([...SUPPORTED_NNTP_PORTS]).toEqual([...ALLOWED_NNTP_PORTS]);
+describe('retired user NZB import', () => {
+	it('has no route, navigation link, or import control in any route source', () => {
+		expect(sources['../routes/library/import/+page.svelte']).toBeUndefined();
+		for (const source of Object.values(sources)) {
+			expect(source).not.toContain('/library/import');
+			expect(source).not.toMatch(/data-testid=["']import-(?:file|status)["']/);
+			expect(source).not.toMatch(/accept=["'][^"']*\.nzb/i);
+		}
+	});
+});
+
+describe('retired provider credential routes', () => {
+	it('has no provider form, route, navigation link, or vault call in active web source', () => {
+		const webSources = import.meta.glob(['../routes/**/*.{svelte,ts}', './api/client.ts'], {
+			query: '?raw', import: 'default', eager: true
+		}) as Record<string, string>;
+		for (const [path, source] of Object.entries(webSources)) {
+			if (path.endsWith('.test.ts')) continue;
+			expect(path).not.toMatch(/\/onboarding\/(?:byop|provider)\//);
+			expect(path).not.toContain('/account/provider/');
+			expect(source).not.toMatch(/\/(?:onboarding\/(?:byop|provider)|account\/provider)\b/);
+			expect(source).not.toContain('/v1/vault');
+			expect(source).not.toMatch(/data-testid=["']byop-/);
+		}
 	});
 });
 
@@ -88,12 +108,15 @@ describe('e2e contract hooks', () => {
 		for (const action of ['next', 'shuffle', 'move', 'playnext', 'remove', 'clear', 'select', 'copylink', 'keepcurrentandupcoming', 'clearupcoming']) {
 			expect(view).toContain(`on${action}={actions.on${action}}`);
 		}
+		for (const action of ['insert', 'reorder', 'playnextids', 'removeids', 'playnow', 'favoriteids']) {
+			expect(view).toContain(`on${action}={actions.on${action}}`);
+		}
 		expect(view).toContain('<QueueExport />');
 	});
 
-	for (const [key, testid] of Object.entries(TESTIDS) as [keyof typeof TESTIDS, string][]) {
+	for (const [key, route] of Object.entries(routeForTestId) as [ActiveTestId, string][]) {
+		const testid = TESTIDS[key];
 		it(`declares data-testid="${testid}" in its route markup (${key})`, () => {
-			const route = routeForTestId[key];
 			const source = sources[route];
 			expect(source, `contract key "${key}": expected route source "${route}"`).toBeDefined();
 			expect(

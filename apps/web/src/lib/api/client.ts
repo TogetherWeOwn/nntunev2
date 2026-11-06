@@ -9,7 +9,6 @@
  */
 
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
-import type { ProviderForm } from '../vault-validation.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
 
@@ -59,8 +58,8 @@ export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
 export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
 
 /**
- * Deadline for a single ApiClient request (headers + body). Hung auth/vault
- * calls must abort instead of wedging login/signup/BYOP spinners forever.
+ * Deadline for a single ApiClient request (headers + body). Hung auth
+ * calls must abort instead of wedging login/signup spinners forever.
  * Well under the acceptance cap (10 fake minutes) and above the
  * still-pending probe (1s); fake-timer driven via `setTimeout` so vitest
  * controls it (unlike `AbortSignal.timeout`'s internal timer).
@@ -71,138 +70,10 @@ export interface MagicLinkResult {
 	ok: true;
 	/**
 	 * Present on magic-link finish only: the signed-in account's own
-	 * email, echoed back so the web app can show "Signed in as …" before
-	 * any provider credential is typed (login-CSRF defense in depth).
+	 * email, echoed back so the web app can show "Signed in as …" on the
+	 * landing page (login-CSRF defense in depth).
 	 */
 	email?: string;
-}
-
-export interface IndexerConfigInput {
-	url: string;
-	api_key: string;
-}
-
-/** Wire shape used by workers/api's serde ProviderConfig and IndexerConfig. */
-export interface ProviderTestInput {
-	host: string;
-	port: number;
-	tls: boolean;
-	allow_insecure_plaintext: boolean;
-	username: string;
-	password: string;
-	max_connections: number;
-	indexer?: IndexerConfigInput;
-}
-
-/**
- * Save/test envelope the API Worker expects (`PUT /v1/vault`,
- * `POST /v1/vault/test`): the flat provider fields nested under
- * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
- * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
- * both the vitest client suite and the Rust handlers suite consume — change
- * both sides in the same PR, never one alone.
- */
-export interface VaultSaveBody {
-	provider: {
-		host: string;
-		port: number;
-		tls: boolean;
-		allow_insecure_plaintext: boolean;
-		username: string;
-		password: string;
-		max_connections: number;
-	};
-	indexer?: IndexerConfigInput;
-}
-
-export function toVaultSaveBody(input: ProviderTestInput): VaultSaveBody {
-	const { indexer, ...provider } = input;
-	return indexer === undefined ? { provider } : { provider, indexer };
-}
-
-export function toProviderTestInput(
-	provider: ProviderForm,
-	indexerUrl: string,
-	indexerApiKey: string
-): ProviderTestInput {
-	return {
-		host: provider.host.trim(),
-		port: provider.port,
-		tls: provider.tls,
-		// Only send the opt-in with plaintext: with TLS it is always false so
-		// the server never records a spurious acknowledgement.
-		allow_insecure_plaintext: !provider.tls && provider.allowInsecurePlaintext,
-		username: provider.username.trim(),
-		password: provider.password,
-		max_connections: provider.maxConnections,
-		...(indexerUrl.trim().length > 0
-			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey.trim() } }
-			: {})
-	};
-}
-
-export interface ProviderTestResult {
-	ok: boolean;
-	latencyMs?: number;
-	error?: string;
-}
-
-/** Redacted vault metadata only; never return credentials or endpoint details. */
-export interface SavedProviderSummary {
-	provider_configured: boolean;
-	indexer_configured: boolean;
-	/** Unix seconds, or zero when no configuration is stored. */
-	updated_at: number;
-}
-
-function validateSavedProviderSummary(data: unknown, status: number): SavedProviderSummary {
-	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-		throw vaultTestShapeFailure(status);
-	}
-	const record = data as Record<string, unknown>;
-	if (
-		typeof record.provider_configured !== 'boolean' ||
-		typeof record.indexer_configured !== 'boolean' ||
-		!isFiniteNonNegativeNumber(record.updated_at)
-	) {
-		throw vaultTestShapeFailure(status);
-	}
-	return {
-		provider_configured: record.provider_configured,
-		indexer_configured: record.indexer_configured,
-		updated_at: record.updated_at
-	};
-}
-
-function isFiniteNonNegativeNumber(value: unknown): value is number {
-	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
-}
-
-/** Typed shape failure for a malformed vault-test success body. */
-function vaultTestShapeFailure(status: number): ApiError {
-	const parsed = parseErrorBody(null, status);
-	return new ApiError(status, 'request_failed', parsed.message, null, false);
-}
-
-/**
- * Guard the `POST /v1/vault/test` success body before any caller can show
- * "Connected": the body must be a plain object whose `ok` is a real boolean
- * (so `{ok:"false"}` can never unlock Save via truthiness), while an invalid
- * `latencyMs` is display-only and therefore omitted, never rejected. A string
- * `error` passes through for logging; anything else is dropped.
- */
-function validateVaultTestResult(data: unknown, status: number): ProviderTestResult {
-	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-		throw vaultTestShapeFailure(status);
-	}
-	const record = data as Record<string, unknown>;
-	if (typeof record.ok !== 'boolean') throw vaultTestShapeFailure(status);
-	const result: ProviderTestResult = { ok: record.ok };
-	if (record.latencyMs !== undefined && isFiniteNonNegativeNumber(record.latencyMs)) {
-		result.latencyMs = record.latencyMs;
-	}
-	if (typeof record.error === 'string') result.error = record.error;
-	return result;
 }
 
 /** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
@@ -547,79 +418,13 @@ export class ApiClient {
 		});
 	}
 
-	/** Read a validated, allowlisted summary of the saved vault. */
-	async getSavedProviderSummary(signal?: AbortSignal): Promise<SavedProviderSummary> {
-		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
-			method: 'GET', signal
-		});
-		return validateSavedProviderSummary(data, status);
-	}
-
-	/** Reachability only, not provider authentication. An empty body selects the stored vault. */
-	async testSavedProviderConnection(signal?: AbortSignal): Promise<ProviderTestResult> {
-		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
-			method: 'POST', signal
-		});
-		return validateVaultTestResult(data, status);
-	}
-
-	/** No automatic retries: only a validated both-false summary proves removal. */
-	async deleteSavedProviderConfig(signal?: AbortSignal): Promise<SavedProviderSummary> {
-		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
-			method: 'DELETE', signal
-		});
-		const summary = validateSavedProviderSummary(data, status);
-		if (summary.provider_configured || summary.indexer_configured) {
-			throw vaultTestShapeFailure(status);
-		}
-		return summary;
-	}
-
-	/**
-	 * Live-test a provider (+ optional indexer) config without storing it.
-	 * The API validates (SSRF guard), dials, and returns a redacted result —
-	 * secrets never come back in the response. The optional caller signal
-	 * lets the owning page fence a stale test: a pre-aborted signal sends no
-	 * request, and a response that arrives after abort — including a limit
-	 * response — rejects as an abort instead of publishing a paywall.
-	 */
-	async testProviderConnection(
-		input: ProviderTestInput,
-		retry?: () => void,
-		signal?: AbortSignal
-	): Promise<ProviderTestResult> {
-		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(toVaultSaveBody(input)),
-			signal
-		}, retry);
-		return validateVaultTestResult(data, status);
-	}
-
-	/**
-	 * Store a tested provider (+ optional indexer) config in the encrypted
-	 * vault. The API seals secrets with envelope encryption; responses are
-	 * redacted summaries, never secret material. The optional caller signal
-	 * fences a stale save the same way as the connection test above.
-	 */
-	async saveProviderConfig(input: ProviderTestInput, signal?: AbortSignal): Promise<MagicLinkResult> {
-		return this.request<MagicLinkResult>('/v1/vault', {
-			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(toVaultSaveBody(input)),
-			signal
-		});
-	}
-
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
 		return (await this.requestWithStatus<T>(path, init)).data;
 	}
 
 	private async requestWithStatus<T>(
 		path: string,
-		init: RequestInit,
-		retry?: () => void
+		init: RequestInit
 	): Promise<{ data: T; status: number }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -628,7 +433,7 @@ export class ApiClient {
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
 
 		// Per-request deadline: abort hung fetches AND stalled body reads so
-		// auth/vault spinners always settle. The timer is cleared on settle so
+		// auth spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
 		const callerSignal = init.signal ?? this.signal;
@@ -673,7 +478,7 @@ export class ApiClient {
 				}
 				callerSignal?.throwIfAborted();
 				const parsed = parseErrorBody(body, response.status);
-				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body }, retry);
+				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {

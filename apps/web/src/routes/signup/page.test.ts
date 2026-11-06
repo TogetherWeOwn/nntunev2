@@ -32,6 +32,12 @@ function readSignupPage(): string {
 }
 
 describe('signup page initial state', () => {
+	it('continues to the existing plan flow without provider setup copy', () => {
+		const { body } = render(SignupPage);
+		expect(body).not.toMatch(/BYOP|Usenet|provider setup|connect your own/i);
+		expect(readSignupPage()).toContain("window.location.href = '/account/billing'");
+	});
+
 	it('renders the email step with no alert', () => {
 		const { body } = render(SignupPage);
 

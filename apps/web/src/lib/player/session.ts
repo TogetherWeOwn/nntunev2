@@ -1,8 +1,8 @@
 /** Per-layout playback ownership. Never instantiate this store at module scope. */
 import { writable } from 'svelte/store';
 import {
-	createQueue, currentTrack, naturalEndPolicy, nextTrack, playNext, previousTrack, shuffleUpcoming,
-	type QueueState, type RepeatMode
+	createQueue, currentTrack, insertTracks, naturalEndPolicy, nextTrack, playNext, previousTrack, shuffleUpcoming,
+	type QueueState, type RepeatMode, type Track
 } from './queue.js';
 import { createTransport, type Transport, type TransportSnapshot } from './transport.js';
 import type { SnapshotStorage } from '../library/cache.js';
@@ -67,6 +67,10 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	let favoritesInitialized = false;
 	let transport: Transport | null = null;
 	let generation = 0;
+	let sourceOwner = {};
+	// Detached, authenticated fallback evidence only; never part of the snapshot.
+	let queuedSources = new Map<string, { streamUrl: string }>();
+	let connecting = false;
 	let started = false;
 	let pendingNavigation: { revision: number; keepPlaying: boolean } | null = null;
 	const queueExport = createQueueExport({
@@ -76,6 +80,8 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	const beforeRestart = new Set<(trackId: string, source: string) => void>();
 	const beforeNavigate = new Set<(next: QueueState) => void>();
 	const afterQueuedFavorite = new Set<(id: string) => void>();
+	// Mounted producer action only; never consulted for queued playback.
+	const queueInsert = new Set<(ids: readonly string[], beforeId: string | null) => void>();
 	const queueShare = createQueueShare({
 		getQueue: () => state.queue,
 		getAudio: matchingAudio,
@@ -116,15 +122,31 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	function initializeFavorites(): void {
 		if (!started || favoritesInitialized) return;
 		favoritesInitialized = true;
-		publish({ favorites: loadFavorites(favoritesSession, storage) });
+		const owner = sourceOwner;
+		const revision = generation;
+		const before = state.favorites;
+		const favorites = loadFavorites(favoritesSession, storage);
+		if (started && owner === sourceOwner && favoritesInitialized &&
+			generation === revision && state.favorites === before) publish({ favorites });
 	}
 
 	/** Memory remains authoritative across routes and failed writes this visit. */
 	function setFavorites(favorites: string[]): boolean {
 		if (!started || !favoritesInitialized) return false;
+		const owner = sourceOwner;
+		const revision = generation;
+		const current = () => started && favoritesInitialized && owner === sourceOwner &&
+			generation === revision && state.favorites === favorites;
 		publish({ favorites });
-		saveFavorites(favoritesSession, storage, favorites);
-		return true;
+		if (!current()) return false;
+		const local = storage;
+		// Reading the scoped key can itself retire the action before the write.
+		saveFavorites(favoritesSession, local && {
+			getItem: (key) => current() ? local.getItem(key) : null,
+			setItem: (key, value) => { if (current()) local.setItem(key, value); },
+			removeItem: (key) => { if (current()) local.removeItem(key); }
+		}, favorites);
+		return current();
 	}
 
 	function toggleFavorite(id: string): boolean {
@@ -137,9 +159,16 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		const track = state.queue.tracks.find((track) => track.id === id);
 		if (!track) return false;
 		const wasFavorite = state.favorites.includes(id);
+		const revision = generation;
 		if (!toggleFavorite(id)) return false;
+		const favorites = state.favorites;
+		const current = () => started && generation === revision && state.favorites === favorites;
 		setQueueFeedback(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
-		for (const listener of afterQueuedFavorite) listener(id);
+		if (!current()) return false;
+		for (const listener of afterQueuedFavorite) {
+			listener(id);
+			if (!current()) return false;
+		}
 		return true;
 	}
 
@@ -148,11 +177,13 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		const track = currentTrack(state.queue);
 		if (!track) return false;
 		const wasFavorite = state.favorites.includes(track.id);
+		const revision = generation;
 		if (!toggleFavorite(track.id)) return false;
+		const favorites = state.favorites;
 		setQueueFeedback(wasFavorite
 			? `Removed ${displayTitle(track)} from Favorites.`
 			: `Saved ${displayTitle(track)} to Favorites.`);
-		return true;
+		return started && generation === revision && state.favorites === favorites;
 	}
 
 	/** Transient action feedback belongs to the layout, never storage or a route. */
@@ -187,12 +218,38 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		if (started) publish({ queueConfirmGeneration: state.queueConfirmGeneration + 1 });
 	}
 
-	function setQueue(queue: QueueState): boolean {
-		if (queue === state.queue) return true;
+	/** Only the current authenticated Library commit/action path supplies these values. */
+	function sourceInputs(
+		queue: QueueState,
+		inputs: readonly { id: string; streamUrl: string }[],
+		authoritative: boolean
+	): Map<string, { streamUrl: string }> {
+		const ids = new Set(queue.tracks.map((track) => track.id));
+		const sources = authoritative ? new Map<string, { streamUrl: string }>()
+			: new Map([...queuedSources].filter(([id]) => ids.has(id)));
+		for (const input of inputs) {
+			if (ids.has(input.id)) sources.set(input.id, { streamUrl: resolveStreamUrl(input) });
+		}
+		return sources;
+	}
+
+	function setQueue(queue: QueueState, input?: {
+		owner: object;
+		tracks: readonly { id: string; streamUrl: string }[];
+		authoritative?: boolean;
+	}): boolean {
+		if (input && (!started || input.owner !== sourceOwner)) return false;
+		const sources = sourceInputs(queue, input?.tracks ?? [], input?.authoritative ?? false);
+		if (queue === state.queue) {
+			// A successful refresh can replace evidence without touching a live decoder.
+			if (input) queuedSources = sources;
+			return true;
+		}
 		const revision = generation;
+		const previousSources = queuedSources;
 		queueExport.reset();
 		// Store notifications may synchronously replace the source or account.
-		if (generation !== revision) return false;
+		if (generation !== revision || queuedSources !== previousSources) return false;
 		const tracks = queue.tracks.map((track) => {
 			const streamUrl = resolveStreamUrl(track);
 			return streamUrl === track.streamUrl ? track : { ...track, streamUrl };
@@ -204,12 +261,55 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		const after = currentTrack(queue);
 		const changedSource = before?.id !== after?.id || before?.streamUrl !== after?.streamUrl;
 		if (changedSource) transport?.disconnect();
-		if (generation !== revision + 1) return false;
+		if (generation !== revision + 1 || queuedSources !== previousSources) return false;
+		// Publish the membership/evidence pair atomically, before any subscriber runs.
+		queuedSources = sources;
 		publish({ queue, queueSelection: reconcileQueueSelection(state.queueSelection, queue, state.queueFilterQuery),
 			...(changedSource ? { audio: null, restartAvailable: false, restartStatus: '' } : {}), announcement: '', queueFeedback: '',
 			queueShareStatus: '', queueShareFallbackUrl: null,
 			...(queue.tracks.length ? { queueFeedbackExposed: true } : {}) });
-		return generation === revision + 1;
+		return generation === revision + 1 && queuedSources === sources;
+	}
+
+	/** The explicit queued Play gesture is the only consumer of fallback evidence. */
+	async function playQueuedTrack(id: string, suffix = ''): Promise<void> {
+		if (!started || !state.queueLiveRegions) return;
+		const index = state.queue.tracks.findIndex((track) => track.id === id);
+		const target = state.queue.tracks[index];
+		if (!target) return;
+		const queuedSource = resolveStreamUrl(target);
+		const evidence = queuedSource ? undefined : queuedSources.get(id);
+		const source = queuedSource || evidence?.streamUrl || '';
+		const owner = sourceOwner;
+		const inputCurrent = () => started && owner === sourceOwner &&
+			(queuedSource !== '' || queuedSources.get(id) === evidence);
+		const tracks = [...state.queue.tracks];
+		tracks[index] = { ...target, streamUrl: source };
+		const queue = { tracks, currentIndex: index };
+		if (!prepareNavigation(queue) || !inputCurrent()) return;
+		const revision = generation + 1;
+		if (!setQueue(queue) || generation !== revision || !inputCurrent()) return;
+		const current = () => inputCurrent() && generation === revision &&
+			currentTrack(state.queue)?.id === id && resolveStreamUrl(currentTrack(state.queue)) === source;
+		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
+		let lead = `Selected ${title}; no stream to play.`;
+		if (source) {
+			await deps.flush();
+			if (!current()) return;
+			const audio = matchingAudio();
+			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (audio) {
+				try {
+					// Preserve the explicit single native attempt, including repeated Play.
+					await audio.play();
+					lead = `Playing ${title}.`;
+				} catch {
+					// Never retry a rejected gesture or treat it as source absence.
+				}
+				if (state.audio !== audio) return;
+			}
+		}
+		if (current()) setQueueFeedback(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function setRepeat(repeat: RepeatMode): void {
@@ -243,8 +343,12 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		// Route-owned share/selection work must retire synchronously, including
 		// a clamped Next. A listener may itself cross an auth/source boundary.
 		setQueueFeedback('');
-		for (const listener of beforeNavigate) listener(queue);
-		return started && revision === generation;
+		if (!started || revision !== generation) return false;
+		for (const listener of beforeNavigate) {
+			listener(queue);
+			if (!started || revision !== generation) return false;
+		}
+		return true;
 	}
 
 	/** Panel edits retire route work but never seek or autoplay the selection. */
@@ -266,6 +370,85 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		if (!started || revision !== generation || !prepareNavigation(queue)) return false;
 		const changed = queue !== state.queue;
 		return setQueue(queue) && changed && started && generation === revision + 1;
+	}
+
+	/** Explicit menu operands reuse the selection reducer without replacing selection. */
+	function editQueueIds(ids: readonly string[], action: QueueSelectionAction, menu = false): boolean {
+		if (menu && !state.queueLiveRegions) return false;
+		const before = state.queue;
+		const requested = new Set(ids);
+		const live = before.tracks.filter((track) => requested.has(track.id)).map((track) => track.id);
+		const queue = applyQueueSelection(before, live, action);
+		const count = action === 'remove' ? before.tracks.length - queue.tracks.length
+			: live.filter((id) => id !== currentTrack(queue)?.id).length;
+		if (queue === before || !rearrangeQueue(() => queue)) return false;
+		const revision = generation;
+		const tracks = `${count} ${count === 1 ? 'track' : 'tracks'}`;
+		const feedback = menu
+			? action === 'remove' ? `${count} selected ${count === 1 ? 'track removed' : 'tracks removed'} from queue.` : 'Tracks placed next in the queue.'
+			: action === 'remove' ? `Removed ${tracks} from the queue.` : `Moved ${tracks} to play next.`;
+		setQueueFeedback(feedback, true);
+		return started && generation === revision;
+	}
+
+	/** Only a live Library action may resolve an external insertion's stable IDs. */
+	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
+		if (!started || !state.queueLiveRegions ||
+			(beforeId !== null && !state.queue.tracks.some((track) => track.id === beforeId))) return;
+		// There is one mounted producer. A disposed route unregisters this action;
+		// accepted queued-source evidence has no dependency on its lifetime.
+		const producer = queueInsert.values().next().value;
+		producer?.([...new Set(ids)], beforeId);
+	}
+
+	function insertQueuedTracks(tracks: readonly Track[], beforeId: string | null, input: {
+		owner: object;
+		tracks: readonly { id: string; streamUrl: string }[];
+	}): boolean {
+		if (!started || input.owner !== sourceOwner || !state.queueLiveRegions ||
+			(beforeId !== null && !state.queue.tracks.some((track) => track.id === beforeId))) return false;
+		const before = state.queue;
+		const sources = queuedSources;
+		const queue = insertTracks(before, tracks, beforeId);
+		if (queue === before || !prepareNavigation(queue) || queuedSources !== sources) return false;
+		const revision = generation;
+		if (!setQueue(queue, input) || !started || generation !== revision + 1) return false;
+		const added = queue.tracks.length - before.tracks.length;
+		setQueueFeedback(added ? `Added ${added} to the queue.` : 'Queue order updated.', true);
+		return started && generation === revision + 1;
+	}
+
+	function reorderQueuedIds(ids: readonly string[], beforeId: string | null): boolean {
+		if (!started || !state.queueLiveRegions ||
+			(beforeId !== null && !state.queue.tracks.some((track) => track.id === beforeId))) return false;
+		const requested = new Set(ids);
+		const tracks = state.queue.tracks.filter((track) => requested.has(track.id));
+		const queue = insertTracks(state.queue, tracks, beforeId);
+		if (queue === state.queue || !rearrangeQueue(() => queue)) return false;
+		const revision = generation;
+		setQueueFeedback('Queue order updated.', true);
+		return started && generation === revision;
+	}
+
+	/** Menus toggle the whole requested set; save batches only add missing IDs. */
+	function favoriteQueuedIds(ids: readonly string[], mode: 'toggle' | 'add' = 'toggle'): boolean {
+		if (!started || !state.queueLiveRegions) return false;
+		const live = [...new Set(ids)].filter((id) => state.queue.tracks.some((track) => track.id === id));
+		if (!live.length) return false;
+		const remove = mode === 'toggle' && live.every((id) => state.favorites.includes(id));
+		const changed = live.filter((id) => state.favorites.includes(id) === remove);
+		const revision = generation;
+		const favorites = remove ? state.favorites.filter((id) => !changed.includes(id)) : [...state.favorites, ...changed];
+		const track = state.queue.tracks.find((track) => track.id === live[0])!;
+		if (!setFavorites(favorites) || !started || generation !== revision || state.favorites !== favorites) return false;
+		const already = live.length - changed.length;
+		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
+		const subject = ids.length === 1 ? displayTitle(track) : count;
+		const missing = new Set(ids).size - live.length;
+		setQueueFeedback((remove ? `Removed ${subject} from favorites.`
+			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) +
+			(missing ? ` ${missing} ${missing === 1 ? 'track is' : 'tracks are'} no longer available.` : ''), true);
+		return started && generation === revision && state.favorites === favorites;
 	}
 
 	/** Metadata-only queue Next preserves the next attachment's saved position. */
@@ -322,8 +505,21 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	function attach(audio: HTMLAudioElement): () => void {
 		const selected = currentTrack(state.queue);
 		if (!selected || !selected.streamUrl || audio.getAttribute('src') !== selected.streamUrl) return () => {};
+		const revision = generation;
+		const current = () => generation === revision && state.audio === audio && currentTrack(state.queue) === selected;
 		publish({ audio });
-		transport?.connect(audio, selected);
+		if (!current()) return () => {};
+		const activeTransport = transport;
+		if (activeTransport) {
+			// connect's internal disconnect publishes before attachment completes.
+			// Expose only its complete snapshot, so subscribers cannot retire half a connect.
+			connecting = true;
+			try { activeTransport.connect(audio, selected); }
+			finally { connecting = false; }
+			if (!current() || transport !== activeTransport) return () => {};
+			publish({ transport: activeTransport.snapshot() });
+			if (!current()) return () => {};
+		}
 		const refreshRestart = () => {
 			if (state.audio === audio) publish({ restartAvailable: matchingAudio() === audio && restartIsAvailable(audio) });
 		};
@@ -333,9 +529,10 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		return () => {
 			for (const event of events) audio.removeEventListener(event, refreshRestart);
 			if (state.audio !== audio) return;
-			++generation;
+			const revision = ++generation;
 			pendingNavigation = null;
 			transport?.disconnect();
+			if (generation !== revision || state.audio !== audio) return;
 			publish({ audio: null, restartAvailable: false, restartStatus: '' });
 		};
 	}
@@ -359,7 +556,7 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 				setItem: (key, value) => storage?.setItem(key, value),
 				removeItem: (key) => storage?.removeItem(key)
 			},
-			onchange: (snapshot) => publish({ transport: snapshot }),
+			onchange: (snapshot) => { if (!connecting) publish({ transport: snapshot }); },
 			onplay: () => void play(),
 			onnext: () => void next(),
 			onprevious: () => void previous(),
@@ -376,6 +573,8 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	}
 
 	function resetAtAuthBoundary(): void {
+		sourceOwner = {};
+		queuedSources = new Map();
 		clearFavoritesAtAuthBoundary(favoritesSession, storage);
 		favoritesInitialized = false;
 		queueShare.reset();
@@ -389,6 +588,8 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 	}
 
 	function destroy(): void {
+		sourceOwner = {};
+		queuedSources = new Map();
 		queueShare.reset();
 		queueExport.reset(true);
 		++generation;
@@ -402,6 +603,7 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		beforeRestart.clear();
 		beforeNavigate.clear();
 		afterQueuedFavorite.clear();
+		queueInsert.clear();
 		publish({ ...emptyQueueView(state.queueConfirmGeneration + 1), transport: null });
 	}
 
@@ -410,20 +612,20 @@ export function createPlayerSession(deps: PlayerSessionDeps) {
 		snapshot: () => state,
 		queueExport,
 		start, attach, setQueue, setQueueFeedback, exposeQueueFeedback, setRepeat, resetAtAuthBoundary, destroy,
+		sourceInputOwner: () => sourceOwner,
+		playQueuedTrack, insertQueuedIds, insertQueuedTracks, reorderQueuedIds, favoriteQueuedIds,
+		onQueueInsert: (listener: (ids: readonly string[], beforeId: string | null) => void) => {
+			queueInsert.clear();
+			queueInsert.add(listener);
+			return () => { queueInsert.delete(listener); };
+		},
 		next, selectNext, previous, editQueue, setQueueFilter, setQueueLiveRegions, invalidateQueueConsent,
 		initializeFavorites, setFavorites, toggleFavorite, toggleQueuedFavorite, toggleCurrentFavorite,
 		toggleQueueSelection: (id: string, range = false) => updateQueueSelection(toggleQueueSelection(state.queueSelection, state.queue, state.queueFilterQuery, id, range)),
 		selectAllQueueRows: () => updateQueueSelection(selectAllQueueRows(state.queueSelection, state.queue, state.queueFilterQuery)),
-		editQueueSelection: (action: QueueSelectionAction) => {
-			const before = state.queue;
-			const queue = applyQueueSelection(before, state.queueSelection.ids, action);
-			const count = action === 'remove' ? before.tracks.length - queue.tracks.length
-				: state.queueSelection.ids.filter((id) => id !== currentTrack(queue)?.id).length;
-			if (queue === before || !rearrangeQueue(() => queue)) return false;
-			const tracks = `${count} ${count === 1 ? 'track' : 'tracks'}`;
-			setQueueFeedback(action === 'remove' ? `Removed ${tracks} from the queue.` : `Moved ${tracks} to play next.`, true);
-			return true;
-		},
+		editQueueSelection: (action: QueueSelectionAction) => editQueueIds(state.queueSelection.ids, action),
+		removeQueuedIds: (ids: readonly string[]) => editQueueIds(ids, 'remove', true),
+		playNextQueuedIds: (ids: readonly string[]) => editQueueIds(ids, 'playNext', true),
 		clearQueueSelection: () => {
 			if (state.queueSelection.active) updateQueueSelection(createQueueSelection());
 		},

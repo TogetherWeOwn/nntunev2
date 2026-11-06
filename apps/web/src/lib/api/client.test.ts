@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ApiClient, ApiError, toProviderTestInput, toVaultSaveBody } from './client.js';
+import { ApiClient, ApiError } from './client.js';
 import { onPaywall, type PaywallModel } from '../billing/planLimit.js';
 import { KNOWN_ERROR_CODES } from './errors.js';
 import apiErrorsRaw from '../../../../../docs/api-errors.md?raw';
@@ -35,75 +35,6 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe('API error code registry', () => {
 	it('keeps the web parser codes aligned with docs/api-errors.md', () => {
 		expect([...KNOWN_ERROR_CODES].sort()).toEqual([...documentedErrorCodes].sort());
-	});
-});
-
-describe('toProviderTestInput', () => {
-	it('trims the provider host to match validation and server rules', () => {
-		expect(
-			toProviderTestInput(
-				{
-					host: ' news.example.com ',
-					port: 563,
-					tls: true,
-					allowInsecurePlaintext: false,
-					username: 'alice',
-					password: 's3cret',
-					maxConnections: 4
-				},
-				'',
-				''
-			).host
-		).toBe('news.example.com');
-	});
-
-	it('uses the API field names and omits an unset indexer', () => {
-		expect(
-			toProviderTestInput(
-				{
-					host: 'news.example.com',
-					port: 563,
-					tls: true,
-					allowInsecurePlaintext: false,
-					username: 'alice',
-					password: 's3cret',
-					maxConnections: 4
-				},
-				'',
-				''
-			)
-		).toEqual({
-			host: 'news.example.com',
-			port: 563,
-			tls: true,
-			allow_insecure_plaintext: false,
-			username: 'alice',
-			password: 's3cret',
-			max_connections: 4
-		});
-	});
-
-	it('only sends the plaintext opt-in with TLS disabled and acknowledged', () => {
-		const base = {
-			host: 'news.example.com',
-			port: 119,
-			username: 'alice',
-			password: 's3cret',
-			maxConnections: 4
-		};
-		expect(
-			toProviderTestInput({ ...base, tls: false, allowInsecurePlaintext: true }, '', '')
-				.allow_insecure_plaintext
-		).toBe(true);
-		expect(
-			toProviderTestInput({ ...base, tls: false, allowInsecurePlaintext: false }, '', '')
-				.allow_insecure_plaintext
-		).toBe(false);
-		// A stale acknowledgement with TLS on must never reach the server.
-		expect(
-			toProviderTestInput({ ...base, tls: true, allowInsecurePlaintext: true }, '', '')
-				.allow_insecure_plaintext
-		).toBe(false);
 	});
 });
 
@@ -304,7 +235,7 @@ describe('ApiClient', () => {
 		}) as unknown as typeof fetch;
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		await client.put('/v1/vault', { provider: {} });
+		await client.put('/v1/example-put', { example: true });
 
 		expect(seen).toEqual([
 			expect.objectContaining({
@@ -393,139 +324,6 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).code).toBe(status === 401 ? 'unauthorized' : 'request_failed');
 	});
 
-	it('nests the provider fields under the save envelope', () => {
-		expect(
-			toVaultSaveBody({
-				host: 'news.example.com',
-				port: 563,
-				tls: true,
-				allow_insecure_plaintext: false,
-				username: 'alice',
-				password: 's3cret',
-				max_connections: 4
-			})
-		).toEqual({
-			provider: {
-				host: 'news.example.com',
-				port: 563,
-				tls: true,
-				allow_insecure_plaintext: false,
-				username: 'alice',
-				password: 's3cret',
-				max_connections: 4
-			}
-		});
-		expect(
-			toVaultSaveBody({
-				host: 'news.example.com',
-				port: 563,
-				tls: true,
-				allow_insecure_plaintext: false,
-				username: 'alice',
-				password: 's3cret',
-				max_connections: 4,
-				indexer: { url: 'https://index.example.com/api', api_key: 'indexer-key' }
-			})
-		).toEqual({
-			provider: {
-				host: 'news.example.com',
-				port: 563,
-				tls: true,
-				allow_insecure_plaintext: false,
-				username: 'alice',
-				password: 's3cret',
-				max_connections: 4
-			},
-			indexer: { url: 'https://index.example.com/api', api_key: 'indexer-key' }
-		});
-	});
-
-	it('tests a provider connection and returns the redacted result', async () => {
-		const seen: { url: unknown; init: { body?: string } & RequestInit }[] = [];
-		const fetchFn = (async (url: unknown, init: { body?: string } & RequestInit) => {
-			seen.push({ url, init });
-			return jsonResponse({ ok: true, latencyMs: 120 });
-		}) as unknown as typeof fetch;
-		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
-
-		const result = await client.testProviderConnection(
-			toProviderTestInput(
-				{
-					host: 'news.example.com',
-					port: 563,
-					tls: true,
-					allowInsecurePlaintext: false,
-					username: 'alice',
-					password: 's3cret',
-					maxConnections: 4
-				},
-				'https://index.example.com/api',
-				'indexer-key'
-			)
-		);
-
-		expect(result).toEqual({ ok: true, latencyMs: 120 });
-		expect(seen.map(({ url }) => url)).toEqual([
-			'https://api.example.com/v1/vault/test'
-		]);
-		expect(seen.map(({ init }) => JSON.parse(String(init.body)))).toEqual([
-			{
-				provider: {
-					host: 'news.example.com',
-					port: 563,
-					tls: true,
-					allow_insecure_plaintext: false,
-					username: 'alice',
-					password: 's3cret',
-					max_connections: 4
-				},
-				indexer: { url: 'https://index.example.com/api', api_key: 'indexer-key' }
-			}
-		]);
-	});
-
-	it('saves a tested provider config to the vault endpoint', async () => {
-		const seen: { url: unknown; init: RequestInit }[] = [];
-		const fetchFn = (async (url: unknown, init: RequestInit) => {
-			seen.push({ url, init });
-			return jsonResponse({ ok: true });
-		}) as unknown as typeof fetch;
-		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
-
-		await expect(
-			client.saveProviderConfig(
-				toProviderTestInput(
-					{
-						host: 'news.example.com',
-						port: 563,
-						tls: true,
-						allowInsecurePlaintext: false,
-						username: 'alice',
-						password: 's3cret',
-						maxConnections: 4
-					},
-					'',
-					''
-				)
-			)
-		).resolves.toEqual({ ok: true });
-		expect(seen.map(({ url }) => url)).toEqual(['https://api.example.com/v1/vault']);
-		expect(seen.map(({ init }) => init.method)).toEqual(['PUT']);
-		expect(seen.map(({ init }) => JSON.parse(String(init.body)))).toEqual([
-			{
-				provider: {
-					host: 'news.example.com',
-					port: 563,
-					tls: true,
-					allow_insecure_plaintext: false,
-					username: 'alice',
-					password: 's3cret',
-					max_connections: 4
-				}
-			}
-		]);
-	});
-
 	it('matches the canonical web/Worker contract fixture', async () => {
 		// The same fixture file the Rust handlers suite consumes: every
 		// `web` entry pins the exact method, path and wire body the client
@@ -538,8 +336,15 @@ describe('ApiClient', () => {
 				expect(route.web, `${route.id} has a wire body but no web builder`).toBeDefined();
 			}
 		}
+		// Retired user-vault builders: the web client no longer implements
+		// them, and the API removal card deletes the fixture rows (the
+		// fixture is owned by workers/api and still carries them).
+		const retiredWebBuilders = new Set(['testProviderConnection', 'saveProviderConfig']);
 		for (const route of contract.routes) {
 			if (route.web === undefined || route.input === undefined || route.wire === undefined) {
+				continue;
+			}
+			if (retiredWebBuilders.has(route.web)) {
 				continue;
 			}
 			const seen: { url: unknown; init: RequestInit }[] = [];
@@ -588,16 +393,6 @@ describe('ApiClient', () => {
 			} else if (route.web === 'reauthenticateFinish') {
 				await client.reauthenticateFinish(
 					route.input as unknown as Parameters<typeof client.reauthenticateFinish>[0]
-				);
-			} else if (route.web === 'testProviderConnection') {
-				await client.testProviderConnection(
-					route.input as unknown as Parameters<
-						typeof client.testProviderConnection
-					>[0]
-				);
-			} else if (route.web === 'saveProviderConfig') {
-				await client.saveProviderConfig(
-					route.input as unknown as Parameters<typeof client.saveProviderConfig>[0]
 				);
 			} else if (route.web === 'mintCredential') {
 				await client.mintCredential(

@@ -27,6 +27,13 @@ export const TESTIDS = {
   libraryItem: 'library-item',
   libraryList: 'library-list',
   libraryStaleBadge: 'library-stale-badge',
+  trackContextMenu: 'track-context-menu',
+  trackMore: 'track-more',
+  favoriteMore: 'favorite-more',
+  trackSelectionToolbar: 'track-selection-toolbar',
+  queueDropTarget: 'queue-drop-target',
+  queueMore: 'queue-more',
+  queueSelectionToolbar: 'queue-selection-toolbar',
   // Player contract across the app-shell redesign (design spec v1): the
   // audio element keeps this hook (its native `controls` go away), the
   // usage meter keeps its hook (rail footer XOR library page, never
@@ -96,8 +103,8 @@ export const API = {
   // served as `application/manifest+json`). A renamed path fails the
   // served-routes spec with this key named.
   manifest: '/manifest.webmanifest',
-  // Legacy provider-setup entry point (`apps/web/src/routes/onboarding/provider/+server.ts`,
-  // 307-redirects to `/onboarding/byop`). A renamed path fails the
+  // Retired provider-setup entry point (the route and the BYOP wizard are
+  // gone; both resolve to the app 404). A resurrected path fails the
   // served-routes spec with this key named.
   onboardingProvider: '/onboarding/provider',
   // Public plans page (`apps/web/src/routes/pricing/+page.svelte`).

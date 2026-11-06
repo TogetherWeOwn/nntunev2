@@ -227,18 +227,9 @@
 		matchesBoundary(page.url.pathname, '/settings')
 	);
 
-	// At most one menu open at a time. Menus render only while open, so a
-	// closed menu contributes no tab stops and no accessible controls. The
-	// Create menu has one button per breakpoint (rail on desktop, top bar on
-	// mobile) but renders exactly one panel: the opener's. Two live panels
-	// would double every menuitem for assistive technology.
-	let openMenu = $state<'create' | 'account' | null>(null);
-	let createAnchor = $state<'rail' | 'topbar' | null>(null);
+	// Closed menus contribute no tab stops or accessible controls.
+	let openMenu = $state<'account' | null>(null);
 	let menuOpener = $state<HTMLElement | null>(null);
-
-	function menuIdFor(kind: 'create' | 'account', anchor: 'rail' | 'topbar' | null): string {
-		return kind === 'create' ? `nt-create-menu-${anchor ?? 'rail'}` : 'nt-account-menu';
-	}
 
 	function focusFirstMenuItem(menuId: string): void {
 		document
@@ -247,28 +238,23 @@
 			?.focus();
 	}
 
-	async function toggleMenu(kind: 'create' | 'account', event: MouseEvent): Promise<void> {
+	async function toggleMenu(kind: 'account', event: MouseEvent): Promise<void> {
 		const trigger = event.currentTarget as HTMLElement;
 		if (openMenu === kind) {
 			openMenu = null;
-			createAnchor = null;
 			menuOpener = null;
 		} else {
 			openMenu = kind;
-			createAnchor = kind === 'create'
-				? (trigger.dataset.createAnchor === 'topbar' ? 'topbar' : 'rail')
-				: null;
 			menuOpener = trigger;
 			// Move focus from the trigger into the menu so keyboard users
 			// land on the first item instead of tabbing from the button.
 			await tick();
-			focusFirstMenuItem(menuIdFor(kind, createAnchor));
+			focusFirstMenuItem('nt-account-menu');
 		}
 	}
 
 	function closeMenus(refocusOpener = false): void {
 		openMenu = null;
-		createAnchor = null;
 		if (refocusOpener && menuOpener?.isConnected) menuOpener.focus();
 		menuOpener = null;
 	}
@@ -303,7 +289,6 @@
 		// drop the menu rather than leaving a detached panel behind.
 		if (!next || !root.contains(next)) {
 			openMenu = null;
-			createAnchor = null;
 			menuOpener = null;
 		}
 	}
@@ -314,7 +299,6 @@
 		// closes via afterNavigate). Anything else dismisses the menu.
 		if ((event.target as HTMLElement).closest('[data-menu-root]')) return;
 		openMenu = null;
-		createAnchor = null;
 		menuOpener = null;
 	}
 
@@ -327,7 +311,6 @@
 	afterNavigate(() => {
 		player.invalidateQueueConsent();
 		openMenu = null;
-		createAnchor = null;
 		menuOpener = null;
 		if (!restoreAfterNavigation) return;
 		restoreAfterNavigation = false;
@@ -669,28 +652,6 @@
 	</a>
 {/snippet}
 
-{#snippet createControl(anchor: 'rail' | 'topbar')}
-	<div class="nt-menu-root" class:nt-topbar-create={anchor === 'topbar'} data-menu-root onfocusout={onMenuFocusOut}>
-		<button
-			type="button"
-			class:nt-create={anchor === 'rail'}
-			data-create-anchor={anchor}
-			aria-haspopup="menu"
-			aria-expanded={openMenu === 'create'}
-			aria-controls="nt-create-menu-{anchor}"
-			onclick={(event) => toggleMenu('create', event)}
-			onkeydown={onMenuKeydown}
-		>
-			Create
-		</button>
-		{#if openMenu === 'create' && createAnchor === anchor}
-			<div class="nt-menu" role="menu" tabindex="-1" id="nt-create-menu-{anchor}" onkeydown={onMenuKeydown}>
-				<a role="menuitem" href="/library/import">Import NZB file</a>
-			</div>
-		{/if}
-	</div>
-{/snippet}
-
 <a class="skip-link" href="#main-content" onclick={skipToContent}>Skip to content</a>
 
 {#if isPublicRoute}
@@ -720,7 +681,6 @@
 			/>
 		</form>
 		{@render appearanceControl()}
-		{@render createControl('topbar')}
 		<div class="nt-menu-root" data-menu-root onfocusout={onMenuFocusOut}>
 			<button
 				type="button"
@@ -758,7 +718,6 @@
 	</div>
 	<div class="nt-body">
 		<div class="nt-rail" data-testid="shell-rail">
-			{@render createControl('rail')}
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
 				{@render primaryLinks()}
 			</nav>
@@ -992,10 +951,6 @@
 		color: var(--nt-fg);
 	}
 
-	.nt-create {
-		width: 100%;
-	}
-
 	.nt-menu {
 		position: absolute;
 		top: calc(100% + var(--nt-space-1));
@@ -1039,10 +994,6 @@
 		border-radius: var(--nt-radius);
 		color: var(--nt-fg-muted);
 		text-decoration: none;
-	}
-
-	.nt-topbar-create {
-		display: none;
 	}
 
 	.nt-tabbar {
@@ -1153,10 +1104,6 @@
 	@media (max-width: 799px) {
 		.nt-rail {
 			display: none;
-		}
-
-		.nt-topbar-create {
-			display: block;
 		}
 
 		.nt-body {

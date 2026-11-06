@@ -548,7 +548,8 @@ test('[FM-B10] loading/error/retry and a genuinely empty library keep their exis
 	h.reply.items = [];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expect(page.getByRole('status').filter({ hasText: /library is empty/i })).toBeVisible();
-	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveAttribute('href', '/library/import');
+	// User NZB import retired: the empty state carries no import link.
+	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
 	await expectRows(page, []);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });

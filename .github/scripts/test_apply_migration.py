@@ -155,6 +155,150 @@ class ComposeTests(unittest.TestCase):
         sql, *_ = self.compose("0002_alpha.sql")
         self.assertNotIn(apply_migration.MISSING_PRIOR, sql)
 
+    def write_manifest(self, entries):
+        """entries: (name, target, body, [alias names], [(old, new) edges]).
+
+        Aliases share the entry's bytes; edges are nested under their entry.
+        """
+        manifest = ""
+        for name, target, body, aliases, *rest in entries:
+            (self.root / name).write_text(body, encoding="utf-8")
+            sha = hashlib.sha256(body.encode()).hexdigest()
+            alias_toml = ", ".join(
+                f'{{ file = "{a}", sha256 = "{sha}" }}' for a in aliases)
+            manifest += (f'[[migration]]\nfile = "{name}"\ntarget = "{target}"\n'
+                         f'sha256 = "{sha}"\n')
+            if aliases:
+                manifest += f"renamed_from = [{alias_toml}]\n"
+            for old, new in (rest[0] if rest else []):
+                manifest += ("[[migration.source_rename_history]]\n"
+                             f'parent = "{"a" * 40}"\ncommit = "{"b" * 40}"\n'
+                             f'old_path = "migrations/{old}"\n'
+                             f'new_path = "migrations/{new}"\n'
+                             f'old_sha256 = "{"c" * 64}"\nnew_sha256 = "{"d" * 64}"\n')
+        (self.root / "manifest.toml").write_text(manifest, encoding="utf-8")
+
+    def test_manifest_validation_is_strict_for_every_entry(self):
+        body = "CREATE TABLE t (id int);\n"
+        good = ("0001_mirror.sql", "mirror", "SELECT 1;\n", [])
+        for label, bad in {
+            "bad target": ("0002_alpha.sql", "web", body, []),
+            "bad name": ("alpha.sql", "app", body, []),
+            "duplicate name": ("0001_mirror.sql", "app", body, []),
+            "alias equals current": ("0002_alpha.sql", "app", body, ["0002_alpha.sql"]),
+            "alias collides with other entry": ("0002_alpha.sql", "app", body,
+                                                ["0001_mirror.sql"]),
+        }.items():
+            with self.subTest(label):
+                self.write_manifest([good, bad])
+                (self.root / "0002_alpha.sql").write_text(body, encoding="utf-8")
+                with self.assertRaises(apply_migration.ApplyError):
+                    self.compose("0002_alpha.sql")
+
+    def test_manifest_alias_must_be_byte_equal_and_hex(self):
+        body = "CREATE TABLE t (id int);\n"
+        self.write_manifest([("0002_alpha.sql", "app", body, ["0001_old.sql"])])
+        text = (self.root / "manifest.toml").read_text()
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        for label, bad_sha in (("different bytes", "0" * 64),
+                               ("uppercase", sha.upper()), ("short", sha[:10])):
+            with self.subTest(label):
+                (self.root / "manifest.toml").write_text(
+                    text.replace(f'file = "0001_old.sql", sha256 = "{sha}"',
+                                 f'file = "0001_old.sql", sha256 = "{bad_sha}"'))
+                with self.assertRaises(apply_migration.ApplyError):
+                    self.compose("0002_alpha.sql")
+        # A mirror entry is validated the same way as an app entry.
+        self.write_manifest([("0001_m.sql", "mirror", body, ["0001_m.sql"]),
+                             ("0002_alpha.sql", "app", body, [])])
+        with self.assertRaises(apply_migration.ApplyError):
+            self.compose("0002_alpha.sql")
+
+    def test_resolve_entry_keeps_return_shape(self):
+        sha = "e" * 64
+        entries = [
+            {"file": "0001_a.sql", "target": "app", "sha256": sha},
+            {"file": "0002_b.sql", "target": "app", "sha256": sha,
+             "renamed_from": [{"file": "0002_old.sql", "sha256": sha}]},
+        ]
+        target, identity, priors = apply_migration.resolve_entry(
+            entries, "0002_old.sql", sha)
+        self.assertEqual(target, "app")
+        self.assertEqual(identity, [("0002_b.sql", sha), ("0002_old.sql", sha)])
+        self.assertEqual(priors, [[("0001_a.sql", sha)]])
+
+    def test_invalid_history_refuses(self):
+        self.write_manifest([("0002_alpha.sql", "app", "SELECT 1;\n", [],
+                              [("0001_x.sql", "../etc.sql")])])
+        with self.assertRaises(apply_migration.ApplyError):
+            self.compose("0002_alpha.sql")
+
+    def deny_list(self, sql):
+        deny = sql[sql.index("WHERE file IN ("):]
+        return deny[:deny.index(")")]
+
+    def test_history_names_feed_the_deny_check_only(self):
+        body = "CREATE TABLE t (id int);\n"
+        self.write_manifest([
+            ("0001_first.sql", "app", "SELECT 1;\n", ["0001_first_alias.sql"],
+             [("0001_ancient.sql", "0001_first.sql")]),
+            ("0002_alpha.sql", "app", body, [],
+             [("0002_prehistoric.sql", "0002_alpha.sql")])])
+        sql, *_ = self.compose("0002_alpha.sql")
+        self.assertIn(apply_migration.CONFLICTING_HISTORY, sql)
+        deny = self.deny_list(sql)
+        # History of the entry and of its earlier prior, plus the
+        # prior's own current and alias names, are denied.
+        for name in ("0002_prehistoric.sql", "0001_ancient.sql",
+                     "0001_first.sql", "0001_first_alias.sql"):
+            self.assertIn(f"'{name}'", deny)
+        # History is never positive identity.
+        for name in ("0002_prehistoric.sql", "0001_ancient.sql"):
+            self.assertNotRegex(sql, rf"\('{name}', '[0-9a-f]{{64}}'\)")
+        # Denial precedes ALREADY_SAME and the prior checks, and each
+        # prior is also checked for duplicate accepted rows first.
+        same = sql.index(f"RAISE EXCEPTION '{apply_migration.ALREADY_SAME}'")
+        self.assertLess(sql.index(apply_migration.CONFLICTING_HISTORY), same)
+        self.assertEqual(sql[:same].count(") > 1 THEN"), 2)
+        self.assertGreater(sql.index(f"RAISE EXCEPTION '{apply_migration.MISSING_PRIOR}'"), same)
+
+    def test_multi_hop_history_on_final_entry_and_mirror_excluded(self):
+        # A chain a -> b -> c with no intermediate aliases is denied in
+        # full because every edge is attached to the final entry.
+        self.write_manifest([
+            ("0001_mirror.sql", "mirror", "SELECT 1;\n", [],
+             [("0001_mirror_old.sql", "0001_mirror.sql")]),
+            ("0002_final.sql", "app", "SELECT 2;\n", [],
+             [("0002_hop_a.sql", "0002_hop_b.sql"),
+              ("0002_hop_b.sql", "0002_hop_c.sql"),
+              ("0002_hop_c.sql", "0002_final.sql")])])
+        sql, *_ = self.compose("0002_final.sql")
+        deny = self.deny_list(sql)
+        for name in ("0002_hop_a.sql", "0002_hop_b.sql", "0002_hop_c.sql",
+                     "0002_final.sql"):
+            self.assertIn(f"'{name}'", deny)
+        self.assertNotIn("0001_mirror", sql)
+
+    def test_guard_rejects_more_than_one_accepted_row(self):
+        sql = apply_migration.guard_sql(
+            [("0002_a.sql", "1" * 64), ("0001_a.sql", "1" * 64)], "db")
+        self.assertIn(") > 1 THEN", sql)
+        self.assertLess(sql.index(") > 1 THEN"),
+                        sql.index(f"RAISE EXCEPTION '{apply_migration.ALREADY_SAME}'"))
+
+    def test_psql_maps_conflicting_history(self):
+        class Result:
+            returncode, stdout = 3, ""
+            stderr = f"ERROR: {apply_migration.CONFLICTING_HISTORY}"
+        real = apply_migration.subprocess.run
+        apply_migration.subprocess.run = lambda *a, **k: Result()
+        try:
+            with self.assertRaises(apply_migration.ApplyError):
+                apply_migration.psql({}, "SELECT 1;")
+        finally:
+            apply_migration.subprocess.run = real
+
+
     def test_ddl_pins_write_privileges_and_database(self):
         self.assertIn("REVOKE INSERT, UPDATE, DELETE", apply_migration.DDL)
         self.assertIn("aclexplode(c.relacl)", apply_migration.DDL)

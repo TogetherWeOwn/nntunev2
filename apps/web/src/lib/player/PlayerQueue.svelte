@@ -5,7 +5,10 @@
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 	import type { QueueSelection, QueueSelectionAction } from './queueSelection.js';
 	import type { PlayerSession } from './session.js';
-	import { selectionCountLabel } from '../library/selection.js';
+	import ContextMenu from '../interactions/ContextMenu.svelte';
+	import { pointerQueueDrag } from '../interactions/pointer-queue-drag.js';
+	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '../interactions/context-menu.js';
+	import { activeTrackDrag, droppedTrackDrag, startTrackDrag, endTrackDrag } from '../interactions/track-drag.js';
 
 	type SelectionControls = Pick<PlayerSession, 'toggleQueueSelection' | 'selectAllQueueRows' | 'clearQueueSelection' | 'editQueueSelection'>;
 
@@ -21,12 +24,24 @@
 		radioActive?: boolean;
 		/** Queue management stays with the host page too: the panel reports intent, never mutates. */
 		onmove?: (from: number, to: number) => void;
+		/** Stable-id drag intents: host resolves against its current, authorized catalogue. */
+		oninsert?: (ids: readonly string[], beforeId: string | null) => void;
+		interactionsUnavailable?: boolean;
+		/** Host recovery target when invalidation unmounts the whole queue. */
+		onmenufocusfallback?: () => void;
+		onreorder?: (ids: readonly string[], beforeId: string | null) => void;
+		onplaynextids?: (ids: readonly string[]) => void;
+		onremoveids?: (ids: readonly string[]) => void;
+		/** Explicit transport gesture, distinct from metadata-only Select. */
+		onplaynow?: (id: string) => void;
 		onplaynext?: (index: number) => void;
 		onremove?: (index: number) => void;
 		onclear?: () => void;
 		/** Favorites stay with the library host; other queues omit the intent. */
 		favoriteIds?: ReadonlySet<string>;
 		ontogglefavorite?: (id: string) => void;
+		/** Aggregate favorite mutation by stable ids (menus); preferred over ontogglefavorite when supplied. */
+		onfavoriteids?: (ids: readonly string[]) => void;
 		/**
 		 * Metadata-only direct selection: the host applies the validated
 		 * selectTrack transition and owns the announcement; the panel reports
@@ -91,6 +106,13 @@
 		onshuffle,
 		radioActive = false,
 		onmove,
+		oninsert,
+		interactionsUnavailable = false,
+		onmenufocusfallback,
+		onreorder,
+		onplaynextids,
+		onremoveids,
+		onplaynow,
 		onplaynext,
 		onremove,
 		onclear,
@@ -98,6 +120,7 @@
 		oncopylink,
 		favoriteIds = new Set<string>(),
 		ontogglefavorite,
+		onfavoriteids,
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
@@ -131,6 +154,8 @@
 	let trackCount = $derived(queue.tracks.length);
 	let upcoming = $derived(selectedIndex < 0 ? 0 : trackCount - selectedIndex - 1);
 
+	const dragVersion = $derived({ queue, confirmGeneration, interactionsUnavailable });
+	let menuHeading: HTMLHeadingElement | null = $state(null);
 	let list: HTMLOListElement | null = $state(null);
 	let emptyTarget: HTMLElement | null = $state(null);
 	let filterEmptyTarget: HTMLElement | null = $state(null);
@@ -154,22 +179,19 @@
 		current: Set<string>
 	): string | null {
 		const at = removedId === undefined ? -1 : beforeIds.indexOf(removedId);
-		for (let i = at + 1; i < beforeIds.length; i++) {
-			const id = beforeIds[i]!;
-			if (current.has(id)) return id;
-		}
-		for (let i = Math.min(at - 1, beforeIds.length - 1); i >= 0; i--) {
-			const id = beforeIds[i]!;
-			if (current.has(id)) return id;
-		}
-		return null;
+		return beforeIds.slice(at + 1).find((id) => current.has(id)) ??
+			beforeIds.slice(0, Math.max(0, at)).reverse().find((id) => current.has(id)) ?? null;
 	}
 
 	function focusRemoveFor(trackId: string): boolean {
+		return focusRowControl(trackId, 'button[aria-label^="Remove "]');
+	}
+
+	function focusRowControl(trackId: string, selector: string): boolean {
 		const rows = list?.querySelectorAll('[data-testid="queue-item"]') ?? [];
 		for (const row of rows) {
 			if (row.getAttribute('data-track-id') !== trackId) continue;
-			const remove = row.querySelector<HTMLButtonElement>('button[aria-label^="Remove "]');
+			const remove = row.querySelector<HTMLButtonElement>(selector);
 			if (!remove) return false;
 			focusVisible(remove);
 			return true;
@@ -489,6 +511,171 @@
 	 * nothing, so a removed identity can never select its replacement. The
 	 * host validates again and applies the selectTrack transition.
 	 */
+	let trackMenu = $state<MenuRequest | null>(null);
+	let dropRow = $state<string | null>(null);
+	let dropAfter = $state(false);
+	const batchIds = $derived(selection?.ids ?? []);
+	const orderedBatch = $derived(queue.tracks.filter((track) => batchIds.includes(track.id)).map((track) => track.id));
+	let moveBefore = $state('');
+	$effect(() => {
+		if (moveBefore && (batchIds.includes(moveBefore) || !queue.tracks.some((track) => track.id === moveBefore))) {
+			moveBefore = '';
+		}
+	});
+
+	function batchFor(id: string): string[] {
+		return batchIds.includes(id) ? orderedBatch : [id];
+	}
+
+	$effect(() => {
+		void queue;
+		void confirmGeneration;
+		void interactionsUnavailable;
+		void filterQuery;
+		trackMenu = null;
+		dropRow = null;
+	});
+
+	function toggleFavorites(ids: readonly string[]): void {
+		const live = ids.filter((id) => queue.tracks.some((track) => track.id === id));
+		if (live.length === 0) return;
+		if (onfavoriteids) onfavoriteids(live);
+		else {
+			const remove = live.every((id) => favoriteIds.has(id));
+			for (const id of live.filter((id) => favoriteIds.has(id) === remove)) ontogglefavorite?.(id);
+		}
+	}
+
+	/** Next surviving More button, otherwise previous, otherwise the heading. */
+	function focusMenuSurvivor(beforeIds: string[], removedId: string | undefined): void {
+		const survivor = survivorId(beforeIds, removedId, new Set(visibleEntries.map(({ track }) => track.id)));
+		if (survivor && focusRowControl(survivor, '[data-testid="queue-more"]')) return;
+		if (menuHeading?.isConnected) menuHeading.focus({ preventScroll: true });
+		else onmenufocusfallback?.();
+	}
+
+	function recoverMenuRemoval(beforeIds: string[], removedId: string | undefined): void {
+		void tick().then(() => {
+			if (document.activeElement !== document.body && document.activeElement?.isConnected) return;
+			focusMenuSurvivor(beforeIds, removedId);
+		});
+	}
+
+	function openTrackMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }, focusMove = false): void {
+		if (interactionsUnavailable || (!oninsert && !onreorder)) return;
+		const index = queue.tracks.findIndex((track) => track.id === id);
+		if (index < 0) return;
+		const at = () => queue.tracks.findIndex((track) => track.id === id);
+		const move = (to: number) => { const from = at(); if (from >= 0) onmove?.(from, to); };
+		const actions: MenuAction[] = [];
+		const ids = batchFor(id);
+		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="queue-more"]') ?? invoker : invoker;
+		let request: MenuRequest;
+		if (ids.length > 1 && onreorder) {
+			const all = queue.tracks.map((track) => track.id);
+			const atTop = all.slice(0, ids.length).every((x) => ids.includes(x));
+			const atBottom = all.slice(all.length - ids.length).every((x) => ids.includes(x));
+			if (onplaynextids) actions.push({ label: 'Play next', run: () => onplaynextids?.(ids) });
+			if (!atTop) actions.push({ label: 'Move to top', run: () => onreorder?.(ids, queue.tracks.find((track) => !ids.includes(track.id))?.id ?? null) });
+			if (!atBottom) actions.push({ label: 'Move to bottom', run: () => onreorder?.(ids, null) });
+			if (onfavoriteids || ontogglefavorite) {
+				const starred = ids.every((x) => favoriteIds.has(x));
+				actions.push({ label: starred ? 'Unstar all' : 'Star all', run: () => toggleFavorites(ids) });
+			}
+			actions.push(unavailablePlaylistAction);
+			if (onremoveids) actions.push({ label: 'Remove from queue', destructive: true, run: () => {
+				const beforeIds = visibleEntries.map(({ track }) => track.id);
+				onremoveids?.(ids);
+				recoverMenuRemoval(beforeIds, ids[0]);
+			} });
+			request = { ...menuAt(target, `${ids.length} selected tracks`, actions), ...point };
+		} else {
+			const last = queue.tracks.length - 1;
+			if (onplaynow) actions.push({ label: 'Play now', run: () => { if (at() >= 0) onplaynow?.(id); } });
+			if (onplaynext) actions.push({ label: 'Play next', run: () => { const i = at(); if (i >= 0) onplaynext?.(i); } });
+			if (onmove && index > 0) {
+				actions.push({ label: 'Move to top', run: () => move(0) });
+				actions.push({ label: 'Move up', run: () => move(at() - 1) });
+			}
+			if (onmove && index < last) {
+				actions.push({ label: 'Move down', run: () => move(at() + 1) });
+				actions.push({ label: 'Move to bottom', run: () => move(queue.tracks.length - 1) });
+			}
+			if (onfavoriteids || ontogglefavorite) {
+				const starred = favoriteIds.has(id);
+				actions.push({ label: starred ? 'Unstar' : 'Star', run: () => toggleFavorites([id]) });
+			}
+			actions.push(unavailablePlaylistAction);
+			if (oncopylink) actions.push({ label: 'Copy link', run: () => { if (at() >= 0) oncopylink?.(id); } });
+			if (onremove) actions.push({ label: 'Remove from queue', destructive: true, run: () => {
+				const i = at();
+				if (i < 0) return;
+				const beforeIds = visibleEntries.map((entry) => entry.track.id);
+				onremove?.(i);
+				recoverMenuRemoval(beforeIds, id);
+			} });
+			request = { ...menuAt(target, `Actions for ${displayTitle(queue.tracks[index]!)}`, actions), ...point };
+		}
+		if (focusMove) request.initialIndex = actions.findIndex((action) => action.label.startsWith('Move'));
+		const beforeIds = visibleEntries.map(({ track }) => track.id);
+		request.fallbackFocus = () => focusMenuSurvivor(beforeIds, id);
+		trackMenu = request;
+	}
+
+	// Touch/pen drag release on the grip can still synthesize a click; it must not open the menu.
+	let gripDragged = false;
+	let gripOrigin = { x: 0, y: 0 };
+	function gripDown(event: PointerEvent): void {
+		gripDragged = false;
+		gripOrigin = { x: event.clientX, y: event.clientY };
+	}
+	function gripMove(event: PointerEvent): void {
+		if (event.pointerType !== 'mouse' && Math.hypot(event.clientX - gripOrigin.x, event.clientY - gripOrigin.y) >= 6) gripDragged = true;
+	}
+	function gripClick(event: MouseEvent, id: string): void {
+		event.stopPropagation();
+		if (gripDragged && event.detail !== 0) { gripDragged = false; event.preventDefault(); return; }
+		gripDragged = false;
+		openTrackMenu(id, event.currentTarget as HTMLElement, undefined, true);
+	}
+
+	function dropDestination(event: Pick<DragEvent, 'target' | 'clientY'>, moving: readonly string[] = []): string | null {
+		const row = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-testid="queue-item"]') : null;
+		const id = row?.dataset.trackId;
+		const index = queue.tracks.findIndex((track) => track.id === id);
+		if (!row || index < 0) { dropRow = null; return null; }
+		dropRow = id ?? null;
+		dropAfter = event.clientY > row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+		// Resolve the boundary in the remaining queue, not inside the moving
+		// group. Hidden rows still participate in the full-queue coordinates.
+		return queue.tracks.slice(index + (dropAfter ? 1 : 0))
+			.find((track) => !moving.includes(track.id))?.id ?? null;
+	}
+
+	function acceptsDrop(event: DragEvent): boolean {
+		const drag = activeTrackDrag(event);
+		return !interactionsUnavailable && !!drag && (drag.queue === list ? !!onreorder : drag.queue === null && !!oninsert);
+	}
+
+	function dragover(event: DragEvent): void {
+		if (!acceptsDrop(event)) return;
+		event.preventDefault();
+		if (event.dataTransfer) event.dataTransfer.dropEffect = activeTrackDrag(event)?.queue ? 'move' : 'copy';
+		dropDestination(event);
+	}
+
+	function drop(event: DragEvent): void {
+		if (!acceptsDrop(event)) return;
+		const drag = droppedTrackDrag(event);
+		if (!drag) return;
+		event.preventDefault();
+		const beforeId = dropDestination(event, drag.ids);
+		if (drag.queue === list) onreorder?.(drag.ids, beforeId);
+		else oninsert?.(drag.ids, beforeId);
+		dropRow = null;
+		endTrackDrag();
+	}
+
 	function reportSelect(event: Event, index: number, trackId: string): void {
 		const button = event.currentTarget;
 		if (!(button instanceof HTMLButtonElement)) return;
@@ -507,6 +694,9 @@
 	and management (via `onmove`/`onplaynext`/`onremove`/`onclear`); the
 	panel itself never mutates state.
 -->
+{#if oninsert || onreorder}
+	<h2 tabindex="-1" bind:this={menuHeading}>Queue</h2>
+{/if}
 {#if showTransport}
 	<p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
 		{#if current}
@@ -583,11 +773,22 @@
 {/if}
 
 {#if selection && selectionControls && selection.active}
-	<div class="queue-filter" data-testid="queue-selection-actions">
-		<p role={liveRegions ? 'status' : undefined}>{selectionCountLabel(selection.ids.length)}</p>
+	<div class="queue-filter" role="group" data-testid="queue-selection-toolbar" aria-label="Selected queue tracks">
+		<p role={liveRegions ? 'status' : undefined}>{selection.ids.length} selected in queue</p>
 		<button type="button" disabled={visibleEntries.length === 0} onclick={() => selectionControls?.selectAllQueueRows()}>Select all displayed</button>
 		<button type="button" disabled={selection.ids.length === 0 || selectedIndex < 0} onclick={(event) => void reportSelection(event, 'playNext')}>Play next</button>
-		<button type="button" disabled={selection.ids.length === 0} onclick={(event) => void reportSelection(event, 'remove')}>Remove</button>
+		{#if onreorder}
+			<label>Move selected before
+				<select bind:value={moveBefore}>
+					<option value="">End of queue</option>
+					{#each queue.tracks.filter((track) => !batchIds.includes(track.id)) as track (track.id)}
+						<option value={track.id}>{displayTitle(track)}</option>
+					{/each}
+				</select>
+			</label>
+			<button type="button" disabled={selection.ids.length === 0} onclick={() => onreorder?.(orderedBatch, moveBefore || null)}>Move selected</button>
+		{/if}
+		<button type="button" disabled={selection.ids.length === 0} onclick={(event) => void reportSelection(event, 'remove')}>Remove selected from queue</button>
 		<button type="button" onclick={(event) => void reportSelection(event)}>Done</button>
 	</div>
 	{@const hiddenCount = selection.ids.filter((id) => !visibleEntries.some(({ track }) => track.id === id)).length}
@@ -597,15 +798,25 @@
 {/if}
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions: delegated row modifiers have native checkbox equivalents; controls keep their own keyboard/click behavior. -->
-<ol aria-label="Playback queue" bind:this={list} onclick={selectionClick} onkeydown={selectionKey}>
+<ol aria-label="Playback queue" bind:this={list}
+	data-testid="queue-drop-target"
+	data-accepts-tracks={oninsert ? '' : undefined}
+	onclick={selectionClick} onkeydown={selectionKey}
+	ondragover={dragover} ondrop={drop}
+	ondragleave={(event) => { if (!(event.relatedTarget instanceof Node) || !list?.contains(event.relatedTarget)) dropRow = null; }}
+>
 	<!-- Stable track identity preserves keyboard focus through reorders. The
 		store guarantees uniqueness: addTrack dedupes and restoreQueue rejects duplicates. -->
 	{#each visibleEntries as { track, index } (track.id)}
-		<!-- svelte-ignore a11y_no_noninteractive_tabindex: tabindex is provably -1-or-absent (QO-U14); the current row is a programmatic focus target, never a tab stop. -->
+		<!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions: rows are programmatic targets, not tab stops; modifier-click selects without activating controls. -->
 		<li
 			class="queue-row"
+			class:drop-before={dropRow === track.id && !dropAfter}
+			class:drop-after={dropRow === track.id && dropAfter}
+			use:contextMenu={!interactionsUnavailable && (oninsert || onreorder) ? (invoker, point) => openTrackMenu(track.id, invoker, point) : undefined}
 			data-testid="queue-item"
 			data-track-id={track.id}
+			data-selected={batchIds.includes(track.id) ? '' : undefined}
 			aria-current={index === selectedIndex ? 'true' : undefined}
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
@@ -617,11 +828,38 @@
 							if (!event.currentTarget.isConnected || !list?.contains(event.currentTarget)) return;
 							const selected = selectionControls?.toggleQueueSelection(track.id, event.shiftKey);
 							event.currentTarget.checked = selected?.ids.includes(track.id) ?? false;
+						}}
+						onkeydown={(event) => {
+							if (event.key !== ' ' || !event.shiftKey || event.defaultPrevented || event.repeat ||
+								event.isComposing || event.altKey || event.ctrlKey || event.metaKey ||
+								!event.currentTarget.isConnected || !list?.contains(event.currentTarget)) return;
+							event.preventDefault();
+							selectionControls?.toggleQueueSelection(track.id, true);
 						}} />
 					Select
 				</label>
 			{/if}
+			{#if onreorder}
+				<button type="button" class="queue-grip" draggable="true"
+					use:pointerQueueDrag={{
+						ids: () => interactionsUnavailable ? [] : batchFor(track.id), list: () => list, version: dragVersion,
+						hover: (target, clientY) => { dropDestination({ target, clientY }); },
+						drop: (ids, target, clientY) => { onreorder?.(ids, dropDestination({ target, clientY }, ids)); dropRow = null; },
+						cancel: () => { dropRow = null; }
+					}}
+					aria-label="Reorder {displayTitle(track)}" aria-haspopup="menu"
+					onpointerdown={gripDown} onpointermove={gripMove}
+					onclick={(event) => gripClick(event, track.id)}
+					ondragstart={(event) => startTrackDrag(event, interactionsUnavailable ? [] : batchFor(track.id), list)}
+				>Reorder</button>
+			{/if}
 			{displayTitle(track)}{#if track.artist}{' — '}{track.artist}{/if}
+			{#if oninsert || onreorder}
+				<button type="button" class="queue-more" data-testid="queue-more" aria-haspopup="menu"
+					aria-label="More actions for {displayTitle(track)}" aria-disabled={interactionsUnavailable}
+					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
+				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+			{/if}
 			{#if ontogglefavorite}
 				<button
 					type="button"
@@ -750,7 +988,27 @@
 	stays reserved for real queue changes. -->
 <p data-testid="queue-confirm-feedback" aria-live={liveRegions ? 'polite' : undefined}>{#key cancelNoteVersion}{cancelNote}{/key}</p>
 
+{#if trackMenu}
+	{#key trackMenu}
+		<ContextMenu request={trackMenu} onclose={() => (trackMenu = null)} />
+	{/key}
+{/if}
+
 <style>
+	ol { min-height: 48px; }
+	.queue-grip { cursor: grab; min-height: 40px; touch-action: none; }
+	.queue-more { min-width: 40px; min-height: 40px; }
+	.queue-more[aria-disabled='true'] { color: var(--nt-fg-muted); cursor: default; background: transparent; }
+	.queue-row[data-selected] { background: var(--nt-bg-raised); outline: 1px solid var(--nt-accent); }
+	@media (pointer: coarse) {
+		.queue-grip, .queue-more { min-width: 48px; min-height: 48px; }
+	}
+	:global(html[data-track-dragging='library']) ol[data-accepts-tracks] {
+		outline: 2px dashed var(--nt-accent);
+	}
+	:global(html[data-track-dragging]) .drop-before { box-shadow: 0 -2px var(--nt-accent); }
+	:global(html[data-track-dragging]) .drop-after { box-shadow: 0 2px var(--nt-accent); }
+
 	.queue-filter {
 		display: flex;
 		flex-wrap: wrap;

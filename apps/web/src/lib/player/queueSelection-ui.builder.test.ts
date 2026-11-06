@@ -28,6 +28,30 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
+it.each([0, 2])('one session-owned group contains the sole exact removal control with %i selected', (count) => {
+	const { player } = setup();
+	player.toggleQueueSelection('b');
+	if (count === 0) player.toggleQueueSelection('b');
+	else player.toggleQueueSelection('d');
+	const props = () => ({ state: player.snapshot().queue, selection: player.snapshot().queueSelection,
+		selectionControls: player, onreorder: vi.fn() });
+	const markup = render(PlayerQueue, { props: props() }).body;
+	expect(markup.match(/data-testid="queue-selection-toolbar"/g)).toHaveLength(1);
+	expect(markup.match(/aria-label="Selected queue tracks"/g)).toHaveLength(1);
+	const group = markup.match(/<div[^>]*role="group"[^>]*data-testid="queue-selection-toolbar"[^>]*>([\s\S]*?)<\/div>/)![1];
+	expect(group).toContain(`>${count} selected in queue</p>`);
+	expect(group.match(/>Remove selected from queue<\/button>/g)).toHaveLength(1);
+	const button = group.match(/<button[^>]*>Remove selected from queue<\/button>/)![0];
+	expect(button.includes('disabled')).toBe(count === 0);
+	expect(button).not.toMatch(/aria-label(?:ledby)?=|title=/);
+	const buttons = [...group.matchAll(/<button\b[^>]*>([^<]*)<\/button>/g)].map((match) => match[1]);
+	expect(buttons.slice(-2)).toEqual(['Remove selected from queue', 'Done']);
+	expect(group).toContain('Move selected before');
+	expect(group).toContain('>Move selected</button>');
+	player.clearQueueSelection();
+	expect(render(PlayerQueue, { props: props() }).body).not.toContain('data-testid="queue-selection-toolbar"');
+});
+
 it('selection is opt-in; production selectors do not replace existing direct Select controls or current marking', () => {
 	const { player, body } = setup();
 	expect(body(false)).not.toContain('type="checkbox"');
@@ -39,7 +63,7 @@ it('selection is opt-in; production selectors do not replace existing direct Sel
 	expect(markup).toContain('aria-label="Select A for queue actions"');
 	expect(markup).toContain('aria-label="Select A"');
 	expect(markup.match(/aria-current="true"/g)).toHaveLength(1);
-	expect(markup).not.toContain('data-testid="queue-selection-actions"');
+	expect(markup).not.toContain('data-testid="queue-selection-toolbar"');
 });
 
 it('the bulk bar includes hidden membership, preserves filter scope and renders the native checked state', () => {
@@ -48,12 +72,12 @@ it('the bulk bar includes hidden membership, preserves filter scope and renders 
 	player.toggleQueueSelection('d');
 	player.setQueueFilter('b');
 	const markup = body();
-	expect(markup).toContain('data-testid="queue-selection-actions"');
-	expect(markup).toContain('>2 selected</p>');
+	expect(markup).toContain('data-testid="queue-selection-toolbar"');
+	expect(markup).toContain('>2 selected in queue</p>');
 	expect(markup).toContain('1 selected track is hidden by this filter.');
 	expect(markup.match(/type="checkbox"[^>]*checked/g)).toHaveLength(1);
 	expect(markup).toContain('>Play next</button>');
-	expect(markup).toContain('>Remove</button>');
+	expect(markup).toContain('>Remove selected from queue</button>');
 	expect(markup).toContain('>Done</button>');
 	expect(player.snapshot().queue.tracks).toEqual(tracks);
 });
@@ -64,7 +88,7 @@ it('an active empty selection disables bulk edits and a zero-match projection di
 	player.toggleQueueSelection('b');
 	player.setQueueFilter('no match');
 	const markup = body();
-	for (const label of ['Play next', 'Remove', 'Select all displayed']) {
+	for (const label of ['Play next', 'Remove selected from queue', 'Select all displayed']) {
 		expect(markup).toMatch(new RegExp(`<button[^>]*disabled[^>]*>${label}</button>`));
 	}
 	expect(markup).toContain('>Done</button>');

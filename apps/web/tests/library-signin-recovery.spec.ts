@@ -261,9 +261,7 @@ test('404 keeps the neutral not-yet-available state with no sign-in link', async
 	await expect(page.getByRole('status')).toContainText(/listing is not available yet/i);
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	await expect(signInLink(page)).toHaveCount(0);
-	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveAttribute(
-		'href',
-		'/library/import'
-	);
+	// User NZB import retired: no import link in the 404 state.
+	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
 	await expectNoPrivateTracks(page);
 });

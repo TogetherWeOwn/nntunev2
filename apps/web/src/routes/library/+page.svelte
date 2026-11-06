@@ -47,6 +47,9 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
+	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
+	import { startTrackDrag, endTrackDrag } from '#lib/interactions/track-drag.js';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
 	import {
 		addTrack,
@@ -55,6 +58,8 @@
 		currentTrack as queueCurrentTrack,
 		formatQueueM3U,
 		formatQueueText,
+		insertTracks,
+		insertTracksNext,
 		selectTrack as selectQueueIndex,
 		type QueueState,
 		type RepeatMode,
@@ -277,6 +282,11 @@
 	// so a remembered position must be fenced here, not re-derived).
 	const restartSupersededSources = new Set<string>();
 
+	let trackMenu = $state<MenuRequest | null>(null);
+	let refreshOwner: object | null = null;
+	let libraryInputOwner: object | null = null;
+	let libraryNotification = 0;
+
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
@@ -290,10 +300,17 @@
 		onStateChange: (state) => {
 			// An aborted request still notifies in finally after route disposal.
 			if (!shareAlive) return;
+			const notification = ++libraryNotification;
+			const owner = player.sourceInputOwner();
+			const current = () => shareAlive && notification === libraryNotification && owner === player.sourceInputOwner();
+			// Refreshed/auth-boundary snapshots invalidate captured intents.
+			trackMenu = null;
+			endTrackDrag();
 			items = state.items;
 			staleAt = state.staleAt;
 			loading = state.loading;
 			player.setQueueLiveRegions(!state.loading);
+			if (!current()) return;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
@@ -302,7 +319,9 @@
 			// it so the next account never inherits the previous query.
 			// Successful same-account refreshes keep items and keep the query.
 			if (state.loadError && state.items.length === 0) {
+				libraryInputOwner = null;
 				player.setQueueFilter('');
+				if (!current()) return;
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
@@ -324,20 +343,26 @@
 			// verified snapshot and must not erase the layout-owned queue.
 			// Auth transitions and 401/403 already reset the session above;
 			// 404 explicitly clears through libraryUnavailable here.
-			if (
-				!state.loading && queue.tracks.length > 0 &&
-				((!state.loadError && state.staleAt === null) || state.libraryUnavailable)
-			) {
+			if (!state.loading && ((!state.loadError && state.staleAt === null) || state.libraryUnavailable)) {
+				if (state.libraryUnavailable) libraryInputOwner = null;
+				else if (refreshOwner === owner) libraryInputOwner = owner;
+				else return; // The load began before this authenticated owner existed.
 				const ids = new Set(state.items.map((track) => track.id));
 				const kept = queue.tracks.filter((track) => ids.has(track.id));
+				let next = queue;
 				if (kept.length !== queue.tracks.length) {
 					player.invalidateQueueConsent();
+					if (!current()) return;
 					const currentId = queueCurrentTrack(queue)?.id ?? null;
 					const rebuilt = createQueue(kept);
-					const index =
-						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
+					const index = currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
+					next = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
 				}
+				if (next !== queue) retireQueueWork(next);
+				if (!current()) return;
+				// Pair authoritative evidence with membership, without hydrating rows
+				// or touching a surviving lawful queued stream/decoder.
+				if (!player.setQueue(next, { owner, tracks: sourceProjections(next), authoritative: true }) || !current()) return;
 			}
 			// The pending subset is per-account: an access refusal or auth
 			// transition that empties the library purges it, so the next
@@ -365,13 +390,16 @@
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (!state.loading && !state.loadError && !state.libraryUnavailable) {
 				player.initializeFavorites();
+				if (!current()) return;
 				if (!recentFindsInitialized) {
 					recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
 					recentFindsInitialized = true;
 				}
 				player.exposeQueueFeedback();
+				if (!current()) return;
 			}
 			if (!state.loading) applyShareLink();
+			if (!current()) return;
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
 			// was typing in. Background refreshes keep the panel mounted, so
@@ -491,6 +519,7 @@
 	}
 
 	function selectTrack(id: string): void {
+		if (!libraryInputCurrent()) return;
 		const item = items.find((track) => track.id === id);
 		if (!item) return;
 		clearShareFeedback();
@@ -510,8 +539,8 @@
 	 */
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
-		if (missing.length === 0) return;
-		replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)));
+		if (missing.length === 0 || !libraryInputCurrent()) return;
+		if (!replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)))) return;
 		player.setQueueFeedback(`Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`);
 	}
 
@@ -525,7 +554,7 @@
 	 * (another action, an auth teardown) fences the late outcome.
 	 */
 	async function playDisplayedFromTop(): Promise<void> {
-		if (playDisplayedDisabled) return;
+		if (playDisplayedDisabled || !libraryInputCurrent()) return;
 		const missing = bulkMissing;
 		const skipped = missingDisplayedTracks(renderedItems, new Set()).length - missing.length;
 		// Appended IDs are new and unique, so one lookup finds the first
@@ -539,27 +568,9 @@
 		// hydrates only its selected slot, preserving every other queued row.
 		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
 		base.tracks[index] = { ...target, streamUrl: source };
-		replaceQueue(selectQueueIndex(base, index));
-		const epoch = playEpoch;
-		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
+		if (!replaceQueue(selectQueueIndex(base, index))) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		let lead = `Selected ${title}; no stream to play.`;
-		if (source) {
-			await tick();
-			if (epoch !== playEpoch) return;
-			const element = audioEl;
-			lead = `Selected ${title}, paused: playback was blocked.`;
-			if (element) {
-				try {
-					await element.play();
-					lead = `Playing ${title}.`;
-				} catch {
-					// Selected-but-paused is the truthful fallback; no retry.
-				}
-			}
-			if (epoch !== playEpoch) return;
-		}
-		player.setQueueFeedback(`${lead} ${counts}`, true);
+		await player.playQueuedTrack(target.id, counts);
 	}
 
 	function queueFavorites(): void {
@@ -609,11 +620,29 @@
 		}
 	}
 
-	function replaceQueue(next: QueueState): void {
+	function sourceProjections(next: QueueState): { id: string; streamUrl: string }[] {
+		return next.tracks.flatMap((track) => {
+			const item = items.find((item) => item.id === track.id);
+			return item ? [{ id: item.id, streamUrl: playableTrackFor(item).streamUrl }] : [];
+		});
+	}
+
+	function libraryInputCurrent(): boolean {
+		return shareAlive && !loading && !libraryUnavailable && libraryInputOwner !== null &&
+			libraryInputOwner === player.sourceInputOwner();
+	}
+
+	function replaceQueue(next: QueueState): boolean {
+		if (!shareAlive) return false;
+		const owner = libraryInputOwner;
+		if (owner !== null && owner !== player.sourceInputOwner()) return false;
 		retireQueueWork(next);
-		player.setQueue(next);
+		if (!player.setQueue(next, owner === null ? undefined : { owner, tracks: sourceProjections(next) })) return false;
 		player.setQueueFeedback('');
+		if (!shareAlive || player.snapshot().queue !== next ||
+			(owner !== null && owner !== player.sourceInputOwner())) return false;
 		syncMiniPlayerHint(next);
+		return true;
 	}
 
 	/**
@@ -642,6 +671,7 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		libraryInputOwner = null;
 		// The session owns audio, but pending row actions and their feedback
 		// remain page-owned and must be fenced before the previous play settles.
 		playEpoch += 1;
@@ -862,9 +892,9 @@
 	async function moveFavorite(
 		id: string,
 		direction: FavoriteMoveDirection,
-		event: Event
+		event: Event | HTMLElement
 	): Promise<void> {
-		const button = event.currentTarget;
+		const button = event instanceof HTMLElement ? event : event.currentTarget;
 		const visibleIds = favoriteTracks.map((track) => track.id);
 		const next = moveFavoriteId(favorites, visibleIds, id, direction);
 		if (next === favorites) return;
@@ -1026,6 +1056,12 @@
 		return holder?.getAttribute('data-id') ?? null;
 	}
 
+	function focusLibraryRecovery(): void {
+		const target = [viewSelect, refreshButton].find((element) =>
+			element?.isConnected && !element.matches(':disabled'));
+		target?.focus({ preventScroll: true });
+	}
+
 	/**
 	 * After a selected row unmounts, land focus on the checkbox of the next
 	 * surviving displayed row, else the previous one, else the Show
@@ -1054,7 +1090,7 @@
 					return;
 				}
 			}
-			viewSelect?.focus({ preventScroll: true });
+			focusLibraryRecovery();
 		});
 	}
 
@@ -1065,16 +1101,21 @@
 	 * ID. Selection changes announce the count once; no-ops stay silent.
 	 */
 	function activateSelectionRow(id: string, extend: boolean, box: HTMLInputElement): void {
+		selectInteractionRow(id, extend);
+		// A native toggle the selection did not follow (Shift on a selected
+		// anchor) would leave the box out of sync: re-assert the truth.
+		box.checked = selectedIds.includes(id);
+	}
+
+	function selectInteractionRow(id: string, extend: boolean): void {
 		const displayedIds = renderedItems.map((track) => track.id);
 		if (extend && rangeAnchorId !== null && displayedIds.includes(rangeAnchorId)) {
 			selectedIds = selectRange(selectedIds, displayedIds, rangeAnchorId, id);
 		} else {
+			// A missing displayed anchor toggles, and can remove the focused row.
 			toggleSelectedId(id);
 		}
 		rangeAnchorId = id;
-		// A native toggle the selection did not follow (Shift on a selected
-		// anchor) would leave the box out of sync: re-assert the truth.
-		box.checked = selectedIds.includes(id);
 	}
 
 	function toggleSelectedId(id: string): void {
@@ -1106,30 +1147,213 @@
 	}
 
 	function clearSelectedIds(): void {
-		// Clearing inside Selected only unmounts every row; only focus that
-		// sat inside one of them needs the Show-control fallback.
+		// Selected only removes all rows. Recover only focus stranded by the
+		// explicit clear; the mounted Clear selection button keeps its focus.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
+		const focusLeavesWithToolbar = typeof document !== 'undefined' &&
+			!!document.activeElement?.closest?.('[data-testid="track-selection-toolbar"]');
+		const returnId = view === 'selected' ? null : renderedItems.find((track) => selectedIds.includes(track.id))?.id ?? null;
 		// Announce real clears only: an already-empty selection stays silent.
 		const hadSelection = selectedIds.length > 0;
 		selectedIds = clearSelection(selectedIds);
 		rangeAnchorId = null;
 		if (hadSelection) announceBrowse('Selection cleared');
-		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
+		if (focusLeavesWithRows || focusLeavesWithToolbar) focusAfterSelectedRowRemoval(returnId, null);
 	}
 
 	function appendSelectedIds(): void {
+		if (!libraryInputCurrent()) return;
 		const result = appendSelection(queue, selectedIds, items);
-		replaceQueue(result.queue);
+		if (!replaceQueue(result.queue)) return;
 		appendFeedback = appendResultLabel(result.added, result.skipped);
 	}
 
+
+	function interactionIds(id: string): string[] {
+		return selectedIds.includes(id) ? renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id) : [id];
+	}
+
+	function announceInteraction(text: string): void {
+		player.setQueueFeedback(text, true);
+	}
+
+	function availableInteractionIds(ids: readonly string[], queued = false): string[] {
+		const available = !libraryInputCurrent() ? [] : queued ? queue.tracks : items;
+		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
+		if (!surviving.length) announceInteraction('That track is no longer available.');
+		return surviving;
+	}
+
+	function missingInteractionLabel(ids: readonly string[], surviving: readonly string[]): string {
+		const missing = new Set(ids).size - surviving.length;
+		return missing ? ` ${missing} ${missing === 1 ? 'track is' : 'tracks are'} no longer available.` : '';
+	}
+
+	async function playLibraryIds(ids: readonly string[]): Promise<void> {
+		const surviving = availableInteractionIds(ids);
+		const first = items.find((item) => item.id === surviving[0]);
+		if (!first) return;
+		const added = surviving.filter((id) => !queue.tracks.some((track) => track.id === id)).length;
+		// Play now moves the complete selection, including a previously current
+		// member. Only Play next deliberately leaves the current track in place.
+		const boundary = queue.tracks.slice(queue.currentIndex + 1).find((track) => !surviving.includes(track.id));
+		const base = insertTracks(queue, knownTracks(surviving), boundary?.id ?? null);
+		const index = base.tracks.findIndex((track) => track.id === first.id);
+		const target = base.tracks[index];
+		if (!target) return;
+		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
+		const tracks = [...base.tracks];
+		tracks[index] = { ...target, streamUrl: source };
+		if (!replaceQueue(selectQueueIndex({ ...base, tracks }, index))) return;
+		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
+		await player.playQueuedTrack(target.id, (counts + missingInteractionLabel(ids, surviving)).trim());
+	}
+
+	function appendInteractionIds(ids: readonly string[]): void {
+		const surviving = availableInteractionIds(ids);
+		if (!surviving.length) return;
+		const result = appendSelection(queue, surviving, items);
+		if (!replaceQueue(result.queue)) return;
+		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
+	}
+
+	function favoriteInteractionIds(ids: readonly string[], queued = false): void {
+		const surviving = availableInteractionIds(ids, queued);
+		if (!surviving.length) return;
+		const remove = surviving.every((id) => favoriteIds.has(id));
+		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
+		const owner = libraryInputOwner;
+		const next = remove ? favorites.filter((id) => !changed.includes(id)) : [...favorites, ...changed];
+		if (!player.setFavorites(next) || !libraryInputCurrent() || owner !== libraryInputOwner || player.snapshot().favorites !== next) return;
+		const already = surviving.length - changed.length;
+		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
+		const track = (queued ? queue.tracks : items).find((track) => track.id === surviving[0]);
+		const subject = ids.length === 1 && track ? displayTitle(track) : count;
+		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
+			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
+		const focusedId = focusedLibraryRowId();
+		if (!queued && view === 'favorites' && remove && focusedId !== null && changed.includes(focusedId)) {
+			focusAfterSelectedRowRemoval(null, null);
+		}
+	}
+
+	function knownTracks(ids: readonly string[]): Track[] {
+		if (!libraryInputCurrent()) return [];
+		return ids.flatMap((id) => {
+			const item = items.find((item) => item.id === id);
+			return item ? [queuedTrackFor(item)] : [];
+		});
+	}
+
+	function queueNextIds(ids: readonly string[]): void {
+		const surviving = availableInteractionIds(ids);
+		if (!surviving.length) return;
+		const next = insertTracksNext(queue, knownTracks(surviving));
+		if (next === queue) return;
+		if (!replaceQueue(next)) return;
+		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
+	}
+
+	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
+		if (!libraryInputCurrent()) return;
+		const tracks = knownTracks(ids);
+		// Copy from current loaded items, never drag payload URLs or menu captures.
+		const inputs = tracks.flatMap((track) => {
+			const item = items.find((item) => item.id === track.id);
+			return item ? [{ id: item.id, streamUrl: playableTrackFor(item).streamUrl }] : [];
+		});
+		player.insertQueuedTracks(tracks, beforeId, { owner: libraryInputOwner!, tracks: inputs });
+	}
+
+	function playbackMenuActions(ids: readonly string[]): MenuAction[] {
+		return [
+			{ label: 'Play now', run: () => void playLibraryIds(ids) },
+			{ label: 'Play next', run: () => queueNextIds(ids) },
+			{ label: 'Add to queue', run: () => appendInteractionIds(ids) }
+		];
+	}
+
+	function openTrackMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }): void {
+		if (loading || libraryUnavailable || !items.some((item) => item.id === id)) return;
+		const ids = interactionIds(id);
+		const starred = ids.every((id) => favoriteIds.has(id));
+		const actions = playbackMenuActions(ids);
+		actions.push(
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids) },
+			unavailablePlaylistAction
+		);
+		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } });
+		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="track-more"]') ?? invoker : invoker;
+		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(items.find((item) => item.id === id)!)}`;
+		const displayedIds = renderedItems.map((item) => item.id);
+		const index = displayedIds.indexOf(id);
+		trackMenu = { ...menuAt(target, label, actions), fallbackFocus: () => {
+			const surviving = new Set(renderedItems.map((item) => item.id));
+			const next = displayedIds.slice(index + 1).find((id) => surviving.has(id)) ?? null;
+			const previous = displayedIds.slice(0, index).reverse().find((id) => surviving.has(id)) ?? null;
+			focusAfterSelectedRowRemoval(next, previous);
+		}, ...point };
+	}
+
+	function openFavoriteMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }): void {
+		const index = favoriteTracks.findIndex((track) => track.id === id);
+		const track = favoriteTracks[index];
+		if (loading || libraryUnavailable || !track) return;
+		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="favorite-more"]') ?? invoker : invoker;
+		const actions = playbackMenuActions([id]);
+		for (const direction of ['up', 'down'] as const) {
+			if (direction === 'up' ? index === 0 : index === favoriteTracks.length - 1) continue;
+			actions.push({ label: direction === 'up' ? 'Move up' : 'Move down', run: () => {
+				if (!availableInteractionIds([id]).length || !favoriteIds.has(id)) return;
+				void moveFavorite(id, direction, target);
+			} });
+		}
+		actions.push(
+			{ label: 'Unstar', run: () => {
+				if (availableInteractionIds([id]).length && favoriteIds.has(id)) unstarFromShelf(id);
+			} },
+			unavailablePlaylistAction,
+			{ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } }
+		);
+		trackMenu = { ...menuAt(target, `Actions for ${displayTitle(track)}`, actions), fallbackFocus: () => {
+			if (shelfHeading?.isConnected) shelfHeading.focus({ preventScroll: true });
+			else focusLibraryRecovery();
+		}, ...point };
+	}
+
+	function libraryRowClick(event: MouseEvent, id: string): void {
+		if (!event.ctrlKey && !event.metaKey && !event.shiftKey) return;
+		if (event.target instanceof Element && event.target.closest('input, .nt-library-copy, .nt-library-star, .nt-library-more')) return;
+		event.preventDefault();
+		event.stopPropagation();
+		selectInteractionRow(id, event.shiftKey);
+	}
+
+	function libraryListKey(event: KeyboardEvent): void {
+		if (event.target instanceof Element && event.target.closest('input:not([type="checkbox"]), textarea, select, [contenteditable="true"]')) return;
+		if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+			event.preventDefault();
+			event.stopPropagation();
+			selectDisplayedIds();
+		} else if (event.key === ' ' && selectedIds.length > 0 && event.target instanceof Element && (event.target.matches('.nt-library-row') || !event.target.closest('input, button, a'))) {
+			const id = event.target.closest('[data-testid="library-item"]')?.getAttribute('data-id');
+			if (!id) return;
+			event.preventDefault();
+			event.stopPropagation();
+			selectInteractionRow(id, event.shiftKey);
+		}
+	}
+
 	function purgeSelection(): void {
+		trackMenu = null;
+		endTrackDrag();
 		selectedIds = createSelection();
 		rangeAnchorId = null;
 		appendFeedback = null;
 	}
 
 	function refresh(): Promise<void> {
+		if (!refresher.state.loading || refreshOwner === null) refreshOwner = player.sourceInputOwner();
 		restoreFilterFocus =
 			typeof document !== 'undefined' &&
 			document.activeElement?.id === 'queue-filter-input';
@@ -1203,10 +1427,12 @@
 		const unsubscribeRestart = player.onBeforeRestart(supersedeShareSeek);
 		const unsubscribeNavigation = player.onBeforeNavigate((next) => retireQueueWork(next, true));
 		const unsubscribeFavorite = player.onQueuedFavorite(afterQueuedFavorite);
+		const unsubscribeInsert = player.onQueueInsert(insertQueuedIds);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
+			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
 				document.title = priorDocumentTitle;
@@ -1214,6 +1440,8 @@
 			// Pending route Play must not publish into the persistent session after unmount.
 			playEpoch += 1;
 			shareAlive = false;
+			libraryInputOwner = null;
+			unsubscribeInsert();
 			favoritesExportAlive = false;
 			releaseFavoritesDownload();
 			clearShareFeedback();
@@ -1309,10 +1537,12 @@
 				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
 				<ul>
 					{#each favoriteTracks as track, index (track.id)}
-						<li class="nt-favorite-item" data-testid="favorite-item" data-id={track.id}>
+						<li class="nt-favorite-item" data-testid="favorite-item" data-id={track.id}
+							use:contextMenu={(invoker, point) => openFavoriteMenu(track.id, invoker, point)}>
 							<button
 								type="button"
 								class="nt-favorite-row"
+								data-context-menu-longpress
 								onclick={() => selectTrack(track.id)}
 							>
 								{displayTitle(track)}
@@ -1347,6 +1577,10 @@
 								<span aria-hidden="true">★</span>
 								Unstar {displayTitle(track)}
 							</button>
+							<button type="button" class="nt-favorite-more" data-testid="favorite-more"
+								aria-label={`More actions for ${displayTitle(track)}`} aria-haspopup="menu"
+								onclick={(event) => openFavoriteMenu(track.id, event.currentTarget)}
+								><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 						</li>
 					{/each}
 				</ul>
@@ -1443,9 +1677,8 @@
 
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
-			<p><a href="/library/import">Import an NZB</a></p>
 		{:else if items.length === 0}
-			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
+			<p role="status">Your library is empty.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
 			<div class="nt-library-find">
@@ -1576,7 +1809,7 @@
 					<button type="button" onclick={showAllTracks}>Show all tracks</button>
 				</p>
 			{/if}
-			<div class="nt-selection-bar">
+			<div class="nt-selection-bar" data-testid="track-selection-toolbar">
 				<p data-testid="selection-count" role={loading ? undefined : 'status'}>{selectionCountLabel(selectedIds.length)}</p>
 				{#if visibleItems.length > 0}
 					<button class="nt-button" type="button" onclick={selectDisplayedIds}>
@@ -1586,6 +1819,8 @@
 				<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
 					Clear selection
 				</button>
+				<button class="nt-button" type="button" disabled={selectedIds.length === 0}
+					onclick={() => queueNextIds(selectedIds)}>Play next</button>
 				<button
 					class="nt-button"
 					type="button"
@@ -1621,7 +1856,8 @@
 					Clear search
 				</button>
 			{:else}
-			<div data-testid="library-list">
+			<!-- svelte-ignore a11y_no_static_element_interactions: list-scoped shortcuts preserve all native controls and do not add a tab stop. -->
+			<div data-testid="library-list" onkeydown={libraryListKey}>
 				{#if groupByArtist}
 					{#each artistGroups as group (group.key)}
 						<div class="nt-artist-group">
@@ -1676,11 +1912,26 @@
 
 </main>
 
+{#if trackMenu}
+	{#key trackMenu}
+		<ContextMenu request={trackMenu} onclose={() => (trackMenu = null)} />
+	{/key}
+{/if}
+
 {#snippet trackRows(tracks: LibraryItem[])}
-	<ul>
+	<ul class="nt-track-list" role="list">
 		{#each tracks as track (track.id)}
 			{@const queued = queuedIds.has(track.id)}
-			<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+			<!-- svelte-ignore a11y_no_noninteractive_tabindex: programmatic menu-return target only. -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions: modifier clicks extend the checkbox selection; keyboard equivalents are list-scoped above. -->
+			<li class="nt-library-item" data-testid="library-item" data-id={track.id}
+				tabindex="-1"
+				data-selected={selectedIds.includes(track.id) ? '' : undefined}
+				use:contextMenu={(invoker, point) => openTrackMenu(track.id, invoker, point)}
+				onclickcapture={(event) => libraryRowClick(event, track.id)}
+				draggable="true"
+				ondragstart={(event) => startTrackDrag(event, interactionIds(track.id))}
+			>
 				<input
 					class="nt-library-select"
 					type="checkbox"
@@ -1699,6 +1950,7 @@
 				<button
 					type="button"
 					class="nt-library-row"
+					data-context-menu-longpress
 					aria-label={queued
 						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 						: undefined}
@@ -1713,6 +1965,11 @@
 						<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
 					{/if}
 				</button>
+				<button type="button" class="nt-library-more"
+					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
+					aria-haspopup="menu"
+					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
+				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 				<button
 					type="button"
 					class="nt-library-copy"
@@ -1738,6 +1995,18 @@
 
 
 <style>
+	.nt-library-item[data-selected] { background: var(--nt-bg-raised); outline: 1px solid var(--nt-accent); }
+	.nt-track-list { padding: 0; list-style: none; }
+	.nt-library-more { flex: 0 0 2.75rem; min-height: 40px; padding: 0.25rem; font: inherit; }
+	@media (max-width: 480px) {
+		.nt-track-list .nt-library-copy { width: 2.75rem; padding: 0.25rem; white-space: normal; }
+	}
+	.nt-favorite-more { font: inherit; padding: var(--nt-space-2); }
+	[data-context-menu-longpress] { -webkit-touch-callout: none; user-select: none; }
+	@media (pointer: coarse) {
+		.nt-library-more, .nt-favorite-more, .nt-favorite-row, .nt-favorite-move, .nt-shelf-unstar { min-width: 48px; min-height: 48px; }
+	}
+
 	.nt-visually-hidden {
 		position: absolute;
 		width: 1px;

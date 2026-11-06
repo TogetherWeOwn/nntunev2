@@ -327,3 +327,494 @@ describe('explicit pending Next then metadata edit', () => {
 		expect(session.snapshot().queueFeedback).toBe('Track C moved to 1 of 3');
 	});
 });
+
+/** Private-source lifecycle units only: AudioFake does not prove browser teardown or decoding. */
+describe('queued Play source-input lifetime', () => {
+	const metadata = [A, B, C].map((track) => ({ ...track, streamUrl: '' }));
+
+	function sourceContext() {
+		const ctx = setup(metadata);
+		const owner = ctx.session.sourceInputOwner();
+		const accept = (tracks = [{ id: 'a', streamUrl: '/accepted' }], authoritative = false) =>
+			ctx.session.setQueue(ctx.session.snapshot().queue, { owner, tracks, authoritative });
+		return { ...ctx, owner, accept };
+	}
+
+	it('keeps accepted sources private and detached, without hydrating metadata or future ids', async () => {
+		const { session, accept, release, flush } = sourceContext();
+		const input = { id: 'a', streamUrl: '/accepted', catalogueOnly: 'not retained' };
+		expect(accept([input, { id: 'outside', streamUrl: '/outside' }])).toBe(true);
+		input.streamUrl = '/mutated';
+		expect(session.snapshot().queue.tracks.every((track) => track.streamUrl === '')).toBe(true);
+		expect(JSON.stringify(session.snapshot())).not.toContain('/accepted');
+		expect(JSON.stringify(session.snapshot())).not.toContain('catalogueOnly');
+		expect(flush).not.toHaveBeenCalled();
+		const playing = session.playQueuedTrack('a');
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/accepted');
+		expect(session.snapshot().queue.tracks.slice(1).every((track) => track.streamUrl === '')).toBe(true);
+		const { audio } = mount(session, { ...A, streamUrl: '/accepted' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		expect(session.snapshot().queueFeedback).toBe('Playing Track A.');
+		session.setQueue(createQueue([{ ...A, id: 'outside', streamUrl: '' }]));
+		await session.playQueuedTrack('outside');
+		expect(session.snapshot().queueFeedback).toBe('Selected Track A; no stream to play.');
+		session.destroy();
+	});
+
+	it.each(['accepted', 'blocked', 'no-stream'] as const)('preserves the exact %s outcome and single-attempt oracle', async (outcome) => {
+		const { session, accept, release, flush } = sourceContext();
+		const queue = session.snapshot().queue;
+		session.setQueue({ ...queue, tracks: queue.tracks.map((track) => track.id === 'a' ? { ...track, title: 'Dawn Chorus' } : track) });
+		accept([{ id: 'a', streamUrl: outcome === 'no-stream' ? '' : '/accepted' }]);
+		const playing = session.playQueuedTrack('a');
+		let audio: AudioFake | undefined;
+		if (outcome !== 'no-stream') {
+			audio = mount(session, { ...A, streamUrl: '/accepted' }).audio;
+			if (outcome === 'blocked') audio.play.mockRejectedValue(new Error('gesture rejected'));
+			await release();
+		}
+		await playing;
+		expect(ids(session)).toEqual(['a', 'b', 'c']);
+		expect(currentId(session)).toBe('a');
+		expect(session.snapshot().queueFeedback).toBe(outcome === 'accepted' ? 'Playing Dawn Chorus.'
+			: outcome === 'blocked' ? 'Selected Dawn Chorus, paused: playback was blocked.'
+				: 'Selected Dawn Chorus; no stream to play.');
+		expect(session.snapshot().queueFeedbackVersion).toBe(1);
+		if (audio) expect(audio.play).toHaveBeenCalledOnce();
+		else expect(flush).not.toHaveBeenCalled();
+		session.destroy();
+	});
+
+	it.each(['resolve', 'reject'] as const)('a superseded delayed %s preserves the winner and original attempt count', async (result) => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		const playing = session.playQueuedTrack('a');
+		const { audio } = mount(session, { ...A, streamUrl: '/accepted' });
+		let finish!: () => void;
+		audio.play.mockImplementation(() => new Promise<void>((resolve, reject) => {
+			finish = result === 'resolve' ? resolve : () => reject(new Error('late rejection'));
+		}));
+		await release();
+		expect(audio.play).toHaveBeenCalledOnce();
+		session.editQueue({ type: 'select', index: 1 });
+		const winning = session.snapshot();
+		finish();
+		await playing;
+		expect(currentId(session)).toBe('b');
+		expect(session.snapshot().queueFeedback).toBe('Selected Track B');
+		expect(session.snapshot().queueFeedbackVersion).toBe(winning.queueFeedbackVersion);
+		expect(session.snapshot().audio).toBeNull();
+		expect(audio.play).toHaveBeenCalledOnce();
+		session.destroy();
+	});
+
+	it.each(['refused', 'evicted'] as const)('accepted live evidence is independent of %s storage', async (mode) => {
+		const { session, release } = setup(metadata);
+		session.destroy();
+		const saved = new Map<string, string>();
+		const storage = {
+			getItem: vi.fn((key: string) => saved.get(key) ?? null),
+			setItem: vi.fn((key: string, value: string) => {
+				if (mode === 'refused') throw new Error('storage refused');
+				saved.set(key, value);
+			}),
+			removeItem: vi.fn((key: string) => { saved.delete(key); })
+		};
+		session.start(storage);
+		session.setQueue(createQueue(metadata), { owner: session.sourceInputOwner(), tracks: [{ id: 'a', streamUrl: '/accepted' }] });
+		saved.clear();
+		storage.getItem.mockClear();
+		expect(storage.setItem).not.toHaveBeenCalled();
+		const playing = session.playQueuedTrack('a');
+		// Source resolution itself never rereads the persisted catalogue.
+		expect(storage.getItem).not.toHaveBeenCalled();
+		const { audio } = mount(session, { ...A, streamUrl: '/accepted' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		expect(session.snapshot().queueFeedback).toBe('Playing Track A.');
+		expect([...saved.values()].join('')).not.toContain('/accepted');
+		session.destroy();
+	});
+
+	it.each(['empty', 'changed', 'removed'] as const)('an authoritative %s input replaces old fallback evidence', async (change) => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		accept(change === 'removed' ? [] : [{ id: 'a', streamUrl: change === 'empty' ? '' : '/new' }], true);
+		const playing = session.playQueuedTrack('a');
+		if (change === 'changed') {
+			expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/new');
+			const { audio } = mount(session, { ...A, streamUrl: '/new' });
+			await release();
+			await playing;
+			expect(audio.play).toHaveBeenCalledOnce();
+		} else {
+			await playing;
+			expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('');
+			expect(session.snapshot().queueFeedback).toBe('Selected Track A; no stream to play.');
+		}
+		session.destroy();
+	});
+
+	it('retains accepted evidence when no authoritative replacement commits', async () => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		// Models absence of a successful replacement, not an exercised HTTP failure.
+		session.setQueueLiveRegions(false);
+		session.setQueueLiveRegions(true);
+		session.setQueueFilter('Track');
+		session.toggleQueueSelection('b');
+		const playing = session.playQueuedTrack('a');
+		const { audio } = mount(session, { ...A, streamUrl: '/accepted' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		expect(session.snapshot().queueFeedback).toBe('Playing Track A.');
+		session.destroy();
+	});
+
+	it('keeps a lawful queued source and the same paused decoder across authoritative source omission', async () => {
+		const { session } = setup([A, B]);
+		const { audio } = mount(session, A);
+		audio.currentTime = 37;
+		const before = session.snapshot();
+		expect(session.setQueue(before.queue, { owner: session.sourceInputOwner(), tracks: [], authoritative: true })).toBe(true);
+		expect(session.snapshot()).toBe(before);
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/a');
+		expect(session.snapshot().audio).toBe(audio.element);
+		expect(audio.currentTime).toBe(37);
+		expectUntouched(audio);
+		session.destroy();
+	});
+
+	it('prefers the existing queued source over a different accepted fallback', async () => {
+		const { session, release } = setup([A, B]);
+		session.setQueue(session.snapshot().queue, { owner: session.sourceInputOwner(), tracks: [{ id: 'a', streamUrl: '/other' }] });
+		const { audio } = mount(session, A);
+		audio.currentTime = 23;
+		const playing = session.playQueuedTrack('a');
+		await release();
+		await playing;
+		expect(session.snapshot().audio).toBe(audio.element);
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/a');
+		expect(audio.currentTime).toBe(23);
+		expect(audio.play).toHaveBeenCalledOnce();
+		expect(audio.pause).not.toHaveBeenCalled();
+		session.destroy();
+	});
+
+	it('remove/re-add cannot resurrect the old incarnation or its pending Play', async () => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		const playing = session.playQueuedTrack('a');
+		session.editQueue({ type: 'remove', index: 0 });
+		session.setQueue(createQueue(metadata));
+		await release();
+		await playing;
+		await session.playQueuedTrack('a');
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('');
+		expect(session.snapshot().queueFeedback).toBe('Selected Track A; no stream to play.');
+		session.destroy();
+	});
+
+	it.each(['resetAtAuthBoundary', 'destroy'] as const)('%s rejects a stale producer and clears private evidence', async (boundary) => {
+		const { session, accept, owner, release } = sourceContext();
+		accept();
+		const playing = session.playQueuedTrack('a');
+		session[boundary]();
+		expect(session.setQueue(createQueue(metadata), { owner, tracks: [{ id: 'a', streamUrl: '/old-account' }] })).toBe(false);
+		await release();
+		await playing;
+		expect(session.snapshot().queue.tracks).toEqual([]);
+		expect(session.snapshot().queueFeedback).toBe('');
+		if (boundary === 'resetAtAuthBoundary') {
+			session.setQueue(createQueue(metadata));
+			await session.playQueuedTrack('a');
+			expect(session.snapshot().queueFeedback).toBe('Selected Track A; no stream to play.');
+		}
+		session.destroy();
+	});
+
+	it('commits membership and detached evidence together before notifying queue subscribers', async () => {
+		const { session, release } = setup([]);
+		let playing: Promise<void> | undefined;
+		let armed = true;
+		const stop = session.subscribe((snapshot) => {
+			if (armed && snapshot.queue.tracks.some((track) => track.id === 'a')) {
+				armed = false;
+				playing = session.playQueuedTrack('a');
+			}
+		});
+		// The subscriber supersedes the outer publication; it must not be reported committed.
+		expect(session.setQueue(createQueue(metadata), { owner: session.sourceInputOwner(), tracks: [{ id: 'a', streamUrl: '/atomic' }] })).toBe(false);
+		expect(playing).toBeDefined();
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/atomic');
+		const { audio } = mount(session, { ...A, streamUrl: '/atomic' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		stop();
+		session.destroy();
+	});
+
+	it.each(['feedback', 'queue', 'export', 'attachment'] as const)('auth retirement at the %s notification cannot continue old Play', async (seam) => {
+		const { session, accept, release, flush } = sourceContext();
+		accept();
+		let armed = false;
+		const stop = (seam === 'export' ? session.queueExport : session).subscribe(() => {
+			if (!armed) return;
+			const snapshot = session.snapshot();
+			if (seam === 'queue' && currentTrack(snapshot.queue)?.streamUrl !== '/accepted') return;
+			if (seam === 'attachment' && !snapshot.audio) return;
+			armed = false;
+			session.resetAtAuthBoundary();
+		});
+		armed = true;
+		const playing = session.playQueuedTrack('a');
+		const audio = new AudioFake('/accepted');
+		if (seam === 'attachment') session.attach(audio.element);
+		await release();
+		await playing;
+		expect(session.snapshot().queue.tracks).toEqual([]);
+		expect(session.snapshot().audio).toBeNull();
+		expect(session.snapshot().queueFeedback).toBe('');
+		expect(audio.play).not.toHaveBeenCalled();
+		if (seam !== 'attachment') expect(flush).not.toHaveBeenCalled();
+		stop();
+		session.destroy();
+	});
+
+	it('authoritative replacement after hydration retires a pending fallback-dependent attempt', async () => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		const playing = session.playQueuedTrack('a');
+		const { audio } = mount(session, { ...A, streamUrl: '/accepted' });
+		accept([{ id: 'a', streamUrl: '' }], true);
+		await release();
+		await playing;
+		expect(audio.play).not.toHaveBeenCalled();
+		expect(session.snapshot().queueFeedback).toBe('');
+		// The accepted queued source is not erased by catalogue omission.
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/accepted');
+		session.destroy();
+	});
+
+	it('auth retirement during source disconnect prevents stale hydration, attachment and playback', async () => {
+		const { session, release, flush } = setup([A, { ...B, streamUrl: '' }]);
+		session.setQueue(session.snapshot().queue, { owner: session.sourceInputOwner(), tracks: [{ id: 'b', streamUrl: '/fallback-b' }] });
+		const { audio } = mount(session, A);
+		const before = session.snapshot().transport;
+		let armed = false;
+		const stop = session.subscribe((snapshot) => {
+			if (!armed || snapshot.transport === before) return;
+			armed = false;
+			session.resetAtAuthBoundary();
+		});
+		armed = true;
+		const playing = session.playQueuedTrack('b');
+		await release();
+		await playing;
+		expect(session.snapshot().queue).toEqual(createQueue([]));
+		expect(session.snapshot().audio).toBeNull();
+		expect(session.snapshot().queueFeedback).toBe('');
+		expect(audio.play).not.toHaveBeenCalled();
+		expect(flush).not.toHaveBeenCalled();
+		stop();
+		session.destroy();
+	});
+
+	it('auth retirement at the completed transport attachment notification cannot reconnect old audio', async () => {
+		const { session, accept, release } = sourceContext();
+		accept();
+		const playing = session.playQueuedTrack('a');
+		const audio = new AudioFake('/accepted');
+		const before = session.snapshot().transport;
+		let armed = false;
+		const stop = session.subscribe((snapshot) => {
+			if (!armed || snapshot.audio !== audio.element || snapshot.transport === before) return;
+			armed = false;
+			session.resetAtAuthBoundary();
+		});
+		armed = true;
+		session.attach(audio.element);
+		await release();
+		await playing;
+		await session.play();
+		expect(session.snapshot().audio).toBeNull();
+		expect(session.snapshot().queue.tracks).toEqual([]);
+		expect(audio.play).not.toHaveBeenCalled();
+		stop();
+		session.destroy();
+	});
+
+	it('a feedback subscriber retiring the action prevents later route aftermath listeners', async () => {
+		const { session, accept } = sourceContext();
+		accept();
+		const listener = vi.fn();
+		session.onBeforeNavigate(listener);
+		let armed = false;
+		const stop = session.subscribe(() => {
+			if (!armed) return;
+			armed = false;
+			session.resetAtAuthBoundary();
+		});
+		armed = true;
+		await session.playQueuedTrack('a');
+		expect(listener).not.toHaveBeenCalled();
+		expect(session.snapshot().queue.tracks).toEqual([]);
+		stop();
+		session.destroy();
+	});
+
+	it('a retiring navigation listener prevents the next old-action listener', async () => {
+		const { session, accept } = sourceContext();
+		accept();
+		session.onBeforeNavigate(() => session.resetAtAuthBoundary());
+		const later = vi.fn();
+		session.onBeforeNavigate(later);
+		await session.playQueuedTrack('a');
+		expect(later).not.toHaveBeenCalled();
+		expect(session.snapshot().queueFeedback).toBe('');
+		session.destroy();
+	});
+
+	it('a newer authoritative source commit during export reset cannot be overwritten by ingress', async () => {
+		const { session, accept, release, owner } = sourceContext();
+		accept();
+		let armed = false;
+		const stop = session.queueExport.subscribe(() => {
+			if (!armed) return;
+			armed = false;
+			accept([{ id: 'a', streamUrl: '/newer' }], true);
+		});
+		armed = true;
+		expect(session.setQueue(createQueue([...metadata, { ...D, streamUrl: '' }]), {
+			owner, tracks: [{ id: 'a', streamUrl: '/obsolete' }, { id: 'd', streamUrl: '/d' }]
+		})).toBe(false);
+		expect(ids(session)).toEqual(['a', 'b', 'c']);
+		const playing = session.playQueuedTrack('a');
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/newer');
+		const { audio } = mount(session, { ...A, streamUrl: '/newer' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		stop();
+		session.destroy();
+	});
+
+	it.each(['remove', 'playNext'] as const)('explicit %s operands never become selection or alter a surviving decoder', (action) => {
+		const { session } = setup([A, B, C, D]);
+		const { audio } = mount(session, A);
+		audio.currentTime = 31;
+		session.toggleQueueSelection('b');
+		session.setQueueFilter('Track B');
+		const selection = session.snapshot().queueSelection;
+		const seen: string[][] = [];
+		const stop = session.subscribe((snapshot) => { seen.push([...snapshot.queueSelection.ids]); });
+		const operands = ['d', 'c', 'd', 'missing'];
+		expect(action === 'remove' ? session.removeQueuedIds(operands) : session.playNextQueuedIds(operands)).toBe(true);
+		expect(ids(session)).toEqual(action === 'remove' ? ['a', 'b'] : ['a', 'c', 'd', 'b']);
+		expect(session.snapshot().queueSelection).toBe(selection);
+		expect(seen.every((ids) => ids.length === 1 && ids[0] === 'b')).toBe(true);
+		expect(session.snapshot().queueFeedback).toBe(action === 'remove' ? '2 selected tracks removed from queue.' : 'Tracks placed next in the queue.');
+		expect(session.snapshot().queueFeedbackVersion).toBe(1);
+		expect(session.snapshot().audio).toBe(audio.element);
+		expect(audio.currentTime).toBe(31);
+		expectUntouched(audio);
+		stop();
+		session.destroy();
+	});
+
+	it.each(['remove', 'playNext'] as const)('explicit %s true no-ops keep selection, feedback and snapshot identity', (action) => {
+		const { session, flush } = setup([A, B, C]);
+		session.toggleQueueSelection('c');
+		session.setQueueFeedback('keep', true);
+		const before = session.snapshot();
+		expect(action === 'remove' ? session.removeQueuedIds(['missing']) : session.playNextQueuedIds(['a', 'missing'])).toBe(false);
+		expect(session.snapshot()).toBe(before);
+		expect(flush).not.toHaveBeenCalled();
+		session.destroy();
+	});
+
+	it.each(['auth', 'destroy', 'replacement'] as const)('explicit operands cannot overwrite a reentrant %s', (boundary) => {
+		for (const action of ['remove', 'playNext'] as const) {
+			const { session } = setup([A, B, C, D]);
+			session.toggleQueueSelection('b');
+			let armed = false;
+			const stop = session.queueExport.subscribe(() => {
+				if (!armed) return;
+				armed = false;
+				if (boundary === 'auth') session.resetAtAuthBoundary();
+				else if (boundary === 'destroy') session.destroy();
+				else session.setQueue(createQueue([D]));
+			});
+			armed = true;
+			expect(action === 'remove' ? session.removeQueuedIds(['c']) : session.playNextQueuedIds(['d'])).toBe(false);
+			expect(session.snapshot().queue).toEqual(createQueue(boundary === 'replacement' ? [D] : []));
+			expect(session.snapshot().queueFeedback).toBe('');
+			stop();
+			session.destroy();
+		}
+	});
+});
+
+describe('incoming bridge commit fences', () => {
+	it('an exact reorder no-op preserves the snapshot, selection and prior feedback', () => {
+		const { session, flush } = setup([A, B, C]);
+		session.toggleQueueSelection('c');
+		session.setQueueFeedback('keep', true);
+		const before = session.snapshot();
+		expect(session.reorderQueuedIds(['c'], null)).toBe(false);
+		expect(session.snapshot()).toBe(before);
+		expect(flush).not.toHaveBeenCalled();
+		session.destroy();
+	});
+
+	it('authoritative replacement during navigation retires an older paired insertion before membership publication', async () => {
+		const metadata = [{ ...A, streamUrl: '' }];
+		const { session, release } = setup(metadata);
+		const owner = session.sourceInputOwner();
+		session.setQueue(session.snapshot().queue, { owner, tracks: [{ id: 'a', streamUrl: '/accepted' }] });
+		const before = session.snapshot().queue;
+		const stop = session.onBeforeNavigate(() => {
+			session.setQueue(before, { owner, tracks: [{ id: 'a', streamUrl: '/newer' }], authoritative: true });
+		});
+		expect(session.insertQueuedTracks([{ ...D, streamUrl: '' }], null, {
+			owner, tracks: [{ id: 'a', streamUrl: '/obsolete' }, { id: 'd', streamUrl: '/d' }]
+		})).toBe(false);
+		expect(session.snapshot().queue).toBe(before);
+		expect(session.snapshot().queueFeedback).toBe('');
+		stop();
+		const playing = session.playQueuedTrack('a');
+		expect(currentTrack(session.snapshot().queue)?.streamUrl).toBe('/newer');
+		const { audio } = mount(session, { ...A, streamUrl: '/newer' });
+		await release();
+		await playing;
+		expect(audio.play).toHaveBeenCalledOnce();
+		expect(session.snapshot().queueFeedback).toBe('Playing Track A.');
+		session.destroy();
+	});
+
+	it('old audio cleanup cannot erase a new attachment created by its disconnect notification', () => {
+		const { session } = setup([A, B]);
+		const { detach } = mount(session, A);
+		let armed = false;
+		let winner: AudioFake | undefined;
+		const stop = session.subscribe((snapshot) => {
+			if (!armed || snapshot.transport?.status !== 'selected') return;
+			armed = false;
+			session.setQueue({ ...createQueue([A, B]), currentIndex: 1 });
+			winner = mount(session, B).audio;
+		});
+		armed = true;
+		detach();
+		expect(winner).toBeDefined();
+		expect(session.snapshot().audio).toBe(winner!.element);
+		expect(currentId(session)).toBe('b');
+		expect(session.snapshot().audio?.getAttribute('src')).toBe('/b');
+		stop();
+		session.destroy();
+	});
+});
