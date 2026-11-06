@@ -47,11 +47,14 @@ impl ApiPlanService {
             .with_body(Some(worker::js_sys::Uint8Array::from(frame).into()));
         let req = worker::Request::new_with_init("https://preparation.invalid/", &init)
             .map_err(|_| StoreError::InvalidInput)?;
-        let mut response = self
+        let response = self
             .fetcher
             .fetch_request(req)
             .await
             .map_err(|_| StoreError::Database)?;
+        // Fetcher returns an HTTP response with the SDK's `http` feature.
+        let mut response =
+            worker::Response::try_from(response).map_err(|_| StoreError::Inconsistent)?;
         if response.status_code() != 200
             || response
                 .headers()
