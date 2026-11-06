@@ -8,6 +8,11 @@ The question: can an immutable snapshot of the curated CC0 subset in R2,
 read through `SnapshotRepo` (`src/snapshot.rs`) behind the existing
 `MbRepo` trait, replace the PlanetScale `nntunev2-mb` cluster?
 
+That cluster was deleted on 2026-11-06 (it held only a test seed), so the
+`pg_trgm` baseline runs on a throwaway Postgres container inside the
+spike job. A no-go would mean recreating the cluster, which is new spend
+and an owner decision first.
+
 ## Pieces
 
 | Piece | Where |

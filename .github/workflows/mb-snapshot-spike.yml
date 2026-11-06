@@ -51,6 +51,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'mb-snapshot-spike'
     runs-on: ubuntu-latest
     timeout-minutes: 345
+    # Staging-scoped by name only (no rules, no deployment record). The
+    # Cloudflare secrets are still read only by the main-only stage steps.
+    environment:
+      name: staging
+      deployment: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,10 +154,12 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          MB_DUMP: ${{ steps.dump.outputs.dump }}
         run: |
           out="$RUNNER_TEMP/out"
           {
-            echo "## mb-snapshot-spike (${{ steps.dump.outputs.dump }})"
+            echo "## mb-snapshot-spike (${MB_DUMP})"
             for f in build.json snapshot-size.txt recall.md bench.json; do
               [ -f "$out/$f" ] && { echo "### $f"; echo '```'; cat "$out/$f"; echo '```'; }
             done
