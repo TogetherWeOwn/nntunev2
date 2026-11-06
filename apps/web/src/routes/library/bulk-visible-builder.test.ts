@@ -25,7 +25,8 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue', 'retireQueueWork',
+		'missingDisplayedTracks', 'queuedTrackFor', 'playableTrackFor', 'appendMissingTracks', 'replaceQueue', 'retireQueueWork',
+		'libraryInputCurrent', 'sourceProjections',
 		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
@@ -57,6 +58,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `const player = createPlayerFacade({ queue, queueFeedback: queueAnnouncement }); ${MIRROR_QUEUE}
+		let shareAlive = true, loading = false, libraryInputOwner = player.sourceInputOwner();
 ${compiled}
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,

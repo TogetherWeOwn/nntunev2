@@ -187,7 +187,9 @@ describe('library repeat hooks are declared in the library markup', () => {
 		const session = sources['../player/session.ts'];
 		expect(session).toContain("import { createTransport, type Transport, type TransportSnapshot } from './transport.js'");
 		expect(session).toContain('transport = createTransport({');
-		expect(session).toContain('transport?.connect(audio, selected)');
+		expect(session).toContain('const activeTransport = transport');
+		expect(session).toContain('activeTransport.connect(audio, selected)');
+		expect(session).toContain('if (!current() || transport !== activeTransport) return () => {}');
 		const transport = sources['../player/transport.ts'];
 		expect(transport).toContain("['ended', () => {");
 		expect(transport).toContain('if (!played || completed || !audio.ended || audio.error) return');

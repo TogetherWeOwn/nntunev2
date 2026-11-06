@@ -28,7 +28,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'retireQueueWork', 'queueFavorites', 'clearShareFeedback',
-		'resetRestartOnSourceChange', 'syncMiniPlayerHint'
+		'resetRestartOnSourceChange', 'syncMiniPlayerHint', 'libraryInputCurrent', 'sourceProjections'
 	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
@@ -53,6 +53,8 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `const player = createPlayerFacade({ queue, queueFeedback: queueAnnouncement }); ${MIRROR_QUEUE}
+		let shareAlive = true, loading = false, libraryUnavailable = false;
+		let libraryInputOwner = player.sourceInputOwner();
 ${compiled}
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},

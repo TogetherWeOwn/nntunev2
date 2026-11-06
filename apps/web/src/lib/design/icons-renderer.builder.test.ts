@@ -12,12 +12,22 @@ const sources = import.meta.glob('./{icons.ts,strings.ts,Icon.svelte,IconSvg.sve
 }) as Record<string, string>;
 
 function svg(body: string): string {
-	const markup = body.match(/<svg\b[\s\S]*?<\/svg>/)?.[0];
+	let markup = body.match(/<svg\b[\s\S]*?<\/svg>/)?.[0];
 	if (!markup) throw new Error('Missing SVG');
-	return markup.replace(/<!--[\s\S]*?-->/g, '');
+	while (markup.includes('<!--')) {
+		const next = markup.replace(/<!--[\s\S]*?-->/g, '');
+		if (next === markup) throw new Error('Unterminated SVG comment');
+		markup = next;
+	}
+	return markup;
 }
 
 describe('shared kit SVG renderer', () => {
+	it('removes comments formed by earlier replacements and rejects unterminated comments', () => {
+		expect(svg('<svg><!<!-- -->--hidden--><path /></svg>')).toBe('<svg><path /></svg>');
+		expect(() => svg('<svg><!<!-- -->--unterminated</svg>')).toThrow('Unterminated SVG comment');
+	});
+
 	it('retains every delivered stencil byte and manifest order', async () => {
 		const data = JSON.stringify(ICON_NAMES.map((name) => [name, ICON_PATHS[name]]));
 		const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));

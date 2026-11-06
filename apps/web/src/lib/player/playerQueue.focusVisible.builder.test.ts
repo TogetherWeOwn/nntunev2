@@ -21,6 +21,7 @@ const FUNCTIONS = [
 	'focusVisible',
 	'currentRowElement',
 	'focusRemoveFor',
+	'focusRowControl',
 	'focusEmptyTarget',
 	'focusFilterEmptyTarget',
 	'revealCurrent'
