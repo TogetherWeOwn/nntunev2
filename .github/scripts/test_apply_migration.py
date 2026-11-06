@@ -10,6 +10,93 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import apply_migration
+import apply_migration_runtime_cases as runtime_cases
+
+
+class MirrorPinTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = pathlib.Path(self.dir.name)
+        self.manifest = self.root / "manifest.toml"
+        self.original = runtime_cases.REAL_MANIFEST.read_text(encoding="utf-8")
+        self.manifest.write_text(self.original, encoding="utf-8")
+        for name, _sha in runtime_cases.MIRROR_FILES:
+            source = runtime_cases.REAL_MANIFEST.parent / name
+            (self.root / name).write_bytes(source.read_bytes())
+
+    def test_real_manifest_passes(self):
+        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_appended_app_entry_passes(self):
+        body = b"SELECT 1;\n"
+        name = "9999_app_pin_fixture.sql"
+        (self.root / name).write_bytes(body)
+        self.manifest.write_text(
+            self.original + f'\n[[migration]]\nfile = "{name}"\ntarget = "app"\n'
+            f'sha256 = "{hashlib.sha256(body).hexdigest()}"\n', encoding="utf-8")
+        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_entry_drift_refuses(self):
+        for name, sha in runtime_cases.MIRROR_FILES:
+            for field, before, after in (
+                    ("file", name, "9998_renamed_mirror.sql"),
+                    ("sha256", sha, "0" * 64),
+                    ("target", "mirror", "app")):
+                with self.subTest(file=name, field=field):
+                    blocks = self.original.split("[[migration]]")
+                    index = next(i for i, block in enumerate(blocks)
+                                 if f'file = "{name}"' in block)
+                    blocks[index] = blocks[index].replace(
+                        f'{field} = "{before}"', f'{field} = "{after}"', 1)
+                    self.manifest.write_text(
+                        "[[migration]]".join(blocks), encoding="utf-8")
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_rename_metadata_drift_refuses(self):
+        for name, sha in runtime_cases.MIRROR_FILES:
+            for field, metadata in (
+                    ("renamed_from",
+                     f'[{{ file = "9998_old_mirror.sql", sha256 = "{sha}" }}]'),
+                    ("source_rename_history",
+                     f'[{{ parent = "{"a" * 40}", commit = "{"b" * 40}", '
+                     f'old_path = "migrations/9998_old_mirror.sql", '
+                     f'new_path = "migrations/{name}", '
+                     f'old_sha256 = "{sha}", new_sha256 = "{sha}" }}]')):
+                with self.subTest(file=name, field=field):
+                    changed = self.original.replace(
+                        f'file = "{name}"\n',
+                        f'file = "{name}"\n{field} = {metadata}\n', 1)
+                    self.manifest.write_text(changed, encoding="utf-8")
+                    # Each addition is valid metadata, not a parser rejection.
+                    apply_migration.load_manifest(self.manifest)
+                    with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_order_drift_refuses(self):
+        blocks = self.original.split("[[migration]]")
+        indices = [i for i, block in enumerate(blocks) if 'target = "mirror"' in block]
+        for left, right in zip(indices, indices[1:]):
+            with self.subTest(left=left, right=right):
+                reordered = blocks.copy()
+                reordered[left], reordered[right] = reordered[right], reordered[left]
+                self.manifest.write_text(
+                    "[[migration]]".join(reordered), encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, "mirror manifest entries changed"):
+                    runtime_cases.assert_frozen_mirror(self.manifest)
+
+    def test_mirror_file_byte_drift_refuses(self):
+        for name, _sha in runtime_cases.MIRROR_FILES:
+            with self.subTest(file=name):
+                path = self.root / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n-- changed fixture bytes\n")
+                try:
+                    with self.assertRaisesRegex(AssertionError, f"{name} bytes changed"):
+                        runtime_cases.assert_frozen_mirror(self.manifest)
+                finally:
+                    path.write_bytes(original)
 
 
 class ComposeTests(unittest.TestCase):
