@@ -173,6 +173,22 @@ assert copy_decode(r'\303') is None
 print('copy_decode utf-8 checks passed')
 EOF
 
+# release_label catalogue-number canonicalization: CAT-001 and the COPY
+# octal-escaped spelling CAT\055001 ('-' is octal 055) decode to the same
+# catalogue number, so the source rows (distinct ids, same release and
+# label) must collapse to one curated edge, not two. The curated output
+# equals the single-row expected file.
+cp -R "$fixtures/mbdump" "$temp_dir/catno-escape"
+printf '82\t30\t70\tCAT\\055001\t2025-01-01 00:00:00+00\n' >> "$temp_dir/catno-escape/release_label"
+grep -q 'CAT\\055001' "$temp_dir/catno-escape/release_label"
+DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/catno-escape"
+diff -u "$expected/mbdump-release_label.tsv" "$temp_dir/catno-escape/curated/mbdump-release_label.tsv"
+[[ "$(grep -c 'CAT' "$temp_dir/catno-escape/curated/mbdump-release_label.tsv")" == "1" ]]
+if grep -Fq 'CAT\055001' "$temp_dir/catno-escape/curated/mbdump-release_label.tsv"; then
+  echo 'expected escaped catalogue number to be canonicalized' >&2
+  exit 1
+fi
+
 # A subsequent valid newer timestamp publishes successfully.
 DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 new_target="$(readlink "$temp_dir/mbdump/curated")"

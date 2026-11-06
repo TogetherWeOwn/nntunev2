@@ -387,6 +387,8 @@ def main() -> int:
             # project_alias). Deterministic, so it is usable in ORDER BY.
             db.create_function("copy_decode_or_raw", 1,
                                copy_decode_or_raw, deterministic=True)
+            db.create_function("copy_roundtrip", 1,
+                               copy_roundtrip, deterministic=True)
             try:
                 db.executescript("""
                     CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
@@ -1008,9 +1010,10 @@ def main() -> int:
                 label_count = insert_select(db, label_query, output_dir / "mbdump-label.tsv", updated_at)
                 # Catalogue numbers: NULL-label rows are skipped (a catalogue
                 # number with no label is not a label edge) and NULL numbers
-                # become ''.
+                # become ''. Canonicalize COPY spellings before DISTINCT so
+                # equivalent catalogue numbers produce one importable key.
                 release_label_query = """
-                    SELECT DISTINCT rel.gid,l.gid,COALESCE(rl.catalog_number,'')
+                    SELECT DISTINCT rel.gid,l.gid,copy_roundtrip(COALESCE(rl.catalog_number,''))
                     FROM release_label rl
                     JOIN release rel ON rel.id=rl.release
                     JOIN label l ON l.id=rl.label

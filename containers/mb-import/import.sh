@@ -237,6 +237,212 @@ refuse_all_poison_dump() {
   fi
 }
 
+check_duplicate_keys() {
+  local table="$1" tsv="$2"
+  # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
+  # track keys on the position tuple (release, medium, track), where
+  # column 1 legitimately repeats per track of a release. Keys are
+  # COPY-decoded and canonicalized the way the validator normalizes
+  # them (lowercase UUIDs, plain integers), so an octal/hex-escaped
+  # alias for an already-listed key cannot slip past as a distinct key
+  # for the same row. Lines whose key fields cannot validate
+  # (undecodable escapes, NUL, non-UTF-8, ill-shaped keys) are skipped
+  # here: the validator poisons them, and poison rows never reach the
+  # table, so they cannot collide with a loaded key.
+  if ! python3 - "$table" "$tsv" <<'EOF' | sort -T "$work" >"$work/mbids.sorted"; then
+import json, sys
+table, path = sys.argv[1], sys.argv[2]
+NAMED = {ord("b"): 8, ord("f"): 12, ord("n"): 10, ord("r"): 13,
+         ord("t"): 9, ord("v"): 11, ord("\\"): 92}
+HEX = b"0123456789abcdefABCDEF"
+def decode(field):
+    """COPY text decode mirroring mb-import-validate; None will poison."""
+    out = bytearray()
+    i, n = 0, len(field)
+    while i < n:
+        b = field[i]
+        if b != 92:
+            if b == 13:
+                return None
+            out.append(b)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            return None
+        c = field[i]
+        if c in NAMED:
+            out.append(NAMED[c])
+            i += 1
+        elif 48 <= c <= 55:
+            j = i
+            while j < n and j - i < 3 and 48 <= field[j] <= 55:
+                j += 1
+            if int(field[i:j], 8) > 255:
+                return None
+            out.append(int(field[i:j], 8))
+            i = j
+        elif c == 120:
+            j = i + 1
+            while j < n and j - i - 1 < 2 and field[j] in HEX:
+                j += 1
+            if j == i + 1:
+                return None
+            out.append(int(field[i + 1:j], 16))
+            i = j
+        else:
+            return None
+    if 0 in out:
+        return None
+    try:
+        return bytes(out).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+def uuid_key(token):
+    parts = token.split("-")
+    if [len(p) for p in parts] != [8, 4, 4, 4, 12]:
+        return None
+    if any(c not in "0123456789abcdefABCDEF" for p in parts for c in p):
+        return None
+    return token.lower()
+def position_key(token):
+    """Canonical medium/track position, or None when it cannot validate.
+
+    Mirrors FieldKind::Position (non-negative i16): the validator poisons
+    anything else, and poison rows never reach the table, so only loadable
+    positions participate in duplicate detection. Keep in step with the
+    schema if the position type ever widens.
+    """
+    digits = token[1:] if token[:1] in ("+", "-") else token
+    if not digits or any(c not in "0123456789" for c in digits):
+        return None
+    try:
+        n = int(token)
+    except ValueError:
+        return None
+    if n < 0 or n > 32767:
+        return None
+    return str(n)
+def isrc_key(decoded):
+    """Canonical ISRC key, or None when it cannot validate (poison).
+
+    Mirrors FieldKind::Isrc (uppercased 12-character CC+OOO+YYYYYYY form):
+    the validator poisons anything else, so only loadable codes take part
+    in duplicate detection.
+    """
+    code = decoded.upper()
+    if len(code) != 12:
+        return None
+    if not (code[:2].isalpha() and code[:2].isascii() and code[:2].isupper()):
+        return None
+    if not all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" for c in code[2:5]):
+        return None
+    if not code[5:].isdigit():
+        return None
+    return code
+def canonical_key(kind, decoded):
+    """Canonical duplicate-key part, or None when the value cannot load."""
+    if kind == "text":
+        # The validator passes text through byte-equal, so the decoded
+        # value is the stored key (link names on the relationship tables).
+        return decoded
+    if kind == "isrc":
+        return isrc_key(decoded)
+    if kind == "pos":
+        return position_key(decoded)
+    return uuid_key(decoded)
+# Duplicate-key columns per table, mirroring each table's conflict target.
+# Single-uuid tables key on column 1; the relationship/pair tables on
+# their full key tuple. Keep in step with the validator specs: only
+# loadable keys participate, poison rows never reach the table.
+KEYS = {
+    "artist": [(0, "uuid")],
+    "release_group": [(0, "uuid")],
+    "release": [(0, "uuid")],
+    "recording": [(0, "uuid")],
+    "url": [(0, "uuid")],
+    "track": [(0, "uuid"), (2, "pos"), (3, "pos")],
+    "artist_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_music_video": [(0, "uuid"), (1, "uuid")],
+    "recording_isrc": [(0, "uuid"), (1, "isrc")],
+    "work": [(0, "uuid")],
+    "label": [(0, "uuid")],
+    "artist_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "artist_release": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "artist_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "release_credit": [(0, "uuid"), (1, "pos")],
+    "artist_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "recording_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_group_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "work_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "label_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_label": [(0, "uuid"), (1, "uuid"), (2, "text")],
+}
+batch = []
+def flush():
+    if batch:
+        sys.stdout.write("".join(key + "\n" for key in batch))
+        batch.clear()
+spec = KEYS.get(table)
+if spec is None:
+    sys.stderr.write(f"duplicate-key pre-check: unknown table {table}\n")
+    sys.exit(1)
+width = max(index for index, _ in spec) + 1
+with open(path, "rb") as f:
+    # Stream line by line with bounded batches: multi-million-line dumps
+    # must never sit wholly in memory beside their decoded key list.
+    for raw in f:
+        # One trailing newline ends the line; it is not key content (awk
+        # reads the same way), while a missing one still yields the tail.
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        fields = raw.split(b"\t")
+        if len(fields) < width:
+            continue
+        parts = []
+        for index, kind in spec:
+            decoded = decode(fields[index])
+            if decoded is None:
+                break
+            value = canonical_key(kind, decoded)
+            if value is None:
+                break
+            parts.append(value)
+        if len(parts) != len(spec):
+            continue
+        if table == "recording_music_video":
+            # One undirected link is one key whichever side the dump
+            # lists first, mirroring the canonical ETL ordering.
+            parts.sort()
+        # JSON frames components and escapes embedded newlines: text keys
+        # may contain '/', tabs or LF without colliding or splitting records.
+        batch.append(json.dumps(parts, ensure_ascii=True, separators=(",", ":")))
+        if len(batch) >= 8192:
+            flush()
+flush()
+EOF
+    echo "import: duplicate-key pre-check failed for $table ($tsv)" >&2
+    exit 1
+  fi
+  uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
+  if [[ -s "$work/mbids.duplicates" ]]; then
+    echo "import: duplicate key(s) in $tsv (dump contradicts itself):" >&2
+    head -n 5 "$work/mbids.duplicates" >&2
+    exit 1
+  fi
+}
+
+# Admit every file before any cursor, row or DLQ mutation. A duplicate
+# in a late phase-2 table must not partially load the earlier base tables.
+# shellcheck disable=SC2086
+for table in $base_tables$phase2_present; do
+  check_duplicate_keys "$table" "$dump_dir/mbdump-$table.tsv"
+done
+
 # Intentional word-splitting of the table lists.
 # shellcheck disable=SC2086
 for table in $base_tables$phase2_present; do
@@ -478,199 +684,6 @@ for table in $base_tables$phase2_present; do
   fi
   dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
   psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
-  # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
-  # track keys on the position tuple (release, medium, track), where
-  # column 1 legitimately repeats per track of a release. Keys are
-  # COPY-decoded and canonicalized the way the validator normalizes
-  # them (lowercase UUIDs, plain integers), so an octal/hex-escaped
-  # alias for an already-listed key cannot slip past as a distinct key
-  # for the same row. Lines whose key fields cannot validate
-  # (undecodable escapes, NUL, non-UTF-8, ill-shaped keys) are skipped
-  # here: the validator poisons them, and poison rows never reach the
-  # table, so they cannot collide with a loaded key.
-  if ! python3 - "$table" "$tsv" <<'EOF' | sort -T "$work" >"$work/mbids.sorted"; then
-import sys
-table, path = sys.argv[1], sys.argv[2]
-NAMED = {ord("b"): 8, ord("f"): 12, ord("n"): 10, ord("r"): 13,
-         ord("t"): 9, ord("v"): 11, ord("\\"): 92}
-HEX = b"0123456789abcdefABCDEF"
-def decode(field):
-    """COPY text decode mirroring mb-import-validate; None will poison."""
-    out = bytearray()
-    i, n = 0, len(field)
-    while i < n:
-        b = field[i]
-        if b != 92:
-            if b == 13:
-                return None
-            out.append(b)
-            i += 1
-            continue
-        i += 1
-        if i >= n:
-            return None
-        c = field[i]
-        if c in NAMED:
-            out.append(NAMED[c])
-            i += 1
-        elif 48 <= c <= 55:
-            j = i
-            while j < n and j - i < 3 and 48 <= field[j] <= 55:
-                j += 1
-            if int(field[i:j], 8) > 255:
-                return None
-            out.append(int(field[i:j], 8))
-            i = j
-        elif c == 120:
-            j = i + 1
-            while j < n and j - i - 1 < 2 and field[j] in HEX:
-                j += 1
-            if j == i + 1:
-                return None
-            out.append(int(field[i + 1:j], 16))
-            i = j
-        else:
-            return None
-    if 0 in out:
-        return None
-    try:
-        return bytes(out).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-def uuid_key(token):
-    parts = token.split("-")
-    if [len(p) for p in parts] != [8, 4, 4, 4, 12]:
-        return None
-    if any(c not in "0123456789abcdefABCDEF" for p in parts for c in p):
-        return None
-    return token.lower()
-def position_key(token):
-    """Canonical medium/track position, or None when it cannot validate.
-
-    Mirrors FieldKind::Position (non-negative i16): the validator poisons
-    anything else, and poison rows never reach the table, so only loadable
-    positions participate in duplicate detection. Keep in step with the
-    schema if the position type ever widens.
-    """
-    digits = token[1:] if token[:1] in ("+", "-") else token
-    if not digits or any(c not in "0123456789" for c in digits):
-        return None
-    try:
-        n = int(token)
-    except ValueError:
-        return None
-    if n < 0 or n > 32767:
-        return None
-    return str(n)
-def isrc_key(decoded):
-    """Canonical ISRC key, or None when it cannot validate (poison).
-
-    Mirrors FieldKind::Isrc (uppercased 12-character CC+OOO+YYYYYYY form):
-    the validator poisons anything else, so only loadable codes take part
-    in duplicate detection.
-    """
-    code = decoded.upper()
-    if len(code) != 12:
-        return None
-    if not (code[:2].isalpha() and code[:2].isascii() and code[:2].isupper()):
-        return None
-    if not all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" for c in code[2:5]):
-        return None
-    if not code[5:].isdigit():
-        return None
-    return code
-def canonical_key(kind, decoded):
-    """Canonical duplicate-key part, or None when the value cannot load."""
-    if kind == "text":
-        # The validator passes text through byte-equal, so the decoded
-        # value is the stored key (link names on the relationship tables).
-        return decoded
-    if kind == "isrc":
-        return isrc_key(decoded)
-    if kind == "pos":
-        return position_key(decoded)
-    return uuid_key(decoded)
-# Duplicate-key columns per table, mirroring each table's conflict target.
-# Single-uuid tables key on column 1; the relationship/pair tables on
-# their full key tuple. Keep in step with the validator specs: only
-# loadable keys participate, poison rows never reach the table.
-KEYS = {
-    "artist": [(0, "uuid")],
-    "release_group": [(0, "uuid")],
-    "release": [(0, "uuid")],
-    "recording": [(0, "uuid")],
-    "url": [(0, "uuid")],
-    "track": [(0, "uuid"), (2, "pos"), (3, "pos")],
-    "artist_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "recording_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "recording_music_video": [(0, "uuid"), (1, "uuid")],
-    "recording_isrc": [(0, "uuid"), (1, "isrc")],
-    "work": [(0, "uuid")],
-    "label": [(0, "uuid")],
-    "artist_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "artist_release": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "artist_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "recording_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "recording_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
-    "release_credit": [(0, "uuid"), (1, "pos")],
-    "artist_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "release_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "recording_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "release_group_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "work_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "label_alias": [(0, "uuid"), (1, "text"), (2, "text")],
-    "release_label": [(0, "uuid"), (1, "uuid"), (2, "text")],
-}
-batch = []
-def flush():
-    if batch:
-        sys.stdout.write("".join(key + "\n" for key in batch))
-        batch.clear()
-spec = KEYS.get(table)
-if spec is None:
-    sys.stderr.write(f"duplicate-key pre-check: unknown table {table}\n")
-    sys.exit(1)
-width = max(index for index, _ in spec) + 1
-with open(path, "rb") as f:
-    # Stream line by line with bounded batches: multi-million-line dumps
-    # must never sit wholly in memory beside their decoded key list.
-    for raw in f:
-        # One trailing newline ends the line; it is not key content (awk
-        # reads the same way), while a missing one still yields the tail.
-        if raw.endswith(b"\n"):
-            raw = raw[:-1]
-        fields = raw.split(b"\t")
-        if len(fields) < width:
-            continue
-        parts = []
-        for index, kind in spec:
-            decoded = decode(fields[index])
-            if decoded is None:
-                break
-            value = canonical_key(kind, decoded)
-            if value is None:
-                break
-            parts.append(value)
-        if len(parts) != len(spec):
-            continue
-        if table == "recording_music_video":
-            # One undirected link is one key whichever side the dump
-            # lists first, mirroring the canonical ETL ordering.
-            parts.sort()
-        batch.append("/".join(parts))
-        if len(batch) >= 8192:
-            flush()
-flush()
-EOF
-    echo "import: duplicate-key pre-check failed for $table ($tsv)" >&2
-    exit 1
-  fi
-  uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
-  if [[ -s "$work/mbids.duplicates" ]]; then
-    echo "import: duplicate key(s) in $tsv (dump contradicts itself):" >&2
-    head -n 5 "$work/mbids.duplicates" >&2
-    exit 1
-  fi
   completed="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$completed" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0014_mb_import_resume_dlq missing?)" >&2
@@ -755,7 +768,7 @@ EOF
         dupes="$(awk -F'\t' '{ print tolower($1) "/" ($2+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
         ;;
       artist_alias|release_alias|recording_alias|release_group_alias|work_alias|label_alias)
-        dupes="$(awk -F'\t' '{ print tolower($1) "/" $2 "/" $3 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" length($2) ":" $2 length($3) ":" $3 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
         ;;
       recording_music_video)
         dupes="$(awk -F'\t' '{ a = tolower($1); b = tolower($2); print (a < b ? a "/" b : b "/" a) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"

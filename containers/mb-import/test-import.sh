@@ -412,8 +412,83 @@ if MB_IMPORT_CHUNK_LINES=10 bash "$SELF_DIR/import.sh" "$DUPE" >/dev/null 2>&1; 
 else
   echo "ok: dupe dump refused"
 fi
-check "dupe: cursor remains at zero" "0" "$(cursor artist "$DUPE/mbdump-artist.tsv")"
+check "dupe: no cursor created" "0" "$(db -c "SELECT count(*) FROM mb_import_cursor WHERE table_name='artist' AND dump_id='$(dump_id "$DUPE/mbdump-artist.tsv")';")"
 check "dupe: no rows loaded" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+
+echo "=== 5b. phase-2 duplicate / partial snapshots are refused with all state unchanged ==="
+# Full-state fingerprint: every mirror table (base + phase 2), the import
+# cursor, the DLQ and the replication state. Row content is hashed, so a
+# refused import that mutated, inserted or deleted anything (including a
+# cursor row for the refused dump's id) changes the fingerprint. The
+# duplicate scan must run before ALL database mutation and cursor inserts,
+# so a duplicate in a LATE phase-2 table must not leave earlier tables
+# loaded or cursors created.
+ALL_MIRROR_TABLES="mb_artist mb_release_group mb_release mb_recording mb_track mb_url mb_artist_url mb_recording_url mb_recording_music_video mb_recording_isrc mb_work mb_label mb_artist_recording mb_artist_release mb_artist_work mb_recording_work mb_recording_recording mb_release_credit mb_artist_alias mb_release_alias mb_recording_alias mb_release_group_alias mb_work_alias mb_label_alias mb_release_label mb_import_cursor mb_import_dlq mb_import_state"
+state_fingerprint() {
+  local t
+  for t in $ALL_MIRROR_TABLES; do
+    printf '%s=%s\n' "$t" "$(db -c "SELECT count(*) || ':' || coalesce(md5(string_agg(x::text, E'\\n' ORDER BY x::text)), '') FROM $t x;")"
+  done
+}
+# refuse_unchanged <label> <dump-dir> <stderr-pattern>
+refuse_unchanged() {
+  local label="$1" dir="$2" pattern="$3" before after rc=0 errf
+  errf="$(mktemp)"
+  before="$(state_fingerprint)"
+  DUMP_SEQ=500 MB_IMPORT_CHUNK_LINES=10 bash "$SELF_DIR/import.sh" "$dir" >/dev/null 2>"$errf" || rc=$?
+  after="$(state_fingerprint)"
+  if [[ "$rc" == "0" ]]; then
+    echo "FAIL: $label imported without error" >&2
+    fail=1
+  else
+    echo "ok: $label refused (exit $rc)"
+  fi
+  if grep -q -- "$pattern" "$errf"; then
+    echo "ok: $label refusal message matches '$pattern'"
+  else
+    echo "FAIL: $label refusal message missing '$pattern'" >&2
+    sed 's/^/  stderr: /' "$errf" >&2
+    fail=1
+  fi
+  rm -f "$errf"
+  check "$label: rows, cursors, DLQ and replication state unchanged (incl. phase-2 tables)" "$before" "$after"
+}
+# Phase-2 duplicate snapshots: the rest of the dump is the valid FIX
+# snapshot, so earlier tables would load fully before the duplicate table
+# is reached if the scan ran lazily.
+make_dupe_p2() { # dir table  (append an exact copy of the first row)
+  rm -rf "$1"
+  mkdir -p "$1"
+  cp "$FIX"/mbdump-*.tsv "$1/"
+  head -n 1 "$1/mbdump-$2.tsv" >>"$1/mbdump-$2.tsv"
+}
+make_dupe_p2 "$FIX-dupe-p2-last" release_label
+make_dupe_p2 "$FIX-dupe-p2-alias" artist_alias
+# Partial phase-2 snapshots: one phase-2 file missing, first / last in order.
+PARTIAL_FIRST="$FIX-partial-first"
+PARTIAL_LAST="$FIX-partial-last"
+for p in "$PARTIAL_FIRST" "$PARTIAL_LAST"; do
+  rm -rf "$p"
+  mkdir -p "$p"
+  cp "$FIX"/mbdump-*.tsv "$p/"
+done
+rm "$PARTIAL_FIRST/mbdump-work.tsv"
+rm "$PARTIAL_LAST/mbdump-release_label.tsv"
+
+for start in empty loaded; do
+  reset_db
+  if [[ "$start" == "loaded" ]]; then
+    bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
+  fi
+  refuse_unchanged "dupe phase-2 release_label [$start start]" "$FIX-dupe-p2-last" "duplicate key"
+  refuse_unchanged "dupe phase-2 artist_alias [$start start]" "$FIX-dupe-p2-alias" "duplicate key"
+  refuse_unchanged "partial snapshot missing work [$start start]" "$PARTIAL_FIRST" "phase-2 tables import as a group"
+  refuse_unchanged "partial snapshot missing release_label [$start start]" "$PARTIAL_LAST" "phase-2 tables import as a group"
+done
+# Base-only (pre-phase-2) duplicate refusal stays covered by section 5
+# above; assert it here with the same full-state fingerprint too.
+reset_db
+refuse_unchanged "dupe base-only artist" "$DUPE" "duplicate key"
 
 echo "=== 6. cursor ahead of dump is refused ==="
 reset_db
@@ -1182,7 +1257,7 @@ check "rel2: older dump leaves group aliases alone" "1" "$(db -c 'SELECT count(*
 check "rel2: older dump leaves work aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
 check "rel2: older dump leaves label aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old"
+rm -rf "$FIX" "$DUPE" "$FIX-dupe-p2-last" "$FIX-dupe-p2-alias" "$PARTIAL_FIRST" "$PARTIAL_LAST" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

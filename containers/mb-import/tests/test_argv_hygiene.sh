@@ -555,6 +555,63 @@ check_file_contains "import empty song-relation: skip reported" "$scenario_dir/s
 check_sql_at_least "import empty song-relation: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
 common_post_checks
 
+# Refused runs must not have issued any mutating SQL: no cursor creation,
+# no chunk transaction, no replication-state write, no truncate/delete.
+assert_no_mutation_sql() { # desc capture-dir
+  local needle
+  for needle in "INSERT INTO mb_import_cursor" "RETURNING lines_done" "UPDATE mb_import_state SET last_packet" "TRUNCATE" "DELETE FROM"; do
+    check_eq "$1: no '$needle' SQL" "0" "$(count_sql "$2" "$needle")"
+  done
+}
+refused_post_checks() { # scenario-dir
+  assert_no_sentinels_in_file "script output [$url_case]" "$1/stdout"
+  assert_no_sentinels_in_file "script output [$url_case]" "$1/stderr"
+  assert_no_leftover_secret_files "$1"
+}
+phase2_file_tables="work label artist_recording artist_release artist_work recording_work recording_recording release_credit artist_alias release_alias recording_alias release_group_alias work_alias label_alias release_label"
+
+echo "=== legacy base-only snapshot (no phase-2 files): still imports, no schema gate ==="
+prep_scenario "import-base-only-plain"
+for t in $phase2_file_tables; do rm -f "$scenario_dir/dump/mbdump-$t.tsv"; done
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import base-only: exit" "0" "$run_exit"
+check_file_contains "import base-only: completes" "$scenario_dir/stdout" "import: done"
+check_eq "import base-only: no phase-2 schema gate" "0" "$(count_sql "$capture_dir" "FROM information_schema.tables")"
+check_sql_at_least "import base-only: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 4
+check_sql_at_least "import base-only: chunk transaction ran per table" "$capture_dir" "RETURNING lines_done" 4
+check_eq "import base-only: no phase-2 cursor" "0" "$(count_sql "$capture_dir" "'work'")"
+common_post_checks
+
+echo "=== phase-2 snapshot with only 14/15 phase-2 tables in the database: refused before any mutation ==="
+prep_scenario "import-phase2-14-plain"
+run_import FAKE_PHASE2_TABLES_PRESENT=14 FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import 14/15 tables: exit" "1" "$run_exit"
+check_file_contains "import 14/15 tables: refusal reported" "$scenario_dir/stderr" "refusing phase-2 snapshot (14/15 phase-2 tables present"
+check_sql_at_least "import 14/15 tables: schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
+assert_no_mutation_sql "import 14/15 tables" "$capture_dir"
+refused_post_checks "$scenario_dir"
+
+# Duplicate-key serialization must be unambiguous: keys (name, locale) =
+# ('a/b', 'c') and ('a', 'b/c') are distinct rows of the same artist and
+# must not collide when the key parts are joined for the duplicate scan.
+echo "=== alias keys that differ only by slash placement are distinct: accepted ==="
+prep_scenario "import-alias-slash-plain"
+printf '00000000-0000-0000-0000-000000000001\ta/b\tc\t1 Alt, Band\ttrue\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000001\ta\tb/c\t1 Alt, Band\tfalse\t2024-05-06T00:00:00Z\n' >"$scenario_dir/dump/mbdump-artist_alias.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import alias slash keys: exit" "0" "$run_exit"
+check_file_not_contains "import alias slash keys: no duplicate reported" "$scenario_dir/stderr" "duplicate key"
+check_file_contains "import alias slash keys: completes" "$scenario_dir/stdout" "import: done"
+common_post_checks
+
+echo "=== true duplicate alias key is refused before any mutation ==="
+prep_scenario "import-alias-dupe-plain"
+printf '00000000-0000-0000-0000-000000000001\ta/b\tc\t1 Alt, Band\ttrue\t2024-05-06T00:00:00Z\n00000000-0000-0000-0000-000000000001\ta/b\tc\tOther, Band\tfalse\t2024-05-06T00:00:00Z\n' >"$scenario_dir/dump/mbdump-artist_alias.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import alias dupe: exit" "1" "$run_exit"
+check_file_contains "import alias dupe: duplicate reported" "$scenario_dir/stderr" "duplicate key"
+assert_no_mutation_sql "import alias dupe" "$capture_dir"
+refused_post_checks "$scenario_dir"
+
 echo
 echo "test-argv-hygiene: $passes passed, $failures failed"
 if (( failures != 0 )); then
