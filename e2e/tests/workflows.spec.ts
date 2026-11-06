@@ -2791,7 +2791,89 @@ function suiteXml(testcases: string): string {
   );
 }
 
+const CATALOGUE_FRESH_CASES = [
+  'catalogue aliases return the same empty library for each fresh account',
+  'catalogue collections expose empty-array contracts for a fresh account',
+  'Library renders the real API empty state for a fresh account',
+] as const;
+const M1_NAMED_CASES = [
+  ['ingest-play-meter.spec.ts', 'ingested track carries recording_mbids'],
+  ['ingest-play-meter.spec.ts', 'NZB fixture ingests and appears in the library'],
+  ['ingest-play-meter.spec.ts', 'ingested library persists across reload without re-import'],
+  ['ingest-play-meter.spec.ts', 'streaming answers byte Ranges with 206 + Content-Range'],
+  ['ingest-play-meter.spec.ts', 'usage meter increases after streaming and shows plan metadata'],
+  ['ingest-play-meter.spec.ts', 'ingested audio actually plays in the browser'],
+  ['ingest-play-meter.spec.ts', 'player UI seek moves the active audio position and playback continues'],
+  ['ingest-play-meter.spec.ts', 'Media Session metadata reflects the playing ingested track'],
+  ['player-queue-order.spec.ts', 'NZB fixture ingests and appears in the library'],
+  ['player-queue-order.spec.ts', 'player queue advances in library-selection order'],
+  ['ingest-play-meter.spec.ts', 'over-limit staging account is refused with a plan-limit status'],
+] as const;
+const CONFIGURED_JOURNEY_ENV = {
+  REQUIRE_QA_AUTH_TOKEN: 'true',
+  QA_AUTH_TOKEN: 'dummy-qa-token',
+  MAX_ALLOWED_SKIPS: '11',
+};
+const cataloguePassingCases = () => CATALOGUE_FRESH_CASES.map((name) =>
+  PASSING('catalogue.spec.ts', name),
+).join('');
+const parkedM1Cases = () => M1_NAMED_CASES.map(([file, name]) =>
+  PASSING(file, `journey › ${name}`).replace('/>', '><skipped/></testcase>'),
+).join('');
+
 test.describe('journey evidence gate (all-skipped must fail)', () => {
+  test('configured full journey reports catalogue passes and named M1 skips honestly', () => {
+    const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 14 | 3 | 11 | 0 |');
+    for (const name of CATALOGUE_FRESH_CASES) {
+      expect(result.summary).toContain(`catalogue.spec.ts: ${name} | passed |`);
+    }
+    for (const [file, name] of M1_NAMED_CASES) {
+      expect(result.summary).toContain(`${file}: ${name} | skipped |`);
+    }
+    expect(result.summary).toContain('do not establish populated-library isolation');
+    expect(result.summary).toContain('skips, never playback or metering proof');
+  });
+
+  test('configured full journey rejects a missing catalogue case', () => {
+    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]), '');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
+    expect(result.output).toContain('required named journey evidence is incomplete');
+  });
+
+  test('configured full journey rejects a skipped catalogue case', () => {
+    const cases = cataloguePassingCases().replace('/>', '><skipped/></testcase>');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), {
+      ...CONFIGURED_JOURNEY_ENV, MAX_ALLOWED_SKIPS: '12',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | skipped |`);
+    expect(result.output).toContain('outside the allow-list');
+  });
+
+  test('configured full journey rejects duplicate catalogue evidence', () => {
+    const cases = cataloguePassingCases() + PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]);
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | duplicate |`);
+  });
+
+  test('another spec cannot satisfy required catalogue evidence', () => {
+    const cases = cataloguePassingCases().replace('classname="catalogue.spec.ts"', 'classname="other.spec.ts"');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
+  });
+
+  test('omitting a parked M1 leg is not complete named evidence', () => {
+    const cases = parkedM1Cases().replace(/<testcase\b[^>]*>[\s\S]*?<\/testcase>/, '');
+    const result = runGateScript(suiteXml(cataloguePassingCases() + cases), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain('ingested track carries recording_mbids | missing |');
+  });
   test('journey job carries an always-run evidence gate on configured runs', () => {
     const section = jobSection(stagingWorkflow, 'e2e');
     const gateAt = section.indexOf('Enforce journey evidence gate');
@@ -3042,7 +3124,10 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
       REQUIRE_QA_AUTH_TOKEN: 'true',
       QA_AUTH_TOKEN: 'dummy-qa-token',
     });
-    expect(provided.status).toBe(0);
+    // A token alone is not complete full-journey evidence: the catalogue and
+    // M1 cases must also be present, not silently omitted by a test filter.
+    expect(provided.status).not.toBe(0);
+    expect(provided.output).toContain('required named journey evidence is incomplete');
     const notRequired = runGateScript(xml, { REQUIRE_QA_AUTH_TOKEN: 'false', QA_AUTH_TOKEN: '' });
     expect(notRequired.status).toBe(0);
   });
