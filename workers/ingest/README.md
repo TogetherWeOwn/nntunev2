@@ -108,12 +108,13 @@ routes are unchanged.
   model before the transport trait would be called, so the modeled fetch
   cannot be aimed at another port as a scan primitive). Address ranges
   come from the shared guard crate (`v4_is_forbidden`/`ip_is_forbidden`
-  single-owned in `crates/nntune-ssrf-guard/src/lib.rs:21-53`),
+  single-owned in the pinned `velmora-ssrf-guard` dependency and re-exported
+  by `crates/nntune-ssrf-guard/src/lib.rs:6`),
   imported here (`src/indexer_fetch.rs:38`) and by the `workers/api`
   vault guard (`workers/api/src/vault.rs:28`) — one list, no copies
   to keep in sync.
 - Every answer from the supplied `DnsResolver` is checked for forbidden
-  ranges (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`, imported at `src/indexer_fetch.rs:38`; one forbidden
+  ranges (`ip_is_forbidden` re-exported by `crates/nntune-ssrf-guard/src/lib.rs:6`, imported at `src/indexer_fetch.rs:38`; one forbidden
   record poisons the whole answer, `src/indexer_fetch.rs:335-338`):
   loopback / link-local (incl. the cloud metadata endpoint) /
   private / unique-local / CGNAT / multicast / broadcast / documentation
@@ -225,7 +226,7 @@ upload routes are unchanged.
   (`allowlist_from_env`, `src/nzb_fetch.rs:121-128`); it
   does not load environment configuration.
 - Every answer from the supplied resolver is checked for forbidden ranges
-  (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`,
+  (`ip_is_forbidden` re-exported by `crates/nntune-ssrf-guard/src/lib.rs:6`,
   imported at `src/nzb_fetch.rs:77`; one forbidden record poisons
   the whole answer, `src/nzb_fetch.rs:345-349`;
   the vault guard and both ingest fetchers share that one predicate —

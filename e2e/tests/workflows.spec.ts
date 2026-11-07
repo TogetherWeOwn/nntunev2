@@ -14,12 +14,13 @@ const stagingWorkflow = readFileSync(new URL('e2e-staging.yml', workflowDir), 'u
 function runShell(script: string, env: Record<string, string> = {}, cwd?: string) {
   const scratch = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'workflow-test-'));
   const outputFile = join(scratch, 'github-output');
+  const summaryFile = join(scratch, 'github-step-summary');
   try {
     const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], {
       encoding: 'utf8',
       timeout: 5_000,
       ...(cwd ? { cwd } : {}),
-      env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, ...env },
+      env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile, ...env },
     });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
@@ -1942,11 +1943,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(section).toMatch(
       /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
     );
-    // Shared mirror binding, generated from HYPERDRIVE_ID_MB and pinned to
-    // the api MB_DB manifest inventory id.
+    // Optional shared mirror binding: generated only when HYPERDRIVE_ID_MB is
+    // non-empty, and then pinned to the api MB_DB manifest inventory id.
     expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
+    expect(section).toContain('mirror: absent (no-enrichment mode)');
     expect(section).toMatch(
-      /^[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
+      /^[ \t]*if \[ -n "\$\{HYPERDRIVE_ID_MB:-\}" \]; then\n(?:[ \t]*#[^\n]*\n)*[ \t]*cat >> wrangler\.toml <<EOF\n\n[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
     );
   };
 

@@ -82,13 +82,17 @@ python3 scripts/cargo_cache.py run -- build -p nntune-backup
 ```
 
 What it does (`crates/nntune-backup/src/drill.rs`): seals a random
-fixture (ephemeral KEK → random per-file media key → rclone-crypt
-ciphertext via `nntune-core` → v2 envelope row), writes the bundle,
-wipes every drill-owned copy (KEK, media key, derived — the caller's
+fixture (ephemeral KEK → random per-file media key → `velmora.media.v1`
+Random-mode ciphertext via `nntune-core::media` under the NNTune profile
+→ v2 envelope row plus the media record: format, key mode, 48-byte
+header and plaintext size), writes the bundle,
+wipes every drill-owned copy (KEK, media key, payload key — the caller's
 fixture buffer is kept only for the final hash comparison), restores
 the bundle into an isolated directory,
 re-verifies it there, opens the envelope with the recovered keyring
-only, decrypts the full plaintext through two ranged reads
+only, verifies the record header's key commitment, fully verifies
+the object (wire header, every chunk, final flag, no trailing bytes),
+decrypts the full plaintext through two ranged reads
 (article-window shaped), and compares SHA-256. Exit 0 prints the
 evidence JSON; exit 2 means the drill failed; exit 1 is a usage/IO
 error. Temp dirs are removed afterwards — the drill proves restore
