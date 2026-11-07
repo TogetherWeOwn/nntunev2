@@ -34,7 +34,7 @@ on:
         description: "Seed of the held-out golden set that decides gate 1"
         required: false
         type: string
-        default: "20261107"
+        default: "20261108"
   pull_request:
     types: [labeled]
 
@@ -112,7 +112,7 @@ jobs:
       - name: Lookup samples and golden set
         env:
           GOLDEN_COUNT: ${{ inputs.golden_count || '1000' }}
-          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261107' }}
+          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261108' }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/out"; mkdir -p "$out/mbids"

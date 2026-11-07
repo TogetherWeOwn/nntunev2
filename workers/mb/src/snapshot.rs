@@ -157,7 +157,8 @@ fn fold_map() -> &'static HashMap<char, &'static str> {
     })
 }
 
-/// Lowercase, then fold Latin diacritics to ASCII (`snapshot_fold.tsv`).
+/// Lowercase, then fold diacritics to their base letters in every script
+/// (`snapshot_fold.tsv`).
 pub fn fold(text: &str) -> String {
     let map = fold_map();
     let mut out = String::with_capacity(text.len());
@@ -936,6 +937,11 @@ mod tests {
             words("Sigur Rós – Ágætis byrjun!"),
             vec!["sigur", "ros", "agaetis", "byrjun"]
         );
+        // Marks outside Latin fold too: scene posts strip them, and a
+        // candidate needs a shared word key.
+        assert_eq!(fold("Λαϊκά ζεϊμπέκικα"), "λαικα ζειμπεκικα");
+        assert_eq!(fold("また逢う日まで"), "また逢う日まて");
+        assert_eq!(fold("Ёлка"), "елка");
         assert_eq!(title_key("  The   Wall "), "t:the wall");
         assert_eq!(
             search_keys("the dark side of the moon"),
