@@ -148,12 +148,34 @@ without reminting or renewing authority. Each replay removes only the old harnes
 completion marker and waits for a fresh callback marker before checking DB/DLQ
 state; pre-restart replay completes first so it cannot satisfy the restart check.
 The converter must retain the selected `resourcePersistencePath`. Temporary
-persistence is removed only after runtime disposal. This control is written,
-not locally executed; require its exact-head Actions result. It is a graceful
-runtime restart, not abrupt crash,
-ambiguous-commit or pending-Queue replay injection. Process crashes, ambiguous DB
-commits, large-file/deadline limits, deployed lifecycle/drain, actual staging/restore
-and remaining foundation review are still unqualified.
+persistence is removed only after runtime disposal. At head `659aafbd`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42383178630/job/128434934300)
+passes all ten runtime subtests (eleven Node passes including the enclosing test),
+including graceful runtime replacement. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42383178630/job/128434934560)
+explicitly reports 255 required cases passed. Graceful restart is not abrupt crash,
+ambiguous-commit or pending-Queue replay injection.
+
+A private-response control opens the real stored plan through the actual service
+binding before injecting status, redirect, content-type, digest, short-body,
+stream-error, oversized-body and stalled-body responses into read-only recovery.
+The oversize stream exceeds the existing 1-MiB bound and stays open: refusal must
+precede the existing ten-second operation deadline, not depend on EOF or digest
+rejection. A one-byte stalled stream must instead reach that deadline. Every
+control requires exactly one successful real plan call, a redacted refusal,
+unchanged full DB fingerprints and exact R2 version/digest, no new objects or
+Queue marker, and successful genuine recovery afterward. These controls are
+written, not locally executed; require their exact-head Actions result. The
+digest fault changes only the original-digest field, preserving canonical format
+and geometry; this exercises end-to-end integrity, not one particular duplicate
+digest check. Truncation does not isolate length from digest/decoder refusal.
+The synthetic redirect is returned after the actual service fetch, so it proves
+status refusal, not platform redirect-following prevention. No production bound
+or timeout is shortened to make the tests pass. This covers
+bounded private response handling, not maximum supported media-file sizing,
+network cancellation, a process crash or ambiguous commit. Process crashes,
+ambiguous DB commits, pending-Queue replay, large-media limits, deployed
+lifecycle/drain, actual staging/restore and remaining foundation review stay open.
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
 activation, posting or R2 deletion authority.

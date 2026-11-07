@@ -46,6 +46,63 @@ export default class QualificationComposite extends WorkerEntrypoint {
       return new Response(response.body, { status: response.status, headers });
     }
     if (path === '/prepare' || path === '/prepare-flac') return worker.qualification_prepare(request, this.env);
+    if (path.startsWith('/recover-plan-fault/')) {
+      // Open real stored custody first, then fault only the private response.
+      // No fault can write a plan, substitute dispatch authority or reach HTTP.
+      const fault = path.slice('/recover-plan-fault/'.length);
+      const plans = this.env.API_PREPARATION_PLANS;
+      let calls = 0;
+      const patched = new Proxy(plans, {
+        get(target, property) {
+          if (property === 'fetch') return async (...args) => {
+            const response = await target.fetch(...args);
+            if (response.status !== 200) throw new Error('qualification plan unavailable');
+            calls += 1;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const headers = new Headers(response.headers);
+            headers.delete('content-length');
+            let status = response.status;
+            let body = bytes;
+            if (fault === 'status') status = 503;
+            else if (fault === 'redirect') {
+              status = 302;
+              headers.set('location', 'https://qualification.invalid/not-a-plan');
+            } else if (fault === 'type') headers.set('content-type', 'text/plain');
+            else if (fault === 'digest') {
+              // Keep canonical encoding/geometry valid: three length-prefixed
+              // atoms, a one-byte version and u64 predecessor precede the
+              // original digest. That digest has no decoder shape restriction.
+              if (new TextDecoder().decode(bytes.slice(0, 8)) !== 'NNPREP02') throw new Error('qualification plan format');
+              let offset = 8;
+              for (let i = 0; i < 3; i++) {
+                const length = bytes[offset];
+                if (!length || length > 64) throw new Error('qualification plan atom');
+                offset += 1 + length;
+              }
+              offset += 1 + 8;
+              if (offset + 32 > bytes.length) throw new Error('qualification plan bounds');
+              body = bytes.slice();
+              body[offset] ^= 1;
+            } else if (fault === 'short') body = bytes.slice(0, -1);
+            else if (fault === 'oversized' || fault === 'stalled' || fault === 'stream-error') {
+              body = new ReadableStream({ start(controller) {
+                // Leave the oversize stream open: a prompt refusal must come
+                // from the 1-MiB cap, not EOF/digest rejection or the deadline.
+                controller.enqueue(fault === 'oversized' ? new Uint8Array(1_048_577) : bytes.slice(0, 1));
+                if (fault === 'stream-error') controller.error(new Error('qualification stream detail'));
+              } });
+            } else throw new Error('unknown qualification plan fault');
+            return new Response(body, { status, headers });
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
+        },
+      });
+      const response = await worker.qualification_recover(request, { ...this.env, API_PREPARATION_PLANS: patched });
+      const headers = new Headers(response.headers);
+      headers.set('x-qualification-plan-calls', String(calls));
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (path === '/recover') return worker.qualification_recover(request, this.env);
     if (path === '/abi') {
       return Response.json(Object.getOwnPropertyNames(generated.default.prototype).sort());

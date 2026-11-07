@@ -486,4 +486,43 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       [objectKey, 'qualification-composite-delivered'].sort(), 'restart must not add plaintext plans');
     assert.equal(await bucket.get('qualification-refused'), null, 'restart replay must not reach DLQ');
   });
+
+  await t.test('private plan response bounds and deadline refuse without changing recovered custody', { timeout: 40_000 }, async () => {
+    const composite = await mf.getWorker('composite-flac');
+    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+    const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+      SELECT id,object_id,object_version,plaintext_bytes,plaintext_sha256
+      FROM ingest_file_dispatches WHERE job_id = 'qualification-flac-job') q;`));
+    const pointer = JSON.stringify({ version: 1, id: row.id });
+    const recover = route => composite.fetch(`https://qualification.invalid${route}`, {
+      method: 'POST', body: pointer,
+    });
+    const persisted = state();
+    const keys = (await bucket.list()).objects.map(o => o.key).sort();
+    assert.equal((await recover('/recover')).status, 204, 'real private plan must open before fault injection');
+    for (const fault of ['status', 'redirect', 'type', 'digest', 'short', 'stream-error', 'oversized', 'stalled']) {
+      const start = performance.now();
+      const response = await recover(`/recover-plan-fault/${fault}`);
+      const elapsed = performance.now() - start;
+      assert.equal(response.status, 503, `private plan response must fail closed: ${fault}`);
+      assert.equal(response.headers.get('x-qualification-plan-calls'), '1', 'real plan open must precede each response fault');
+      assert.equal(await response.text(), 'qualification unavailable', 'private body/error detail must not escape');
+      if (fault === 'oversized') {
+        assert.ok(elapsed < 8_000, 'open oversize stream must refuse before the 10-second deadline');
+      } else if (fault === 'stalled') {
+        assert.ok(elapsed >= 9_000 && elapsed < 25_000, 'stalled read must reach the existing bounded deadline');
+      }
+      assert.equal(state(), persisted, `failed recovery must not renew, rotate or remint: ${fault}`);
+      const object = await bucket.get(`prepared-tagged/${row.object_id}`);
+      assert.ok(object, `failed recovery retains R2: ${fault}`);
+      assert.equal(object.version, row.object_version);
+      const bytes = Buffer.from(await object.arrayBuffer());
+      assert.equal(bytes.length, row.plaintext_bytes);
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), row.plaintext_sha256);
+      assert.deepEqual((await bucket.list()).objects.map(o => o.key).sort(), keys);
+      assert.equal(await bucket.get('qualification-refused'), null, 'direct refusal must not create Queue work');
+      assert.equal((await recover('/recover')).status, 204, 'fault must not poison later genuine recovery');
+      assert.equal(state(), persisted);
+    }
+  });
 });
