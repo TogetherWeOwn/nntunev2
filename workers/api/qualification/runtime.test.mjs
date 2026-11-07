@@ -85,6 +85,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
           PROBE: { name: 'api', entrypoint: 'QualificationProbe' },
           CONFIGURED_PROBE: { name: 'api-configured', entrypoint: 'QualificationProbe' },
           CONFIGURED_PLANS: { name: 'api-configured', entrypoint: 'IngestPreparationPlans' },
+          CONFIGURED_PUBLIC: { name: 'api-configured' },
         },
         r2Buckets: { INGEST_SCRATCH: 'qualification-scratch' },
         queueProducers: { INGEST_QUEUE: 'qualification-queue' },
@@ -171,11 +172,15 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
   });
 
   await t.test('configured public router stays isolated while named lifecycle failure is reachable', async () => {
-    const publicConfigured = await mf.getWorker('api-configured');
     const configuredProbe = () => entry.fetch('https://qualification.invalid/configured-probe').then(r => r.json());
+    // Construct Origin inside workerd: the Node binding proxy's own host guard
+    // otherwise rejects it before the application sees any matrix request.
+    const publicConfigured = (route, init) => entry.fetch(`https://qualification.invalid/configured-public${route}`, init);
     const health = async () => {
-      const response = await publicConfigured.fetch('https://qualification.invalid/healthz');
+      const response = await publicConfigured('/healthz');
       assert.equal(response.status, 200, 'missing config must not short-circuit the route matrix');
+      assert.equal(response.headers.get('access-control-allow-origin'), configured.RP_ORIGIN,
+        'the real Rust router must receive the configured application Origin');
       assert.deepEqual(await response.json(), { ok: true, build_sha: 'unknown' });
     };
     await health();
@@ -184,16 +189,18 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     const before = (await configuredProbe()).bridgeCalls;
     for (const route of ['/', '/ingest_preparation_plan', '/preparation', '/v1/ingest/preparation']) {
       for (const method of ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
-        const response = await publicConfigured.fetch(`https://qualification.invalid${route}?entrypoint=IngestPreparationPlans`, {
+        const response = await publicConfigured(`${route}?entrypoint=IngestPreparationPlans`, {
           method,
           headers: {
-            origin: configured.RP_ORIGIN,
             'x-preparation-mode': 'preparation_only',
             'content-type': 'application/octet-stream',
           },
           ...(['GET', 'HEAD'].includes(method) ? {} : { body: new Uint8Array([255]) }),
         });
         assert.equal(response.status, 404, `configured public ${method} ${route} must stay unserved`);
+        assert.equal(response.headers.get('access-control-allow-origin'), configured.RP_ORIGIN);
+        assert.match(response.headers.get('x-trace-id') ?? '', /^[a-f0-9]{32}$/,
+          'every matrix response must come from the Rust router, not a harness/proxy 404');
         await response.arrayBuffer();
         assert.equal((await configuredProbe()).bridgeCalls, before);
       }

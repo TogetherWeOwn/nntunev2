@@ -48,9 +48,16 @@ isolate, preserving the real generated constructor and platform lifecycle. It
 is an explicit fault injection, not production logic or successful DB evidence.
 The original public matrix runs without API configuration. A separate isolate
 now gets ephemeral harness-generated session/KEK inputs and must serve the real
-Rust health route before and after its matrix. That matrix requires exact 404s
-for four unserved paths across seven methods, despite a mode header, query hint
-and binary body. Per-request bridge counts stay unchanged. A named-binding
+Rust health route before and after its matrix. The harness constructs the
+application Origin inside workerd and forwards through a service binding to the
+unchanged public/default facade. This avoids the Node binding proxy's separate
+nonlocal-Origin rejection; no runtime host guard is disabled. Health must also
+return the exact configured CORS origin, proving the Rust router received that
+header. That matrix requires exact 404s for four unserved paths across seven
+methods, despite the Origin, mode header, query hint and binary body.
+Every matrix response must carry the exact CORS origin and a valid Rust trace
+ID, not merely a 404 from a harness/proxy. Per-request bridge counts stay
+unchanged. A named-binding
 positive control must reach the injected failure and increment the same count,
 while its response remains redacted and no-store. No generated/platform class
 is replaced. These configured routes do not need a DB; successful DB-backed
