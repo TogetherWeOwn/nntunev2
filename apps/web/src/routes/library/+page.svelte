@@ -1586,24 +1586,17 @@
 									<span> — {displayArtist(track)}</span>
 								{/if}
 							</button>
-							<button
-								type="button"
-								class="nt-favorite-move"
-								aria-label={moveFavoriteLabel(track, 'up')}
-								disabled={index === 0}
-								onclick={(event) => void moveFavorite(track.id, 'up', event)}
-							>
-								Up
-							</button>
-							<button
-								type="button"
-								class="nt-favorite-move"
-								aria-label={moveFavoriteLabel(track, 'down')}
-								disabled={index === favoriteTracks.length - 1}
-								onclick={(event) => void moveFavorite(track.id, 'down', event)}
-							>
-								Down
-							</button>
+							{#each (['up', 'down'] as const) as direction (direction)}
+								<button
+									type="button"
+									class="nt-favorite-move"
+									aria-label={moveFavoriteLabel(track, direction)}
+									disabled={index === (direction === 'up' ? 0 : favoriteTracks.length - 1)}
+									onclick={(event) => void moveFavorite(track.id, direction, event)}
+								>
+									{direction === 'up' ? 'Up' : 'Down'}
+								</button>
+							{/each}
 							<button
 								type="button"
 								class="nt-shelf-unstar"
