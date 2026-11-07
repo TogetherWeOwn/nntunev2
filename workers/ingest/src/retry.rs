@@ -37,7 +37,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch::{payload_retry_delay_ms, PAYLOAD_RETRY_ATTEMPTS};
-use crate::jobs::{can_retry, is_terminal, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS};
+use crate::jobs::{
+    can_retry, is_parked, is_terminal, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS,
+};
 use crate::newznab::redact_api_key;
 use crate::queue::QueueMsg;
 
@@ -222,7 +224,7 @@ pub struct DlqEntry {
 /// the platform retry operation. Persist the returned checkpoint to
 /// `INGEST_STATE` atomically with the job id before returning Retry.
 pub fn record_redelivery(cp: &mut JobCheckpoint) -> Option<u32> {
-    if !can_retry(cp.attempt) || is_terminal(cp.state) {
+    if !can_retry(cp.attempt) || is_terminal(cp.state) || is_parked(cp.state) {
         return None;
     }
     let spent_attempt = cp.attempt;
@@ -267,7 +269,7 @@ pub fn decide_checkpoint(
     if msg.job_id != cp.job_id {
         return Err(RetryError::CheckpointJobMismatch);
     }
-    if cp.state == JobState::Done {
+    if matches!(cp.state, JobState::Done | JobState::Rejected) || is_parked(cp.state) {
         return Ok(Disposition::Ack);
     }
     if cp.state == JobState::Failed {
@@ -302,6 +304,15 @@ pub fn decide_checkpoint(
                     delay_secs.max(hint.clamp(1, MAX_HINTED_RETRY_DELAY_SECS))
                 }),
             },
+            None if cp.source == JobSource::AdminUpload && cp.attempt == MAX_ATTEMPTS => {
+                // The retained original remains retryable from review. Never
+                // put provider/parser detail (or the message body) in this
+                // admin outcome; only a fixed reason crosses the boundary.
+                cp.state = JobState::NeedsReview;
+                cp.failure_code = Some(e.code.to_string());
+                cp.failure_reason = Some("retry budget exhausted".to_string());
+                Disposition::Ack
+            }
             None => {
                 fail_checkpoint(cp, e.code, &e.detail);
                 Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
@@ -426,7 +437,7 @@ where
     }
     let mut report = BatchReport::default();
     for (msg, checkpoint) in msgs.iter().zip(checkpoints) {
-        let result = if is_terminal(checkpoint.state) {
+        let result = if is_terminal(checkpoint.state) || is_parked(checkpoint.state) {
             Ok(())
         } else {
             run(msg)
@@ -499,6 +510,95 @@ mod tests {
             ERR_PROBE_FAILED,
             "430 on every segment",
         ))
+    }
+
+    #[test]
+    fn admin_transient_failures_back_off_then_park_without_quarantine() {
+        let mut msg = msg_at(1);
+        msg.source = JobSource::AdminUpload;
+        let mut cp = checkpoint_for(&msg);
+        cp.state = JobState::Probing;
+        for delay_secs in [5, 15, 30, 60] {
+            assert_eq!(
+                decide_checkpoint(
+                    &msg,
+                    &mut cp,
+                    Err(JobError::transient(
+                        ERR_PROBE_FAILED,
+                        "opaque upstream detail"
+                    )),
+                ),
+                Ok(Disposition::Retry { delay_secs }),
+            );
+            assert_eq!(cp.state, JobState::Probing);
+        }
+        assert_eq!(cp.attempt, MAX_ATTEMPTS);
+        assert_eq!(
+            decide_checkpoint(
+                &msg,
+                &mut cp,
+                Err(JobError::transient(
+                    ERR_PROBE_FAILED,
+                    "opaque upstream detail"
+                )),
+            ),
+            Ok(Disposition::Ack),
+        );
+        assert_eq!(cp.state, JobState::NeedsReview);
+        assert_eq!(cp.failure_code.as_deref(), Some(ERR_PROBE_FAILED));
+        assert_eq!(cp.failure_reason.as_deref(), Some("retry budget exhausted"));
+        assert!(!serde_json::to_string(&cp)
+            .unwrap()
+            .contains("opaque upstream detail"));
+        // A late delivery cannot turn the review outcome into a failure.
+        let before = cp.clone();
+        assert_eq!(
+            decide_checkpoint(&msg, &mut cp, boom()),
+            Ok(Disposition::Ack)
+        );
+        assert_eq!(cp, before);
+    }
+
+    #[test]
+    fn parked_and_rejected_deliveries_skip_work_and_preserve_checkpoint() {
+        for state in [
+            JobState::NeedsReview,
+            JobState::NeedsArchiveRead,
+            JobState::Rejected,
+        ] {
+            let mut msg = msg_at(1);
+            msg.source = JobSource::AdminUpload;
+            let mut cp = checkpoint_for(&msg);
+            cp.state = state;
+            let before = cp.clone();
+            assert_eq!(record_redelivery(&mut cp), None);
+            let report = drive_batch(&[msg], std::slice::from_mut(&mut cp), |_| {
+                panic!("parked/terminal delivery must not execute a step")
+            })
+            .unwrap();
+            assert_eq!(report.acked, 1);
+            assert_eq!(report.retried, 0);
+            assert!(report.quarantined.is_empty());
+            assert_eq!(cp, before);
+        }
+    }
+
+    #[test]
+    fn admin_permanent_failures_still_fail_instead_of_spending_retry_budget() {
+        let mut msg = msg_at(1);
+        msg.source = JobSource::AdminUpload;
+        let mut cp = checkpoint_for(&msg);
+        cp.state = JobState::Parsing;
+        assert!(matches!(
+            decide_checkpoint(
+                &msg,
+                &mut cp,
+                Err(JobError::permanent(ERR_PARSE_FAILED, "malformed")),
+            ),
+            Ok(Disposition::Quarantine(_)),
+        ));
+        assert_eq!(cp.state, JobState::Failed);
+        assert_eq!(cp.attempt, 1);
     }
 
     #[test]

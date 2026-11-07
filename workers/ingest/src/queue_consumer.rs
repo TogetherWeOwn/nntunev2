@@ -175,6 +175,9 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     }
 
     match msg.source {
+        // Fail closed until the authenticated, durable admin-original
+        // dispatch is wired; legacy payload handles cannot select it.
+        JobSource::AdminUpload => return Err("admin dispatch unavailable"),
         JobSource::IndexerSearch => {
             let query = msg.query.as_deref().ok_or("missing search query")?;
             let indexer_ref = msg.indexer_ref.as_deref().ok_or("missing indexer handle")?;
@@ -1150,6 +1153,10 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<Stri
 /// unmatched, never guessed at).
 async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobError> {
     match msg.source {
+        JobSource::AdminUpload => Err(JobError::permanent(
+            ERR_MATCH_FAILED,
+            "admin dispatch unavailable",
+        )),
         JobSource::IndexerSearch => Ok(crate::matching::validate_match_query(
             msg.query.as_deref().unwrap_or(""),
         )),
@@ -1888,7 +1895,8 @@ fn plan_settlement(
     step: Result<(), JobError>,
     step_ran: bool,
 ) -> (bool, Settlement) {
-    let persist = step_ran || !matches!(cp.state, JobState::Done | JobState::Failed);
+    let persist =
+        step_ran || !(crate::jobs::is_terminal(cp.state) || crate::jobs::is_parked(cp.state));
     match decide_checkpoint(msg, cp, step) {
         Ok(Disposition::Ack) => (persist, Settlement::Ack),
         // A continuation's whole point is the persisted progress, so it
@@ -1968,7 +1976,7 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
 
     // Terminal checkpoints skip the step: `Done` acks, `Failed`
     // re-quarantines the recorded failure (both without a write).
-    let step_ran = !matches!(cp.state, JobState::Done | JobState::Failed);
+    let step_ran = !(crate::jobs::is_terminal(cp.state) || crate::jobs::is_parked(cp.state));
     let step = if step_ran {
         run_step(env, msg, &mut cp).await
     } else {
@@ -2167,6 +2175,31 @@ mod tests {
             build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         incomplete_upload.payload_ref = None;
         assert!(validate_queue_msg(&incomplete_upload).is_err());
+    }
+
+    #[test]
+    fn legacy_upload_identity_cannot_select_admin_execution() {
+        let mut msg = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
+        msg.source = JobSource::AdminUpload;
+        assert_eq!(validate_queue_msg(&msg), Err("admin dispatch unavailable"));
+    }
+
+    #[test]
+    fn parked_and_rejected_replays_ack_without_checkpoint_writes() {
+        let msg = search_message();
+        for state in [
+            JobState::NeedsReview,
+            JobState::NeedsArchiveRead,
+            JobState::Rejected,
+        ] {
+            let mut cp = crate::checkpoint::initial(&msg);
+            cp.state = state;
+            let before = cp.clone();
+            let (persist, settlement) = plan_settlement(&msg, &mut cp, Ok(()), false);
+            assert!(!persist);
+            assert_eq!(settlement, Settlement::Ack);
+            assert_eq!(cp, before);
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! User-scoped ingest job state machine: idempotent and resumable.
+//! Ingest job state machine: idempotent and resumable.
 //!
-//! A job moves `Queued -> Searching|Parsing -> Probing -> Verifying
+//! Legacy jobs move `Queued -> Searching|Parsing -> Probing -> Verifying
 //! -> (Repairing -> Verifying)? -> Matching -> Transcoding -> Writing -> Done`.
-//! Any step may move to `Failed` with a reason; `Done`/`Failed` are
-//! terminal. Workers persist the [`JobCheckpoint`] after every step, so a
+//! Admin uploads instead move `Queued -> Parsing -> Matching -> Probing
+//! -> Writing -> Done` (published), with explicit review/archive parking.
+//! `Done`/`Failed`/`Rejected` are terminal. Workers persist the [`JobCheckpoint`] after every step, so a
 //! crashed or evicted run resumes from the last checkpoint instead of
 //! restarting (Queue redelivery + Workflow step replay both converge here).
 
@@ -32,6 +33,9 @@ pub enum JobState {
     Matching,
     Transcoding,
     Writing,
+    NeedsReview,
+    NeedsArchiveRead,
+    Rejected,
     Done,
     Failed,
 }
@@ -42,6 +46,9 @@ pub enum JobState {
 pub enum JobSource {
     IndexerSearch,
     NzbUpload,
+    /// Content-derived admin identity; never admitted through the legacy
+    /// self-asserted user upload or indexer-search routes.
+    AdminUpload,
 }
 
 /// Durable resume point written after every completed step.
@@ -108,10 +115,26 @@ pub struct JobCheckpoint {
 
 /// Advance one step on success. `repair_needed` is only read in `Verifying`.
 pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobState {
+    if source == JobSource::AdminUpload {
+        return match state {
+            JobState::Queued => JobState::Parsing,
+            JobState::Parsing => JobState::Matching,
+            JobState::Matching => JobState::Probing,
+            JobState::Probing => JobState::Writing,
+            JobState::Writing => JobState::Done,
+            // These stages require the retired user-artifact pipeline.
+            // A stale/corrupt admin checkpoint must not dispatch them.
+            JobState::Searching
+            | JobState::Verifying
+            | JobState::Repairing
+            | JobState::Transcoding => JobState::NeedsReview,
+            _ => state,
+        };
+    }
     match state {
         JobState::Queued => match source {
             JobSource::IndexerSearch => JobState::Searching,
-            JobSource::NzbUpload => JobState::Parsing,
+            JobSource::NzbUpload | JobSource::AdminUpload => JobState::Parsing,
         },
         JobState::Searching => JobState::Parsing,
         JobState::Parsing => JobState::Probing,
@@ -127,8 +150,11 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
         JobState::Matching => JobState::Transcoding,
         JobState::Transcoding => JobState::Writing,
         JobState::Writing => JobState::Done,
-        JobState::Done => JobState::Done,
-        JobState::Failed => JobState::Failed,
+        JobState::NeedsReview
+        | JobState::NeedsArchiveRead
+        | JobState::Rejected
+        | JobState::Done
+        | JobState::Failed => state,
     }
 }
 
@@ -143,7 +169,7 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
 /// alone (it belongs to Queue redelivery, not to in-job loops).
 pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobState {
     match cp.state {
-        JobState::Verifying if repair_needed => {
+        JobState::Verifying if repair_needed && cp.source != JobSource::AdminUpload => {
             if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
                 cp.failure_code = Some("repair_budget_exhausted".to_string());
                 cp.failure_reason = Some("repair budget exhausted".to_string());
@@ -160,17 +186,47 @@ pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobSta
     cp.state
 }
 
+/// Park a parsed admin archive before matching or spending provider reads.
+/// The original and identity remain available for an explicit later resume.
+pub fn park_archive(cp: &mut JobCheckpoint) -> bool {
+    if cp.source != JobSource::AdminUpload || cp.state != JobState::Parsing {
+        return false;
+    }
+    cp.state = JobState::NeedsArchiveRead;
+    true
+}
+
+/// Resume only after the archive reader is available. Re-enter parse using
+/// the retained original; queue replay alone never invokes this transition.
+pub fn resume_archive(cp: &mut JobCheckpoint) -> bool {
+    if cp.source != JobSource::AdminUpload || cp.state != JobState::NeedsArchiveRead {
+        return false;
+    }
+    cp.state = JobState::Parsing;
+    true
+}
+
 /// Move to `Failed`, unless already terminal (terminal states stick).
 pub fn fail(state: JobState) -> JobState {
-    match state {
-        JobState::Done | JobState::Failed => state,
-        _ => JobState::Failed,
+    if is_terminal(state) {
+        state
+    } else {
+        JobState::Failed
     }
 }
 
-/// Terminal states need no further work and free the user's job slot.
+/// Terminal states need no further work and free the job slot.
 pub fn is_terminal(state: JobState) -> bool {
-    matches!(state, JobState::Done | JobState::Failed)
+    matches!(
+        state,
+        JobState::Done | JobState::Failed | JobState::Rejected
+    )
+}
+
+/// Parked jobs retain their original but await an explicit admin action or
+/// archive capability, not another automatic queue delivery.
+pub fn is_parked(state: JobState) -> bool {
+    matches!(state, JobState::NeedsReview | JobState::NeedsArchiveRead)
 }
 
 /// True when another attempt is allowed (`attempt` is 1-based).
@@ -349,6 +405,96 @@ mod tests {
             transcode_inputs: Vec::new(),
             transcode_next: 0,
         }
+    }
+
+    #[test]
+    fn admin_matches_before_probe_and_publishes_without_artifact_stages() {
+        let mut cp = checkpoint_at(JobState::Queued);
+        cp.source = JobSource::AdminUpload;
+        for expected in [
+            JobState::Parsing,
+            JobState::Matching,
+            JobState::Probing,
+            JobState::Writing,
+            JobState::Done,
+            JobState::Done,
+        ] {
+            assert_eq!(advance_checkpoint(&mut cp, false), expected);
+            assert_eq!(cp.attempt, 1);
+            assert_eq!(cp.repair_rounds, 0);
+        }
+        assert!(is_terminal(cp.state));
+    }
+
+    #[test]
+    fn admin_never_dispatches_legacy_stages_even_with_repair_requested() {
+        for state in [
+            JobState::Searching,
+            JobState::Verifying,
+            JobState::Repairing,
+            JobState::Transcoding,
+        ] {
+            let mut cp = checkpoint_at(state);
+            cp.source = JobSource::AdminUpload;
+            assert_eq!(advance_checkpoint(&mut cp, true), JobState::NeedsReview);
+            assert_eq!(cp.repair_rounds, 0);
+        }
+    }
+
+    #[test]
+    fn archive_parks_and_resumes_the_retained_job_without_reupload() {
+        let mut cp = checkpoint_at(JobState::Parsing);
+        cp.source = JobSource::AdminUpload;
+        let original = cp.clone();
+        assert!(park_archive(&mut cp));
+        assert!(is_parked(cp.state));
+        assert!(!is_terminal(cp.state));
+        // A persisted/reloaded checkpoint and an ordinary queue replay
+        // must leave the job parked, not probe an unread archive.
+        let mut cp: JobCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(
+            advance_checkpoint(&mut cp, false),
+            JobState::NeedsArchiveRead
+        );
+        assert!(resume_archive(&mut cp));
+        assert_eq!(cp, original);
+        // The reader can now parse the same original, then match first.
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Matching);
+    }
+
+    #[test]
+    fn archive_actions_refuse_other_sources_and_non_archive_states() {
+        let mut legacy = checkpoint_at(JobState::Parsing);
+        let before = legacy.clone();
+        assert!(!park_archive(&mut legacy));
+        assert!(!resume_archive(&mut legacy));
+        assert_eq!(legacy, before);
+        for state in [JobState::Matching, JobState::Done, JobState::Rejected] {
+            let mut cp = checkpoint_at(state);
+            cp.source = JobSource::AdminUpload;
+            let before = cp.clone();
+            assert!(!park_archive(&mut cp));
+            assert!(!resume_archive(&mut cp));
+            assert_eq!(cp, before);
+        }
+    }
+
+    #[test]
+    fn review_archive_and_rejected_states_do_not_advance_on_replay() {
+        for source in [JobSource::NzbUpload, JobSource::AdminUpload] {
+            for (state, wire) in [
+                (JobState::NeedsReview, "needs_review"),
+                (JobState::NeedsArchiveRead, "needs_archive_read"),
+                (JobState::Rejected, "rejected"),
+            ] {
+                assert_eq!(advance(state, source, false), state);
+                assert_eq!(advance(state, source, true), state);
+                assert_eq!(serde_json::to_value(state).unwrap(), wire);
+            }
+        }
+        assert!(is_terminal(JobState::Rejected));
+        assert_eq!(fail(JobState::Rejected), JobState::Rejected);
     }
 
     #[test]

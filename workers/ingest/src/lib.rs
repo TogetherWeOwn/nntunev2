@@ -590,7 +590,7 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
 fn meter_entry_stage(source: JobSource) -> &'static str {
     match source {
         JobSource::IndexerSearch => "search",
-        JobSource::NzbUpload => "parse",
+        JobSource::NzbUpload | JobSource::AdminUpload => "parse",
     }
 }
 
