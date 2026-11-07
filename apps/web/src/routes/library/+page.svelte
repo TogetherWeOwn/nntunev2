@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { clipboardWriter } from '#lib/clipboard.js';
 	import { createTrackListExport } from '#lib/player/trackListExport.js';
 	import { onMount, tick, untrack } from 'svelte';
 	import { usePlayerSession } from '#lib/player/context.js';
@@ -685,18 +686,6 @@
 		restartSupersededSources.clear();
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
-	}
-
-	type ClipboardWriter = { writeText: (text: string) => Promise<void> };
-
-	/** Match demo copy: feature-detect inside a try (even the getter may throw). */
-	function clipboardWriter(): ClipboardWriter | undefined {
-		try {
-			const candidate = navigator.clipboard;
-			return typeof candidate?.writeText === 'function' ? candidate : undefined;
-		} catch {
-			return undefined;
-		}
 	}
 
 	function shortTitle(title: string): string {

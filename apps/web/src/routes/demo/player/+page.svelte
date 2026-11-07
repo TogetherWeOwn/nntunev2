@@ -13,7 +13,8 @@
 		type SoundPreference
 	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
-	import { deriveTrackTime } from '#lib/format.js';
+	import { deriveTrackTime, formatRemainingMs as formatSleepRemainingMs } from '#lib/format.js';
+	import { clipboardWriter } from '#lib/clipboard.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
@@ -336,14 +337,7 @@
 		}
 		const url = `${window.location.origin}/demo/player?${query}`;
 		const revision = sourceRevision;
-		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
-		let clipboard: ClipboardWriter | undefined;
-		try {
-			const candidate = (navigator as Navigator & { clipboard?: ClipboardWriter }).clipboard;
-			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
-		} catch {
-			clipboard = undefined;
-		}
+		const clipboard = clipboardWriter();
 		if (!clipboard) {
 			shareCopyStatus = '';
 			shareCopyFallbackUrl = url;
@@ -398,18 +392,6 @@
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
 	let clockOffset = 0;
-
-	/** Bounded m:ss/h:mm:ss, ceiling fractional seconds, never negative. */
-	function formatSleepRemainingMs(remainingMs: number): string {
-		const totalSeconds = Math.max(0, Math.ceil(Math.max(0, remainingMs) / 1000));
-		const hours = Math.floor(totalSeconds / 3600);
-		const minutes = Math.floor((totalSeconds % 3600) / 60);
-		const seconds = totalSeconds % 60;
-		if (hours > 0) {
-			return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-		}
-		return `${minutes}:${String(seconds).padStart(2, '0')}`;
-	}
 
 	/** Read-only text from the existing arming; never ticks, fires or re-arms. */
 	function sleepProgressText(): string {

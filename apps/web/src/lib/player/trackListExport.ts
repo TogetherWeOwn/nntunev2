@@ -1,4 +1,5 @@
 import { createM3UDownload, m3uDownloadFailure } from './m3uDownload.js';
+import { clipboardWriter } from '../clipboard.js';
 import type { QueueState } from './queue.js';
 
 interface TrackListExportDeps {
@@ -52,8 +53,8 @@ export function createTrackListExport(deps: TrackListExportDeps) {
 		}
 		try {
 			// Accessors and writes may both refuse. Never claim a copy on failure.
-			const clipboard = navigator.clipboard;
-			if (typeof clipboard?.writeText !== 'function') throw new Error('No clipboard');
+			const clipboard = clipboardWriter();
+			if (!clipboard) throw new Error('No clipboard');
 			if (!current()) return;
 			await clipboard.writeText(text);
 		} catch {
