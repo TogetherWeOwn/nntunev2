@@ -33,7 +33,9 @@ def smoke(conclusion, step="success", started="2026-01-02T00:00:00Z"):
             "steps": [{"number": 3, "name": "Run synthetic smoke", "conclusion": step}]}
 
 
-def issue(number, updated="2026-01-01T00:00:00Z", body=MARKER, **extra):
+def issue(number, updated="2026-01-01T00:00:00Z", body=MARKER, source=(9, 1), **extra):
+    if source is not None:
+        body += f"\n<!-- incident-source: {source[0]}:{source[1]} -->"
     return {"number": number, "body": body, "updated_at": updated, **extra}
 
 
@@ -53,7 +55,7 @@ class FakeAPI(ir.API):
             raise ir.ReportError("GitHub GET refused (HTTP 500)")
         if method != "GET":
             self.writes.append((method, path, body))
-            return None
+            return {"number": 1}
         page = int(m.group(1)) if (m := re.search(r"[?&]page=(\d+)", path)) else 1
         window = slice((page - 1) * 100, page * 100)
         if re.fullmatch(r"/actions/runs/\d+", path):
@@ -76,7 +78,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(body["labels"], ["incident"])
         api = FakeAPI(jobs=[smoke("failure")], issues=[issue(7), issue(9)])
         self.assertEqual(ir.report(api, 10), [f"commented #7: {SMOKE}"])
-        self.assertEqual([w[1] for w in api.writes], ["/issues/7/comments"])
+        self.assertEqual([w[1] for w in api.writes], ["/issues/7", "/issues/7/comments"])
+        self.assertIn("<!-- incident-source: 10:1 -->", api.writes[0][2]["body"])
 
     def test_pull_request_issue_is_not_a_match(self):
         api = FakeAPI(jobs=[smoke("failure")], issues=[issue(7, pull_request={})])
@@ -89,11 +92,27 @@ class ReportTests(unittest.TestCase):
                          [("POST", "/issues/7/comments"), ("PATCH", "/issues/7")])
         self.assertEqual(api.writes[1][2]["state"], "closed")
 
-    def test_recovery_held_when_issue_has_newer_activity_or_bad_time(self):
+    def test_recovery_uses_failure_source_not_delayed_issue_activity(self):
         for updated in ("2026-01-03T00:00:00Z", "garbage"):
             api = FakeAPI(jobs=[smoke("success")], issues=[issue(7, updated=updated)])
-            self.assertEqual(ir.report(api, 10), ["held #7: newer activity"])
-            self.assertEqual(api.writes, [])
+            self.assertEqual(ir.report(api, 10), [f"recovered #7: {SMOKE}"])
+
+    def test_unknown_failure_source_holds_recovery(self):
+        api = FakeAPI(jobs=[smoke("success")], issues=[issue(7, source=None)])
+        self.assertEqual(ir.report(api, 10), ["held #7: unknown source"])
+        self.assertEqual(api.writes, [])
+
+    def test_recorded_newer_failure_or_recovery_refuses_stale_replay(self):
+        for state in ("open", "closed"):
+            for conclusion in ("success", "failure"):
+                api = FakeAPI(jobs=[smoke(conclusion)], issues=[issue(7, source=(11, 1), state=state)])
+                self.assertEqual(ir.report(api, 10), ["superseded"])
+                self.assertEqual(api.writes, [])
+
+    def test_recurrence_reopens_closed_key_instead_of_creating_duplicate(self):
+        api = FakeAPI(jobs=[smoke("failure")], issues=[issue(7, state="closed")])
+        self.assertEqual(ir.report(api, 10), [f"commented #7: {SMOKE}"])
+        self.assertEqual(api.writes[0][2]["state"], "open")
 
     def test_skipped_or_unevidenced_success_does_not_recover(self):
         for job in (smoke("skipped"), smoke("success", step="skipped"),
@@ -107,6 +126,31 @@ class ReportTests(unittest.TestCase):
             api = FakeAPI(jobs=[smoke("success")], issues=[issue(7)], runs=[make_run(), newer])
             self.assertEqual(ir.report(api, 10), ["superseded"])
             self.assertEqual(api.writes, [])
+
+    def test_newer_skipped_gate_does_not_erase_failure_or_recovery(self):
+        for conclusion, expected in (("failure", f"commented #7: {SMOKE}"),
+                                     ("success", f"recovered #7: {SMOKE}")):
+            api = FakeAPI(jobs=[smoke(conclusion)], issues=[issue(7)],
+                          runs=[make_run(), make_run(11)])
+            pages = api.pages
+            api.pages = lambda path, key=None: ([smoke("skipped")] if "/runs/11/" in path
+                                                else pages(path, key))
+            self.assertEqual(ir.report(api, 10), [expected])
+
+    def test_all_existing_staging_deployments_are_observed_without_enabling_them(self):
+        for lane in ("mb", "ingest"):
+            name, step = f"staging-{lane}", f"Deploy {lane} to staging"
+            job = {"name": name, "conclusion": "failure", "steps": []}
+            run = make_run(workflow="deploy.yml", event="push")
+            api = FakeAPI(run=run, jobs=[job])
+            self.assertEqual(ir.report(api, 10), [f"opened: {name}"])
+            key = f"<!-- incident-key: deploy.yml:staging-{lane} -->"
+            for outcome in ("skipped", "success"):
+                job = {"name": name, "conclusion": "success", "steps": [
+                    {"number": 1, "name": step, "conclusion": outcome}]}
+                api = FakeAPI(run=run, jobs=[job], issues=[issue(7, body=key)])
+                self.assertEqual(ir.report(api, 10), [] if outcome == "skipped"
+                                 else [f"recovered #7: {name}"])
 
     def test_untrusted_newer_run_does_not_supersede(self):
         api = FakeAPI(jobs=[smoke("failure")], runs=[make_run(), make_run(11, head_branch="x")])

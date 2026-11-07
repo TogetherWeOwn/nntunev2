@@ -12,7 +12,6 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
 
 REPO = "TogetherWeOwn/nntunev2"
 WORKFLOWS = {"deploy.yml": "push", "e2e-staging.yml": None,
@@ -25,6 +24,8 @@ GATES = {
         "gate": None,
         "staging-web": "Deploy to staging",
         "staging-api": "Deploy api to staging",
+        "staging-mb": "Deploy mb to staging",
+        "staging-ingest": "Deploy ingest to staging",
         "post-deploy-e2e / synthetic smoke (health)": "Run synthetic smoke",
         "post-deploy-e2e / full journey (signup → library → meter → limits)":
             "Enforce journey evidence gate (all-skipped must fail)",
@@ -99,12 +100,25 @@ def trusted(run):
             and re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", "")) is not None)
 
 
-def timestamp(value):
-    try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return result if result.tzinfo else None
-    except (AttributeError, TypeError, ValueError):
+def gate_result(jobs, name, evidence):
+    selected = [j for j in jobs if j.get("name") == name]
+    if len(selected) != 1:
         return None
+    job = selected[0]
+    recovered = any(s.get("name") == evidence and s.get("conclusion") == "success"
+                    for s in job.get("steps", [])) if evidence is not None else any(
+                        j.get("name") == "staging-web" and j.get("conclusion") == "success"
+                        and any(s.get("name") == "Deploy to staging"
+                                and s.get("conclusion") == "success" for s in j.get("steps", []))
+                        for j in jobs)
+    return job if (job.get("conclusion") in BAD or
+                   (job.get("conclusion") == "success" and recovered)) else None
+
+
+def source(issue):
+    match = re.search(r"<!-- incident-source: ([1-9][0-9]*):([1-9][0-9]*) -->",
+                      issue.get("body") or "")
+    return tuple(map(int, match.groups())) if match else None
 
 
 def report(api, run_id, dry_run=False):
@@ -118,30 +132,28 @@ def report(api, run_id, dry_run=False):
     # Runs are newest-created first: a newer run, if any, is in this page.
     # Do not walk all history (a busy repository can exceed the search bound).
     latest = api.request("GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
-    if any(trusted(r) and (r["id"], r["run_attempt"]) > (run_id, attempt) for r in latest):
-        return ["superseded"]
+    newer = [r for r in latest if trusted(r) and (r["id"], r["run_attempt"]) > (run_id, attempt)]
+    if len(newer) > 10:
+        raise ReportError("Gate history replay exceeds bound")
     current = api.request("GET", f"/actions/runs/{run_id}")
     if current["run_attempt"] != attempt or current["status"] != "completed":
         return ["superseded"]
     jobs = api.pages(f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
-    issues = api.pages("/issues?state=open&labels=incident")
+    newer_jobs = [api.pages(f"/actions/runs/{r['id']}/attempts/{r['run_attempt']}/jobs", "jobs")
+                  for r in newer]
+    # Retain source ordering even after recovery, so a delayed older failure
+    # cannot reopen the same episode. Reuse a closed keyed issue on recurrence.
+    issues = api.pages("/issues?state=all&labels=incident")
     actions = []
     for name, evidence in GATES[workflow].items():
-        selected = [j for j in jobs if j.get("name") == name]
-        if len(selected) != 1:
+        job = gate_result(jobs, name, evidence)
+        if job is None:
             continue
-        job = selected[0]
+        if any(gate_result(rows, name, evidence) is not None for rows in newer_jobs):
+            actions.append("superseded")
+            continue
         conclusion = job.get("conclusion")
-        steps = job.get("steps", [])
-        failed = [str(s["number"]) for s in steps if s.get("conclusion") in BAD]
-        recovered = any(s.get("name") == evidence and s.get("conclusion") == "success"
-                        for s in steps) if evidence is not None else any(
-                            j.get("name") == "staging-web" and j.get("conclusion") == "success"
-                            and any(s.get("name") == "Deploy to staging"
-                                    and s.get("conclusion") == "success" for s in j.get("steps", []))
-                            for j in jobs)
-        if conclusion not in BAD and not (conclusion == "success" and recovered):
-            continue
+        failed = [str(s["number"]) for s in job.get("steps", []) if s.get("conclusion") in BAD]
         # Stable workflow/job key, independent of mapping order. Names are our
         # constants, not user-controlled API strings. Never rename a live key.
         key = workflow + ":" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
@@ -160,31 +172,41 @@ def report(api, run_id, dry_run=False):
             body += ("\nThis is the workflow source SHA, not necessarily the selected "
                      "promotion target. The dispatch input is not exposed by the runs API; "
                      "consult the linked preflight. No production change is authorized here.\n")
+        occurrence = (run_id, attempt)
+        if any(source(i) is not None and source(i) >= occurrence for i in matches):
+            actions.append("superseded")
+            continue
+        recorded = body + f"\n{marker}\n<!-- incident-source: {run_id}:{attempt} -->\n"
         if conclusion in BAD:
             if matches:
-                for issue in matches[:1]:
-                    actions.append(f"commented #{issue['number']}: {name}")
-                    if not dry_run:
-                        api.request("POST", f"/issues/{issue['number']}/comments",
-                                    {"body": "Still failing.\n\n" + body})
+                issue = matches[0]
+                actions.append(f"commented #{issue['number']}: {name}")
+                if not dry_run:
+                    api.request("PATCH", f"/issues/{issue['number']}",
+                                {"body": recorded, "state": "open"})
+                    api.request("POST", f"/issues/{issue['number']}/comments",
+                                {"body": "Still failing.\n\n" + body})
             else:
                 actions.append(f"opened: {name}")
                 if not dry_run:
-                    api.request("POST", "/issues", {"title": f"incident: {workflow}: {name}",
-                                "body": body + "\n" + marker, "labels": ["incident"]})
+                    created = api.request("POST", "/issues", {
+                        "title": f"incident: {workflow}: {name}",
+                        "body": recorded, "labels": ["incident"]})
+                    if not isinstance(created, dict) or type(created.get("number")) is not int:
+                        raise ReportError("Issue creation returned no number")
         else:
-            started = timestamp(job.get("started_at"))
             for issue in matches:
-                updated = timestamp(issue.get("updated_at"))
-                if started is None or updated is None or updated > started:
-                    actions.append(f"held #{issue['number']}: newer activity")
+                if issue.get("state") == "closed":
+                    continue
+                if source(issue) is None:
+                    actions.append(f"held #{issue['number']}: unknown source")
                     continue
                 actions.append(f"recovered #{issue['number']}: {name}")
                 if not dry_run:
                     api.request("POST", f"/issues/{issue['number']}/comments",
                                 {"body": "Recovered.\n\n" + body})
                     api.request("PATCH", f"/issues/{issue['number']}",
-                                {"state": "closed", "state_reason": "completed"})
+                                {"body": recorded, "state": "closed", "state_reason": "completed"})
     return actions
 
 

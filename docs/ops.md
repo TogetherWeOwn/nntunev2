@@ -787,8 +787,13 @@ and `deploy-production` runs. Its separate issue-writer job opens one
 `incident` issue per workflow/job key, comments on repeats and closes it
 with a recovery comment after a successful job with its required evidence
 step. Unconfigured/skipped smoke and skipped deployment jobs do not recover
-an incident. Older runs/attempts and issue activity newer than the healthy
-job's start cannot close a newer alert. Keep existing gate keys stable.
+an incident. Ordering is per gate: a newer run that skips the gate cannot
+erase its earlier failure or recovery. Each keyed issue records its last
+source run/attempt, including after closure; issue activity time is not a
+proxy for failure time. Older evidence cannot close/reopen a newer episode.
+Recurrence reopens the existing keyed issue. Keep existing gate keys stable.
+The existing MB/ingest job names are observed only; reporting does not
+enable those lanes or change their retirement/qualification holds.
 
 This observer reads job/step conclusions only, never logs, artifacts or
 triggering-run code. Issues carry the source SHA, attempt URL, fixed gate
