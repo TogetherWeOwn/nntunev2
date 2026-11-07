@@ -4,7 +4,7 @@
 //! (TogetherWeOwn/velmora, pinned by git `rev` in this crate's
 //! `Cargo.toml`); their sources, tests and benches live there. This crate
 //! keeps only the NNTune-specific [`transcode`] and [`original_source`]
-//! modules, plus the provider-authority-store model its tests include.
+//! modules and their tests.
 //!
 //! Compiles for `wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`)
 //! **and** native targets (ingest/streaming services, Container batch jobs).

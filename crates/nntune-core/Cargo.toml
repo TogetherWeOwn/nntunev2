@@ -2,7 +2,7 @@
 name = "nntune-core"
 version = "0.1.0"
 edition = "2021"
-description = "NNTune v2 shim over the velmora Usenet engine, plus the NNTune-only transcode, original-source and provider-authority-store modules"
+description = "NNTune v2 shim over the velmora Usenet engine, plus the NNTune-only modules"
 license = "MIT"
 # velmora's locked dependency graph needs 1.89 (aes 0.9).
 rust-version = "1.89"
