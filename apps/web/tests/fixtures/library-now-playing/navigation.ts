@@ -20,6 +20,6 @@ export function beforeNavigate(callback: () => void): void {
 }
 
 export async function goto(path: string): Promise<void> {
-	if (handles(path)) return navigate(path, { type: 'goto' });
+	if (handles(path) && new URL(path, location.origin).pathname !== '/now-playing') return navigate(path, { type: 'goto' });
 	window.location.assign(path);
 }
