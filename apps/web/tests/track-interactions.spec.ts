@@ -88,8 +88,28 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 	await page.keyboard.press('Tab');
 	await expect(menu(page)).toHaveCount(0);
 	await expect(page.locator('body')).not.toBeFocused();
+	// Keep both targets in view: scrolling to an offscreen heading dismisses
+	// the menu before the click and tests scroll recovery instead.
+	await page.setViewportSize({ width: 1280, height: 1600 });
+	const outside = page.getByRole('heading', { name: 'Library', exact: true });
+	await outside.scrollIntoViewIfNeeded();
 	await more.click();
-	await page.getByRole('heading', { name: 'Library', exact: true }).click();
+	await expect(menu(page)).toBeVisible();
+	await expect(outside).toBeInViewport({ ratio: 1 });
+	await outside.click();
+	await expect(menu(page)).toHaveCount(0);
+	await expect(more).toBeFocused();
+});
+
+test('scroll dismisses an open menu and restores its invoker before any later click', async ({ page }) => {
+	await seed(page);
+	const more = libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+	await more.click();
+	await expect(menu(page)).toBeVisible();
+	const before = await page.evaluate(() => window.scrollY);
+	expect(before).toBeGreaterThan(0);
+	await page.evaluate(() => window.scrollTo(0, 0));
+	await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
 	await expect(menu(page)).toHaveCount(0);
 	await expect(more).toBeFocused();
 });

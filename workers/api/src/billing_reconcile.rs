@@ -927,27 +927,19 @@ pub fn open_checkout_operation_select_statement() -> &'static str {
     "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
 }
 
-/// Parameters: limit, settlement_secs. The hourly sweep's live-slot
-/// targets: every nonterminal row that is not a settled `active` row
-/// (held and grace rows always re-fold: `incomplete` may complete,
-/// `past_due` may recover or lapse, `unpaid`/`paused` may change), plus
-/// `active` rows whose confirmed coverage ends inside the renewal
-/// settlement window (`settlement_secs`, the caller passes
-/// `billing::RENEWAL_SETTLEMENT_ALLOWANCE_SECS` so the 3 h bound has one
-/// owner). NULL coverage sorts first: a row stored before any confirmed
-/// payment is the most urgent to re-fold. Same five-status predicate as
-/// the live select above, so the sweep never resurrects a terminal row.
+/// Parameters: limit. Atomically rotate least-recently-attempted live
+/// slots before remote work, including unchanged rows and failed attempts.
+/// All active rows participate: a lost portal-upgrade webhook must not
+/// defer the new paid plan until renewal. Terminal rows stay excluded.
 pub fn reconcile_sweep_targets_statement() -> &'static str {
-    "SELECT user_id, stripe_subscription_id FROM subscriptions WHERE status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') AND (status <> 'active' OR paid_through_at IS NULL OR paid_through_at <= now() + ($2::bigint * interval '1 second')) ORDER BY paid_through_at ASC NULLS FIRST LIMIT $1"
+    include_str!("billing_subscription_sweep.sql")
 }
 
-/// Parameters: limit. The hourly sweep's open checkout operations across
-/// all users (the reconcile-without-webhook path: a paid session whose
-/// webhook was lost still folds in within the hour). Same projection
-/// and single-flight predicate as the per-user select above, oldest
-/// operation first.
+/// Parameters: limit. Claim open flights before retrieval, including
+/// sessionless/expired/missing sessions. A failed or unchanged attempt
+/// rotates without releasing the single flight or granting entitlement.
 pub fn open_checkout_operations_statement() -> &'static str {
-    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE state IN ('pending', 'submitted', 'needs_reconcile') ORDER BY created_at ASC LIMIT $1"
+    include_str!("billing_checkout_sweep.sql")
 }
 
 /// Parameters: op_id. Operation lookup by id (the webhook's
@@ -2160,20 +2152,21 @@ mod tests {
                 "operation lookup must read the JSONB payload as text, got: {select}",
             );
         }
-        // The sweep re-folds exactly the live slot: same five-status
-        // predicate as the read path, settled `active` rows only inside
-        // the caller-supplied settlement window, bounded by LIMIT.
+        // The sweep claims every live slot fairly, including active rows
+        // whose upgrade webhook was lost. Attempt order is not entitlement.
         let sweep = reconcile_sweep_targets_statement();
         assert!(
             sweep.contains("status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"),
             "sweep matches the live slot predicate: {sweep}",
         );
-        assert!(
-            sweep.contains("status <> 'active'")
-                && sweep.contains("paid_through_at <= now() + ($2::bigint * interval '1 second')")
-                && sweep.contains("LIMIT $1"),
-            "settled active rows enter only inside the settlement window, bounded: {sweep}",
-        );
+        for claim in [sweep, open_checkout_operations_statement()] {
+            assert!(claim.contains("ORDER BY reconcile_attempted_at ASC NULLS FIRST, id"));
+            assert!(claim.contains("LIMIT $1"));
+            assert!(claim.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(claim.contains("SET reconcile_attempted_at = clock_timestamp()"));
+            assert!(claim.contains("RETURNING"));
+            assert!(!claim.contains("paid_through_at <="));
+        }
         assert!(
             open_checkout_operations_statement()
                 .contains("state IN ('pending', 'submitted', 'needs_reconcile')"),

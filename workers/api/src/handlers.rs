@@ -1340,24 +1340,33 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Err(StoreError) }
     }
-    /// The hourly sweep's live-slot targets (bounded by `limit`):
-    /// nonterminal rows that are not settled `active`, plus `active`
-    /// rows whose confirmed coverage ends within `settlement_secs`.
-    /// Default empty (nothing swept): a store that cannot list cannot
-    /// advance anything, and the next hour retries.
-    fn list_reconcile_sweep_targets(
+    /// Hold the operation-wide per-user lock across Stripe reads, mutation
+    /// and persistence. This is a separate namespace from the short write
+    /// lock; nested store writes must not deadlock on it. Busy/error fails
+    /// before polling `operation`. Dropping the future releases the guard.
+    fn with_billing_operation<T>(
+        &self,
+        _user_id: &str,
+        _operation: impl Future<Output = T>,
+    ) -> impl Future<Output = Result<T, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Atomically claim up to `limit` least-recently-attempted live slots
+    /// before remote work. Failures and unchanged rows rotate; every active
+    /// row participates, including paid upgrades whose webhook was lost.
+    /// Default empty cannot advance entitlement.
+    fn claim_reconcile_sweep_targets(
         &self,
         _limit: i64,
-        _settlement_secs: i64,
     ) -> impl Future<Output = Result<Vec<crate::billing_reconcile::ReconcileSweepTarget>, StoreError>>
     {
         async move { Ok(Vec::new()) }
     }
-    /// The hourly sweep's open checkout operations across all users
-    /// (bounded by `limit`, oldest first): the reconcile-without-webhook
-    /// path folds a paid session in even when its webhook was lost.
-    /// Default empty (nothing swept), same rationale as above.
-    fn list_open_checkout_operations(
+    /// Atomically claim open flights least-recently-attempted first,
+    /// including flights without a usable session. Advance attempt order
+    /// before remote work so no failing leader monopolizes the batch.
+    /// Default empty cannot advance entitlement.
+    fn claim_open_checkout_operations(
         &self,
         _limit: i64,
     ) -> impl Future<Output = Result<Vec<crate::billing_reconcile::StoredCheckoutOp>, StoreError>>
@@ -5923,6 +5932,71 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    ctx.store
+        .with_billing_operation(
+            user_id,
+            reconcile_remote_subscription_locked(ctx, user_id, subscription_id),
+        )
+        .await
+        .map_err(|_| ())?
+}
+
+/// Caller holds the operation lock. Re-read paid invoices before deciding
+/// whether the exhausted grace can settle; never cancel a recovered payer.
+async fn reconcile_remote_subscription_locked<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<crate::billing_reconcile::ReconcileOutcome, ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let outcome = fold_remote_subscription(ctx, user_id, subscription_id).await?;
+    let now = billing_now_i64(ctx.now);
+    let expired = !outcome.disable_new_purchases()
+        && outcome.row.status == "past_due"
+        && outcome.row.grace_until_unix.is_some_and(|end| end <= now)
+        && outcome.row.paid_through_unix.is_some_and(|end| end <= now);
+    if !expired {
+        return Ok(outcome);
+    }
+    // Keep the local slot on failed/uncertain cancellation. Only a fresh,
+    // fully reconciled terminal observation releases it; debt/history stay.
+    let canceled = ctx
+        .stripe
+        .cancel_subscription(subscription_id.to_string())
+        .await
+        .map_err(|_| ())?;
+    if canceled.id != subscription_id
+        || canceled.livemode
+        || canceled.customer.as_deref() != Some(outcome.row.stripe_customer_id.as_str())
+        || !crate::billing_reconcile::is_terminal_status(&canceled.status)
+    {
+        return Err(());
+    }
+    let confirmed = fold_remote_subscription(ctx, user_id, subscription_id).await?;
+    if confirmed.disable_new_purchases()
+        || !crate::billing_reconcile::is_terminal_status(&confirmed.row.status)
+    {
+        return Err(());
+    }
+    Ok(confirmed)
+}
+
+async fn fold_remote_subscription<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<crate::billing_reconcile::ReconcileOutcome, ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     let subscription = ctx
         .stripe
         .retrieve_subscription(subscription_id.to_string())
@@ -6013,6 +6087,20 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    reconcile_checkout_session_inner(ctx, session_id, None).await
+}
+
+async fn reconcile_checkout_session_inner<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    session_id: &str,
+    lock_owner: Option<&str>,
+) -> Result<(), ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     let session = ctx
         .stripe
         .retrieve_checkout_session(session_id.to_string())
@@ -6056,23 +6144,105 @@ where
         .await;
         return Ok(());
     };
-    let outcome = reconcile_remote_subscription(ctx, &user_id, &subscription_id).await?;
-    // The operation that sourced this session resolves with it: clean
-    // passes succeed it, fail-closed passes park it for the hourly job.
-    // Best-effort (the reconcile itself already stored): a lost mark only
-    // leaves the flight open, never double-bills.
-    if let Some(op) = op {
-        let state = if outcome.disable_new_purchases() {
-            "needs_reconcile"
-        } else {
-            "succeeded"
-        };
-        let price_id = op.price_id.clone().unwrap_or_default();
-        let _ = ctx
-            .store
-            .update_checkout_operation(&op.id, state, &price_id, Some(session_id))
-            .await;
+    let reconcile = async {
+        let outcome = reconcile_remote_subscription_locked(ctx, &user_id, &subscription_id).await?;
+        // The operation that sourced this session resolves with it: clean
+        // passes succeed it, fail-closed passes park it for the hourly job.
+        // Best-effort (the reconcile itself already stored): a lost mark only
+        // leaves the flight open, never double-bills.
+        if let Some(op) = op {
+            let state = if outcome.disable_new_purchases() {
+                "needs_reconcile"
+            } else {
+                "succeeded"
+            };
+            let price_id = op.price_id.clone().unwrap_or_default();
+            let _ = ctx
+                .store
+                .update_checkout_operation(&op.id, state, &price_id, Some(session_id))
+                .await;
+        }
+        if outcome.disable_new_purchases() {
+            billing_alert(ctx, &user_id, BILLING_FAIL_CLOSED_ACTION).await;
+        }
+        Ok(())
+    };
+    if let Some(owner) = lock_owner {
+        if owner != user_id {
+            return Err(());
+        }
+        reconcile.await
+    } else {
+        ctx.store
+            .with_billing_operation(&user_id, reconcile)
+            .await
+            .map_err(|_| ())?
     }
+}
+
+/// Events are wake-up hints, never payment authority. Resolve routing from
+/// fresh test-mode objects, then re-read the subscription/invoices under
+/// the same per-user operation lock as polling and purchases.
+async fn reconcile_subscription_event<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    event: &crate::stripe::StripeEvent,
+) -> Result<(), ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let id = event
+        .object
+        .get("id")
+        .and_then(|value| value.as_str())
+        .ok_or(())?;
+    let subscription_id = if matches!(
+        event.event_type.as_str(),
+        "invoice.paid" | "invoice.payment_succeeded"
+    ) {
+        let invoice = ctx
+            .stripe
+            .retrieve_invoice(id.to_string())
+            .await
+            .map_err(|_| ())?;
+        if invoice.livemode || invoice.status != "paid" {
+            return Ok(());
+        }
+        let Some(subscription_id) = invoice.subscription else {
+            return Ok(());
+        };
+        subscription_id
+    } else {
+        id.to_string()
+    };
+    let subscription = ctx
+        .stripe
+        .retrieve_subscription(subscription_id.clone())
+        .await
+        .map_err(|_| ())?;
+    if subscription.livemode {
+        return Ok(());
+    }
+    let Some(customer) = subscription.customer.as_deref() else {
+        return Err(());
+    };
+    let Some(user_id) = ctx
+        .store
+        .user_for_stripe_customer(customer)
+        .await
+        .map_err(|_| ())?
+    else {
+        billing_alert(
+            ctx,
+            "stripe:unknown-customer",
+            BILLING_UNKNOWN_CUSTOMER_ACTION,
+        )
+        .await;
+        return Ok(());
+    };
+    let outcome = reconcile_remote_subscription(ctx, &user_id, &subscription_id).await?;
     if outcome.disable_new_purchases() {
         billing_alert(ctx, &user_id, BILLING_FAIL_CLOSED_ACTION).await;
     }
@@ -6110,25 +6280,22 @@ where
         Ok(event) => event,
         Err(_) => return invalid_request(),
     };
-    // First claim wins. Duplicates of a verified non-checkout event (or a
-    // live-mode event) still ack 200 with no state change — those paths
-    // never write state, so nothing can be lost. A duplicate
-    // `checkout.session.completed`, however, is REPROCESSED idempotently
-    // instead of acked: the release below is a same-DB DELETE, so a store
-    // outage that fails the release — or a worker death after the claim —
-    // would otherwise leave the paid event consumed and unprocessed.
-    // Reconciliation converges (monotonic upsert under the per-user lock,
-    // history idempotent on the invoice id, operation mark idempotent), so
-    // reprocessing a duplicate lands the same stored state, and a still-
-    // failing pass 500s so Stripe retries anyway. A store failure on the
-    // claim itself 500s so Stripe retries the delivery.
+    // Claims are receipts, not exactly-once execution: every supported
+    // duplicate re-reads current payment state. A crash after claim or a
+    // failed claim release must not consume an unprocessed payment.
     let _first_claim = match ctx.store.claim_webhook_event(&event.id).await {
         Ok(first) => first,
         Err(_) => return internal(),
     };
-    if event.event_type != "checkout.session.completed" {
-        // Verified but not ours: ack, no state change. Live-mode events
-        // land here too — never Stripe-called, never stored.
+    if !matches!(
+        event.event_type.as_str(),
+        "checkout.session.completed"
+            | "invoice.paid"
+            | "invoice.payment_succeeded"
+            | "customer.subscription.updated"
+            | "customer.subscription.deleted"
+    ) {
+        // Verified but unsupported: receipt only, never Stripe-called.
         return json_response(200, serde_json::json!({"ok": true}));
     }
     if event.livemode {
@@ -6142,13 +6309,18 @@ where
         .await;
         return json_response(200, serde_json::json!({"ok": true}));
     }
-    // The session object is verified JSON now; a missing id is a sender
-    // bug (400), not a retryable failure.
+    // Every supported event requires an object id; missing is malformed
+    // (400), not a retryable Stripe or store failure.
     let session_id = match event.object.get("id").and_then(|id| id.as_str()) {
         Some(id) => id.to_string(),
         None => return invalid_request(),
     };
-    match reconcile_checkout_session(ctx, &session_id).await {
+    let result = if event.event_type == "checkout.session.completed" {
+        reconcile_checkout_session(ctx, &session_id).await
+    } else {
+        reconcile_subscription_event(ctx, &event).await
+    };
+    match result {
         Ok(()) => json_response(200, serde_json::json!({"ok": true})),
         Err(()) => {
             // The claim is released so the retried delivery reprocesses
@@ -6225,7 +6397,7 @@ where
                 .cancel_subscription(subscription_id.to_string())
                 .await
                 .map_err(|_| EnsureCheckoutError::Failed)?;
-            reconcile_remote_subscription(ctx, user_id, subscription_id)
+            reconcile_remote_subscription_locked(ctx, user_id, subscription_id)
                 .await
                 .map_err(|_| EnsureCheckoutError::Failed)?;
             Ok(())
@@ -6233,7 +6405,7 @@ where
         // Already terminal remotely: nothing to cancel, reconcile it out
         // of the slot.
         status if crate::billing_reconcile::is_terminal_status(status) => {
-            reconcile_remote_subscription(ctx, user_id, subscription_id)
+            reconcile_remote_subscription_locked(ctx, user_id, subscription_id)
                 .await
                 .map_err(|_| EnsureCheckoutError::Failed)?;
             Ok(())
@@ -6242,7 +6414,7 @@ where
         // refuse — the account is already subscribed, so no cancel and no
         // second session.
         "active" | "past_due" => {
-            reconcile_remote_subscription(ctx, user_id, subscription_id)
+            reconcile_remote_subscription_locked(ctx, user_id, subscription_id)
                 .await
                 .map_err(|_| EnsureCheckoutError::Failed)?;
             Err(EnsureCheckoutError::Unavailable)
@@ -6434,7 +6606,7 @@ where
         // this retry): reconcile the paid session through the shared driver
         // instead of minting a second payable session. Money already landed,
         // whatever price it names — no replacement is minted on this path.
-        reconcile_checkout_session(ctx, session_id)
+        reconcile_checkout_session_inner(ctx, session_id, Some(&op.user_id))
             .await
             .map_err(|_| EnsureCheckoutError::Failed)?;
         return Ok(FlightSessionDecision::Completed);
@@ -6507,6 +6679,36 @@ where
 }
 
 pub async fn ensure_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    ctx.store
+        .with_billing_operation(
+            user_id,
+            ensure_checkout_session_locked(
+                ctx,
+                user_id,
+                price_id,
+                success_url,
+                cancel_url,
+                test_clock,
+            ),
+        )
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+}
+
+async fn ensure_checkout_session_locked<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
     price_id: &str,
@@ -6792,7 +6994,8 @@ where
 
 /// Per-class row bound for one sweep pass: each target costs one
 /// retrieve-plus-invoices fold, so the batch stays well inside one cron
-/// invocation while the next hour drains any remainder.
+/// invocation. Atomic attempt rotation lets subsequent passes reach the
+/// remainder even when earlier rows fail or remain unchanged.
 pub const BILLING_RECONCILE_SWEEP_LIMIT: i64 = 50;
 
 /// Outcome counts for one sweep pass (the cron entry logs them).
@@ -6809,8 +7012,9 @@ pub struct BillingReconcileSweepReport {
 /// operations fold first (a paid session whose webhook was lost becomes
 /// entitlement here), then every due live-slot row re-folds through the
 /// same `reconcile_remote_subscription` the webhook uses. Per-target
-/// failures never stop the pass and never advance anything: the row
-/// stays due and the next hour retries. Fail-closed folds raise the
+/// failures never stop the pass or advance entitlement. Claims rotate
+/// before remote work so failures remain retryable without starvation.
+/// Fail-closed folds raise the
 /// same audit alert as the webhook path.
 pub async fn run_billing_reconcile_sweep<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
@@ -6824,7 +7028,7 @@ where
     let mut report = BillingReconcileSweepReport::default();
     if let Ok(operations) = ctx
         .store
-        .list_open_checkout_operations(BILLING_RECONCILE_SWEEP_LIMIT)
+        .claim_open_checkout_operations(BILLING_RECONCILE_SWEEP_LIMIT)
         .await
     {
         for op in &operations {
@@ -6842,10 +7046,7 @@ where
     }
     if let Ok(targets) = ctx
         .store
-        .list_reconcile_sweep_targets(
-            BILLING_RECONCILE_SWEEP_LIMIT,
-            crate::billing::RENEWAL_SETTLEMENT_ALLOWANCE_SECS,
-        )
+        .claim_reconcile_sweep_targets(BILLING_RECONCILE_SWEEP_LIMIT)
         .await
     {
         for target in &targets {
@@ -7577,9 +7778,12 @@ mod tests {
         /// Billing store-outage pin: when set, every billing method fails
         /// like a production query outage instead of touching state.
         fail_billing: RefCell<bool>,
-        /// The sweep's clock for the due-coverage predicate (production
-        /// uses `now()` in SQL; the fake has no clock of its own).
-        sweep_now_unix: RefCell<i64>,
+        fail_terminal_reconcile_write: RefCell<bool>,
+        /// Monotonic attempt order, independent of entitlement state.
+        sweep_claim_clock: RefCell<u64>,
+        billing_operation_users: RefCell<HashSet<String>>,
+        subscription_sweep_attempts: RefCell<HashMap<String, u64>>,
+        checkout_sweep_attempts: RefCell<HashMap<String, u64>>,
         /// Billing display reads: plan rows served verbatim, the live-slot
         /// subscription per user, whether any subscription row ever
         /// existed, and metered stream seconds keyed by
@@ -8900,6 +9104,11 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            if *self.fail_terminal_reconcile_write.borrow()
+                && crate::billing_reconcile::is_terminal_status(&outcome.row.status)
+            {
+                return Err(StoreError);
+            }
             // Mirrors the production upsert's monotonic coverage CASE: a
             // pass that folded an older snapshot commits without
             // regressing confirmed `paid_through_at` (or the plan and
@@ -9324,17 +9533,35 @@ mod tests {
             ));
             Ok(AdminInviteRevokeOutcome::Revoked)
         }
-        async fn list_reconcile_sweep_targets(
+        async fn with_billing_operation<T>(
+            &self,
+            user_id: &str,
+            operation: impl Future<Output = T>,
+        ) -> Result<T, StoreError> {
+            if *self.fail_billing.borrow()
+                || !self
+                    .billing_operation_users
+                    .borrow_mut()
+                    .insert(user_id.to_string())
+            {
+                return Err(StoreError);
+            }
+            struct Guard<'a>(&'a RefCell<HashSet<String>>, String);
+            impl Drop for Guard<'_> {
+                fn drop(&mut self) {
+                    self.0.borrow_mut().remove(&self.1);
+                }
+            }
+            let _guard = Guard(&self.billing_operation_users, user_id.to_string());
+            Ok(operation.await)
+        }
+        async fn claim_reconcile_sweep_targets(
             &self,
             limit: i64,
-            settlement_secs: i64,
         ) -> Result<Vec<crate::billing_reconcile::ReconcileSweepTarget>, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Mirrors the production predicate: live-slot statuses, with
-            // settled `active` rows only inside the settlement window.
-            let now = *self.sweep_now_unix.borrow();
             let mut targets: Vec<crate::billing_reconcile::ReconcileSweepTarget> = self
                 .billing_rows
                 .borrow()
@@ -9343,10 +9570,7 @@ mod tests {
                     matches!(
                         row.status.as_str(),
                         "incomplete" | "active" | "past_due" | "unpaid" | "paused"
-                    ) && (row.status != "active"
-                        || row
-                            .paid_through_unix
-                            .is_none_or(|end| end <= now.saturating_add(settlement_secs)))
+                    )
                 })
                 .map(
                     |(user_id, row)| crate::billing_reconcile::ReconcileSweepTarget {
@@ -9355,11 +9579,20 @@ mod tests {
                     },
                 )
                 .collect();
-            targets.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+            let mut attempts = self.subscription_sweep_attempts.borrow_mut();
+            targets.sort_by(|a, b| {
+                (attempts.get(&a.stripe_subscription_id), &a.user_id)
+                    .cmp(&(attempts.get(&b.stripe_subscription_id), &b.user_id))
+            });
             targets.truncate(limit.max(0) as usize);
+            let mut clock = self.sweep_claim_clock.borrow_mut();
+            *clock += 1;
+            for target in &targets {
+                attempts.insert(target.stripe_subscription_id.clone(), *clock);
+            }
             Ok(targets)
         }
-        async fn list_open_checkout_operations(
+        async fn claim_open_checkout_operations(
             &self,
             limit: i64,
         ) -> Result<Vec<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
@@ -9373,8 +9606,14 @@ mod tests {
                 .filter(|op| crate::billing_reconcile::is_single_flight_state(&op.state))
                 .cloned()
                 .collect();
-            ops.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut attempts = self.checkout_sweep_attempts.borrow_mut();
+            ops.sort_by(|a, b| (attempts.get(&a.id), &a.id).cmp(&(attempts.get(&b.id), &b.id)));
             ops.truncate(limit.max(0) as usize);
+            let mut clock = self.sweep_claim_clock.borrow_mut();
+            *clock += 1;
+            for op in &ops {
+                attempts.insert(op.id.clone(), *clock);
+            }
             Ok(ops)
         }
     }
@@ -9522,6 +9761,9 @@ mod tests {
         /// Subscription ids passed to `cancel_subscription` (proves a
         /// recovered or unknown remote is never canceled).
         canceled: RefCell<Vec<String>>,
+        cancel_response_status: RefCell<Option<String>>,
+        subscription_retrievals: RefCell<usize>,
+        fail_subscription_retrieve_at: RefCell<Option<usize>>,
         /// Portal sessions minted, as `(customer_id, return_url)`.
         portal_customers: RefCell<Vec<(String, String)>>,
         /// Session ids passed to `expire_checkout_session` (proves a
@@ -9699,7 +9941,11 @@ mod tests {
             Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
         > {
             Box::pin(async move {
-                if self.fail("retrieve_subscription") {
+                let mut calls = self.subscription_retrievals.borrow_mut();
+                *calls += 1;
+                if self.fail("retrieve_subscription")
+                    || *self.fail_subscription_retrieve_at.borrow() == Some(*calls)
+                {
                     return self.err();
                 }
                 self.subscriptions
@@ -9801,7 +10047,11 @@ mod tests {
                     .get(&subscription_id)
                     .cloned()
                     .ok_or_else(crate::stripe::StripeError::transport)?;
-                subscription.status = "canceled".to_string();
+                subscription.status = self
+                    .cancel_response_status
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "canceled".to_string());
                 subscriptions.insert(subscription_id, subscription.clone());
                 Ok(subscription)
             })
@@ -10519,11 +10769,11 @@ mod tests {
     }
 
     #[test]
-    fn billing_webhook_non_checkout_and_livemode_ack_without_state() {
+    fn billing_webhook_unsupported_and_livemode_ack_without_state() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         // A verified non-checkout event acks 200 with no state change.
-        let other = other_event_body("evt_test_9", "invoice.payment_succeeded");
+        let other = other_event_body("evt_test_9", "customer.created");
         webhook_ok(&h.call_webhook(&other, Some(sign(&other, BILLING_NOW))));
         assert!(live_for(&h, "u1").is_none());
         assert!(h.store.invoice_history.borrow().is_empty());
@@ -11131,7 +11381,6 @@ mod tests {
                 grace_until_unix: Some(BILLING_NOW + 3_600),
             },
         );
-        *h.store.sweep_now_unix.borrow_mut() = BILLING_NOW;
 
         let report = block_on(run_billing_reconcile_sweep(&h.ctx()));
         assert_eq!(report.operations_attempted, 1);
@@ -11154,6 +11403,168 @@ mod tests {
         assert_eq!(u2.status, "past_due");
         assert_eq!(u2.paid_through_unix, Some(BILLING_NOW - BILLING_PERIOD));
     }
+
+    #[test]
+    fn billing_reconcile_sweep_reaches_rows_after_unchanged_and_failed_batches() {
+        let h = stripe_harness();
+        // A full batch of unchanged or failing targets must not hide the
+        // next paid checkout or renewal forever. Keep every leader eligible.
+        for index in 0..BILLING_RECONCILE_SWEEP_LIMIT {
+            let user = format!("leader-{index:03}");
+            let customer = format!("cus_leader_{index}");
+            let subscription = format!("sub_leader_{index}");
+            let operation = format!("op-leader-{index:03}");
+            let session = format!("cs_leader_{index}");
+            seed_billing_user(&h, &user);
+            h.store
+                .billing_customers
+                .borrow_mut()
+                .insert(user.clone(), customer.clone());
+            h.store.billing_rows.borrow_mut().insert(
+                user.clone(),
+                crate::billing_reconcile::ReconciledRow {
+                    stripe_subscription_id: subscription.clone(),
+                    stripe_customer_id: customer.clone(),
+                    stripe_item_id: "si_test_1".to_string(),
+                    stripe_price_id: PRICE_PLUS.to_string(),
+                    plan_id: PLAN_PLUS.to_string(),
+                    status: "paused".to_string(),
+                    current_period_end_unix: None,
+                    cancel_at_period_end: false,
+                    paid_through_unix: None,
+                    paid_invoice_id: None,
+                    grace_until_unix: None,
+                },
+            );
+            if index % 2 == 0 {
+                h.stripe.subscriptions.borrow_mut().insert(
+                    subscription.clone(),
+                    test_subscription(&subscription, &customer, "paused", PRICE_PLUS),
+                );
+            }
+            // Alternate sessionless operations, confirmed-expired sessions,
+            // and missing remote sessions. No leader is a paid checkout.
+            let session_id = (index % 3 != 0).then_some(session.clone());
+            if index % 3 == 1 {
+                h.stripe.sessions.borrow_mut().insert(
+                    session.clone(),
+                    test_session(
+                        &session,
+                        "expired",
+                        "unpaid",
+                        Some(&customer),
+                        None,
+                        Some(&operation),
+                    ),
+                );
+            }
+            h.store.checkout_ops.borrow_mut().insert(
+                operation.clone(),
+                crate::billing_reconcile::StoredCheckoutOp {
+                    id: operation,
+                    user_id: user,
+                    state: "submitted".to_string(),
+                    price_id: Some(PRICE_PLUS.to_string()),
+                    session_id,
+                    subscription_id: None,
+                },
+            );
+        }
+        seed_billing_user(&h, "zz-checkout");
+        seed_billing_user(&h, "zz-renewal");
+        h.store.checkout_ops.borrow_mut().insert(
+            "zz-paid-operation".to_string(),
+            crate::billing_reconcile::StoredCheckoutOp {
+                id: "zz-paid-operation".to_string(),
+                user_id: "zz-checkout".to_string(),
+                state: "submitted".to_string(),
+                price_id: Some(PRICE_PLUS.to_string()),
+                session_id: Some("cs_tail_paid".to_string()),
+                subscription_id: None,
+            },
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_tail_paid".to_string(),
+            test_session(
+                "cs_tail_paid",
+                "complete",
+                "paid",
+                Some("cus_tail_checkout"),
+                Some("sub_tail_checkout"),
+                Some("zz-paid-operation"),
+            ),
+        );
+        h.store.billing_rows.borrow_mut().insert(
+            "zz-renewal".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_tail_renewal".to_string(),
+                stripe_customer_id: "cus_tail_renewal".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "past_due".to_string(),
+                current_period_end_unix: Some(BILLING_NOW),
+                cancel_at_period_end: false,
+                paid_through_unix: Some(BILLING_NOW),
+                paid_invoice_id: None,
+                grace_until_unix: Some(BILLING_NOW + 3_600),
+            },
+        );
+        for (user, customer, subscription, invoice) in [
+            (
+                "zz-checkout",
+                "cus_tail_checkout",
+                "sub_tail_checkout",
+                "in_tail_checkout",
+            ),
+            (
+                "zz-renewal",
+                "cus_tail_renewal",
+                "sub_tail_renewal",
+                "in_tail_renewal",
+            ),
+        ] {
+            h.store
+                .billing_customers
+                .borrow_mut()
+                .insert(user.to_string(), customer.to_string());
+            h.stripe.subscriptions.borrow_mut().insert(
+                subscription.to_string(),
+                test_subscription(subscription, customer, "active", PRICE_PLUS),
+            );
+            h.stripe.invoices.borrow_mut().insert(
+                invoice.to_string(),
+                test_invoice(
+                    invoice,
+                    customer,
+                    subscription,
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    BILLING_NOW + BILLING_PERIOD,
+                    BILLING_NOW,
+                ),
+            );
+        }
+        for _ in 0..3 {
+            let report = block_on(run_billing_reconcile_sweep(&h.ctx()));
+            assert!(report.operations_attempted <= BILLING_RECONCILE_SWEEP_LIMIT as usize);
+            assert!(report.subscriptions_attempted <= BILLING_RECONCILE_SWEEP_LIMIT as usize);
+        }
+        for user in ["zz-checkout", "zz-renewal"] {
+            let row = live_for(&h, user).expect("later paid row eventually reconciled");
+            assert_eq!(row.status, "active");
+            assert_eq!(row.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        }
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        for index in 0..BILLING_RECONCILE_SWEEP_LIMIT {
+            let row = live_for(&h, &format!("leader-{index:03}")).expect("held leader retained");
+            assert_eq!(row.status, "paused");
+            assert_eq!(row.paid_through_unix, None);
+        }
+    }
+
+    include!("billing_wiring_regressions.rs");
 
     #[test]
     fn billing_concurrent_attempts_converge_on_one_session() {

@@ -4427,10 +4427,32 @@ impl Store for PgStore {
         .await
     }
 
-    async fn list_reconcile_sweep_targets(
+    async fn with_billing_operation<T>(
+        &self,
+        user_id: &str,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, StoreError> {
+        Self::bounded(async {
+            let mut client = self.connect().await?;
+            let transaction = client.transaction().await.map_err(|_| StoreError)?;
+            // Two-int advisory keys do not overlap the one-bigint namespace
+            // used by store_reconcile_outcome's short write transaction.
+            let row = transaction.query_one(
+                "SELECT pg_try_advisory_xact_lock(hashtext('billing_operation'), hashtext($1)) AS acquired",
+                &[&user_id],
+            ).await.map_err(|_| StoreError)?;
+            if !row.try_get::<_, bool>("acquired").map_err(|_| StoreError)? {
+                return Err(StoreError);
+            }
+            let result = operation.await;
+            transaction.commit().await.map_err(|_| StoreError)?;
+            Ok(result)
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn claim_reconcile_sweep_targets(
         &self,
         limit: i64,
-        settlement_secs: i64,
     ) -> Result<Vec<crate::billing_reconcile::ReconcileSweepTarget>, StoreError> {
         Self::bounded(
             async {
@@ -4438,12 +4460,12 @@ impl Store for PgStore {
                 let rows = client
                     .query_typed(
                         crate::billing_reconcile::reconcile_sweep_targets_statement(),
-                        &[(&limit, Type::INT8), (&settlement_secs, Type::INT8)],
+                        &[(&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
                         self.statement_failed(
-                            "api.db.statement_failed.list_reconcile_sweep_targets",
+                            "api.db.statement_failed.claim_reconcile_sweep_targets",
                         )
                     })?;
                 rows.iter()
@@ -4462,7 +4484,7 @@ impl Store for PgStore {
         .await
     }
 
-    async fn list_open_checkout_operations(
+    async fn claim_open_checkout_operations(
         &self,
         limit: i64,
     ) -> Result<Vec<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
@@ -4477,7 +4499,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| {
                         self.statement_failed(
-                            "api.db.statement_failed.list_open_checkout_operations",
+                            "api.db.statement_failed.claim_open_checkout_operations",
                         )
                     })?;
                 rows.iter().map(Self::checkout_op_from_row).collect()
