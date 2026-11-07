@@ -34,7 +34,7 @@ const ON: DispatchMode = DispatchMode::PreparationOnly;
 const OFF: DispatchMode = DispatchMode::Disabled;
 const SMALL: usize = 2_600;
 const LARGE: usize = 70_000;
-const MIGRATION_0047: &str = include_str!("../../../../migrations/0047_ingest_file_dispatch.sql");
+const MIGRATION_0047: &str = include_str!("../../../../migrations/0048_ingest_file_dispatch.sql");
 
 // ---- synthetic objects, bounded fakes -------------------------------------
 

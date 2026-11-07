@@ -83,7 +83,7 @@ pub fn write_nzb_to<W: io::Write>(sink: W, files: &[FileInput]) -> Result<()> {
     let mut writer = Writer::new(sink);
     writer
         .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
-        .map_err(|e| Error::Malformed(format!("write NZB declaration: {e}")))?;
+        .map_err(|_| Error::Malformed("write NZB declaration failed".into()))?;
     let mut root = BytesStart::new("nzb");
     root.push_attribute(("xmlns", "http://www.newzbin.com/DTD/nzb/nzb-1.1"));
     write_start(&mut writer, root)?;
@@ -122,19 +122,19 @@ pub fn write_nzb_to<W: io::Write>(sink: W, files: &[FileInput]) -> Result<()> {
 fn write_start<W: io::Write>(writer: &mut Writer<W>, element: BytesStart<'_>) -> Result<()> {
     writer
         .write_event(Event::Start(element))
-        .map_err(|e| Error::Malformed(format!("write NZB element: {e}")))
+        .map_err(|_| Error::Malformed("write NZB element failed".into()))
 }
 
 fn write_end<W: io::Write>(writer: &mut Writer<W>, name: &str) -> Result<()> {
     writer
         .write_event(Event::End(BytesEnd::new(name)))
-        .map_err(|e| Error::Malformed(format!("write NZB element: {e}")))
+        .map_err(|_| Error::Malformed("write NZB element failed".into()))
 }
 
 fn write_text<W: io::Write>(writer: &mut Writer<W>, text: &str) -> Result<()> {
     writer
         .write_event(Event::Text(BytesText::new(text)))
-        .map_err(|e| Error::Malformed(format!("write NZB text: {e}")))
+        .map_err(|_| Error::Malformed("write NZB text failed".into()))
 }
 
 /// Mirrors the parser's bounds so emitted documents always parse back:
@@ -239,6 +239,30 @@ mod tests {
                     encoded_bytes: 18_412,
                 },
             ],
+        }
+    }
+
+    #[test]
+    fn sink_diagnostics_never_escape_the_writer() {
+        struct FailAfter(usize);
+        impl io::Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::other("sensitive sink context"));
+                }
+                let count = self.0.min(bytes.len());
+                self.0 -= count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let files = [two_segment_file()];
+        let len = write_nzb(&files).unwrap().len();
+        for budget in 0..len {
+            let error = write_nzb_to(FailAfter(budget), &files).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("sensitive sink context"));
         }
     }
 

@@ -5,6 +5,22 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → library → meter → limits) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
+**Target-model note (2026-11-03):** the BYOP step is retired. Under
+ADR 0013/0014 users bring no provider or NZB; the target journey is
+signup → subscription/entitlement → play/seek over the admin-ingested
+shared catalogue, with ingest as an admin action rather than a user step.
+Rows below describe the current specs and their measured gaps, not proof
+that the shared catalogue or pool is implemented. Keep their current
+coverage and update this matrix in the same PRs that change the specs,
+per the rule below.
+
+Current status of the journey's later legs: user NZB ingest is retired, so
+the playback, Range, usage-meter and plan-limit legs are parked by name (see
+rows 3, 4 and the parked-leg list) and are not asserted live today. Offline
+helper pins for them are not exit evidence. Parking does not waive the
+catalogue task's real journey gate: that gate still needs a real exact-head
+staging journey, and these legs return via admin-ingested tracks.
+
 Line numbers below track the cited specs; re-verify with the commands at the
 end of this document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -19,7 +35,7 @@ a manual re-verify item.
   closing it is separate work.
 
 One global caveat applies to every COVERED/PARTIAL row: all live specs
-(`health`, `signup`, `signup-arrival`, `login-magic-link`,
+(`health`, `signup`, `signup-arrival`, `login-magic-link`, `catalogue`,
 `ingest-play-meter`, `player-queue-order`) skip while
 `STAGING_BASE_URL` is unset (file-level skip plus in-test guards, see
 `e2e/README.md` "Activation progression"). Until staging is configured, a
@@ -44,6 +60,24 @@ configured, the harness fails closed instead of skipping.
 ## Coverage that is not an M1 exit step
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
+
+- Catalogue fresh-account contracts (`e2e/tests/catalogue.spec.ts:39`
+  "catalogue aliases return the same empty library for each fresh account",
+  `:60` "catalogue collections expose empty-array contracts for a fresh account",
+  and `:74` "Library renders the real API empty state for a fresh account")
+  assert cookie-authenticated `/v1/library` and `/api/library` parity in two
+  independent account contexts, empty track/release/artist collections, refusal
+  of an unowned release detail, and the Library empty state from the real API
+  without response stubs. They skip only before staging is configured and
+  require the account seam once configured. The journey evidence gate requires
+  all three named cases to pass exactly once and accounts for every parked M1
+  leg by name; missing, duplicate, failed or skipped catalogue cases fail a
+  configured full journey. Empty accounts do not prove populated isolation,
+  rich-row rendering, playback or metering. Populated per-user isolation is
+  covered separately by `workers/api/tests/sql/library_catalogue.sql` on
+  exact-head migration CI; populated staging coverage waits for shared-library
+  read-back and admin publication, not fixture injection. No live result is
+  claimed by this matrix entry.
 
 - Local Favorites bulk queue (`apps/web/tests/library-favorites-queue-all.spec.ts:114`,
   '[FAVQ-01] the queue-all action renders exactly once only when a favorite resolves',
@@ -210,12 +244,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   while the staging legs prove liveness and fail-closed denial behind the
   Access edge with the Access pair only and no app session
   (`e2e/tests/api-worker-anonymous.spec.ts:531` "GET /healthz answers 200 with ok:true and no session",
-  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/vault answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/plans answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:586` "anonymous POST /v1/session/refresh answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:613` "anonymous POST /v1/session/revoke-all answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:637` "GET unknown worker path answers the 404 not_found envelope",
   `e2e/tests/api-worker-anonymous.spec.ts:656` "anonymous OPTIONS preflight is answered by Access and never reaches the Worker"):
-  `GET /healthz` answers 200 with ok true, the vault read and both session
+  `GET /healthz` answers 200 with ok true, the plans read and both session
   mutations answer the generic 401 with no cookie set, and the unknown path
   answers the not_found envelope — each leg first clears the Access-wall
   check so an edge denial can never masquerade as Worker evidence, with

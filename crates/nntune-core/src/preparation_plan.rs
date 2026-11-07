@@ -2,13 +2,16 @@
 //! Format and private service frames are fixed binary sequences. No general
 //! object decoder, unbounded count allocation, filenames or article identities.
 
-use crate::{decrypt::rclone::PLAIN_BLOCK_SIZE, encrypt};
+use crate::{
+    media::{ciphertext_size, PLAIN_CHUNK_SIZE},
+    media_layout,
+};
 
 /// Opened preparation buffers wipe on drop, including cancellation paths.
 pub type PlanBytes = zeroize::Zeroizing<Vec<u8>>;
 
 pub const PLAN_BYTE_CAP: usize = 1_048_576;
-const MAGIC: &[u8; 8] = b"NNPREP01";
+const MAGIC: &[u8; 8] = b"NNPREP02";
 const SPAN_BYTES: usize = 32;
 const MAX_EXACT_INTEGER: u64 = (1_u64 << 53) - 1;
 
@@ -43,7 +46,7 @@ pub struct PreparationPlan {
 }
 
 impl PreparationPlan {
-    fn spans(&self) -> Result<Vec<encrypt::ArticleSpan>, InvalidPlan> {
+    fn spans(&self) -> Result<Vec<media_layout::ArticleSpan>, InvalidPlan> {
         if self.predecessor >= i64::MAX as u64
             || self.original_bytes == 0
             || self.original_bytes > i64::MAX as u64
@@ -59,12 +62,12 @@ impl PreparationPlan {
         // Bound BEFORE calling the existing allocating geometry helper.
         let count = self
             .plaintext_bytes
-            .div_ceil(PLAIN_BLOCK_SIZE)
+            .div_ceil(PLAIN_CHUNK_SIZE)
             .div_ceil(u64::from(self.blocks_per_article));
         if count > (PLAN_BYTE_CAP / SPAN_BYTES) as u64 {
             return Err(InvalidPlan);
         }
-        encrypt::plan_articles(self.plaintext_bytes, u64::from(self.blocks_per_article))
+        media_layout::plan_articles(self.plaintext_bytes, u64::from(self.blocks_per_article))
             .ok_or(InvalidPlan)
     }
 
@@ -87,7 +90,7 @@ impl PreparationPlan {
         out.push(1);
         out.extend(self.blocks_per_article.to_be_bytes());
         out.extend(
-            encrypt::ciphertext_len(self.plaintext_bytes)
+            ciphertext_size(self.plaintext_bytes)
                 .ok_or(InvalidPlan)?
                 .to_be_bytes(),
         );
@@ -161,7 +164,7 @@ impl PreparationPlan {
             blocks_per_article,
         };
         let spans = plan.spans()?;
-        if count != spans.len() || Some(cipher_bytes) != encrypt::ciphertext_len(plaintext_bytes) {
+        if count != spans.len() || Some(cipher_bytes) != ciphertext_size(plaintext_bytes) {
             return Err(InvalidPlan);
         }
         for span in spans {
@@ -319,7 +322,7 @@ mod tests {
     #[test]
     fn canonical_layout_and_short_tail() {
         let bytes = plan().encode().unwrap();
-        assert_eq!(&bytes[..8], b"NNPREP01");
+        assert_eq!(&bytes[..8], b"NNPREP02");
         assert!(PreparationPlan::decode(&bytes).unwrap() == plan());
         assert_eq!(
             PreparationPlan::decode(&bytes).unwrap().encode().unwrap(),
@@ -333,7 +336,7 @@ mod tests {
                     .try_into()
                     .unwrap()
             ),
-            32
+            48
         );
     }
     #[test]

@@ -342,9 +342,18 @@ out-of-band **before** merge, by the migrator role, after board approval for
 the DDL. Applies go through `.github/scripts/apply_migration.py`, which
 verifies the file bytes against `migrations/manifest.toml` and writes a
 `public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
-the same transaction** as the migration; a file carrying its own
-`BEGIN`/`COMMIT` is applied by hand and then recorded with
-`--record-only`. Every invocation requires `--expect-database <name>`
+the same transaction** as the migration effects. A single exact outer
+`BEGIN; ... COMMIT;` envelope is validated lexically and removed only
+in memory: its boundary commands are never executed, and the receipt
+still hashes the complete original file. Strings, quoted identifiers,
+nested comments and dollar-quoted bodies are distinguished from SQL
+boundaries. Nested/multiple/early boundaries, other transaction forms
+(including savepoints, rollback and chaining), psql commands, malformed
+quotes/comments and unsupported lexical forms refuse before connecting.
+`--record-only` does not bypass this check and is **not** a workaround
+for unsupported files or a way to certify unexecuted DDL; it remains
+only for separately verified, authorized historical backfill.
+Every invocation requires `--expect-database <name>`
 (matching the `DATABASE_URL` database and checked again inside the
 transaction against `current_database()` — a URL pointed at the wrong
 database creates and records nothing), and the apply refuses while an
@@ -359,6 +368,46 @@ on a missing, unlisted, sha-mismatched or double-applied migration. That
 comparison, not PR text, is the source of truth for what staging has:
 merging a migration that staging lacks turns `staging-api` red until it
 is applied and recorded.
+
+Every actual runner database child session overrides caller `PGOPTIONS`
+with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
+90-second statement/idle-in-transaction and 10-second lock timeouts.
+Both sessions use `--no-psqlrc`, verified TLS off localhost and the
+expected-database guard inside their transaction. The order is:
+
+1. **Transaction A:** guarded, advisory-locked tracking-table bootstrap
+   and table/column ACL enforcement; commits independently, including on an already-recorded
+   invocation. These ACL writes are intentional, not a read-only no-op.
+2. **Transaction B:** advisory lock, database/history/checksum guards,
+   migration effects and append-only receipt, committed atomically per file.
+
+Failure in B does not undo A, nor does a later file undo any successful
+prefix of earlier files. The advisory lock covers one file transaction,
+**not the whole migration window**. Operators must still arrange the
+separately authorized exclusive window and quiesce writers/importers;
+this runner does not provide that coordination. SQL effects that are not
+transactional in PostgreSQL (for example sequence advancement or external
+function side effects) are not made transactional by the runner. No
+history deletion, automatic destructive rollback or all-files atomicity
+is provided. If a timeout or disconnect leaves commit outcome unknown,
+reconcile the exact original-file checksum receipt and expected catalog/
+effects using the authorized evidence path before a retry; do not infer
+rollback from a missing client acknowledgement or use record-only to
+repair it. `--dry-run` proves composition only, never successful apply.
+A code merge alone authorizes no live operation. A successor runner needs
+fresh exact-source and deployment-evidence review; older runner evidence
+is not transferable.
+
+**Trust boundary.** The runner consumes trusted, reviewed migration bytes
+bound to a manifest entry; it does not make untrusted SQL safe. The lexical
+outer-envelope validator is neither an arbitrary-SQL sandbox nor proof that
+session settings stay unchanged: the startup pin of the session settings
+above is controlled for the A/B transactions, but opaque routine bodies
+(for example function or `DO` bodies) are not generally inspected, so SQL
+inside them can still run and alter session state. Approving manifest bytes
+therefore means reviewing the SQL's actual behavior, including any session
+changes, not just its envelope. PostgreSQL non-transactional effects stay
+non-transactional, as described above.
 
 Rows keep the name a migration was **applied under**. When a PR branch
 renumbers a file that staging already has, the rename must be
@@ -396,6 +445,23 @@ merge base of the target and PR head. Target-only additions after divergence
 are not PR deletions; no merge from the target is required to hide them.
 Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
+
+The secretless PR gate loads its checker and its stdlib-only
+`migration_history.py` import from a separate checkout of the event's full
+trusted **base SHA**. The PR **head SHA** is checked out with full Git
+history under a different root, used only as evidence through `--root`;
+no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+excludes the working directory, `PYTHONPATH` and user-site imports, then
+adds only the trusted checker directory. The checker runs outside both
+checkouts with no API token in its environment; Git ignores global/system
+configuration and disables hooks and filesystem-monitor commands. The
+PR tree cannot supply Git's local configuration, which checkout creates.
+The checked-out head supplies the manifest while pinned Git objects supply
+SQL bytes and ancestry. A PR predating the checker can therefore be
+validated without executing its Python files. Missing trusted checker code,
+manifest, pinned Git objects or API evidence fails closed: there is no
+fallback to PR code and no missing-file pass. This compatibility boundary
+does not grant old heads an exception to the manifest or lineage contract.
 
 The secretless PR gate retains **both** coverage sources: complete,
 paginated net PR-file mappings and every per-parent Git rename in the
@@ -602,7 +668,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
 | Transcode service (ingest `TRANSCODE_CONTAINER` target) | `nntune-transcode-staging` | `nntune-transcode` |
 | MB service (ingest `MB_API` target; per-env `name` committed in `workers/mb/wrangler.toml:24,:61,:80`) | `nntune-mb-staging` | `nntune-mb-production` |
-| Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
+| Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz`, `/api/library` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
@@ -644,6 +710,7 @@ config sources in the Non-storage bindings inventory below.
 | `mb` (`workers/mb/wrangler.toml`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID; the prod section still names the staging bucket until the MB art-cache activation lands (`[[known_drift]]`) |
 | `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
+| `api` (`workers/api/wrangler.toml.example`) | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `ingest` (`workers/ingest/wrangler.toml`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
 | `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
 | `mb` / `ingest` (shared reserved namespace) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; all three bindings share the single reserved namespace per env (dedicated namespaces not provisioned). Keys disjoint by prefix: `ingest:checkpoint:`/`ingest:verify:` (`workers/ingest/src/checkpoint.rs`), `nzb:sha256:` (`workers/ingest/src/dispatch.rs:31`), `mb:lookup:`/`mb:release-recordings:` (`workers/mb/src/lib.rs`). Sharing couples quota/blast radius; accepted for staging; split later without code change |
@@ -768,13 +835,20 @@ without a tag. Production therefore only ever deploys on the release path
 only (`environment: staging` on both deploy jobs). No other GitHub
 environment exists on this repo.
 
-- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
-  pull requests, not on `main`: record the PR whose squash commit is the
-  promotion SHA, and that they were green on that PR's final head
-  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
-  or recorded as a flake/quarantine decision with a card link, never
-  dismissed.
+- [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
+  URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
+  CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
+  never in a local CI mirror. Reviewers and the Release Manager accept
+  these exact-head links as CI evidence, not local full-suite transcripts
+  ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
+  `migrations-staging` and `Devin Review` report on pull requests, not on
+  `main`: record the PR whose squash commit is the promotion SHA, and that
+  they were green on that PR's final head. Answer any advisory CodeRabbit
+  findings without waiting for it. Required checks and review/release
+  gates are unchanged; this evidence does not authorize production or
+  replace the staging, migration and rollback boxes below. A red required
+  check is fixed in code or recorded as a flake/quarantine decision with
+  a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:233-241` runs

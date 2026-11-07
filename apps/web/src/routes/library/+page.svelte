@@ -2,10 +2,12 @@
 	import { onMount, tick } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import {
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
+		libraryItemKey,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		staleLabel,
 		type LibraryItem
@@ -318,6 +320,7 @@
 			target.muted = settings.muted;
 			target.playbackRate = settings.playbackRate;
 			target.currentTime = 0;
+			jumpStatus = '';
 			playingElement = target;
 			await target.play();
 			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
@@ -334,6 +337,7 @@
 	let shareInvalid = $state(false);
 	let shareGeneration = 0;
 	let shareAlive = true;
+	let draggedLibraryItem: LibraryItem | null = null;
 	// Queue-row share outcomes live apart from the browse share feedback so a
 	// queue action never touches browse-row announcements (and vice versa).
 	// An outcome belongs to the queue it was produced for: any queue or
@@ -379,6 +383,11 @@
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
 	let restartStatusVersion = $state(0);
+	// One-shot readout for Back/Forward 10 seconds; cleared on source change
+	// and at the auth boundary.
+	let jumpStatus = $state('');
+	let jumpStatusVersion = $state(0);
+	let lastJumpSeek: { element: HTMLAudioElement; target: number } | null = null;
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -402,6 +411,7 @@
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
+			draggedLibraryItem = null;
 			items = state.items;
 			staleAt = state.staleAt;
 			loading = state.loading;
@@ -601,8 +611,7 @@
 		};
 	}
 
-	function selectTrack(id: string): void {
-		const item = items.find((track) => track.id === id);
+	function selectTrack(id: string, item = items.find((track) => track.id === id)): void {
 		if (!item) return;
 		clearShareFeedback();
 		pendingShareSeek = null;
@@ -684,7 +693,7 @@
 		const before = queue.tracks.length;
 		// Use the shelf's resolved star order and the same deduping path as
 		// individual taps. No persistence, playback, or account lookup here.
-		for (const track of favoriteTracks) selectTrack(track.id);
+		for (const track of favoriteTracks) selectTrack(track.id, track);
 		const added = queue.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
 	}
@@ -822,6 +831,7 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			restartCanSeek = false;
 			restartStatus = '';
+			jumpStatus = '';
 		}
 	}
 
@@ -893,6 +903,7 @@
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
+		jumpStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 	}
@@ -963,10 +974,9 @@
 		else setQueueShareOutcome('', url);
 	}
 
-	async function copyTrackLink(id: string): Promise<void> {
+	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
 		clearShareFeedback();
 		const generation = shareGeneration;
-		const item = items.find((track) => track.id === id);
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queue);
 		const seconds =
@@ -1029,6 +1039,9 @@
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		// A same-source share skips the source-change reset; the share moves the
+		// position, so an earlier jump readout no longer describes it.
+		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
 		void tick().then(() => applyPendingShareSeek());
@@ -1057,11 +1070,23 @@
 		}
 	}
 
-	function handleSeeking(): void {
+	function handleSeeking(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (!element) return;
+		// Keep the jump's own queued event from erasing its announcement.
+		// A different native seek retires feedback for the old position.
+		if (
+			lastJumpSeek?.element !== element ||
+			!Number.isFinite(element.currentTime) ||
+			Math.abs(element.currentTime - lastJumpSeek.target) > 0.05
+		) {
+			jumpStatus = '';
+			lastJumpSeek = null;
+		}
 		// A listener's own seek wins over a pending late-duration adjustment.
 		if (
 			pendingShareSeek?.appliedSeconds != null &&
-			audioEl?.currentTime !== pendingShareSeek.appliedSeconds
+			element.currentTime !== pendingShareSeek.appliedSeconds
 		) {
 			pendingShareSeek = null;
 		}
@@ -1168,6 +1193,7 @@
 		if (Math.abs(position) <= 0.05) {
 			try {
 				element.currentTime = 0;
+				jumpStatus = '';
 			} catch {
 				// Already at the start; a refusal changes nothing there.
 			}
@@ -1177,6 +1203,7 @@
 		let refused = false;
 		try {
 			element.currentTime = 0;
+			jumpStatus = '';
 		} catch {
 			refused = true;
 		}
@@ -1193,6 +1220,30 @@
 				? withTitle('Restarted')
 				: withTitle('Could not restart')
 		);
+	}
+
+	/**
+	 * Back/Forward 10 seconds act on the mounted audio element for the current
+	 * source only. Like restart, the gesture supersedes a pending inbound-share
+	 * seek for that source even if the jump is refused, so later metadata
+	 * events cannot move the position to the share time.
+	 */
+	function jumpRelative(direction: JumpDirection): void {
+		const element = audioEl;
+		const current = queueCurrentTrack(queue);
+		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
+		if (live && pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === streamUrl) {
+			pendingShareSeek = null;
+		}
+		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
+		// A no-write outcome must not disown an earlier jump's queued event.
+		// handleSeeking still retires feedback at a different element or position.
+		if (element && outcome.kind === 'jumped') {
+			lastJumpSeek = { element, target: outcome.target };
+		}
+		jumpStatus = describeJump(direction, outcome);
+		// Re-announce a repeated identical outcome.
+		jumpStatusVersion += 1;
 	}
 
 	if (typeof window !== 'undefined') {
@@ -1664,7 +1715,15 @@
 
 
 	function interactionIds(id: string): string[] {
-		return selectedIds.includes(id) ? renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id) : [id];
+		return selectedIds.includes(id) ? [...new Set(renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id))] : [id];
+	}
+
+	// Re-resolve deferred actions after refresh without substituting another occurrence.
+	function occurrenceItems(item: LibraryItem): LibraryItem[] {
+		const key = libraryItemKey(item);
+		const current = items.find((track) => libraryItemKey(track) === key);
+		const others = items.filter((track) => track.id !== item.id);
+		return current ? [current, ...others] : others;
 	}
 
 	function announceInteraction(text: string): void {
@@ -1672,8 +1731,8 @@
 		queueAnnouncementVersion += 1;
 	}
 
-	function availableInteractionIds(ids: readonly string[], queued = false): string[] {
-		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : items;
+	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
+		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : source;
 		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
@@ -1684,15 +1743,15 @@
 		return missing ? ` ${missing} ${missing === 1 ? 'track is' : 'tracks are'} no longer available.` : '';
 	}
 
-	async function playLibraryIds(ids: readonly string[]): Promise<void> {
-		const surviving = availableInteractionIds(ids);
-		const first = items.find((item) => item.id === surviving[0]);
+	async function playLibraryIds(ids: readonly string[], catalogue: readonly LibraryItem[] = items): Promise<void> {
+		const surviving = availableInteractionIds(ids, false, catalogue);
+		const first = catalogue.find((item) => item.id === surviving[0]);
 		if (!first) return;
 		const added = surviving.filter((id) => !queue.tracks.some((track) => track.id === id)).length;
 		// Play now moves the complete selection, including a previously current
 		// member. Only Play next deliberately leaves the current track in place.
 		const boundary = queue.tracks.slice(queue.currentIndex + 1).find((track) => !surviving.includes(track.id));
-		const base = insertTracks(queue, knownTracks(surviving), boundary?.id ?? null);
+		const base = insertTracks(queue, knownTracks(surviving, catalogue), boundary?.id ?? null);
 		const index = base.tracks.findIndex((track) => track.id === first.id);
 		const target = base.tracks[index];
 		if (!target) return;
@@ -1704,16 +1763,16 @@
 		await playSelectedTrack(target, source, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
-	function appendInteractionIds(ids: readonly string[]): void {
-		const surviving = availableInteractionIds(ids);
+	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, false, source);
 		if (!surviving.length) return;
-		const result = appendSelection(queue, surviving, items);
+		const result = appendSelection(queue, surviving, source);
 		replaceQueue(result.queue);
 		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
 	}
 
-	function favoriteInteractionIds(ids: readonly string[], queued = false): void {
-		const surviving = availableInteractionIds(ids, queued);
+	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, queued, source);
 		if (!surviving.length) return;
 		const remove = surviving.every((id) => favoriteIds.has(id));
 		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
@@ -1721,7 +1780,7 @@
 		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		const already = surviving.length - changed.length;
 		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
-		const track = (queued ? queue.tracks : items).find((track) => track.id === surviving[0]);
+		const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
 		const subject = ids.length === 1 && track ? displayTitle(track) : count;
 		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
 			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
@@ -1731,25 +1790,27 @@
 		}
 	}
 
-	function knownTracks(ids: readonly string[]): Track[] {
+	function knownTracks(ids: readonly string[], source: readonly LibraryItem[] = items): Track[] {
 		if (loading || libraryUnavailable) return [];
 		return ids.flatMap((id) => {
-			const item = items.find((item) => item.id === id);
+			const item = source.find((item) => item.id === id);
 			return item ? [queuedTrackFor(item)] : [];
 		});
 	}
 
-	function queueNextIds(ids: readonly string[]): void {
-		const surviving = availableInteractionIds(ids);
+	function queueNextIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, false, source);
 		if (!surviving.length) return;
-		const next = insertTracksNext(queue, knownTracks(surviving));
+		const next = insertTracksNext(queue, knownTracks(surviving, source));
 		if (next === queue) return;
 		replaceQueue(next);
 		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
 	}
 
 	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
-		const next = insertTracks(queue, knownTracks(ids), beforeId);
+		const source = draggedLibraryItem ? occurrenceItems(draggedLibraryItem) : items;
+		draggedLibraryItem = null;
+		const next = insertTracks(queue, knownTracks(ids, source), beforeId);
 		if (next === queue) return;
 		const added = next.tracks.length - queue.tracks.length;
 		replaceQueue(next);
@@ -1784,26 +1845,31 @@
 		queueAnnouncementVersion += 1;
 	}
 
-	function playbackMenuActions(ids: readonly string[]): MenuAction[] {
+	function playbackMenuActions(ids: readonly string[], source: () => readonly LibraryItem[] = () => items): MenuAction[] {
 		return [
-			{ label: 'Play now', run: () => void playLibraryIds(ids) },
-			{ label: 'Play next', run: () => queueNextIds(ids) },
-			{ label: 'Add to queue', run: () => appendInteractionIds(ids) }
+			{ label: 'Play now', run: () => void playLibraryIds(ids, source()) },
+			{ label: 'Play next', run: () => queueNextIds(ids, source()) },
+			{ label: 'Add to queue', run: () => appendInteractionIds(ids, source()) }
 		];
 	}
 
-	function openTrackMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }): void {
-		if (loading || libraryUnavailable || !items.some((item) => item.id === id)) return;
+	function openTrackMenu(item: LibraryItem, invoker: HTMLElement, point?: { x: number; y: number }): void {
+		if (loading || libraryUnavailable || !items.includes(item)) return;
+		const id = item.id;
+		const source = (): LibraryItem[] => occurrenceItems(item);
 		const ids = interactionIds(id);
 		const starred = ids.every((id) => favoriteIds.has(id));
-		const actions = playbackMenuActions(ids);
+		const actions = playbackMenuActions(ids, source);
 		actions.push(
-			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids) },
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, false, source()) },
 			unavailablePlaylistAction
 		);
-		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } });
+		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => {
+			const current = source().find((track) => track.id === id);
+			if (current && availableInteractionIds([id]).length) void copyTrackLink(id, current);
+		} });
 		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="track-more"]') ?? invoker : invoker;
-		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(items.find((item) => item.id === id)!)}`;
+		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(item)}`;
 		const displayedIds = renderedItems.map((item) => item.id);
 		const index = displayedIds.indexOf(id);
 		trackMenu = { ...menuAt(target, label, actions), fallbackFocus: () => {
@@ -2085,14 +2151,14 @@
 			{:else}
 				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
 				<ul>
-					{#each favoriteTracks as track, index (track.id)}
+					{#each favoriteTracks as track, index (libraryItemKey(track))}
 						<li class="nt-favorite-item" data-testid="favorite-item" data-id={track.id}
 							use:contextMenu={(invoker, point) => openFavoriteMenu(track.id, invoker, point)}>
 							<button
 								type="button"
 								class="nt-favorite-row"
 								data-context-menu-longpress
-								onclick={() => selectTrack(track.id)}
+								onclick={() => selectTrack(track.id, track)}
 							>
 								{displayTitle(track)}
 								{#if displayArtist(track)}
@@ -2527,8 +2593,7 @@
 						oncanplay={refreshRestartAvailability}
 						onprogress={refreshRestartAvailability}
 						ontimeupdate={refreshRestartAvailability}
-						onseeking={handleSeeking}
-					></audio>
+						onseeking={handleSeeking}					></audio>
 				{/key}
 				<button
 					class="nt-button nt-library-restart"
@@ -2545,6 +2610,27 @@
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
 			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
+			<div class="nt-player-jump">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-back"
+					aria-label="Back 10 seconds"
+					onclick={() => jumpRelative('back')}
+				>
+					Back 10 s
+				</button>
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-forward"
+					aria-label="Forward 10 seconds"
+					onclick={() => jumpRelative('forward')}
+				>
+					Forward 10 s
+				</button>
+			</div>
+			<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
 		</section>
 	{/if}
 </main>
@@ -2557,17 +2643,21 @@
 
 {#snippet trackRows(tracks: LibraryItem[])}
 	<ul class="nt-track-list" role="list">
-		{#each tracks as track (track.id)}
+		{#each tracks as track (libraryItemKey(track))}
 			{@const queued = queuedIds.has(track.id)}
 			<!-- svelte-ignore a11y_no_noninteractive_tabindex: programmatic menu-return target only. -->
 			<!-- svelte-ignore a11y_no_noninteractive_element_interactions: modifier clicks extend the checkbox selection; keyboard equivalents are list-scoped above. -->
 			<li class="nt-library-item" data-testid="library-item" data-id={track.id}
 				tabindex="-1"
 				data-selected={selectedIds.includes(track.id) ? '' : undefined}
-				use:contextMenu={(invoker, point) => openTrackMenu(track.id, invoker, point)}
+				use:contextMenu={(invoker, point) => openTrackMenu(track, invoker, point)}
 				onclickcapture={(event) => libraryRowClick(event, track.id)}
 				draggable="true"
-				ondragstart={(event) => startTrackDrag(event, interactionIds(track.id))}
+				ondragstart={(event) => {
+					draggedLibraryItem = track;
+					startTrackDrag(event, interactionIds(track.id));
+				}}
+				ondragend={() => { draggedLibraryItem = null; }}
 			>
 				<input
 					class="nt-library-select"
@@ -2592,7 +2682,7 @@
 						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 						: undefined}
 					aria-pressed={queued ? true : undefined}
-					onclick={() => selectTrack(track.id)}
+					onclick={() => selectTrack(track.id, track)}
 				>
 					{displayTitle(track)}
 					{#if displayArtist(track)}
@@ -2605,14 +2695,14 @@
 				<button type="button" class="nt-library-more"
 					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
 					aria-haspopup="menu"
-					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
+					onclick={(event) => openTrackMenu(track, event.currentTarget)}
 				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 				<button
 					type="button"
 					class="nt-library-copy"
 					data-testid="library-copy-link"
 					aria-label={`Copy link ${displayTitle(track)}`}
-					onclick={() => void copyTrackLink(track.id)}
+					onclick={() => void copyTrackLink(track.id, track)}
 				>
 					Copy link
 				</button>
@@ -2765,6 +2855,15 @@
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;
+	}
+	.nt-player-jump {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-player-jump button {
+		min-height: 2.75rem;
 	}
 	.nt-library-order {
 		display: flex;

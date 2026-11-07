@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -26,20 +26,21 @@ function shell(section: string): string {
 
 // Run only extracted preflight/report shell. No Actions, provider calls,
 // ambient credentials, generated Wrangler config or deployment execution.
-function runShell(script: string, env: Record<string, string>) {
+function runShell(script: string, env: Record<string, string>, expectStatus: number | 'nonzero' = 0, cwdDir?: string) {
   const scratch = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'api-outcome-'));
   const outputFile = join(scratch, 'output');
   const summaryFile = join(scratch, 'summary');
   try {
     const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], {
-      cwd: scratch,
+      cwd: cwdDir ?? scratch,
       encoding: 'utf8',
       timeout: 5_000,
       env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile, ...env },
     });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
-    expect(result.status, result.stdout + result.stderr).toBe(0);
+    if (expectStatus === 'nonzero') expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    else expect(result.status, result.stdout + result.stderr).toBe(expectStatus);
     const read = (path: string): string => {
       try { return readFileSync(path, 'utf8'); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -53,6 +54,8 @@ function runShell(script: string, env: Record<string, string>) {
 }
 
 const sourceSha = '0123456789abcdef0123456789abcdef01234567';
+// Required staging-api vars. HYPERDRIVE_ID_MB is deliberately absent: the
+// mirror is optional (absent or empty means no-enrichment mode).
 const dummyVars = {
   HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-value',
   API_RP_ID_STAGING: 'dummy-rp-id-value',
@@ -125,12 +128,14 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     }
   });
 
-  // All seven incomplete combinations preserve safe skip, even though the
-  // preflight and job may succeed. Values must never enter the summary.
+  // All seven incomplete combinations of the three required vars preserve safe
+  // skip, with or without the optional mirror var. Values never enter the summary.
   for (let mask = 0; mask < 7; mask++) {
     test(`missing public vars (mask ${mask}) cannot report deployed`, () => {
       const vars = Object.fromEntries(Object.entries(dummyVars).filter((_, index) => mask & (1 << index)));
-      const config = runShell(shell(step('Check api staging configuration')), vars);
+      const config = runShell(shell(step('Check api staging configuration')), { ...vars, HYPERDRIVE_ID_MB: 'dummy-mirror-value' });
+      expect(runShell(shell(step('Check api staging configuration')), vars).output).toBe('configured=false\n');
+      expect(config.summary).not.toContain('HYPERDRIVE_ID_MB');
       expect(config.output).toBe('configured=false\n');
       for (const name of Object.keys(dummyVars).filter(name => !(name in vars))) {
         expect(config.summary).toContain(name);
@@ -141,7 +146,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
       expect(report.output).toBe('deployed=false\noutcome=unconfigured\nsource_sha=\n');
       expect(report.summary).toContain('deployment outcome: unconfigured');
       expect(report.summary).not.toContain(sourceSha);
-      for (const value of Object.values(dummyVars)) {
+      for (const value of [...Object.values(dummyVars), 'dummy-mirror-value']) {
         expect(config.summary + config.log + report.summary + report.log).not.toContain(value);
       }
     });
@@ -185,6 +190,11 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
   test('complete vars and successful executed steps report the deployed source only', () => {
     const config = runShell(shell(step('Check api staging configuration')), dummyVars);
     expect(config.output).toBe('configured=true\n');
+    const mirrorModes: Record<string, string>[] = [{}, { HYPERDRIVE_ID_MB: '' }, { HYPERDRIVE_ID_MB: 'dummy-mirror-value' }];
+    for (const mirror of mirrorModes) {
+      const withMirror = runShell(shell(step('Check api staging configuration')), { ...dummyVars, ...mirror });
+      expect(withMirror.output).toBe('configured=true\n');
+    }
     const result = runShell(shell(reporter), positive);
     expect(result.output).toBe(`deployed=true\noutcome=deployed\nsource_sha=${sourceSha}\n`);
     expect(result.summary).toContain('deployment outcome: deployed');
@@ -194,5 +204,80 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     expect(result.summary).toContain(`Source SHA: ${sourceSha}`);
     expect(result.summary).toContain(`BUILD_SHA var: ${sourceSha}`);
     expect(result.summary).toContain('not health, rollback or full staging acceptance evidence');
+  });
+
+  test('config step no longer requires or reads HYPERDRIVE_ID_MB', () => {
+    const section = step('Check api staging configuration');
+    expect(section).not.toContain('HYPERDRIVE_ID_MB');
+  });
+
+  // Extracted generation shell, run offline against a dummy manifest. No
+  // provider calls, credentials or deploy execution.
+  const generator = step('Generate staging wrangler.toml');
+  function generate(mirror: Record<string, string>) {
+    const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'api-generate-'));
+    try {
+      const apiDir = join(probe, 'workers/api');
+      mkdirSync(apiDir, { recursive: true });
+      mkdirSync(join(probe, '.github/scripts'), { recursive: true });
+      writeFileSync(join(probe, '.github/scripts/binding_manifest.toml'), `
+[[worker]]
+name = "api"
+[[worker.binding]]
+binding = "HYPERDRIVE"
+staging = "dummy-hyperdrive-staging"
+[[worker.binding]]
+binding = "MB_DB"
+staging = "dummy-mb-mirror"
+prod = "dummy-mb-mirror"
+`);
+      const env = {
+        API_RP_ID_STAGING: 'staging.nntune.com',
+        API_RP_ORIGIN_STAGING: 'https://staging.nntune.com',
+        HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-staging',
+        ...mirror,
+      };
+      const run = (expected: number | 'nonzero') => runShell(shell(generator), env, expected, apiDir);
+      return { run, apiDir, configPath: join(apiDir, 'wrangler.toml'), read: (path: string) => (existsSync(path) ? readFileSync(path, 'utf8') : undefined) };
+    } catch (error) {
+      rmSync(probe, { recursive: true, force: true });
+      throw error;
+    }
+  }
+  // runShell removes only its own scratch; the probe tree is removed here.
+  function withGenerated(mirror: Record<string, string>, expected: number | 'nonzero') {
+    const g = generate(mirror);
+    try {
+      const result = g.run(expected);
+      return { ...result, toml: g.read(g.configPath) };
+    } finally {
+      rmSync(join(g.apiDir, '../..'), { recursive: true, force: true });
+    }
+  }
+
+  for (const [name, mirror] of [['unset', {}], ['empty', { HYPERDRIVE_ID_MB: '' }]] as const) {
+    test(`${name} HYPERDRIVE_ID_MB omits MB_DB and reports no-enrichment mode`, () => {
+      const result = withGenerated(mirror, 0);
+      expect(result.toml).toBeDefined();
+      expect(result.toml).toContain('binding = "HYPERDRIVE"');
+      expect(result.toml).toContain('id = "dummy-hyperdrive-staging"');
+      expect(result.toml).not.toContain('MB_DB');
+      expect(result.toml).not.toContain('HYPERDRIVE_ID_MB');
+      expect(result.summary).toContain('mirror: absent (no-enrichment mode)');
+    });
+  }
+
+  test('matching HYPERDRIVE_ID_MB binds MB_DB after the primary Hyperdrive', () => {
+    const result = withGenerated({ HYPERDRIVE_ID_MB: 'dummy-mb-mirror' }, 0);
+    expect(result.toml).toContain('[[env.staging.hyperdrive]]\nbinding = "MB_DB"\nid = "dummy-mb-mirror"\n');
+    expect(result.toml!.indexOf('binding = "HYPERDRIVE"')).toBeLessThan(result.toml!.indexOf('binding = "MB_DB"'));
+    expect(result.summary).not.toContain('no-enrichment');
+  });
+
+  test('mismatched HYPERDRIVE_ID_MB is refused before any config is written', () => {
+    const result = withGenerated({ HYPERDRIVE_ID_MB: 'dummy-other-mirror' }, 'nonzero');
+    expect(result.log).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
+    expect(result.toml).toBeUndefined();
+    expect(result.summary).not.toContain('mirror:');
   });
 });

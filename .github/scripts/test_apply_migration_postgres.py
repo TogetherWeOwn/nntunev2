@@ -436,6 +436,9 @@ def main():
 
             run_history_cases(fixture, history_manifest(fixture.root), test_env)
             run_concurrent_apply(fixture.root, test_env)
+
+        import apply_migration_runtime_cases
+        apply_migration_runtime_cases.run(env, test_env)
     finally:
         run_psql(env, f"DROP DATABASE {TEST_DB};")
 

@@ -22,7 +22,7 @@ metering primitives below are built to support them from day one.
 | Concern | Choice |
 |---|---|
 | Backend | **Rust** (`workers-rs` → `wasm32`) for backend Workers, including Durable Objects; the staging Tail alert Worker (`workers/observability`) is JavaScript |
-| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
+| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native; the engine is [velmora](https://github.com/TogetherWeOwn/velmora), pinned by git `rev` |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
 | Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
 | Object cache | **R2** for audio / artwork cache |
@@ -39,15 +39,16 @@ subscription mechanism lives in `docs/adr/0005-billing.md`; no vendor is
 chosen or changed here.
 
 ```text
-crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
+crates/nntune-core   # velmora engine re-export (NNTP, yEnc, NZB, decrypt, par2) + transcode (wasm32 + native)
 workers/             # Rust workers-rs backends incl. Durable Objects
 apps/web/            # SvelteKit frontend (adapter-cloudflare)
 ```
 
 ## Quickstart
 
-Setup, test, then read the runbooks before touching staging. Every command
-below was run verbatim against a clean checkout; expected results are noted.
+Set up for focused development, push a PR branch for GitHub Actions
+verification, then read the runbooks before touching staging. Full suites
+and CI gates do not run locally.
 
 ### Prerequisites
 
@@ -84,45 +85,55 @@ dev dependencies the harness needs — install it with
 
 ### Test
 
-Local Rust builds go through the bounded Cargo pool wrapper — prefix
-the `cargo` commands below with `python3 scripts/cargo_cache.py run --`,
-e.g. `python3 scripts/cargo_cache.py run -- test --workspace`. Pool rules
-(two slots, exit 75 when refused, never a per-worktree `target/`) live in
-the [agent notes](AGENTS.md#local-rust-builds-the-bounded-cargo-pool);
-checkouts without the pool use the bare commands as listed.
+Push commits to the PR branch and **open a draft PR while incomplete**.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the Rust
+workspace and standalone Worker suites, frontend checks/builds, and offline
+E2E harness validation; its aggregate gate is **`ci-ok`**. There is no
+`check.yml` in this repo. Do not reproduce this workflow as a local full
+suite or CI mirror. Mark the PR ready once the work is complete.
 
-```sh
-# Rust workspace (crates/*, workers/stream, workers/youtube,
-# containers/repair, containers/transcode)
-cargo test --workspace
-# Standalone Worker crates (excluded from the workspace in Cargo.toml; each
-# carries a committed lockfile: Cargo.lock plus workers/{api,ingest,mb,
-# repair,transcode}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
-# The cargo-deny job's `Prove committed lockfiles are fresh` step checks
-# the workspace and api/mb/ingest/repair lockfiles (.github/workflows/ci.yml).
-# Those four Worker jobs also pass --locked to every test/clippy/check
-# invocation, including wasm32 checks and clippy, so CI cannot silently
-# re-resolve their dependency graphs. Formatting checks are unchanged.
-# The workspace rust-test job separately pins one --locked probe:
-# nntune-core --no-default-features.
+Local test execution is limited to focused reproduction of **one failing
+test or crate** from Actions. Small Rust reproductions use the
+[bounded pool](AGENTS.md#local-rust-builds-the-bounded-cargo-pool);
+missing/refused pools never permit bare compiling Cargo or a per-worktree
+`target/`. Heavy focused work uses the guarded `boat` PATH wrapper with
+`--no-env`, source-only export and verified cleanup. Boat fallback does not
+authorize a full suite, CI mirror or heavy raw-host run. See
+[verification policy](CONTRIBUTING.md#verification-github-actions-first)
+for the permitted paths; defer to Actions when none is available.
+
+In Actions, the `cargo-deny` job's `Prove committed lockfiles are fresh`
+step checks the workspace and api/mb/ingest/repair lockfiles.
+Those four Worker jobs also pass --locked to every test/clippy/check
+invocation, including wasm32 checks and clippy, so CI cannot silently
+re-resolve their dependency graphs. Formatting checks are unchanged.
+The workspace rust-test job separately pins one --locked probe:
+nntune-core --no-default-features. This is not a claim that every workspace
+command uses `--locked`; the standalone transcode Worker is outside the
+four-Worker freshness/compiling-flag gate.
+
+The four Worker test commands below document existing **Actions coverage**,
+not a local checklist:
+
+```text
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
-cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
-# Web frontend (from apps/web): unit tests, then typecheck
-pnpm test
-pnpm check
-# E2E harness (from e2e): typecheck, offline self-tests, then spec discovery
-npm run typecheck
-npm run test:unit
-npm run e2e:list
 ```
 
-`npm run e2e:list` compiles the suite and lists the specs with no staging
-needed. Live staging runs stay in CI — see below.
+The API job additionally selects its ignored acceptance cases and skips
+Postgres cases handled by the separate database job. The transcode Worker
+job runs its own tests without `--locked`. These dependency/security gates
+remain unchanged.
 
-Public-repo hygiene gate (part of `ci-ok`, from the repo root):
+Record the reviewed head SHA and exact-head **Actions run/job links** with
+conclusions as CI evidence, not local transcripts. Reviewers and the
+Release Manager use those links without waiving staging, rollback or
+production approval gates. Live staging runs stay in Actions — see below.
+
+For a documentation-only change, focused static/diff checks are sufficient
+locally; for example the public-text scan (also part of `ci-ok`):
 
 ```sh
 python3 .github/scripts/public_text_lint.py
@@ -197,9 +208,12 @@ review for personal data or the policy keeping the full account ID private.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Every PR must pass `ci-ok`,
-`gitleaks`, `pr-lint`, `migrations-staging`, `CodeRabbit` and `Devin Review`,
-with review findings fixed or answered, before its author merges it.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for required checks and the
+review/merge policy. `ci-ok`, `gitleaks`, `pr-lint`, `migrations-staging`
+and `Devin Review` must pass, and review findings must be fixed or answered.
+CodeRabbit is advisory; answer its findings without waiting for it. The
+final-stage reviewer merges the pinned head before approval; production
+merges/promotions still require exact-head Release Manager authorization.
 
 ## Security
 

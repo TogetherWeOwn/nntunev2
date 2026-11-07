@@ -6,7 +6,7 @@
 use super::*;
 
 const MIGRATION_0046: &str =
-    include_str!("../../../../migrations/0046_posted_file_attempt_receipts.sql");
+    include_str!("../../../../migrations/0047_posted_file_attempt_receipts.sql");
 
 async fn durable(db: &mut Client, c: &Case, key: &str, expected: i64) -> AttemptAcquisition {
     match prepare_durable_attempt_acquisition(db, &c.job, &c.owner, key, expected).await {

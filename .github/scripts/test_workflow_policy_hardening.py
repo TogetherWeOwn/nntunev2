@@ -91,10 +91,32 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 self.assertIn(f"uses: $/.github/workflows/{callee}\n", text)
                 self.assertNotIn(f"uses: ./.github/workflows/{callee}", text)
 
+    def test_candidate_evidence_uses_staging_without_a_deployment(self):
+        production = (WORKFLOWS / "deploy-production.yml").read_text()
+        evidence = job(production, "staging-evidence")
+        self.assertIn("    environment:\n      name: staging\n      deployment: false\n", evidence)
+        self.assertEqual(
+            sorted(re.findall(r"secrets\.([A-Z_]+)", evidence)),
+            ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "STAGING_BASE_URL"],
+        )
+        self.assertIn("persist-credentials: false", evidence)
+        self.assertIn("run: python3 -I ci/staging_admission.py verify", evidence)
+        self.assertNotIn("environment:", job(production, "preflight"))
+        self.assertIn("      name: production\n", job(production, "deploy-production"))
+        self.assertIn("needs: [preflight, staging-evidence]", job(production, "deploy-production"))
+
     def test_regression_suite_is_a_required_ci_step(self):
         ci = (WORKFLOWS / "ci.yml").read_text()
         self.assertIn("python3 .github/scripts/test_workflow_policy_hardening.py", job(ci, "public-text"))
         self.assertIn("public-text", job(ci, "ci-ok"))
+
+    def test_codeql_reports_on_every_pull_request(self):
+        # The code_scanning ruleset waits for CodeQL on every PR; a path filter
+        # leaves Rust/docs-only PRs waiting forever.
+        text = (WORKFLOWS / "codeql.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("  pull_request:\n", triggers)
+        self.assertNotRegex(triggers, r"(?m)^\s+paths(-ignore)?:")
 
 
 if __name__ == "__main__":

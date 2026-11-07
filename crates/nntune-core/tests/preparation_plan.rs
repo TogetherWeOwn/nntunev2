@@ -21,7 +21,7 @@ fn plan(size: u64) -> PreparationPlan {
 
 #[test]
 fn one_byte_golden_vector_pins_order_width_endianness_and_header_geometry() {
-    let mut golden = b"NNPREP01\x01o\x01j\x01p\x01".to_vec();
+    let mut golden = b"NNPREP02\x01o\x01j\x01p\x01".to_vec();
     golden.extend([0; 8]);
     golden.extend([2; 32]);
     golden.extend(9_u64.to_be_bytes());
@@ -32,9 +32,9 @@ fn one_byte_golden_vector_pins_order_width_endianness_and_header_geometry() {
     golden.extend([3; 32]);
     golden.push(1);
     golden.extend(1_u32.to_be_bytes());
-    golden.extend(49_u64.to_be_bytes()); // 32-byte header + one byte + tag.
+    golden.extend(65_u64.to_be_bytes()); // 48-byte header + one byte + tag.
     golden.extend(1_u32.to_be_bytes());
-    for n in [0_u64, 1, 32, 17] {
+    for n in [0_u64, 1, 48, 17] {
         golden.extend(n.to_be_bytes());
     }
     assert_eq!(plan(1).encode().unwrap(), golden);
@@ -112,4 +112,16 @@ fn private_reference_never_accepts_a_trailer_or_unknown_frame_version() {
     changed = encoded;
     changed.push(0);
     assert!(PlanReference::decode(&changed).is_err());
+}
+
+#[test]
+fn superseded_plan_version_and_legacy_geometry_never_replay_as_media_v1() {
+    let bytes = plan(1).encode().unwrap();
+    let mut legacy = bytes.clone();
+    legacy[..8].copy_from_slice(b"NNPREP01");
+    assert!(PreparationPlan::decode(&legacy).is_err());
+    let mut legacy_offset = bytes;
+    let len = legacy_offset.len();
+    legacy_offset[len - 16..len - 8].copy_from_slice(&32_u64.to_be_bytes());
+    assert!(PreparationPlan::decode(&legacy_offset).is_err());
 }

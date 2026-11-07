@@ -1,10 +1,12 @@
-//! `posted_files` writer: pure statements (migrations 0035 + 0036).
+//! Legacy `posted_files` custody statements, retained without reinterpretation.
 //!
-//! Pipeline position: the post flow writes one content-global row per
-//! tagged plaintext sha256 after the poster seals the file (encrypt with
-//! `nntune_core::encrypt`, NZB via `nntune_core::nzb_writer`, article plan
-//! via `plan_articles`) and the API-side mint wraps the per-file key and
-//! the manifest in the existing AES-GCM envelope v2. This module is pure
+//! These helpers still describe the historical 24-byte nonce record, NOT a
+//! `velmora.media.v1` writer. A forward schema and adapter change is required
+//! before accepting its 48-byte committing header and trusted format/mode.
+//! Do not synthesize a legacy nonce from that header or relabel existing rows.
+//!
+//! The API-side mint wraps the per-file key and manifest in the existing
+//! AES-GCM envelope v2. This module is pure
 //! and order-agnostic: it pins the full-row insert, the sha re-select, the
 //! verify/retention touches, the parameter orders, and the zero-row
 //! classification the wire-up uses. Zero execution here — the

@@ -472,7 +472,7 @@ fn redaction_and_trace_validation_stay_fail_closed_with_release() {
     );
     assert!(
         nntune_logging::fields_from_json(serde_json::json!({
-            "route": "GET /v1/vault/victim@example.com",
+            "route": "GET /v1/library/victim@example.com",
             "build_sha": VALID_SHA,
             "release": VALID_SHA,
         }))

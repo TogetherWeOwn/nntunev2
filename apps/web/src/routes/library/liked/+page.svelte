@@ -2,6 +2,7 @@
 	import {
 		browserStorage,
 		invalidateLibraryCache,
+		libraryItemKey,
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import {
@@ -119,7 +120,7 @@
 		<p>No liked tracks yet. Star tracks in Your Library to find them here.</p>
 	{:else}
 		<ul>
-			{#each liked as item (item.id)}
+			{#each liked as item (libraryItemKey(item))}
 				<li>
 					{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}
 					<button type="button" onclick={() => removeFavorite(item.id, displayTitle(item))}>

@@ -39,6 +39,14 @@ on:
         description: Promotion commit SHA the staging deploy was built from
         type: string
         required: false
+      api_deployed:
+        description: Actual same-run staging-api deployed output (not job success)
+        type: string
+        required: false
+      api_source_sha:
+        description: Actual same-run staging-api source output
+        type: string
+        required: false
       api_deploy_outcome:
         # Same-run staging-api outcome (deployed / skipped / unconfigured /
         # failed / cancelled). The build-identity spec holds the API
@@ -367,6 +375,9 @@ jobs:
           # build-identity spec fails closed when it is absent or malformed.
           EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}
           API_DEPLOY_OUTCOME: ${{ inputs.api_deploy_outcome }}
+          # Preserve flaky/retry failure markers for product admission. Legacy
+          # green and expected failures are not automatically product PASS.
+          PLAYWRIGHT_JUNIT_INCLUDE_RETRIES: 'true'
         run: npm run e2e:staging
 
       - name: Enforce journey evidence gate (all-skipped must fail)
@@ -386,6 +397,28 @@ jobs:
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: node scripts/enforce-journey-evidence.mjs
+
+      # This is a separate product predicate, not a new meaning of legacy
+      # green. Empty reviewed applicability policy produces INCOMPLETE, never
+      # acceptance. Only fixed labels, hashes and live identities are uploaded;
+      # raw JUnit, account data and failure diagnostics stay out of this artifact.
+      - name: Record candidate admission receipt
+        if: always() && inputs.post_deploy
+        env:
+          API_DEPLOYED: ${{ inputs.api_deployed }}
+          API_DEPLOY_OUTCOME: ${{ inputs.api_deploy_outcome }}
+          API_SOURCE_SHA: ${{ inputs.api_source_sha }}
+          JOURNEY_GATE: ${{ steps.journey-gate.outcome }}
+        run: python3 -I ci/staging_admission.py produce
+
+      - name: Upload candidate admission receipt
+        if: ${{ success() && inputs.post_deploy }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: staging-admission.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Publish signup-path evidence summary
         id: signup-path-summary

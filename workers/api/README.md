@@ -1,8 +1,7 @@
-# nntune-api: Subsonic, accounts, auth, sessions, BYOP vault, library
+# nntune-api: Subsonic, accounts, auth, sessions, library
 
 Rust core + Worker HTTP entry for NNTune v2 accounts/auth (passkeys +
-email magic link), signed-cookie sessions, the BYOP credential
-vault, and the genre/playlist library, with a Subsonic-compatible
+email magic link), signed-cookie sessions, and the genre/playlist library, with a Subsonic-compatible
 Worker entry on `/rest/*`. Compiles to native (tests)
 and `wasm32` (Cloudflare Worker).
 
@@ -59,8 +58,6 @@ the core and require exactly one row before any response.
 | `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof; finish never replaces an existing session for a different account and echoes the signed-in account's own email for display) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
 | `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
-| `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
-| `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
 | `POST /v1/plays` | issue an entitlement-bound play grant (cookie session + exact Origin only; `plays:write` scope admission alone does not authenticate the handler or deliver native play-event writes) |
 | `POST /v1/plays/heartbeat` | renew the current playback lease (cookie session + exact Origin; not a bearer-scoped operation) |
 | `POST /v1/credentials` | mint a native REST credential (session-only, fresh-session step-up; secret rendered once in the 201 body, never stored or listed; rejects zero TTL and scope lists longer than the defined vocabulary with 422 `validation_failed`) |
@@ -85,8 +82,7 @@ and the raw token (printed as the code the signup step asks for). That
 page never auto-redeems (login CSRF): it scrubs the token from the URL
 and waits for an explicit confirm, `magic/finish` refuses to swap an
 existing session for a different account without burning the token,
-and the provider wizard shows "Signed in as …" before any credential
-is typed. A swap-guarded failure always offers sign-out
+and no user provider setup is offered. A swap-guarded failure always offers sign-out
 (`POST /v1/session/logout`), after which the unspent link redeems; it
 names the still-signed-in account only when this browser tab knows it
 (the display-only sessionStorage label), otherwise it says to sign out
@@ -96,21 +92,58 @@ invite code) are pre-validated before either single-use claim, so a
 corrected retry against the same challenge still enrolls.
 
 Generic errors only: auth `401 {"error":"check your email and try
-again"}`, vault `400 {"error":"vault unavailable"}`, internal
+again"}`, internal
 `500 {"error":"internal error"}`. Cookie-authenticated mutations also
 require an exact `Origin` header match.
 
 Known limits of this slice: attestation `x5c` chains reject (no CA
-trust store yet); test-connection dials the validated hostname (runtime TLS SNI/verify),
-proving TCP+TLS reachability only with no NNTP exchange; magic-link delivery needs the operator's
+trust store yet); magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
 passkey signup cannot complete its inbox-proof step);
-test-connection is a direct bounded dial, not yet routed through the
-stream pool. Staging deploy rides the `staging-api` lane in
+Staging deploy rides the `staging-api` lane in
 `.github/workflows/deploy.yml` (generated per-env wrangler config from
 public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
 Worker secrets and the staging variable values are Operator-wired, and the
 lane skips until they are.
+
+### Catalogue mirror availability
+
+The staging API can deploy without `HYPERDRIVE_ID_MB`. An unset or empty
+variable omits the generated `MB_DB` Hyperdrive block and reports
+`mirror: absent (no-enrichment mode)`. A nonempty variable must still match
+the shared mirror ID in the binding manifest. The app Hyperdrive cache-disabled
+attestation, read-only schema gate and deployment-outcome records remain required.
+
+`PgStore` checks binding presence once per request; absence is not a caught
+connection error. Empty app library pages and empty member collections return
+before any mirror connection, whether or not the binding is configured.
+
+- `/v1/library` and its `/api/library` alias return the same app-backed rows
+  without enrichment when the binding is absent. Stored MBIDs, full recording
+  arrays, legacy playback IDs and distinct `occurrence_key` values are preserved;
+  mirror title/artist/duration/position fields remain null. Existing own-origin
+  art-path derivation is unchanged; this does not add an art cache.
+- Nonempty member `/v1/tracks`, `/v1/releases`, `/v1/artists` and member release
+  detail return the existing opaque 503 `service_unavailable` envelope without
+  connecting when the mirror is absent. Internally this logs
+  `api.db.mirror_unconfigured`, never configuration values.
+- Release detail and its track read probe app membership before requiring the
+  mirror. Malformed/nonmember IDs remain 404 (or an empty store track result),
+  not a mirror-availability oracle.
+- A configured mirror that fails to connect or execute a statement is still a
+  store error, not no-enrichment mode. Existing `api.db.connect_failed.mirror_*`
+  and statement-failure diagnostics remain opaque. Library store errors remain
+  generic 500s; entity store errors use the opaque 503 envelope.
+
+Regression coverage is in `tests/catalogue_store_postgres.rs` (real production
+store reads with disposable app rows and injected mirror acquisition), the
+handler tests in `src/handlers.rs`, and the offline deployment workflow tests in
+`e2e/tests/api-deploy-outcome.spec.ts`. CI runs these on GitHub Actions; no local
+full-suite transcript substitutes for exact-head Actions evidence.
+
+This follows [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails):
+CC0 core only, no NC enrichment, no new art caching, and no YouTube playback or
+clean-room UI changes. The M1 contract remains additive and unchanged.
 
 ### Session refresh retries without a stale-cookie grace period
 
@@ -211,41 +244,18 @@ cookie alone. Stealing both the predecessor cookie and its separately
 retained retry secret allows recovery inside the bounded window; protect
 both as credentials.
 
-### Test-connection routing boundary
+### Retired user-provider surface
 
-- The current path is a direct dial from the api Worker:
-  `vault_test_connection` in `workers/api/src/handlers.rs` resolves all
-  records, validates the provider config, then calls the injected
-  `Dialer::probe` on the vetted target (`workers/api/src/handlers.rs`),
-  and the Worker entry wires that dialer to `SocketDialer`
-  (`workers/api/src/worker_entry.rs`).
-- The dial targets the validated hostname (at most
-  `MAX_DIAL_ADDRESSES` bounded attempts in
-  `workers/api/src/worker_entry.rs`), never a second DNS lookup of our
-  own — the runtime resolves for routing (`workers/api/src/handlers.rs`,
-  `workers/api/src/worker_entry.rs`); the per-attempt and total
-  deadlines come from `DIAL_TIMEOUT_MS` / `TOTAL_TIMEOUT_MS` in
-  `workers/api/src/vault.rs`, with per-user concurrency capped by
-  `MAX_TEST_CONCURRENCY` in `workers/api/src/vault.rs`.
-- TLS verifies against the hostname: `probe_attempt` in
-  `workers/api/src/worker_entry.rs` dials the validated hostname with
-  the runtime socket, so the runtime SNI-verifies the certificate
-  against that name. No peer-IP check exists: workerd reports the dial
-  string itself as `SocketInfo.remote_address`, so containment is the
-  fresh dial-time validation, the allowlisted port, the timeouts, and no
-  application bytes exchanged (`workers/api/src/worker_entry.rs`).
-- Stream-pool routing is not yet in place: the per-user `NntpPool`
-  Durable Object and its probe/body lanes live in `workers/stream`
-  (`workers/stream/src/lib.rs`, `workers/stream/src/runtime.rs`,
-  `workers/stream/wrangler.toml`), and test-connection does not call
-  the pool binding (`workers/ingest/src/pool_probe.rs`); pool
-  integration is future work, not started here.
-- Boundary ownership: scoped-credential behavior is owned by its own
-  lane and port-allowlist hardening by the SSRF-guard lane
-  (`ALLOWED_NNTP_PORTS` in `workers/api/src/vault.rs`, threat-model §3
-  in `docs/security/threat-model.md`); this note describes the routing
-  boundary only and changes no vault, dial, TLS, pool, or credential
-  behavior.
+`/v1/vault`, `/v1/vault/test` and `/v1/vault/test-connection` are no longer
+routes, including on `OPTIONS`. They return the ordinary unknown-route 404;
+no handler accepts, tests, saves or returns user Usenet credentials, and no
+user `providers` row is minted. There is no compatibility stub.
+
+Envelope encryption (`vault.rs`, `field_envelope.rs`), version-pinned KEK
+selection and the KEK rewrap job (`rotation.rs`) remain for encrypted rows
+and backend account-pool reuse. Existing account-admission and signup-reaper
+protections for legacy rows remain until the separate forward purge migration.
+This API change does not purge or migrate user credential data.
 
 ### Inline magic-link delivery deadline
 
@@ -350,10 +360,8 @@ This crate remains standalone (excluded from the root workspace), so use
   absent secret, or a user id ingest would reject, mints nothing. Both
   crates pin `fixtures/ingest-caller-grant/vectors.json`. No api route
   calls ingest yet.
-- **Never logged, never returned:** reads return booleans only
-  (`redacted_summary`); `test connection` returns a boolean, never provider
-  banners; audit events carry ids/results only — there is no field for
-  secret material anywhere in the API or schema.
+- **Never logged, never returned:** user-provider routes are absent. Audit
+  events carry ids/results only; no credential material is returned or logged.
 - **Sessions:** `__Host-nntune-session` (`__Host-` prefix: `Path=/` via the
   pinned `COOKIE_PATH` constant, `Secure`, no `Domain=` by construction);
   `HttpOnly; SameSite=Lax`; `Max-Age` clamped to `MAX_SESSION_SECS`, and the
@@ -377,13 +385,10 @@ This crate remains standalone (excluded from the root workspace), so use
   `verify_stored_session` against the current `sessions` row on every
   request: owner, expiry, counter and revocation must match. Refresh must
   conditionally update the matching row/counter and commit before sending
-  the cookie; a superseded cookie then fails. Vault credential writes
-  (`PUT /v1/vault`) and deletes (`DELETE /v1/vault`) require a freshness
-  window of 600 seconds (10 minutes) on the immutable authentication time
-  (`created_at`, never `issued_at`, so rotation cannot restore freshness):
-  sessions authenticated outside the window are rejected with the documented
-  `reauth_required` error code (401). Vault summary reads and boolean
-  connection tests retain ordinary session authentication.
+  the cookie; a superseded cookie then fails. Native REST credential issuance
+  and revocation require a 600-second freshness window on the immutable
+  authentication time (`created_at`, never `issued_at`); stale sessions receive
+  `reauth_required` (401).
   `POST /v1/session/reauthenticate/start` authenticates the existing cookie
   with exact-Origin CSRF protection and stores a `reauth` passkey challenge
   bound to that session's user. `/finish` requires the same active session,
@@ -397,7 +402,7 @@ This crate remains standalone (excluded from the root workspace), so use
   issue independent sessions without revoking existing rows.
 - **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
   Hyperdrive config with query caching disabled (`--caching-disabled`).
-  Session, credential, user, challenge and vault reads are plain
+  Session, credential, user and challenge reads are plain
   parameterized `SELECT`s; Hyperdrive caches such reads by default
   (`max_age` 60s + 15s `stale_while_revalidate`, never invalidated by
   writes) and names sessions/authentication as the case needing a
@@ -598,7 +603,7 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:474-526`) and
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:477-529`) and
 `fixture-check` (`.github/workflows/ci.yml:93-102`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under
