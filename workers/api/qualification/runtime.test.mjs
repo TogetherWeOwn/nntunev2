@@ -91,17 +91,25 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
   const probe = () => entry.fetch('https://qualification.invalid/probe').then(r => r.json());
 
   await t.test('snapshot actual generated exports, prototypes and facade containment', async () => {
-    const result = await probe();
-    assert.deepEqual(result.generated, ['default']);
-    assert.deepEqual(result.facade, ['IngestPreparationPlans', 'default']);
-    assert.deepEqual(result.generatedPrototype, ['constructor', 'fetch', 'ingest_preparation_plan']);
-    assert.deepEqual(result.publicPrototype, ['constructor', 'fetch']);
-    assert.deepEqual(result.namedPrototype, ['constructor', 'fetch']);
-    assert.equal(result.bridgeOnInstance, 'function');
-    const generatedIngest = await entry.fetch('https://qualification.invalid/abi').then(r => r.json());
-    assert.deepEqual(generatedIngest, {
-      generated: ['default'], prototype: ['constructor', 'fetch', 'queue'],
+    const { bridgeCalls, ...apiSnapshot } = await probe();
+    const ingestSnapshot = await entry.fetch('https://qualification.invalid/abi').then(r => r.json());
+    // The locked SDK exports these data classes through the builder's class
+    // wrappers. They must not leak through the composition-only public facade.
+    const sdkExports = ['ContainerStartupOptions', 'MinifyConfig', 'R2Range', 'default'];
+    assert.deepEqual({ api: apiSnapshot, ingest: ingestSnapshot }, {
+      api: {
+        generated: sdkExports,
+        facade: ['IngestPreparationPlans', 'default'],
+        generatedPrototype: ['constructor', 'fetch', 'ingest_preparation_plan'],
+        publicPrototype: ['constructor', 'fetch'],
+        namedPrototype: ['constructor', 'fetch'],
+        bridgeOnInstance: 'function',
+      },
+      ingest: {
+        generated: sdkExports, prototype: ['constructor', 'fetch', 'queue'],
+      },
     });
+    assert.equal(bridgeCalls, 0);
   });
 
   await t.test('real generated fetch lifecycle: API missing-config refusal and ingest health', async () => {

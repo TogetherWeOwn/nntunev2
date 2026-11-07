@@ -18,7 +18,12 @@ The Node test imports Miniflare from this package only. Actual generated JS/Wasm
 and `cloudflare:workers` execute inside workerd, without VM substitutions. The
 harness-only roots import the unchanged facade and generated Workers; they are
 not effective application entrypoints. Snapshot assertions cover the actual
-export namespaces and class prototypes. Real service bindings exercise the
+export namespaces and class prototypes, including the locked SDK's three data
+classes emitted by the builder's class wrappers. The facade must export none
+of those classes or the raw private bridge; it retains only its two composed
+entrypoints. Both Workers' snapshots are compared together so a failure reports
+the full ABI delta rather than stopping at the first namespace mismatch.
+Real service bindings exercise the
 named facade, mode refusal, a redacted injected bridge failure, and public
 surface isolation for the tested request matrix. The generated API runs with
 no keyring/config and must refuse startup; ingest's health fetch runs normally.
