@@ -528,6 +528,47 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     assert.equal(await bucket.get('qualification-refused'), null, 'restart replay must not reach DLQ');
   });
 
+  await t.test('R2 stream bounds and deadline refuse without changing recovered custody', { timeout: 40_000 }, async () => {
+    const composite = await mf.getWorker('composite-flac');
+    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+    const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+      SELECT id,object_id,object_version,plaintext_bytes,plaintext_sha256
+      FROM ingest_file_dispatches WHERE job_id = 'qualification-flac-job') q;`));
+    const pointer = JSON.stringify({ version: 1, id: row.id });
+    const recover = route => composite.fetch(`https://qualification.invalid${route}`, {
+      method: 'POST', body: pointer,
+    });
+    const persisted = state();
+    const objects = () => bucket.list().then(result => result.objects
+      .map(object => ({ key: object.key, version: object.version })).sort((a, b) => a.key.localeCompare(b.key)));
+    const custody = await objects();
+    assert.equal((await recover('/recover')).status, 204, 'genuine R2 recovery must succeed before faults');
+    for (const fault of ['oversized', 'chunked-long', 'stream-error', 'stalled']) {
+      const start = performance.now();
+      const response = await recover(`/recover-range-fault/${fault}`);
+      const elapsed = performance.now() - start;
+      assert.equal(response.status, 503, `R2 stream must refuse: ${fault}`);
+      assert.equal(response.headers.get('x-qualification-range-reads'), '1', 'fault must reach actual R2 GET');
+      assert.equal(await response.text(), 'qualification unavailable', 'R2 stream details must remain redacted');
+      if (fault === 'stalled') {
+        assert.ok(elapsed >= 9_000 && elapsed < 25_000, 'stalled R2 body must reach the existing deadline');
+      } else {
+        assert.ok(elapsed < 8_000, 'byte-bound and stream-error refusal must not depend on the deadline');
+      }
+      assert.equal(state(), persisted, `failed R2 read must not renew, rotate or remint: ${fault}`);
+      const object = await bucket.get(`prepared-tagged/${row.object_id}`);
+      assert.ok(object, 'failed read must retain exact R2 custody');
+      assert.equal(object.version, row.object_version);
+      const bytes = Buffer.from(await object.arrayBuffer());
+      assert.equal(bytes.length, row.plaintext_bytes);
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), row.plaintext_sha256);
+      assert.deepEqual(await objects(), custody, 'direct refusal must neither write objects nor invoke Queue');
+      assert.equal(await bucket.get('qualification-refused'), null);
+      assert.equal((await recover('/recover')).status, 204, 'fault must not poison genuine recovery');
+      assert.equal(state(), persisted);
+    }
+  });
+
   await t.test('private plan response bounds and deadline refuse without changing recovered custody', { timeout: 40_000 }, async () => {
     const composite = await mf.getWorker('composite-flac');
     const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');

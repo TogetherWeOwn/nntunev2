@@ -190,10 +190,25 @@ a fresh callback marker must prove actual Rust Queue recovery. Full DB
 fingerprints must remain unchanged across both faults. An ordinary producer retry
 then sets the acknowledgement bit, changes no other persisted field, preserves
 the exact R2 version and requires another fresh callback marker. No DB reset,
-manual acknowledgement or replacement custody is used. These added controls are
-written, not locally executed; require exact-head Actions. The post-send throw
-simulates a lost Queue reply, not a process crash, ambiguous DB commit or pending
-Queue persistence across restart.
+manual acknowledgement or replacement custody is used. At head `474aabaa`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42386967887/job/128446288295)
+passes all eleven runtime subtests (twelve Node passes including the enclosing
+test), including these Queue controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42386967887/job/128446288347)
+explicitly reports 255 required cases passed. The post-send throw simulates a lost
+Queue reply, not a process crash, ambiguous DB commit or pending Queue persistence
+across restart.
+
+A separate R2 recovery control retains the actual GET metadata and faults only
+its body: an open oversized chunk, two individually bounded chunks whose total
+exceeds the requested range, a stream error and a stalled prefix. All must reach
+exactly one real GET and return the static redacted refusal. Oversize/error
+refusals must precede the existing ten-second operation deadline; the stalled
+body must instead reach it. Full DB rows and every R2 key/version must stay
+unchanged, exact tagged bytes/digest must survive, no Queue marker may change,
+and genuine recovery must succeed after each fault. These controls are written,
+not locally executed; require exact-head Actions. They qualify bounded range
+stream handling, not maximum-media sizing, network cancellation or abrupt crash.
 
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production

@@ -35,10 +35,11 @@ export default class QualificationComposite extends WorkerEntrypoint {
       headers.set('x-qualification-send-accepted', String(accepted));
       return new Response(response.body, { status: response.status, headers });
     }
-    if (path.startsWith('/prepare-range-fault/')) {
-      // Fault only the GET response after the actual create-only R2 PUT/HEAD.
-      // Preserve the real body except in the explicit stream-length controls.
-      const fault = path.slice('/prepare-range-fault/'.length);
+    if (path.startsWith('/prepare-range-fault/') || path.startsWith('/recover-range-fault/')) {
+      // Fault only the actual R2 GET response; retain its metadata and custody.
+      // Preparation still performs the real create-only PUT/HEAD first.
+      const recovery = path.startsWith('/recover-range-fault/');
+      const fault = path.slice((recovery ? '/recover-range-fault/' : '/prepare-range-fault/').length);
       const bucket = this.env.INGEST_SCRATCH;
       let reads = 0;
       const patched = new Proxy(bucket, {
@@ -61,6 +62,20 @@ export default class QualificationComposite extends WorkerEntrypoint {
                 controller.enqueue(new Uint8Array(object.range.length + (fault === 'short' ? -1 : 1)));
                 controller.close();
               } });
+            } else if (fault === 'oversized' || fault === 'stalled' || fault === 'stream-error') {
+              result.body = new ReadableStream({ start(controller) {
+                controller.enqueue(new Uint8Array(fault === 'oversized' ? object.range.length + 1 : 1));
+                if (fault === 'stream-error') controller.error(new Error('qualification R2 stream detail'));
+                // Open oversize must hit the byte cap, not EOF or the deadline.
+                // A stalled valid prefix instead exercises the existing deadline.
+              } });
+            } else if (fault === 'chunked-long') {
+              result.body = new ReadableStream({ start(controller) {
+                controller.enqueue(new Uint8Array(object.range.length));
+                controller.enqueue(new Uint8Array(1));
+                // Leave open so EOF length validation cannot mask a missing
+                // cumulative streaming bound across individually valid chunks.
+              } });
             } else throw new Error('unknown qualification fault');
             return result;
           };
@@ -69,7 +84,10 @@ export default class QualificationComposite extends WorkerEntrypoint {
           return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
         },
       });
-      const response = await worker.qualification_prepare(request, { ...this.env, INGEST_SCRATCH: patched });
+      const env = { ...this.env, INGEST_SCRATCH: patched };
+      const response = await (recovery
+        ? worker.qualification_recover(request, env)
+        : worker.qualification_prepare(request, env));
       const headers = new Headers(response.headers);
       headers.set('x-qualification-range-reads', String(reads));
       return new Response(response.body, { status: response.status, headers });
