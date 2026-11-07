@@ -71,6 +71,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "conflict",
+        status: 409,
+        retryable: false,
+    },
+    CodeSpec {
         code: "payload_too_large",
         status: 413,
         retryable: false,
@@ -175,6 +180,9 @@ impl ApiError {
     }
     pub fn account_deleting(message: impl Into<String>) -> Self {
         Self::by_code("account_deleting", message)
+    }
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::by_code("conflict", message)
     }
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::by_code("payload_too_large", message)

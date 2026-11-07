@@ -4334,6 +4334,66 @@ impl Store for PgStore {
         .await
     }
 
+    async fn list_reconcile_sweep_targets(
+        &self,
+        limit: i64,
+        settlement_secs: i64,
+    ) -> Result<Vec<crate::billing_reconcile::ReconcileSweepTarget>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_sweep_targets_statement(),
+                        &[(&limit, Type::INT8), (&settlement_secs, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed(
+                            "api.db.statement_failed.list_reconcile_sweep_targets",
+                        )
+                    })?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(crate::billing_reconcile::ReconcileSweepTarget {
+                            user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+                            stripe_subscription_id: row
+                                .try_get("stripe_subscription_id")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn list_open_checkout_operations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::open_checkout_operations_statement(),
+                        &[(&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed(
+                            "api.db.statement_failed.list_open_checkout_operations",
+                        )
+                    })?;
+                rows.iter().map(Self::checkout_op_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
@@ -5261,6 +5321,23 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
             .await
         })
     }
+    fn create_billing_portal_session(
+        &self,
+        req: crate::stripe::CreateBillingPortalSession,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = crate::stripe::StripeResult<crate::stripe::BillingPortalSession>>
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::create_billing_portal_session_request(
+                &req.customer_id,
+                &req.return_url,
+            ))
+            .await
+        })
+    }
 }
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
@@ -5645,6 +5722,80 @@ fn emit_record(
     #[cfg(target_arch = "wasm32")]
     worker::console_log!("{line}");
     Some(line)
+}
+
+/// The one cron trigger this Worker schedules: the hourly
+/// `billing-reconcile` sweep (ADR 0005). The wiring lives in the
+/// deploy-generated wrangler config (`[env.*.triggers] crons`); the
+/// string here must match it exactly, and any other cron value is
+/// ignored below so a stray trigger can never run billing work.
+pub const BILLING_RECONCILE_CRON: &str = "0 * * * *";
+
+/// Worker `scheduled` entry: run one billing-reconcile sweep. Builds the
+/// same context as `dispatch` (same config gates, same fail-closed
+/// Stripe posture: an unprovisioned secret makes every fold fail and
+/// store nothing). The outcome counts land in one structured record;
+/// per-target detail stays in the audit rows the sweep already writes.
+pub async fn run_scheduled(env: Env, cron: &str) {
+    let trace_id = crate::logging::resolve_trace_id(None);
+    let build_sha = build_sha_from_env(&env);
+    if cron != BILLING_RECONCILE_CRON {
+        let _ = emit_record(
+            crate::logging::Level::Warn,
+            "api.billing_reconcile.unknown_cron",
+            &trace_id,
+            serde_json::json!({"build_sha": build_sha, "release": build_sha}),
+        );
+        return;
+    }
+    let Some(config) = config_from_env(&env) else {
+        let _ = emit_record(
+            crate::logging::Level::Error,
+            "api.billing_reconcile.misconfigured",
+            &trace_id,
+            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha, "release": build_sha}),
+        );
+        return;
+    };
+    let config = config.with_build_sha(Some(build_sha.as_str()));
+    let stripe = WorkerStripeTransport {
+        secret_key: config.stripe_secret_key.clone(),
+    };
+    let store = PgStore {
+        env: Some(env.clone()),
+        trace_id: trace_id.clone(),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_client: std::cell::RefCell::new(None),
+    };
+    let mailer = WebhookMailer {
+        origin: config.origin.clone(),
+        env: env.clone(),
+        trace_id: trace_id.clone(),
+    };
+    let ctx = handlers::Ctx {
+        cfg: &config,
+        store: &store,
+        mailer: &mailer,
+        dialer: &SocketDialer,
+        dns: &DohDns,
+        stripe: &stripe,
+        now: worker::Date::now().as_millis() / 1000,
+        source_ip: "cron:billing-reconcile".to_string(),
+    };
+    let report = handlers::run_billing_reconcile_sweep(&ctx).await;
+    let _ = emit_record(
+        crate::logging::Level::Info,
+        "api.billing_reconcile.sweep",
+        &trace_id,
+        serde_json::json!({
+            "subscriptions_attempted": report.subscriptions_attempted,
+            "subscriptions_failed": report.subscriptions_failed,
+            "operations_attempted": report.operations_attempted,
+            "operations_failed": report.operations_failed,
+            "build_sha": build_sha,
+            "release": build_sha,
+        }),
+    );
 }
 
 /// Worker `fetch` entry: adapts the runtime request into the handlers'

@@ -699,6 +699,7 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("POST", "/v1/session/revoke-all", SessionOnly),
         ("DELETE", "/v1/account", SessionOnly),
         ("POST", "/v1/billing/checkout", SessionOnly),
+        ("POST", "/v1/billing/portal", SessionOnly),
         // Admin surface (migration 0028): session + fresh DB role only.
         ("GET", "/v1/admin/settings", SessionOnly),
         (

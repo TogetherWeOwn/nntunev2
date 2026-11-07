@@ -229,6 +229,18 @@ serving record.
   authorized secure injection and verify both credentials are available to the
   job. Do not bypass Access, publish values, or rotate the shared token for this
   docs correction; credential distribution remains a separate gated operation.
+- **Stripe webhook bypass (one path only):** Stripe posts to
+  `staging.nntune.com/v1/billing/webhook` with no Access credential, so the
+  hostname-wide app above would reject every delivery. A **separate Access
+  application** for exactly that path, with a **Bypass (Everyone)** policy,
+  takes precedence for the webhook path only; the Worker authenticates the
+  request itself (`Stripe-Signature` HMAC over the raw body, fail-closed
+  before parsing), so the bypass opens no unauthenticated surface — every
+  other path on the host stays gated by the app above, and any sub-shape of
+  the webhook path 404s in the Worker. Provisioned by the operator with the
+  Stripe test-mode wiring (the billing wiring card and its operator
+  provisioning card); record the bypass app ID
+  here once created.
 
 UNDO: delete only this Access app during authorized decommissioning. Do not delete
 or rotate the shared QA service token, and never remove the gate from a live app.

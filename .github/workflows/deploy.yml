@@ -324,6 +324,13 @@ jobs:
           # deploy-production.yml.
           QA_CODE_SEAM = "1"
 
+          # Hourly billing-reconcile sweep (ADR 0005): the `scheduled`
+          # entry runs only this exact cron value
+          # (`BILLING_RECONCILE_CRON` in worker_entry.rs) and fails
+          # closed while the Stripe test secrets are unprovisioned.
+          [env.staging.triggers]
+          crons = ["0 * * * *"]
+
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the
           # deployed Worker has observability=null and persists nothing.

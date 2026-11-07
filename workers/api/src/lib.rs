@@ -144,6 +144,18 @@ pub async fn main(
     worker_entry::dispatch(req, env).await
 }
 
+/// Hourly `billing-reconcile` cron (ADR 0005): the trigger is declared
+/// in the deploy-generated wrangler config; the sweep itself lives in
+/// `worker_entry::run_scheduled`, which ignores any other cron value.
+#[worker::event(scheduled)]
+pub async fn scheduled(
+    event: worker::ScheduledEvent,
+    env: worker::Env,
+    _ctx: worker::ScheduleContext,
+) {
+    worker_entry::run_scheduled(env, &event.cron()).await;
+}
+
 /// True when this request targets the Subsonic `/rest/*` surface.
 #[cfg(target_arch = "wasm32")]
 fn is_subsonic_request(req: &Request) -> bool {

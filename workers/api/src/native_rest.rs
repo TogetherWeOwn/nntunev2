@@ -571,6 +571,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
+                || path == "/v1/billing/portal"
                 || path == "/v1/admin/ingest"
             {
                 return SessionOnly;

@@ -744,6 +744,17 @@ pub fn is_single_flight_state(state: &str) -> bool {
     SINGLE_FLIGHT_STATES.contains(&state)
 }
 
+/// One live-slot row the hourly sweep must re-reconcile: the expiry and
+/// grace executor works from stored state only, so a row is a target
+/// when its stored status is nonterminal and either it is not a settled
+/// `active` row or its confirmed coverage ends inside the renewal
+/// settlement window (see the sweep select below).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileSweepTarget {
+    pub user_id: String,
+    pub stripe_subscription_id: String,
+}
+
 /// Requested-vs-selected price check for session reuse: an open operation
 /// records the price its session was created for (`None` only for corrupt
 /// payloads, which keep today's reuse). A second attempt naming a
@@ -914,6 +925,29 @@ pub fn release_webhook_event_statement() -> &'static str {
 /// `String`, which rejects the JSONB binary form.
 pub fn open_checkout_operation_select_statement() -> &'static str {
     "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
+}
+
+/// Parameters: limit, settlement_secs. The hourly sweep's live-slot
+/// targets: every nonterminal row that is not a settled `active` row
+/// (held and grace rows always re-fold: `incomplete` may complete,
+/// `past_due` may recover or lapse, `unpaid`/`paused` may change), plus
+/// `active` rows whose confirmed coverage ends inside the renewal
+/// settlement window (`settlement_secs`, the caller passes
+/// `billing::RENEWAL_SETTLEMENT_ALLOWANCE_SECS` so the 3 h bound has one
+/// owner). NULL coverage sorts first: a row stored before any confirmed
+/// payment is the most urgent to re-fold. Same five-status predicate as
+/// the live select above, so the sweep never resurrects a terminal row.
+pub fn reconcile_sweep_targets_statement() -> &'static str {
+    "SELECT user_id, stripe_subscription_id FROM subscriptions WHERE status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') AND (status <> 'active' OR paid_through_at IS NULL OR paid_through_at <= now() + ($2::bigint * interval '1 second')) ORDER BY paid_through_at ASC NULLS FIRST LIMIT $1"
+}
+
+/// Parameters: limit. The hourly sweep's open checkout operations across
+/// all users (the reconcile-without-webhook path: a paid session whose
+/// webhook was lost still folds in within the hour). Same projection
+/// and single-flight predicate as the per-user select above, oldest
+/// operation first.
+pub fn open_checkout_operations_statement() -> &'static str {
+    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE state IN ('pending', 'submitted', 'needs_reconcile') ORDER BY created_at ASC LIMIT $1"
 }
 
 /// Parameters: op_id. Operation lookup by id (the webhook's
@@ -2119,11 +2153,31 @@ mod tests {
         for select in [
             open_checkout_operation_select_statement(),
             checkout_operation_by_id_select_statement(),
+            open_checkout_operations_statement(),
         ] {
             assert!(
                 select.contains("request_payload::text"),
                 "operation lookup must read the JSONB payload as text, got: {select}",
             );
         }
+        // The sweep re-folds exactly the live slot: same five-status
+        // predicate as the read path, settled `active` rows only inside
+        // the caller-supplied settlement window, bounded by LIMIT.
+        let sweep = reconcile_sweep_targets_statement();
+        assert!(
+            sweep.contains("status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"),
+            "sweep matches the live slot predicate: {sweep}",
+        );
+        assert!(
+            sweep.contains("status <> 'active'")
+                && sweep.contains("paid_through_at <= now() + ($2::bigint * interval '1 second')")
+                && sweep.contains("LIMIT $1"),
+            "settled active rows enter only inside the settlement window, bounded: {sweep}",
+        );
+        assert!(
+            open_checkout_operations_statement()
+                .contains("state IN ('pending', 'submitted', 'needs_reconcile')"),
+            "sweep operations match the single-flight window",
+        );
     }
 }
