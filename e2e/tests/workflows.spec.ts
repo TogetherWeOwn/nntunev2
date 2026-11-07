@@ -2794,9 +2794,10 @@ function suiteXml(testcases: string): string {
 }
 
 const CATALOGUE_FRESH_CASES = [
-  'catalogue aliases return the same empty library for each fresh account',
-  'catalogue collections expose empty-array contracts for a fresh account',
-  'Library renders the real API empty state for a fresh account',
+  'catalogue aliases return the same library for each fresh account',
+  'catalogue collections expose member-scoped array contracts for a fresh account',
+  'Library renders the real API state for a fresh account',
+  'admin-published rich catalogue is shared by two fresh accounts',
 ] as const;
 const M1_NAMED_CASES = [
   ['ingest-play-meter.spec.ts', 'ingested track carries recording_mbids'],
@@ -2827,7 +2828,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('configured full journey reports catalogue passes and named M1 skips honestly', () => {
     const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 14 | 3 | 11 | 0 |');
+    expect(result.summary).toContain('| 15 | 4 | 11 | 0 |');
     for (const name of CATALOGUE_FRESH_CASES) {
       expect(result.summary).toContain(`catalogue.spec.ts: ${name} | passed |`);
     }
@@ -2836,6 +2837,25 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     }
     expect(result.summary).toContain('do not establish populated-library isolation');
     expect(result.summary).toContain('skips, never playback or metering proof');
+  });
+
+  test('parked populated catalogue fails closed without granting acceptance', () => {
+    const name = CATALOGUE_FRESH_CASES[3];
+    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', name),
+      PASSING('catalogue.spec.ts', name).replace('/>', '><skipped/></testcase>'));
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${name} | skipped |`);
+    expect(result.output).toContain('PARKED: shared catalogue requires an admin-consumer publish');
+    expect(result.output).not.toContain('PASS: journey evidence complete');
+  });
+
+  test('passing empty controls cannot replace a missing populated catalogue leg', () => {
+    const name = CATALOGUE_FRESH_CASES[3];
+    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', name), '');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${name} | missing |`);
   });
 
   test('configured full journey rejects a missing catalogue case', () => {

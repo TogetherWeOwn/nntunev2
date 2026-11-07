@@ -254,7 +254,7 @@ pub fn validate_shared_library_write(write: &SharedUpsertParams<'_>) -> Result<(
     {
         return Err("idempotency key must be an ingest key");
     }
-    if let Some(ref mbid) = write.release_mbid {
+    if let Some(mbid) = write.release_mbid {
         if !validate_mbid(mbid) {
             return Err("release mbid must be canonical 8-4-4-4-12 hex");
         }

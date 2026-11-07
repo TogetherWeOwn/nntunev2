@@ -563,4 +563,118 @@ BEGIN
     END IF;
 END $$;
 
+-- Shared publication/read-back uses the exact included production statements.
+CREATE TEMPORARY TABLE shared_publish_query (sql TEXT NOT NULL);
+INSERT INTO shared_publish_query VALUES (:'library_shared_upsert_sql');
+DO $$
+DECLARE
+    caller TEXT;
+    page_row RECORD;
+    publish_count INTEGER;
+    page_count INTEGER;
+    before_replay INTEGER;
+    members UUID[];
+    recordings UUID[];
+BEGIN
+    INSERT INTO users (id, email, created_at)
+    VALUES ('user-lib-shared', 'lib-shared@example.com', 1700000000);
+    INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status)
+    VALUES ('job_shared', 'user-lib-1', 'ingest:fixture:shared', 1700000000, 'done');
+    INSERT INTO mb_release (mbid, artist_mbid, title)
+    VALUES ('cccccccc-1111-2222-3333-444444444444',
+            'ffffffff-1111-2222-3333-444444444444', 'Shared Release');
+    INSERT INTO mb_recording (mbid, release_mbid, title)
+    VALUES ('55555555-1111-2222-3333-444444444444',
+            'cccccccc-1111-2222-3333-444444444444', 'Shared Track');
+    INSERT INTO mb_track (release_mbid, recording_mbid, medium_no, track_no)
+    VALUES ('cccccccc-1111-2222-3333-444444444444',
+            '55555555-1111-2222-3333-444444444444', 1, 1);
+    -- No library owner is bound, even while the acting admin is deleting.
+    UPDATE users SET deleting_at = 1700000001 WHERE id = 'user-lib-1';
+    FOR publish_count IN 1..2 LOOP
+        EXECUTE (SELECT sql FROM shared_publish_query)
+            USING 'job_shared'::text, 'ingest:fixture:shared'::text,
+                  'cccccccc-1111-2222-3333-444444444444'::text,
+                  ARRAY['55555555-1111-2222-3333-444444444444']::text[];
+        IF (SELECT count(*) FROM library WHERE idempotency_key = 'ingest:fixture:shared'
+            AND user_id IS NULL) <> 1 THEN
+            RAISE EXCEPTION 'shared publish must converge on one NULL-owned row';
+        END IF;
+        FOREACH caller IN ARRAY ARRAY['user-lib-1', 'user-lib-shared'] LOOP
+            page_count := 0;
+            FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query) USING caller, 50::bigint LOOP
+                page_count := page_count + 1;
+                IF page_row.job_id = 'job_shared' THEN
+                    IF page_row.recording_mbid <> '55555555-1111-2222-3333-444444444444' THEN
+                        RAISE EXCEPTION 'shared recording missing';
+                    END IF;
+                ELSIF caller = 'user-lib-shared' THEN
+                    RAISE EXCEPTION 'fresh reader received a private row';
+                END IF;
+            END LOOP;
+            IF page_count <> CASE WHEN caller = 'user-lib-1' THEN 9 ELSE 1 END THEN
+                RAISE EXCEPTION 'own plus shared page count wrong: %', page_count;
+            END IF;
+            IF caller = 'user-lib-shared' THEN
+                IF publish_count = 1 THEN before_replay := page_count;
+                ELSIF page_count <> before_replay THEN
+                    RAISE EXCEPTION 'replay changed catalogue read-back count';
+                END IF;
+            END IF;
+        END LOOP;
+    END LOOP;
+    -- A missing job refuses both an initial insert and a conflicting replay.
+    EXECUTE (SELECT sql FROM shared_publish_query)
+        USING 'job_missing'::text, 'ingest:fixture:missing'::text, NULL::text, '{}'::text[];
+    GET DIAGNOSTICS page_count = ROW_COUNT;
+    IF page_count <> 0 THEN RAISE EXCEPTION 'missing job published a shared row'; END IF;
+    DELETE FROM ingest_jobs WHERE id = 'job_shared';
+    EXECUTE (SELECT sql FROM shared_publish_query)
+        USING 'job_shared'::text, 'ingest:fixture:shared'::text, NULL::text, '{}'::text[];
+    GET DIAGNOSTICS page_count = ROW_COUNT;
+    IF page_count <> 0 THEN RAISE EXCEPTION 'missing job overwrote an existing shared row'; END IF;
+
+    -- The fresh reader's browse/detail membership admits only the shared release.
+    SELECT array_agg(release_mbid::uuid) INTO members FROM (
+        SELECT DISTINCT release_mbid FROM library
+        WHERE (user_id = 'user-lib-shared' OR user_id IS NULL) AND release_mbid IS NOT NULL
+    ) s;
+    IF members IS DISTINCT FROM ARRAY['cccccccc-1111-2222-3333-444444444444'::uuid] THEN
+        RAISE EXCEPTION 'shared browse membership leaked private or non-member releases';
+    END IF;
+    IF (SELECT count(*) FROM mb_release WHERE mbid = ANY(members)) <> 1
+       OR (SELECT count(*) FROM mb_artist WHERE mbid IN
+           (SELECT artist_mbid FROM mb_release WHERE mbid = ANY(members))) <> 1 THEN
+        RAISE EXCEPTION 'shared browse missed mirror titles/artist';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM library
+        WHERE (user_id = 'user-lib-shared' OR user_id IS NULL)
+        AND lower(release_mbid) = 'cccccccc-1111-2222-3333-444444444444')
+       OR EXISTS (SELECT 1 FROM library
+        WHERE (user_id = 'user-lib-shared' OR user_id IS NULL)
+        AND lower(release_mbid) = 'dddddddd-1111-2222-3333-444444444444') THEN
+        RAISE EXCEPTION 'shared release detail membership is not isolated';
+    END IF;
+    SELECT array_agg(recording_mbid::uuid) INTO recordings FROM (
+        SELECT DISTINCT u.recording_mbid FROM library l
+        CROSS JOIN unnest(l.recording_mbids) AS u(recording_mbid)
+        WHERE (l.user_id = 'user-lib-shared' OR l.user_id IS NULL)
+          AND lower(l.release_mbid) = 'cccccccc-1111-2222-3333-444444444444'
+    ) s;
+    IF (SELECT count(*) FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid
+        WHERE t.release_mbid = ANY(members) AND t.recording_mbid = ANY(recordings)
+          AND rec.title = 'Shared Track') <> 1 THEN
+        RAISE EXCEPTION 'shared member detail missed its rich track';
+    END IF;
+    -- Exercise the page's empty-array UNION branch for shared rows too.
+    INSERT INTO library (idempotency_key, job_id, user_id, recording_mbids)
+    VALUES ('lib:shared:unmatched', 'job_shared_unmatched', NULL, '{}');
+    page_count := 0;
+    FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
+        USING 'user-lib-shared'::text, 50::bigint LOOP
+        page_count := page_count + 1;
+    END LOOP;
+    IF page_count <> 2 THEN RAISE EXCEPTION 'shared unmatched row was hidden'; END IF;
+END $$;
+
 ROLLBACK;

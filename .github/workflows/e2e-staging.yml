@@ -361,6 +361,8 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          # Un-park only after admin publish; empty/parked evidence cannot pass the gate.
+          SHARED_CATALOGUE_PUBLISHED: ${{ vars.SHARED_CATALOGUE_PUBLISHED }}
           SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
           SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
           SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}

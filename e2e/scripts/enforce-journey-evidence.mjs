@@ -158,10 +158,12 @@ const ALLOWED_SKIPS = [
 // Full post-deploy runs require these exact fresh-account cases plus every
 // named M1 leg below. Empty-state evidence is deliberately not populated-row
 // isolation or playback evidence. Existing M1 skips retain their own reasons.
+const SHARED_CATALOGUE_CASE = 'admin-published rich catalogue is shared by two fresh accounts';
 const CATALOGUE_CASES = [
-  'catalogue aliases return the same empty library for each fresh account',
-  'catalogue collections expose empty-array contracts for a fresh account',
-  'Library renders the real API empty state for a fresh account',
+  SHARED_CATALOGUE_CASE,
+  'catalogue aliases return the same library for each fresh account',
+  'catalogue collections expose member-scoped array contracts for a fresh account',
+  'Library renders the real API state for a fresh account',
 ].map((match) => ({ file: 'catalogue.spec.ts', match }));
 const NAMED_JOURNEYS = [...CATALOGUE_CASES, ...ALLOWED_SKIPS];
 
@@ -432,7 +434,8 @@ summaryLines = [
   '| --- | --- |',
   ...namedJourneys.map((entry) => `| ${entry.file}: ${entry.match} | ${entry.outcome} |`),
   '',
-  'Fresh-account catalogue cases do not establish populated-library isolation or row rendering. ' +
+  'Empty-state controls do not establish populated-library isolation or row rendering. ' +
+    'Only the named admin-published two-account case establishes populated shared visibility. ' +
     'Parked M1 legs are skips, never playback or metering proof.',
   '',
   ...(tokenMissing ? [tokenLine, ''] : []),
@@ -448,6 +451,11 @@ if (tokenMissing) {
 if (tests === 0) fail('zero journeys ran (no test cases in junit evidence).');
 if (ran === 0) {
   fail(`every journey skipped (0 ran, ${skipped} skipped) — staging evidence is empty.`);
+}
+if (REQUIRE_QA_AUTH_TOKEN && namedJourneys.some((entry) =>
+  entry.match === SHARED_CATALOGUE_CASE && entry.outcome === 'skipped')) {
+  fail('PARKED: shared catalogue requires an admin-consumer publish of a curated matched release on staging; ' +
+    'then set SHARED_CATALOGUE_PUBLISHED=true and rerun the post-deploy journey. A park is not acceptance.');
 }
 if (skipped > EFFECTIVE_BUDGET) {
   fail(

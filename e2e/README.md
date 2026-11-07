@@ -346,8 +346,14 @@ How the suite uses them:
   junit evidence, zero journeys ran, every journey skipped, more skips than
   the one remaining `test.fixme` leg (recording_mbids),
   any skip outside that allow-list, any failure, or a missing `QA_AUTH_TOKEN`
-  fails the job instead of passing silently. Failure artifacts
-  are kept 7 days.
+  fails the job instead of passing silently. The named populated-catalogue leg
+  in `tests/catalogue.spec.ts` is also fail-closed: its `PARKED` state keeps the
+  configured full journey red, not accepted. After the admin consumer publishes
+  a curated matched release on staging, set the repository variable
+  `SHARED_CATALOGUE_PUBLISHED=true` and rerun the post-deploy journey. The leg
+  must then observe identical nonempty, mirror-enriched libraries in two distinct
+  fresh QA-seam accounts; empty data cannot pass merely by setting the variable.
+  Failure artifacts are kept 7 days.
 - `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
   chromium install (`--with-deps`), `tsc --noEmit`,
   helper/workflow self-tests, `playwright test --list`, and the
