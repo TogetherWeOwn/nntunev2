@@ -10,17 +10,27 @@ describe('test-only Favorites owner observer', () => {
 		const player = createPlayerSession({ flush: async () => {} });
 		const detach = attachFavoritesObserver(player);
 		const binding = window.__favoritesQueueOwner!;
-		expect(Object.keys(binding)).toEqual(['snapshot']);
+		expect(Object.keys(binding)).toEqual(['snapshot', 'selectionVersion']);
+		expect(Object.isFrozen(binding)).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(binding, 'selectionVersion')?.set).toBeUndefined();
+		expect(binding.selectionVersion).toBe(0);
 		player.setQueue({ tracks: [{ id: 'a', title: 'Alpha', artist: '', streamUrl: '' }, { id: 'b', title: 'Bravo', artist: '', streamUrl: '' }], currentIndex: 0 });
 		const first = binding.snapshot;
 		expect(first).toEqual({ ids: ['a', 'b'], currentIndex: 0, currentId: 'a', selectedTitle: 'Alpha' });
+		expect(binding.selectionVersion).toBe(1);
 		first.ids.reverse();
 		expect(binding.snapshot.ids).toEqual(['a', 'b']);
 		player.setQueue({ ...player.snapshot().queue, currentIndex: 1 });
 		expect(binding.snapshot).toEqual({ ids: ['a', 'b'], currentIndex: 1, currentId: 'b', selectedTitle: 'Bravo' });
+		expect(binding.selectionVersion).toBe(2);
+		player.setQueue({ ...player.snapshot().queue, tracks: [...player.snapshot().queue.tracks, { id: 'c', title: 'Charlie', artist: '', streamUrl: '' }] });
+		expect(binding.selectionVersion).toBe(2);
+		player.setRepeat('queue');
+		expect(binding.selectionVersion).toBe(2);
 		detach();
 		expect(window.__favoritesQueueOwner).toBeUndefined();
 		expect(() => binding.snapshot).toThrow(/Disposed/);
+		expect(() => binding.selectionVersion).toThrow(/Disposed/);
 		player.destroy();
 	});
 
