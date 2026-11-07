@@ -1,5 +1,4 @@
 <script lang="ts">
-	import ExportFallback from '#lib/player/ExportFallback.svelte';
 	import { createTrackListExport } from '#lib/player/trackListExport.js';
 	import { onMount, tick, untrack } from 'svelte';
 	import { usePlayerSession } from '#lib/player/context.js';
@@ -1635,13 +1634,19 @@
 						{favoritesExportStatusShown}
 					</p>
 					{#if favoritesExportFallbackShown !== null}
-						<ExportFallback
-							prefix="favorites-export"
-							fieldId="favorites-export-fallback-field"
-							label="Favorites as text"
+						<label for="favorites-export-fallback-field">Favorites as text</label>
+						<textarea
+							id="favorites-export-fallback-field"
+							data-testid="favorites-export-fallback"
+							readonly
+							rows="4"
 							value={favoritesExportFallbackShown}
-							instructions="Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or Cmd+C). On touch screens, long-press the text, select all and choose Copy."
-						/>
+							aria-describedby="favorites-export-instructions"
+						></textarea>
+						<p id="favorites-export-instructions" data-testid="favorites-export-instructions">
+							Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or
+							Cmd+C). On touch screens, long-press the text, select all and choose Copy.
+						</p>
 					{/if}
 				</div>
 			{/if}
@@ -2299,10 +2304,10 @@
 		min-height: 2.75rem;
 		max-width: 100%;
 	}
-	.nt-favorites-export :global(p) {
+	.nt-favorites-export p {
 		margin-block: var(--nt-space-2);
 	}
-	.nt-favorites-export :global(textarea) {
+	.nt-favorites-export textarea {
 		display: block;
 		width: 100%;
 		min-width: 0;

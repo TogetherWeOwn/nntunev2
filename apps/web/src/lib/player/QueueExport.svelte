@@ -1,5 +1,4 @@
 <script lang="ts">
-	import ExportFallback from './ExportFallback.svelte';
 	import { usePlayerSession } from './context.js';
 
 	const player = usePlayerSession();
@@ -32,13 +31,18 @@
 		{$player.queue.tracks.length === 0 ? 'Nothing to export: the queue is empty. Add a track first.' : $exporter.status}
 	</p>
 	{#if $exporter.fallback !== null}
-		<ExportFallback
-			prefix="queue-export"
-			fieldId="queue-export-fallback-field"
-			label="Queue as text"
+		<label for="queue-export-fallback-field">Queue as text</label>
+		<textarea
+			id="queue-export-fallback-field"
+			data-testid="queue-export-fallback"
+			readonly
+			rows="4"
 			value={$exporter.fallback}
-			instructions="Select the text above and use Ctrl+C / Cmd+C, or long-press to copy manually."
-		/>
+			aria-describedby="queue-export-instructions"
+		></textarea>
+		<p id="queue-export-instructions" data-testid="queue-export-instructions">
+			Select the text above and use Ctrl+C / Cmd+C, or long-press to copy manually.
+		</p>
 	{/if}
 </div>
 
@@ -57,10 +61,10 @@
 		max-width: 100%;
 		flex-shrink: 0;
 	}
-	.queue-export :global(p) {
+	.queue-export p {
 		font-size: 0.875rem;
 	}
-	.queue-export :global(textarea) {
+	.queue-export textarea {
 		display: block;
 		box-sizing: border-box;
 		width: 100%;

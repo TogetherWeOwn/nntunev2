@@ -4,7 +4,6 @@
 </svelte:head>
 
 <script lang="ts">
-	import ExportFallback from '#lib/player/ExportFallback.svelte';
 	import { createTrackListExport } from '#lib/player/trackListExport.js';
 	import { onMount, tick } from 'svelte';
 	import {
@@ -1939,13 +1938,19 @@
 				{queue.tracks.length === 0 ? 'Nothing to export: the track list is empty. Add a track first.' : queueExportStatus}
 			</p>
 			{#if queueExportFallback !== null}
-				<ExportFallback
-					prefix="queue-export"
-					fieldId="queue-export-fallback-field"
-					label="Queue as text"
+				<label for="queue-export-fallback-field">Queue as text</label>
+				<textarea
+					id="queue-export-fallback-field"
+					data-testid="queue-export-fallback"
+					readonly
+					rows="4"
 					value={queueExportFallback}
-					instructions="Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or Cmd+C). On touch screens, long-press the text, select all and choose Copy."
-				/>
+					aria-describedby="queue-export-instructions"
+				></textarea>
+				<p id="queue-export-instructions" data-testid="queue-export-instructions">
+					Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or Cmd+C).
+					On touch screens, long-press the text, select all and choose Copy.
+				</p>
 			{/if}
 		</div>
 		<ShuffleUpcoming
@@ -2196,7 +2201,7 @@
 		font: inherit;
 	}
 
-	.queue-export :global(p) {
+	.queue-export p {
 		margin-block: var(--nt-space-2);
 	}
 
@@ -2204,7 +2209,7 @@
 		color: var(--nt-fg-muted);
 	}
 
-	.queue-export :global(textarea) {
+	.queue-export textarea {
 		display: block;
 		width: 100%;
 		min-width: 0;
