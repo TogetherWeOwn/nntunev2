@@ -551,9 +551,10 @@ pub fn assemble_library_rows(
 ///   hidden. Both branches select the same ledger columns so page rows are
 ///   uniform; mirror enrichment (including release/artist for an
 ///   unmatched-but-released job) arrives in the probes below.
-/// - `ORDER BY matched_last ASC, job_id DESC, recording_ord ASC` applies to
-///   the union: matched ingests first, then job recency, then album
-///   position. The ordering names the computed `matched_last` output column
+/// - `ORDER BY matched_last ASC, job_id DESC, recording_ord ASC, idempotency_key ASC`
+///   applies to the union: matched ingests first, then job recency, then album
+///   position, with the ledger's primary key breaking ties between jobs.
+///   The ordering names the computed `matched_last` output column
 ///   because Postgres rejects expressions in a `UNION` `ORDER BY` (`(x IS
 ///   NULL)` is an expression, not a result column — and naming the bare
 ///   `release_mbid` column would sort matched rows by release text instead
@@ -1170,13 +1171,16 @@ mod tests {
             2
         );
         assert!(statement.contains("cardinality(l.recording_mbids)"));
-        // Matched-first, then job recency, then album position: the
-        // ordering names the computed `matched_last` column because
+        // Matched-first, then job recency, then album position, with the
+        // primary key breaking ties. The ordering names `matched_last` because
         // Postgres rejects expressions in a UNION ORDER BY (and the bare
         // `release_mbid` column would sort matched rows by release text,
         // not recency).
         assert!(statement.contains("(l.release_mbid IS NULL) AS matched_last"));
-        assert!(statement.contains("ORDER BY matched_last ASC, job_id DESC, recording_ord ASC"));
+        assert_eq!(statement.matches("l.idempotency_key").count(), 2);
+        assert!(statement.ends_with(
+            "ORDER BY matched_last ASC, job_id DESC, recording_ord ASC, idempotency_key ASC LIMIT $2"
+        ));
         // Unnest preserves album order with ordinality.
         assert!(statement.contains("WITH ORDINALITY"));
     }

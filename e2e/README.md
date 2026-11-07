@@ -349,8 +349,11 @@ How the suite uses them:
   the one remaining `test.fixme` leg (recording_mbids),
   any skip outside that allow-list, any failure, or a missing `QA_AUTH_TOKEN`
   fails the job instead of passing silently. The named populated-catalogue leg
-  in `tests/catalogue.spec.ts` is also fail-closed: its `PARKED` state keeps the
-  configured full journey red, not accepted. After the admin consumer publishes
+  in `tests/catalogue.spec.ts` has a budgeted `PARKED:` skip while
+  `SHARED_CATALOGUE_PUBLISHED` is not `true`: the configured full-journey gate
+  can be green, but that is not populated-catalogue acceptance. With the variable
+  `true`, a skip fails the gate. A missing, duplicated or failed case fails in
+  either mode. After the admin consumer publishes
   a curated matched release on staging, set the repository variable
   `SHARED_CATALOGUE_PUBLISHED=true` and rerun the post-deploy journey. The leg
   must then observe identical nonempty, mirror-enriched libraries in two distinct

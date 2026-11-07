@@ -70,9 +70,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   they accept shared rows and require populated rendering.
   "admin-published rich catalogue is shared by two fresh accounts" additionally
   requires two distinct QA-seam accounts to see identical, nonempty `/v1/library`
-  results with mirror titles and non-null release MBIDs. Its named **PARKED**
-  state is fail-closed: configured post-deploy journey evidence fails, never
-  passes, while this leg is parked, missing, duplicated or failed. Un-park only
+  results with mirror titles and non-null release MBIDs. While
+  `SHARED_CATALOGUE_PUBLISHED` is not `true`, its named **PARKED:** skip counts
+  against the skip budget and the configured journey gate can be green; that
+  green gate is not populated-catalogue acceptance. With the variable `true`,
+  a skip fails the gate. A missing, duplicated or failed case fails in either
+  mode. Un-park only
   after the admin consumer publishes a curated matched release to staging, by
   setting `SHARED_CATALOGUE_PUBLISHED=true` for the post-deploy workflow, then
   rerunning on the deployed SHA. A variable alone cannot satisfy the nonempty
