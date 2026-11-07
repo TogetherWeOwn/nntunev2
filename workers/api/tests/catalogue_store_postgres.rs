@@ -33,8 +33,8 @@ async fn client(populated: bool) -> Client {
         // degradation. The other user's row must never become membership.
         client
             .execute(
-                "INSERT INTO library VALUES ('u1','job-1',$1,ARRAY[$2,$2,'stored-invalid']),
-             ('u1','job-0',NULL,ARRAY[]::text[]), ('other','private',$3,ARRAY[$2])",
+                "INSERT INTO library VALUES ('u1','job-1',$1,ARRAY[$2,$2,'stored-invalid'],'key-1'),
+             ('u1','job-0',NULL,ARRAY[]::text[],'key-0'), ('other','private',$3,ARRAY[$2],'key-private')",
                 &[&RELEASE, &RECORDING, &OTHER_RELEASE],
             )
             .await
@@ -52,6 +52,49 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
         attempts.clone(),
     );
     (store, attempts)
+}
+
+#[tokio::test]
+async fn library_continuation_binds_every_key_and_preserves_owner_scope() {
+    use nntune_api::catalogue::LibraryCursor;
+    for caller in ["u1", "fresh"] {
+        let app = client(false).await;
+        app.execute(
+            "INSERT INTO library SELECT NULL, 'same-job', $1, ARRAY[$2], 'shared-' || lpad(g::text, 3, '0')
+             FROM generate_series(1,55) g",
+            &[&RELEASE, &RECORDING],
+        ).await.unwrap();
+        app.execute(
+            "INSERT INTO library VALUES ('u1','same-job',$1,ARRAY[$2],'own'),
+             ('other','same-job',$1,ARRAY[$2],'other')",
+            &[&RELEASE, &RECORDING],
+        )
+        .await
+        .unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let s = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
+        let mut after = None;
+        let mut seen = std::collections::HashSet::new();
+        for turn in 0..3 {
+            let mut rows = s.catalogue_library(caller, after.as_ref()).await.unwrap();
+            if turn == 0 {
+                assert_eq!(rows.len(), 51, "one lookahead row");
+            }
+            let more = rows.len() > 50;
+            rows.truncate(50);
+            for row in &rows {
+                assert!(seen.insert(row.idempotency_key.clone()));
+            }
+            if !more {
+                break;
+            }
+            after = rows.last().map(LibraryCursor::from_row);
+        }
+        assert_eq!(seen.len(), if caller == "u1" { 56 } else { 55 });
+        assert_eq!(seen.contains("own"), caller == "u1");
+        assert!(!seen.contains("other"));
+        assert_eq!(attempts.get(), 0);
+    }
 }
 
 #[tokio::test]
@@ -99,7 +142,17 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
             assert_eq!(!recordings.is_empty(), is_member);
         }
         let page = app
-            .query(library_page_statement(), &[&caller, &50_i64])
+            .query(
+                library_page_statement(),
+                &[
+                    &caller,
+                    &50_i64,
+                    &None::<bool>,
+                    &None::<String>,
+                    &None::<i64>,
+                    &None::<String>,
+                ],
+            )
             .await
             .unwrap();
         assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
@@ -110,7 +163,7 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
 #[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
-    let rows = store.catalogue_library("u1").await.unwrap();
+    let rows = store.catalogue_library("u1", None).await.unwrap();
     let page: Vec<_> = [
         Some(RECORDING),
         Some(RECORDING),
@@ -120,6 +173,12 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     .into_iter()
     .enumerate()
     .map(|(i, recording)| LibraryPageRow {
+        idempotency_key: if recording.is_some() {
+            "key-1"
+        } else {
+            "key-0"
+        }
+        .into(),
         job_id: if recording.is_some() {
             "job-1"
         } else {
@@ -148,7 +207,7 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
 async fn empty_app_membership_never_connects_in_either_mode() {
     for configured in [false, true] {
         let (s, attempts) = store(false, configured).await;
-        assert!(s.catalogue_library("u1").await.unwrap().is_empty());
+        assert!(s.catalogue_library("u1", None).await.unwrap().is_empty());
         assert_eq!(attempts.get(), 0);
         let (s, attempts) = store(false, configured).await;
         assert!(s.catalogue_artists("u1").await.unwrap().is_empty());
@@ -215,7 +274,7 @@ async fn nonempty_entities_fail_without_dialing_an_absent_binding() {
 #[tokio::test]
 async fn configured_library_connect_and_statement_failures_never_degrade() {
     let (s, attempts) = store(true, true).await;
-    assert!(s.catalogue_library("u1").await.is_err());
+    assert!(s.catalogue_library("u1", None).await.is_err());
     assert_eq!(attempts.get(), 1);
     // A connected mirror without its required tables must propagate the real
     // statement failure, not serve the same null-enriched rows as absence.
@@ -226,7 +285,7 @@ async fn configured_library_connect_and_statement_failures_never_degrade() {
         Ok(client(false).await),
         attempts.clone(),
     );
-    assert!(s.catalogue_library("u1").await.is_err());
+    assert!(s.catalogue_library("u1", None).await.is_err());
     assert_eq!(attempts.get(), 1);
 }
 

@@ -141,7 +141,7 @@ BEGIN
     -- sorted aggregate cannot hide a broken production ORDER BY.
     actual := ARRAY[]::TEXT[];
     FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
-        USING 'user-lib-1'::text, 50::bigint
+        USING 'user-lib-1'::text, 50::bigint, NULL::boolean, NULL::text, NULL::bigint, NULL::text
     LOOP
         actual := array_append(actual, page_row.job_id || ':' || page_row.recording_ord::text);
         INSERT INTO lib_page VALUES (page_row.job_id, page_row.release_mbid,
@@ -602,7 +602,7 @@ BEGIN
         END IF;
         FOREACH caller IN ARRAY ARRAY['user-lib-1', 'user-lib-shared'] LOOP
             page_count := 0;
-            FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query) USING caller, 50::bigint LOOP
+            FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query) USING caller, 50::bigint, NULL::boolean, NULL::text, NULL::bigint, NULL::text LOOP
                 page_count := page_count + 1;
                 IF page_row.job_id = 'job_shared' THEN
                     IF page_row.recording_mbid <> '55555555-1111-2222-3333-444444444444' THEN
@@ -640,7 +640,7 @@ BEGIN
     END IF;
     page_count := 0;
     FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
-        USING 'user-lib-shared'::text, 50::bigint LOOP
+        USING 'user-lib-shared'::text, 50::bigint, NULL::boolean, NULL::text, NULL::bigint, NULL::text LOOP
         page_count := page_count + 1;
         IF page_row.job_id <> 'job_shared' THEN
             RAISE EXCEPTION 'private collision leaked to a fresh reader';
@@ -696,10 +696,72 @@ BEGIN
     VALUES ('lib:shared:unmatched', 'job_shared_unmatched', NULL, '{}');
     page_count := 0;
     FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
-        USING 'user-lib-shared'::text, 50::bigint LOOP
+        USING 'user-lib-shared'::text, 50::bigint, NULL::boolean, NULL::text, NULL::bigint, NULL::text LOOP
         page_count := page_count + 1;
     END LOOP;
     IF page_count <> 2 THEN RAISE EXCEPTION 'shared unmatched row was hidden'; END IF;
+END $$;
+
+-- Walk the exact production query across own/shared boundaries, including
+-- identical job/ordinal positions. The primary-key tie-breaker is essential.
+DO $$
+DECLARE
+    caller TEXT;
+    page_row RECORD;
+    seen TEXT[];
+    after_matched BOOLEAN;
+    after_job TEXT;
+    after_ord BIGINT;
+    after_key TEXT;
+    page_count INTEGER;
+    turns INTEGER;
+BEGIN
+    DELETE FROM library;
+    INSERT INTO library (idempotency_key, job_id, user_id, release_mbid, recording_mbids)
+    SELECT 'page:shared:' || lpad(g::text, 3, '0'), 'same-job', NULL,
+           'aaaaaaaa-1111-2222-3333-444444444444',
+           ARRAY['11111111-1111-2222-3333-444444444444']::text[]
+    FROM generate_series(1, 55) g;
+    INSERT INTO library (idempotency_key, job_id, user_id, release_mbid, recording_mbids)
+    VALUES ('page:private', 'same-job', 'user-lib-1',
+            'aaaaaaaa-1111-2222-3333-444444444444',
+            ARRAY['22222222-1111-2222-3333-444444444444']),
+           ('page:shared:empty', 'empty-job', NULL, NULL, '{}'),
+           ('page:private:empty', 'empty-job', 'user-lib-1', NULL, '{}');
+    FOREACH caller IN ARRAY ARRAY['user-lib-1', 'user-lib-2'] LOOP
+        seen := ARRAY[]::text[];
+        after_matched := NULL; after_job := NULL; after_ord := NULL; after_key := NULL;
+        turns := 0;
+        LOOP
+            turns := turns + 1;
+            IF turns > 4 THEN RAISE EXCEPTION 'library continuation failed to terminate'; END IF;
+            page_count := 0;
+            FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
+                USING caller, 50::bigint, after_matched, after_job, after_ord, after_key
+            LOOP
+                page_count := page_count + 1;
+                IF page_row.idempotency_key = ANY(seen) THEN
+                    RAISE EXCEPTION 'library continuation duplicated a row';
+                END IF;
+                seen := array_append(seen, page_row.idempotency_key);
+                after_matched := page_row.matched_last;
+                after_job := page_row.job_id;
+                after_ord := page_row.recording_ord;
+                after_key := page_row.idempotency_key;
+            END LOOP;
+            IF turns = 1 AND page_count <> 50 THEN
+                RAISE EXCEPTION 'first combined page must be full';
+            END IF;
+            EXIT WHEN page_count = 0;
+        END LOOP;
+        IF cardinality(seen) <> (CASE WHEN caller = 'user-lib-1' THEN 58 ELSE 56 END) THEN
+            RAISE EXCEPTION 'continuation lost own/shared rows: %', cardinality(seen);
+        END IF;
+        IF ('page:private' = ANY(seen)) IS DISTINCT FROM (caller = 'user-lib-1')
+           OR ('page:private:empty' = ANY(seen)) IS DISTINCT FROM (caller = 'user-lib-1') THEN
+            RAISE EXCEPTION 'continuation private membership is not isolated';
+        END IF;
+    END LOOP;
 END $$;
 
 ROLLBACK;

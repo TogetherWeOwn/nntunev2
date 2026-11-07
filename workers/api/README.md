@@ -145,6 +145,25 @@ This follows [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGE
 CC0 core only, no NC enrichment, no new art caching, and no YouTube playback or
 clean-room UI changes. The M1 contract remains additive and unchanged.
 
+### Library continuation
+
+`GET /v1/library` and `GET /api/library` return
+`{ "items": [...], "next_cursor": null | "<opaque cursor>" }`, at most 50
+rows per response. Follow a non-null continuation with `?cursor=<cursor>`
+until `next_cursor` is null. Both routes retain their existing authentication
+transports; the cursor is a position, never an access grant, and every page
+reapplies the authenticated caller's own-or-shared membership predicate.
+Invalid, duplicate or unsupported cursor parameters answer 400 after auth.
+
+The keyset order is matched-first, descending job ID, recording ordinal,
+then the unique `idempotency_key`, with explicit bytewise text ordering.
+`occurrence_key` uses the ledger key and ordinal so equally positioned rows
+from different ledger entries remain distinct in the web cache. Playback IDs
+are unchanged. The web refresher follows continuations before committing a
+new snapshot, with one timeout and one aggregate 1 MiB response-byte budget;
+a refused, cyclic or over-budget traversal never commits a partial library.
+Existing cache eviction and auth-transition fencing remain in effect.
+
 ### Session refresh retries without a stale-cookie grace period
 
 An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:

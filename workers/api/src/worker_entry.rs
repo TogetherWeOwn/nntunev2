@@ -1100,6 +1100,7 @@ fn catalogue_library_page_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<crate::catalogue::LibraryPageRow, StoreError> {
     Ok(crate::catalogue::LibraryPageRow {
+        idempotency_key: row.try_get("idempotency_key").map_err(|_| StoreError)?,
         job_id: row.try_get("job_id").map_err(|_| StoreError)?,
         release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
         recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
@@ -3561,18 +3562,31 @@ impl Store for PgStore {
     async fn catalogue_library(
         &self,
         user_id: &str,
+        after: Option<&crate::catalogue::LibraryCursor>,
     ) -> Result<Vec<crate::catalogue::LibraryDbRow>, StoreError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
-                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                // One lookahead row determines whether a continuation exists.
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE + 1)
                     .map_err(|_| StoreError)?;
+                let matched_last = after.map(|cursor| cursor.matched_last);
+                let job_id = after.map(|cursor| cursor.job_id.as_str());
+                let recording_ord = after.map(|cursor| cursor.recording_ord);
+                let idempotency_key = after.map(|cursor| cursor.idempotency_key.as_str());
                 let page = client
                     .query_typed(
                         crate::catalogue::library_page_statement(),
-                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&limit, Type::INT8),
+                            (&matched_last, Type::BOOL),
+                            (&job_id, Type::TEXT),
+                            (&recording_ord, Type::INT8),
+                            (&idempotency_key, Type::TEXT),
+                        ],
                     )
                     .await
                     .map_err(|_| {
@@ -5817,13 +5831,14 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // The runtime path strips the query string everywhere; the admin
-    // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
+    // Preserve list filters and Library keyset continuations for exactly
+    // these GET collections. Every other route keeps the bare runtime path.
     let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+    let handler_path = if req.method() == Method::Get
+        && matches!(
+            bare_path.as_str(),
+            "/v1/admin/ingest" | "/v1/library" | "/api/library"
+        ) {
         match req.url().ok().and_then(|url| {
             url.query()
                 .filter(|query| !query.is_empty())

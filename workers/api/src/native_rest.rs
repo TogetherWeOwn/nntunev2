@@ -457,6 +457,7 @@ pub enum RouteDecision {
 /// resource name or a similar operation.
 pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     use RouteDecision::{Bearer, Deny, SessionOnly};
+    let path = crate::handlers::library_route_path(path);
     /// `/prefix/{single-segment}` (no deeper nesting). Callers pass a
     /// slash-terminated prefix, so the remainder never starts with `/`.
     fn one_segment_after(prefix: &str, path: &str) -> bool {
