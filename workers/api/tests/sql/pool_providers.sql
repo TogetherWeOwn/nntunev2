@@ -1,8 +1,8 @@
--- Regression test for migration 0035 (service pool provider registry).
+-- Regression test for migration 0036 (service pool provider registry).
 -- Run after ALL migrations are applied (see ../run_migration_tests.sh,
 -- which passes -v migrations_dir=...). One transaction, rolled back.
 --
--- Part 1 rebuilds the pre-0035 shape of user_cache_grants (composite
+-- Part 1 rebuilds the pre-0036 shape of user_cache_grants (composite
 -- (user_id, provider_id) FK to providers, provider_id NOT NULL), then
 -- re-executes the real migration file and proves the old attribution is
 -- moved to legacy_provider_id, not lost. Part 2 proves a re-apply does
@@ -27,7 +27,7 @@ VALUES (repeat('a', 64), 1, 'b', 'k/a', 1700000000),
        (repeat('b', 64), 1, 'b', 'k/b', 1700000000),
        (repeat('c', 64), 1, 'b', 'k/c', 1700000000);
 
--- Part 1: rebuild the pre-0035 state with two legacy-attributed grants.
+-- Part 1: rebuild the pre-0036 state with two legacy-attributed grants.
 INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
 VALUES ('user-pp-1', repeat('a', 64), 'aaaaaaaa-0000-4000-8000-000000000001', 1700000000),
        ('user-pp-1', repeat('b', 64), 'aaaaaaaa-0000-4000-8000-000000000001', 1700000000);
@@ -41,7 +41,7 @@ ALTER TABLE user_cache_grants
     ADD CONSTRAINT user_cache_grants_user_id_provider_id_fkey
     FOREIGN KEY (user_id, provider_id) REFERENCES providers (user_id, id) ON DELETE RESTRICT;
 
-\i :migrations_dir/0035_pool_providers.sql
+\i :migrations_dir/0036_pool_providers.sql
 
 DO $$
 BEGIN
@@ -108,7 +108,7 @@ VALUES ('cccccccc-0000-4000-8000-000000000001', 'Primary', 'news.example.com', 5
 UPDATE user_cache_grants SET provider_id = 'cccccccc-0000-4000-8000-000000000001'
 WHERE user_id = 'user-pp-1' AND content_hash = repeat('a', 64);
 
-\i :migrations_dir/0035_pool_providers.sql
+\i :migrations_dir/0036_pool_providers.sql
 
 DO $$
 BEGIN

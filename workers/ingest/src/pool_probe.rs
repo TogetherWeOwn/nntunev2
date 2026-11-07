@@ -167,7 +167,7 @@ pub fn classify_reply(
 /// slow-but-healthy provider at 25 ms per `STAT` (12.5 s per batch) with 2x
 /// headroom, plus one nominal 5 s dial allowance. The pool path dials via
 /// `nntune_core` `WorkerTransport` (per-operation `config.timeout`, default
-/// 20 s in `crates/nntune-core/src/nntp.rs`) with the greeting + `MODE
+/// 20 s in velmora `crates/velmora/src/nntp.rs`) with the greeting + `MODE
 /// READER` + `AUTHINFO` handshake in `NntpClient::connect`; the 5 s is a
 /// nominal allowance for that handshake, not the transport timeout. A
 /// warm-stale redial fails fast on the first `Io` (closed-while-idle)

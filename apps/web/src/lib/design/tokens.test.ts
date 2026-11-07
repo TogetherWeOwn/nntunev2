@@ -93,26 +93,44 @@ for (const block of topBlocks(css)) {
 
 // Same cascades the browser applies: plain roots in file order (dark
 // defaults), then the light overlays. The attribute override wins over the
-// media query, so attribute-light resolves with or without a light OS;
-// system-light (no attribute, light OS — the default path) resolves from
-// the media block alone. Gating only the merged `light` once masked a token
-// missing from the media block, so both cascades resolve and both are gated.
+// media query, so explicit Light on a dark OS resolves without the media
+// block (`attributeLight`), while explicit Light on a light OS layers it as
+// well (`light`); system-light (no attribute, light OS) resolves from the
+// media block alone (`systemLight`). Symmetrically, explicit Dark on a dark
+// OS is `dark`, explicit Dark on a light OS additionally layers the losing
+// media block (`explicitDark`), and system-dark (no attribute, dark OS) is
+// the plain roots alone (`systemDark`). Gating only the merged `light` once
+// masked a token missing from the media block, and gating only `dark` masks
+// a token missing from the attribute-dark block the same way, so every
+// cascade resolves and every one is gated.
 const dark = resolveAll([...plain, ...attrDark]);
 const light = resolveAll([...plain, ...mediaLight, ...attrLight]);
 const systemLight = resolveAll([...plain, ...mediaLight]);
+const attributeLight = resolveAll([...plain, ...attrLight]);
+const systemDark = resolveAll([...plain]);
+const explicitDark = resolveAll([...plain, ...mediaLight, ...attrDark]);
+
+const darkCascades: Array<[string, VarMap]> = [
+	['dark', dark],
+	['explicit-dark', explicitDark],
+	['system-dark', systemDark]
+];
+const lightCascades: Array<[string, VarMap]> = [
+	['light', light],
+	['attribute-light', attributeLight],
+	['system-light', systemLight]
+];
 
 /**
- * Dark pairs gate one cascade; light pairs gate both the
- * explicit-attribute cascade and the system (media-query-only) cascade,
- * so a token missing from either block fails instead of falling through
- * to the dark default unseen.
+ * Dark pairs gate all three dark cascades (explicit Dark on either OS, plus
+ * system-dark with no attribute); light pairs gate all three light cascades
+ * (explicit Light on either OS, plus system-light with no attribute), so a
+ * token missing from any single block fails instead of falling through to
+ * the other theme's value unseen.
  */
 function themesFor(label: string): Array<[string, VarMap]> {
-	if (label.startsWith('dark')) return [['dark', dark]];
-	return [
-		['attribute-light', light],
-		['system-light', systemLight]
-	];
+	if (label.startsWith('dark')) return darkCascades;
+	return lightCascades;
 }
 
 const roots = plain;
@@ -152,7 +170,10 @@ describe('design tokens: protected nine', () => {
 		it(`${name} keeps its dark and light values in every palette`, () => {
 			expect(roots[0].get(name), `original :root ${name}`).toBe(values.dark);
 			expect(dark.get(name), `resolved dark ${name}`).toBe(values.dark);
+			expect(explicitDark.get(name), `resolved explicit-dark ${name}`).toBe(values.dark);
+			expect(systemDark.get(name), `resolved system-dark ${name}`).toBe(values.dark);
 			expect(light.get(name), `resolved light ${name}`).toBe(values.light);
+			expect(attributeLight.get(name), `resolved attribute-light ${name}`).toBe(values.light);
 			expect(systemLight.get(name), `resolved system-light ${name}`).toBe(values.light);
 		});
 	}
@@ -173,13 +194,14 @@ describe('design tokens: new layer presence', () => {
 		'--nt-hero-scrim'
 	];
 	for (const name of surface) {
-		it(`${name} resolves in both themes`, () => {
-			expect(dark.get(name), `dark ${name}`).toMatch(/\S/);
-			expect(light.get(name), `light ${name}`).toMatch(/\S/);
+		it(`${name} resolves in every cascade`, () => {
+			for (const [themeLabel, theme] of [...darkCascades, ...lightCascades]) {
+				expect(theme.get(name), `${themeLabel} ${name}`).toMatch(/\S/);
+			}
 		});
 	}
 
-	it('semantic text and focus tokens resolve in both themes', () => {
+	it('semantic text and focus tokens resolve in every cascade', () => {
 		for (const name of [
 			'--nt-good-text',
 			'--nt-bad-text',
@@ -187,13 +209,13 @@ describe('design tokens: new layer presence', () => {
 			'--nt-focus-ring-width',
 			'--nt-focus-ring-offset'
 		]) {
-			expect(dark.get(name), `dark ${name}`).toMatch(/\S/);
-			expect(light.get(name), `light ${name}`).toMatch(/\S/);
-			expect(systemLight.get(name), `system-light ${name}`).toMatch(/\S/);
+			for (const [themeLabel, theme] of [...darkCascades, ...lightCascades]) {
+				expect(theme.get(name), `${themeLabel} ${name}`).toMatch(/\S/);
+			}
 		}
 	});
 
-	it('system-light and attribute-light resolve identically (no media/attribute divergence)', () => {
+	it('system-light and merged light resolve identically (no media/attribute divergence)', () => {
 		const keys = new Set([...light.keys(), ...systemLight.keys()]);
 		expect(keys.size, 'resolved token count').toBeGreaterThan(0);
 		for (const key of keys) {
@@ -201,10 +223,27 @@ describe('design tokens: new layer presence', () => {
 		}
 	});
 
+	it('attribute-only light matches merged light (explicit Light ignores the OS)', () => {
+		const keys = new Set([...light.keys(), ...attributeLight.keys()]);
+		expect(keys.size, 'resolved token count').toBeGreaterThan(0);
+		for (const key of keys) {
+			expect(attributeLight.get(key), `attribute-light ${key}`).toBe(light.get(key));
+		}
+	});
+
+	it('dark cascades agree (explicit Dark ignores the OS, attribute repeats plain)', () => {
+		const keys = new Set([...dark.keys(), ...explicitDark.keys(), ...systemDark.keys()]);
+		expect(keys.size, 'resolved token count').toBeGreaterThan(0);
+		for (const key of keys) {
+			expect(explicitDark.get(key), `explicit-dark ${key}`).toBe(dark.get(key));
+			expect(systemDark.get(key), `system-dark ${key}`).toBe(dark.get(key));
+		}
+	});
+
 	it('focus ring resolves to the accent color with fixed geometry', () => {
-		expect(dark.get('--nt-focus-ring')).toBe(dark.get('--nt-accent'));
-		expect(light.get('--nt-focus-ring')).toBe(light.get('--nt-accent'));
-		expect(systemLight.get('--nt-focus-ring')).toBe(systemLight.get('--nt-accent'));
+		for (const [themeLabel, theme] of [...darkCascades, ...lightCascades]) {
+			expect(theme.get('--nt-focus-ring'), `${themeLabel} focus ring`).toBe(theme.get('--nt-accent'));
+		}
 		expect(dark.get('--nt-focus-ring-width')).toBe('2px');
 		expect(dark.get('--nt-focus-ring-offset')).toBe('2px');
 	});
@@ -283,8 +322,9 @@ describe('design tokens: new layer presence', () => {
 			'--nt-ease-exit'
 		];
 		for (const name of names) {
-			expect(dark.get(name), `dark ${name}`).toMatch(/\S/);
-			expect(light.get(name), `light ${name}`).toMatch(/\S/);
+			for (const [themeLabel, theme] of [...darkCascades, ...lightCascades]) {
+				expect(theme.get(name), `${themeLabel} ${name}`).toMatch(/\S/);
+			}
 		}
 	});
 

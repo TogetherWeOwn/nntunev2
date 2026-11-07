@@ -169,6 +169,12 @@ target = "app"
 sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"
 
 [[migration]]
-file = "0035_pool_providers.sql"
+file = "0035_library_table.sql"
+target = "app"
+sha256 = "fcca71547ad14366c7ba7d37920fba476fa6237b40ee8986ecee3d19f604efc0"
+
+[[migration]]
+file = "0036_pool_providers.sql"
 target = "app"
 sha256 = "2037f4ac5b8fa2e7fd67cf902cbc1bfb8b34e6c4c47573f86d596730ed273569"
+renamed_from = [{ file = "0035_pool_providers.sql", sha256 = "2037f4ac5b8fa2e7fd67cf902cbc1bfb8b34e6c4c47573f86d596730ed273569" }]

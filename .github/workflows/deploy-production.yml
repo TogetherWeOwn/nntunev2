@@ -21,8 +21,12 @@ name: deploy-production
 #   count and can never shadow evidence) must have staging-web success (never
 #   skipped) and its post-deploy full-journey job success. The called
 #   workflow reports its jobs under the "post-deploy-e2e / ..." prefix, so
-#   every matching job must conclude success. Scheduled or manual monitoring
-#   runs never count (see docs/ops.md staging checklist).
+#   every matching job must conclude success. These are prerequisites only:
+#   ci/staging_admission.py additionally authenticates an attempt-bound receipt
+#   with actual same-source API deployment, both live identities, candidate
+#   migration manifest and complete independently approved product mapping.
+#   The reviewed approval list is initially empty: real admission refuses.
+#   Scheduled/manual monitoring never counts (docs/ops.md staging checklist).
 # - deploy-production uploads one Worker version without mutating routes,
 #   custom domains or triggers, then calls the shared central
 #   gradual-promote action (pinned below): 5% -> 50% -> 100% with per-stage
@@ -117,7 +121,18 @@ jobs:
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Read staging identities with its existing credentials, without creating
+    # a deployment record or claiming that this admission job deployed staging.
+    environment:
+      name: staging
+      deployment: false
     steps:
+      # Verifier and approval policy come from the dispatch's reviewed main
+      # source, never from an artifact or an arbitrary selected candidate.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Require real post-deploy staging evidence on the exact SHA
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -183,8 +198,25 @@ jobs:
               print(f"::error::Deploy run {latest['id']} post-deploy-e2e jobs are not all success "
                     f"(not success: {', '.join(bad)}); scheduled/manual monitoring never counts")
               sys.exit(1)
-          print(f"staging evidence ok: deploy run {latest['id']} staging-web + post-deploy-e2e success on {sha}")
+          if by_name.get("staging-api") != "success":
+              print(f"::error::Deploy run {latest['id']} has no staging-api success; a skipped or failed API is not candidate evidence")
+              sys.exit(1)
+          # These job conclusions are necessary, not sufficient deployment or
+          # product acceptance proof: the API lane can succeed unconfigured.
+          journey = "post-deploy-e2e / full journey (signup → library → meter → limits)"
+          if by_name.get(journey) != "success":
+              print(f"::error::Deploy run {latest['id']} has no full journey success; smoke-only evidence cannot qualify")
+              sys.exit(1)
+          print(f"staging evidence job prerequisites ok: deploy run {latest['id']} on {sha}; receipt verification still required")
           PY
+      - name: Verify candidate deployment and accepted journey receipt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: python3 -I ci/staging_admission.py verify
 
   deploy-production:
     name: deploy-production

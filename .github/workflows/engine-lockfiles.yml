@@ -1,0 +1,61 @@
+name: engine lockfile refresh
+
+# Report-only dependency maintenance: generate lockfiles on Actions for a
+# reviewed immutable engine pin. Download and review the artifact, then commit
+# it on the same PR; this neither writes the branch nor replaces locked CI.
+on:
+  pull_request:
+    paths:
+      - crates/nntune-core/Cargo.toml
+      - crates/nntune-test-nntp/Cargo.toml
+      - crates/nntune-ssrf-guard/Cargo.toml
+      - .github/workflows/engine-lockfiles.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-lockfiles-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      # Cargo has no stable release-age or build-script refusal setting.
+      # This resolves only: no dependency build.rs, proc macros or tests run.
+      - name: Refresh affected locks without upgrading unrelated packages
+        env:
+          ENGINE_REV: 5af1bfe901d15b5f041a5d1973b866436d988b19
+        run: |
+          set -euo pipefail
+          # Prepare the next coordinated pin without publishing manifests
+          # against stale locks. These native manifest updates resolve only.
+          cargo add --manifest-path crates/nntune-core/Cargo.toml velmora --git https://github.com/TogetherWeOwn/velmora --rev "$ENGINE_REV" --no-default-features
+          cargo add --manifest-path crates/nntune-test-nntp/Cargo.toml velmora-test-nntp --git https://github.com/TogetherWeOwn/velmora --rev "$ENGINE_REV"
+          cargo add --manifest-path crates/nntune-ssrf-guard/Cargo.toml velmora-ssrf-guard --git https://github.com/TogetherWeOwn/velmora --rev "$ENGINE_REV"
+          for manifest in Cargo.toml workers/api/Cargo.toml workers/ingest/Cargo.toml workers/repair/Cargo.toml workers/transcode/Cargo.toml; do
+            cargo update --workspace --manifest-path "$manifest"
+            cargo metadata --locked --no-deps --format-version 1 --manifest-path "$manifest" > /dev/null
+          done
+      - name: Upload generated lockfiles for review
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-lockfiles
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            Cargo.lock
+            workers/api/Cargo.lock
+            workers/ingest/Cargo.lock
+            workers/repair/Cargo.lock
+            workers/transcode/Cargo.lock

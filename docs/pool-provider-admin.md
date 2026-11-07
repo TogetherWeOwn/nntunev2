@@ -4,9 +4,11 @@ The ADR 0014 service registry is managed only through the admin API. It is
 not a user provider or credential-vault API. The registry API alone does not
 install account scheduling or enable NNTP cache-miss playback.
 
-**Landing boundary:** the API registry/admin/resolver and migration 0035 are
+**Landing boundary:** the API registry/admin/resolver and migration 0036 are
 intentionally enabled effects requiring full review and the pre-merge schema
-approval/apply/ledger gate. Account runtime, candidate/journal/config writes,
+approval/apply/ledger gate. The pool migration was renamed byte-identically from
+`0035_pool_providers.sql` after the library migration took sequence 0035;
+`renamed_from` preserves its original identity. This is not apply authority. Account runtime, candidate/journal/config writes,
 alarms, transport, selection and the ingress decorator described below remain
 uninstalled source. Stream exports no account class or binding/migration and
 its existing object does not forward account operation paths. Live ingest keeps

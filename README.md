@@ -22,7 +22,7 @@ metering primitives below are built to support them from day one.
 | Concern | Choice |
 |---|---|
 | Backend | **Rust** (`workers-rs` → `wasm32`) for backend Workers, including Durable Objects; the staging Tail alert Worker (`workers/observability`) is JavaScript |
-| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
+| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native; the engine is [velmora](https://github.com/TogetherWeOwn/velmora), pinned by git `rev` |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
 | Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
 | Object cache | **R2** for audio / artwork cache |
@@ -39,7 +39,7 @@ subscription mechanism lives in `docs/adr/0005-billing.md`; no vendor is
 chosen or changed here.
 
 ```text
-crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
+crates/nntune-core   # velmora engine re-export (NNTP, yEnc, NZB, decrypt, par2) + transcode (wasm32 + native)
 workers/             # Rust workers-rs backends incl. Durable Objects
 apps/web/            # SvelteKit frontend (adapter-cloudflare)
 ```

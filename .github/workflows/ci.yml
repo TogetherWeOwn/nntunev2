@@ -501,6 +501,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # nntune-test-nntp re-exports velmora-test-nntp at the pinned rev. Its
+      # boundary tests drive the pinned nntune-core client against that server
+      # so a pin bump that regresses fetch, decode or POST fails this gate.
       - run: cargo test -p nntune-test-nntp --all-targets
       - run: cargo clippy -p nntune-test-nntp --all-targets -- -D warnings
       - run: cargo fmt -p nntune-test-nntp -- --check
@@ -1066,6 +1069,8 @@ jobs:
           node-version: 24
       - name: Unit-test the promotion receipt proof
         run: node --test ci/test-release-promotion-proof.cjs
+      - name: Unit-test candidate staging admission (offline synthetic evidence only)
+        run: python3 ci/test_staging_admission.py
       - name: Unit-test the receipt archive bounds
         run: python3 ci/test_read_promotion_receipt.py
       - name: Promotion proof scripts parse clean

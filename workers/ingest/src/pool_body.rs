@@ -181,7 +181,7 @@ pub fn classify_body_reply(
 /// a fresh dial) and 5 s of headroom for DO overhead and the 16 MiB reply
 /// transfer: 5 + 10 + 5 + 5 = 25 s. The pool path dials via `nntune_core`
 /// `WorkerTransport` (per-operation `config.timeout`, default 20 s in
-/// `crates/nntune-core/src/nntp.rs`) with the greeting + `MODE READER` +
+/// velmora `crates/velmora/src/nntp.rs`) with the greeting + `MODE READER` +
 /// `AUTHINFO` handshake in `NntpClient::connect`; the 5 s / 10 s figures
 /// are nominal allowances, not that transport timeout (the playback
 /// `UpstreamTimeouts` in `workers/stream/src/nntp.rs` is a different

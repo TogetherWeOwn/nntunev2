@@ -1536,7 +1536,15 @@ test.describe('generated staging API Tail config (offline)', () => {
     return JSON.parse(result.stdout) as Record<string, unknown>;
   }
 
-  function generateConfig(overrides: Record<string, string> = {}) {
+  // Dummy shared-mirror inventory: the same id in both environments, for the
+  // api worker (the generator's mirror pin reads it) and the mb worker.
+  const MB_INVENTORY = `[[worker.binding]]
+binding = "MB_DB"
+staging = "dummy-mb-mirror"
+prod = "dummy-mb-mirror"
+`;
+
+  function generateConfig(overrides: Record<string, string> = {}, manifestMb: string | null = MB_INVENTORY) {
     const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'staging-api-config-'));
     try {
       const apiDir = join(probe, 'workers/api');
@@ -1551,7 +1559,10 @@ name = "api"
 [[worker.binding]]
 binding = "HYPERDRIVE"
 staging = "dummy-hyperdrive-staging"
-`);
+${manifestMb ?? ''}
+[[worker]]
+name = "mb"
+${MB_INVENTORY}`);
       const section = jobSection(deployWorkflow, 'staging-api');
       const parts = section.split('      - name: Generate staging wrangler.toml\n');
       expect(parts, 'exactly one staging API config generator').toHaveLength(2);
@@ -1564,6 +1575,7 @@ staging = "dummy-hyperdrive-staging"
         API_RP_ID_STAGING: 'staging.nntune.com',
         API_RP_ORIGIN_STAGING: 'https://staging.nntune.com',
         HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-staging',
+        HYPERDRIVE_ID_MB: 'dummy-mb-mirror',
         ...overrides,
       }, apiDir);
       const configPath = join(apiDir, 'wrangler.toml');
@@ -1611,6 +1623,7 @@ staging = "dummy-hyperdrive-staging"
           name: 'nntune-api-staging',
           routes: [
             { pattern: 'staging.nntune.com/v1/*', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/library', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
@@ -1624,7 +1637,10 @@ staging = "dummy-hyperdrive-staging"
             QA_CODE_SEAM: '1',
           },
           observability: { enabled: true, head_sampling_rate: 1 },
-          hyperdrive: [{ binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' }],
+          hyperdrive: [
+            { binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' },
+            { binding: 'MB_DB', id: 'dummy-mb-mirror' },
+          ],
         },
       },
     });
@@ -1644,6 +1660,7 @@ staging = "dummy-hyperdrive-staging"
 
   for (const [name, overrides, diagnostic] of [
     ['wrong inventory id', { HYPERDRIVE_ID_STAGING: 'dummy-other-hyperdrive' }, 'HYPERDRIVE_ID_STAGING must equal the api staging inventory id'],
+    ['wrong mirror id', { HYPERDRIVE_ID_MB: 'dummy-other-mirror' }, 'HYPERDRIVE_ID_MB must equal the api MB_DB inventory id'],
     ['stale host', { API_RP_ID_STAGING: 'obsolete.example', API_RP_ORIGIN_STAGING: 'https://obsolete.example' }, 'API_RP_ID_STAGING must equal the staging RP ID'],
     ['noncanonical origin', { API_RP_ORIGIN_STAGING: 'https://staging.nntune.com/' }, 'API_RP_ORIGIN_STAGING must be the canonical serialized origin'],
     ['non-https origin', { API_RP_ORIGIN_STAGING: 'http://staging.nntune.com' }, 'API_RP_ORIGIN_STAGING must be https'],
@@ -1655,6 +1672,19 @@ staging = "dummy-hyperdrive-staging"
       expect(result.toml).toBeUndefined();
     });
   }
+
+  test('generator rejects a manifest without the api MB_DB binding before writing deploy config', () => {
+    const result = generateConfig({}, null);
+    expect(result.status).not.toBe(0);
+    expect(result.toml).toBeUndefined();
+  });
+
+  test('generator rejects a non-shared api MB_DB inventory before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY.replace('prod = "dummy-mb-mirror"', 'prod = "dummy-prod-mirror"'));
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('api MB_DB must name the shared mirror id in both environments');
+    expect(result.toml).toBeUndefined();
+  });
 
   // Hand-derived TOML controls test the same assertion as the real output.
   // Parse outside toThrow so syntax errors cannot count as caught regressions.
@@ -1910,7 +1940,13 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       'API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)',
     );
     expect(section).toMatch(
-      /^[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n/m,
+      /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
+    );
+    // Shared mirror binding, generated from HYPERDRIVE_ID_MB and pinned to
+    // the api MB_DB manifest inventory id.
+    expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
+    expect(section).toMatch(
+      /^[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
     );
   };
 
@@ -2755,7 +2791,89 @@ function suiteXml(testcases: string): string {
   );
 }
 
+const CATALOGUE_FRESH_CASES = [
+  'catalogue aliases return the same empty library for each fresh account',
+  'catalogue collections expose empty-array contracts for a fresh account',
+  'Library renders the real API empty state for a fresh account',
+] as const;
+const M1_NAMED_CASES = [
+  ['ingest-play-meter.spec.ts', 'ingested track carries recording_mbids'],
+  ['ingest-play-meter.spec.ts', 'NZB fixture ingests and appears in the library'],
+  ['ingest-play-meter.spec.ts', 'ingested library persists across reload without re-import'],
+  ['ingest-play-meter.spec.ts', 'streaming answers byte Ranges with 206 + Content-Range'],
+  ['ingest-play-meter.spec.ts', 'usage meter increases after streaming and shows plan metadata'],
+  ['ingest-play-meter.spec.ts', 'ingested audio actually plays in the browser'],
+  ['ingest-play-meter.spec.ts', 'player UI seek moves the active audio position and playback continues'],
+  ['ingest-play-meter.spec.ts', 'Media Session metadata reflects the playing ingested track'],
+  ['player-queue-order.spec.ts', 'NZB fixture ingests and appears in the library'],
+  ['player-queue-order.spec.ts', 'player queue advances in library-selection order'],
+  ['ingest-play-meter.spec.ts', 'over-limit staging account is refused with a plan-limit status'],
+] as const;
+const CONFIGURED_JOURNEY_ENV = {
+  REQUIRE_QA_AUTH_TOKEN: 'true',
+  QA_AUTH_TOKEN: 'dummy-qa-token',
+  MAX_ALLOWED_SKIPS: '11',
+};
+const cataloguePassingCases = () => CATALOGUE_FRESH_CASES.map((name) =>
+  PASSING('catalogue.spec.ts', name),
+).join('');
+const parkedM1Cases = () => M1_NAMED_CASES.map(([file, name]) =>
+  PASSING(file, `journey › ${name}`).replace('/>', '><skipped/></testcase>'),
+).join('');
+
 test.describe('journey evidence gate (all-skipped must fail)', () => {
+  test('configured full journey reports catalogue passes and named M1 skips honestly', () => {
+    const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 14 | 3 | 11 | 0 |');
+    for (const name of CATALOGUE_FRESH_CASES) {
+      expect(result.summary).toContain(`catalogue.spec.ts: ${name} | passed |`);
+    }
+    for (const [file, name] of M1_NAMED_CASES) {
+      expect(result.summary).toContain(`${file}: ${name} | skipped |`);
+    }
+    expect(result.summary).toContain('do not establish populated-library isolation');
+    expect(result.summary).toContain('skips, never playback or metering proof');
+  });
+
+  test('configured full journey rejects a missing catalogue case', () => {
+    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]), '');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
+    expect(result.output).toContain('required named journey evidence is incomplete');
+  });
+
+  test('configured full journey rejects a skipped catalogue case', () => {
+    const cases = cataloguePassingCases().replace('/>', '><skipped/></testcase>');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), {
+      ...CONFIGURED_JOURNEY_ENV, MAX_ALLOWED_SKIPS: '12',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | skipped |`);
+    expect(result.output).toContain('outside the allow-list');
+  });
+
+  test('configured full journey rejects duplicate catalogue evidence', () => {
+    const cases = cataloguePassingCases() + PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]);
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | duplicate |`);
+  });
+
+  test('another spec cannot satisfy required catalogue evidence', () => {
+    const cases = cataloguePassingCases().replace('classname="catalogue.spec.ts"', 'classname="other.spec.ts"');
+    const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
+  });
+
+  test('omitting a parked M1 leg is not complete named evidence', () => {
+    const cases = parkedM1Cases().replace(/<testcase\b[^>]*>[\s\S]*?<\/testcase>/, '');
+    const result = runGateScript(suiteXml(cataloguePassingCases() + cases), CONFIGURED_JOURNEY_ENV);
+    expect(result.status).not.toBe(0);
+    expect(result.summary).toContain('ingested track carries recording_mbids | missing |');
+  });
   test('journey job carries an always-run evidence gate on configured runs', () => {
     const section = jobSection(stagingWorkflow, 'e2e');
     const gateAt = section.indexOf('Enforce journey evidence gate');
@@ -3006,7 +3124,10 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
       REQUIRE_QA_AUTH_TOKEN: 'true',
       QA_AUTH_TOKEN: 'dummy-qa-token',
     });
-    expect(provided.status).toBe(0);
+    // A token alone is not complete full-journey evidence: the catalogue and
+    // M1 cases must also be present, not silently omitted by a test filter.
+    expect(provided.status).not.toBe(0);
+    expect(provided.output).toContain('required named journey evidence is incomplete');
     const notRequired = runGateScript(xml, { REQUIRE_QA_AUTH_TOKEN: 'false', QA_AUTH_TOKEN: '' });
     expect(notRequired.status).toBe(0);
   });

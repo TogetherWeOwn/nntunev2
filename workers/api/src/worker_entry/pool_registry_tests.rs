@@ -52,7 +52,7 @@ impl Fixture {
         .unwrap();
         // Use the actual migration's table definitions and constraints, with
         // only the schema rebound to this test's isolated namespace.
-        let ddl = include_str!("../../../../migrations/0035_pool_providers.sql");
+        let ddl = include_str!("../../../../migrations/0036_pool_providers.sql");
         let ddl = ddl
             .split("CREATE TABLE IF NOT EXISTS public.pool_provider_secrets")
             .nth(1)

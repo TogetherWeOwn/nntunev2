@@ -20,6 +20,7 @@ pub mod auth;
 pub mod b64;
 pub mod billing;
 pub mod billing_reconcile;
+pub mod catalogue;
 mod field_envelope;
 pub mod handlers;
 pub mod ingest_grant;
