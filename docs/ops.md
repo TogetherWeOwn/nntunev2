@@ -265,14 +265,31 @@ Existing TWO databases were not touched.
   The host reports it was empty (zero tables) and required no data migration;
   this update did not independently inventory schema objects. The latest receipt records
   that removed PS-DEV branch as $5/month, correcting the earlier $0 statement.
-- `nntunev2-mb` / `main`: separate MusicBrainz cluster, now reported as $5/month
-  compute. The latest receipt does not specify its final SKU/replica count;
-  do not carry forward the earlier PS-10 CPU/RAM/HA claims as current facts.
-- Monthly cluster compute: **$10** ($5 app main, including staging, + $5 MB).
-  Metered storage, backups, and egress are additional; $10 is not an all-in bill.
-- The ~100 GB MB import remains a capacity target, not already-imported data.
-  Initial storage was gp3 autoscale 10 GB–4 TB; verify current storage, connection
-  allowance, and import performance on the reduced allocation before importing.
+- **MusicBrainz lifecycle, updated 2026-11-07:** the former `nntunev2-mb`
+  cluster was deleted on 2026-11-06. Its small test seed was not a completed
+  MusicBrainz import. App databases and production were untouched. Its MB
+  Hyperdrive config was deleted and `HYPERDRIVE_ID_MB` removed; the cleanup
+  receipt reports no environment override. Never restore the retired config ID.
+- After the snapshot alternative failed its interactive latency criterion,
+  the owner permitted a conditional replacement: **PS-5 only, ≤$10/month all-in,
+  curated CC0 10-table subset, one branch, no development branch or extra
+  replicas**. The 2026-11-07 setup receipt reports one main branch, zero replicas
+  and a 50 GiB storage auto-grow cap. It reports no import, new Hyperdrive
+  binding, variable restoration or consumer enablement. Provisioning is not
+  import completion, serving readiness or runtime activation.
+- The earlier **$10 combined monthly compute** statement is historical, not a
+  current bill. The separate app database has a reported $5/month compute line;
+  it is not the replacement mirror's invoice. Mirror estimates of $6.9–8.8/month
+  remain estimates. A storage cap does not cap backups, transfer or every
+  billable dimension. Record the mirror's first actual invoice and all-in total.
+  A larger SKU requires measured PS-5 latency failure and a fresh spend decision.
+- The replacement import plan is one manual trusted-host CC0 ETL → validated
+  COPY run, with TLS, least privilege and elapsed-time/row-count evidence.
+  Native validator source/digest/architecture/ABI provenance and security/release
+  acceptance remain prerequisites; no unvalidated COPY or Container fallback.
+  The old ~100 GB capacity target and synthetic-fixture-only recreation recipe
+  are not this replacement plan. Runtime activation is separately gated; see
+  [ADR 0007's amendment](adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement).
 - **Launch remains gated:** prod will get its own clean PostgreSQL database on
   the main cluster, with resize/split assessed then. The current prod Hyperdrive
   still targets `postgres`; it is not evidence that the clean launch database
@@ -307,13 +324,12 @@ this documentation update, nor evidence of separate compute/failure domains.
   default privileges, runtime DDL denial, read-only
   write denial, and bidirectional cross-database CONNECT denial. The earlier
   seven-role `select 1` probe predates consolidation and is not current proof.
-- MB migrator/runtime/read-only roles were provisioned separately. The latest
-  app-isolation receipt does not prove MB read-only enforcement. On 2026-10-17,
-  this agent attempted to locate an authorized read-only SQL executor through the
-  Paperclip connection catalog; both searches timed out. No direct SQL session or
-  host-side verification receipt was available in this workspace. Accordingly,
-  **the MB app role's live grants remain unverified**; the older receipt's claim
-  that the MB binding uses a read-only role is host-reported only.
+- MB migrator/runtime/read-only roles were originally provisioned separately.
+  Those receipts predate the former cluster's deletion and do not attest to
+  replacement roles. **Replacement MB grants remain unverified here**; neither
+  app-isolation results nor the old read-only binding claim prove them. Apply
+  the following checks to the replacement through its authorized evidence path
+  before import or activation.
 - Exact checks still required against the MB database using the authorized
   read-only verification path: establish the database/schema and effective role
   identity without exposing connection details; run a representative `SELECT`
@@ -506,11 +522,11 @@ operator-verified staging state). The three pre-merge applies from
 #917 and #922 are recorded by the sibling `-premerge-917.sql` /
 `-premerge-922.sql` files, applied only when each PR merges (or
 equivalently via `apply_migration.py --record-only`), so the gate is
-green immediately after the app backfill. The mirror database is shared by staging and
-production reads, so its backfill — and creating the table on
-production at all — is applied only under a Release Manager decision;
-production applies use the same `apply_migration.py` path once their
-gate opens.
+green immediately after the app backfill. A future shared mirror would couple
+staging and production reads; the replacement is not activated and these
+historical backfill files do not prove its migration state. Its backfill — and
+creating the table on production at all — requires a Release Manager decision;
+production applies use the same `apply_migration.py` path once their gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -585,30 +601,29 @@ redeemed end-to-end in that environment.
 |---|---|---|---|
 | `nntunev2-staging` | `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING` | `nntunev2_staging` on app `main` | staging app, new runtime role (host-reported) |
 | `nntunev2-prod` | `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` | `postgres` on app `main` | reserved prod app; clean launch DB deferred |
-| `nntunev2-mb` | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` | `postgres` on MB `main` | shared read-oriented MB mirror |
+| `nntunev2-mb` | `1c6460d5112448888031973c87f671bc` **deleted, never reuse** / `HYPERDRIVE_ID_MB` **unset** | retired origin; replacement unbound | unavailable; no activated replacement |
 
-All three configs independently GET-resolved on 2026-10-13 after consolidation.
-IDs are unchanged and match the repo variables set at `18:59:44Z`. Staging's
-config was modified at `19:37:25Z`; its database is `nntunev2_staging`. Prod and MB
-metadata retain their original `18:58:55Z` and `18:58:57Z` modification times. Fresh
-metadata confirms app staging/prod share an origin host but use different origin
-users and databases. A metadata GET is not an ongoing SQL connectivity or
-privilege test; no hostnames, usernames, or credentials need publishing here.
+The three-config GET inventory from 2026-10-13 is historical. The 2026-11-06
+cleanup supersedes its MB entry: deletion was followed by GET 404, and the
+repository variable was removed with no environment override reported. App
+staging/prod configs were untouched by that cleanup. Their older metadata
+reported a shared app origin with different users/databases, caching enabled
+and `origin_connection_limit = 60`; verify current settings at deployment.
+A metadata GET is not an ongoing SQL connectivity or privilege test.
 
-There are **three** configs, not separate MB staging/prod configs. The MB origin
-uses its read-only role per the original host receipt, subject to the MB grant
-check above. The MB import uses its migrator role, not this read-oriented binding.
-Staging and prod MB reads share one MB config/cluster: load, cache behavior, and
-outages are coupled. The import competes for that same MB connection/compute
-allowance even though it uses a separate role.
+A future shared MB read config would couple staging/prod load, cache behavior
+and outages. Import must use a separately verified least-privilege importer,
+not the read binding, and still competes for the same connection/compute budget.
+The recreated cluster has no activated read binding. Do not restore the deleted
+ID: a new verified config, tracked binding/manifest alignment and separate
+activation acceptance are required before setting `HYPERDRIVE_ID_MB` again.
 
-All three configs still report caching enabled and `origin_connection_limit = 60`.
-The two app pools now share one PS-5 single-node cluster, alongside direct
+The two app pools share one PS-5 single-node cluster, alongside direct
 migrator/admin connections; they do **not** have independent branch allowances.
 Before deploy/import, the owning lanes must validate the combined connection
 budget and cache freshness against the actual origin limits. Database CONNECT
-isolation does not isolate CPU, connections, storage/I/O, maintenance, or outages, and the
-app single-node allocation must not be described as highly available.
+isolation does not isolate CPU, connections, storage/I/O, maintenance, or outages,
+and the app single-node allocation must not be described as highly available.
 
 App auth reads require cache-disabled Hyperdrive: the API reads sessions,
 credentials, users, challenges and vaults with plain `SELECT`s through the
@@ -617,7 +632,8 @@ caches by default (60s + 15s stale-while-revalidate, never invalidated by
 writes). The staging/prod app configs (`HYPERDRIVE_ID_STAGING`,
 `HYPERDRIVE_ID_PROD`) MUST be updated with
 `wrangler hyperdrive update <id> --caching-disabled` before the API serves
-traffic; the MB mirror config may stay cached. Deploy checklist (with
+traffic; query caching is intended only for a newly verified MB config, not
+for the deleted config. Deploy checklist (with
 `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` exported):
 `workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING`
 (and prod) must report `caching.disabled=true`. The gate fails closed
@@ -644,7 +660,29 @@ R2, KV, Queues, Analytics Engine and PlanetScale Postgres are in
 [`docs/cost-basis.md`](cost-basis.md) (checked 2026-10-17). The first
 measured staging bill (2026-10-13 → 2026-10-17) is recorded in section 10
 of that document; plug later staging volumes into the same formulas for
-updated estimates.
+updated estimates. That historical staging bill and the separate app compute
+line do not measure the replacement MB mirror. Its first actual invoice must
+record all-in compute, storage, backup and transfer charges against the
+**≤$10/month** ceiling; modeled mirror costs are not measured billing.
+
+### MB unavailable: deployment and runtime evidence
+
+With `HYPERDRIVE_ID_MB` unset, `.github/workflows/deploy.yml` records
+`staging-mb` as `configured=false`, `deployed=false`, `outcome=unconfigured`.
+Ingest deploy requires `staging-mb.outputs.deployed == 'true'` in that same
+run; otherwise it skips rather than binding an unavailable MB service. This
+is not permission to treat transient matching failures as successful ingest.
+The unrelated web/API e2e journey remains independent of MB. The static
+contract in `e2e/tests/workflows.spec.ts` protects these deployment guards;
+a green skipped lane is never deployment or runtime-health evidence.
+
+The 2026-11-06 staging-only runtime receipt reports the MB Worker still deployed
+with its deleted `MB_DB` binding, artwork R2 and cache KV retained; MB lookups
+remain unavailable. Ingest had no service, queue or Hyperdrive bindings,
+including no `MB_API`; both staging ingest queues had zero consumers. This is
+a dated observation, not a fresh production inventory or evidence about queued
+jobs. No Worker, bucket or KV deletion, MB-only ownership, licence clearance or
+zero-cost claim follows. Replacement provisioning does not restore those bindings.
 
 ## Environments matrix
 
@@ -671,7 +709,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz`, `/api/library` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
-| MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
+| MB Hyperdrive variable | `HYPERDRIVE_ID_MB` unset; MB unavailable | MB lane not enabled; shared mirror is intended topology only |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
 
 ## Binding parity check
@@ -708,18 +746,20 @@ config sources in the Non-storage bindings inventory below.
 | `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
 | `ingest` (`workers/ingest/wrangler.toml`) | `AUDIO_PUBLISH` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID; write-only publication binding (same buckets as `AUDIO_CACHE`), bucket name mirrored in the `AUDIO_BUCKET_NAME` var |
 | `mb` (`workers/mb/wrangler.toml`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID; the prod section still names the staging bucket until the MB art-cache activation lands (`[[known_drift]]`) |
-| `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
+| `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` logical inventory; replacement unbound | intended only, not enabled | `1c6460d5112448888031973c87f671bc` **deleted, never reuse** (stale committed metadata) / `HYPERDRIVE_ID_MB` **unset** |
 | `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
-| `api` (`workers/api/wrangler.toml.example`) | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
+| `api` (`workers/api/wrangler.toml.example`) | `MB_DB` | Hyperdrive | `nntunev2-mb` logical inventory; replacement unbound | intended only, not enabled | `1c6460d5112448888031973c87f671bc` **deleted, never reuse** (stale committed metadata) / `HYPERDRIVE_ID_MB` **unset** |
 | `ingest` (`workers/ingest/wrangler.toml`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
 | `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
 | `mb` / `ingest` (shared reserved namespace) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; all three bindings share the single reserved namespace per env (dedicated namespaces not provisioned). Keys disjoint by prefix: `ingest:checkpoint:`/`ingest:verify:` (`workers/ingest/src/checkpoint.rs`), `nzb:sha256:` (`workers/ingest/src/dispatch.rs:31`), `mb:lookup:`/`mb:release-recordings:` (`workers/mb/src/lib.rs`). Sharing couples quota/blast radius; accepted for staging; split later without code change |
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
 owning lanes, not here): the ingest queue names are aligned — the real
-`workers/ingest/wrangler.toml` uses the per-environment producer, consumer
-and DLQ names above, with a live consumer in every environment. The remaining
-tracked drift is the mb prod `ART_CACHE` override (see the `ART_CACHE` row
+`workers/ingest/wrangler.toml` declares the per-environment producer, consumer
+and DLQ names above. Committed declarations do not prove live consumers: the
+2026-11-06 staging receipt reported none on either staging queue, and this
+update makes no production-consumer claim. The remaining tracked config drift
+is the mb prod `ART_CACHE` override (see the `ART_CACHE` row
 above and `[[known_drift]]` in `.github/scripts/binding_manifest.toml`). Do
 not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
 rejects that shape, so it will not configure dead-letter routing.
