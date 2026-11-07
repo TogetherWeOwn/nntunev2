@@ -1436,7 +1436,7 @@ jobs:
           echo "CC0 fixture fetched and sha256-verified against the manifest:"
           sha256sum "$fetched"
       - name: Run apps/web Playwright suite
-        run: pnpm test:e2e
+        run: pnpm test:e2e --reporter=dot,./tests/reporters/runtime-inventory.ts
         env:
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
@@ -1447,6 +1447,14 @@ jobs:
         with:
           name: web-e2e-report
           path: apps/web/test-results/
+          retention-days: 7
+      - name: Upload runtime test inventory
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e-runtime-inventory
+          path: apps/web/test-results/runtime-inventory.json
+          if-no-files-found: error
           retention-days: 7
 
   # Axe accessibility gate: every existing route must report zero serious or
