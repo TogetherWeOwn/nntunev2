@@ -172,8 +172,11 @@ pub fn fold(text: &str) -> String {
 
 /// Folded words: maximal runs of alphanumeric characters, like `pg_trgm`.
 pub fn words(text: &str) -> Vec<String> {
-    fold(text)
-        .split(|ch: char| !ch.is_alphanumeric())
+    split_words(&fold(text))
+}
+
+fn split_words(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_owned)
         .collect()
@@ -216,8 +219,19 @@ pub fn search_keys(normalized_q: &str) -> Vec<String> {
 /// leading spaces and one trailing space, then every 3-character window,
 /// deduplicated.
 pub fn trigrams(text: &str) -> Vec<[char; 3]> {
+    word_trigrams(words(text))
+}
+
+/// `pg_trgm` trigrams of the lowercased text without diacritic folding:
+/// the set Postgres itself scores. Breaks ties between titles that fold
+/// to the same words, so an exact accented match outranks its ASCII twin.
+pub fn exact_trigrams(text: &str) -> Vec<[char; 3]> {
+    word_trigrams(split_words(&text.to_lowercase()))
+}
+
+fn word_trigrams(words: Vec<String>) -> Vec<[char; 3]> {
     let mut out = Vec::new();
-    for word in words(text) {
+    for word in words {
         let padded: Vec<char> = "  "
             .chars()
             .chain(word.chars())
@@ -254,6 +268,24 @@ pub fn similarity(a: &str, b: &str) -> f32 {
     similarity_of(&trigrams(a), &trigrams(b))
 }
 
+pub type LabelKey = (String, String, Vec<bool>, String);
+
+/// Sort key for `label ASC` under the database collation (glibc
+/// `en_US.UTF-8`, the Postgres image default): spaces and punctuation
+/// ignored, then base letters, then accents, then lowercase before
+/// uppercase. The raw label last keeps the order total. Byte order would
+/// put every uppercase title before its lowercase twin.
+pub fn label_sort_key(label: &str) -> LabelKey {
+    let alnum: Vec<char> = label.chars().filter(|ch| ch.is_alphanumeric()).collect();
+    let lower: String = alnum.iter().flat_map(|ch| ch.to_lowercase()).collect();
+    (
+        fold(&lower),
+        lower,
+        alnum.iter().map(|ch| ch.is_uppercase()).collect(),
+        label.to_owned(),
+    )
+}
+
 /// One release-search posting: `[mbid, title, artist_mbid, artist_name]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Posting(
@@ -264,9 +296,11 @@ pub struct Posting(
 );
 
 /// Score, filter and page postings the way the Postgres release search
-/// orders rows: similarity desc, then title asc, then MBID asc, with the
-/// `%` floor ([`SEARCH_MIN_SCORE`]). Duplicate MBIDs (a release under its
-/// title key and its word keys) count once.
+/// orders rows: similarity desc, then title asc ([`label_sort_key`]), then
+/// MBID asc, with the `%` floor ([`SEARCH_MIN_SCORE`]). The folded score
+/// ranks first; equal folded scores fall back to the unfolded `pg_trgm`
+/// score ([`exact_trigrams`]) before the title. Duplicate MBIDs (a release
+/// under its title key and its word keys) count once.
 pub fn rank_postings(
     normalized_q: &str,
     postings: impl IntoIterator<Item = Posting>,
@@ -274,17 +308,22 @@ pub fn rank_postings(
     offset: u32,
 ) -> Vec<SearchHit> {
     let query = trigrams(normalized_q);
+    let exact_query = exact_trigrams(normalized_q);
     let mut seen = HashSet::new();
-    let mut scored: Vec<(f32, Posting)> = postings
+    let mut scored: Vec<(f32, f32, LabelKey, Posting)> = postings
         .into_iter()
         .filter(|posting| seen.insert(posting.0.clone()))
         .map(|posting| (similarity_of(&query, &trigrams(&posting.1)), posting))
         .filter(|(score, _)| *score >= SEARCH_MIN_SCORE)
+        .map(|(score, posting)| {
+            let exact = similarity_of(&exact_query, &exact_trigrams(&posting.1));
+            (score, exact, label_sort_key(&posting.1), posting)
+        })
         .collect();
-    scored.sort_by(|(sa, pa), (sb, pb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| pa.1.cmp(&pb.1))
+    scored.sort_by(|(sa, ea, ka, pa), (sb, eb, kb, pb)| {
+        sb.total_cmp(sa)
+            .then_with(|| eb.total_cmp(ea))
+            .then_with(|| ka.cmp(kb))
             .then_with(|| pa.0.cmp(&pb.0))
     });
     scored
@@ -292,7 +331,7 @@ pub fn rank_postings(
         .skip(offset as usize)
         .take(limit as usize)
         .map(
-            |(score, Posting(mbid, title, artist_mbid, artist_name))| SearchHit {
+            |(score, _, _, Posting(mbid, title, artist_mbid, artist_name))| SearchHit {
                 mbid,
                 label: title,
                 score,
@@ -949,6 +988,34 @@ mod tests {
         );
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].mbid, "b");
+    }
+
+    #[test]
+    fn ties_follow_the_database_collation_and_the_exact_score() {
+        let p = |mbid: &str, title: &str| Posting(mbid.into(), title.into(), None, None);
+        // Collation order, not byte order: punctuation ignored first, then
+        // lowercase before uppercase.
+        let hits = rank_postings(
+            "late show",
+            vec![
+                p("a", "LATE SHOW"),
+                p("b", "Late Show"),
+                p("c", "late show"),
+                p("d", "Late, Late Show"),
+            ],
+            25,
+            0,
+        );
+        let order: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(order[1..], ["late show", "Late Show", "LATE SHOW"]);
+        assert!(hits.iter().all(|h| h.score == 1.0));
+        // Titles that fold alike: the unaccented query prefers the ASCII
+        // title, the accented query the accented one.
+        let twins = || vec![p("x", "Detente"), p("y", "Détente")];
+        assert_eq!(rank_postings("detente", twins(), 25, 0)[0].label, "Detente");
+        let hits = rank_postings("détente", twins(), 25, 0);
+        assert_eq!(hits[0].label, "Détente");
+        assert_eq!(hits[1].score, 1.0, "folded score is unchanged");
     }
 
     #[test]

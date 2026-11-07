@@ -15,9 +15,10 @@
 //! timings). Format: `workers/mb/src/snapshot.rs`.
 
 use nntune_mb::snapshot::{
-    deflate_block, encode_idx_entry, idx_object, key_bucket, mbid_bucket, title_key, word_key,
-    words, ArtistRow, BlockRef, Posting, RecordingRow, ReleaseRow, BUCKETS, IDX_ENTRY_LEN, IDX_LEN,
-    MAX_PART_BYTES, MAX_SNAPSHOT_BLOCK_BYTES, MAX_TITLE_POSTINGS, MAX_WORD_POSTINGS, SEARCH_KIND,
+    deflate_block, encode_idx_entry, idx_object, key_bucket, label_sort_key, mbid_bucket,
+    title_key, word_key, words, ArtistRow, BlockRef, Posting, RecordingRow, ReleaseRow, BUCKETS,
+    IDX_ENTRY_LEN, IDX_LEN, MAX_PART_BYTES, MAX_SNAPSHOT_BLOCK_BYTES, MAX_TITLE_POSTINGS,
+    MAX_WORD_POSTINGS, SEARCH_KIND,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -464,18 +465,14 @@ fn build_search(
         let mut by_bucket: HashMap<usize, Vec<(String, String)>> = HashMap::new();
         for (key, mut list) in by_key {
             if key.starts_with("t:") {
-                list.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                list.sort_by_cached_key(|p| (label_sort_key(&p.1), p.0.clone()));
                 if list.len() > MAX_TITLE_POSTINGS {
                     truncated_keys += 1;
                     list.truncate(MAX_TITLE_POSTINGS);
                 }
             } else {
-                list.sort_by(|a, b| {
-                    a.1.chars()
-                        .count()
-                        .cmp(&b.1.chars().count())
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.0.cmp(&b.0))
+                list.sort_by_cached_key(|p| {
+                    (p.1.chars().count(), label_sort_key(&p.1), p.0.clone())
                 });
                 if list.len() > MAX_WORD_POSTINGS {
                     truncated_keys += 1;

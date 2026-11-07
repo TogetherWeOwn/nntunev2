@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: "1000"
+      heldout_seed:
+        description: "Seed of the held-out golden set that decides gate 1"
+        required: false
+        type: string
+        default: "20261107"
   pull_request:
     types: [labeled]
 
@@ -107,6 +112,7 @@ jobs:
       - name: Lookup samples and golden set
         env:
           GOLDEN_COUNT: ${{ inputs.golden_count || '1000' }}
+          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261107' }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/out"; mkdir -p "$out/mbids"
@@ -116,6 +122,9 @@ jobs:
             "$RUNNER_TEMP/tools/snapshot_eval" lookup /work/snap "$kind" < "$out/mbids/$kind.txt"
           done
           python3 workers/mb/spike/golden.py "$cur" "$out/golden.tsv" "$GOLDEN_COUNT"
+          # Gate 1 is decided on a held-out set the ranker was not tuned on
+          # (SNAPSHOT.md); golden.tsv (seed 3599) stays for comparison.
+          python3 workers/mb/spike/golden.py "$cur" "$out/golden-heldout.tsv" 2000 "$HELDOUT_SEED"
 
       - name: Recall vs pg_trgm (gate 1)
         run: |
@@ -126,9 +135,11 @@ jobs:
             -v "$RUNNER_TEMP/pgdata:/var/lib/postgresql" "$PG_IMAGE"
           for _ in $(seq 1 60); do docker exec mbpg pg_isready -U postgres && break; sleep 2; done
           python3 workers/mb/spike/pg_baseline.py load /work/dump/curated
-          python3 workers/mb/spike/pg_baseline.py search "$out/golden.tsv" "$out/hits-pg.tsv"
-          "$RUNNER_TEMP/tools/snapshot_eval" search /work/snap < "$out/golden.tsv" > "$out/hits-snapshot.tsv"
-          python3 workers/mb/spike/recall.py "$out/golden.tsv" "$out/hits-pg.tsv" "$out/hits-snapshot.tsv" "$out/recall.json" | tee "$out/recall.md"
+          for set in "" -heldout; do
+            python3 workers/mb/spike/pg_baseline.py search "$out/golden$set.tsv" "$out/hits-pg$set.tsv"
+            "$RUNNER_TEMP/tools/snapshot_eval" search /work/snap < "$out/golden$set.tsv" > "$out/hits-snapshot$set.tsv"
+            python3 workers/mb/spike/recall.py "$out/golden$set.tsv" "$out/hits-pg$set.tsv" "$out/hits-snapshot$set.tsv" "$out/recall$set.json" | tee "$out/recall$set.md"
+          done
           docker rm -f mbpg
 
       - name: Stage, deploy spike Worker and bench (gate 2)
@@ -160,7 +171,7 @@ jobs:
           out="$RUNNER_TEMP/out"
           {
             echo "## mb-snapshot-spike (${MB_DUMP})"
-            for f in build.json snapshot-size.txt recall.md bench.json; do
+            for f in build.json snapshot-size.txt recall-heldout.md recall.md bench.json; do
               if [ -f "$out/$f" ]; then echo "### $f"; echo '```'; cat "$out/$f"; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
