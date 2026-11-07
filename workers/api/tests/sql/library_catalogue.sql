@@ -612,7 +612,7 @@ BEGIN
                     RAISE EXCEPTION 'fresh reader received a private row';
                 END IF;
             END LOOP;
-            IF page_count <> CASE WHEN caller = 'user-lib-1' THEN 9 ELSE 1 END THEN
+            IF page_count <> (CASE WHEN caller = 'user-lib-1' THEN 9 ELSE 1 END) THEN
                 RAISE EXCEPTION 'own plus shared page count wrong: %', page_count;
             END IF;
             IF caller = 'user-lib-shared' THEN
