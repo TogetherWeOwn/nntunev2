@@ -481,9 +481,11 @@ async fn read_handle(
     }))
 }
 
-/// Atomic absent-hash admission. The preparation schema deliberately refuses
-/// terminal-predecessor replacement until the complete rollout fence lands.
-/// A zero-row insert is never interpreted as admission of the caller's mint.
+/// Atomic absent-hash admission. The registry alone selects physical custody;
+/// missing legacy registration is an error, never an implicit hash-row winner.
+/// The preparation schema deliberately refuses terminal-predecessor replacement
+/// until the complete rollout fence lands. A zero-row insert is never
+/// interpreted as admission of the caller's mint.
 pub async fn admit(
     client: &mut Client,
     attempt: &AttemptHandle,
@@ -498,22 +500,29 @@ pub async fn admit(
     if !lock_attempt(&tx, attempt).await? {
         return Ok(AdmissionOutcome::StaleOrDiverged);
     }
+    // Bootstrap/backfill owns legacy associations while physical hashes are
+    // unique. Never evaluate a scalar physical-row lookup, even on a conflicting
+    // registry insert: multiple retained generations must not choose a winner.
     tx.execute(
-        "INSERT INTO posted_file_registry (plaintext_sha256, selected_generation) \
-         SELECT $1, (SELECT id FROM posted_files WHERE plaintext_sha256 = $1) \
+        "INSERT INTO posted_file_registry (plaintext_sha256) \
+         SELECT $1 WHERE NOT EXISTS \
+         (SELECT 1 FROM posted_files WHERE plaintext_sha256 = $1) \
          ON CONFLICT (plaintext_sha256) DO NOTHING",
         &[&expected.hash],
     )
     .await
     .map_err(database_error)?;
-    let registry = tx
-        .query_one(
+    let Some(registry) = tx
+        .query_opt(
             "SELECT selected_generation, revision, pending_operation FROM posted_file_registry \
              WHERE plaintext_sha256 = $1 FOR UPDATE",
             &[&expected.hash],
         )
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+    else {
+        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    };
     if let Some(operation) = registry.get::<_, Option<String>>("pending_operation") {
         if operation != mint.operation_id {
             return Ok(AdmissionOutcome::ClaimBusy);

@@ -20,6 +20,12 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_registry_admission::postgres_admission_missing_legacy_registration_refuses_without_adopting_custody",
+    "posted_generation_registry_admission::postgres_admission_selected_health_never_implicitly_reuses_or_replaces",
+    "posted_generation_registry_admission::postgres_admission_registered_history_uses_registry_without_scalar_physical_lookup",
+    "posted_generation_registry_admission::postgres_admission_unregistered_history_is_inconsistent_not_an_arbitrary_winner",
+    "posted_generation_registry_admission::postgres_admission_pending_history_replays_only_the_exact_stored_candidate",
+    "posted_generation_registry_admission::postgres_admission_history_does_not_repair_a_stale_registry_observation",
     "posted_generation_media_v1::postgres_media_v1_candidate_recovery_replay_and_retained_custody_keep_exact_metadata",
     "posted_generation_media_v1::postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_ciphertext",
     "posted_generation_dispatch::tagged::postgres_tagged_producer_commits_byte_derived_storage_identity_and_replays",
