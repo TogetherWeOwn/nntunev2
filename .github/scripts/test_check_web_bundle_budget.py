@@ -335,6 +335,34 @@ def _parse_byte_number(text: str) -> int:
     return int(text.replace(",", "").replace("_", "").strip())
 
 
+def test_ci_retains_only_public_client_bundle_after_budget_failure() -> None:
+    from test_ci_pnpm_retry import split_jobs, split_steps, step_field
+
+    workflow = _repo_root().joinpath(".github", "workflows", "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    steps = split_steps(split_jobs(workflow)["web-build"])
+    build = next(step for step in steps if step_field(step, "id") == "client-build")
+    assert step_field(build, "run") == "pnpm build"
+    upload = next(step for step in steps if step_field(step, "name") == "Retain client bundle for size diagnosis")
+    assert step_field(upload, "if") == "${{ !cancelled() && steps.client-build.outcome == 'success' }}"
+    assert re.fullmatch(r"actions/upload-artifact@[a-f0-9]{40}", step_field(upload, "uses"))
+    assert step_field(upload, "include-hidden-files") == "true"
+    assert step_field(upload, "if-no-files-found") == "error"
+    assert step_field(upload, "retention-days") == "7"
+    paths = re.findall(r"^            (\S+)$", upload, re.MULTILINE)
+    assert paths == [
+        "apps/web/.svelte-kit/output/client/**/*.js",
+        "apps/web/.svelte-kit/output/client/.vite/manifest.json",
+    ], paths
+    gate = next(step for step in steps if step_field(step, "name") == "Enforce client-JS bundle budget")
+    assert step_field(gate, "run") == 'python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"'
+    assert step_field(gate, "continue-on-error") is None
+    assert step_field(gate, "if") is None
+    self_tests = next(step for step in steps if step_field(step, "name") == "Bundle-budget self-tests (pass + breach fixtures)")
+    assert steps.index(build) < steps.index(self_tests) < steps.index(gate) < steps.index(upload)
+
+
 def test_readme_budget_matches_pinned_constant() -> None:
     """README budget number must equal BUDGET_CLIENT_JS_BYTES."""
     readme = _repo_root().joinpath("apps", "web", "README.md").read_text(
@@ -414,6 +442,7 @@ def main_test() -> int:
         test_actions_annotations_retain_pass_and_breach_results,
         test_actions_annotation_escapes_command_data,
         test_annotations_are_actions_only,
+        test_ci_retains_only_public_client_bundle_after_budget_failure,
         test_readme_budget_matches_pinned_constant,
         test_readme_baseline_matches_script_measured_figure,
         test_splitting_plan_headroom_matches_pinned_budget,
