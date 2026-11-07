@@ -368,15 +368,17 @@ pub fn repair_read_order(record: &PostedFileRecord) -> Vec<RepairSource> {
 pub enum DedupeDecision {
     /// A verified two-spool post already exists: reuse it, post nothing.
     Reuse { posted_file_id: String },
-    /// No usable post exists: post fresh. `reason` names why
-    /// (`"no_verified_post"`, `"post_failed_verification"`,
-    /// `"post_lost_retention"`) for the log line — never an ID.
+    /// No post exists: post fresh. `reason` is `"no_verified_post"` for
+    /// the log line — never an ID. This decision is not an admission fence.
     PostFresh { reason: &'static str },
 }
 
 /// Decide dedupe from a lookup of the sha256's existing post, if any.
-/// `verified` must be true AND the post must still be retained: a post
-/// that failed verification or fell out of retention posts fresh.
+/// `verified` must be true AND the post must still be retained for reuse.
+/// An unusable existing row refuses: the legacy first-wins insert cannot
+/// publish replacement custody. Only a fenced generation replacement may
+/// authorize a fresh post for that hash; this helper grants no such authority.
+/// An absent-row snapshot still requires atomic admission before network IO.
 pub fn decide_dedupe(
     plaintext_sha256: &str,
     existing: Option<(&str, bool, bool)>,
@@ -388,12 +390,7 @@ pub fn decide_dedupe(
         Some((id, verified, retained)) if verified && retained => Ok(DedupeDecision::Reuse {
             posted_file_id: id.to_string(),
         }),
-        Some((_, verified, _)) if !verified => Ok(DedupeDecision::PostFresh {
-            reason: "post_failed_verification",
-        }),
-        Some(_) => Ok(DedupeDecision::PostFresh {
-            reason: "post_lost_retention",
-        }),
+        Some(_) => Err("existing post requires fenced generation replacement"),
         None => Ok(DedupeDecision::PostFresh {
             reason: "no_verified_post",
         }),
@@ -1010,18 +1007,20 @@ mod tests {
             DedupeDecision::Reuse { .. }
         ));
         assert!(matches!(
-            decide_dedupe(SHA, Some(("posted_01", false, true))).unwrap(),
-            DedupeDecision::PostFresh { .. }
-        ));
-        assert!(matches!(
-            decide_dedupe(SHA, Some(("posted_01", true, false))).unwrap(),
-            DedupeDecision::PostFresh { .. }
-        ));
-        assert!(matches!(
             decide_dedupe(SHA, None).unwrap(),
             DedupeDecision::PostFresh { .. }
         ));
         assert!(decide_dedupe("not-hex", None).is_err());
+    }
+
+    #[test]
+    fn dedupe_refuses_existing_unusable_posts_before_fresh_post() {
+        for (verified, retained) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                decide_dedupe(SHA, Some(("posted_01", verified, retained))),
+                Err("existing post requires fenced generation replacement"),
+            );
+        }
     }
 
     #[test]

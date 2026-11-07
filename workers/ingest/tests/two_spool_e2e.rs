@@ -216,16 +216,15 @@ async fn dedupe_reuse_skips_posting_for_identical_sha256() {
     ));
     assert_eq!(spool_b.posted_count().await, posted_before);
 
-    // A post that failed verification — or fell out of retention — posts
-    // fresh instead of reusing.
-    assert!(matches!(
-        decide_dedupe(&sha, Some(("posted_row", false, true))).expect("valid sha"),
-        DedupeDecision::PostFresh { .. }
-    ));
-    assert!(matches!(
-        decide_dedupe(&sha, Some(("posted_row", true, false))).expect("valid sha"),
-        DedupeDecision::PostFresh { .. }
-    ));
+    // An unusable existing post cannot use the legacy first-wins insert
+    // for fresh custody: refuse until fenced generation replacement exists.
+    for (verified, retained) in [(false, true), (true, false), (false, false)] {
+        assert_eq!(
+            decide_dedupe(&sha, Some(("posted_row", verified, retained))),
+            Err("existing post requires fenced generation replacement"),
+        );
+        assert_eq!(spool_b.posted_count().await, posted_before);
+    }
 }
 
 #[tokio::test]
