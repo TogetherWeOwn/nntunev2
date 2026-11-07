@@ -214,7 +214,13 @@ impl StoredGeneration {
             repost_exhausted: r.try_get("repost_exhausted").map_err(database_error)?,
             plaintext_size: r.try_get("plaintext_size").map_err(database_error)?,
             article_payload_size: r.try_get("article_payload_size").map_err(database_error)?,
-            header_nonce: r.try_get("header_nonce").map_err(database_error)?,
+            media: crate::posted_files::PostedFileMedia::from_record(
+                r.try_get("media_format").map_err(database_error)?,
+                r.try_get("header_nonce").map_err(database_error)?,
+                r.try_get("media_key_mode").map_err(database_error)?,
+                r.try_get("media_header").map_err(database_error)?,
+            )
+            .map_err(|_| StoreError::Inconsistent)?,
             file_key_encrypted: r.try_get("file_key_encrypted").map_err(database_error)?,
             file_key_kek_version: r.try_get("file_key_kek_version").map_err(database_error)?,
             file_key_dek_wrapped_nonce: r
@@ -565,8 +571,9 @@ pub async fn admit(
              file_key_kek_version, file_key_dek_wrapped_nonce, file_key_dek_wrapped, \
              file_key_payload_nonce, file_key_payload_format, manifest_encrypted, \
              manifest_envelope_version, manifest_kek_version, manifest_dek_wrapped_nonce, \
-             manifest_dek_wrapped, manifest_payload_nonce, manifest_payload_format) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,2,$13,$14,$15,$16,$17,$18,2,$19,$20,$21,$22,$23) \
+             manifest_dek_wrapped, manifest_payload_nonce, manifest_payload_format, \
+             media_format, media_key_mode, media_header) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,2,$13,$14,$15,$16,$17,$18,2,$19,$20,$21,$22,$23,$24,$25,$26) \
              ON CONFLICT DO NOTHING",
             &[
                 &mint.generation_id,
@@ -579,7 +586,7 @@ pub async fn admit(
                 &p.original_nzb_sha256,
                 &p.plaintext_size,
                 &p.article_payload_size,
-                &p.header_nonce,
+                &p.media.legacy_nonce(),
                 &p.file_key_encrypted,
                 &p.file_key_kek_version,
                 &p.file_key_dek_wrapped_nonce,
@@ -592,6 +599,9 @@ pub async fn admit(
                 &p.manifest_dek_wrapped,
                 &p.manifest_payload_nonce,
                 &p.manifest_payload_format,
+                &p.media.format(),
+                &p.media.key_mode(),
+                &p.media.header(),
             ],
         )
         .await

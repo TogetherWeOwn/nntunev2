@@ -20,6 +20,7 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_media_v1::postgres_media_v1_candidate_recovery_replay_and_retained_custody_keep_exact_metadata",
     "posted_generation_dispatch::tagged::postgres_tagged_producer_commits_byte_derived_storage_identity_and_replays",
     "posted_generation_dispatch::tagged::postgres_tagged_producer_disabled_or_unadmitted_never_reaches_storage",
     "posted_generation_dispatch::tagged::postgres_tagged_producer_revalidates_role_stop_original_owner_and_admission_after_storage",

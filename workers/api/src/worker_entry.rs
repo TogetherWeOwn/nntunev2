@@ -730,6 +730,7 @@ pub fn catalogue_store_for_postgres_test(
 #[cfg(all(target_arch = "wasm32", feature = "preparation-service"))]
 pub(crate) async fn preparation_client(env: Env) -> Result<tokio_postgres::Client, StoreError> {
     PgStore {
+        mirror_binding: MirrorBinding::from_env(&env),
         env: Some(env),
         trace_id: nntune_logging::resolve_trace_id(None),
     }

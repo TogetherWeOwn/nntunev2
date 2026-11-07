@@ -56,6 +56,9 @@ const MIGRATION_0044: &str =
 const MIGRATION_0045: &str =
     include_str!("../../../migrations/0046_posted_file_legacy_writer_retirement.sql");
 
+#[path = "support/posted_generation_media_v1.rs"]
+mod posted_generation_media_v1;
+
 #[path = "support/posted_generation_abandon.rs"]
 mod posted_generation_abandon;
 #[path = "support/posted_generation_attempt_acquisition.rs"]
@@ -282,7 +285,7 @@ impl Sealed {
             repost_exhausted: false,
             plaintext_size: 1024,
             article_payload_size: 512,
-            header_nonce: &self.header,
+            media: nntune_ingest::posted_files::PostedFileMedia::LegacyNonce(&self.header),
             file_key_encrypted: &self.key,
             file_key_kek_version: 1,
             file_key_dek_wrapped_nonce: &self.key_wrap_nonce,
@@ -1087,7 +1090,9 @@ fn postgres_invalid_partial_parameters_fail_before_any_insertion() {
             &attempt,
             &obs,
             "short header nonce",
-            mint_with(s, |p| p.header_nonce = &short_header),
+            mint_with(s, |p| {
+                p.media = nntune_ingest::posted_files::PostedFileMedia::LegacyNonce(&short_header)
+            }),
         )
         .await;
         reject(
@@ -1267,7 +1272,7 @@ fn postgres_managed_custody_is_immutable_and_legacy_id_health_writes_are_rejecte
         let p = legacy.custody();
         let post_copy = spool_copy_state_db_str(p.post_copy);
         let verify_copy = spool_copy_state_db_str(p.verify_copy);
-        let params: [&(dyn ToSql + Sync); 25] = [
+        let params: [&(dyn ToSql + Sync); 28] = [
             &p.plaintext_sha256,
             &p.backbone_post,
             &p.backbone_verify,
@@ -1280,7 +1285,7 @@ fn postgres_managed_custody_is_immutable_and_legacy_id_health_writes_are_rejecte
             &p.repost_exhausted,
             &p.plaintext_size,
             &p.article_payload_size,
-            &p.header_nonce,
+            &p.media.legacy_nonce(),
             &p.file_key_encrypted,
             &p.file_key_kek_version,
             &p.file_key_dek_wrapped_nonce,
@@ -1293,6 +1298,9 @@ fn postgres_managed_custody_is_immutable_and_legacy_id_health_writes_are_rejecte
             &p.manifest_dek_wrapped,
             &p.manifest_payload_nonce,
             &p.manifest_payload_format,
+            &p.media.format(),
+            &p.media.key_mode(),
+            &p.media.header(),
         ];
         let inserted = db
             .execute(insert_posted_file_sql(), &params)

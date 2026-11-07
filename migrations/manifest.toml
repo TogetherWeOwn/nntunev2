@@ -352,3 +352,8 @@ file = "0049_ingest_preparation_plans.sql"
 renamed_from = [{ file = "0048_ingest_preparation_plans.sql", sha256 = "3edeabd43ee56c60ebfa7ebf167dc6bfc62dae4c526216dcd90df1a5b60c91c6" }]
 target = "app"
 sha256 = "3edeabd43ee56c60ebfa7ebf167dc6bfc62dae4c526216dcd90df1a5b60c91c6"
+
+[[migration]]
+file = "0050_posted_file_media_v1.sql"
+target = "app"
+sha256 = "4537a8bcbcf272c7aa5896c085b296a4af4a96f64afe6a54fa968015ee560506"

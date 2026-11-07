@@ -831,7 +831,7 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
         let p = legacy.custody();
         let post_copy = spool_copy_state_db_str(p.post_copy);
         let verify_copy = spool_copy_state_db_str(p.verify_copy);
-        let params: [&(dyn ToSql + Sync); 25] = [
+        let params: [&(dyn ToSql + Sync); 28] = [
             &p.plaintext_sha256,
             &p.backbone_post,
             &p.backbone_verify,
@@ -844,7 +844,7 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
             &p.repost_exhausted,
             &p.plaintext_size,
             &p.article_payload_size,
-            &p.header_nonce,
+            &p.media.legacy_nonce(),
             &p.file_key_encrypted,
             &p.file_key_kek_version,
             &p.file_key_dek_wrapped_nonce,
@@ -857,6 +857,9 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
             &p.manifest_dek_wrapped,
             &p.manifest_payload_nonce,
             &p.manifest_payload_format,
+            &p.media.format(),
+            &p.media.key_mode(),
+            &p.media.header(),
         ];
         assert_eq!(
             db.execute(insert_posted_file_sql(), &params)

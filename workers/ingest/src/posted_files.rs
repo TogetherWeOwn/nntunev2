@@ -1,9 +1,7 @@
-//! Legacy `posted_files` custody statements, retained without reinterpretation.
-//!
-//! These helpers still describe the historical 24-byte nonce record, NOT a
-//! `velmora.media.v1` writer. A forward schema and adapter change is required
-//! before accepting its 48-byte committing header and trusted format/mode.
-//! Do not synthesize a legacy nonce from that header or relabel existing rows.
+//! Versioned `posted_files` custody statements. Migration 0050 adds explicit
+//! `velmora.media.v1` format/random-mode/48-byte-header metadata alongside
+//! historical 24-byte nonce custody. No old record is reinterpreted. Header
+//! authentication remains with the engine after opening the existing key envelope.
 //!
 //! The API-side mint wraps the per-file key and manifest in the existing
 //! AES-GCM envelope v2. This module is pure
@@ -78,6 +76,88 @@ use crate::two_spool::{validate_backbone_label, validate_plaintext_sha256, Spool
 /// Public rclone header nonce length (bytes). Posted in article 0 in the
 /// clear; mirrors the 0036 `CHECK` (`octet_length(header_nonce) = 24`).
 pub const HEADER_NONCE_BYTES: usize = 24;
+
+/// Trusted database discriminators. Historical records are never relabelled.
+pub const LEGACY_MEDIA_FORMAT: &str = "legacy";
+pub const MEDIA_V1_FORMAT: &str = "velmora.media.v1";
+pub const MEDIA_V1_KEY_MODE: &str = "random";
+
+/// Public media metadata, separate from the existing sealed key and manifest.
+/// Length validation is not authentication: consumers must open the stored key
+/// and verify the committing header with `media::VerifiedHeader` and the NNTune
+/// profile before trusting ranges or plaintext. Never infer mode from the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PostedFileMedia<'a> {
+    LegacyNonce(&'a [u8]),
+    MediaV1 { key_mode: &'a str, header: &'a [u8] },
+}
+
+impl<'a> PostedFileMedia<'a> {
+    pub fn from_record(
+        format: &str,
+        legacy_nonce: Option<&'a [u8]>,
+        key_mode: Option<&'a str>,
+        header: Option<&'a [u8]>,
+    ) -> Result<Self, &'static str> {
+        let media = match (format, legacy_nonce, key_mode, header) {
+            (LEGACY_MEDIA_FORMAT, Some(nonce), None, None) => Self::LegacyNonce(nonce),
+            (MEDIA_V1_FORMAT, None, Some(key_mode), Some(header)) => {
+                Self::MediaV1 { key_mode, header }
+            }
+            _ => return Err("invalid posted media record"),
+        };
+        media.validate()?;
+        Ok(media)
+    }
+
+    pub fn format(self) -> &'static str {
+        match self {
+            Self::LegacyNonce(_) => LEGACY_MEDIA_FORMAT,
+            Self::MediaV1 { .. } => MEDIA_V1_FORMAT,
+        }
+    }
+
+    pub fn legacy_nonce(self) -> Option<&'a [u8]> {
+        match self {
+            Self::LegacyNonce(nonce) => Some(nonce),
+            Self::MediaV1 { .. } => None,
+        }
+    }
+
+    pub fn key_mode(self) -> Option<&'a str> {
+        match self {
+            Self::LegacyNonce(_) => None,
+            Self::MediaV1 { key_mode, .. } => Some(key_mode),
+        }
+    }
+
+    pub fn header(self) -> Option<&'a [u8]> {
+        match self {
+            Self::LegacyNonce(_) => None,
+            Self::MediaV1 { header, .. } => Some(header),
+        }
+    }
+
+    fn validate(self) -> Result<(), &'static str> {
+        match self {
+            Self::LegacyNonce(nonce) if nonce.len() == HEADER_NONCE_BYTES => Ok(()),
+            Self::MediaV1 {
+                key_mode: MEDIA_V1_KEY_MODE,
+                header,
+            } if header.len() == nntune_core::media::HEADER_SIZE as usize => Ok(()),
+            _ => Err("invalid posted media format, mode or header"),
+        }
+    }
+}
+
+impl std::fmt::Debug for PostedFileMedia<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostedFileMedia")
+            .field("format", &self.format())
+            .field("header", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// `file_key_*` payload format: the raw 32-byte per-file key. Card-fixed
 /// (0036 `CHECK`s `= 1`); the mint assigns nothing else here.
@@ -170,8 +250,8 @@ pub struct PostedFileParams<'a> {
     pub plaintext_size: i64,
     /// Cipher bytes per full article, header excluded (> 0).
     pub article_payload_size: i64,
-    /// Public 24-byte rclone header nonce.
-    pub header_nonce: &'a [u8],
+    /// Explicit format/mode and public header; legacy records remain distinct.
+    pub media: PostedFileMedia<'a>,
     /// Sealed file-key envelope body (opaque AES-GCM ciphertext).
     pub file_key_encrypted: &'a [u8],
     /// KEK generation that wrapped the file-key DEK (>= 1).
@@ -212,7 +292,7 @@ impl std::fmt::Debug for PostedFileParams<'_> {
             .field("repost_exhausted", &self.repost_exhausted)
             .field("plaintext_size", &self.plaintext_size)
             .field("article_payload_size", &self.article_payload_size)
-            .field("header_nonce_len", &self.header_nonce.len())
+            .field("media", &self.media)
             .field("file_key_encrypted_len", &self.file_key_encrypted.len())
             .field("file_key_kek_version", &self.file_key_kek_version)
             .field(
@@ -297,9 +377,7 @@ pub fn validate_posted_file_params(params: &PostedFileParams) -> Result<(), &'st
     if params.article_payload_size <= 0 {
         return Err("article payload size must be positive");
     }
-    if params.header_nonce.len() != HEADER_NONCE_BYTES {
-        return Err("header nonce must be 24 bytes");
-    }
+    params.media.validate()?;
     validate_envelope_side(
         params.file_key_encrypted,
         params.file_key_kek_version,
@@ -330,7 +408,7 @@ pub fn validate_posted_file_params(params: &PostedFileParams) -> Result<(), &'st
 
 /// Bind order for [`insert_posted_file_sql`]. Envelope versions bind as
 /// the SQL literal `2`, so they take no parameter slot.
-pub const POSTED_FILE_INSERT_PARAM_ORDER: [&str; 25] = [
+pub const POSTED_FILE_INSERT_PARAM_ORDER: [&str; 28] = [
     "plaintext_sha256",
     "backbone_post",
     "backbone_verify",
@@ -356,6 +434,9 @@ pub const POSTED_FILE_INSERT_PARAM_ORDER: [&str; 25] = [
     "manifest_dek_wrapped",
     "manifest_payload_nonce",
     "manifest_payload_format",
+    "media_format",
+    "media_key_mode",
+    "media_header",
 ];
 
 /// Full-row insert converging on the sha. Copy states bind as their
@@ -369,9 +450,9 @@ pub fn insert_posted_file_sql() -> &'static str {
      file_key_dek_wrapped_nonce, file_key_dek_wrapped, file_key_payload_nonce, \
      file_key_payload_format, manifest_encrypted, manifest_envelope_version, \
      manifest_kek_version, manifest_dek_wrapped_nonce, manifest_dek_wrapped, \
-     manifest_payload_nonce, manifest_payload_format) \
+     manifest_payload_nonce, manifest_payload_format, media_format, media_key_mode, media_header) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 2, $15, \
-     $16, $17, $18, $19, $20, 2, $21, $22, $23, $24, $25) \
+     $16, $17, $18, $19, $20, 2, $21, $22, $23, $24, $25, $26, $27, $28) \
      ON CONFLICT (plaintext_sha256) DO NOTHING"
 }
 
@@ -390,12 +471,12 @@ pub fn select_posted_file_row_sql() -> &'static str {
      file_key_payload_format, manifest_encrypted, manifest_envelope_version, \
      manifest_kek_version, manifest_dek_wrapped_nonce, manifest_dek_wrapped, \
      manifest_payload_nonce, manifest_payload_format, post_verified_at, \
-     last_retention_check, created_at \
+     last_retention_check, created_at, media_format, media_key_mode, media_header \
      FROM posted_files WHERE id = $1"
 }
 
 /// Read column order for [`select_posted_file_row_sql`].
-pub const POSTED_FILE_COLUMN_ORDER: [&str; 31] = [
+pub const POSTED_FILE_COLUMN_ORDER: [&str; 34] = [
     "id",
     "plaintext_sha256",
     "backbone_post",
@@ -427,6 +508,9 @@ pub const POSTED_FILE_COLUMN_ORDER: [&str; 31] = [
     "post_verified_at",
     "last_retention_check",
     "created_at",
+    "media_format",
+    "media_key_mode",
+    "media_header",
 ];
 
 /// Stamps both verify timestamps at once: first verification wins for
@@ -496,7 +580,7 @@ mod tests {
             repost_exhausted: false,
             plaintext_size: 720_896,
             article_payload_size: 721_072,
-            header_nonce: &[0u8; HEADER_NONCE_BYTES],
+            media: PostedFileMedia::LegacyNonce(&[0u8; HEADER_NONCE_BYTES]),
             file_key_encrypted: &[1u8; FILE_KEY_ENVELOPE_BODY_BYTES],
             file_key_kek_version: 1,
             file_key_dek_wrapped_nonce: &[2u8; ENVELOPE_NONCE_BYTES],
@@ -515,6 +599,82 @@ mod tests {
     #[test]
     fn valid_params_pass() {
         assert!(validate_posted_file_params(&valid_params()).is_ok());
+    }
+
+    #[test]
+    fn media_record_requires_explicit_matching_format_mode_and_header() {
+        let nonce = [0; 24];
+        let header = [0; 48];
+        assert!(
+            PostedFileMedia::from_record(LEGACY_MEDIA_FORMAT, Some(&nonce), None, None).is_ok()
+        );
+        assert!(
+            PostedFileMedia::from_record(MEDIA_V1_FORMAT, None, Some("random"), Some(&header))
+                .is_ok()
+        );
+        for (format, nonce, mode, header) in [
+            ("unknown", None, Some("random"), Some(header.as_slice())),
+            (MEDIA_V1_FORMAT, None, None, Some(header.as_slice())),
+            (
+                MEDIA_V1_FORMAT,
+                None,
+                Some("convergent"),
+                Some(header.as_slice()),
+            ),
+            (MEDIA_V1_FORMAT, None, Some("random"), None),
+            (
+                MEDIA_V1_FORMAT,
+                None,
+                Some("random"),
+                Some(nonce.as_slice()),
+            ),
+            (
+                MEDIA_V1_FORMAT,
+                Some(nonce.as_slice()),
+                Some("random"),
+                Some(header.as_slice()),
+            ),
+            (
+                LEGACY_MEDIA_FORMAT,
+                Some(nonce.as_slice()),
+                Some("random"),
+                None,
+            ),
+            (
+                LEGACY_MEDIA_FORMAT,
+                Some(nonce.as_slice()),
+                None,
+                Some(header.as_slice()),
+            ),
+        ] {
+            assert!(PostedFileMedia::from_record(format, nonce, mode, header).is_err());
+        }
+        for size in [0, 24, 47, 49] {
+            let bytes = vec![0; size];
+            assert!(PostedFileMedia::from_record(
+                MEDIA_V1_FORMAT,
+                None,
+                Some("random"),
+                Some(&bytes)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn media_v1_params_preserve_the_existing_envelope_contract_and_redact_header() {
+        let header = [b'X'; 48];
+        let mut p = valid_params();
+        p.media = PostedFileMedia::MediaV1 {
+            key_mode: MEDIA_V1_KEY_MODE,
+            header: &header,
+        };
+        assert!(validate_posted_file_params(&p).is_ok());
+        assert_eq!(p.media.legacy_nonce(), None);
+        assert_eq!(p.media.key_mode(), Some("random"));
+        assert!(!format!("{p:?}").contains("XXXX"));
+        p.file_key_encrypted = &[0; 47];
+        assert!(validate_posted_file_params(&p).is_err());
     }
 
     #[test]
@@ -549,7 +709,7 @@ mod tests {
     #[test]
     fn rejects_bad_envelope_material() {
         let mut p = valid_params();
-        p.header_nonce = &[0u8; 12];
+        p.media = PostedFileMedia::LegacyNonce(&[0u8; 12]);
         assert!(validate_posted_file_params(&p).is_err());
         let mut p = valid_params();
         p.file_key_encrypted = &[];
@@ -637,7 +797,7 @@ mod tests {
         // Envelope versions bind as the literal 2 on both sides.
         assert!(sql.contains("$14, 2, $15"));
         assert!(sql.contains("$20, 2, $21"));
-        assert_eq!(POSTED_FILE_INSERT_PARAM_ORDER.len(), 25);
+        assert_eq!(POSTED_FILE_INSERT_PARAM_ORDER.len(), 28);
         for (i, name) in POSTED_FILE_INSERT_PARAM_ORDER.iter().enumerate() {
             let slot = format!("${}", i + 1);
             assert!(sql.contains(&slot), "missing slot for {name}");
@@ -647,7 +807,7 @@ mod tests {
     #[test]
     fn row_select_lists_columns_in_order() {
         let sql = select_posted_file_row_sql();
-        assert_eq!(POSTED_FILE_COLUMN_ORDER.len(), 31);
+        assert_eq!(POSTED_FILE_COLUMN_ORDER.len(), 34);
         let mut cursor = 0;
         for name in POSTED_FILE_COLUMN_ORDER {
             let rest = &sql[cursor..];
