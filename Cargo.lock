@@ -786,6 +786,8 @@ version = "0.1.0"
 name = "nntune-test-nntp"
 version = "0.1.0"
 dependencies = [
+ "nntune-core",
+ "tokio",
  "velmora-test-nntp",
 ]
 

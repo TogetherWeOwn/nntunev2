@@ -10,6 +10,11 @@ server, the runtime-generated CC0 corpus (synthesized sine tones), fault
 injection, the `POST` spool and their acceptance tests live there; see
 `crates/velmora-test-nntp/README.md` in velmora.
 
+Cargo never runs a dependency's tests, so `tests/pinned_engine_boundary.rs`
+keeps a representative check in this repository's gate: the pinned
+`nntune_core` client fetches and decodes a multipart fixture and round-trips
+a `POST` through the spool. A pin bump that regresses either fails here.
+
 Existing callers keep the `nntune_test_nntp::` paths:
 
 ```rust

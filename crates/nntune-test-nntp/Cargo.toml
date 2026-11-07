@@ -13,3 +13,10 @@ path = "src/lib.rs"
 [dependencies]
 # Same immutable pin as velmora in crates/nntune-core/Cargo.toml.
 velmora-test-nntp = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "c5e79d617896490a47d577a9b062cd0010e0bc8a" }
+
+[dev-dependencies]
+# Consumer-boundary acceptance (tests/pinned_engine_boundary.rs): the
+# nntune-core client against this server, both at the pinned velmora rev.
+# nntune-core never depends on this crate, so there is no cycle.
+nntune-core = { path = "../nntune-core" }
+tokio = { version = "1", features = ["full"] }
