@@ -17,9 +17,10 @@ on:
   workflow_dispatch:
     inputs:
       dump:
-        description: "fullexport directory (YYYYMMDD-HHMMSS); blank = LATEST"
+        description: "Pinned fullexport directory for the inspected exclusion corpus"
         required: false
         type: string
+        default: "20261104-002222"
       stage:
         description: "Upload, deploy the spike Worker and bench (main only)"
         required: false
@@ -34,7 +35,7 @@ on:
         description: "Seed of the held-out golden set that decides gate 1"
         required: false
         type: string
-        default: "20261108"
+        default: "20261109"
   pull_request:
     types: [labeled]
 
@@ -70,13 +71,15 @@ jobs:
         id: dump
         env:
           INPUT_DUMP: ${{ inputs.dump }}
+          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261109' }}
         run: |
           set -euo pipefail
-          dump="${INPUT_DUMP:-}"
-          if [ -z "$dump" ]; then
-            dump=$(curl -fsS https://data.metabrainz.org/pub/musicbrainz/data/fullexport/LATEST | tr -d '[:space:]')
-          fi
-          [[ "$dump" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo "bad dump id"; exit 1; }
+          [[ "$HELDOUT_SEED" =~ ^[1-9][0-9]*$ ]] || { echo "bad held-out seed"; exit 1; }
+          case "$HELDOUT_SEED" in
+            3599|20261107|20261108) echo "held-out seed has already been inspected"; exit 1 ;;
+          esac
+          dump="${INPUT_DUMP:-20261104-002222}"
+          [[ "$dump" = 20261104-002222 ]] || { echo "dump must reproduce the pinned inspected corpus"; exit 1; }
           echo "dump=$dump" >> "$GITHUB_OUTPUT"
 
       - name: Free runner disk
@@ -112,7 +115,7 @@ jobs:
       - name: Lookup samples and golden set
         env:
           GOLDEN_COUNT: ${{ inputs.golden_count || '1000' }}
-          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261108' }}
+          HELDOUT_SEED: ${{ inputs.heldout_seed || '20261109' }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/out"; mkdir -p "$out/mbids"
@@ -122,13 +125,15 @@ jobs:
             "$RUNNER_TEMP/tools/snapshot_eval" lookup /work/snap "$kind" < "$out/mbids/$kind.txt"
           done
           python3 workers/mb/spike/golden.py "$cur" "$out/golden.tsv" "$GOLDEN_COUNT"
-          # Preserve both sets previously read while tuning, regardless of
-          # GOLDEN_COUNT. Different seeds alone do not prevent query overlap.
+          # Preserve all three inspected sets, regardless of GOLDEN_COUNT.
+          # Different seeds alone do not prevent query overlap.
           python3 workers/mb/spike/golden.py "$cur" "$out/golden-tuning.tsv" 1000 3599
           python3 workers/mb/spike/golden.py "$cur" "$out/golden-tuning-fold.tsv" 2000 20261107
+          python3 workers/mb/spike/golden.py "$cur" "$out/golden-inspected-heldout.tsv" 2000 20261108
+          (cd "$out" && sha256sum --check "$GITHUB_WORKSPACE/workers/mb/spike/inspected-golden.sha256")
           python3 workers/mb/spike/golden.py "$cur" "$out/golden-heldout.tsv" 2000 "$HELDOUT_SEED" \
             --exclude "$out/golden.tsv" --exclude "$out/golden-tuning.tsv" \
-            --exclude "$out/golden-tuning-fold.tsv"
+            --exclude "$out/golden-tuning-fold.tsv" --exclude "$out/golden-inspected-heldout.tsv"
 
       - name: Recall vs pg_trgm (gate 1)
         run: |
@@ -140,9 +145,14 @@ jobs:
           for _ in $(seq 1 60); do docker exec mbpg pg_isready -U postgres && break; sleep 2; done
           python3 workers/mb/spike/pg_baseline.py load /work/dump/curated
           for set in "" -heldout; do
+            exclusions=()
+            if [ "$set" = -heldout ]; then
+              exclusions=(--exclude "$out/golden.tsv" --exclude "$out/golden-tuning.tsv"
+                --exclude "$out/golden-tuning-fold.tsv" --exclude "$out/golden-inspected-heldout.tsv")
+            fi
             python3 workers/mb/spike/pg_baseline.py search "$out/golden$set.tsv" "$out/hits-pg$set.tsv"
             "$RUNNER_TEMP/tools/snapshot_eval" search /work/snap < "$out/golden$set.tsv" > "$out/hits-snapshot$set.tsv"
-            python3 workers/mb/spike/recall.py "$out/golden$set.tsv" "$out/hits-pg$set.tsv" "$out/hits-snapshot$set.tsv" "$out/recall$set.json" | tee "$out/recall$set.md"
+            python3 workers/mb/spike/recall.py "$out/golden$set.tsv" "$out/hits-pg$set.tsv" "$out/hits-snapshot$set.tsv" "$out/recall$set.json" "${exclusions[@]}" | tee "$out/recall$set.md"
           done
           docker rm -f mbpg
 

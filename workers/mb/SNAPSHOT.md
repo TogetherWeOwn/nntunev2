@@ -69,13 +69,31 @@ variants of non-Latin titles whose combining marks the variant strips
 so those words shared no key with the indexed title and the snapshot had
 no candidate. That result stands as recorded. The fold table now folds
 every lowercase letter whose NFKD form carries a combining mark. Seed
-20261107 has been read too, so the re-test is decided on another fresh
-2,000-query set (`heldout_seed`, default 20261108); seed 3599 is still
-reported for comparison. Both inspected tuning sets (1,000 at seed 3599
-and 2,000 at seed 20261107) are now preserved as artifacts and excluded
-from the gate set by query group (case/accent/punctuation folded). The
-comparison set is excluded too, even if its requested size changes.
+20261107 has been read too, as have the aggregates for seed 20261108,
+so the re-test is decided on another fresh 2,000-query set (`heldout_seed`,
+default 20261109); seed 3599 is still reported for comparison. All three
+inspected sets (1,000 at seed 3599 and 2,000 each at seeds 20261107 and
+20261108) are preserved as artifacts and excluded from the gate set by
+query group (case/accent/punctuation folded). The comparison set is
+excluded too, even if its requested size changes. `recall.py --exclude`
+independently checks these groups before scoring and refuses to emit gate
+evidence on any overlap or an unreadable exclusion file. The workflow
+rejects any of the three retired seeds as the decision seed.
 Different random seeds alone do not provide disjoint query groups.
+
+This gate is pinned to dump `20261104-002222`, not `LATEST`. Before
+sampling the new gate set, the workflow checks the three regenerated
+exclusion files against `spike/inspected-golden.sha256`. Those hashes are
+from the original `mb-snapshot-spike-results` artifacts: `golden.tsv`
+(seed 3599) and `golden-heldout.tsv` (seed 20261107) in
+[run 42319533627](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42319533627),
+and `golden-heldout.tsv` (seed 20261108) in
+[run 42330290183](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42330290183).
+The seed-3599 files match in both runs; both dump manifests report
+replication sequence 190240, schema sequence 31 and timestamp
+`2026-11-04 00:22:23.592249+00`. Any dump or sampler drift that changes
+these inspected files fails closed; testing a new dump needs a separately
+registered corpus, not regenerated exclusions silently replacing these.
 
 The earlier 0.741 vs 0.740 result from run 42330290183 is **not valid
 held-out gate evidence**: its artifacts contain 14 distinct query groups

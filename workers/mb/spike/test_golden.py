@@ -55,7 +55,7 @@ class GoldenPortTest(unittest.TestCase):
 
 
 class GoldenSamplingTest(unittest.TestCase):
-    def test_heldout_excludes_both_tuning_sets_by_query_group(self):
+    def test_heldout_excludes_all_three_inspected_seeds_by_query_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "mbdump-artist.tsv").write_text("artist\tArtist\n")
@@ -73,12 +73,13 @@ class GoldenSamplingTest(unittest.TestCase):
                 return out
             first = generate("tuning.tsv", 3599)
             second = generate("tuning-mark-fold.tsv", 20261107)
-            heldout = generate("heldout.tsv", 20261108, first, second)
+            third = generate("inspected-heldout.tsv", 20261108)
+            heldout = generate("heldout.tsv", 20261109, first, second, third)
             keys = lambda path: {golden.query_group(r.split("\t")[1])
                                  for r in path.read_text().splitlines()}
             self.assertEqual(len(heldout.read_text().splitlines()), 4)  # rare stratum only
-            self.assertFalse(keys(heldout) & (keys(first) | keys(second)))
-            again = generate("again.tsv", 20261108, first, second)
+            self.assertFalse(keys(heldout) & (keys(first) | keys(second) | keys(third)))
+            again = generate("again.tsv", 20261109, first, second, third)
             self.assertEqual(heldout.read_bytes(), again.read_bytes())
 
     def test_query_group_collapses_variant_spelling(self):

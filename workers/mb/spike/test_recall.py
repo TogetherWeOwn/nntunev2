@@ -32,6 +32,21 @@ class RecallTest(unittest.TestCase):
             self.assertEqual(result["recall_top5"]["overall"]["snapshot_recall"], 0.74)
             self.assertFalse(result["gate_1_pass"])
 
+    def test_crlf_golden_preserves_baseline_only_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            golden, pg, snap, out = [root / name for name in ("golden", "pg", "snap", "out")]
+            golden.write_bytes(b"1\tFresh Album\tplain\tunique\tid\r\n")
+            pg.write_text("1\t1\tid\n")
+            snap.touch()
+            with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out))]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(recall.main(), 0)
+            result = json.loads(out.read_text())
+            self.assertEqual(result["pg_hits"], 1)
+            self.assertEqual(result["snapshot_hits"], 0)
+            self.assertFalse(result["gate_1_pass"])
+
     def test_empty_golden_is_not_gate_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -40,6 +55,48 @@ class RecallTest(unittest.TestCase):
             with patch.object(sys, "argv", ["recall.py", str(empty), str(empty), str(empty), str(root / "out")]):
                 with self.assertRaisesRegex(SystemExit, "empty golden"):
                     recall.main()
+
+    def test_excluded_query_overlap_refuses_gate_output(self):
+        for query in ("DÉBUT (Live)", "debut live", "DEBUT--LIVE"):
+            with self.subTest(query=query), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                golden, pg, snap, out = [root / name for name in ("golden", "pg", "snap", "out")]
+                golden.write_text(f"1\t{query}\tplain\tunique\tid\n")
+                excluded = []
+                for seed, prior_query in ((3599, "Other"), (20261107, "Different"), (20261108, "Début Live")):
+                    prior = root / str(seed)
+                    prior.write_text(f"1\t{prior_query}\tscene\trare\tother-id\n")
+                    excluded += ["--exclude", str(prior)]
+                # No hits files: disjointness must be checked before scoring.
+                with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out)), *excluded]):
+                    with self.assertRaisesRegex(SystemExit, "overlap.*excluded"):
+                        recall.main()
+                self.assertFalse(out.exists())
+
+    def test_disjoint_query_groups_allow_gate_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            golden, pg, snap, out, prior = [root / name for name in ("golden", "pg", "snap", "out", "prior")]
+            golden.write_text("1\tFresh Album\tplain\tunique\tid\n")
+            prior.write_text("1\tOld Album\tplain\tunique\tid\n")
+            pg.write_text("1\t1\tid\n")
+            snap.write_text("1\t1\tid\n")
+            with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out)), "--exclude", str(prior)]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(recall.main(), 0)
+            result = json.loads(out.read_text())
+            self.assertTrue(result["gate_1_pass"])
+            self.assertEqual(result["excluded_query_groups"], 1)
+
+    def test_missing_exclusion_file_refuses_gate_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            golden, pg, snap, out = [root / name for name in ("golden", "pg", "snap", "out")]
+            golden.write_text("1\tFresh Album\tplain\tunique\tid\n")
+            with patch.object(sys, "argv", ["recall.py", *map(str, (golden, pg, snap, out)), "--exclude", str(root / "missing")]):
+                with self.assertRaises(FileNotFoundError):
+                    recall.main()
+            self.assertFalse(out.exists())
 
     def test_baseline_newlines_do_not_consume_ranks(self):
         rows = [{"mbid": f"id{i}", "label": "Album\n@@not-a-query\tTime: 9",

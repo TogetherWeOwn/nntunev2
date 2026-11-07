@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score release-search top-5 recall for the R2 snapshot spike (gate 1).
 
-Usage: recall.py <golden.tsv> <pg-hits.tsv> <snapshot-hits.tsv> <out.json>
+Usage: recall.py <golden.tsv> <pg-hits.tsv> <snapshot-hits.tsv> <out.json> [--exclude prior.tsv ...]
 
 A query is recalled when any of its top 5 hits is in its acceptable set
 (golden column 5). Hit rows with rank 0 are timing rows (baseline only).
@@ -12,10 +12,12 @@ when snapshot recall >= baseline recall overall.
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
+
+from golden import query_group, read_tsv
 
 
 def load_hits(path: Path) -> tuple[dict[str, list[str]], list[float]]:
@@ -39,14 +41,23 @@ def pct(values: list[float], p: float) -> float | None:
 
 
 def main() -> int:
-    if len(sys.argv) != 5:
-        print(__doc__.splitlines()[2], file=sys.stderr)
-        return 2
-    golden = [line.split("\t") for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("golden", type=Path)
+    parser.add_argument("pg_hits", type=Path)
+    parser.add_argument("snapshot_hits", type=Path)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--exclude", type=Path, action="append", default=[],
+                        help="Refuse gate evidence if a query group occurs in this prior TSV (repeatable)")
+    args = parser.parse_args()
+    golden = [line.split("\t") for line in args.golden.read_text(encoding="utf-8").splitlines()]
     if not golden:
         raise SystemExit("recall: empty golden set is not gate evidence")
-    pg, pg_ms = load_hits(Path(sys.argv[2]))
-    snap, _ = load_hits(Path(sys.argv[3]))
+    excluded = {query_group(row[1]) for path in args.exclude for row in read_tsv(path)}
+    overlap = {query_group(row[1]) for row in golden} & excluded
+    if overlap:
+        raise SystemExit(f"recall: {len(overlap)} query groups overlap an excluded set; not gate evidence")
+    pg, pg_ms = load_hits(args.pg_hits)
+    snap, _ = load_hits(args.snapshot_hits)
     groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"pg": [0, 0], "snapshot": [0, 0]})
     wins, losses = [], []
     for qid, q, variant, stratum, acceptable in golden:
@@ -73,6 +84,7 @@ def main() -> int:
     overall = groups["overall"]
     result = {
         "gate_1_pass": overall["snapshot"][0] >= overall["pg"][0],
+        "excluded_query_groups": len(excluded),
         "pg_hits": overall["pg"][0],
         "snapshot_hits": overall["snapshot"][0],
         "recall_top5": table,
@@ -81,7 +93,7 @@ def main() -> int:
         "pg_only_examples": losses[:50],
         "pg_trgm_query_ms": {"p50": pct(pg_ms, 50), "p95": pct(pg_ms, 95), "max": max(pg_ms, default=None)},
     }
-    Path(sys.argv[4]).write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    args.out.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print("| group | queries | pg_trgm top-5 | snapshot top-5 |")
     print("|---|---|---|---|")
     for name, row in table.items():
