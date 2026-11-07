@@ -555,6 +555,16 @@ jobs:
         run: bash containers/mb-import/tests/test_runtime_user.sh
       - name: Run mb-import runtime-user pin self-test
         run: bash containers/mb-import/tests/test_runtime_user.sh --self-test
+      - name: Run mb-import stream-extract and disk-bounded ETL tests
+        run: python3 containers/mb-import/tests/test_stream_extract.py
+      - name: Run R2 snapshot spike golden-set port tests
+        run: python3 workers/mb/spike/test_golden.py
+      - name: Run R2 snapshot spike recall and baseline framing tests
+        run: python3 workers/mb/spike/test_recall.py
+      - name: Run R2 snapshot spike gate 2 verdict tests
+        run: python3 workers/mb/spike/test_bench.py
+      - name: Run R2 snapshot spike expiry-rule check tests
+        run: python3 workers/mb/spike/test_lifecycle.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
@@ -629,6 +639,7 @@ jobs:
       - name: Exercise production session retry adapter under PostgreSQL contention
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
