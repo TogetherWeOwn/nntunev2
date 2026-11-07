@@ -1,7 +1,7 @@
 //! Proven restore drill: synthetic fixture end to end.
 //!
 //! Pipeline (mirrors `docs/offsite-backup-runbook.md` §4):
-//! backup a synthetic posted-file fixture (envelope row + rclone
+//! backup a synthetic posted-file fixture (envelope row + `velmora.media.v1`
 //! ciphertext) into a bundle, wipe every live copy, then restore from
 //! the bundle into an isolated directory and decrypt the full
 //! plaintext from the restored material only, via ranged reads (the
@@ -13,7 +13,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use nntune_core::media::{self, FileKey, Header, Profile, Sealer, VerifiedHeader};
+use nntune_core::rng::SystemRng;
 
 use crate::bundle::{self, BundleError, BundleWriter, Manifest, TableCount};
 use crate::envelope::{
@@ -26,15 +30,10 @@ pub const DRILL_KEK_VERSION: u32 = 4294967000;
 pub const DRILL_USER_ID: &str = "drill-user";
 pub const DRILL_TRACK_ID: &str = "drill-track-1";
 
-/// rclone layout constants (mirror `nntune-core::decrypt::rclone`).
-const RCLONE_MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
-const HEADER_NONCE_LEN: usize = 24;
-const PLAIN_BLOCK: usize = 64 * 1024;
-const DERIVED_LEN: usize = 80;
 /// First ranged-read length (article-window shaped). The fixture must
 /// exceed it so *both* ranged reads authenticate ciphertext, and it
-/// already exceeds one 64 KiB rclone block, so the drill also proves
-/// decrypt across a block boundary.
+/// already exceeds one 64 KiB `velmora.media.v1` chunk, so the drill also
+/// proves decrypt across a chunk boundary.
 const FIRST_READ_LEN: u64 = 70_000;
 /// Minimum fixture size: anything smaller would report success without
 /// authenticating a ciphertext block (`--bytes 0` is the degenerate
@@ -114,9 +113,11 @@ impl KeyringRecovery {
     }
 }
 
-/// One synthetic `track_sources`-shaped row (JSONL in the bundle).
-/// Field bytes are base64 (standard engine) — drill-local encoding;
-/// production backups carry the raw `BYTEA` columns via `pg_dump`.
+/// One synthetic posted-file row (JSONL in the bundle): the wrapped media
+/// key plus the trusted `velmora.media.v1` record (format, key mode, the
+/// 48-byte header and the plaintext size `P`). Field bytes are base64
+/// (standard engine) — drill-local encoding; production backups carry the
+/// raw `BYTEA` columns via `pg_dump`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DrillRow {
     user_id: String,
@@ -128,6 +129,10 @@ struct DrillRow {
     dek_wrapped_b64: String,
     payload_nonce_b64: String,
     ciphertext_b64: String,
+    media_format: u8,
+    media_mode: u8,
+    media_header_b64: String,
+    plaintext_size: u64,
 }
 
 /// Evidence for the card: timestamps, object counts, hash match. No
@@ -167,8 +172,9 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Seal one synthetic posted-file fixture: random media key, rclone
-/// ciphertext, v2 envelope row. Returns the bundle directory and the
+/// Seal one synthetic posted-file fixture: random media key,
+/// `velmora.media.v1` Random-mode ciphertext under the NNTune profile, v2
+/// envelope row. Returns the bundle directory and the
 /// keyring recovery stand-in (the "offsite keyring backup" side).
 pub fn backup_fixture(
     bundle_dir: &Path,
@@ -177,37 +183,24 @@ pub fn backup_fixture(
 ) -> Result<(Manifest, KeyringRecovery), DrillError> {
     let mut kek = [0u8; KEK_LEN];
     fill_random(&mut kek)?;
-    let mut media_key = [0u8; 32];
-    fill_random(&mut media_key)?;
-    let mut header_nonce = [0u8; HEADER_NONCE_LEN];
-    fill_random(&mut header_nonce)?;
+    // `FileKey` is zeroized on drop, so every `?` exit below wipes it.
+    let media_key = FileKey::generate(&mut SystemRng).map_err(crypto)?;
 
-    // rclone ciphertext: 32-byte header + sealed 64 KiB blocks.
-    let mut derived = [0u8; DERIVED_LEN];
-    derived[..32].copy_from_slice(&media_key);
-    let blocks = plaintext.len().div_ceil(PLAIN_BLOCK);
-    let mut blob = Vec::with_capacity(32 + blocks * (PLAIN_BLOCK + 16));
-    blob.extend_from_slice(&RCLONE_MAGIC);
-    blob.extend_from_slice(&header_nonce);
-    for (i, chunk) in plaintext.chunks(PLAIN_BLOCK).enumerate() {
-        let mut sealed = vec![0u8; chunk.len() + 16];
-        nntune_core::decrypt::rclone::seal_block(
-            &derived,
-            &header_nonce,
-            i as u64,
-            chunk,
-            &mut sealed,
-        )
-        .map_err(|e| DrillError::Crypto(e.to_string()))?;
-        blob.extend_from_slice(&sealed);
-    }
+    // velmora.media.v1 ciphertext: 48-byte header + sealed 64 KiB chunks.
+    let sealer = Sealer::random(&Profile::nntune(), &media_key, &mut SystemRng).map_err(crypto)?;
+    let header = sealer.header();
+    let blob = sealer.seal_to_vec(plaintext).map_err(crypto)?;
 
     // Envelope the media key (the "wrapped per-file key") under the KEK.
     let row_key = format!("{DRILL_USER_ID}:{DRILL_TRACK_ID}");
-    let env =
-        envelope::seal_media_key(&kek, DRILL_KEK_VERSION, DRILL_USER_ID, &row_key, &media_key)?;
-    media_key.zeroize();
-    derived.zeroize();
+    let env = envelope::seal_media_key(
+        &kek,
+        DRILL_KEK_VERSION,
+        DRILL_USER_ID,
+        &row_key,
+        media_key.expose_secret(),
+    )?;
+    drop(media_key);
 
     let row = DrillRow {
         user_id: DRILL_USER_ID.to_string(),
@@ -219,6 +212,10 @@ pub fn backup_fixture(
         dek_wrapped_b64: b64(&env.dek_wrapped),
         payload_nonce_b64: b64(&env.payload_nonce),
         ciphertext_b64: b64(&env.ciphertext),
+        media_format: media::FORMAT_ID,
+        media_mode: media::KeyMode::Random.as_byte(),
+        media_header_b64: b64(&header.to_bytes()),
+        plaintext_size: plaintext.len() as u64,
     };
     let mut jsonl = serde_json::to_vec(&row)
         .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
@@ -309,50 +306,60 @@ fn decrypt_restored_dir(
         }
     };
     kek.zeroize();
-    if media_key.len() != 32 {
-        media_key.zeroize();
-        return Err(DrillError::Crypto("media key length".to_string()));
-    }
-    // `Zeroizing` for the same reason: the blob `fs::read` `?`
-    // below must not drop the derived key material unzeroized.
-    let mut derived = Zeroizing::new([0u8; DERIVED_LEN]);
-    derived[..32].copy_from_slice(&media_key);
+    // Exactly 32 bytes, or the row is corrupt; `FileKey` owns the only
+    // copy from here and is zeroized on drop.
+    let key_bytes: Result<[u8; media::KEY_SIZE], _> = media_key.as_slice().try_into();
     media_key.zeroize();
+    let media_key = FileKey::from_bytes(
+        key_bytes.map_err(|_| DrillError::Crypto("media key length".to_string()))?,
+    );
+
+    // The trusted record selects the format; anything but
+    // `velmora.media.v1` fails closed before any key use.
+    if row.media_format != media::FORMAT_ID {
+        return Err(DrillError::Crypto("unknown media format".to_string()));
+    }
+    let header = Header::from_slice(&b64_bytes(
+        &row.media_header_b64,
+        media::HEADER_SIZE as usize,
+    )?)
+    .map_err(crypto)?;
+    // Mode allow-list (NNTune: Random only) and the constant-time key
+    // commitment run here, before any chunk is touched.
+    let verified =
+        VerifiedHeader::verify_record(&Profile::nntune(), row.media_mode, &media_key, &header)
+            .map_err(crypto)?;
+    drop(media_key);
+    let reader = verified.reader(row.plaintext_size).map_err(crypto)?;
 
     let blob = std::fs::read(restore_dir.join("blobs/drill-track-1.bin"))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("blob read: {e}"))))?;
-    let cipher_blocks = blob.len().saturating_sub(32).div_ceil(PLAIN_BLOCK + 16);
+    let cipher_blocks = media::chunk_count(reader.plaintext_size());
+
+    // Full verification first (decision §1.5 rule 7): the wire header
+    // equals the record, every chunk authenticates with the final flag
+    // at `L-1`, and the blob ends right after it, so a `P` that does not
+    // match the restored ciphertext fails closed here.
+    let verified_sha256 = reader.verify_all(&blob).map_err(crypto)?;
 
     // Ranged reads, article-window shaped: two halves joined, so the
-    // drill proves ranged decrypt, not just whole-file decrypt. The
-    // plaintext size is discovered from the blob, never trusted from
-    // the row: try sizes by block arithmetic from the ciphertext
-    // length (last block may be partial).
-    let plaintext_size = plaintext_size_from_blob(blob.len() as u64);
+    // drill proves ranged decrypt, not just whole-file decrypt.
+    let plaintext_size = reader.plaintext_size();
     let mut first = vec![0u8; plaintext_size.min(FIRST_READ_LEN) as usize];
-    let n1 =
-        nntune_core::decrypt::rclone::read_at(&blob, &derived[..], plaintext_size, &mut first, 0)
-            .map_err(|e| {
-            derived.zeroize();
-            DrillError::Crypto(e.to_string())
-        })?;
+    let n1 = reader.read_at(&blob, &mut first, 0).map_err(crypto)?;
     first.truncate(n1);
     let mut rest = vec![0u8; plaintext_size.saturating_sub(n1 as u64) as usize];
-    let n2 = nntune_core::decrypt::rclone::read_at(
-        &blob,
-        &derived[..],
-        plaintext_size,
-        &mut rest,
-        n1 as u64,
-    )
-    .map_err(|e| {
-        derived.zeroize();
-        DrillError::Crypto(e.to_string())
-    })?;
+    let n2 = reader
+        .read_at(&blob, &mut rest, n1 as u64)
+        .map_err(crypto)?;
     rest.truncate(n2);
-    derived.zeroize();
+    drop(verified);
     let mut restored = first;
     restored.extend_from_slice(&rest);
+    // The joined ranged reads must reproduce the fully verified plaintext.
+    if Sha256::digest(&restored)[..] != verified_sha256[..] {
+        return Err(DrillError::HashMismatch);
+    }
 
     // The evidence hash covers the manifest as restored into the
     // isolated environment — the same copy every other read above
@@ -378,16 +385,8 @@ fn decrypt_restored_dir(
     })
 }
 
-fn plaintext_size_from_blob(blob_len: u64) -> u64 {
-    if blob_len <= 32 {
-        return 0;
-    }
-    let body = blob_len - 32;
-    let full = body / (PLAIN_BLOCK as u64 + 16);
-    let rem = body % (PLAIN_BLOCK as u64 + 16);
-    // A non-zero remainder is a partial last block (ciphertext bytes
-    // minus the 16-byte tag).
-    full * PLAIN_BLOCK as u64 + rem.saturating_sub(16)
+fn crypto(e: nntune_core::Error) -> DrillError {
+    DrillError::Crypto(e.to_string())
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -461,7 +460,7 @@ pub fn run_synthetic_drill(
 
     let (_manifest, keyring) = backup_fixture(&bundle_dir, plaintext, tool)?;
     // Wipe: the plaintext slice is the caller's; every drill-owned
-    // copy (KEK, media key, derived) was zeroized or moved into the
+    // copy (KEK, media key, payload key) was zeroized or moved into the
     // bundle/keyring above. Restore sees only bundle_dir + keyring.
     let mut evidence = restore_and_decrypt(&bundle_dir, &restore_dir, &keyring, tool)?;
     evidence.plaintext_sha256 = bundle::sha256_hex(plaintext);
@@ -626,6 +625,34 @@ mod tests {
             err,
             DrillError::KeyringMissingVersion(DRILL_KEK_VERSION)
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fixture_is_media_v1_bound_to_its_record() {
+        // The bundled blob is a `velmora.media.v1` object: it starts with
+        // the record's 48-byte header (no cleartext magic), has exactly
+        // `48 + P + 16·L` bytes, and the record pins format 1 / Random.
+        let pt = fixture_bytes();
+        let tag = format!("{}-media-v1", std::process::id());
+        let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
+        let bundle_dir = base.join("backup-store");
+        let _ = std::fs::remove_dir_all(&base);
+        let (_m, _keyring) = backup_fixture(&bundle_dir, &pt, "test").unwrap();
+        let raw = std::fs::read(bundle_dir.join("tables/track_sources.jsonl")).unwrap();
+        let row: DrillRow =
+            serde_json::from_slice(raw.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let blob = std::fs::read(bundle_dir.join("blobs/drill-track-1.bin")).unwrap();
+        let header = b64_bytes(&row.media_header_b64, media::HEADER_SIZE as usize).unwrap();
+        assert_eq!(row.media_format, media::FORMAT_ID);
+        assert_eq!(row.media_mode, media::KeyMode::Random.as_byte());
+        assert_eq!(row.plaintext_size, pt.len() as u64);
+        assert_eq!(&blob[..media::HEADER_SIZE as usize], &header[..]);
+        assert!(!blob.starts_with(b"RCLONE"));
+        assert_eq!(
+            Some(blob.len() as u64),
+            media::ciphertext_size(pt.len() as u64)
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
