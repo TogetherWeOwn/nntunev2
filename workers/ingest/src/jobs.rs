@@ -186,6 +186,27 @@ pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobSta
     cp.state
 }
 
+/// Complete an admin parse using the shared parser's classification, never
+/// a scan of subject prose. Call only after loading and validating the
+/// retained original. Any archive parks the whole job before matching or
+/// provider reads, including an archive mixed with loose audio. Only the
+/// state changes: no parser content enters the checkpoint.
+pub fn complete_admin_parse(cp: &mut JobCheckpoint, parsed: &nntune_core::nzb::Document) -> bool {
+    if cp.source != JobSource::AdminUpload || cp.state != JobState::Parsing {
+        return false;
+    }
+    if parsed
+        .files
+        .iter()
+        .any(|file| file.role == "archive" || matches!(file.container.as_str(), "rar" | "7z"))
+    {
+        park_archive(cp)
+    } else {
+        advance_checkpoint(cp, false);
+        true
+    }
+}
+
 /// Park a parsed admin archive before matching or spending provider reads.
 /// The original and identity remain available for an explicit later resume.
 pub fn park_archive(cp: &mut JobCheckpoint) -> bool {
@@ -438,6 +459,86 @@ mod tests {
             cp.source = JobSource::AdminUpload;
             assert_eq!(advance_checkpoint(&mut cp, true), JobState::NeedsReview);
             assert_eq!(cp.repair_rounds, 0);
+        }
+    }
+
+    fn parsed_with_suffix(suffix: &str) -> nntune_core::nzb::Document {
+        // Reuse the existing synthetic corpus; add no payload, subject,
+        // filename or segment identity literals to this regression.
+        let xml = crate::fixtures::SMALL_NZB.replace(".flac", suffix);
+        nntune_core::nzb::parse(xml.as_bytes())
+            .unwrap_or_else(|_| panic!("synthetic parse rejected"))
+    }
+
+    #[test]
+    fn parsed_admin_archives_park_before_matching_without_retaining_parser_content() {
+        for suffix in [".rar", ".RAR", ".part01.rar", ".r00", ".7z", ".7Z"] {
+            let parsed = parsed_with_suffix(suffix);
+            let mut cp = checkpoint_at(JobState::Parsing);
+            cp.source = JobSource::AdminUpload;
+            cp.attempt = MAX_ATTEMPTS;
+            let mut expected = cp.clone();
+            expected.state = JobState::NeedsArchiveRead;
+            assert!(complete_admin_parse(&mut cp, &parsed));
+            assert_eq!(cp, expected);
+            // Replay never gets another parse/match or any provider work.
+            assert!(!complete_admin_parse(&mut cp, &parsed));
+            assert_eq!(cp, expected);
+        }
+    }
+
+    #[test]
+    fn parsed_admin_loose_audio_matches_and_mixed_archives_park() {
+        for suffix in [".flac", ".FLAC", ".rar.flac", ".flac.par2"] {
+            let parsed = parsed_with_suffix(suffix);
+            let mut cp = checkpoint_at(JobState::Parsing);
+            cp.source = JobSource::AdminUpload;
+            let mut expected = cp.clone();
+            expected.state = JobState::Matching;
+            assert!(complete_admin_parse(&mut cp, &parsed));
+            assert_eq!(cp, expected);
+        }
+        let mut mixed = parsed_with_suffix(".flac");
+        mixed.files.extend(parsed_with_suffix(".7z").files);
+        let mut cp = checkpoint_at(JobState::Parsing);
+        cp.source = JobSource::AdminUpload;
+        assert!(complete_admin_parse(&mut cp, &mixed));
+        assert_eq!(cp.state, JobState::NeedsArchiveRead);
+        assert!(resume_archive(&mut cp));
+        // Re-reading an unchanged original must park again: resume is not
+        // permission to treat an unread archive as loose audio.
+        assert!(complete_admin_parse(&mut cp, &mixed));
+        assert_eq!(cp.state, JobState::NeedsArchiveRead);
+    }
+
+    #[test]
+    fn parsed_admin_completion_refuses_other_sources_and_states() {
+        let parsed = parsed_with_suffix(".rar");
+        for source in [
+            JobSource::IndexerSearch,
+            JobSource::NzbUpload,
+            JobSource::AdminUpload,
+        ] {
+            for state in [
+                JobState::Queued,
+                JobState::Parsing,
+                JobState::Matching,
+                JobState::Probing,
+                JobState::NeedsArchiveRead,
+                JobState::NeedsReview,
+                JobState::Rejected,
+                JobState::Done,
+                JobState::Failed,
+            ] {
+                if source == JobSource::AdminUpload && state == JobState::Parsing {
+                    continue;
+                }
+                let mut cp = checkpoint_at(state);
+                cp.source = source;
+                let expected = cp.clone();
+                assert!(!complete_admin_parse(&mut cp, &parsed));
+                assert_eq!(cp, expected);
+            }
         }
     }
 

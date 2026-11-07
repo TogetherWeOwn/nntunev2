@@ -3133,7 +3133,7 @@ mod build_sha_tests {
         // `build_sha_from_env` needs a wasm Env, so pin the call sites in
         // source the way the throttle-gate test pins the route shape: slice
         // the pre-test source so this test's own literals cannot satisfy it.
-        // All four fetch lines plus the queue-consumer line must carry the
+        // Active fetch lines plus the queue-consumer line must carry the
         // normalized key — never a missing key or a raw var.
         let source = include_str!("lib.rs");
         let production = source
@@ -3148,8 +3148,11 @@ mod build_sha_tests {
             production.contains("nntune_logging::parse_build_sha"),
             "the reader must normalize through the shared validator"
         );
+        assert!(
+            !production.contains("ingest.search.received"),
+            "retired search admission must not emit an accepted-work event"
+        );
         for event in [
-            "ingest.search.received",
             "ingest.payload.store_failed",
             "ingest.upload.received",
             "ingest.job.status_checked",
@@ -3159,14 +3162,14 @@ mod build_sha_tests {
         }
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // The four fetch lines plus the migrated operational emits carry
+        // Active fetch lines plus the migrated operational emits carry
         // the key, so a dropped key at any one of them drops the count
-        // below eighteen. The detached library-db failure line owns its
+        // below seventeen. The detached library-db failure line owns its
         // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            18,
-            "all eighteen keyed lines must carry the build_sha key"
+            17,
+            "all seventeen keyed lines must carry the build_sha key"
         );
         assert_eq!(
             production
