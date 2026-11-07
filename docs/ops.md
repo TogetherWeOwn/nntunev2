@@ -780,6 +780,44 @@ Notes, all referencing (not changing) owning-lane state:
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
 
+### Gate incident reporting
+
+`gate-incidents.yml` observes completed main-branch `deploy`, `e2e-staging`
+and `deploy-production` runs. Its separate issue-writer job opens one
+`incident` issue per workflow/job key, comments on repeats and closes it
+with a recovery comment after a successful job with its required evidence
+step. Unconfigured/skipped smoke and skipped deployment jobs do not recover
+an incident. Older runs/attempts and issue activity newer than the healthy
+job's start cannot close a newer alert. Keep existing gate keys stable.
+
+This observer reads job/step conclusions only, never logs, artifacts or
+triggering-run code. Issues carry the source SHA, attempt URL, fixed gate
+name, failing step numbers and expected-versus-observed job conclusion.
+Numeric journey counts remain in the linked gate summary; absence from the
+jobs API is not a fabricated measurement. A manual promotion's source SHA
+is not its selected target SHA; consult that run's preflight for the target.
+Reporting success is neither staging qualification nor production approval.
+
+The observer needs only `contents: read`, `actions: read` and job-scoped
+`issues: write` with the existing workflow token. The `incident` label must
+exist. API failures fail the reporting job; inspect the observer's Actions
+run if an expected incident is absent. The existing incident intake owns
+routing issues to an accountable responder; an issue alone is not a hold
+owner. No new credential, runtime, probe or schedule is introduced.
+
+There is no scheduled production promotion workflow here: production is
+manual-only. Consequently there is no scheduled six-hour production-hold
+detector. Completed failed/cancelled promotion attempts are reported, but
+an attempt still waiting on an environment approval is not completed and
+is not detected by this observer. Do not claim unattended hold coverage.
+
+Read-only replay of a completed main-branch run:
+`GITHUB_REPOSITORY=TogetherWeOwn/nntunev2 python3 -I ci/incident_report.py --run-id <run-id> --dry-run`
+(with a granted `GITHUB_TOKEN`). Dry runs perform API GETs and print planned
+issue actions without writing. Superseded runs print `superseded` instead
+of replaying stale alerts. Offline API-fixture tests run in the required
+`release-proof` CI job; neither mode touches staging or production.
+
 ### Production seed precondition (one-time)
 
 The production lane (`.github/workflows/deploy-production.yml`) promotes

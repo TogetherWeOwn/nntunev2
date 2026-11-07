@@ -1,0 +1,41 @@
+name: gate-incidents
+
+# Observe conclusions, never change a deployment or qualification gate. This
+# privileged workflow checks out only its own default-branch source, never the
+# triggering run's ref, and downloads neither artifacts nor logs.
+on:
+  workflow_run:
+    workflows: [deploy, e2e-staging, deploy-production]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One issue writer; queue completions instead of dropping pending reports.
+concurrency:
+  group: gate-incident-writer
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  report:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Open, update or recover gate incidents
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python3 -I ci/incident_report.py --run-id "$SOURCE_RUN_ID"
