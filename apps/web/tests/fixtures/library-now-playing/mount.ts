@@ -10,12 +10,12 @@ import '../../../src/app.css';
  * prohibited. The Vite transform exports only the route's existing queue setter.
  */
 const library = mount(Fixture, { target: document.getElementById('app')! }) as unknown as {
-	acceptanceReplaceQueue(state: QueueState): void;
+	acceptanceReplaceQueue(state: QueueState): boolean;
 };
 let state: QueueState = { tracks: [], currentIndex: -1 };
 async function replace(next: QueueState) {
 	state = next;
-	library.acceptanceReplaceQueue(next);
+	if (!library.acceptanceReplaceQueue(next)) throw new Error('library child not mounted');
 	await tick();
 }
 
