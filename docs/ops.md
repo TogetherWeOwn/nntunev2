@@ -11,6 +11,35 @@ Every UNDO block is a rollback reference only. **No deletion, credential revocat
 resource mutation, or spend increase is authorized by this documentation update.**
 An authorized executor must satisfy the applicable approval/retention gates first.
 
+## Zero-idle-cost staging and preview
+
+Staging and preview runtimes must run on demand or scale to zero when idle;
+no recurring always-on runtime cost is authorized. Inventory every applicable
+Container, Durable Object (including alarms and keep-alive), scheduled Worker,
+Stream input and database compute allocation before claiming compliance. The
+historical resource tables below are not a verified idle-cost inventory or a
+cost exception, including the shared database compute reported there.
+
+A trusted pipeline must start and verify the exact SHA/environment before
+qualification, bound its use window, and retain startup/readiness plus native
+stop/scale-to-zero and cleanup/expiry evidence on success, failure and
+cancellation. No host timers, new scheduler, idle probes or alarms may sustain
+or resurrect resources outside that window. Keep security, health and full
+qualification checks during active use. Unsupported lifecycle controls remain
+explicit prerequisites, not permission to skip tests or claim sleeping.
+
+The generated staging API config sets `crons = []` explicitly: deployment
+removes recurring billing triggers rather than leaving an idle hourly wake.
+The ADR 0005 scheduled handler remains implemented, but this is **not** evidence
+of an active or qualified billing scheduler. Bounded pipeline-owned scheduling,
+expiry and same-SHA billing qualification remain prerequisites before enabling
+staging reconciliation. Do not enable a persistent cron as a workaround.
+
+Any always-on exception requires dated owner authorization recording resource,
+environment, recurring cost and expiry/review date. This rule authorizes no new
+spend, credential or security change. Production is untouched; existing review,
+migration/rollback and exact-head release gates still apply.
+
 ## Cloudflare
 
 - Account: owner account (short prefix `209cf7dd`).

@@ -326,12 +326,12 @@ jobs:
           # deploy-production.yml.
           QA_CODE_SEAM = "1"
 
-          # Hourly billing-reconcile sweep (ADR 0005): the `scheduled`
-          # entry runs only this exact cron value
-          # (`BILLING_RECONCILE_CRON` in worker_entry.rs) and fails
-          # closed while the Stripe test secrets are unprovisioned.
+          # Idle staging has no recurring billing wake. Keep an explicit
+          # empty list so deployments remove any existing cron trigger.
+          # Bounded, pipeline-owned scheduling and expiry must be qualified
+          # before enabling the ADR 0005 sweep (see docs/ops.md).
           [env.staging.triggers]
-          crons = ["0 * * * *"]
+          crons = []
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the

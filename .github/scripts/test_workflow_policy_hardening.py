@@ -69,6 +69,14 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("pnpm install --frozen-lockfile", web)
         self.assertIn("command: deploy --env staging", web)
 
+    def test_idle_staging_api_has_no_recurring_billing_trigger(self):
+        api = job((WORKFLOWS / "deploy.yml").read_text(), "staging-api")
+        self.assertIn("[env.staging.triggers]\n          crons = []", api)
+        self.assertNotIn('crons = ["0 * * * *"]', api)
+        example = (ROOT / "workers/api/wrangler.toml.example").read_text()
+        self.assertIn("# [env.staging.triggers]\n# crons = []", example)
+        self.assertNotIn('crons = ["0 * * * *"]', example)
+
     def test_shell_uses_environment_data_not_source_interpolation(self):
         ci = (WORKFLOWS / "ci.yml").read_text()
         for script in ("check_web_bundle_budget.py", "test_check_web_bundle_budget.py"):

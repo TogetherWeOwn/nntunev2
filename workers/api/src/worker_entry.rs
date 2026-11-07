@@ -5817,11 +5817,11 @@ fn emit_record(
     Some(line)
 }
 
-/// The one cron trigger this Worker schedules: the hourly
-/// `billing-reconcile` sweep (ADR 0005). The wiring lives in the
-/// deploy-generated wrangler config (`[env.*.triggers] crons`); the
-/// string here must match it exactly, and any other cron value is
-/// ignored below so a stray trigger can never run billing work.
+/// The only accepted cron value: the hourly `billing-reconcile` sweep
+/// (ADR 0005). Idle staging declares no triggers in the deploy-generated
+/// wrangler config; bounded startup and expiry remain prerequisites.
+/// An authorized trigger must match this string exactly; any other value
+/// is ignored below so a stray trigger can never run billing work.
 pub const BILLING_RECONCILE_CRON: &str = "0 * * * *";
 
 /// Worker `scheduled` entry: run one billing-reconcile sweep. Builds the
@@ -5857,8 +5857,11 @@ pub async fn run_scheduled(env: Env, cron: &str) {
     let store = PgStore {
         env: Some(env.clone()),
         trace_id: trace_id.clone(),
+        mirror_binding: MirrorBinding::from_env(&env),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_mirror: None,
     };
     let mailer = WebhookMailer {
         origin: config.origin.clone(),

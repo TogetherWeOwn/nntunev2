@@ -144,9 +144,9 @@ pub async fn main(
     worker_entry::dispatch(req, env).await
 }
 
-/// Hourly `billing-reconcile` cron (ADR 0005): the trigger is declared
-/// in the deploy-generated wrangler config; the sweep itself lives in
-/// `worker_entry::run_scheduled`, which ignores any other cron value.
+/// Hourly `billing-reconcile` entry (ADR 0005), inactive in idle staging.
+/// The deploy-generated staging config has no recurring triggers. The
+/// sweep in `worker_entry::run_scheduled` ignores any other cron value.
 #[worker::event(scheduled)]
 pub async fn scheduled(
     event: worker::ScheduledEvent,
