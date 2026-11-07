@@ -29,7 +29,7 @@ media codecs between edge and native targets.
 | Config | **KV**, not authoritative entitlements or usage counters |
 | Usage enforcement | **Postgres** daily flow ledger and live cache-grant gauge; pool Durable Object leases for concurrency (ADR 0004) |
 | Observability | **Analytics Engine**, sampled telemetry only — never a billing/cap authority |
-| Batch only | **Containers** — MusicBrainz import, par2 repair; interactive paths stay serverless |
+| Batch only | **Containers** — par2 repair; interactive paths stay serverless. MusicBrainz import is superseded by the [2026-11-07 no-Containers amendment](0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement); replacement setup does not establish import/readiness or activation |
 
 ### Repo layout
 

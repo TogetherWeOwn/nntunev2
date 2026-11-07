@@ -1028,6 +1028,23 @@ database URLs, environment values, or personal login identities in them.
 
 ## Operator runbook: enabling staging-mb / staging-ingest
 
+**Unavailable as of 2026-11-07 — do not execute the sequence below.** The
+former MB config is deleted; the conditional replacement is not an imported,
+ready or activated mirror. Keep `HYPERDRIVE_ID_MB` unset and the ingest enable
+gate disabled. See the [dated lifecycle inventory](#planetscale-postgres) and
+[ADR 0007 amendment](adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement).
+
+Before this sequence becomes executable, require validated import/readiness
+and separately accepted activation. A reviewed, coordinated replacement-ID
+change must align `workers/mb/wrangler.toml`, API MB metadata in
+`workers/api/wrangler.toml.example`, `.github/scripts/binding_manifest.toml`,
+relevant binding/deploy contracts and the Hyperdrive inventory **before any
+variable wiring**. Both API and MB deploy assertions pin the manifest ID;
+a new variable alone fails parity, while the retired ID targets no config.
+Do not invent an ID, restore the retired one or provision a resource from this
+runbook. This documentation change neither updates bindings nor accepts
+activation. All existing intake, security and release gates still apply.
+
 Operator-owned actions only. No secrets in the repo or the workflow: Worker
 secrets are operator-set in Cloudflare, and the lanes below only ever read
 secret *names* (the `CLOUDFLARE_*` credentials stay in repo secrets). The
@@ -1044,13 +1061,14 @@ deploys either Worker — until every step below clears, in order:
    `workers/ingest/wrangler.toml` is live, so the consumer goes live the
    moment the lane first deploys; a search job admitted before the search
    boundary is wired would burn its retry budget against the unwired
-   boundary and quarantine. `staging-mb` has no such gate and may proceed
-   first — ingest needs it (`needs: [gate, staging-mb]`, since `MB_API`
-   targets `nntune-mb-staging`).
-2. **Wire the staging variables, mb first.** Set the public repo variables
-   (names only, never values) `HYPERDRIVE_ID_MB` then
-   `HYPERDRIVE_ID_STAGING`, matching the inventory IDs in the Hyperdrive
-   table above. Each lane pins its variable against
+   boundary and quarantine. Once the replacement prerequisites above clear,
+   `staging-mb` may deploy first — ingest needs it (`needs: [gate, staging-mb]`,
+   since `MB_API` targets `nntune-mb-staging`).
+2. **After replacement alignment and activation acceptance only, wire the
+   staging variables, mb first.** Set the public repo variables (names only,
+   never values) `HYPERDRIVE_ID_MB` then `HYPERDRIVE_ID_STAGING`, matching
+   the newly verified active inventory. The deleted MB ID is historical,
+   never a value to wire; until the coordinated change lands, stop here. Each lane pins its variable against
    `.github/scripts/binding_manifest.toml` before generating its staging
    config and fails the job on mismatch, so a mistyped variable blocks the
    deploy instead of deploying the wrong binding. Set
