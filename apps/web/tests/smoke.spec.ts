@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /** Ensure passkeys read as supported so signup reaches its API branches. */
 async function ensurePasskeysSupported(page: Page): Promise<void> {
@@ -266,7 +267,8 @@ test('library renders no audio element while the selected track has no stream UR
 	// Selecting the row makes it the queue's current track — the state that
 	// used to reveal <audio data-testid="audio-player" src="">, which made
 	// the browser request the page URL as if it were media.
-	await page.getByTestId('library-item').click();
+	await page.getByTestId('library-item').locator('button.nt-library-row').click();
+	await openQueue(page);
 	await expect(page.getByTestId('now-playing')).toContainText('Silent Song');
 
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);

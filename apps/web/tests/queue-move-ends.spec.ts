@@ -1,7 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * QTOP acceptance-owned contract; Builder must not edit this file.
+ * One-time reviewed exception: queueLibraryTracks uses the actual append
+ * button and visible Queue toggle; every behavior predicate stays protected.
  * Test bank ref: test/queue-move-ends-acceptance.
  *
  * Companion: src/lib/player/queue.moveEnds.acceptance.test.ts (QTOP-U-*)
@@ -132,8 +135,9 @@ async function openLibrary(page: Page, baseURL: string, traffic: Traffic): Promi
 
 async function queueLibraryTracks(page: Page, ids: string[]): Promise<void> {
 	for (const id of ids) {
-		await page.locator(`[data-testid="library-item"][data-id="${id}"]`).click();
+		await page.locator(`[data-testid="library-item"][data-id="${id}"] button.nt-library-row`).click();
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(ids.length);
 }
 

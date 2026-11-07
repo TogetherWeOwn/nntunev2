@@ -184,6 +184,42 @@ async function clientLink(page: Page, path: string) {
 	}, path);
 }
 
+test('production clock interval follows the actual decoder, not the layout lifetime', async ({ page }) => {
+	await page.addInitScript(() => {
+		const active = new Set<number>();
+		const interval = window.setInterval.bind(window);
+		const clear = window.clearInterval.bind(window);
+		window.setInterval = (handler, delay, ...args) => {
+			const id = interval(handler, delay, ...args);
+			if (delay === 1000) active.add(id);
+			return id;
+		};
+		window.clearInterval = (id) => {
+			if (id !== undefined) active.delete(id);
+			clear(id);
+		};
+		Reflect.set(window, '__hostClockIntervals', active);
+	});
+	const intervals = () => page.evaluate(() => [...Reflect.get(window, '__hostClockIntervals') as Set<number>]);
+	await page.goto('/home');
+	await expect(page.getByTestId('player-queue-toggle')).toBeVisible();
+	expect(await intervals()).toEqual([]);
+	await library(page);
+	await expect.poll(intervals).toHaveLength(1);
+	const active = await intervals();
+	const audio = (await page.getByTestId('audio-player').elementHandle())!;
+	await primary(page, '/home');
+	expect(await intervals()).toEqual(active);
+	expect(await audio.evaluate((node) => node === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
+	await clientLink(page, '/pricing');
+	await expect(page).toHaveURL(/\/pricing$/);
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect.poll(intervals).toEqual([]);
+	await clientLink(page, '/library');
+	await expect(page.getByTestId('audio-player')).toHaveJSProperty('readyState', 4);
+	await expect.poll(intervals).toHaveLength(1);
+});
+
 test('mobile automatic deep-link conversion leaves an escapable Back history', async ({ page }) => {
 	await page.setViewportSize({ width: 390, height: 844 });
 	await page.goto('/home');

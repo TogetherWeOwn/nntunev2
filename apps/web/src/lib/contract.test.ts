@@ -103,7 +103,8 @@ describe('e2e contract hooks', () => {
 		const view = sources['./player/QueueView.svelte'];
 		expect(view).toContain('const player = usePlayerSession()');
 		expect(view).toContain("import PlayerQueue from './PlayerQueue.svelte'");
-		expect(view).toMatch(/<PlayerQueue\s+state=\{\$player\.queue\}/);
+		expect(view).toContain('const queue = $derived($player.queue)');
+		expect(view).toMatch(/<PlayerQueue\s+state=\{queue\}/);
 		expect(view).toContain('const actions = queueViewActions(player)');
 		for (const action of ['next', 'shuffle', 'move', 'playnext', 'remove', 'clear', 'select', 'copylink', 'keepcurrentandupcoming', 'clearupcoming']) {
 			expect(view).toContain(`on${action}={actions.on${action}}`);

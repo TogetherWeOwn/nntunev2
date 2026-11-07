@@ -49,13 +49,18 @@
 
 	onMount(() => {
 		player.start(browserStorage('local'), browserStorage('session'));
-		const interval = window.setInterval(player.tick, 1000);
 		window.addEventListener('pagehide', player.persistPosition);
 		return () => {
-			window.clearInterval(interval);
 			window.removeEventListener('pagehide', player.persistPosition);
 			player.destroy();
 		};
+	});
+
+	const playerAudio = $derived($player.audio);
+	$effect(() => {
+		if (!playerAudio) return;
+		const interval = window.setInterval(player.tick, 1000);
+		return () => window.clearInterval(interval);
 	});
 
 	$effect(() => {
