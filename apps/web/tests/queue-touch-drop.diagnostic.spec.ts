@@ -65,9 +65,13 @@ test('stationary queue touch release retains hit-test and cancellation evidence'
 		await openQueue(page);
 		const list = page.getByTestId(TESTIDS.queueDropTarget);
 		await list.evaluate((node) => { node.style.maxHeight = '320px'; node.style.overflowY = 'auto'; });
-		await list.scrollIntoViewIfNeeded();
+		// Match the real bank's visible drop-point prerequisite, not an obscured edge.
+		await list.evaluate((node) => node.scrollIntoView({ block: 'center', behavior: 'instant' }));
 		const source = (await queueRow('coral').getByRole('button', { name: /^Reorder / }).boundingBox())!;
 		const box = (await list.boundingBox())!;
+		const dropHitsList = () => list.evaluate((node, point) => node.contains(document.elementFromPoint(point.x, point.y)),
+			{ x: box.x + 40, y: box.y + box.height - 8 });
+		expect(await dropHitsList()).toBe(true);
 		stages.push({ stage: 'gesture-coordinates', source, box });
 		const session = await context.newCDPSession(page);
 		await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
@@ -92,6 +96,7 @@ test('stationary queue touch release retains hit-test and cancellation evidence'
 		await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: box.x + 40, y: box.y + box.height - 8 }] });
 		await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeGreaterThan(200);
 		await snapshot('before-drop');
+		expect(await dropHitsList()).toBe(true);
 		await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 		await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
 		await expect(queueRow('coral')).toHaveAttribute('aria-current', 'true');

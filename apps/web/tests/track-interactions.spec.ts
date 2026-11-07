@@ -632,9 +632,13 @@ test('a stationary touch drag scrolls its queue pane and stops scrolling on drop
 	await openQueue(page);
 	const list = page.getByTestId(TESTIDS.queueDropTarget);
 	await list.evaluate((node) => { node.style.maxHeight = '320px'; node.style.overflowY = 'auto'; });
-	await list.scrollIntoViewIfNeeded();
+	// Nearest-edge scrolling can leave the drop point behind fixed shell controls.
+	await list.evaluate((node) => node.scrollIntoView({ block: 'center', behavior: 'instant' }));
 	const source = (await queueRow(page, 'coral').getByRole('button', { name: /^Reorder / }).boundingBox())!;
 	const box = (await list.boundingBox())!;
+	const dropHitsList = () => list.evaluate((node, point) => node.contains(document.elementFromPoint(point.x, point.y)),
+		{ x: box.x + 40, y: box.y + box.height - 8 });
+	expect(await dropHitsList()).toBe(true);
 	const session = await context.newCDPSession(page);
 	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
@@ -655,6 +659,7 @@ test('a stationary touch drag scrolls its queue pane and stops scrolling on drop
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: box.x + 40, y: box.y + box.height - 8 }] });
 	await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeGreaterThan(200);
+	expect(await dropHitsList()).toBe(true);
 	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
