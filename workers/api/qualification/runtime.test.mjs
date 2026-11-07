@@ -197,11 +197,25 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
           },
           ...(['GET', 'HEAD'].includes(method) ? {} : { body: new Uint8Array([255]) }),
         });
-        assert.equal(response.status, 404, `configured public ${method} ${route} must stay unserved`);
+        // The existing scope map covers POST /v1/ingest/*, so its generic
+        // browser preflight is 204 even though this path has no handler.
+        // That empty response must not be mistaken for a private bridge call.
+        const preflight = method === 'OPTIONS' && route === '/v1/ingest/preparation';
+        assert.equal(response.status, preflight ? 204 : 404,
+          `configured public ${method} ${route} must keep its router posture`);
         assert.equal(response.headers.get('access-control-allow-origin'), configured.RP_ORIGIN);
         assert.match(response.headers.get('x-trace-id') ?? '', /^[a-f0-9]{32}$/,
-          'every matrix response must come from the Rust router, not a harness/proxy 404');
-        await response.arrayBuffer();
+          'every matrix response must come from the Rust router, not a harness/proxy');
+        if (preflight) {
+          assert.equal(response.headers.get('access-control-allow-methods'),
+            'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
+          assert.equal(response.headers.get('access-control-allow-headers'), 'content-type, authorization');
+          assert.equal((await response.arrayBuffer()).byteLength, 0);
+        } else {
+          assert.equal(response.headers.get('access-control-allow-methods'), null);
+          assert.equal(response.headers.get('access-control-allow-headers'), null);
+          await response.arrayBuffer();
+        }
         assert.equal((await configuredProbe()).bridgeCalls, before);
       }
     }
