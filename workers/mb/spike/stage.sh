@@ -21,13 +21,25 @@ here=$(cd "$(dirname "$0")" && pwd)
 state="${RUNNER_TEMP:-/tmp}/mb-snap-stage"
 mkdir -p "$state"
 wrangler() { npx --yes "wrangler@${WRANGLER_VERSION}" "$@"; }
+RULE=expire-spike-snapshots
+
+has_expiry_rule() {
+  local rules
+  rules=$(wrangler r2 bucket lifecycle list "$BUCKET") || return 1
+  grep -q "$RULE" <<< "$rules" && grep -q "snap/" <<< "$rules"
+}
 
 up() {
   local snap=$1
   if ! wrangler r2 bucket info "$BUCKET" > /dev/null 2>&1; then
     wrangler r2 bucket create "$BUCKET"
   fi
-  wrangler r2 bucket lifecycle add "$BUCKET" expire-spike-snapshots snap/ --expire-days 14 || true
+  # No upload without a confirmed expiry rule: it is the backstop when
+  # teardown fails or the run is cancelled. Add only if missing (reruns).
+  if ! has_expiry_rule; then
+    wrangler r2 bucket lifecycle add "$BUCKET" "$RULE" snap/ --expire-days 14
+    has_expiry_rule || { echo "stage: cannot confirm the $RULE expiry rule; not uploading" >&2; exit 1; }
+  fi
   for file in "$snap"/*.idx "$snap"/*.dat.*; do
     wrangler r2 object put "$BUCKET/$PREFIX$(basename "$file")" --file "$file" --remote > /dev/null
     basename "$file" >> "$state/objects.txt"
@@ -78,13 +90,20 @@ bench() {
 }
 
 down() {
+  # Attempt every delete, then fail the step if any failed.
+  local failed=0
   if [ -f "$state/deployed" ]; then
-    wrangler delete --name "$WORKER" --force || true
+    wrangler delete --name "$WORKER" --force || { echo "stage: Worker delete failed" >&2; failed=$((failed + 1)); }
   fi
   if [ -f "$state/objects.txt" ]; then
     while read -r name; do
-      wrangler r2 object delete "$BUCKET/$PREFIX$name" --remote > /dev/null || true
+      wrangler r2 object delete "$BUCKET/$PREFIX$name" --remote > /dev/null < /dev/null \
+        || { echo "stage: delete failed: $PREFIX$name" >&2; failed=$((failed + 1)); }
     done < "$state/objects.txt"
+  fi
+  if [ "$failed" -gt 0 ]; then
+    echo "stage: teardown incomplete, $failed delete(s) failed (the $RULE rule expires snap/ objects in 14 days)" >&2
+    exit 1
   fi
 }
 

@@ -81,6 +81,27 @@ def run(urls: list[str], token: str) -> dict:
     }
 
 
+ENDPOINTS = ("lookup:artist", "lookup:release", "lookup:recording", "search:release")
+
+
+def gate(report: dict) -> dict:
+    """Gate 2 verdict. Percentiles cover status-200 results only, so a pass
+    also needs every endpoint to have run all REQUESTS and all of them to
+    have returned 200: a failing subset must not hide behind fast successes."""
+    complete = all(
+        report[e]["requests"] == REQUESTS and report[e]["statuses"] == {"200": REQUESTS}
+        for e in ENDPOINTS)
+    lookup_p95 = max(report[e]["client_ms"]["p95"] or 1e9 for e in ENDPOINTS[:3])
+    search = report["search:release"]
+    return {
+        "all_requests_ok": complete,
+        "lookup_client_p95_ms": lookup_p95,
+        "search_client_p95_ms": search["client_ms"]["p95"],
+        "search_reads_p95": search["reads"]["p95"],
+        "pass": complete and lookup_p95 < 250 and (search["client_ms"]["p95"] or 1e9) < 600,
+    }
+
+
 def main() -> int:
     if len(sys.argv) != 5:
         print(__doc__.splitlines()[2], file=sys.stderr)
@@ -94,14 +115,7 @@ def main() -> int:
     queries = [line.split("\t")[1] for line in golden.read_text(encoding="utf-8").splitlines()][:REQUESTS]
     report["search:release"] = run(
         [f"{base}/v1/mb/search?type=release&q={urllib.parse.quote(q)}" for q in queries], token)
-    lookup_p95 = max(report[f"lookup:{k}"]["client_ms"]["p95"] or 1e9 for k in ("artist", "release", "recording"))
-    search = report["search:release"]
-    report["gate_2"] = {
-        "lookup_client_p95_ms": lookup_p95,
-        "search_client_p95_ms": search["client_ms"]["p95"],
-        "search_reads_p95": search["reads"]["p95"],
-        "pass": lookup_p95 < 250 and (search["client_ms"]["p95"] or 1e9) < 600,
-    }
+    report["gate_2"] = gate(report)
     out.write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
     return 0
