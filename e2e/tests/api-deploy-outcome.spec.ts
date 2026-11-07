@@ -190,7 +190,8 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
   test('complete vars and successful executed steps report the deployed source only', () => {
     const config = runShell(shell(step('Check api staging configuration')), dummyVars);
     expect(config.output).toBe('configured=true\n');
-    for (const mirror of [{}, { HYPERDRIVE_ID_MB: '' }, { HYPERDRIVE_ID_MB: 'dummy-mirror-value' }] as const) {
+    const mirrorModes: Record<string, string>[] = [{}, { HYPERDRIVE_ID_MB: '' }, { HYPERDRIVE_ID_MB: 'dummy-mirror-value' }];
+    for (const mirror of mirrorModes) {
       const withMirror = runShell(shell(step('Check api staging configuration')), { ...dummyVars, ...mirror });
       expect(withMirror.output).toBe('configured=true\n');
     }
