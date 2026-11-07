@@ -44,13 +44,18 @@ import { openQueue } from './helpers/queue-host';
  * and lifecycle setup to the persistent shell's Queue panel. Every assertion
  * and behavior vector remains protected, and an independent equivalence
  * review is required.
+ *
+ * Cache exception: the Engineering Lead authorized only a per-worker Vite
+ * cacheDir for the standalone component server. Every test, fixture, assertion
+ * and restriction remains protected.
  */
 
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
-	componentOrigin: [async ({}, use) => {
+	componentOrigin: [async ({}, use, workerInfo) => {
 		const server = await createServer({
 			configFile: false,
 			root: decodeURIComponent(new URL('./fixtures/queue-orientation/', import.meta.url).pathname),
+			cacheDir: decodeURIComponent(new URL(`../node_modules/.vite/queue-orientation-${workerInfo.workerIndex}/`, import.meta.url).pathname),
 			publicDir: false,
 			plugins: [svelte({ configFile: false, compilerOptions: { runes: true } })],
 			server: { host: '127.0.0.1', port: 0, fs: { allow: [decodeURIComponent(new URL('../', import.meta.url).pathname)] } }
