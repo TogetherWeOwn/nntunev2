@@ -363,3 +363,8 @@ file = "0051_posted_file_media_v1.sql"
 renamed_from = [{ file = "0050_posted_file_media_v1.sql", sha256 = "4537a8bcbcf272c7aa5896c085b296a4af4a96f64afe6a54fa968015ee560506" }]
 target = "app"
 sha256 = "4537a8bcbcf272c7aa5896c085b296a4af4a96f64afe6a54fa968015ee560506"
+
+[[migration]]
+file = "0052_posted_file_retained_observations.sql"
+target = "app"
+sha256 = "ded2a3b6d1300a6b72409efed7285a94ce3ad3f6645b31703f53e0b483e1c518"

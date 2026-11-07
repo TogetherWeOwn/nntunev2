@@ -20,6 +20,12 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_retained::provenance::postgres_retained_unknown_provenance_binds_original_attempt_reference_round_and_selection",
+    "posted_generation_retained::provenance::postgres_retained_content_provenance_keeps_each_nonaffirmative_verdict_and_side",
+    "posted_generation_retained::provenance::postgres_retained_provenance_distinguishes_selection_aba_from_historical_reference_health",
+    "posted_generation_retained::provenance::postgres_retained_stale_callbacks_create_no_provenance",
+    "posted_generation_retained::provenance::postgres_retained_provenance_and_content_roll_back_with_health_failure",
+    "posted_generation_retained::provenance::postgres_retained_provenance_is_immutable_and_migration_replay_preserves_it",
     "posted_generation_registry_admission::postgres_admission_missing_legacy_registration_refuses_without_adopting_custody",
     "posted_generation_registry_admission::postgres_admission_selected_health_never_implicitly_reuses_or_replaces",
     "posted_generation_registry_admission::postgres_admission_registered_history_uses_registry_without_scalar_physical_lookup",

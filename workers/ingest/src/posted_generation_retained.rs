@@ -7,7 +7,10 @@
 //! No transaction spans a reader. An explicit
 //! unknown/failed read may withdraw eligibility through that exact permit only.
 //! Complete-read observations do not establish independent-backbone provenance,
-//! affirmative retention, terminal loss, reuse or cleanup authority.
+//! affirmative retention, terminal loss, reuse or cleanup authority. Negative
+//! mutations atomically retain original attempt/reference/health and pre/post
+//! registry context in an immutable observation ledger; no conclusive failure
+//! decision is inferred from those observations.
 
 use super::*;
 
@@ -46,6 +49,8 @@ pub struct RetainedCheckPermit {
     reference_kind: RetainedReferenceKind,
     reference_owner: String,
     reference_token: String,
+    registry_revision: i64,
+    selected_generation: Option<String>,
     revision: i64,
     round: i64,
     round_token: String,
@@ -85,6 +90,8 @@ pub enum RetainedInvalidation {
 struct RetainedFence {
     health: Row,
     reference_token: String,
+    registry_revision: i64,
+    selected_generation: Option<String>,
 }
 
 // Match candidate/publication lock order: owning job/attempt, hash registry,
@@ -101,19 +108,18 @@ async fn lock_retained(
     if !lock_attempt(tx, attempt).await? {
         return Ok(None);
     }
-    if tx
+    let Some(registry) = tx
         .query_opt(
-            "SELECT r.plaintext_sha256 FROM posted_file_registry r \
+            "SELECT r.revision, r.selected_generation FROM posted_file_registry r \
              JOIN posted_files p ON p.plaintext_sha256 = r.plaintext_sha256 \
              WHERE p.id = $1 FOR UPDATE OF r",
             &[&generation],
         )
         .await
         .map_err(database_error)?
-        .is_none()
-    {
+    else {
         return Ok(None);
-    }
+    };
     let operation = tx
         .query_opt(
             "SELECT o.state FROM posted_file_operations o \
@@ -155,6 +161,8 @@ async fn lock_retained(
     Ok(Some(RetainedFence {
         health,
         reference_token: reference.get("reference_token"),
+        registry_revision: registry.get("revision"),
+        selected_generation: registry.get("selected_generation"),
     }))
 }
 
@@ -190,6 +198,8 @@ pub async fn prepare_retained_check(
         reference_kind: kind,
         reference_owner: owner.to_owned(),
         reference_token: fence.reference_token,
+        registry_revision: fence.registry_revision,
+        selected_generation: fence.selected_generation,
         revision: fence.health.get("revision"),
         round: fence.health.get("round"),
         round_token: fence.health.get("round_token"),
@@ -223,6 +233,7 @@ pub async fn invalidate_retained_check(
     if !matches_fence(&health, permit) {
         return Ok(RetainedInvalidation::StaleOrMissing);
     }
+    store_negative_provenance(&tx, permit, &health, None, "unknown").await?;
     withdraw_health(&tx, &permit.generation).await?;
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(RetainedInvalidation::Applied)
@@ -233,6 +244,55 @@ fn matches_fence(fence: &RetainedFence, permit: &RetainedCheckPermit) -> bool {
         && fence.health.get::<_, i64>("revision") == permit.revision
         && fence.health.get::<_, i64>("round") == permit.round
         && fence.health.get::<_, &str>("round_token") == permit.round_token
+}
+
+// Persist the ORIGINAL read and current registry context in the same commit as
+// the invalidation. Historical serving/rollback reads remain valid after global
+// selection moves, but cannot be mistaken for a check of the new selection.
+// This ledger contains observations, never a terminal-failure decision. No FK
+// targets a mutable attempt/reference incarnation, which must be free to advance.
+async fn store_negative_provenance(
+    tx: &Transaction<'_>,
+    permit: &RetainedCheckPermit,
+    current: &RetainedFence,
+    side: Option<ArticleSide>,
+    state: &str,
+) -> Result<(), StoreError> {
+    let side = side.map(ArticleSide::db_value);
+    let changed = tx
+        .execute(
+            "INSERT INTO posted_file_retained_observations \
+             (generation_id, plaintext_sha256, health_revision, round, round_token, \
+              job_id, attempt, attempt_token, reference_kind, reference_owner, reference_token, \
+              prepared_registry_revision, prepared_selection, recorded_registry_revision, \
+              recorded_selection, side, state) \
+             SELECT id, plaintext_sha256, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                    $11, $12, $13, $14, $15, $16 FROM posted_files WHERE id = $1",
+            &[
+                &permit.generation,
+                &permit.revision,
+                &permit.round,
+                &permit.round_token,
+                &permit.attempt.job_id,
+                &permit.attempt.attempt,
+                &permit.attempt.token,
+                &permit.reference_kind.db_value(),
+                &permit.reference_owner,
+                &permit.reference_token,
+                &permit.registry_revision,
+                &permit.selected_generation,
+                &current.registry_revision,
+                &current.selected_generation,
+                &side,
+                &state,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(StoreError::Inconsistent);
+    }
+    Ok(())
 }
 
 async fn withdraw_health(tx: &Transaction<'_>, generation: &str) -> Result<(), StoreError> {

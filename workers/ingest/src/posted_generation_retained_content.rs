@@ -125,6 +125,13 @@ pub async fn record_retained_content_check(
     )
     .await?;
     if state != ContentCheckState::Intact {
+        let verdict = match state {
+            ContentCheckState::Unavailable => "unavailable",
+            ContentCheckState::AuthenticationFailed => "authentication_failed",
+            ContentCheckState::IntegrityFailed => "integrity_failed",
+            ContentCheckState::Intact => return Err(StoreError::Inconsistent),
+        };
+        store_negative_provenance(&tx, original, &health, Some(permit.side), verdict).await?;
         withdraw_health(&tx, &original.generation).await?;
     } else if changed == 1 {
         tx.execute(
