@@ -132,10 +132,28 @@ custody matching its own upload identity. The first structural-control Actions r
 failed at that seed index before parsing; it is not parser/tagger acceptance.
 The fixture is generated structural data: no PCM decoder or MD5 verification is
 performed, and historical seeded admission is still not authenticated HTTP upload.
-These new controls are written, not locally executed; require exact-head Actions
-before claiming their result. Process crashes, ambiguous DB commits,
-large-file/deadline limits, deployed lifecycle/drain, actual staging/restore and
-remaining foundation review are still unqualified.
+At head `524e39f9`, [exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42381117815/job/128428780077)
+passes all nine runtime subtests (ten Node passes including the enclosing test),
+including this structural FLAC composition and all four malformed-input controls.
+The same head's [database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42381117815/job/128428780004)
+explicitly reports 255 required cases passed. These are exact-head Actions results,
+not authenticated-upload, PCM-decoder, security, staging or release acceptance.
+
+An additional lifecycle control now disposes the entire Miniflare/workerd runtime
+and creates a fresh one using the same temporary R2 persistence, external DB and
+ephemeral API keyring. No object, plan or admission is reseeded. Fresh Rust and API
+isolates must recover the stored FLAC pointer, preserve the exact R2 version/digest
+and full DB fingerprints, reject an unknown pointer, and replay the producer
+without reminting or renewing authority. Each replay removes only the old harness
+completion marker and waits for a fresh callback marker before checking DB/DLQ
+state; pre-restart replay completes first so it cannot satisfy the restart check.
+The converter must retain the selected `resourcePersistencePath`. Temporary
+persistence is removed only after runtime disposal. This control is written,
+not locally executed; require its exact-head Actions result. It is a graceful
+runtime restart, not abrupt crash,
+ambiguous-commit or pending-Queue replay injection. Process crashes, ambiguous DB
+commits, large-file/deadline limits, deployed lifecycle/drain, actual staging/restore
+and remaining foundation review are still unqualified.
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
 activation, posting or R2 deletion authority.

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
@@ -47,6 +48,16 @@ function worker(name, modules, options = {}) {
   };
 }
 
+async function compositeDelivery(bucket) {
+  for (let i = 0; i < 400; i++) {
+    assert.equal(await bucket.get('qualification-refused'), null, 'replay must not reach DLQ');
+    const marker = await bucket.get('qualification-composite-delivered');
+    if (marker) return marker.json();
+    await setTimeout(50);
+  }
+  assert.fail('new Queue callback completion marker required');
+}
+
 test('generated release artifacts in real workerd', { timeout: 120_000 }, async t => {
   const apiModules = [
     await sourceModule(`${api}qualification/api-probe.mjs`),
@@ -75,8 +86,16 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
   };
   // The pinned runtime accepts v5 configs; use its shipped v4 option converter.
   // Resolve module paths from the explicit Workers root, not the harness cwd.
+  const persistence = await mkdtemp(path.join(tmpdir(), 'preparation-qualification-'));
+  let mf;
+  t.after(async () => {
+    if (mf) await mf.dispose();
+    assert.ok((await lstat(persistence)).isDirectory());
+    await rm(persistence, { recursive: true });
+  });
   const options = convertV4MiniflareOptions({
     rootPath: root,
+    resourcePersistencePath: persistence,
     host: '127.0.0.1',
     port: 0,
     workers: [
@@ -139,8 +158,8 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       }),
     ],
   });
-  const mf = new Miniflare(options);
-  t.after(() => mf.dispose());
+  assert.equal(options.resourcePersistencePath, persistence, 'converter must retain explicit persistence');
+  mf = new Miniflare(options);
   const publicApi = await mf.getWorker('api');
   const entry = await mf.getWorker('ingest');
   const probe = () => entry.fetch('https://qualification.invalid/probe').then(r => r.json());
@@ -414,10 +433,57 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     }
     assert.deepEqual(delivered, { count: 1 });
     assert.equal(state(), persisted, 'Queue recovery does not mutate startup authority');
+    // Consume the replay before disposing this runtime; an old pending callback
+    // must not supply the post-restart replay's completion marker.
+    await bucket.delete('qualification-composite-delivered');
     assert.equal((await prepare(input)).status, 202);
+    assert.deepEqual(await compositeDelivery(bucket), { count: 1 });
+    assert.equal(await bucket.get('qualification-refused'), null);
     assert.equal(state(), persisted, 'tagging and producer replay preserve exact custody');
     assert.equal((await bucket.get(objectKey)).version, row.object_version);
     assert.deepEqual((await bucket.list()).objects.map(o => o.key).sort(),
       [objectKey, 'qualification-composite-delivered'].sort(), 'R2 stores no plaintext plan');
+  });
+
+  await t.test('fresh workerd recovers persisted FLAC preparation without restarting authority', async () => {
+    const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+      SELECT id,object_id,object_version,plaintext_bytes,plaintext_sha256
+      FROM ingest_file_dispatches WHERE job_id = 'qualification-flac-job') q;`));
+    const pointer = { version: 1, id: row.id };
+    const objectKey = `prepared-tagged/${row.object_id}`;
+    const persisted = state();
+    // Shut down the runtime, not just a Rust client or handle. Only the external
+    // DB, explicit R2 persistence and the same ephemeral API keyring survive.
+    // Graceful disposal is not abrupt-process/ambiguous-commit fault injection.
+    await mf.dispose();
+    mf = undefined;
+    mf = new Miniflare(options);
+    const composite = await mf.getWorker('composite-flac');
+    assert.equal((await composite.fetch('https://qualification.invalid/healthz')).status, 200);
+    const recover = body => composite.fetch('https://qualification.invalid/recover', {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    assert.equal((await recover(pointer)).status, 204, 'fresh Rust/service isolates must open persisted custody');
+    assert.equal(state(), persisted, 'restart recovery must not acquire, remint or renew');
+    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+    const object = await bucket.get(objectKey);
+    assert.ok(object, 'R2 must survive runtime replacement, not be reseeded by the harness');
+    assert.equal(object.version, row.object_version);
+    const tagged = Buffer.from(await object.arrayBuffer());
+    assert.equal(tagged.length, row.plaintext_bytes);
+    assert.equal(createHash('sha256').update(tagged).digest('hex'), row.plaintext_sha256);
+    assert.equal((await recover(pointer)).status, 204, 'duplicate restart delivery remains read-only');
+    assert.equal((await recover({ version: 1, id: 'unknown-restart-pointer' })).status, 503);
+    assert.equal(state(), persisted, 'unknown restart pointer must not borrow persisted authority');
+    await bucket.delete('qualification-composite-delivered');
+    assert.equal((await composite.fetch('https://qualification.invalid/prepare-flac', {
+      method: 'POST', body: flacFixture().input,
+    })).status, 202, 'fresh producer reuses the exact stored preparation');
+    assert.deepEqual(await compositeDelivery(bucket), { count: 1 }, 'new replay callback must complete');
+    assert.equal(state(), persisted, 'producer replay after restart must not rotate authority or custody');
+    assert.equal((await bucket.get(objectKey)).version, row.object_version);
+    assert.deepEqual((await bucket.list()).objects.map(o => o.key).sort(),
+      [objectKey, 'qualification-composite-delivered'].sort(), 'restart must not add plaintext plans');
+    assert.equal(await bucket.get('qualification-refused'), null, 'restart replay must not reach DLQ');
   });
 });
