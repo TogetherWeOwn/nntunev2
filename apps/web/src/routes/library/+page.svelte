@@ -1405,6 +1405,8 @@
 	}
 
 	function clearLibraryAuthState(): void {
+		const heldMenuFocus = typeof document !== 'undefined' &&
+			!!document.activeElement?.closest('[data-testid="track-context-menu"]');
 		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
@@ -1419,6 +1421,13 @@
 		confirmClear = false;
 		managementFeedback = '';
 		purgeSelection();
+		// The persistent queue's menu is outside this route, but its auth
+		// invalidation still lands on Library's recovery control while mounted.
+		if (heldMenuFocus) void tick().then(() => {
+			if (document.activeElement === null || document.activeElement === document.body) {
+				focusLibraryRecovery();
+			}
+		});
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {

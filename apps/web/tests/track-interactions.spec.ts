@@ -527,6 +527,25 @@ for (const surface of ['library', 'favorites', 'queue'] as const) {
 	});
 }
 
+for (const moveFocus of [false, true]) {
+	test(`queue-menu auth cleanup ${moveFocus ? 'preserves a newer Library focus choice' : 'lands on the mounted Library recovery control'}`, async ({ page }) => {
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await seed(page);
+		await queueAll(page);
+		await queueRow(page, 'coral').getByTestId(TESTIDS.queueMore).click();
+		await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+		await page.evaluate((move) => {
+			window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' }));
+			if (move) document.getElementById('library-density')?.focus();
+		}, moveFocus);
+		await expect(menu(page)).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(0);
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
+		await expect(moveFocus ? page.getByLabel('Density', { exact: true })
+			: page.getByRole('button', { name: 'Retry', exact: true })).toBeFocused();
+	});
+}
+
 test('library toolbar reserves Play next before Append selected and includes hidden tracks in activation order', async ({ page }) => {
 	await seed(page);
 	const toolbar = page.getByTestId(TESTIDS.trackSelectionToolbar);
