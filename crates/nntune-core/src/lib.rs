@@ -1,5 +1,11 @@
 //! Shared Usenet data-plane core for NNTune v2.
 //!
+//! The engine modules are re-exported from `velmora`
+//! (TogetherWeOwn/velmora, pinned by git `rev` in this crate's
+//! `Cargo.toml`); their sources, tests and benches live there. This crate
+//! keeps only the NNTune-specific [`transcode`] and [`original_source`]
+//! modules, plus the provider-authority-store model its tests include.
+//!
 //! Compiles for `wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`)
 //! **and** native targets (ingest/streaming services, Container batch jobs).
 //!
@@ -31,19 +37,10 @@
 //! own network I/O and per-operation timeouts (see [`transport`] and
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
-pub mod article;
-pub mod decrypt;
-pub mod error;
-pub mod nntp;
-pub mod nzb;
-pub mod original_source;
-pub mod par2;
-pub mod pinned_transport;
-pub mod rng;
-pub mod segment_identity;
-pub mod transcode;
-pub mod transport;
-pub mod transports;
-pub mod yenc;
+pub use velmora::{
+    article, decrypt, error, nntp, nzb, par2, pinned_transport, rng, segment_identity, transport,
+    transports, yenc, Error, Result,
+};
 
-pub use error::{Error, Result};
+pub mod original_source;
+pub mod transcode;

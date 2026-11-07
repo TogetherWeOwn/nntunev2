@@ -2,61 +2,28 @@
 name = "nntune-core"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Usenet data-plane core for NNTune v2: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
+description = "NNTune v2 shim over the velmora Usenet engine, plus the NNTune-only transcode, original-source and provider-authority-store modules"
 license = "MIT"
-rust-version = "1.75"
+# velmora's locked dependency graph needs 1.89 (aes 0.9).
+rust-version = "1.89"
 
 [features]
 default = ["native-tls"]
-native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
-worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
+native-tls = ["velmora/native-tls"]
+worker-transport = ["velmora/worker-transport"]
 
 [dependencies]
+# The engine (NNTP, yEnc, NZB, decrypt, par2, transports) lives in
+# TogetherWeOwn/velmora. Pin policy: an immutable git `rev` only (never a
+# branch or tag); a bump is a reviewed PR that moves this rev, the matching
+# nntune-test-nntp rev and every committed lockfile together.
+velmora = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "c5e79d617896490a47d577a9b062cd0010e0bc8a", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"
-quick-xml = "0.42"
-sha2 = "0.11"
-md5 = "0.8"
-aes = "0.9"
-cbc = "0.2"
-# No default features: the default `getrandom` backend does not build for
-# wasm32-unknown-unknown, and this crate never generates keys/nonces.
-crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
-# Posting obfuscation mints randomness in this crate (`rng::SystemRng`).
-# The `js` feature is the wasm32-unknown-unknown backend (Workers posting
-# path); on native targets it selects the OS backend as usual.
-getrandom = { version = "0.2", features = ["js"] }
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
-webpki-roots = { version = "1", optional = true }
-worker = { version = "0.8", optional = true }
-futures-util = { version = "0.3", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["io-util", "net", "time"], optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", features = ["io-util"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-criterion = "0.8"
-
-[[bench]]
-name = "yenc"
-harness = false
-
-[[bench]]
-name = "par2_nzb"
-harness = false
-
-[[bench]]
-name = "par2_create"
-harness = false
 
 [lib]
 name = "nntune_core"
