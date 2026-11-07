@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises';
 import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { openQueue } from './helpers/queue-host';
 import { tabTo as boundedTabTo } from './support/tab-to';
@@ -257,10 +258,22 @@ async function runLane(browser: Browser, baseURL: string | undefined, colorSchem
 		if (diagnostic) stages.push({ ...diagnostic, helper, ok: false, error: String(caught), presses: diagnostic.sequence.length, initial: null });
 		throw caught;
 	} finally {
-		await test.info().attach(`tab-traversal-${helper}`, { body: JSON.stringify({ helper, colorScheme, stages }, null, 2), contentType: 'application/json' });
+		const path = test.info().outputPath(`tab-traversal-${helper}.json`);
+		await writeFile(path, JSON.stringify({ helper, colorScheme, stages }, null, 2));
+		await test.info().attach(`tab-traversal-${helper}`, { path, contentType: 'application/json' });
 		await context.close();
 	}
 }
+
+test.afterEach(async ({}, testInfo) => {
+	const path = testInfo.outputPath('diagnostic-result.json');
+	await writeFile(path, JSON.stringify({
+		title: testInfo.title, status: testInfo.status, expectedStatus: testInfo.expectedStatus,
+		errors: testInfo.errors.map((error) => error.message ?? error.value),
+		attachments: testInfo.attachments.map(({ name, contentType }) => ({ name, contentType }))
+	}, null, 2));
+	await testInfo.attach('diagnostic-result', { path, contentType: 'application/json' });
+});
 
 for (const colorScheme of ['light', 'dark'] as const) {
 	test(`[KT-D1a:${colorScheme}] legacy 80-press tabTo on the desktop favorites flow (observational)`, async ({ browser, baseURL }) => {

@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const CANDIDATES = 'a[href], area[href], button, input, select, textarea, iframe, summary, audio[controls], video[controls], [contenteditable]:not([contenteditable="false"]), [tabindex]';
@@ -85,12 +86,15 @@ export async function tabTo(page: Page, target: Locator) {
 			observationError = String(error);
 		}
 		try {
-			await test.info().attach('tab-traversal', { body: JSON.stringify({
+			// CI uploads test-results files, not the dot reporter's in-memory attachment bodies.
+			const path = test.info().outputPath(`tab-traversal-${test.info().attachments.length}.json`);
+			await writeFile(path, JSON.stringify({
 				start: initial.start, presses: sequence.length, B: bound, C_start: initial.candidates,
 				C_end: final?.candidates ?? null, initialIframeCount: initial.iframes,
 				iframeCount: final?.iframes ?? null, final: final?.focus ?? null, sequence,
 				failure, error: traversalError ? String(traversalError) : null, observationError
-			}), contentType: 'application/json' });
+			}));
+			await test.info().attach('tab-traversal', { path, contentType: 'application/json' });
 		} catch (error) {
 			if (!traversalError) throw error;
 		} finally {
