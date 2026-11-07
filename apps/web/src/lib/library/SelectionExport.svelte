@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ExportFallback from '#lib/player/ExportFallback.svelte';
 	import { onDestroy } from 'svelte';
 	import { createQueue, formatQueueM3U, formatQueueText } from '#lib/player/queue.js';
 	import { createTrackListExport } from '#lib/player/trackListExport.js';
@@ -65,18 +66,15 @@
 <p data-testid="selection-export-status" aria-live="polite">{status}</p>
 {#if fallback !== null}
 	<div class="nt-selection-export-fallback">
-		<label for="selection-export-text">Selected tracks as text</label>
-		<textarea
-			id="selection-export-text"
-			data-testid="selection-export-fallback"
-			aria-describedby="selection-export-help"
-			readonly
+		<ExportFallback
+			prefix="selection-export"
+			fieldId="selection-export-text"
+			label="Selected tracks as text"
 			value={fallback}
-			rows="5"
-		></textarea>
-		<p id="selection-export-help" data-testid="selection-export-instructions">
-			Select the text above, then press Ctrl+C (Command+C on Mac) or use your device’s Copy command.
-		</p>
+			instructionsId="selection-export-help"
+			rows={5}
+			instructions="Select the text above, then press Ctrl+C (Command+C on Mac) or use your device’s Copy command."
+		/>
 	</div>
 {/if}
 
@@ -93,7 +91,7 @@
 		min-width: 0;
 		margin: 0;
 	}
-	textarea {
+	:global(textarea[data-testid='selection-export-fallback']) {
 		display: block;
 		box-sizing: border-box;
 		width: 100%;
