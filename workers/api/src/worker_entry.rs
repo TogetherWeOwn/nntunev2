@@ -184,7 +184,7 @@ fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
     })
 }
 
-fn config_from_env(env: &Env) -> Option<Config> {
+pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     // Runtime fail-closed gate for the Hyperdrive caching finding: auth
     // reads are plain SELECTs through the HYPERDRIVE binding, so a
     // caching-enabled config would serve stale sessions/credentials for
@@ -724,6 +724,18 @@ pub fn catalogue_store_for_postgres_test(
             attempts,
         }),
     }
+}
+
+/// Reuse the public adapter's uncached connector and deadline, not its router.
+#[cfg(all(target_arch = "wasm32", feature = "preparation-service"))]
+pub(crate) async fn preparation_client(env: Env) -> Result<tokio_postgres::Client, StoreError> {
+    PgStore {
+        mirror_binding: MirrorBinding::from_env(&env),
+        env: Some(env),
+        trace_id: nntune_logging::resolve_trace_id(None),
+    }
+    .connect()
+    .await
 }
 
 /// Inject only connection acquisition; the handler still executes the real
@@ -5928,6 +5940,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
 fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
 }
+
+#[cfg(all(test, feature = "postgres-tests"))]
+#[path = "../tests/support/admin_dispatch_postgres.rs"]
+mod admin_dispatch_postgres;
 
 #[cfg(test)]
 mod tests {
