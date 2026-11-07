@@ -26,7 +26,7 @@ async fn client(populated: bool) -> Client {
     tokio::spawn(async move { connection.await.unwrap() });
     client.batch_execute(
         "SET statement_timeout = '3s'; SET search_path = pg_temp;
-         CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[])",
+         CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
     ).await.unwrap();
     if populated {
         // Duplicate recordings and malformed stored MBIDs must survive library
