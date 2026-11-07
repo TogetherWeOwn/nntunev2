@@ -7,29 +7,36 @@
 
 	const player = usePlayerSession();
 	const actions = queueViewActions(player);
-	const favorites = $derived(new Set($player.favorites));
+	// Transport ticks publish the session, not a new queue interaction lifetime.
+	const queue = $derived($player.queue);
+	const selection = $derived($player.queueSelection);
+	const liveRegions = $derived($player.queueLiveRegions);
+	const confirmGeneration = $derived($player.queueConfirmGeneration);
+	const filterQuery = $derived($player.queueFilterQuery);
+	const favoriteIds = $derived($player.favorites);
+	const favorites = $derived(new Set(favoriteIds));
 </script>
 
 <div data-testid="queue-panel" data-density={$player.queueDensity}>
 	<PlayerQueue
-		state={$player.queue}
-		selection={$player.queueSelection}
+		state={queue}
+		selection={selection}
 		selectionControls={player}
-		interactionsUnavailable={!$player.queueLiveRegions}
+		interactionsUnavailable={!liveRegions}
 		oninsert={actions.oninsert}
 		onreorder={actions.onreorder}
 		onplaynextids={actions.onplaynextids}
 		onremoveids={actions.onremoveids}
 		onplaynow={actions.onplaynow}
 		onfavoriteids={actions.onfavoriteids}
-		showTransport={!currentTrack($player.queue)?.streamUrl}
+		showTransport={!currentTrack(queue)?.streamUrl}
 		showAnnouncement={false}
 		favoriteIds={favorites}
 		ontogglefavorite={(id) => player.toggleQueuedFavorite(id)}
-		bind:filterQuery={() => $player.queueFilterQuery, (query) => player.setQueueFilter(query)}
-		liveRegions={$player.queueLiveRegions}
+		bind:filterQuery={() => filterQuery, (query) => player.setQueueFilter(query)}
+		liveRegions={liveRegions}
 		confirmDestructive
-		confirmGeneration={$player.queueConfirmGeneration}
+		confirmGeneration={confirmGeneration}
 		onnext={actions.onnext}
 		onshuffle={actions.onshuffle}
 		onmove={actions.onmove}

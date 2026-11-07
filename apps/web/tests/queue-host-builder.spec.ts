@@ -105,6 +105,36 @@ for (const playing of [false, true]) {
 	}
 }
 
+for (const playing of [false, true]) {
+	test(`queue menu survives session clock publications with a real ${playing ? 'playing' : 'paused'} decoder`, async ({ page }) => {
+		await page.clock.install();
+		await library(page);
+		const audio = page.getByTestId('audio-player');
+		if (playing) await page.getByTestId('player-play-pause').click();
+		await expect(audio).toHaveJSProperty('paused', !playing);
+		if (playing) await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeGreaterThan(0.2);
+		const original = (await audio.elementHandle())!;
+		await page.getByTestId('player-queue-toggle').click();
+		await page.locator('[data-testid="queue-item"][data-track-id="host-a"]')
+			.getByTestId('queue-more').click();
+		const menu = page.getByTestId('track-context-menu');
+		await expect(menu).toBeVisible();
+		const mounted = (await menu.elementHandle())!;
+		await page.keyboard.press('Home');
+		const first = menu.getByRole('menuitem', { name: 'Play now', exact: true });
+		await expect(first).toBeFocused();
+		await page.clock.runFor(2500);
+		await expect(menu).toBeVisible();
+		expect(await mounted.evaluate((el) => el === document.querySelector('[data-testid="track-context-menu"]'))).toBe(true);
+		await expect(first).toBeFocused();
+		await expect(page.getByTestId('queue-item')).toHaveCount(2);
+		expect(await original.evaluate((el) => el === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
+		await expect(audio).toHaveJSProperty('paused', !playing);
+		await page.keyboard.press('Escape');
+		await expect(menu).toHaveCount(0);
+	});
+}
+
 test('mobile queue supports back/forward and toggling closed returns to the invoking route', async ({ page }) => {
 	await page.setViewportSize({ width: 390, height: 844 });
 	await library(page);

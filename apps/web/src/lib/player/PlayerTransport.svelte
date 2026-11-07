@@ -137,8 +137,8 @@
 		<span>{duration ? formatDuration(duration) : '—'}</span>
 	</div>
 	<div class="transport-buttons">
-		<button type="button" data-testid="player-seek-back" aria-label="Back 10 seconds" onclick={() => player.jumpRelative('back')}>Back 10 s</button>
-		<button type="button" data-testid="player-seek-forward" aria-label="Forward 10 seconds" onclick={() => player.jumpRelative('forward')}>Forward 10 s</button>
+		<button type="button" data-testid="player-seek-back" onclick={() => player.jumpRelative('back')}>Back 10 seconds</button>
+		<button type="button" data-testid="player-seek-forward" onclick={() => player.jumpRelative('forward')}>Forward 10 seconds</button>
 	</div>
 	<p data-testid="player-seek-feedback" aria-live="polite">{#key $player.jumpStatusVersion}{$player.jumpStatus}{/key}</p>
 {/snippet}

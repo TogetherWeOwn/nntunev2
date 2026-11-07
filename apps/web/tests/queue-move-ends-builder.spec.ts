@@ -39,9 +39,10 @@ for (const surface of ['library', 'demo'] as const) {
 		await page.goto(surface === 'library' ? '/library' : '/demo/player');
 		if (surface === 'library') {
 			for (const track of tracks) {
-				await page.locator(`[data-testid="library-item"][data-id="${track.id}"]`).click();
+				await page.locator(`[data-testid="library-item"][data-id="${track.id}"] button.nt-library-row`).click();
 			}
 		}
+		if (surface === 'library') await page.getByTestId('player-queue-toggle').click();
 		await expect(page.getByTestId('queue-item')).toHaveCount(3);
 		await page.getByTestId('queue-announcement').evaluate((region) => {
 			new MutationObserver(() => {
