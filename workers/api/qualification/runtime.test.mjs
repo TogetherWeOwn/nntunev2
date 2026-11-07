@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
 import test from 'node:test';
-import { Miniflare } from 'miniflare';
+import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const api = 'api/';
@@ -55,7 +55,10 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     ...await generatedModules(ingest),
   ];
   const mode = { GENERATION_PREPARATION_MODE: 'preparation_only' };
-  const mf = new Miniflare({
+  // The pinned runtime accepts v5 configs; use its shipped v4 option converter.
+  // Resolve module paths from the explicit Workers root, not the harness cwd.
+  const options = convertV4MiniflareOptions({
+    rootPath: root,
     host: '127.0.0.1',
     port: 0,
     workers: [
@@ -81,6 +84,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       }),
     ],
   });
+  const mf = new Miniflare(options);
   t.after(() => mf.dispose());
   const publicApi = await mf.getWorker('api');
   const entry = await mf.getWorker('ingest');
