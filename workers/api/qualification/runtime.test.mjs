@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { lstat, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,42 +12,42 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { database, seed, sql, state } from './database.mjs';
 import { flacFixture, metadataBlocks } from './flac-fixture.mjs';
 
-const root = fileURLToPath(new URL('../../', import.meta.url));
+import { flacWorkers, generatedModules, root, sourceModule, worker } from './runtime-fixture.mjs';
+
 const api = 'api/';
 const ingest = 'ingest/';
 
-async function generatedModules(prefix, folder = 'build') {
-  const modules = [];
-  async function visit(relative) {
-    for (const item of await readdir(path.join(root, relative), { withFileTypes: true })) {
-      const name = `${relative}/${item.name}`;
-      if (item.isDirectory()) await visit(name);
-      else if (/\.(mjs|js|wasm)$/.test(name)) {
-        modules.push({
-          type: name.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule',
-          path: name,
-          contents: await readFile(path.join(root, name)),
-        });
-      }
+async function crashAfterAcceptedSend(persistence, configured) {
+  assert.equal(process.platform, 'linux', 'crash qualification requires a killable Linux process group');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./crash-runtime.mjs', import.meta.url))], {
+    detached: true, stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+  });
+  const exited = once(child, 'exit');
+  try {
+    const accepted = once(child, 'message', { signal: AbortSignal.timeout(20_000) });
+    child.send({ persistence, configured });
+    const [message] = await accepted;
+    assert.deepEqual(message, { accepted: true }, 'real native acceptance must precede the crash');
+    process.kill(-child.pid, 'SIGKILL');
+    assert.deepEqual(await exited, [null, 'SIGKILL'], 'producer process must die abruptly, without disposal');
+  } finally {
+    // Kill the entire detached group, including workerd, even on a failed probe.
+    // No child or runtime may retain the R2 persistence before the next startup.
+    try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
     }
+    await exited;
+    let live = true;
+    for (let i = 0; i < 100 && live; i++) {
+      live = execFileSync('ps', ['-eo', 'pgid=,stat='], { encoding: 'utf8', timeout: 5_000 })
+        .trim().split('\n').some(line => {
+          const [group, status] = line.trim().split(/\s+/);
+          return Number(group) === child.pid && !status.startsWith('Z');
+        });
+      if (live) await setTimeout(50);
+    }
+    assert.equal(live, false, 'crash runtime process group must contain no live processes');
   }
-  await visit(`${prefix}${folder}`);
-  assert.ok(modules.some(m => m.type === 'CompiledWasm'), 'actual Wasm artifact required');
-  return modules;
-}
-
-async function sourceModule(relative) {
-  return { type: 'ESModule', path: relative, contents: await readFile(path.join(root, relative), 'utf8') };
-}
-
-function worker(name, modules, options = {}) {
-  return {
-    name, modules, modulesRoot: root,
-    compatibilityDate: '2026-10-23',
-    // An accidental external fetch must fail, never contact a real service.
-    outboundService: () => new Response(null, { status: 502 }),
-    ...options,
-  };
 }
 
 async function compositeDelivery(bucket) {
@@ -102,9 +104,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       worker('api', apiModules, { bindings: mode }),
       worker('api-configured', apiModules, { bindings: configured }),
       worker('api-disabled', apiModules, { bindings: { GENERATION_PREPARATION_MODE: 'disabled' } }),
-      worker('api-database', [
-        await sourceModule(`${api}src/runtime.mjs`), ...await generatedModules(api),
-      ], { bindings: configured, hyperdrives: { HYPERDRIVE: database } }),
+      ...await flacWorkers(configured),
       worker('composite', compositeModules, {
         bindings: { ...mode, HYPERDRIVE_CACHING_DISABLED: '1' },
         hyperdrives: { LIBRARY_DB: database },
@@ -119,21 +119,6 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       worker('composite-dead-letter', [await sourceModule(`${api}qualification/dead-letter-probe.mjs`)], {
         r2Buckets: { INGEST_SCRATCH: 'qualification-composite' },
         queueConsumers: { 'qualification-composite-dead-letter': { maxBatchSize: 1, maxBatchTimeout: 0 } },
-      }),
-      worker('composite-flac', compositeModules, {
-        bindings: { ...mode, HYPERDRIVE_CACHING_DISABLED: '1' },
-        hyperdrives: { LIBRARY_DB: database },
-        serviceBindings: { API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' } },
-        r2Buckets: { INGEST_SCRATCH: 'qualification-flac' },
-        queueProducers: { INGEST_QUEUE: 'qualification-flac-queue' },
-        queueConsumers: { 'qualification-flac-queue': {
-          maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 0,
-          deadLetterQueue: 'qualification-flac-dead-letter',
-        } },
-      }),
-      worker('flac-dead-letter', [await sourceModule(`${api}qualification/dead-letter-probe.mjs`)], {
-        r2Buckets: { INGEST_SCRATCH: 'qualification-flac' },
-        queueConsumers: { 'qualification-flac-dead-letter': { maxBatchSize: 1, maxBatchTimeout: 0 } },
       }),
       worker('ingest', ingestModules, {
         bindings: mode,
@@ -503,6 +488,48 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
           assert.equal(await bucket.get('qualification-composite-delivered'), null,
             'direct recovery must not send or recreate an earlier callback marker');
           assert.equal(await bucket.get('qualification-refused'), null);
+        });
+        await t.test('SIGKILL after native Queue acceptance preserves unacknowledged outbox recovery', async () => {
+          const key = `prepared-tagged/${pendingVersion.object_id}`;
+          const object = await bucket.get(key);
+          const bytes = Buffer.from(await object.arrayBuffer());
+          assert.equal(object.version, pendingVersion.object_version);
+          assert.equal(await bucket.get('qualification-send-accepted'), null);
+          const objects = (await bucket.list()).objects.map(o => ({ key: o.key, version: o.version }));
+          assert.equal(state(), pending);
+          // Never open the same R2 persistence in two runtime process groups.
+          await mf.dispose();
+          mf = undefined;
+          await crashAfterAcceptedSend(persistence, configured);
+          assert.equal(state(), pending, 'abrupt producer death must not acknowledge or renew dispatch');
+          mf = new Miniflare(options);
+          composite = await mf.getWorker('composite-flac');
+          bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+          const accepted = await bucket.get('qualification-send-accepted');
+          assert.ok(accepted, 'native acceptance marker must survive the actual process crash');
+          assert.deepEqual(await accepted.json(), { attempts: 1, accepted: 1 });
+          assert.equal(await bucket.get('qualification-refused'), null);
+          // Harness sentinels grant no authority. A callback may have completed
+          // before SIGKILL; remove its marker so only the later retry can count.
+          await bucket.delete('qualification-send-accepted');
+          await bucket.delete('qualification-composite-delivered');
+          const recover = pointer => composite.fetch('https://qualification.invalid/recover', {
+            method: 'POST', body: JSON.stringify(pointer),
+          });
+          const pointer = { version: 1, id: pendingVersion.id };
+          assert.equal((await recover(pointer)).status, 204, 'fresh Rust/service must recover after SIGKILL');
+          assert.equal((await recover(pointer)).status, 204, 'crash recovery replay remains read-only');
+          assert.equal((await recover({ version: 1, id: 'unknown-crash-pointer' })).status, 503);
+          assert.equal(state(), pending, 'recovery preserves every deadline and custody row');
+          assert.equal(sql(`SELECT send_acknowledged FROM ingest_file_dispatches
+            WHERE job_id = 'qualification-flac-job';`), 'f');
+          const retained = await bucket.get(key);
+          assert.ok(retained);
+          assert.equal(retained.version, pendingVersion.object_version);
+          assert.deepEqual(Buffer.from(await retained.arrayBuffer()), bytes);
+          assert.deepEqual((await bucket.list()).objects.map(o => ({ key: o.key, version: o.version })), objects);
+          assert.equal(await bucket.get('qualification-composite-delivered'), null,
+            'direct crash recovery must not send Queue work');
         });
       }
       assert.equal(state(), pending, 'failed send/recovery must preserve full persisted rows');

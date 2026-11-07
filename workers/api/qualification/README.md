@@ -221,10 +221,36 @@ fresh Rust/private API isolates must recover that same unacknowledged pointer
 without changing any DB row, deadline, R2 byte/version or inventory. Unknown
 recovery refuses and direct recovery cannot recreate a callback marker. The
 ordinary producer retry must then acknowledge only the existing dispatch and
-produce a fresh native callback. This additional control is written, not locally
-executed; exact-head Actions is required. It covers graceful restart after a
-simulated lost reply and completed native delivery, **not** persistence or replay
-of an accepted pending Queue message, an abrupt crash or an ambiguous DB commit.
+produce a fresh native callback. At head `b25879f3`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42392975789/job/128464253581)
+passes all fourteen runtime subtests (fifteen Node passes including the enclosing
+test), including this accepted-send restart. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42392975789/job/128464253452)
+explicitly reports 255 required cases passed. This covers graceful restart after
+a simulated lost reply and completed native delivery, **not** persistence or
+replay of an accepted pending Queue message, an abrupt crash or an ambiguous DB
+commit.
+
+An additional Actions-only subprocess now reuses the exact generated FLAC
+fixture composition and persistent R2/DB/keyring. The parent first disposes its
+runtime; the child performs a real native Queue send and holds its reply before
+the producer can acknowledge the outbox. A fresh R2 sentinel records exactly one
+attempt/acceptance. Only after observing that boundary, the parent sends SIGKILL
+to the child's entire detached Linux process group, requires the Node process's
+SIGKILL exit and verifies that no live process remains in the group before
+opening the persistence again. Cleanup also runs when the probe fails. No
+Miniflare disposal runs in the killed subprocess.
+
+Fresh Rust/private API isolates must recover and replay the same unacknowledged
+pointer, with full DB fingerprints/deadlines, exact R2 bytes/version and object
+inventory unchanged after removing only harness sentinels. Unknown pointers
+refuse. The ordinary retry afterward must change only the acknowledgement bit
+and produce a fresh native callback. These new assertions are written, not locally
+executed; exact-head Actions is required. They test **outbox recovery after an
+actual abrupt process crash**, not whether the emulator persists accepted pending
+Queue messages. A callback may have completed before the kill, so it cannot
+supply the post-crash retry's marker. No ambiguous DB commit, maximum-media,
+cancellation, deployed drain or actual staging/restore proof is inferred.
 
 A separate R2 recovery control retains the actual GET metadata and faults only
 its body: an open oversized chunk, two individually bounded chunks whose total

@@ -11,17 +11,25 @@ export default class QualificationComposite extends WorkerEntrypoint {
       // Keep the actual Rust producer and native Queue. Fail only at the send
       // boundary: before acceptance, or after acceptance with a lost reply.
       const fault = url.searchParams.get('queue-fault');
-      if (!['before', 'after'].includes(fault)) throw new Error('unknown qualification Queue fault');
+      if (!['before', 'after', 'crash'].includes(fault)) throw new Error('unknown qualification Queue fault');
       const queue = this.env.INGEST_QUEUE;
+      const thisBucket = this.env.INGEST_SCRATCH;
       let attempts = 0;
       let accepted = 0;
       const patched = new Proxy(queue, {
         get(target, property) {
           if (property === 'send') return async (...args) => {
             attempts += 1;
-            if (fault === 'after') {
+            if (fault !== 'before') {
               await target.send(...args);
               accepted += 1;
+            }
+            if (fault === 'crash') {
+              await thisBucket.put('qualification-send-accepted', JSON.stringify({ attempts, accepted }));
+              // Keep real platform IO pending until the external parent kills
+              // the complete subprocess group; do not return a simulated error.
+              await new Promise(resolve => setTimeout(resolve, 60_000));
+              throw new Error('qualification crash did not occur');
             }
             throw new Error('qualification Queue reply unavailable');
           };
