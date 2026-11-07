@@ -8,7 +8,6 @@ use nntune_ingest::posted_generations::{prepare_retained_check, RetainedReferenc
 #[test]
 fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_ciphertext() {
     run_test(async {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
         use nntune_api::{posted_manifest, posted_media, rotation::KekSource};
         use nntune_core::nzb_writer::{FileInput, SegmentInput};
         use sha2::{Digest, Sha256};
@@ -115,25 +114,35 @@ fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_cipherte
             stored.manifest_dek_wrapped_nonce.try_into().unwrap();
         stored_manifest.envelope.dek_wrapped = stored.manifest_dek_wrapped.to_vec();
         stored_manifest.envelope.payload_nonce = stored.manifest_payload_nonce.try_into().unwrap();
-        let opened = posted_manifest::open(&keys, stored.plaintext_sha256, &stored_manifest)
-            .expect("authenticate recovered manifest");
-        let document: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+        let opened = posted_manifest::open_validated(
+            &keys,
+            stored.plaintext_sha256,
+            &stored_manifest,
+            stored.plaintext_size.try_into().unwrap(),
+            1,
+        )
+        .expect("authenticate and validate recovered manifest");
+        assert!(posted_manifest::open_validated(
+            &keys,
+            stored.plaintext_sha256,
+            &stored_manifest,
+            (stored.plaintext_size + 1).try_into().unwrap(),
+            1,
+        )
+        .is_err());
+        assert_eq!(opened.article_spans().len(), 1);
+        let document: serde_json::Value = serde_json::from_slice(opened.json()).unwrap();
         assert_eq!(document["format"], 1);
         assert_eq!(document["plaintext_ranges"], serde_json::json!([[0, 1024]]));
         assert_eq!(
             document["ciphertext_offsets"],
             serde_json::json!([[48, 1040]])
         );
-        let nzb = Zeroizing::new(
-            STANDARD
-                .decode(document["nzb_xml_base64"].as_str().unwrap())
-                .unwrap(),
-        );
-        assert!(nntune_core::nzb::parse(&nzb).is_ok());
+        assert!(nntune_core::nzb::parse(opened.nzb_xml()).is_ok());
         let expected_nzb = Zeroizing::new(
             nntune_core::nzb_writer::write_nzb(std::slice::from_ref(&file)).unwrap(),
         );
-        assert!(*nzb == *expected_nzb);
+        assert!(opened.nzb_xml() == expected_nzb.as_slice());
         assert!(posted_manifest::open(&keys, &"f".repeat(64), &stored_manifest).is_err());
         assert!(posted_manifest::open(
             &Keys(Zeroizing::new(
