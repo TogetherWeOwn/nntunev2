@@ -45,6 +45,7 @@ for f in "${tests[@]}"; do
   psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
     -v billing_subscription_sweep_sql="$(<"$root/workers/api/src/billing_subscription_sweep.sql")" \
     -v billing_checkout_sweep_sql="$(<"$root/workers/api/src/billing_checkout_sweep.sql")" \
+    -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" \
     -f "$f"
 done
 echo "migration tests passed"

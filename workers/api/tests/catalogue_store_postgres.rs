@@ -26,7 +26,7 @@ async fn client(populated: bool) -> Client {
     tokio::spawn(async move { connection.await.unwrap() });
     client.batch_execute(
         "SET statement_timeout = '3s'; SET search_path = pg_temp;
-         CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[])",
+         CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
     ).await.unwrap();
     if populated {
         // Duplicate recordings and malformed stored MBIDs must survive library
@@ -52,6 +52,59 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
         attempts.clone(),
     );
     (store, attempts)
+}
+
+#[tokio::test]
+async fn shared_memberships_use_production_queries_without_private_leaks() {
+    use nntune_api::catalogue::*;
+    let app = client(true).await;
+    app.execute(
+        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[$2])",
+        &[&OTHER_RELEASE, &RECORDING],
+    )
+    .await
+    .unwrap();
+    for caller in ["u1", "fresh-a", "fresh-b"] {
+        let releases = app
+            .query(catalogue_member_releases_statement(), &[&caller])
+            .await
+            .unwrap();
+        let ids: Vec<String> = releases.iter().map(|r| r.get(0)).collect();
+        assert!(ids.iter().any(|id| id == OTHER_RELEASE));
+        assert_eq!(ids.iter().any(|id| id == RELEASE), caller == "u1");
+        let pairs = app
+            .query(catalogue_member_track_pairs_statement(), &[&caller])
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), if caller == "u1" { 3 } else { 1 });
+        for release in [RELEASE, OTHER_RELEASE] {
+            let is_member = caller == "u1" || release == OTHER_RELEASE;
+            assert_eq!(
+                app.query(
+                    catalogue_release_membership_statement(),
+                    &[&caller, &release]
+                )
+                .await
+                .unwrap()
+                .len(),
+                usize::from(is_member)
+            );
+            let recordings = app
+                .query(
+                    catalogue_member_release_recordings_statement(),
+                    &[&caller, &release],
+                )
+                .await
+                .unwrap();
+            assert_eq!(!recordings.is_empty(), is_member);
+        }
+        let page = app
+            .query(library_page_statement(), &[&caller, &50_i64])
+            .await
+            .unwrap();
+        assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
+        assert!(page.iter().all(|r| r.get::<_, String>(0) != "private"));
+    }
 }
 
 #[tokio::test]

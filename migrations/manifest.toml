@@ -174,6 +174,11 @@ target = "app"
 sha256 = "fcca71547ad14366c7ba7d37920fba476fa6237b40ee8986ecee3d19f604efc0"
 
 [[migration]]
-file = "0036_billing_sweep_progress.sql"
+file = "0036_library_shared_owner.sql"
 target = "app"
-sha256 = "8a9e4eb6dc9e70f15946062898bc5fff887210f14d30d4403797e8af3af2c1be"
+sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
+
+[[migration]]
+file = "0037_billing_sweep_progress.sql"
+target = "app"
+sha256 = "e4d7611093aab4546d1e0a43a10d2d7e04ce7b3a1a79b43131830e36eb0f706b"
