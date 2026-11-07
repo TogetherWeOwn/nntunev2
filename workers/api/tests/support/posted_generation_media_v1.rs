@@ -1,5 +1,5 @@
 //! Shape/replay controls use synthetic sealed buffers; the keyring control uses
-//! real engine/key-envelope crypto with synthetic plaintext and manifest buffers.
+//! real engine/key/manifest crypto and generated NZB data with synthetic plaintext.
 //! No production promotion is proved; retained states are explicitly seeded.
 use super::*;
 use nntune_ingest::posted_files::{PostedFileMedia, MEDIA_V1_KEY_MODE};
@@ -8,7 +8,9 @@ use nntune_ingest::posted_generations::{prepare_retained_check, RetainedReferenc
 #[test]
 fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_ciphertext() {
     run_test(async {
-        use nntune_api::{posted_media, rotation::KekSource};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use nntune_api::{posted_manifest, posted_media, rotation::KekSource};
+        use nntune_core::nzb_writer::{FileInput, SegmentInput};
         use sha2::{Digest, Sha256};
         use zeroize::Zeroizing;
 
@@ -28,6 +30,32 @@ fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_cipherte
         c.sealed.hash = digest.iter().map(|b| format!("{b:02x}")).collect();
         let s = &c.sealed;
         let media = posted_media::mint(&keys, 1, &s.hash).expect("mint media key");
+        let file = FileInput {
+            subject: "synthetic".into(),
+            poster: "synthetic".into(),
+            date: 1,
+            groups: vec!["synthetic".into()],
+            segments: vec![SegmentInput {
+                number: 1,
+                message_id: format!("{}@postie", s.op),
+                encoded_bytes: 1200,
+            }],
+        };
+        let labels = vec!["backbone-a".into(), "backbone-b".into()];
+        let manifest = posted_manifest::seal(
+            &keys,
+            1,
+            &s.hash,
+            &posted_manifest::ManifestInput {
+                file: &file,
+                plaintext_bytes: plaintext.len() as u64,
+                chunks_per_article: 1,
+                flac_seek_index: None,
+                par2_message_ids: &[],
+                posted_via: &labels,
+            },
+        )
+        .expect("seal actual generated manifest");
         let mut mint = s.mint();
         mint.custody.article_count = 1;
         mint.custody.article_payload_size = 1040;
@@ -40,6 +68,13 @@ fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_cipherte
         mint.custody.file_key_dek_wrapped_nonce = &envelope.dek_wrapped_nonce;
         mint.custody.file_key_dek_wrapped = &envelope.dek_wrapped;
         mint.custody.file_key_payload_nonce = &envelope.payload_nonce;
+        let envelope = &manifest.envelope;
+        mint.custody.manifest_kek_version = manifest.kek_version.try_into().unwrap();
+        mint.custody.manifest_payload_format = manifest.payload_format.try_into().unwrap();
+        mint.custody.manifest_encrypted = &envelope.ciphertext;
+        mint.custody.manifest_dek_wrapped_nonce = &envelope.dek_wrapped_nonce;
+        mint.custody.manifest_dek_wrapped = &envelope.dek_wrapped;
+        mint.custody.manifest_payload_nonce = &envelope.payload_nonce;
         let attempt = acquire(&mut db, &c.job, &c.owner, 0).await;
         let expected = observe(&db, &s.hash).await.expect("observe media hash");
         assert!(matches!(
@@ -72,6 +107,42 @@ fn postgres_media_v1_keyring_open_authenticates_the_recovered_candidate_cipherte
             &stored_key,
         )
         .expect("authenticate recovered key and header");
+        let mut stored_manifest = manifest.clone();
+        stored_manifest.kek_version = stored.manifest_kek_version.try_into().unwrap();
+        stored_manifest.payload_format = stored.manifest_payload_format.try_into().unwrap();
+        stored_manifest.envelope.ciphertext = stored.manifest_encrypted.to_vec();
+        stored_manifest.envelope.dek_wrapped_nonce =
+            stored.manifest_dek_wrapped_nonce.try_into().unwrap();
+        stored_manifest.envelope.dek_wrapped = stored.manifest_dek_wrapped.to_vec();
+        stored_manifest.envelope.payload_nonce = stored.manifest_payload_nonce.try_into().unwrap();
+        let opened = posted_manifest::open(&keys, stored.plaintext_sha256, &stored_manifest)
+            .expect("authenticate recovered manifest");
+        let document: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(document["format"], 1);
+        assert_eq!(document["plaintext_ranges"], serde_json::json!([[0, 1024]]));
+        assert_eq!(
+            document["ciphertext_offsets"],
+            serde_json::json!([[48, 1040]])
+        );
+        let nzb = Zeroizing::new(
+            STANDARD
+                .decode(document["nzb_xml_base64"].as_str().unwrap())
+                .unwrap(),
+        );
+        assert!(nntune_core::nzb::parse(&nzb).is_ok());
+        let expected_nzb = Zeroizing::new(
+            nntune_core::nzb_writer::write_nzb(std::slice::from_ref(&file)).unwrap(),
+        );
+        assert!(*nzb == *expected_nzb);
+        assert!(posted_manifest::open(&keys, &"f".repeat(64), &stored_manifest).is_err());
+        assert!(posted_manifest::open(
+            &Keys(Zeroizing::new(
+                nntune_api::random::secure_random_bytes().unwrap()
+            )),
+            stored.plaintext_sha256,
+            &stored_manifest,
+        )
+        .is_err());
         let wire = media
             .sealer
             .seal_to_vec(&plaintext)

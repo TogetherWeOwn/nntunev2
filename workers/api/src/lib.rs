@@ -36,6 +36,7 @@ pub mod original_source;
 pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
+pub mod posted_manifest;
 pub mod posted_media;
 pub mod random;
 pub mod rate_limit;

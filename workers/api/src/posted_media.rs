@@ -41,7 +41,7 @@ pub struct MintedMedia {
     pub sealed_key: SealedMediaKey,
 }
 
-fn context(hash: &str) -> Result<Context<'_>, MediaKeyError> {
+pub(crate) fn context(hash: &str) -> Result<Context<'_>, MediaKeyError> {
     if hash.len() != 64
         || !hash
             .bytes()
