@@ -161,6 +161,168 @@ later integrations without making a hint a new publication authority. An
 error after streaming output requires the response authority to abort, never
 claim a complete file or retry bytes into the same response.
 
+## Async playback composition
+
+`reader::RangeReader` exposes that same bounded walk incrementally: await
+only `next_reference()`, then `push` its framed body. The synchronous
+`read_range` also uses this state machine. It retains the final decoded part
+for proof, never fetches it twice, checks the remaining aggregate decoded
+budget before another open, and poisons a walk after any failed push. A
+completed walk requests no further articles. Transport cancellation and a
+whole-request deadline remain the caller's responsibility.
+
+The internal `account_playback::read_original_range` composition verifies a
+v2 play grant before the trusted source lookup, rechecks its track binding
+and expiry before provider work and output, and dispatches only fixed Stream
+BODY requests. A caller-owned deadline of at most 20 seconds covers the
+lookup and the entire range walk; each article has at most one dispatch,
+without failure/uncertainty retries. The sink streams verified slices and
+must abort a partial response on error. Its internal receipt counts slices
+accepted by the sink, **not bytes delivered to a client**, and records actual
+serving-account identities only as telemetry. It confers no cache authority.
+
+This composition installs no production catalogue/service binding, public
+route, output backpressure adapter, writer execution or metering call site.
+It does not decrypt posted files or claim cryptographic original-media
+authentication. Runtime qualification gates remain disabled and mandatory.
+
+## Shared request authority preparation (off-route)
+
+`account_playback::control::RequestControl` is a local authority primitive for
+future catalogue/account-supplier and response composition. It verifies a
+canonical track-bound v2 play grant before constructing its timer. One timer
+covers the earlier of the request deadline and grant expiry, with exact
+remaining milliseconds. The injected timer and abort futures must wake the
+current task; native tests do not qualify platform timer or request-abort APIs.
+
+Clones share terminal state and a monotonic clock watermark. Clock rollback,
+expiry, explicit stop, a failed enclosed call or dropping a polled pending call
+permanently revoke every clone. Abort/deadline signals and explicit stop wake
+live handles; dropping a sibling cannot strand the remaining signal waiter.
+The last handle owns signal cleanup. `run` checks cancellation before and after
+polling work, so control wins a simultaneous success. An unpolled call does no
+I/O and does not revoke authority. `check` is a synchronous boundary check;
+`poll_cancel` supplies the wakeable seam. `now_unix` returns the last checked
+clock observation and must only be used after checking authority.
+
+This authority implements the shared `ReadControl`, `AsyncReadControl` and
+`OriginalControl` traits. Async cancellation and observed time forward directly
+to its inherent methods: the supplier and response use clones of the SAME
+checked authority, not another clock watermark, request timer or cancellation
+controller. The supplier still binds source index/reference to its validated
+catalogue and enforces its own at-most-20-second operation timer. No runtime
+caller is installed by this forwarding. Local revocation never proves physical
+account closure, releases capacity or records delivery.
+
+## Catalogue/account article supplier (off-route)
+
+`account_playback::supplier::ArticleSupplier::prepare` takes a clone of the
+already verified request authority and performs one trusted source lookup under
+that authority. Missing, failed or wrong-track lookups poison the shared control.
+It retains the validated source; each inherent `open(index, reference)` binds
+both the zero-based ordinal and the exact reference to that source. The final
+article may be requested first, but no ordinal can be attempted twice and total
+attempts cannot exceed the source's article count. Dropping an unpolled call
+performs no I/O; dropping a polled pending call revokes the shared authority.
+
+Every article open creates one injected operation timer for the earlier of
+20 seconds or the request/grant deadline. It spans registry, all candidate hints
+and the single fixed-Stream BODY dispatch without resetting at stage boundaries.
+Request cancellation and the operation timer are checked before and after each
+individual I/O poll, including synchronously-ready results, so expiry or clock
+rollback cannot advance selection to another stage. A hint failure can still be
+ignored by selection; no second account is tried after an operation dispatch,
+including a lost, invalid, empty, oversized or failed reply. Every terminal
+supplier error revokes the response control too.
+
+The account transport owns bounded reads and its server retains independent
+physical-close/capacity authority when client work is cancelled. A successful
+open yields a bounded encoded article, not verified media. Successful serving
+identities (including proof articles) are internal telemetry only: no public
+metadata, cache authority, entitlement or delivered-byte meter is created.
+
+`AsyncArticleSource::open` forwards directly to this same inherent operation.
+It can feed the shared `AsyncRangeReader` and off-route `OriginalPlay` response
+without a second reader, writer or meter. The request control passed to that
+response must be a clone of the supplier's already checked authority. There is
+no Worker supplier/timer installation, public caller or newly enabled route in
+this increment. Native generated fixtures do not qualify actual Worker abort,
+timers or physical close; dialing/ingress gates, full-slice security and curated
+staging remain mandatory.
+
+## Internal catalogue transport (off-route)
+
+`SourceCatalogue` verifies the v2 play grant and signs a canonical-track lookup
+with the existing play-grant key in a distinct HMAC domain. The attestation's
+absolute deadline is at most five seconds and never outlives the grant. The
+API service composition authenticates before lazy repository connection and
+rechecks authority across every suspension. This is not a public raw-source
+endpoint or a new entitlement token.
+
+The qualification-only `WorkerSourceTransport` makes one POST to
+`/internal/v1/original-source` through the `API` service binding; it has no
+public-fetch, redirect-following, retry or cache path. Its successful internal
+reply contract is status 200, `Content-Type: application/octet-stream`,
+`Cache-Control: no-store`, and `X-NNTune-Source-Job` containing the persisted
+job identity (1–64 validated ASCII bytes). The body is the existing source
+encoding, not a second payload format. Content encoding must be absent or
+identity. Optional content length must be positive, at most 8 MiB and equal
+the final read length. Unknown/missing job identity, bad headers, empty or
+oversized bodies and failed reads are opaque catalogue failures.
+
+The whole-call timer covers fetch and body consumption without resetting per
+chunk. Monotonic authority checks run before/after I/O and before returning;
+zero-progress chunks fail closed. The raw Worker reader checks each typed
+array's length before copying into the bounded Rust destination. The pending
+fetch and returned reader retain an abort controller until drop, including
+error, timeout and caller cancellation. Native fakes exercise that ownership
+contract, not actual Worker abort propagation or physical connection closure.
+
+The off-route `WorkerRepositoryFactory` accesses only the existing Hyperdrive
+binding, after authentication. It requires the existing query-cache-disabled
+attestation and PostgreSQL STARTTLS with no plaintext fallback. A retained raw
+socket owns forced-close initiation through opening and handshake, updating
+that authority to the replacement TLS socket before PostgreSQL authentication.
+The returned `DrivenRepository` polls its driver alongside bounded queries;
+no detached connection task is spawned. Driver completion, query failure or
+query cancellation poisons the repository and initiates closure once. Dropping
+the repository closes before destroying its client/driver. This is not proof of
+actual Worker physical closure. Native PostgreSQL tests prove inline driver
+progress, not the Hyperdrive/Worker transport boundary.
+
+`service::read_timed` authenticates first, then uses one platform timer for the
+signed time remaining through connection, both queries and encoding. Expiry
+wins ties, authority is rechecked across suspension and no per-query timer
+reset or retry is introduced. The injected-deadline seam remains available for
+deterministic tests.
+
+The portable off-route `service::http::handle` accepts only the fixed POST,
+JSON content type, a bounded authorization header, no content encoding and no
+browser context. It collects at most 512 request bytes, rejects zero-progress
+chunks and requires any declared length to equal the actual body. Its raw body
+adapter must check chunk length before copying into Rust and cancel reads on
+drop. Wakeable caller cancellation and a whole-request deadline enclose body
+collection and database work; the signed timer additionally bounds the
+remaining authenticated lookup. Controls win ties, including when they become
+ready during a work poll. A backward clock poisons the entire request.
+
+Success returns the exact existing encoded source and selected-job identity;
+every failure returns the same empty 503 with no job header. Both responses
+are explicitly no-store. The off-route `service::worker::handle` candidate
+preflights raw JavaScript URL/header lengths before Rust conversion and raw
+chunk lengths before copying. It binds an abort-event listener to a retained
+waker, removes that listener on drop, cancels the body reader on drop and
+supplies one five-second request timer in addition to the signed remaining
+time. It materializes only the exact source/job response, with explicit content
+length and no cache, CORS, compression or fallback middleware. Neither native
+fakes nor compilation establish actual Worker abort propagation or database
+physical closure.
+
+No runtime caller, binding configuration or API ingress is installed here; the
+existing account/provider qualification gates are not changed. Playback HTTP
+response/backpressure, ACK/drop accounting and delivered-byte metering remain
+in their separate adapter, not in this source-record transport.
+
 ## Async reader and off-route response adapter
 
 `original_source::reader::RangeReader::new/next_reference/push` is the shared
@@ -236,12 +398,25 @@ writer with no article/write/close I/O or interval. Both entry points use the
 same pump and acknowledged-prefix settlement; expiry is rechecked on first
 output work after scheduling.
 
-Shared source ownership does not make borrowed pool inputs static. The existing
-pool owner must still supply owned registry/accounts/channel keys/clock/signals
-and operation timer, retaining the same request authority through task cleanup.
-Synthetic retained-input fixtures cover source-allocation retention, refusal
-release, unpolled drop and pending article/write/close drop/cancellation with one
-ACK-prefix interval. They are not production pool-task or actual Worker proof.
+Shared source ownership does not make borrowed pool inputs static.
+`ArticleSupplier::prepare_owned` retains registry/accounts, zeroizing channel
+keys and the operation timer; its static `RequestControl` owns the shared clock
+and request signals. After that single lookup, `ArticleSupplier::into_response`
+consumes the supplier and the same request's verified `OriginalAuthorization`.
+The resulting `supplier::task::OwnedAccountResponse` binds the supplier's exact
+source Rc and SAME control, exposing checked metadata without account I/O.
+Its `pump_owned` delegates to the library pump immediately (not inside an async
+wrapper), so the writer guard exists before an outer scheduler's first poll.
+Its off-route wasm `schedule_response` delegates to the existing scheduler;
+there is no second reader, writer, meter, request authority or task driver.
+
+Synthetic lifecycle fixtures use the real owned supplier and response task
+with fake catalogue/registry/account boundaries, signals and writer. They cover
+source-allocation retention, refusal release, unpolled drop and pending
+registry/hint/BODY/write/close drop/cancellation with exactly one ACK-prefix
+interval, or none at zero ACK. These are not actual Worker, remote-stop,
+physical-close/capacity or report-durability proof. No public caller or concrete
+Worker clock/signal/timer installation is added; qualification gates stay closed.
 
 The off-route wasm `schedule_response` creates the fixed-length channel, moves
 the source/supplier/control/writer into a `Context::wait_until` task, and returns
@@ -253,8 +428,9 @@ remain with their existing owners. The scheduler accepts the existing
 `OriginalControl` trait rather than requiring a separate concrete control. A
 production supplier and response must share the same checked request authority
 through thin forwarding; do not create a second clock watermark or cancellation
-authority during composition. That forwarding is not installed here. Nothing
-calls this scheduler from the public fetch path. Runtime task limits, nested
+authority during composition. The off-route account supplier above supplies that
+forwarding; it does not install a runtime caller. Nothing calls this scheduler
+from the public fetch path. Runtime task limits, nested
 report scheduling and disconnect/report
 durability still require actual Worker qualification; static compilation and
 owned-task fixtures do not establish them.

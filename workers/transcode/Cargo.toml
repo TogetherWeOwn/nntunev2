@@ -1,3 +1,7 @@
+# Standalone Worker; do not discover an ancestor workspace through a worktree.
+[workspace]
+resolver = "2"
+
 [package]
 name = "nntune-transcode"
 version = "0.1.0"

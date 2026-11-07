@@ -45,6 +45,24 @@
 //! exports the `NntpPool` Durable Object with its probe route. Native builds
 //! and `cargo test` never link the Workers runtime.
 
+pub mod account_dispatch;
+pub mod account_ingress;
+pub mod account_operation;
+pub mod account_owner;
+pub mod account_playback;
+pub mod account_pool;
+// Retain wasm type checking without installing the unqualified account ingress.
+#[cfg(any(target_arch = "wasm32", test))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod account_request;
+pub mod account_route;
+pub mod account_selection;
+pub mod account_storage;
+pub mod account_supervisor;
+// The account transport has no installed runtime caller until qualification.
+#[cfg(any(target_arch = "wasm32", test))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod account_transport;
 pub mod api_error;
 pub mod body;
 pub mod cache;
@@ -71,7 +89,10 @@ pub mod yenc;
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
 // (and a single-threaded isolate cannot park a waiter anyway). The Worker
 // entry point gets an async shared-future equivalent; see the module docs.
+// account_runtime.rs is intentionally not installed: candidate/journal and
+// operation dispatch require actual Worker qualification before export.
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
+pub mod source_catalogue;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stampede;

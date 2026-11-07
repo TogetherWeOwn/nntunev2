@@ -90,7 +90,7 @@ BEGIN
 
     -- B6 statement 3: the own-provider proof. Without this row the bytes
     -- are unservable.
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     SELECT 'user-la-1',
            '9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734',
            '11111111-1111-1111-1111-111111111111', 1700000000
@@ -117,7 +117,7 @@ BEGIN
            'opus', 64, 1700000000
     FROM (SELECT id FROM users WHERE id = 'user-la-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING;
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     SELECT 'user-la-1',
            '9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734',
            '11111111-1111-1111-1111-111111111111', 1700000000
@@ -161,7 +161,7 @@ BEGIN
     IF (SELECT count(*) FROM track_media WHERE user_id = 'user-la-2') <> 0 THEN
         RAISE EXCEPTION 'fenced track_media insert landed a row behind the deletion marker';
     END IF;
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     SELECT 'user-la-2',
            '9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734',
            '11111111-1111-1111-1111-111111111111', 1700000000
@@ -336,7 +336,7 @@ BEGIN
     -- composite FK binds the provider to the same user: user-la-3
     -- cannot present user-la-1's provider as their own proof.
     BEGIN
-        INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+        INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
         VALUES ('user-la-1',
                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 '11111111-1111-1111-1111-111111111111', 1700000000);
@@ -345,7 +345,7 @@ BEGIN
         NULL;
     END;
     BEGIN
-        INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+        INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
         VALUES ('user-la-3',
                 '9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734',
                 '11111111-1111-1111-1111-111111111111', 1700000000);

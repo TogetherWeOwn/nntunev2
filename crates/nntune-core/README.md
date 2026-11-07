@@ -13,6 +13,7 @@ batch jobs).
 | `article`, `decrypt`, `error`, `nntp`, `nzb`, `par2`, `pinned_transport`, `rng`, `segment_identity`, `transport`, `transports`, `yenc` (+ `Error`, `Result`) | Re-exported from velmora; see `crates/velmora/README.md` there for the module table, resource limits, pinned-transport policy and repair contract |
 | `transcode` | Local: the `opus-64` profile contract (pinned ffmpeg argv, Ogg serial normaliser, content-addressed artifact keys) |
 | `original_source` (+ `reader`) | Local: original-source references and the segment reader built on `nzb` and `yenc` |
+| `pool_channel`, `pool_operation` | Local, retained: the provider-pool channel and operation types (see the module docs in `src/pool_channel.rs` and `src/pool_operation.rs`); Worker dialing remains disabled |
 
 `src/provider_authority_store.rs` is an inert model, not a module: only
 `tests/provider_authority_store_acceptance.rs` includes it (see
@@ -20,20 +21,28 @@ batch jobs).
 
 ## The velmora pin
 
-`Cargo.toml` pins velmora by an immutable git `rev`, never a branch or tag;
-`crates/nntune-test-nntp` pins `velmora-test-nntp` to the same rev. Engine
-changes land as a velmora PR first, then a pin bump here that moves both
-revs and every committed lockfile together (root, `workers/api`,
+`Cargo.toml` pins velmora by an immutable git `rev`, never a branch or tag.
+Engine changes land as a velmora PR first, then a pin bump here moves all
+shim revs and affected committed lockfiles together (root, `workers/api`,
 `workers/ingest`, `workers/repair`, `workers/transcode`). `deny.toml`
 allows velmora as the only git source.
 
+The three shims pin `5af1bfe901d15b5f041a5d1973b866436d988b19` for
+`velmora`, `velmora-test-nntp` and `velmora-ssrf-guard`, with matching
+Actions-generated locks. The shared engine owns the authentication guard,
+SSRF predicate and qualification-only TLS transport; this pin does not
+qualify or enable Worker dialing.
+
 ## Features
 
-Forwarded to velmora unchanged:
+Forwarded to velmora:
 
 - `default = ["native-tls"]` — what services and tests build.
 - `native-tls` — tokio + rustls transport (non-wasm).
 - `worker-transport` — Workers `connect()` socket transport (wasm32 only).
+- `worker-pinned-tls` — qualification-only forwarding to velmora's
+  `worker-pinned-tls` (implies `worker-transport`); no runtime call site is
+  enabled by this feature and Worker dialing remains disabled.
 
 ## Checks
 

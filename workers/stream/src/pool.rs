@@ -44,6 +44,7 @@ pub enum Lane {
 pub struct Lease {
     pub id: u64,
     pub lane: Lane,
+    generation: u64,
     guard: Option<SlotGuard>,
 }
 
@@ -68,6 +69,7 @@ pub struct OrphanedPlay {
 #[derive(Debug, Default)]
 struct SlotState {
     in_use: u32,
+    ingest_in_use: u32,
     probe_in_flight: Option<u64>,
 }
 
@@ -77,6 +79,7 @@ struct SlotGuard {
     /// only acts on a still-armed guard.
     slots: Option<Arc<Mutex<SlotState>>>,
     id: u64,
+    lane: Lane,
 }
 
 impl SlotGuard {
@@ -93,6 +96,9 @@ impl Drop for SlotGuard {
         if let Some(slots) = self.slots.take() {
             if let Ok(mut state) = slots.lock() {
                 state.in_use = state.in_use.saturating_sub(1);
+                if self.lane == Lane::Ingest {
+                    state.ingest_in_use = state.ingest_in_use.saturating_sub(1);
+                }
                 if state.probe_in_flight == Some(self.id) {
                     state.probe_in_flight = None;
                 }
@@ -146,8 +152,29 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// Service-account class budgets. Unlike the legacy lane policy, background
+/// traffic never borrows the stream reserve, including during half-open recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountLimits {
+    pub max_connections: u32,
+    pub stream_reserve: u32,
+    pub ingest_limit: u32,
+    pub enabled: bool,
+}
+
+impl AccountLimits {
+    pub fn valid(&self) -> bool {
+        (1..=HARD_MAX_CONNS).contains(&self.max_connections)
+            && (1..=self.max_connections).contains(&self.stream_reserve)
+            && self.ingest_limit <= self.max_connections - self.stream_reserve
+    }
+}
+
 pub struct Pool<C> {
     capacity: u32,
+    account_limits: Option<AccountLimits>,
+    generation: u64,
+    auth_quarantined: bool,
     slots: Arc<Mutex<SlotState>>,
     /// `BytesServed` records for plays that ended without `finalize`
     /// (dropped streams, `abort`), on either the miss or the hit path.
@@ -174,6 +201,9 @@ impl<C> Pool<C> {
     pub fn new(capacity: u32) -> Self {
         Self {
             capacity: capacity.clamp(1, HARD_MAX_CONNS),
+            account_limits: None,
+            generation: 0,
+            auth_quarantined: false,
             slots: Arc::new(Mutex::new(SlotState::default())),
             orphaned: Arc::new(Mutex::new(Vec::new())),
             idle: Vec::new(),
@@ -185,6 +215,86 @@ impl<C> Pool<C> {
             window_start_ms: None,
             quarantined_until_ms: None,
             now_ms: 0,
+        }
+    }
+
+    /// Reconfigure in place: outstanding guards still count against the new
+    /// cap. A cap reduction drains rather than creating a second pool. Kill
+    /// switches and rotations discard idle sockets immediately; old in-flight
+    /// sessions may finish but can never be parked under the new generation.
+    pub fn configure_account(&mut self, limits: AccountLimits) -> bool {
+        if !limits.valid() {
+            return false;
+        }
+        if self.account_limits != Some(limits) {
+            self.invalidate_sessions();
+        }
+        self.capacity = limits.max_connections;
+        self.account_limits = Some(limits);
+        true
+    }
+
+    /// Any registry revision can change the endpoint or username even when its
+    /// class budgets are unchanged. Never reuse a socket from that old snapshot.
+    pub fn invalidate_sessions(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.idle.clear();
+        self.advance_provider_error_epoch();
+    }
+
+    /// Only an authoritative credential rotation may reset an auth quarantine.
+    /// The DO persists the quarantine against the credential identity; merely
+    /// changing capacity, toggling enabled or waiting out cooldown cannot reset it.
+    pub fn credentials_rotated(&mut self) {
+        self.invalidate_sessions();
+        self.auth_quarantined = false;
+        self.record_success();
+    }
+
+    pub fn auth_quarantined(&self) -> bool {
+        self.auth_quarantined
+    }
+
+    pub fn quarantine_auth(&mut self) {
+        self.auth_quarantined = true;
+        self.advance_provider_error_epoch();
+        self.idle.clear();
+    }
+
+    /// Service accounts never retry a failed login. Legacy callers keep their
+    /// existing error taxonomy until they switch to account-scoped admission.
+    pub fn record_dial_failure_for(&mut self, lease: &Lease, error: &nntune_core::Error) {
+        if lease.generation != self.generation {
+            return;
+        }
+        if self.account_limits.is_some() && matches!(error, nntune_core::Error::AuthFailed(_)) {
+            self.quarantine_auth();
+        } else {
+            self.record_lease_provider_error(lease);
+        }
+    }
+
+    pub fn record_lease_provider_error(&mut self, lease: &Lease) {
+        if lease.generation == self.generation {
+            self.record_provider_error_for(lease.id);
+        }
+    }
+
+    fn account_admits(&self, state: &SlotState, lane: Lane) -> bool {
+        let Some(limits) = self.account_limits else {
+            return true;
+        };
+        if !limits.enabled || self.auth_quarantined {
+            return false;
+        }
+        match lane {
+            Lane::Playback => true,
+            Lane::Ingest => {
+                state.ingest_in_use < limits.ingest_limit
+                    && state.in_use.saturating_add(limits.stream_reserve) < self.capacity
+            }
+            // Cache fill / health / post are deliberately not installed by slice 1.
+            Lane::Prefetch => false,
         }
     }
 
@@ -211,6 +321,9 @@ impl<C> Pool<C> {
         let Ok(state) = self.slots.lock() else {
             return false;
         };
+        if !self.account_admits(&state, lane) {
+            return false;
+        }
         let is_probe = circuit_state == CircuitState::HalfOpen
             && matches!(lane, Lane::Playback | Lane::Ingest)
             && state.probe_in_flight.is_none();
@@ -228,6 +341,11 @@ impl<C> Pool<C> {
     /// While half-open exactly one probe is admitted, tracked by its lease id;
     /// further acquires get a non-zero retry hint while that probe runs.
     pub fn try_acquire(&mut self, lane: Lane) -> Result<Lease, PoolError> {
+        if self.auth_quarantined {
+            return Err(PoolError::Quarantined {
+                retry_after_ms: 60_000,
+            });
+        }
         let is_probe = if let Some(until) = self.quarantined_until_ms {
             if self.now_ms < until {
                 return Err(PoolError::Quarantined {
@@ -242,6 +360,9 @@ impl<C> Pool<C> {
             Ok(state) => state,
             Err(_) => return Err(PoolError::Exhausted),
         };
+        if !self.account_admits(&state, lane) {
+            return Err(PoolError::Exhausted);
+        }
         if is_probe
             && (!matches!(lane, Lane::Playback | Lane::Ingest) || state.probe_in_flight.is_some())
         {
@@ -263,13 +384,18 @@ impl<C> Pool<C> {
         let lease = Lease {
             id,
             lane,
+            generation: self.generation,
             guard: Some(SlotGuard {
                 slots: Some(Arc::clone(&self.slots)),
                 id,
+                lane,
             }),
         };
         self.next_id += 1;
         state.in_use += 1;
+        if lane == Lane::Ingest {
+            state.ingest_in_use += 1;
+        }
         if is_probe {
             state.probe_in_flight = Some(id);
         }
@@ -301,14 +427,23 @@ impl<C> Pool<C> {
             if let Ok(mut state) = self.slots.lock() {
                 debug_assert!(state.in_use > 0, "released without a matching acquire");
                 state.in_use = state.in_use.saturating_sub(1);
+                if lease.lane == Lane::Ingest {
+                    state.ingest_in_use = state.ingest_in_use.saturating_sub(1);
+                }
                 if state.probe_in_flight == Some(lease.id) {
                     state.probe_in_flight = None;
                 }
             }
         }
         if let Some(conn) = conn {
-            // Never hold more warm connections than the cap allows.
-            if (self.idle.len() as u32) < self.capacity {
+            // Idle sockets also consume provider connections. An old session
+            // must not return warm after a rotation, disable or cap change.
+            let enabled = self.account_limits.is_none_or(|limits| limits.enabled);
+            if enabled
+                && !self.auth_quarantined
+                && lease.generation == self.generation
+                && (self.idle.len() as u32).saturating_add(self.in_use()) < self.capacity
+            {
                 self.idle.push(conn);
             }
         }
@@ -525,6 +660,9 @@ impl<C> Pool<C> {
     }
 
     pub fn quarantined(&self) -> bool {
+        if self.auth_quarantined {
+            return true;
+        }
         match self.quarantined_until_ms {
             Some(until) => self.now_ms < until,
             None => false,
@@ -535,6 +673,9 @@ impl<C> Pool<C> {
     /// half-open once it has elapsed with the failure streak still at
     /// threshold (exactly one probe acquire is admitted), closed otherwise.
     pub fn circuit_state(&self) -> CircuitState {
+        if self.auth_quarantined {
+            return CircuitState::Open;
+        }
         match self.quarantined_until_ms {
             Some(until) if self.now_ms < until => CircuitState::Open,
             Some(_) if self.consecutive_errors >= CIRCUIT_FAILURE_THRESHOLD => {

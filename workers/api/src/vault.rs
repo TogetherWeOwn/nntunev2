@@ -182,7 +182,7 @@ pub trait DnsResolver {
     fn resolve(&self, host: &str) -> Vec<IpAddr>;
 }
 
-fn host_shape_ok(host: &str) -> bool {
+pub(crate) fn host_shape_ok(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 {
         return false;
     }

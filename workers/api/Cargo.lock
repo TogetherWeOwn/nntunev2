@@ -886,8 +886,11 @@ name = "nntune-core"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "velmora",
 ]
 
@@ -923,6 +926,9 @@ dependencies = [
 [[package]]
 name = "nntune-ssrf-guard"
 version = "0.1.0"
+dependencies = [
+ "velmora-ssrf-guard",
+]
 
 [[package]]
 name = "nntune-subsonic"
@@ -1732,7 +1738,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "velmora"
 version = "0.1.0"
-source = "git+https://github.com/TogetherWeOwn/velmora?rev=fe8b840b077027f9792430c5fe9f6fc53ed0012b#fe8b840b077027f9792430c5fe9f6fc53ed0012b"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=5af1bfe901d15b5f041a5d1973b866436d988b19#5af1bfe901d15b5f041a5d1973b866436d988b19"
 dependencies = [
  "chacha20poly1305",
  "crc32fast",
@@ -1748,6 +1754,11 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "velmora-ssrf-guard"
+version = "0.1.0"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=5af1bfe901d15b5f041a5d1973b866436d988b19#5af1bfe901d15b5f041a5d1973b866436d988b19"
 
 [[package]]
 name = "wasi"

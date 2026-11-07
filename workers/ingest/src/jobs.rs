@@ -84,14 +84,14 @@ pub struct JobCheckpoint {
     #[serde(default)]
     pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
-    /// Pool-fetch attribution (see [`QueueMsg::provider_id`](crate::queue::QueueMsg::provider_id)).
-    /// Projected from the message at admission and carried as the live
-    /// copy thereafter: Queue bodies are immutable on redelivery, so the
-    /// checkpoint — not the redelivered message — is what the grant
-    /// publication reads. `#[serde(default)]` keeps pre-attribution
-    /// checkpoints readable (they resume unattributed).
+    /// Legacy queue hint, retained for checkpoint compatibility only. It is
+    /// never evidence of a service account supplying this job's bytes.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Bounded successful account-operation observations. May be incomplete
+    /// after recovery/adoption and may span accounts; not grant attribution.
+    #[serde(default)]
+    pub pool_observations: crate::pool_attribution::PoolObservations,
     /// Verified audio inputs awaiting `Transcoding`, recorded by
     /// `Verifying` on `Complete` (see
     /// [`TranscodeInput`](crate::transcode::TranscodeInput)). Empty
@@ -99,6 +99,11 @@ pub struct JobCheckpoint {
     /// checkpoints readable (they record on their next verify).
     #[serde(default)]
     pub transcode_inputs: Vec<crate::transcode::TranscodeInput>,
+    /// Published artifacts keyed by their transcode-input cursor. Each record
+    /// retains its exact source/generation, never a whole-job or first-account
+    /// attribution. Legacy checkpoints have no output evidence.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transcode_outputs: std::collections::BTreeMap<usize, crate::transcode::TranscodeOutput>,
     /// Index of the next input `Transcoding` must encode. Advances
     /// past each published artifact; `#[serde(default)]` restarts
     /// pre-existing checkpoints at the first input.
@@ -346,8 +351,10 @@ mod tests {
             failure_code: None,
             failure_reason: None,
             provider_id: None,
+            pool_observations: Default::default(),
             transcode_inputs: Vec::new(),
             transcode_next: 0,
+            transcode_outputs: Default::default(),
         }
     }
 
@@ -443,6 +450,7 @@ mod tests {
     fn checkpoint_transcode_cursor_roundtrips_with_legacy_default() {
         let mut cp = checkpoint_at(JobState::Transcoding);
         cp.transcode_inputs = vec![crate::transcode::TranscodeInput {
+            pool_provenance: None,
             file_index: 0,
             key: "ingest-scratch/job_0123456789abcdef/r1/in/0000-aabb".to_string(),
             sha256: "a".repeat(64),

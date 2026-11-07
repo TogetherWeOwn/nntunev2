@@ -81,7 +81,7 @@ emit the code.
 | `subscription_required` | 402 | false | api | Playback requires an active subscription and the account has none current. The body carries `reason`: `never_subscribed` (no subscription ever; → `/pricing`) or `lapsed` (a subscription exists but confers no entitlement; → billing portal), plus `upgrade_url`. Browsing, search, and library remain available in both states — only playback refuses. Subscribing or reactivating changes the answer; retrying unchanged does not. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
-| `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
+| `conflict` | 409 | false | api, ingest | The request is valid but the resource state refuses it (for example a duplicate pool account create, stale pool registry revision, or re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
 | `account_deleting` | 409 | false | api | An account the write targets — the caller's own, or an admin write's subject — is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
 | `invalid_request` | 400 | false | api, ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `MB_SEARCH_EMPTY_QUERY` | 400 | false | mb | Empty or whitespace-only `q` on `GET /v1/mb/search`; returned before `type` validation without touching the mirror or the cache. Send a non-empty `q` of at least 2 chars. |
@@ -107,10 +107,10 @@ complete served set; they intentionally carry no `api_error` registry entry
 (`registry_matches_docs_api_errors`, `docs_registry_matches_all_worker_registries`)
 ignore this table by design: its rows use bare codes, never the `| \``
 envelope-registry prefix. Ingest consumes them through `classify_reply` in
-`workers/ingest/src/pool_probe.rs:69-99` (400/413/401/403 are `Rejected`,
+`workers/ingest/src/pool_probe.rs:127-156` (400/413/401/403 are `Rejected`,
 everything else is `Retry` with clamped `Retry-After`; a 401/403's
 `Retry-After` is deliberately unread) and `classify_body_reply` in
-`workers/ingest/src/pool_body.rs:83-118` (exact `{"error":"missing"}` 404 is
+`workers/ingest/src/pool_body.rs:136-170` (exact `{"error":"missing"}` 404 is
 `Missing` data, 413 is `TooLarge` data, 400/401/403 are `Rejected`,
 everything else is `Retry` with clamped `Retry-After`, including non-exact
 404s at the default delay). The pool wire never emits 401/403 today (auth
@@ -303,8 +303,8 @@ code, status, or retryable drift):
   `workers/stream/src/body.rs:73-101`, route constants and decisions in
   `workers/stream/src/routes.rs:29-107`, pool fetch in
   `workers/stream/src/runtime.rs:79-206`, consumed by `classify_reply` in
-  `workers/ingest/src/pool_probe.rs:69-99` and `classify_body_reply` in
-  `workers/ingest/src/pool_body.rs:83-118`, pinned by
+  `workers/ingest/src/pool_probe.rs:127-156` and `classify_body_reply` in
+  `workers/ingest/src/pool_body.rs:136-170`, pinned by
   `workers/stream/tests/pool_error_wire_codes.rs` (served set ⊆ pool table).
 
 ## Adding a code

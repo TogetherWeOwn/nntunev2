@@ -93,12 +93,12 @@ pub(crate) fn seal(
     })
 }
 
-pub(crate) fn open(
+fn unwrap_dek(
     kek: &[u8; 32],
     kek_version: u32,
     context: &Context<'_>,
     envelope: &FieldEnvelope,
-) -> Result<Vec<u8>, VaultError> {
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     if envelope.dek_wrapped.len() != 48 {
         return Err(VaultError::CorruptStoredData);
     }
@@ -117,6 +117,16 @@ pub(crate) fn open(
     if bytes.len() != 32 {
         return Err(VaultError::Crypto);
     }
+    Ok(bytes)
+}
+
+pub(crate) fn open(
+    kek: &[u8; 32],
+    kek_version: u32,
+    context: &Context<'_>,
+    envelope: &FieldEnvelope,
+) -> Result<Vec<u8>, VaultError> {
+    let bytes = unwrap_dek(kek, kek_version, context, envelope)?;
     let dek_cipher = Aes256Gcm::new_from_slice(&bytes).map_err(|_| VaultError::Crypto)?;
     dek_cipher
         .decrypt(
@@ -127,4 +137,33 @@ pub(crate) fn open(
             },
         )
         .map_err(|_| VaultError::Crypto)
+}
+
+/// Authenticate the old wrap before minting a new wrap with unchanged payload.
+pub(crate) fn rewrap(
+    old_kek: &[u8; 32],
+    old_version: u32,
+    new_kek: &[u8; 32],
+    new_version: u32,
+    context: &Context<'_>,
+    envelope: &FieldEnvelope,
+) -> Result<FieldEnvelope, VaultError> {
+    let bytes = unwrap_dek(old_kek, old_version, context, envelope)?;
+    let cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
+    let nonce = crate::random::secure_random_bytes::<12>()?;
+    let dek_wrapped = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: &bytes,
+                aad: &context.aad("dek", Some(new_version)),
+            },
+        )
+        .map_err(|_| VaultError::Crypto)?;
+    Ok(FieldEnvelope {
+        dek_wrapped_nonce: nonce,
+        dek_wrapped,
+        payload_nonce: envelope.payload_nonce,
+        ciphertext: envelope.ciphertext.clone(),
+    })
 }

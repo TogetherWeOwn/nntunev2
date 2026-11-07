@@ -29,32 +29,17 @@
 //! contract, so their bytes and hashes coincide by construction.
 //! Source bytes are only ever read, never modified.
 //!
-//! Publication (spec §4.2, ADR 0002 rule 3 / ADR 0003 §writers), one
-//! idempotent statement each, all converging on redelivery. This step
-//! publishes the content-global row only; the two user rows stay
-//! pinned here but unwired until the tracks/providers writers land
-//! (a follow-up wires them, with the §8 proof, once their FK targets
-//! exist — publishing them today would fail closed on every job):
+//! Publication remains content-global and idempotent on redelivery:
+//! [`upsert_cache_object_sql`] writes only the blob row. It carries no user
+//! identity or serving authority; an unreferenced blob is never served.
 //!
-//! - [`upsert_cache_object_sql`] — the content-global blob row. No
-//!   writer fence: the row carries no user identity and an orphaned
-//!   blob is swept, never served.
-//! - [`upsert_track_media_sql`] — the per-user mapping with
-//!   `format='opus'`, `bitrate=64` as SQL literals (the profile is
-//!   pinned in the statement, not in a caller-supplied value).
-//! - [`upsert_cache_grant_sql`] — `user_cache_grants(user,
-//!   artifact_hash)` with the fetching `provider_id`, so a transcode
-//!   derived from own-provider bytes keeps the same own-provider
-//!   proof requirement as its source: knowing the hash confers
-//!   nothing.
-//!
-//! The two user rows select through the standard `writer_fence`
-//! (`users` row `FOR SHARE` while `deleting_at IS NULL`), so
-//! publication cannot repopulate library state after deletion is
-//! scheduled. A zero-row write is either a benign replay
-//! (`ON CONFLICT DO NOTHING` converged) or a fenced account; the
-//! consumer separates them with the PK selects plus
-//! [`classify_publish_zero_rows`], never by assuming.
+//! ADR 0013 supersedes ADR 0003's per-user cache authorization. The unused
+//! own-provider grant and per-user artifact-mapping writers are retired, not
+//! re-pointed at pool accounts. Account contributions are service provenance
+//! (ADR 0014), never entitlement. Global catalogue mapping and popularity-cache
+//! admission/publication require their own implementation and independent
+//! review, including the per-hash serialization and no-oracle rules. This
+//! legacy transcode step does not implement or enable that shared-cache path.
 //!
 //! Runtime: the `Transcoding` step (`run_transcode_step` in
 //! `queue_consumer.rs`) dispatches one recorded input per delivery through
@@ -72,8 +57,8 @@
 //! an operator action). Missing-table SQLSTATEs map through
 //! `crate::library::is_deterministic_sqlstate` to permanent
 //! failures, so jobs quarantine at once instead of burning budget.
-//! Grant publication (the follow-up, not this step) carries the
-//! standing threat-model §8 gate with it.
+//! Playback's signed play grants remain separate: retiring own-provider cache
+//! grants changes neither entitlement checks nor delivered-byte metering.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -428,86 +413,13 @@ pub fn upsert_cache_object_sql() -> &'static str {
     "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (content_hash) DO NOTHING"
 }
 
-/// `$n` parameter order for [`upsert_track_media_sql`].
-/// `format`/`bitrate` are SQL literals, not parameters (see below).
-pub const TRACK_MEDIA_PARAM_ORDER: [&str; 5] = [
-    "user_id",
-    "track_id",
-    "source_job_id",
-    "content_hash",
-    "verified_at",
-];
-
-/// Idempotent per-user artifact mapping. `format='opus'` and
-/// `bitrate=64` are literals: the profile is pinned in the statement
-/// so no caller can publish a differently-labelled mapping for these
-/// bytes. `source_job_id` carries the pipeline `job_id` string (the
-/// artifact-table migration types it compatibly). `verified_at` is
-/// BIGINT unix seconds; `last_served_at` is initialized by the schema
-/// default at publication.
-///
-/// Account-deletion fence (ADR 0002 rule 3): the row is selected
-/// through `writer_fence`, which takes the job owner's `users` row
-/// `FOR SHARE` only while `deleting_at IS NULL`. A fenced write
-/// affects 0 rows; the consumer separates that from a benign replay
-/// with [`select_track_media_by_pk_sql`] plus
-/// [`classify_publish_zero_rows`].
-pub fn upsert_track_media_sql() -> &'static str {
-    "INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) SELECT $1, $2, $3, $4, 'opus', 64, $5 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING"
-}
-
-/// `$n` parameter order for [`upsert_cache_grant_sql`].
-pub const CACHE_GRANT_PARAM_ORDER: [&str; 4] =
-    ["user_id", "content_hash", "provider_id", "verified_at"];
-
-/// Idempotent own-provider proof for the artifact: without this row
-/// the bytes are unservable (ADR 0003: the blob row is a storage
-/// index, never authorization). `provider_id` is the fetching
-/// provider's UUID text. Fenced like [`upsert_track_media_sql`];
-/// zero-row writes classify through [`select_cache_grant_by_pk_sql`]
-/// plus [`classify_publish_zero_rows`]. `verified_at` is BIGINT unix
-/// seconds; `last_served_at` is initialized by the schema default at
-/// publication.
-pub fn upsert_cache_grant_sql() -> &'static str {
-    "INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at) SELECT $1, $2, $3, $4 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, content_hash) DO NOTHING"
-}
-
-/// Fetch the mapping row after a zero-row [`upsert_track_media_sql`]
-/// write so the consumer can separate a benign replay from a fenced
-/// account. Parameters: `user_id` ($1), `track_id` ($2),
-/// `source_job_id` ($3), `content_hash` ($4).
-pub fn select_track_media_by_pk_sql() -> &'static str {
-    "SELECT user_id, track_id, source_job_id, content_hash, format, bitrate FROM track_media WHERE user_id = $1 AND track_id = $2 AND source_job_id = $3 AND content_hash = $4"
-}
-
-/// Fetch the grant row after a zero-row [`upsert_cache_grant_sql`]
-/// write. Parameters: `user_id` ($1), `content_hash` ($2).
-pub fn select_cache_grant_by_pk_sql() -> &'static str {
-    "SELECT user_id, content_hash, provider_id FROM user_cache_grants WHERE user_id = $1 AND content_hash = $2"
-}
-
-/// Outcome of one idempotent publication write.
+/// Outcome of one idempotent content-global blob publication write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
-    /// The row landed (inserted while the owner's fence was open).
+    /// The blob row landed. No track mapping or serving authority is created.
     Published,
-    /// Zero rows but the row exists: a redelivery converged on the
-    /// already-published mapping. Same-hash artifacts converge on
-    /// the first writer's row; the bytes are identical either way.
+    /// The same-hash blob row already exists; redelivery converged.
     Duplicate,
-    /// Zero rows and no row exists: the owner's fence refused the
-    /// write (account deleting or erased). Permanent.
-    AccountDeleting,
-}
-
-/// Classify a zero-row fenced publication write by whether the PK
-/// select found the row. Pure; the consumer owns the select.
-pub const fn classify_publish_zero_rows(row_exists: bool) -> PublishOutcome {
-    if row_exists {
-        PublishOutcome::Duplicate
-    } else {
-        PublishOutcome::AccountDeleting
-    }
 }
 
 /// Classify a [`upsert_cache_object_sql`] write by its affected-row
@@ -536,6 +448,118 @@ pub struct TranscodeInput {
     pub sha256: String,
     pub size: u64,
     pub scratch_prefix: String,
+    /// Complete input contributions only. No serving authority is inferred,
+    /// including when there is exactly one account (ADR 0013/0014).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
+}
+
+impl TranscodeInput {
+    /// Validate the full checkpoint layout, not just the basename sent to the
+    /// front. A swapped job, round or file index must fail before dispatch.
+    pub fn staging_id(&self, job_id: &str) -> Result<String, &'static str> {
+        let input_key = self.key.rsplit('/').next().unwrap_or("");
+        if self.size == 0
+            || self.file_index >= crate::verify::MAX_VERIFY_FILES
+            || self.key != format!("{}in/{input_key}", self.scratch_prefix)
+            || !input_key.starts_with(&format!("{:04}-", self.file_index))
+        {
+            return Err("transcode input outside recorded source layout");
+        }
+        derive_transcode_staging(&self.sha256, input_key, job_id, &self.scratch_prefix)
+    }
+
+    fn with_valid_provenance(&self) -> Self {
+        let mut input = self.clone();
+        input.pool_provenance = input
+            .pool_provenance
+            .filter(|proof| proof.matches_identity(&input.sha256, input.size));
+        input
+    }
+}
+
+/// One verified, published artifact and its exact encode source. The source
+/// proof stays source-bound: encoded output is not an NNTP BODY. Trusted
+/// checkpoint writers carry this derivation, not an authenticated receipt or a
+/// grant. Deserialized records must be checked against the current job/input.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeOutput {
+    source: TranscodeInput,
+    staging_id: String,
+    artifact_sha256: String,
+    byte_size: u64,
+}
+
+impl TranscodeOutput {
+    /// Called with the request actually dispatched and the bytes actually
+    /// fetched. The front contract checks the source hash before encoding;
+    /// ingest checks output size/hash here before publication. Neither check
+    /// establishes entitlement or makes arbitrary scratch writers trustworthy.
+    pub fn verified(
+        req: &TranscodeRequest,
+        input: &TranscodeInput,
+        bytes: &[u8],
+        artifact_sha256: &str,
+        byte_size: u64,
+    ) -> Result<Self, &'static str> {
+        let staging_id = input.staging_id(&req.job_id)?;
+        if req.staging_id != staging_id
+            || req.input_key != input.key.rsplit('/').next().unwrap_or("")
+            || req.scratch_prefix != input.scratch_prefix
+            || req.source_sha256
+                != canonical_sha256_hex(&input.sha256)
+                    .map_err(|_| "source hash outside content identity")?
+        {
+            return Err("transcode output outside dispatched generation");
+        }
+        if !(1..=MAX_ARTIFACT_BYTES).contains(&byte_size) {
+            return Err("transcode artifact outside profile ceiling");
+        }
+        verify_transcode_artifact(bytes, artifact_sha256, byte_size)?;
+        Ok(Self {
+            source: input.with_valid_provenance(),
+            staging_id,
+            artifact_sha256: canonical_sha256_hex(artifact_sha256)
+                .map_err(|_| "artifact hash outside content identity")?,
+            byte_size,
+        })
+    }
+
+    pub fn matches_input(&self, job_id: &str, input: &TranscodeInput) -> bool {
+        input
+            .staging_id(job_id)
+            .is_ok_and(|id| id == self.staging_id)
+            && self.source == input.with_valid_provenance()
+            && (1..=MAX_ARTIFACT_BYTES).contains(&self.byte_size)
+            && canonical_sha256_hex(&self.artifact_sha256)
+                .is_ok_and(|sha| sha == self.artifact_sha256)
+    }
+
+    /// Complete contributors to this source only. Never select one account
+    /// from a multi-account set or fill missing evidence from job observations.
+    pub fn contributing_provider_ids(
+        &self,
+        job_id: &str,
+        input: &TranscodeInput,
+    ) -> Option<&std::collections::BTreeSet<String>> {
+        if !self.matches_input(job_id, input) {
+            return None;
+        }
+        self.source
+            .pool_provenance
+            .as_ref()
+            .filter(|proof| proof.matches_identity(&self.source.sha256, self.source.size))
+            .map(|proof| proof.provider_ids())
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    pub fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
 }
 
 /// Audio containers the profile accepts, matched case-insensitively
@@ -612,6 +636,11 @@ pub fn select_transcode_inputs(
             sha256,
             size: rec.size,
             scratch_prefix: VerifyProgress::scratch_prefix(job_id, round),
+            pool_provenance: rec
+                .pool_provenance
+                .as_ref()
+                .filter(|proof| proof.matches_identity(&rec.sha256, rec.size))
+                .cloned(),
         });
     }
     Ok(inputs)
@@ -630,6 +659,7 @@ pub fn record_transcode_inputs(
 ) -> Result<(), &'static str> {
     cp.transcode_inputs = select_transcode_inputs(files, staged, job_id, round)?;
     cp.transcode_next = 0;
+    cp.transcode_outputs.clear();
     Ok(())
 }
 
@@ -914,38 +944,6 @@ mod tests {
             "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (content_hash) DO NOTHING"
         );
         assert_eq!(
-            upsert_track_media_sql(),
-            "INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) SELECT $1, $2, $3, $4, 'opus', 64, $5 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING"
-        );
-        assert_eq!(
-            upsert_cache_grant_sql(),
-            "INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at) SELECT $1, $2, $3, $4 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, content_hash) DO NOTHING"
-        );
-        assert_eq!(
-            select_track_media_by_pk_sql(),
-            "SELECT user_id, track_id, source_job_id, content_hash, format, bitrate FROM track_media WHERE user_id = $1 AND track_id = $2 AND source_job_id = $3 AND content_hash = $4"
-        );
-        assert_eq!(
-            select_cache_grant_by_pk_sql(),
-            "SELECT user_id, content_hash, provider_id FROM user_cache_grants WHERE user_id = $1 AND content_hash = $2"
-        );
-        // Literals pin the profile: no parameter can relabel the bytes.
-        assert!(upsert_track_media_sql().contains("'opus', 64"));
-        assert_eq!(
-            TRACK_MEDIA_PARAM_ORDER,
-            [
-                "user_id",
-                "track_id",
-                "source_job_id",
-                "content_hash",
-                "verified_at"
-            ]
-        );
-        assert_eq!(
-            CACHE_GRANT_PARAM_ORDER,
-            ["user_id", "content_hash", "provider_id", "verified_at"]
-        );
-        assert_eq!(
             CACHE_OBJECT_PARAM_ORDER,
             [
                 "content_hash",
@@ -954,15 +952,6 @@ mod tests {
                 "r2_key",
                 "last_verified_at"
             ]
-        );
-    }
-
-    #[test]
-    fn publish_zero_rows_classify_by_row_existence() {
-        assert_eq!(classify_publish_zero_rows(true), PublishOutcome::Duplicate);
-        assert_eq!(
-            classify_publish_zero_rows(false),
-            PublishOutcome::AccountDeleting
         );
     }
 
@@ -1151,6 +1140,7 @@ mod tests {
 
     fn staged_audio(key: String, sha256: &str, size: u64) -> StagedFile {
         StagedFile {
+            pool_provenance: None,
             key,
             size,
             sha256: sha256.to_string(),
@@ -1231,6 +1221,7 @@ mod tests {
         // is incorrect output).
         let mut spooled = staged_audio(key.clone(), SHA, 512);
         spooled.spool = vec![crate::verify::StagedSpoolSegment {
+            pool_provenance: None,
             key: "seg".to_string(),
             size: 1,
             crc32: 0,
@@ -1310,8 +1301,10 @@ mod tests {
             failure_code: None,
             failure_reason: None,
             provider_id: None,
+            pool_observations: Default::default(),
             transcode_inputs: Vec::new(),
             transcode_next: 7,
+            transcode_outputs: Default::default(),
         };
         record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
         assert_eq!(cp.transcode_inputs.len(), 1);
@@ -1322,6 +1315,27 @@ mod tests {
             cp.transcode_inputs[0].scratch_prefix,
             "ingest-scratch/job_01J9ZQ8K2M/r2/"
         );
+        let input = &cp.transcode_inputs[0];
+        let req = decide_transcode(
+            JOB,
+            USER,
+            KEY,
+            input.key.rsplit('/').next().unwrap(),
+            &input.sha256,
+            &input.scratch_prefix,
+            &input.staging_id(JOB).unwrap(),
+        )
+        .unwrap();
+        let output =
+            TranscodeOutput::verified(&req, input, b"opus", &sha256_hex(b"opus"), 4).unwrap();
+        cp.transcode_outputs.insert(0, output);
+        cp.transcode_next = 1;
+        record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
+        assert!(
+            cp.transcode_outputs.is_empty(),
+            "a new verify selection resets output evidence"
+        );
+        assert_eq!(cp.transcode_next, 0);
     }
 
     #[test]
@@ -1431,7 +1445,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            function.contains("crate::transcode::derive_transcode_staging( &input.sha256, input_key, &msg.job_id, &input.scratch_prefix, )"),
+            function.contains("input.staging_id(&msg.job_id)"),
             "queue caller must derive from the recorded job and scratch prefix, not a reconstructed default round"
         );
     }

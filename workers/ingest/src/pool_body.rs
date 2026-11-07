@@ -6,7 +6,12 @@
 //! Durable Object binding, `id_from_name(user_id)`, no public route and no
 //! shared secret. The envelope JSON is the stream crate's
 //! `body::BodyRequest`; unknown response fields never appear because a
-//! `200` body is the article bytes themselves.
+//! `200` body is the article bytes themselves. A legacy reply names no
+//! serving account and is never attributed to one.
+//!
+//! [`classify_account_body_reply`] decodes the account BODY wire shape. It
+//! is pure and UNWIRED: account BODY routes are disabled/unqualified and no
+//! live caller uses it.
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -66,6 +71,53 @@ pub enum BodyFetch {
     /// not a job failure. The caller judges the segment absent (data
     /// for the par2 block count), exactly like a `430`.
     TooLarge,
+}
+
+/// UNWIRED: decoded account BODY reply; no live caller produces it.
+/// Actual serving identity exists only for successful bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolBodyFetch {
+    pub provider_id: Option<String>,
+    pub outcome: BodyFetch,
+}
+
+/// UNWIRED pure decoder for the shared account wire contract, never accepting
+/// unattributed `200` replies or route-miss `404`s as missing article data.
+/// Not called by `call_pool_body`.
+pub fn classify_account_body_reply(
+    status: u16,
+    content_type: &str,
+    provider_id: Option<&str>,
+    retry_after: Option<&str>,
+    body: Vec<u8>,
+) -> Result<PoolBodyFetch, PoolBodyError> {
+    use nntune_core::pool_operation::{decode_response, OperationError, OperationReply, Output};
+    let outcome = match decode_response(status, content_type, provider_id, body) {
+        OperationReply::Served(served) => {
+            let Output::Body(bytes) = served.output else {
+                return Err(PoolBodyError::Rejected);
+            };
+            return Ok(PoolBodyFetch {
+                provider_id: Some(served.provider_id),
+                outcome: BodyFetch::Bytes(bytes),
+            });
+        }
+        OperationReply::Failed(OperationError::Missing) => BodyFetch::Missing,
+        OperationReply::Failed(OperationError::TooLarge) => BodyFetch::TooLarge,
+        _ if status == 200 || matches!(status, 400 | 401 | 403) => {
+            return Err(PoolBodyError::Rejected);
+        }
+        _ => {
+            return classify_body_reply(status, retry_after, &[]).map(|outcome| PoolBodyFetch {
+                provider_id: None,
+                outcome,
+            })
+        }
+    };
+    Ok(PoolBodyFetch {
+        provider_id: None,
+        outcome,
+    })
 }
 
 /// Why a body call produced no usable fetch.
@@ -210,6 +262,7 @@ pub async fn call_pool_body_with_deadline(
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Error)
         .with_body(Some(JsValue::from_str(&body)));
     let request = Request::new_with_init(POOL_BODY_URL, &init).map_err(|_| unavailable)?;
     // One cancellable deadline spans headers plus the body drain, armed

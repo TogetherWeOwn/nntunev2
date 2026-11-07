@@ -197,6 +197,12 @@ SESSION_TTL_SECS = "86400"
 #                                 the endpoint fails closed and the stream
 #                                 side keeps windows pending (nothing
 #                                 meters, nothing is lost permanently).
+#   POOL_RESOLVER_SECRET          Dedicated API/stream service-channel HMAC key:
+#                                 raw bytes of a 32+ byte random string, never
+#                                 a grant/session/meter key. Not provisioned
+#                                 by this example; follow credential approval.
+#                                 Absent/short fails resolution closed. The
+#                                 KEK stays API-only. See docs/pool-provider-admin.md.
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
 #   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
 #                                 seam only). High-entropy; same value as the

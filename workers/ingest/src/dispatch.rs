@@ -124,9 +124,9 @@ fn dispatch(
         limit: None,
         page: None,
         payload_ref: None,
-        // No pool attribution at admission: the stream pool's provider
-        // wiring does not exist yet, so every job starts unattributed
-        // and the first fetch records the id on the checkpoint.
+        // Selection occurs at each account operation, not at enqueue time.
+        // Confirmed serving observations live on the checkpoint; a job can
+        // span accounts, so no requested/first account labels the whole job.
         provider_id: None,
     })
 }

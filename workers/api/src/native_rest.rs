@@ -503,7 +503,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
-            if path == "/v1/admin/settings" {
+            if path == "/v1/admin/settings" || path == "/v1/admin/pool-providers" {
                 return SessionOnly;
             }
             // Admin ingest reads (migration 0034): the exact list path
@@ -572,6 +572,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/admin/pool-providers"
             {
                 return SessionOnly;
             }
@@ -609,7 +610,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin writes (migration 0028): one setting key, or one
             // user's role. Deeper shapes deny here, before any spend.
-            if one_segment_after("/v1/admin/settings/", path) {
+            if one_segment_after("/v1/admin/settings/", path)
+                || one_segment_after("/v1/admin/pool-providers/", path)
+            {
                 return SessionOnly;
             }
             if let Some(rest) = path.strip_prefix("/v1/admin/users/") {

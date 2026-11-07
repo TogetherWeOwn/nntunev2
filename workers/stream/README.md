@@ -5,6 +5,64 @@ NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
 wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
 excluded from native builds and tests.
 
+## Deployment entry and uninstalled ingress boundary
+
+`wrangler.toml` selects the application-owned `entry.mjs`. It currently only
+re-exports the generated SDK: existing `NntpPool` construction, fetch and alarms
+are unchanged. `ingress.mjs` is retained as **uninstalled source**, not imported
+by this entry. Its 256-unit/byte raw-URL guard has portable tests, but is not a
+protection claimed for the deployed existing object. Installing it changes
+module startup and shared ingress and requires separate actual Worker proof.
+
+Only worker-build **0.8.7**'s normal minified module output with panic recovery
+is supported. The build pins that tool, rejects custom-shim/coredump hooks and
+executes `tests/check-package.mjs`. The checker requires account exports to be
+absent, checks the unchanged existing object descriptors/dispatch/recovery and
+checks its alarm and a harmless public route with network-denying host stubs.
+Its optional second path argument checks a bundled entry. This is synthetic
+package evidence, **not actual Cloudflare Worker qualification**.
+
+CI runs the source, ingress-helper and generated-package checks. Full suites
+and packaging gates belong on GitHub Actions; local execution is only for a
+permitted focused failing-test/crate reproduction under AGENTS.md. Neither a
+packaged shim nor the helper tests authorize deployment or qualification.
+Stream artifacts must retain the configured `entry.mjs` and its relative
+package layout, not substitute `build/worker/shim.mjs` as the deploy entry.
+See [Worker packaging](../../docs/worker-packaging.md).
+
+No new dependency or host installation is authorized. The existing packaging
+pins/locked inputs do not remove Cargo's lack of native release-age and blanket
+build-script/proc-macro controls.
+
+## Account owner boundary (uninstalled source)
+
+`src/account_runtime.rs` is deliberately not declared as a crate module.
+There is no generated `NntpAccount` export, `NNTP_ACCOUNT` binding or account
+class migration in the deploy configuration. Existing user DO dispatch does
+not forward account ingest paths. Therefore candidate/config/journal writes,
+account alarms and dialing are unreachable from the shipped entry, rather
+than relying on missing keys or a false dial flag alone. No deployed class or
+migration history is claimed or changed by this source configuration.
+
+The retained adapter describes an account-UUID owner and authenticated
+`POST /candidate` protocol using `POOL_ACCOUNT_SECRET`, with registry refresh
+through `POOL_RESOLVER_SECRET`. A candidate would reconcile durable config;
+it is **not** a read-only scheduling projection or a lease. The operation
+flag in that uninstalled file remains hard-false. These libraries, account
+transport and raw-URL guard need authorized actual Worker ingress, TLS/name/
+chain/time/entropy, alarm/persistence/physical-close/cancellation/capacity and
+curated staging qualification before any future wiring. No environment toggle,
+key provisioning or fixture is supplied here. Public NNTP misses stay disabled.
+
+The API registry/admin/resolver and SQL migration are separate **enabled
+effects**, not made dormant by removing this runtime. Their compatibility,
+full review and pre-merge schema approval/application/ledger gates remain.
+Legacy ingest calls keep `/probe` and `/body`; their bytes and queue hints do
+not establish service-account provenance or serving authority.
+
+This backend/playback preparation follows AGENTS.md **Clean-room, YouTube and
+MetaBrainz guardrails**; it adds no UI assets, video behavior or catalogue data.
+
 ## Play path
 
 ```text

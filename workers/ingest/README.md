@@ -108,12 +108,13 @@ routes are unchanged.
   model before the transport trait would be called, so the modeled fetch
   cannot be aimed at another port as a scan primitive). Address ranges
   come from the shared guard crate (`v4_is_forbidden`/`ip_is_forbidden`
-  single-owned in `crates/nntune-ssrf-guard/src/lib.rs:21-53`),
+  single-owned in the pinned `velmora-ssrf-guard` dependency and re-exported
+  by `crates/nntune-ssrf-guard/src/lib.rs:6`),
   imported here (`src/indexer_fetch.rs:38`) and by the `workers/api`
   vault guard (`workers/api/src/vault.rs:28`) — one list, no copies
   to keep in sync.
 - Every answer from the supplied `DnsResolver` is checked for forbidden
-  ranges (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`, imported at `src/indexer_fetch.rs:38`; one forbidden
+  ranges (`ip_is_forbidden` re-exported by `crates/nntune-ssrf-guard/src/lib.rs:6`, imported at `src/indexer_fetch.rs:38`; one forbidden
   record poisons the whole answer, `src/indexer_fetch.rs:335-338`):
   loopback / link-local (incl. the cloud metadata endpoint) /
   private / unique-local / CGNAT / multicast / broadcast / documentation
@@ -225,7 +226,7 @@ upload routes are unchanged.
   (`allowlist_from_env`, `src/nzb_fetch.rs:121-128`); it
   does not load environment configuration.
 - Every answer from the supplied resolver is checked for forbidden ranges
-  (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`,
+  (`ip_is_forbidden` re-exported by `crates/nntune-ssrf-guard/src/lib.rs:6`,
   imported at `src/nzb_fetch.rs:77`; one forbidden record poisons
   the whole answer, `src/nzb_fetch.rs:345-349`;
   the vault guard and both ingest fetchers share that one predicate —
@@ -348,7 +349,7 @@ stub whose NZB references fixture message-ids.
   feedback loop is still open. After a repair round, `Verifying` re-runs
   the verify driver over the pool body route (`src/queue_consumer.rs:701-704`,
   `PoolBodySource::fetch_body` via `call_pool_body` at
-  `src/queue_consumer.rs:900`) and does not yet consume the repair
+  `src/queue_consumer.rs:930`) and does not yet consume the repair
   round's `out/` objects (the repair Worker streams outputs back to `out/`
   per `workers/repair/README.md:23-28`; key shapes in
   `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
@@ -421,6 +422,23 @@ stub whose NZB references fixture message-ids.
   reason (`ERR_PROBE_FAILED` in `src/retry.rs`). Unit tests cover the
   fold/resume/retry/budget policy against a scripted pool fake; no live
   Worker runs in CI.
+
+  Account attribution: the live pool callers (`call_pool_probe`,
+  `call_pool_body`) use the legacy `/probe` and `/body` wire contracts,
+  which name no serving account, so fetched bytes are `ArticleFetch::Present`
+  and nothing is attributed to an account. Queue and checkpoint `provider_id`
+  hints are cleared, never trusted. The account STAT/BODY decoders
+  (`classify_account_probe_reply`, `classify_account_body_reply` and their
+  result types) are pure source that is not installed: no live caller uses
+  them and the account routes are disabled and unqualified. Scratch metadata
+  never supplies content-bound provenance on adoption (`pool_provenance` is
+  neither written nor read there). Persisted checkpoints and verify progress
+  are scrubbed before dispatch: retained `pool_observations`,
+  `transcode_outputs` and `pool_provenance` fields are untrusted, off-route
+  compatibility fields and are cleared, while input keys/hashes and the
+  transcode cursor are kept. `TranscodeOutput` is a content-only derivation
+  (source layout, artifact hash and size) and claims no account qualification
+  or cache grant.
 
 The match/write steps are wired in the consumer (`src/matching.rs` +
 `src/queue_consumer.rs`): MB release search through the `MB_API` service

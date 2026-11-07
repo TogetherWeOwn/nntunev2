@@ -52,6 +52,22 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                         command += f" --target {target}"
                     self.assertIn(command + "\n          rustup default stable\n", section)
 
+    def test_wasm_jobs_install_the_pinned_compiler_before_building(self):
+        ci = (WORKFLOWS / "ci.yml").read_text()
+        self.assertIn("CC_wasm32_unknown_unknown: clang-18", ci)
+        self.assertIn("AR_wasm32_unknown_unknown: llvm-ar-18", ci)
+        install = "sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18"
+        for name in ("rust-wasm", "worker-wasm-budget", "worker-wasm-sizes"):
+            with self.subTest(job=name):
+                section = job(ci, name)
+                self.assertIn("runs-on: ubuntu-24.04", section)
+                self.assertIn(install, section)
+                self.assertIn("clang-18 --version", section)
+                self.assertIn("llvm-ar-18 --version", section)
+                self.assertIn("wasm-ld-18 --version", section)
+                self.assertLess(section.index(install), section.index("uses: Swatinem/rust-cache@"))
+                self.assertNotIn("continue-on-error:", section[section.index("    steps:"):])
+
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
             with self.subTest(path=path):

@@ -273,6 +273,9 @@ pub struct Config {
     /// closed per-request with a generic 500 while every other
     /// route keeps serving.
     pub meter_sink_secret: Option<Vec<u8>>,
+    /// Dedicated API/stream service-channel key, raw string bytes. Not a
+    /// session, grant or meter key. Absent/short fails resolution closed.
+    pub pool_resolver_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -344,6 +347,7 @@ impl Config {
             stripe_webhook_secret: None,
             play_grant_secret: None,
             meter_sink_secret: None,
+            pool_resolver_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -436,6 +440,12 @@ impl Config {
     /// closed), so this setter accepts whatever the entry staged.
     pub fn with_meter_sink_secret(mut self, secret: Vec<u8>) -> Self {
         self.meter_sink_secret = Some(secret);
+        self
+    }
+
+    /// Provision the dedicated pool-resolver service-channel key.
+    pub fn with_pool_resolver_secret(mut self, secret: Vec<u8>) -> Self {
+        self.pool_resolver_secret = Some(secret);
         self
     }
 
@@ -665,12 +675,41 @@ pub enum PairAdmission {
     DeniedSecond,
 }
 
+mod admin_pool;
+mod pool_resolver;
+
 /// Persistence over migration-0002 tables. Implementations must use
 /// parameterized statements only, and conditional single-row updates for
 /// the rotation/sign-count advances. `Store` implementors also implement
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Service account metadata only. Unprovisioned stores fail closed.
+    fn pool_providers(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Current registry row and its envelope in one database snapshot.
+    /// Only the authenticated internal resolver may decrypt this result.
+    fn pool_account(
+        &self,
+        _provider_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::pool_resolver::StoredAccount>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Atomic registry/envelope/audit write with a transaction-side role
+    /// recheck and revision CAS. Never persists plaintext credentials.
+    fn admin_write_pool_provider(
+        &self,
+        _actor_user_id: &str,
+        _write: &crate::pool_providers::PoolProviderWrite,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::pool_providers::PoolProviderWriteOutcome, StoreError>>
+    {
+        async { Err(StoreError) }
+    }
     fn user_by_email(
         &self,
         email: &str,
@@ -7051,6 +7090,9 @@ where
         // above never sees its Authorization header; it is absent
         // from `is_known_path` on purpose (no browser preflight).
         ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
+        ("POST", crate::pool_resolver::REGISTRY_PATH | crate::pool_resolver::RESOLVE_PATH) => {
+            pool_resolver::handle(ctx, req).await
+        }
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -7086,6 +7128,11 @@ where
         // cannot name them).
         ("DELETE", path) if path.starts_with("/v1/credentials/") => {
             credentials_revoke(ctx, req).await
+        }
+        ("GET", "/v1/admin/pool-providers") => admin_pool::list(ctx, req).await,
+        ("POST", "/v1/admin/pool-providers") => admin_pool::write(ctx, req).await,
+        ("PUT", path) if path.starts_with("/v1/admin/pool-providers/") => {
+            admin_pool::write(ctx, req).await
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
@@ -7369,6 +7416,14 @@ mod tests {
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
+        /// Mirror of `pool_providers` (registry rows, settings + current
+        /// `secret_ref` + revision).
+        pool_provider_rows: RefCell<Vec<crate::pool_providers::PoolProviderRow>>,
+        pool_reads: std::cell::Cell<usize>,
+        /// Mirror of `pool_provider_secrets`, keyed by `secret_ref`:
+        /// stored KEK version plus the envelope fields (the envelope type
+        /// is neither `Clone` nor `Debug`, so fields are copied).
+        pool_provider_secrets: RefCell<HashMap<String, (u32, StoredPoolEnvelope)>>,
         /// Catalogue slice-1 fixtures: joined library rows by user id plus
         /// the shared mirror collections and per-release track lists.
         /// Tests seed these in store (query) order; the bound and the
@@ -7441,7 +7496,146 @@ mod tests {
         }
     }
 
+    struct StoredPoolEnvelope {
+        dek_wrapped_nonce: [u8; 12],
+        dek_wrapped: Vec<u8>,
+        payload_nonce: [u8; 12],
+        ciphertext: Vec<u8>,
+    }
+
+    impl StoredPoolEnvelope {
+        fn to_envelope(&self) -> crate::pool_providers::PoolSecretEnvelope {
+            crate::pool_providers::PoolSecretEnvelope {
+                dek_wrapped_nonce: self.dek_wrapped_nonce,
+                dek_wrapped: self.dek_wrapped.clone(),
+                payload_nonce: self.payload_nonce,
+                ciphertext: self.ciphertext.clone(),
+            }
+        }
+    }
+
     impl Store for FakeStore {
+        async fn pool_account(
+            &self,
+            provider_id: &str,
+        ) -> Result<Option<crate::pool_resolver::StoredAccount>, StoreError> {
+            self.pool_reads.set(self.pool_reads.get() + 1);
+            let Some(row) = self
+                .pool_provider_rows
+                .borrow()
+                .iter()
+                .find(|row| row.settings.id == provider_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let secrets = self.pool_provider_secrets.borrow();
+            let Some((kek_version, envelope)) = secrets.get(&row.secret_ref) else {
+                return Ok(None);
+            };
+            Ok(Some(crate::pool_resolver::StoredAccount {
+                row,
+                kek_version: *kek_version,
+                envelope: envelope.to_envelope(),
+            }))
+        }
+
+        async fn pool_providers(
+            &self,
+        ) -> Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError> {
+            self.pool_reads.set(self.pool_reads.get() + 1);
+            let mut rows = self.pool_provider_rows.borrow().clone();
+            rows.sort_by(|a, b| {
+                (a.settings.tier, &a.settings.id).cmp(&(b.settings.tier, &b.settings.id))
+            });
+            Ok(rows)
+        }
+        async fn admin_write_pool_provider(
+            &self,
+            actor_user_id: &str,
+            write: &crate::pool_providers::PoolProviderWrite,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<crate::pool_providers::PoolProviderWriteOutcome, StoreError> {
+            use crate::pool_providers::{PoolProviderRow, PoolProviderWriteOutcome};
+            write.validate().map_err(|_| StoreError)?;
+            // Production: `role FROM users WHERE id = $1 AND deleting_at IS
+            // NULL` under the lock, so a deleting actor is not an admin.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref())
+                    && !self.deleting_users.borrow().contains(actor_user_id) => {}
+                _ => return Ok(PoolProviderWriteOutcome::ActorNotAdmin),
+            }
+            let previous = self
+                .pool_provider_rows
+                .borrow()
+                .iter()
+                .find(|row| row.settings.id == write.settings.id)
+                .cloned();
+            if previous.as_ref().map_or(0, |row| row.revision) != write.expected_revision {
+                return Ok(PoolProviderWriteOutcome::Conflict);
+            }
+            let secret_ref = match (&write.secret, &previous) {
+                (Some(secret), _) => secret.secret_ref.clone(),
+                (None, Some(old)) => old.secret_ref.clone(),
+                _ => return Err(StoreError),
+            };
+            if let Some(secret) = &write.secret {
+                // A rotation must be a new identity; never overwrite a row.
+                if self
+                    .pool_provider_secrets
+                    .borrow()
+                    .contains_key(&secret.secret_ref)
+                {
+                    return Err(StoreError);
+                }
+                self.pool_provider_secrets.borrow_mut().insert(
+                    secret.secret_ref.clone(),
+                    (
+                        secret.kek_version,
+                        StoredPoolEnvelope {
+                            dek_wrapped_nonce: secret.envelope.dek_wrapped_nonce,
+                            dek_wrapped: secret.envelope.dek_wrapped.clone(),
+                            payload_nonce: secret.envelope.payload_nonce,
+                            ciphertext: secret.envelope.ciphertext.clone(),
+                        },
+                    ),
+                );
+            }
+            let next = PoolProviderRow {
+                settings: write.settings.clone(),
+                secret_ref,
+                revision: write.expected_revision + 1,
+            };
+            {
+                let mut rows = self.pool_provider_rows.borrow_mut();
+                rows.retain(|row| row.settings.id != next.settings.id);
+                rows.push(next.clone());
+            }
+            for (action, details) in crate::pool_providers::audit_changes(
+                previous.as_ref(),
+                &next,
+                write.secret.is_some(),
+            ) {
+                self.audits.borrow_mut().push(vault::audit_event_extended(
+                    actor_user_id,
+                    action,
+                    true,
+                    source_ip,
+                    now,
+                    None,
+                    serde_json::from_str(&details).map_err(|_| StoreError)?,
+                ));
+            }
+            if let Some(old) = &previous {
+                if old.secret_ref != next.secret_ref {
+                    self.pool_provider_secrets
+                        .borrow_mut()
+                        .remove(&old.secret_ref);
+                }
+            }
+            Ok(PoolProviderWriteOutcome::Applied(next))
+        }
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -16957,6 +17151,9 @@ mod tests {
         let resp = h.call_full("OPTIONS", "/v1/me", None, None, Some(ORIGIN));
         assert_eq!(resp.status, 204);
     }
+
+    include!("handlers/admin_pool_tests.rs");
+    include!("handlers/pool_resolver_tests.rs");
 
     #[test]
     fn admin_write_store_recheck_refuses_a_demoted_actor() {

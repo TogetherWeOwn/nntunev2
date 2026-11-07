@@ -17,7 +17,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 # resolves wherever the caller's role points. This wrapper (not a one-off) is
 # the required way to apply any pre-convention file in every environment;
 # new migrations carry their own in-file SET (see migrations/README.md).
-psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -v migrations_dir="$root/migrations" "$@"; }
 
 shopt -s nullglob
 migrations=("$root"/migrations/*.sql)

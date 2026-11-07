@@ -27,6 +27,10 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # ring's Worker backend compiles C to wasm32; never select the runner's
+  # floating default clang. These target-only pins leave native builds alone.
+  CC_wasm32_unknown_unknown: clang-18
+  AR_wasm32_unknown_unknown: llvm-ar-18
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
 
@@ -131,7 +135,7 @@ jobs:
 
   rust-wasm:
     name: rust check (wasm32)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,6 +145,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -214,7 +225,7 @@ jobs:
   # Keep this job id in ci-ok's needs.
   worker-wasm-budget:
     name: worker wasm budget (enforcing)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -224,6 +235,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -243,7 +261,7 @@ jobs:
   # can never fail the build. No thresholds, no dependency-gate changes.
   worker-wasm-sizes:
     name: worker wasm sizes (report-only)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
     # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
     timeout-minutes: 35
@@ -256,6 +274,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
           rustup default stable
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -338,6 +363,15 @@ jobs:
           persist-credentials: false
       - name: Run the bounded-pool offline suite
         run: python3 scripts/test_cargo_cache.py
+      - name: Run the bounded Worker packaging offline suite
+        run: python3 scripts/test_worker_package.py
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test the stream raw Durable Object ingress boundary
+        run: |
+          node --test workers/stream/tests/ingress.test.mjs
+          python3 workers/stream/tests/test_entry_config.py
       - name: Run the pool capacity acceptance suite
         run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy
@@ -632,6 +666,14 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise production pool registry transactions on PostgreSQL
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::pool_registry_tests
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise bounded original-source PostgreSQL reads
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib original_source::tests::postgres_execution
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       # The bank runner's own inventory guard: a missing, empty or extra

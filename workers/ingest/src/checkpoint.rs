@@ -54,14 +54,14 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         missing_blocks: 0,
         failure_code: None,
         failure_reason: None,
-        // Attribution starts here and lives on the checkpoint after:
-        // redelivered Queue bodies are immutable, so the message copy
-        // must never be read back over this field.
-        provider_id: msg.provider_id.clone(),
+        // A queued provider ID is not evidence of account-owned service.
+        provider_id: None,
+        pool_observations: Default::default(),
         // Transcode inputs record at the first verify `Complete`; the
         // cursor starts at the first input.
         transcode_inputs: Vec::new(),
         transcode_next: 0,
+        transcode_outputs: Default::default(),
     }
 }
 
@@ -231,10 +231,11 @@ mod tests {
         assert!(initial(&plain).provider_id.is_none());
         let mut attributed = msg();
         attributed.provider_id = Some("11111111-1111-4111-8111-111111111111".to_string());
-        assert_eq!(
-            initial(&attributed).provider_id.as_deref(),
-            Some("11111111-1111-4111-8111-111111111111")
-        );
+        assert!(initial(&attributed).provider_id.is_none());
+        assert!(initial(&attributed)
+            .pool_observations
+            .provider_ids
+            .is_empty());
     }
 
     #[test]

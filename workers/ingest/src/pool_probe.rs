@@ -1,12 +1,16 @@
 //! Pool probe call: one [`ProbeRequest`] to the user's `NntpPool` Durable
-//! Object (stream Worker), answered with a [`ProbeOutcome`].
+//! Object (stream Worker), answered with a [`ProbeOutcome`] over the existing
+//! `/probe` wire contract.
 //!
 //! The object is reached through the cross-script Durable Object binding
 //! [`POOL_BINDING`] and addressed by `id_from_name(user_id)`, so there is no
-//! public route and no shared secret: only Workers holding the binding can
-//! call it, and the pool refuses envelopes naming another user. The answer
-//! is checked against the request ([`check_outcome`]) before the tally may
-//! fold it.
+//! public route and no shared secret. The answer is checked against the
+//! request ([`check_outcome`]) before the tally may fold it. A legacy reply
+//! names no serving account and is never attributed to one.
+//!
+//! [`classify_account_probe_reply`] decodes the account STAT wire shape. It
+//! is pure and UNWIRED: account STAT routes are disabled/unqualified and no
+//! live caller uses it.
 
 use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
@@ -31,6 +35,59 @@ pub const MAX_RETRY_SECS: u32 = 300;
 /// retain. An oversize body is `Rejected` because more bytes existed, never
 /// parsed from a truncated prefix.
 pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
+
+/// UNWIRED: decoded account STAT reply; no live caller produces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolProbeOutcome {
+    pub provider_id: String,
+    pub outcome: ProbeOutcome,
+}
+
+/// UNWIRED pure decoder: correlate an account-owned STAT reply with this
+/// exact request. Not called by `call_pool_probe`; the account route is
+/// disabled pending qualification.
+pub fn classify_account_probe_reply(
+    req: &ProbeRequest,
+    status: u16,
+    content_type: &str,
+    provider_id: Option<&str>,
+    retry_after: Option<&str>,
+    body: Vec<u8>,
+) -> Result<PoolProbeOutcome, PoolProbeError> {
+    use nntune_core::pool_operation::{
+        decode_response, valid_output, Operation, OperationReply, Output,
+    };
+    if status != 200 {
+        return match classify_reply(req, status, retry_after, "") {
+            Err(error) => Err(error),
+            Ok(_) => Err(PoolProbeError::Rejected),
+        };
+    }
+    let operation = Operation::Stat(req.segment_ids.clone());
+    if !operation.valid() {
+        return Err(PoolProbeError::Rejected);
+    }
+    let OperationReply::Served(served) = decode_response(status, content_type, provider_id, body)
+    else {
+        return Err(PoolProbeError::Rejected);
+    };
+    if !valid_output(&operation, &served.output) {
+        return Err(PoolProbeError::Rejected);
+    }
+    let Output::Stat { present, missing } = served.output else {
+        return Err(PoolProbeError::Rejected);
+    };
+    let outcome = ProbeOutcome {
+        batch_index: req.batch_index,
+        present,
+        missing,
+    };
+    check_outcome(req, &outcome)?;
+    Ok(PoolProbeOutcome {
+        provider_id: served.provider_id,
+        outcome,
+    })
+}
 
 /// Why a probe call produced no usable outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +231,7 @@ pub async fn call_pool_probe_with_deadline(
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Error)
         .with_body(Some(JsValue::from_str(&body)));
     let request = Request::new_with_init(POOL_PROBE_URL, &init).map_err(|_| unavailable)?;
     // One cancellable deadline spans headers plus the body drain, armed

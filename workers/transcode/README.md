@@ -69,7 +69,7 @@ itself are operator actions. Until then `wrangler.toml` is the deploy
 contract and ingest stays unable to finish a `Transcoding` job (its
 consumer also remains disabled).
 (Sources: `wrangler.toml:11-13`;
-`workers/ingest/src/transcode.rs:323-408` (`call_transcode`) —
+`workers/ingest/src/transcode.rs:308-393` (`call_transcode`) —
 binding, transport and body-read failure is `Retry`, never a terminal
 outcome.)
 
