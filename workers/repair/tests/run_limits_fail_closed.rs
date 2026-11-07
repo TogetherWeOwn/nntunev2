@@ -1,6 +1,6 @@
 //! Pin `run()` entry gate fail-closed: zero, over-ceiling, and empty inputs.
 //!
-//! `crates/nntune-core/src/par2/repair/linux.rs::run()` rejects a zero
+//! velmora `crates/velmora/src/par2/repair/linux.rs::run()` rejects a zero
 //! timeout, any zero budget, any budget above the default ceiling, and an
 //! empty `par2_files` list with `Error::Malformed` before
 //! `canonicalize`/spawn/`prlimit`. These tests pin that gate with fake
@@ -20,7 +20,7 @@ use nntune_core::par2::repair::{repair_with_limits, RepairLimits};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 // Serializes fork-based tests within this test binary; see
-// `crates/nntune-core/tests/review_support/repair.rs` for why a fork in one
+// velmora `crates/velmora/tests/review_support/repair.rs` for why a fork in one
 // libtest thread can otherwise inherit another thread's open script fd.
 static SERIAL: Mutex<()> = Mutex::new(());
 

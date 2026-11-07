@@ -47,7 +47,7 @@ Examples grounded in this repository:
   ingestion path that lets an untrusted supplier feed uncapped input to the
   XML reader would enable memory exhaustion. Identify the reachable caller
   and missing cap, not just a large-input possibility. Today
-  `crates/nntune-core/src/nzb.rs` wraps input in `BoundedReader` before XML
+  velmora `crates/velmora/src/nzb.rs` wraps input in `BoundedReader` before XML
   parsing (`Parser::parse`), limiting event-buffer growth.
 - **False alarm:** no account session on the billing webhook is intentional,
   not an authentication bypass. `workers/api/src/handlers.rs::billing_webhook`

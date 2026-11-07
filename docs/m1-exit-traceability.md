@@ -14,6 +14,13 @@ that the shared catalogue or pool is implemented. Keep their current
 coverage and update this matrix in the same PRs that change the specs,
 per the rule below.
 
+Current status of the journey's later legs: user NZB ingest is retired, so
+the playback, Range, usage-meter and plan-limit legs are parked by name (see
+rows 3, 4 and the parked-leg list) and are not asserted live today. Offline
+helper pins for them are not exit evidence. Parking does not waive the
+catalogue task's real journey gate: that gate still needs a real exact-head
+staging journey, and these legs return via admin-ingested tracks.
+
 Line numbers below track the cited specs; re-verify with the commands at the
 end of this document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -28,7 +35,7 @@ a manual re-verify item.
   closing it is separate work.
 
 One global caveat applies to every COVERED/PARTIAL row: all live specs
-(`health`, `signup`, `signup-arrival`, `login-magic-link`,
+(`health`, `signup`, `signup-arrival`, `login-magic-link`, `catalogue`,
 `ingest-play-meter`, `player-queue-order`) skip while
 `STAGING_BASE_URL` is unset (file-level skip plus in-test guards, see
 `e2e/README.md` "Activation progression"). Until staging is configured, a
@@ -53,6 +60,24 @@ configured, the harness fails closed instead of skipping.
 ## Coverage that is not an M1 exit step
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
+
+- Catalogue fresh-account contracts (`e2e/tests/catalogue.spec.ts:39`
+  "catalogue aliases return the same empty library for each fresh account",
+  `:60` "catalogue collections expose empty-array contracts for a fresh account",
+  and `:74` "Library renders the real API empty state for a fresh account")
+  assert cookie-authenticated `/v1/library` and `/api/library` parity in two
+  independent account contexts, empty track/release/artist collections, refusal
+  of an unowned release detail, and the Library empty state from the real API
+  without response stubs. They skip only before staging is configured and
+  require the account seam once configured. The journey evidence gate requires
+  all three named cases to pass exactly once and accounts for every parked M1
+  leg by name; missing, duplicate, failed or skipped catalogue cases fail a
+  configured full journey. Empty accounts do not prove populated isolation,
+  rich-row rendering, playback or metering. Populated per-user isolation is
+  covered separately by `workers/api/tests/sql/library_catalogue.sql` on
+  exact-head migration CI; populated staging coverage waits for shared-library
+  read-back and admin publication, not fixture injection. No live result is
+  claimed by this matrix entry.
 
 - Local Favorites bulk queue (`apps/web/tests/library-favorites-queue-all.spec.ts:114`,
   '[FAVQ-01] the queue-all action renders exactly once only when a favorite resolves',

@@ -55,6 +55,7 @@ function runShell(script: string, env: Record<string, string>) {
 const sourceSha = '0123456789abcdef0123456789abcdef01234567';
 const dummyVars = {
   HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-value',
+  HYPERDRIVE_ID_MB: 'dummy-mirror-value',
   API_RP_ID_STAGING: 'dummy-rp-id-value',
   API_RP_ORIGIN_STAGING: 'https://dummy-origin.invalid',
 };
@@ -125,9 +126,9 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     }
   });
 
-  // All seven incomplete combinations preserve safe skip, even though the
+  // All fifteen incomplete combinations preserve safe skip, even though the
   // preflight and job may succeed. Values must never enter the summary.
-  for (let mask = 0; mask < 7; mask++) {
+  for (let mask = 0; mask < 15; mask++) {
     test(`missing public vars (mask ${mask}) cannot report deployed`, () => {
       const vars = Object.fromEntries(Object.entries(dummyVars).filter((_, index) => mask & (1 << index)));
       const config = runShell(shell(step('Check api staging configuration')), vars);
