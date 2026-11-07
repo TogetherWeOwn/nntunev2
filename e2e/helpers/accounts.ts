@@ -410,11 +410,12 @@ export async function anonymousGet(
  * Two credentials are installed for a session account. First, the minted
  * session is planted as the `__Host-` session cookie (see
  * browserSessionCookie): session routes (`/v1/session/*`, …) authenticate
- * by cookie only and ignore the bearer, so without this plant browser
- * session requests fail closed as unauthenticated. When no plant applies
- * (a null account or a non-https offline double) any previously planted session cookie is
- * cleared instead, so a re-applied page is anonymous and cookieless rather
- * than leaking the earlier identity. Second, headers are attached ONLY to
+ * by cookie only and ignore the bearer, so browser session requests fail
+ * closed as unauthenticated without this cookie plant.
+ * When no plant applies (a null account or a non-https offline double),
+ * any previously planted session cookie is cleared instead, so a
+ * re-applied page is anonymous and cookieless rather than leaking the
+ * earlier identity. Second, headers are attached ONLY to
  * the staging origin via a context route: `extraHTTPHeaders`/
  * `setExtraHTTPHeaders` would also send the Access service token and
  * session bearer to cross-origin subresources (fonts, analytics,
