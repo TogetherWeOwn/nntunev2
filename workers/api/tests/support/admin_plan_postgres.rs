@@ -324,7 +324,7 @@ fn postgres_sealed_plan_immutability_and_migration_replay_preserve_custody() {
         .await
         .quiet("allow true no-op plan update");
         db.batch_execute(include_str!(
-            "../../../../migrations/0049_ingest_preparation_plans.sql"
+            "../../../../migrations/0050_ingest_preparation_plans.sql"
         ))
         .await
         .quiet("replay plan migration");

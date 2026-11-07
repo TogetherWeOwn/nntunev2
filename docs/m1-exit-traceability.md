@@ -61,23 +61,27 @@ configured, the harness fails closed instead of skipping.
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
 
-- Catalogue fresh-account contracts (`e2e/tests/catalogue.spec.ts:39`
-  "catalogue aliases return the same empty library for each fresh account",
-  `:60` "catalogue collections expose empty-array contracts for a fresh account",
-  and `:74` "Library renders the real API empty state for a fresh account")
-  assert cookie-authenticated `/v1/library` and `/api/library` parity in two
-  independent account contexts, empty track/release/artist collections, refusal
-  of an unowned release detail, and the Library empty state from the real API
-  without response stubs. They skip only before staging is configured and
-  require the account seam once configured. The journey evidence gate requires
-  all three named cases to pass exactly once and accounts for every parked M1
-  leg by name; missing, duplicate, failed or skipped catalogue cases fail a
-  configured full journey. Empty accounts do not prove populated isolation,
-  rich-row rendering, playback or metering. Populated per-user isolation is
-  covered separately by `workers/api/tests/sql/library_catalogue.sql` on
-  exact-head migration CI; populated staging coverage waits for shared-library
-  read-back and admin publication, not fixture injection. No live result is
-  claimed by this matrix entry.
+- Catalogue fresh-account contracts in `e2e/tests/catalogue.spec.ts`:
+  "catalogue aliases return the same library for each fresh account",
+  "catalogue collections expose member-scoped array contracts for a fresh account",
+  and "Library renders the real API state for a fresh account" assert real-API
+  alias parity, array contracts, unowned-release refusal and Library rendering.
+  Before admin publication they retain the empty-state assertions; afterwards
+  they accept shared rows and require populated rendering.
+  "admin-published rich catalogue is shared by two fresh accounts" additionally
+  requires two distinct QA-seam accounts to see identical, nonempty `/v1/library`
+  results with mirror titles and non-null release MBIDs. While
+  `SHARED_CATALOGUE_PUBLISHED` is not `true`, its named **PARKED:** skip counts
+  against the skip budget and the configured journey gate can be green; that
+  green gate is not populated-catalogue acceptance. With the variable `true`,
+  a skip fails the gate. A missing, duplicated or failed case fails in either
+  mode. Un-park only
+  after the admin consumer publishes a curated matched release to staging, by
+  setting `SHARED_CATALOGUE_PUBLISHED=true` for the post-deploy workflow, then
+  rerunning on the deployed SHA. A variable alone cannot satisfy the nonempty
+  assertions. No fixture injection, playback/metering or live acceptance is
+  claimed. SQL visibility/isolation and publish-once proof run separately in
+  `workers/api/tests/sql/library_catalogue.sql` under exact-head migration CI.
 
 - Local Favorites bulk queue (`apps/web/tests/library-favorites-queue-all.spec.ts:114`,
   '[FAVQ-01] the queue-all action renders exactly once only when a favorite resolves',

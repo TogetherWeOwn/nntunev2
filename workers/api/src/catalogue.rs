@@ -1,5 +1,5 @@
 //! Catalogue slice 1: rich Artist/Release/Track reads over the MusicBrainz
-//! mirror plus the per-user ingest library ledger.
+//! mirror plus the own-or-shared ingest library ledger.
 //!
 //! Native core for the `/v1/library`, `/v1/tracks`, `/v1/releases`,
 //! `/v1/artists` collections, the `/v1/releases/{mbid}` detail read, and
@@ -12,7 +12,8 @@
 //!
 //! Sources (ADR 0002 rule 6: the mirror is the ONLY authority for shared
 //! metadata):
-//! - Per-user rows come from the ingest `library` ledger (migration 0035):
+//! - Own and shared rows come from the ingest `library` ledger (ADR 0013):
+//!   NULL owners are shared; non-NULL owners remain private to that user.
 //!   one row per ingest job carrying the matched release MBID plus the
 //!   release's recording MBIDs in album order. An unmatched ingest writes
 //!   the empty array by design (`recording_mbids_or_fallback` in
@@ -46,7 +47,7 @@
 //! them):
 //! - Authentication first: the dispatch owns session-or-bearer identity and
 //!   answers 401 before any store read. Owner ids never leave SQL: the
-//!   library page filters `WHERE ... user_id = $1`, the browse lists and the
+//!   library page filters own OR NULL owner rows, the browse lists and the
 //!   release detail resolve only through the caller's ledger membership (ADR
 //!   0006 §6 — a non-member id returns 404 on detail reads and never appears
 //!   in a list), and no owner column is selected.
@@ -58,7 +59,7 @@
 //!   to the response AFTER membership matching (exact-pair join, member
 //!   recordings filter), never to the membership input: the app-side
 //!   membership enumerations span the caller's whole ledger (one indexed
-//!   per-user scan) so a first page never omits member rows that sort
+//!   own-or-shared scan) so a first page never omits member rows that sort
 //!   inside it. Cursor paging needs the `Request` query-field churn and is
 //!   an explicit slice-2 follow-up, as are `/v1/search` (W14) and
 //!   per-track/per-artist item reads (each needs its own ADR 0010
@@ -532,7 +533,7 @@ pub fn assemble_library_rows(
         .collect()
 }
 
-/// Per-user library page: the ingest ledger crossed with one unnested
+/// Own-or-shared library page: the ingest ledger crossed with one unnested
 /// recording per row, matched content first. App-database only (the
 /// `library` table is app-target, migration 0035): this statement names no
 /// mirror relation, because the mirror lives on its own cluster (ADR 0002
@@ -550,9 +551,10 @@ pub fn assemble_library_rows(
 ///   hidden. Both branches select the same ledger columns so page rows are
 ///   uniform; mirror enrichment (including release/artist for an
 ///   unmatched-but-released job) arrives in the probes below.
-/// - `ORDER BY matched_last ASC, job_id DESC, recording_ord ASC` applies to
-///   the union: matched ingests first, then job recency, then album
-///   position. The ordering names the computed `matched_last` output column
+/// - `ORDER BY matched_last ASC, job_id DESC, recording_ord ASC, idempotency_key ASC`
+///   applies to the union: matched ingests first, then job recency, then album
+///   position, with the ledger's primary key breaking ties between jobs.
+///   The ordering names the computed `matched_last` output column
 ///   because Postgres rejects expressions in a `UNION` `ORDER BY` (`(x IS
 ///   NULL)` is an expression, not a result column — and naming the bare
 ///   `release_mbid` column would sort matched rows by release text instead
@@ -713,20 +715,20 @@ pub fn retain_member_track_occurrences(
 }
 
 /// App-side distinct member releases for the browse lists: every release
-/// the caller owns, ordered by release MBID. Parameters: owner user id
+/// the caller owns or shares, ordered by release MBID. Parameters: owner user id
 /// ($1) only. The enumeration is deliberately uncapped — capping the input
 /// at the response page size drops member releases whose artists then never
 /// appear (the response page has room for them), so the member input spans
-/// the caller's whole ledger (one indexed per-user scan) while the mirror
+/// the caller's whole ledger (one indexed own-or-shared scan) while the mirror
 /// responses stay bounded at [`CATALOGUE_MAX_PAGE_SIZE`].
 pub fn catalogue_member_releases_statement() -> &'static str {
     "SELECT DISTINCT release_mbid FROM library \
-     WHERE user_id = $1 AND release_mbid IS NOT NULL \
+     WHERE (user_id = $1 OR user_id IS NULL) AND release_mbid IS NOT NULL \
      ORDER BY release_mbid ASC"
 }
 
 /// App-side distinct member (release, recording) pairs for the track list:
-/// every pair the caller owns, ordered by release then recording.
+/// every own-or-shared pair, ordered by release then recording.
 /// Parameters: owner user id ($1) only, same uncapped-enumeration
 /// discipline as above — the exact-pair join applies the response bound
 /// after matching, so the track page is the first page of the caller's
@@ -736,13 +738,13 @@ pub fn catalogue_member_track_pairs_statement() -> &'static str {
      FROM library l \
      JOIN LATERAL (SELECT value AS recording_mbid \
      FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true \
-     WHERE l.user_id = $1 AND l.release_mbid IS NOT NULL \
+     WHERE (l.user_id = $1 OR l.user_id IS NULL) AND l.release_mbid IS NOT NULL \
      AND coalesce(cardinality(l.recording_mbids), 0) > 0 \
      ORDER BY release_mbid ASC, recording_mbid ASC"
 }
 
 /// App-side distinct member recordings on one release for the release
-/// detail's track read: every recording the caller owns on that release.
+/// detail's track read: every own-or-shared recording on that release.
 /// Parameters: owner user id ($1), requested release MBID lowercased through
 /// [`enrichment_key`] ($2), same case-insensitive gate as
 /// [`catalogue_release_membership_statement`]. Uncapped like the other
@@ -754,7 +756,7 @@ pub fn catalogue_member_release_recordings_statement() -> &'static str {
      FROM library l \
      JOIN LATERAL (SELECT value AS recording_mbid \
      FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true \
-     WHERE l.user_id = $1 AND lower(l.release_mbid) = $2 \
+     WHERE (l.user_id = $1 OR l.user_id IS NULL) AND lower(l.release_mbid) = $2 \
      AND coalesce(cardinality(l.recording_mbids), 0) > 0 \
      ORDER BY recording_mbid ASC"
 }
@@ -765,7 +767,7 @@ pub fn catalogue_member_release_recordings_statement() -> &'static str {
 /// the mirror's `::uuid` cast: one row means member, zero rows means the
 /// handler answers 404 before any mirror probe.
 pub fn catalogue_release_membership_statement() -> &'static str {
-    "SELECT 1 FROM library WHERE user_id = $1 AND lower(release_mbid) = $2 LIMIT 1"
+    "SELECT 1 FROM library WHERE (user_id = $1 OR user_id IS NULL) AND lower(release_mbid) = $2 LIMIT 1"
 }
 
 /// Artist collection page, member-scoped: only artists of the caller's member
@@ -1100,11 +1102,16 @@ mod tests {
         // Owner scoping never leaves SQL: the library page, the membership
         // reads, and nothing else take a user, and each filters on it. The
         // mirror probes take member MBID arrays only.
-        assert!(library_page_statement().contains("l.user_id = $1"));
-        assert!(catalogue_member_releases_statement().contains("user_id = $1"));
-        assert!(catalogue_member_track_pairs_statement().contains("l.user_id = $1"));
-        assert!(catalogue_member_release_recordings_statement().contains("l.user_id = $1"));
-        assert!(catalogue_release_membership_statement().contains("user_id = $1"));
+        assert!(library_page_statement().contains("(l.user_id = $1 OR l.user_id IS NULL) AND"));
+        assert!(
+            catalogue_member_releases_statement().contains("(user_id = $1 OR user_id IS NULL) AND")
+        );
+        assert!(catalogue_member_track_pairs_statement()
+            .contains("(l.user_id = $1 OR l.user_id IS NULL) AND"));
+        assert!(catalogue_member_release_recordings_statement()
+            .contains("(l.user_id = $1 OR l.user_id IS NULL) AND"));
+        assert!(catalogue_release_membership_statement()
+            .contains("(user_id = $1 OR user_id IS NULL) AND"));
         for statement in [
             artists_list_statement(),
             releases_list_statement(),
@@ -1157,14 +1164,23 @@ mod tests {
         let statement = library_page_statement();
         // Unmatched (empty-array) rows re-enter through the union branch.
         assert!(statement.contains("UNION ALL"));
+        assert_eq!(
+            statement
+                .matches("(l.user_id = $1 OR l.user_id IS NULL) AND")
+                .count(),
+            2
+        );
         assert!(statement.contains("cardinality(l.recording_mbids)"));
-        // Matched-first, then job recency, then album position: the
-        // ordering names the computed `matched_last` column because
+        // Matched-first, then job recency, then album position, with the
+        // primary key breaking ties. The ordering names `matched_last` because
         // Postgres rejects expressions in a UNION ORDER BY (and the bare
         // `release_mbid` column would sort matched rows by release text,
         // not recency).
         assert!(statement.contains("(l.release_mbid IS NULL) AS matched_last"));
-        assert!(statement.contains("ORDER BY matched_last ASC, job_id DESC, recording_ord ASC"));
+        assert_eq!(statement.matches("l.idempotency_key").count(), 2);
+        assert!(statement.ends_with(
+            "ORDER BY matched_last ASC, job_id DESC, recording_ord ASC, idempotency_key ASC LIMIT $2"
+        ));
         // Unnest preserves album order with ordinality.
         assert!(statement.contains("WITH ORDINALITY"));
     }
@@ -1233,9 +1249,9 @@ mod tests {
     }
 
     #[test]
-    fn membership_reads_span_the_ledger_and_stay_owner_scoped() {
+    fn membership_reads_span_the_own_or_shared_ledger() {
         // The browse lists resolve through these app-side reads, so they
-        // carry the library page's disciplines: owner filter and stable
+        // carry the library page's disciplines: own-or-shared filter and stable
         // order. They carry NO bound LIMIT by design — capping the
         // membership input at the response page size drops member rows
         // whose response page still has room (artists past 50 releases,
@@ -1244,7 +1260,7 @@ mod tests {
         // The detail probes answer one row (or the member set) for a
         // member and zero rows for anyone else.
         let releases = catalogue_member_releases_statement();
-        assert!(releases.contains("user_id = $1"));
+        assert!(releases.contains("(user_id = $1 OR user_id IS NULL) AND"));
         assert!(releases.contains("release_mbid IS NOT NULL"));
         assert!(releases.contains("ORDER BY release_mbid ASC"));
         assert!(
@@ -1252,7 +1268,7 @@ mod tests {
             "member releases must not cap the enumeration: {releases}"
         );
         let pairs = catalogue_member_track_pairs_statement();
-        assert!(pairs.contains("l.user_id = $1"));
+        assert!(pairs.contains("(l.user_id = $1 OR l.user_id IS NULL) AND"));
         assert!(pairs.contains("unnest(l.recording_mbids)"));
         assert!(pairs.contains("ORDER BY release_mbid ASC, recording_mbid ASC"));
         assert!(
@@ -1260,7 +1276,7 @@ mod tests {
             "member pairs must not cap the enumeration: {pairs}"
         );
         let recordings = catalogue_member_release_recordings_statement();
-        assert!(recordings.contains("l.user_id = $1"));
+        assert!(recordings.contains("(l.user_id = $1 OR l.user_id IS NULL) AND"));
         assert!(recordings.contains("lower(l.release_mbid) = $2"));
         assert!(recordings.contains("unnest(l.recording_mbids)"));
         assert!(
@@ -1268,7 +1284,7 @@ mod tests {
             "member release recordings must not cap the enumeration: {recordings}"
         );
         let membership = catalogue_release_membership_statement();
-        assert!(membership.contains("user_id = $1"));
+        assert!(membership.contains("(user_id = $1 OR user_id IS NULL) AND"));
         assert!(membership.contains("lower(release_mbid) = $2"));
         assert!(membership.ends_with("LIMIT 1"));
         for statement in [releases, pairs, recordings] {

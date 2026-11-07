@@ -219,7 +219,7 @@ fn postgres_media_v1_candidate_recovery_replay_and_retained_custody_keep_exact_m
             assert!(before == snapshot(&db, s).await);
         }
         db.batch_execute(include_str!(
-            "../../../../migrations/0050_posted_file_media_v1.sql"
+            "../../../../migrations/0051_posted_file_media_v1.sql"
         ))
         .await
         .quiet("replay media migration");
