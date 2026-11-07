@@ -18,5 +18,5 @@ velmora-test-nntp = { version = "0.1.0", git = "https://github.com/TogetherWeOwn
 # Consumer-boundary acceptance (tests/pinned_engine_boundary.rs): the
 # nntune-core client against this server, both at the pinned velmora rev.
 # nntune-core never depends on this crate, so there is no cycle.
-nntune-core = { path = "../nntune-core" }
+nntune-core = { version = "0.1.0", path = "../nntune-core" }
 tokio = { version = "1", features = ["full"] }
