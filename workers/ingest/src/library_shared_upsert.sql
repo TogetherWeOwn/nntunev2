@@ -6,3 +6,4 @@ job_id = EXCLUDED.job_id,
 user_id = EXCLUDED.user_id,
 release_mbid = EXCLUDED.release_mbid,
 recording_mbids = EXCLUDED.recording_mbids
+WHERE library.user_id IS NULL

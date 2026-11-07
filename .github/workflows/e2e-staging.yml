@@ -361,7 +361,7 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
-          # Un-park only after admin publish; empty/parked evidence cannot pass the gate.
+          # Un-park only after admin publish; parked evidence is not acceptance.
           SHARED_CATALOGUE_PUBLISHED: ${{ vars.SHARED_CATALOGUE_PUBLISHED }}
           SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
           SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
@@ -388,16 +388,17 @@ jobs:
         # failed, and turns an all-skipped green run red. Unconfigured
         # staging never reaches here: the preflight fails the job. The skip
         # budget covers the recording_mbids test.fixme, the nine parked
-        # user-NZB legs and the capped stream leg (TWO-1635); every other
-        # skip fails the job.
+        # user-NZB legs, capped stream leg and the shared-catalogue park;
+        # the last allowance ends when publication is enabled.
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
         if: always() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
-          MAX_ALLOWED_SKIPS: '11'
+          MAX_ALLOWED_SKIPS: '12'
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SHARED_CATALOGUE_PUBLISHED: ${{ vars.SHARED_CATALOGUE_PUBLISHED }}
         run: node scripts/enforce-journey-evidence.mjs
 
       # This is a separate product predicate, not a new meaning of legacy

@@ -122,7 +122,8 @@ pub fn upsert_library_sql() -> &'static str {
 
 /// Shared publish (ADR 0013): NULL owner, fenced by the publishing job's
 /// existence, never the admin's account. The consumer must persist the job
-/// before executing this statement; enablement remains separate.
+/// before executing this statement; enablement remains separate. A key
+/// collision with a private row affects 0 rows and preserves its owner.
 pub fn upsert_shared_library_sql() -> &'static str {
     include_str!("library_shared_upsert.sql").trim_end()
 }
@@ -303,6 +304,7 @@ mod tests {
         assert!(!sql.contains("$5"));
         assert!(sql.contains("ON CONFLICT (idempotency_key) DO UPDATE SET"));
         assert!(sql.contains("user_id = EXCLUDED.user_id"));
+        assert!(sql.ends_with("WHERE library.user_id IS NULL"));
         assert_eq!(
             SHARED_UPSERT_PARAM_ORDER,
             [

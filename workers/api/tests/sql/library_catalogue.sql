@@ -623,6 +623,31 @@ BEGIN
             END IF;
         END LOOP;
     END LOOP;
+    -- An existing publishing job cannot promote a private idempotency-key collision.
+    EXECUTE (SELECT sql FROM shared_publish_query)
+        USING 'job_shared'::text, 'lib:key:A'::text,
+              'cccccccc-1111-2222-3333-444444444444'::text,
+              ARRAY['55555555-1111-2222-3333-444444444444']::text[];
+    GET DIAGNOSTICS page_count = ROW_COUNT;
+    IF page_count <> 0 THEN RAISE EXCEPTION 'shared publish updated a private row'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM library WHERE idempotency_key = 'lib:key:A'
+        AND user_id = 'user-lib-1' AND job_id = 'lib-job-A'
+        AND release_mbid = 'aaaaaaaa-1111-2222-3333-444444444444'
+        AND recording_mbids = ARRAY['11111111-1111-2222-3333-444444444444',
+            '22222222-1111-2222-3333-444444444444',
+            '33333333-1111-2222-3333-444444444444']::text[]) THEN
+        RAISE EXCEPTION 'private collision changed ownership or content';
+    END IF;
+    page_count := 0;
+    FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
+        USING 'user-lib-shared'::text, 50::bigint LOOP
+        page_count := page_count + 1;
+        IF page_row.job_id <> 'job_shared' THEN
+            RAISE EXCEPTION 'private collision leaked to a fresh reader';
+        END IF;
+    END LOOP;
+    IF page_count <> 1 THEN RAISE EXCEPTION 'private collision changed fresh read-back'; END IF;
+
     -- A missing job refuses both an initial insert and a conflicting replay.
     EXECUTE (SELECT sql FROM shared_publish_query)
         USING 'job_missing'::text, 'ingest:fixture:missing'::text, NULL::text, '{}'::text[];
