@@ -45,7 +45,7 @@ export default class QualificationComposite extends WorkerEntrypoint {
       headers.set('x-qualification-range-reads', String(reads));
       return new Response(response.body, { status: response.status, headers });
     }
-    if (path === '/prepare') return worker.qualification_prepare(request, this.env);
+    if (path === '/prepare' || path === '/prepare-flac') return worker.qualification_prepare(request, this.env);
     if (path === '/recover') return worker.qualification_recover(request, this.env);
     if (path === '/abi') {
       return Response.json(Object.getOwnPropertyNames(generated.default.prototype).sort());

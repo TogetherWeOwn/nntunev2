@@ -1,8 +1,9 @@
 //! Actions-only raw bridges, absent from ordinary generated artifacts. These
 //! have no public router entry and accept no caller-selected producer identity.
-//! The synthetic tagged output is not FLAC parser/tagger acceptance.
+//! Synthetic structural FLAC input can also exercise the real tag rewrite;
+//! neither fixture establishes authenticated upload or PCM decoder acceptance.
 
-use crate::flac::{FlacWalk, StreamInfo, TaggedFlac};
+use crate::flac::{rewrite_tags, FlacWalk, StreamInfo, TaggedFlac, TrackTags};
 use crate::posted_generations::dispatch::{
     preparation::{prepare_and_send, recover_delivery, PreparationInput},
     DispatchPointer, DispatchSend,
@@ -38,19 +39,61 @@ fn tagged() -> TaggedFlac {
     }
 }
 
-async fn prepare(req: worker::Request, env: worker::Env) -> worker::Result<worker::Response> {
+async fn prepare(mut req: worker::Request, env: worker::Env) -> worker::Result<worker::Response> {
     if req.method() != worker::Method::Post {
         return worker::Response::error("qualification unavailable", 503);
     }
+    let flac = req.path() == "/prepare-flac";
+    let tagged = if flac {
+        use futures_util::StreamExt;
+        let mut stream = req.stream()?;
+        let mut input = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if chunk.len() > (128 * 1024usize).saturating_sub(input.len()) {
+                return worker::Response::error("qualification unavailable", 503);
+            }
+            input.extend_from_slice(&chunk);
+        }
+        let tags = TrackTags {
+            title: "Qualification title",
+            artist: "Qualification artist",
+            album: "Qualification album",
+            album_artist: None,
+            date: None,
+            track_number: None,
+            track_total: None,
+            disc_number: None,
+            disc_total: None,
+            recording_mbid: "00000000-0000-4000-8000-000000000001",
+            release_mbid: "00000000-0000-4000-8000-000000000002",
+            artist_mbids: &[],
+            isrc: None,
+        };
+        match rewrite_tags(&input, &tags) {
+            Ok(tagged) => tagged,
+            Err(_) => return worker::Response::error("qualification unavailable", 503),
+        }
+    } else {
+        tagged()
+    };
     let result = prepare_and_send(
         &env,
         PreparationInput {
-            job: "qualification-job",
-            operation: "qualification-file",
+            job: if flac {
+                "qualification-flac-job"
+            } else {
+                "qualification-job"
+            },
+            operation: if flac {
+                "qualification-flac-file"
+            } else {
+                "qualification-file"
+            },
             predecessor: 0,
             file_index: 0,
             blocks_per_article: 11,
-            tagged: tagged(),
+            tagged,
         },
     )
     .await;

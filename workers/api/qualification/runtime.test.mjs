@@ -7,6 +7,7 @@ import { setTimeout } from 'node:timers/promises';
 import test from 'node:test';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { database, seed, sql, state } from './database.mjs';
+import { flacFixture, metadataBlocks } from './flac-fixture.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const api = 'api/';
@@ -99,6 +100,21 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       worker('composite-dead-letter', [await sourceModule(`${api}qualification/dead-letter-probe.mjs`)], {
         r2Buckets: { INGEST_SCRATCH: 'qualification-composite' },
         queueConsumers: { 'qualification-composite-dead-letter': { maxBatchSize: 1, maxBatchTimeout: 0 } },
+      }),
+      worker('composite-flac', compositeModules, {
+        bindings: { ...mode, HYPERDRIVE_CACHING_DISABLED: '1' },
+        hyperdrives: { LIBRARY_DB: database },
+        serviceBindings: { API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' } },
+        r2Buckets: { INGEST_SCRATCH: 'qualification-flac' },
+        queueProducers: { INGEST_QUEUE: 'qualification-flac-queue' },
+        queueConsumers: { 'qualification-flac-queue': {
+          maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 0,
+          deadLetterQueue: 'qualification-flac-dead-letter',
+        } },
+      }),
+      worker('flac-dead-letter', [await sourceModule(`${api}qualification/dead-letter-probe.mjs`)], {
+        r2Buckets: { INGEST_SCRATCH: 'qualification-flac' },
+        queueConsumers: { 'qualification-flac-dead-letter': { maxBatchSize: 1, maxBatchTimeout: 0 } },
       }),
       worker('ingest', ingestModules, {
         bindings: mode,
@@ -336,5 +352,64 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     assert.equal((await recover(pointer)).status, 503);
     assert.equal(state(), persisted);
     assert.ok(await bucket.get(objectKey), 'unknown/version mismatch retains R2');
+  });
+
+  await t.test('real FLAC tag rewrite feeds Rust R2, sealed plan and Queue recovery', async () => {
+    seed(true);
+    const composite = await mf.getWorker('composite-flac');
+    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+    const { input, audio, samples } = flacFixture();
+    const prepare = body => composite.fetch('https://qualification.invalid/prepare-flac', {
+      method: 'POST', body,
+    });
+    const badCrc = Buffer.from(input);
+    badCrc[badCrc.length - 1] ^= 1;
+    const badTotal = Buffer.from(input);
+    badTotal[25] ^= 1;
+    const initial = state();
+    for (const body of [Buffer.from('invalid'), badCrc, badTotal, Buffer.alloc(128 * 1024 + 1)]) {
+      const response = await prepare(body);
+      assert.equal(response.status, 503, 'invalid structural FLAC must fail before preparation');
+      assert.equal(await response.text(), 'qualification unavailable');
+      assert.equal(state(), initial);
+      assert.deepEqual((await bucket.list()).objects, [], 'parser refusal must not write R2');
+    }
+    assert.equal((await prepare(input)).status, 202);
+    const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+      SELECT id,object_id,object_version,plaintext_bytes,plaintext_sha256,send_acknowledged
+      FROM ingest_file_dispatches WHERE job_id = 'qualification-flac-job') q;`));
+    const objectKey = `prepared-tagged/${row.object_id}`;
+    const object = await bucket.get(objectKey);
+    assert.ok(object);
+    assert.equal(object.version, row.object_version);
+    const tagged = Buffer.from(await object.arrayBuffer());
+    assert.ok(tagged.length > 65_536, 'tagged fixture must cross the real range-reader boundary');
+    assert.equal(tagged.length, row.plaintext_bytes);
+    assert.equal(row.plaintext_sha256, createHash('sha256').update(tagged).digest('hex'));
+    assert.notEqual(row.plaintext_sha256, createHash('sha256').update(input).digest('hex'),
+      'dispatch must freeze tagged bytes, not the original upload');
+    const rewritten = metadataBlocks(tagged);
+    assert.deepEqual(rewritten.blocks.map(b => b.type), [0, 4], 'tagger strips padding and adds comments');
+    assert.equal(Number(rewritten.blocks[0].body.readBigUInt64BE(10) & 0xfffffffffn), samples);
+    assert.ok(rewritten.blocks[1].body.includes(Buffer.from('TITLE=Qualification title')));
+    assert.deepEqual(rewritten.audio, audio, 'tag rewrite must preserve every structural audio frame');
+    assert.equal(row.send_acknowledged, true);
+    assert.equal(sql(`SELECT count(*) FROM ingest_preparation_plans
+      WHERE job_id = 'qualification-flac-job' AND octet_length(encrypted) = plaintext_bytes + 16;`), '1');
+    const persisted = state();
+    let delivered;
+    for (let i = 0; i < 400; i++) {
+      assert.equal(await bucket.get('qualification-refused'), null);
+      const marker = await bucket.get('qualification-composite-delivered');
+      if (marker) { delivered = await marker.json(); break; }
+      await setTimeout(50);
+    }
+    assert.deepEqual(delivered, { count: 1 });
+    assert.equal(state(), persisted, 'Queue recovery does not mutate startup authority');
+    assert.equal((await prepare(input)).status, 202);
+    assert.equal(state(), persisted, 'tagging and producer replay preserve exact custody');
+    assert.equal((await bucket.get(objectKey)).version, row.object_version);
+    assert.deepEqual((await bucket.list()).objects.map(o => o.key).sort(),
+      [objectKey, 'qualification-composite-delivered'].sort(), 'R2 stores no plaintext plan');
   });
 });

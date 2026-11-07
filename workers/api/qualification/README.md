@@ -111,8 +111,25 @@ long bodies. Each must refuse before DB dispatch while retaining the R2 object;
 the unchanged real multi-range producer/recovery path is the positive control.
 No runtime/provider guard or test expectation is relaxed to hide the panic.
 
-These corrected controls are written, not locally executed; require exact-head
-Actions before claiming their runtime result. Process crashes, ambiguous DB commits,
+At head `bd7ff8df`, [exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42377491568/job/128418003741)
+passes all eight runtime subtests (nine Node passes including the enclosing test).
+This includes the corrected range faults and actual Rust composite above, not
+just the earlier JS-seeded controls.
+
+A separate synthetic structural FLAC control now feeds the actual `rewrite_tags`
+parser/tagger before the same Rust preparation/R2/private plan service/DB/Queue
+path. Fixed harness tags and producer identity cannot be chosen by the request.
+Malformed magic, frame CRC, total samples and an oversized harness body must
+refuse before R2 or DB writes. The positive fixture crosses the range boundary;
+assertions require stripped padding, fresh comments, unchanged frame bytes,
+byte-derived tagged digest distinct from the input, exact R2 version, sealed plan,
+Queue recovery and immutable producer replay. Separate fixed owner/job/operation
+custody and an isolated bucket keep the earlier control's rows and deliberately
+replaced object from satisfying or blocking this one.
+The fixture is generated structural data: no PCM decoder or MD5 verification is
+performed, and historical seeded admission is still not authenticated HTTP upload.
+These new controls are written, not locally executed; require exact-head Actions
+before claiming their result. Process crashes, ambiguous DB commits,
 large-file/deadline limits, deployed lifecycle/drain, actual staging/restore and
 remaining foundation review are still unqualified.
 No test uses candidate media keys, articles or manifests.

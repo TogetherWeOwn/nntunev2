@@ -24,20 +24,26 @@ export function sql(text) {
   }
 }
 
-export function seed() {
+export function seed(flac = false) {
+  // Two fixed fixtures get separate DB custody as well as separate R2 buckets.
+  // No SQL identifier or value comes from a request or arbitrary fixture label.
+  assert.equal(typeof flac, 'boolean');
+  const owner = flac ? 'qualification-flac-owner' : 'qualification-owner';
+  const job = flac ? 'qualification-flac-job' : 'qualification-job';
+  const email = flac ? 'qualification-flac@example.invalid' : 'qualification@example.invalid';
   // Shape-valid historical admission custody, not an authenticated upload test.
   // The actual producer creates every plan, dispatch, receipt and attempt row.
   sql(`
     INSERT INTO users (id,email,created_at,role)
-      VALUES ('qualification-owner','qualification@example.invalid',1700000000,'admin');
+      VALUES ('${owner}','${email}',1700000000,'admin');
     INSERT INTO ingest_jobs
       (id,user_id,idempotency_key,accepted_at,status,source,content_sha256,nzb_bytes,file_count,segment_count)
-      VALUES ('qualification-job','qualification-owner','admin:' || repeat('a',64),1700000000,
+      VALUES ('${job}','${owner}','admin:' || repeat('a',64),1700000000,
         'queued','admin',repeat('a',64),79,1,1);
     INSERT INTO ingest_originals
       (job_id,content_sha256,nzb_bytes,nzb_ref_encrypted,nzb_ref_envelope_version,nzb_ref_kek_version,
        nzb_ref_dek_wrapped_nonce,nzb_ref_dek_wrapped,nzb_ref_payload_nonce,nzb_ref_payload_format,created_at)
-      VALUES ('qualification-job',repeat('a',64),79,decode(repeat('00',48),'hex'),2,1,
+      VALUES ('${job}',repeat('a',64),79,decode(repeat('00',48),'hex'),2,1,
         decode(repeat('00',12),'hex'),decode(repeat('00',48),'hex'),decode(repeat('00',12),'hex'),1,1700000000);
   `);
 }
