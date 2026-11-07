@@ -43,7 +43,8 @@ const SENTINEL_URL = "https://SENTINEL-host.example.invalid/x?key=SENTINEL-QUERY
 const SENTINEL_NEWLINE = "SENTINEL-LINE1\nSENTINEL-LINE2";
 const SENTINEL_CTRL = "SENTINEL-CTRL\u0007END";
 
-const HTML_MARKERS = "NNTune Get started sign up plan pricing Sign in byop server host";
+const HTML_MARKERS = "NNTune Get started sign up plan pricing Sign in";
+const ACTIVE_ROUTES = ["/api/health", "/api/ready", "/api/build", "/", "/signup", "/pricing", "/login"];
 
 function happyBody(path) {
   if (path === "/api/health") return { type: "json", body: { ok: true, version: "1" } };
@@ -64,6 +65,12 @@ async function withFixture(routes, fn) {
     const override = routes[path];
     if (override) {
       override(req, res);
+      return;
+    }
+    // Unknown and retired routes are not healthy fixture endpoints.
+    if (!ACTIVE_ROUTES.includes(path)) {
+      res.writeHead(404);
+      res.end("not found");
       return;
     }
     const happy = happyBody(path);
@@ -375,7 +382,7 @@ describe("secret-safe diagnostics", () => {
     try {
       const { lines, log } = captureLog();
       const failures = await smoke("http://127.0.0.1:9", { log, timeoutMs: 2_000 });
-      assert.ok(failures >= 8, "every route must fail when fetch throws");
+      assert.equal(failures, ACTIVE_ROUTES.length, "every route must fail when fetch throws");
       assertNoSentinelInLines(lines, "exception-message");
       for (const path of ["/api/health", "/api/ready", "/api/build", "/", "/login"]) {
         assert.ok(lines.some((l) => l.includes(path)), `diagnostic must name ${path}`);
@@ -408,8 +415,8 @@ describe("retained contract", () => {
       const { lines, log } = captureLog();
       const failures = await smoke(base, { log, timeoutMs: 2_000, expectedSha: GOOD_SHA });
       assert.equal(failures, 0, lines.join("\n"));
-      assert.equal(hits.length, 8, "single attempt: exactly one hit per route");
-      assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+      assert.equal(hits.length, ACTIVE_ROUTES.length, "single attempt: exactly one hit per route");
+      assert.deepEqual(hits.map((h) => h.path), ACTIVE_ROUTES);
     });
   });
 
@@ -419,7 +426,7 @@ describe("retained contract", () => {
       const { log } = captureLog();
       const failures = await smoke(base, { log, timeoutMs: 2_000, versionOverride: override });
       assert.equal(failures, 0);
-      assert.equal(hits.length, 8);
+      assert.equal(hits.length, ACTIVE_ROUTES.length);
       for (const hit of hits) {
         assert.equal(
           hit.headers["cloudflare-workers-version-overrides"],
@@ -533,8 +540,8 @@ describe("HTTP response guards", () => {
           const failures = await smoke(base, { log, timeoutMs: 2_000 });
           assert.equal(failures, 1, `only ${path}'s HTTP 500 must fail: ${lines.join("\n")}`);
           assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
-          assert.equal(hits.length, 8, "every route must still be attempted once");
-          assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+          assert.equal(hits.length, ACTIVE_ROUTES.length, "every route must still be attempted once");
+          assert.equal(new Set(hits.map((h) => h.path)).size, ACTIVE_ROUTES.length);
         },
       );
     });
@@ -578,8 +585,8 @@ describe("HTTP response guards", () => {
           assert.equal(hits.filter((h) => h.path === alias).length, 0, `${alias} must never be fetched`);
           assert.equal(failures, 1, `only ${path}'s redirect must fail: ${lines.join("\n")}`);
           assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
-          assert.equal(hits.length, 8, "every original route must still be attempted once");
-          assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+          assert.equal(hits.length, ACTIVE_ROUTES.length, "every original route must still be attempted once");
+          assert.equal(new Set(hits.map((h) => h.path)).size, ACTIVE_ROUTES.length);
         },
       );
     });
@@ -599,8 +606,8 @@ describe("HTTP response guards", () => {
         const failures = await smoke(base, { log, timeoutMs: 2_000 });
         assert.equal(failures, 1, `only /login's missing marker must fail: ${lines.join("\n")}`);
         assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
-        assert.equal(hits.length, 8, "every route must still be attempted once");
-        assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+        assert.equal(hits.length, ACTIVE_ROUTES.length, "every route must still be attempted once");
+        assert.equal(new Set(hits.map((h) => h.path)).size, ACTIVE_ROUTES.length);
       },
     );
   });

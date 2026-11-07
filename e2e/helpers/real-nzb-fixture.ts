@@ -1,13 +1,10 @@
 /**
  * Staging real-NZB fixture resolution for the post-deploy journey.
  *
- * The staging provider is a real NNTP service, so the journey ingests a
- * real, secret-held NZB rebuilt in CI from the `NNTUNE_TEST_NZB_XZ_B64_1` /
- * `_2` repo secrets into `RUNNER_TEMP` only (see
- * `.github/workflows/e2e-staging.yml`). This helper resolves that runtime
- * path: when the `TEST_NZB_PATH` environment variable names an existing
- * file, staging legs ingest it; otherwise they fail closed — there are no
- * checked-in NZB fixtures to fall back to (TWO-1169 removed them all).
+ * Dormant compatibility helper: the staging workflow no longer stages or
+ * ingests an NZB. User upload legs are parked until admin ingest can seed
+ * a curated track. This helper retains runtime-path resolution for their
+ * offline fixtures only; there are no checked-in NZB bytes to fall back to.
  *
  * Owner rule (public repo): no NZB bytes, message-IDs, subjects, file names
  * or segment lists in the repo or public logs. This file carries none of
@@ -17,10 +14,10 @@
  * Honest scope: the secret NZB is a RAR/PAR2 set and the ingest pipeline
  * has no RAR read (`workers/ingest` transcode inputs skip non-audio files),
  * so an RAR-only subset fails permanent at transcode before any library row
- * is written. The real NZB currently proves signup, BYOP + test-connection,
- * the intake-level ingest-refusal leg and the provider 430 control — but no
- * completable ingest or streamable track until RAR read lands. Legs that need
- * them skip by name in real-NZB mode (see `REAL_NZB_RAR_SKIP` and the
+ * is written. The dormant fixture proves no live signup, subscription,
+ * ingest or playback behavior. The provider 430 control remains live and
+ * independent of this helper. Legacy fixture legs that need audio
+ * skip by name in real-NZB mode (see `REAL_NZB_RAR_SKIP` and the
  * journey evidence gate's real-NZB allow-list); the skip reason links the
  * RAR-set playback follow-up (TWO-1174). The 430 control leg needs no NZB
  * at all (it uses a random, never-posted message-ID).

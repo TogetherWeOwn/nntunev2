@@ -606,10 +606,10 @@ test.describe('failure-artifact sanitization', () => {
         join(probe, 'marker.spec.ts'),
         `import { test, expect } from '@playwright/test';\n` +
           `test('fills marker password then fails', async ({ page }) => {\n` +
-          `  await page.setContent('<input data-testid="byop-pass" type="password" />');\n` +
-          `  await page.getByTestId('byop-pass').fill('${marker}');\n` +
+          `  await page.setContent('<input data-testid="fixture-secret" type="password" />');\n` +
+          `  await page.getByTestId('fixture-secret').fill('${marker}');\n` +
           // Fail on a page assertion so the failure snapshots the filled page.
-          `  await expect(page.getByTestId('byop-pass')).toHaveValue('definitely-not-the-marker');\n` +
+          `  await expect(page.getByTestId('fixture-secret')).toHaveValue('definitely-not-the-marker');\n` +
           `});\n`,
       );
       writeFileSync(
@@ -2814,18 +2814,20 @@ const CONFIGURED_JOURNEY_ENV = {
   QA_AUTH_TOKEN: 'dummy-qa-token',
   MAX_ALLOWED_SKIPS: '11',
 };
-const cataloguePassingCases = () => CATALOGUE_FRESH_CASES.map((name) =>
+const BILLING_ARRIVAL_TITLE = 'public UI signup with virtual authenticator reaches billing';
+const activeJourneyPassingCases = () => CATALOGUE_FRESH_CASES.map((name) =>
   PASSING('catalogue.spec.ts', name),
-).join('');
+).join('') + PASSING('signup-arrival.spec.ts', BILLING_ARRIVAL_TITLE);
 const parkedM1Cases = () => M1_NAMED_CASES.map(([file, name]) =>
   PASSING(file, `journey › ${name}`).replace('/>', '><skipped/></testcase>'),
 ).join('');
 
 test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('configured full journey reports catalogue passes and named M1 skips honestly', () => {
-    const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    const result = runGateScript(suiteXml(activeJourneyPassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 14 | 3 | 11 | 0 |');
+    expect(result.summary).toContain('| 15 | 4 | 11 | 0 |');
+    expect(result.summary).toContain(`signup-arrival.spec.ts: ${BILLING_ARRIVAL_TITLE} | passed |`);
     for (const name of CATALOGUE_FRESH_CASES) {
       expect(result.summary).toContain(`catalogue.spec.ts: ${name} | passed |`);
     }
@@ -2834,10 +2836,35 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     }
     expect(result.summary).toContain('do not establish populated-library isolation');
     expect(result.summary).toContain('skips, never playback or metering proof');
+    expect(result.summary).toContain('Billing arrival is not invite redemption or completed-subscription evidence');
+  });
+
+  for (const scenario of ['missing', 'skipped', 'duplicate', 'wrong spec'] as const) {
+    test(`configured full journey rejects ${scenario} billing-arrival evidence`, () => {
+      const billing = PASSING('signup-arrival.spec.ts', BILLING_ARRIVAL_TITLE);
+      const replacement = scenario === 'missing' ? ''
+        : scenario === 'skipped' ? billing.replace('/>', '><skipped/></testcase>')
+          : scenario === 'duplicate' ? billing + billing
+            : PASSING('other.spec.ts', BILLING_ARRIVAL_TITLE);
+      const cases = activeJourneyPassingCases().replace(billing, replacement);
+      const result = runGateScript(suiteXml(cases + parkedM1Cases()), {
+        ...CONFIGURED_JOURNEY_ENV, MAX_ALLOWED_SKIPS: '12',
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.summary).toContain(
+        `${BILLING_ARRIVAL_TITLE} | ${scenario === 'wrong spec' ? 'missing' : scenario} |`,
+      );
+    });
+  }
+
+  test('journey name describes live legs without claiming parked playback', () => {
+    const section = jobSection(stagingWorkflow, 'e2e');
+    expect(section).toContain('name: full journey (signup → billing → library)');
+    expect(section).not.toContain('name: full journey (signup → library → meter → limits)');
   });
 
   test('configured full journey rejects a missing catalogue case', () => {
-    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]), '');
+    const cases = activeJourneyPassingCases().replace(PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]), '');
     const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
     expect(result.status).not.toBe(0);
     expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
@@ -2845,7 +2872,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
   test('configured full journey rejects a skipped catalogue case', () => {
-    const cases = cataloguePassingCases().replace('/>', '><skipped/></testcase>');
+    const cases = activeJourneyPassingCases().replace('/>', '><skipped/></testcase>');
     const result = runGateScript(suiteXml(cases + parkedM1Cases()), {
       ...CONFIGURED_JOURNEY_ENV, MAX_ALLOWED_SKIPS: '12',
     });
@@ -2855,14 +2882,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
   test('configured full journey rejects duplicate catalogue evidence', () => {
-    const cases = cataloguePassingCases() + PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]);
+    const cases = activeJourneyPassingCases() + PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]);
     const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
     expect(result.status).not.toBe(0);
     expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | duplicate |`);
   });
 
   test('another spec cannot satisfy required catalogue evidence', () => {
-    const cases = cataloguePassingCases().replace('classname="catalogue.spec.ts"', 'classname="other.spec.ts"');
+    const cases = activeJourneyPassingCases().replace('classname="catalogue.spec.ts"', 'classname="other.spec.ts"');
     const result = runGateScript(suiteXml(cases + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
     expect(result.status).not.toBe(0);
     expect(result.summary).toContain(`${CATALOGUE_FRESH_CASES[0]} | missing |`);
@@ -2870,7 +2897,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
   test('omitting a parked M1 leg is not complete named evidence', () => {
     const cases = parkedM1Cases().replace(/<testcase\b[^>]*>[\s\S]*?<\/testcase>/, '');
-    const result = runGateScript(suiteXml(cataloguePassingCases() + cases), CONFIGURED_JOURNEY_ENV);
+    const result = runGateScript(suiteXml(activeJourneyPassingCases() + cases), CONFIGURED_JOURNEY_ENV);
     expect(result.status).not.toBe(0);
     expect(result.summary).toContain('ingested track carries recording_mbids | missing |');
   });

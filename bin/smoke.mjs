@@ -53,7 +53,6 @@ const HTML_ROUTES = [
   { path: "/signup", marker: /Get started|sign up/i },
   { path: "/pricing", marker: /plan|pricing/i },
   { path: "/login", marker: /Sign in/i },
-  { path: "/onboarding/byop", marker: /byop|server|host/i },
 ];
 
 function parseArgs(argv) {

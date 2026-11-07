@@ -196,7 +196,7 @@ export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string
   return raw;
 }
 
-/** Real staging NNTP endpoint the BYOP wizard points at (a real provider despite the `SYNTHETIC_` names). */
+/** Staging NNTP endpoint for provider controls (a real provider despite the `SYNTHETIC_` names). */
 export interface NntpEndpoint {
   host: string;
   port: number;
@@ -210,34 +210,30 @@ export interface NntpEndpoint {
  * NNTP endpoint config. Host/user have harness defaults (not secrets); the
  * password has NO default and stays in the environment. TLS defaults on.
  *
- * Fail closed on a provider transport the BYOP wizard cannot represent:
- * only the UI allowlist ports (119 / 563) are accepted, and TLS-off is
- * rejected outright — the product allows plaintext only behind an explicit
- * in-page acknowledgement the harness is not configured to give, so the
- * harness must never enable (or silently ignore) plaintext on its behalf.
+ * Retain the provider-control fixture's bounded transport policy:
+ * only ports 119 / 563 are accepted and TLS-off is rejected outright.
+ * The harness must never enable (or silently ignore) plaintext.
  */
 export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean } {
   const host = (process.env.SYNTHETIC_NNTP_HOST || 'synthetic-nntp').trim();
   const port = Number(process.env.SYNTHETIC_NNTP_PORT || '563');
   const user = (process.env.SYNTHETIC_NNTP_USER || 'e2e').trim();
   const tlsSetting = (process.env.SYNTHETIC_NNTP_TLS || 'on').trim().toLowerCase();
-  if (!host) throw new Error('[byop] SYNTHETIC_NNTP_HOST is empty.');
+  if (!host) throw new Error('[nntp] SYNTHETIC_NNTP_HOST is empty.');
   if (!Number.isInteger(port) || !SUPPORTED_NNTP_PORTS.includes(port)) {
     throw new Error(
-      '[byop] SYNTHETIC_NNTP_PORT must be one of the BYOP allowlist ports: 119 or 563. ' +
-        'The wizard cannot select any other port — refusing to run against an ' +
-        'unrepresentable fixture transport (names only — no values logged).',
+      '[nntp] SYNTHETIC_NNTP_PORT must be one of the fixture ports: 119 or 563. ' +
+        'Refusing an unsupported fixture transport (names only — no values logged).',
     );
   }
   if (tlsSetting === 'off') {
     throw new Error(
-      '[byop] SYNTHETIC_NNTP_TLS=off requests a plaintext transport, which the fixture ' +
-        'harness does not support: plaintext requires an explicit in-page acknowledgement ' +
-        'the fixture is not configured to give. Run the synthetic endpoint with TLS on.',
+      '[nntp] SYNTHETIC_NNTP_TLS=off requests a plaintext transport, which the fixture ' +
+        'harness does not support. Run the synthetic endpoint with TLS on.',
     );
   }
   if (tlsSetting !== 'on') {
-    throw new Error('[byop] SYNTHETIC_NNTP_TLS must be "on" (or unset). See e2e/README.md.');
+    throw new Error('[nntp] SYNTHETIC_NNTP_TLS must be "on" (or unset). See e2e/README.md.');
   }
   return { host, port, user, tls: true, hasPassword: Boolean(process.env.SYNTHETIC_NNTP_PASS) };
 }

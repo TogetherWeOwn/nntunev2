@@ -163,7 +163,11 @@ const CATALOGUE_CASES = [
   'catalogue collections expose empty-array contracts for a fresh account',
   'Library renders the real API empty state for a fresh account',
 ].map((match) => ({ file: 'catalogue.spec.ts', match }));
-const NAMED_JOURNEYS = [...CATALOGUE_CASES, ...ALLOWED_SKIPS];
+const BILLING_ARRIVAL_CASE = {
+  file: 'signup-arrival.spec.ts',
+  match: 'public UI signup with virtual authenticator reaches billing',
+};
+const NAMED_JOURNEYS = [...CATALOGUE_CASES, BILLING_ARRIVAL_CASE, ...ALLOWED_SKIPS];
 
 // Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
 // completable ingest until RAR read lands — the pipeline fails an RAR-only
@@ -433,7 +437,8 @@ summaryLines = [
   ...namedJourneys.map((entry) => `| ${entry.file}: ${entry.match} | ${entry.outcome} |`),
   '',
   'Fresh-account catalogue cases do not establish populated-library isolation or row rendering. ' +
-    'Parked M1 legs are skips, never playback or metering proof.',
+    'Parked M1 legs are skips, never playback or metering proof. ' +
+    'Billing arrival is not invite redemption or completed-subscription evidence.',
   '',
   ...(tokenMissing ? [tokenLine, ''] : []),
 ];
@@ -471,7 +476,8 @@ if (failed > 0) fail(`${failed} failing test(s) — the journey is red.`);
 if (REQUIRE_QA_AUTH_TOKEN) {
   const invalid = namedJourneys.filter((entry) =>
     entry.outcome === 'missing' || entry.outcome === 'duplicate' || entry.outcome === 'failed' ||
-    (entry.file === 'catalogue.spec.ts' && entry.outcome !== 'passed'),
+    ((entry.file === 'catalogue.spec.ts' || entry.file === BILLING_ARRIVAL_CASE.file) &&
+      entry.outcome !== 'passed'),
   );
   if (invalid.length > 0) {
     fail('required named journey evidence is incomplete:\n' +

@@ -13,15 +13,6 @@ export const TESTIDS = {
   signupEmail: 'signup-email',
   signupSubmit: 'signup-submit',
   signupError: 'signup-error',
-  byopHost: 'byop-host',
-  byopPort: 'byop-port',
-  byopUser: 'byop-user',
-  byopPass: 'byop-pass',
-  byopTls: 'byop-tls',
-  byopConnections: 'byop-connections',
-  byopTest: 'byop-test-connection',
-  byopSave: 'byop-save',
-  byopStatus: 'byop-status',
   importFile: 'import-file',
   importStatus: 'import-status',
   libraryItem: 'library-item',
@@ -386,11 +377,8 @@ export function assertPlanLimitRefusal(args: {
 }
 
 /**
- * Ports the BYOP UI offers; the fixture transport must stay inside this
- * allowlist. Lives here (not access.ts, which reads `process.env`) so the
- * web contract test can pin it against ALLOWED_NNTP_PORTS
- * (vault-validation.ts, itself mirroring vault.rs) without dragging Node
- * types into the web tsconfig — see apps/web/src/lib/contract.test.ts.
+ * Ports supported by the retained provider-control fixture transport.
+ * Keep this pure contract separate from access.ts, which reads `process.env`.
  */
 export const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
 
