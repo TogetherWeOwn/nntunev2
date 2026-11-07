@@ -6,9 +6,13 @@ Vectors mirror the ingest unit tests for `derive_upload_query`,
 port and the matcher shows up here. Run: python3 workers/mb/spike/test_golden.py
 """
 
+import contextlib
+import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import golden  # noqa: E402
@@ -48,6 +52,43 @@ class GoldenPortTest(unittest.TestCase):
     def test_copy_text(self):
         self.assertIsNone(golden.copy_text(r"\N"))
         self.assertEqual(golden.copy_text(r"a\tb\\c"), "a\tb\\c")
+
+
+class GoldenSamplingTest(unittest.TestCase):
+    def test_heldout_excludes_both_tuning_sets_by_query_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mbdump-artist.tsv").write_text("artist\tArtist\n")
+            # Repeated titles across releases must not leak between samples.
+            (root / "mbdump-release.tsv").write_text("".join(
+                f"{i}\tartist\tAlbum {i // 3}\n" for i in range(180)
+            ))
+            def generate(name, seed, *excludes):
+                out = root / name
+                args = ["golden.py", str(root), str(out), "12", str(seed)]
+                for path in excludes:
+                    args += ["--exclude", str(path)]
+                with patch.object(sys, "argv", args), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(golden.main(), 0)
+                return out
+            first = generate("tuning.tsv", 3599)
+            second = generate("tuning-mark-fold.tsv", 20261107)
+            heldout = generate("heldout.tsv", 20261108, first, second)
+            keys = lambda path: {golden.query_group(r.split("\t")[1])
+                                 for r in path.read_text().splitlines()}
+            self.assertEqual(len(heldout.read_text().splitlines()), 4)  # rare stratum only
+            self.assertFalse(keys(heldout) & (keys(first) | keys(second)))
+            again = generate("again.tsv", 20261108, first, second)
+            self.assertEqual(heldout.read_bytes(), again.read_bytes())
+
+    def test_query_group_collapses_variant_spelling(self):
+        self.assertEqual(golden.query_group("DÉBUT (Live)"), golden.query_group("debut live"))
+
+    def test_negative_count_is_refused_before_reading_dump(self):
+        with patch.object(sys, "argv", ["golden.py", "/missing", "/unused", "-1000"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                golden.main()
+        self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

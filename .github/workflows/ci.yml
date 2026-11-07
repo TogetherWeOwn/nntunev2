@@ -556,6 +556,8 @@ jobs:
         run: python3 containers/mb-import/tests/test_stream_extract.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
+      - name: Run R2 snapshot spike recall and baseline framing tests
+        run: python3 workers/mb/spike/test_recall.py
       - name: Run R2 snapshot spike gate 2 verdict tests
         run: python3 workers/mb/spike/test_bench.py
       - name: Run R2 snapshot spike expiry-rule check tests

@@ -16,6 +16,7 @@ same hit columns as `snapshot_eval search` plus per-query milliseconds.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -87,7 +88,7 @@ def normalize_query(raw: str) -> str:
 
 def search(golden: Path, out: Path) -> None:
     lines = ["\\timing on", "\\pset format unaligned", "\\pset tuples_only on",
-             "\\pset fieldsep '\\t'", f"PREPARE s(text) AS {RELEASE_SEARCH_SQL};"]
+             f"PREPARE s(text) AS SELECT row_to_json(hit) FROM ({RELEASE_SEARCH_SQL}) hit;"]
     for row in golden.read_text(encoding="utf-8").splitlines():
         cols = row.split("\t")
         lines.append(f"\\echo @@{cols[0]}")
@@ -104,10 +105,12 @@ def search(golden: Path, out: Path) -> None:
                 ms = line.split()[1]
                 target.write(f"{current}\t0\t\t\t\t{ms}\n")
             elif line and current is not None:
-                mbid, label, score, _artist_mbid, artist_name = (line.split("\t") + [""] * 5)[:5]
+                hit = json.loads(line)
                 rank += 1
-                label = label.replace("\t", " ")
-                target.write(f"{current}\t{rank}\t{mbid}\t{label}\t{artist_name}\t{score}\n")
+                clean = lambda value: "" if value is None else str(value).translate(
+                    str.maketrans({"\t": " ", "\n": " ", "\r": " "}))
+                fields = [current, rank, hit["mbid"], hit["label"], hit["artist_name"], hit["score"]]
+                target.write("\t".join(map(clean, fields)) + "\n")
 
 
 def main() -> int:

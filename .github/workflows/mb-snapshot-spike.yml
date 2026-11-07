@@ -122,9 +122,13 @@ jobs:
             "$RUNNER_TEMP/tools/snapshot_eval" lookup /work/snap "$kind" < "$out/mbids/$kind.txt"
           done
           python3 workers/mb/spike/golden.py "$cur" "$out/golden.tsv" "$GOLDEN_COUNT"
-          # Gate 1 is decided on a held-out set the ranker was not tuned on
-          # (SNAPSHOT.md); golden.tsv (seed 3599) stays for comparison.
-          python3 workers/mb/spike/golden.py "$cur" "$out/golden-heldout.tsv" 2000 "$HELDOUT_SEED"
+          # Preserve both sets previously read while tuning, regardless of
+          # GOLDEN_COUNT. Different seeds alone do not prevent query overlap.
+          python3 workers/mb/spike/golden.py "$cur" "$out/golden-tuning.tsv" 1000 3599
+          python3 workers/mb/spike/golden.py "$cur" "$out/golden-tuning-fold.tsv" 2000 20261107
+          python3 workers/mb/spike/golden.py "$cur" "$out/golden-heldout.tsv" 2000 "$HELDOUT_SEED" \
+            --exclude "$out/golden.tsv" --exclude "$out/golden-tuning.tsv" \
+            --exclude "$out/golden-tuning-fold.tsv"
 
       - name: Recall vs pg_trgm (gate 1)
         run: |

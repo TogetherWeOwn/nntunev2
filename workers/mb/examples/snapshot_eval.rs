@@ -78,6 +78,16 @@ fn clean(field: &str) -> String {
     field.replace(['\t', '\n', '\r'], " ")
 }
 
+fn validate_lookup_sample(found: u64, missing: u64) -> Result<(), String> {
+    if found + missing == 0 {
+        return Err("no nonblank sampled MBIDs".to_owned());
+    }
+    if missing > 0 {
+        return Err(format!("{missing} sampled MBIDs missing from the snapshot"));
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let usage = "usage: snapshot_eval <search <dir>|lookup <dir> <kind>>";
     let mode = args.get(1).ok_or(usage)?;
@@ -129,13 +139,22 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             writeln!(stdout, "found={found} missing={missing}").map_err(|e| e.to_string())?;
-            if missing > 0 {
-                return Err(format!("{missing} sampled MBIDs missing from the snapshot"));
-            }
+            validate_lookup_sample(found, missing)?;
         }
         _ => return Err(usage.to_owned()),
     }
     stdout.flush().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn empty_lookup_sample_is_not_success() {
+        assert!(super::validate_lookup_sample(0, 0).is_err());
+        assert!(super::validate_lookup_sample(0, 1).is_err());
+        assert!(super::validate_lookup_sample(1, 1).is_err());
+        assert!(super::validate_lookup_sample(1, 0).is_ok());
+    }
 }
 
 fn main() {

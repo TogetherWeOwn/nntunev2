@@ -76,7 +76,33 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("track", json.loads((out / "dump-meta.json").read_text())["missing"])
 
 
+class DuplicateMemberTest(unittest.TestCase):
+    def test_duplicate_allowed_member_is_refused_before_opening_output(self):
+        out = Path(tempfile.mkdtemp())
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            for data in (b"first\n", b"second\n"):
+                info = tarfile.TarInfo("mbdump/artist")
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        result = subprocess.run([sys.executable, str(EXTRACT), str(out)], input=buffer.getvalue(),
+                                capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"duplicate", result.stderr)
+        self.assertEqual(gzip.decompress((out / "artist.gz").read_bytes()), b"first\n")
+
+
 class EtlDiskBoundedModeTest(unittest.TestCase):
+    def test_plain_and_gz_for_one_table_is_refused(self):
+        etl = load("etl_both", ROOT / "etl.py", {"MB_ETL_CONSUME_INPUTS": "1"})
+        directory = Path(tempfile.mkdtemp())
+        (directory / "area").write_bytes(b"1\t" + b"\t".join([b"x"] * 13) + b"\n")
+        (directory / "area.gz").write_bytes(gzip.compress(b"2\t" + b"\t".join([b"y"] * 13) + b"\n"))
+        with self.assertRaisesRegex(ValueError, "both"):
+            list(etl.rows(directory / "area", 14))
+        self.assertTrue((directory / "area").exists())
+        self.assertTrue((directory / "area.gz").exists())
+
     def test_gz_inputs_are_read_and_consumed(self):
         etl = load("etl_consume", ROOT / "etl.py", {"MB_ETL_CONSUME_INPUTS": "1"})
         directory = Path(tempfile.mkdtemp())

@@ -57,8 +57,10 @@ MB_SNAPSHOT_PREFIX = "${PREFIX}"
 binding = "MB_SNAPSHOT"
 bucket_name = "${BUCKET}"
 EOF
-  (cd "$here/.." && wrangler deploy -c wrangler.spike.toml) | tee "$state/deploy.log"
+  # The remote deploy can succeed even if Wrangler or tee then fails.
+  # Teardown must attempt deletion after any deployment attempt.
   touch "$state/deployed"
+  (cd "$here/.." && wrangler deploy -c wrangler.spike.toml) | tee "$state/deploy.log"
   local token
   token=$(openssl rand -hex 32)
   echo "::add-mask::$token"

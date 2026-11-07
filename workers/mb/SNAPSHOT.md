@@ -71,9 +71,52 @@ no candidate. That result stands as recorded. The fold table now folds
 every lowercase letter whose NFKD form carries a combining mark. Seed
 20261107 has been read too, so the re-test is decided on another fresh
 2,000-query set (`heldout_seed`, default 20261108); seed 3599 is still
-reported for comparison. Remaining gap: candidates need a shared word,
-so a change inside an unspaced CJK title that is not a stripped mark
-still finds nothing.
+reported for comparison. Both inspected tuning sets (1,000 at seed 3599
+and 2,000 at seed 20261107) are now preserved as artifacts and excluded
+from the gate set by query group (case/accent/punctuation folded). The
+comparison set is excluded too, even if its requested size changes.
+Different random seeds alone do not provide disjoint query groups.
+
+The earlier 0.741 vs 0.740 result from run 42330290183 is **not valid
+held-out gate evidence**: its artifacts contain 14 distinct query groups
+shared with the seed-3599 tuning set even after only lowercasing and
+collapsing whitespace. Gate 1 needs a new run with these exclusions; do
+not reuse that pass. Gate decisions now compare integer hits on the same
+query count, before rounding for display.
+
+## Measurement limits (not production guarantees)
+
+- Candidate retrieval intentionally reads only four word keys plus the
+  exact-title key. A candidate sharing only an omitted query word is not
+  fetched. An unspaced CJK typo without a shared word can also miss.
+- Title posting lists are capped at 1,025 and word lists at 2,000. Fold-equivalent
+  accented titles can be lost behind ASCII twins at the title cap; a
+  longer typo candidate can be lost behind shorter titles at the word
+  cap. These are measured recall losses, not claims of pg_trgm parity.
+  Uncapping or query-aware overflow retrieval would change the bounded
+  I/O design being measured, so is outside this phase-0 harness.
+- Golden acceptable identities use Python `str.isalnum`, not Rust's
+  Unicode Alphabetic property. Some Indic vowel marks can be removed and
+  conflate same-title artists. This is a known proxy-label limitation:
+  the recall figure does not establish matcher equivalence for those
+  names. A production acceptance corpus needs exact matcher identities.
+- Search display names are read from the curated artist TSV, not joined
+  against the validated artist snapshot. Malformed supplied artist rows
+  (for example a NULL sort name) can therefore disagree with lookups.
+  This spike consumes this job's curated dump, not arbitrary TSV uploads;
+  it is not an import-validation or malformed-data parity gate.
+- The per-isolate index cache assumes one immutable R2 bucket/source per
+  prefix. The Worker binds one bucket, and each native evaluation process
+  reads one directory. Mixing sources under the same prefix on a thread
+  is unsupported; no multi-source isolation claim is made.
+- R2 reads have no application deadline. The benchmark client has a
+  30-second request timeout and counts errors/timeouts against gate 2;
+  the workflow also has an overall time limit. This bounds measurement,
+  not Worker-side cancellation. Production use needs a server deadline.
+- Memory peaks are sampled lower bounds; the last interval can be missed.
+
+The clean-room and MetaBrainz guardrails in `AGENTS.md` still apply:
+CC0 core only, no NC supplementary data or live product API reads.
 
 ## Running
 

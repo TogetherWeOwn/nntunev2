@@ -63,6 +63,8 @@ def main() -> int:
             if table is None:
                 skipped += 1
                 continue
+            if table in written:
+                raise SystemExit(f"stream_extract: {name}: duplicate member")
             source = archive.extractfile(member)
             if source is None:
                 raise SystemExit(f"stream_extract: {name}: unreadable member")

@@ -43,6 +43,8 @@ def main() -> int:
         print(__doc__.splitlines()[2], file=sys.stderr)
         return 2
     golden = [line.split("\t") for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+    if not golden:
+        raise SystemExit("recall: empty golden set is not gate evidence")
     pg, pg_ms = load_hits(Path(sys.argv[2]))
     snap, _ = load_hits(Path(sys.argv[3]))
     groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"pg": [0, 0], "snapshot": [0, 0]})
@@ -68,9 +70,11 @@ def main() -> int:
         }
         for name, values in sorted(groups.items())
     }
-    overall = table["overall"]
+    overall = groups["overall"]
     result = {
-        "gate_1_pass": overall["snapshot_recall"] >= overall["pg_trgm_recall"],
+        "gate_1_pass": overall["snapshot"][0] >= overall["pg"][0],
+        "pg_hits": overall["pg"][0],
+        "snapshot_hits": overall["snapshot"][0],
         "recall_top5": table,
         "snapshot_only_hits": len(wins),
         "pg_only_hits": len(losses),

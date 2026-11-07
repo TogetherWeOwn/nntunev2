@@ -73,6 +73,7 @@ result = {
     "wall_seconds": end - start,
     "peak_disk_bytes": peak_disk,
     "disk_cap_bytes": int(env["M_DISK_SIZE"]),
+    "memory_measurement": "sampled lower bounds; final sampling interval may be missed",
     "peak_memory_bytes": int(env["M_PEAK_MEM"]),
     "peak_anon_memory_bytes": int(env["M_PEAK_ANON"]),
     "memory_cap_bytes": 12 * 1024**3,

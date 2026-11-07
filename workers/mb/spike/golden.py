@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the release-search golden set for the R2 snapshot spike.
 
-Usage: golden.py <curated-dir> <out-golden.tsv> [count] [seed]
+Usage: golden.py <curated-dir> <out-golden.tsv> [count] [seed] [--exclude prior.tsv ...]
 
 No ingest query log exists yet (the staging ingest lane is gated), so the
 golden set is derived from the dump itself through the ingest matcher's
@@ -25,6 +25,7 @@ release's, the set the matcher's pick could accept. Output columns:
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import random
 import sys
@@ -58,7 +59,10 @@ def copy_text(field: str) -> str | None:
 
 
 def normalize_match_text(raw: str) -> str:
-    """Port of ingest `normalize_match_text` (apostrophe-n folding)."""
+    """Proxy ingest normalization; Python alnum omits some Alphabetic marks.
+
+    See SNAPSHOT.md measurement limits before interpreting identity recall.
+    """
     chars = list(raw.lower())
     out: list[str] = []
     apostrophe = ("'", "’")
@@ -197,13 +201,26 @@ def curated(directory: Path, table: str) -> Path:
     raise SystemExit(f"golden: missing curated {table} in {directory}")
 
 
+def query_group(q: str) -> str:
+    # Conservative grouping also excludes casing, accents and punctuation
+    # variants of tuning queries, not just byte-identical query strings.
+    return normalize_match_text(ascii_fold(q))
+
+
 def main() -> int:
-    if len(sys.argv) not in (3, 4, 5):
-        print(__doc__.splitlines()[2], file=sys.stderr)
-        return 2
-    directory, out = Path(sys.argv[1]), Path(sys.argv[2])
-    count = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
-    rng = random.Random(int(sys.argv[4]) if len(sys.argv) > 4 else 3599)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("count", type=int, nargs="?", default=1000)
+    parser.add_argument("seed", type=int, nargs="?", default=3599)
+    parser.add_argument("--exclude", type=Path, action="append", default=[],
+                        help="Exclude query groups in this prior tuning TSV (repeatable)")
+    args = parser.parse_args()
+    if args.count <= 0:
+        parser.error("count must be positive")
+    directory, out, count = args.directory, args.out, args.count
+    rng = random.Random(args.seed)
+    excluded = {query_group(row[1]) for path in args.exclude for row in read_tsv(path)}
 
     names = {}
     for f in read_tsv(curated(directory, "artist")):
@@ -240,7 +257,7 @@ def main() -> int:
                 break
             variant = VARIANTS[len(picked) % len(VARIANTS)]
             q = search_q(subject_for(release[1], release[2], variant))
-            if q is None:
+            if q is None or query_group(q) in excluded:
                 continue
             picked.append((release, variant, name, q))
             want -= 1

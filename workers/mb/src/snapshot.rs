@@ -689,6 +689,23 @@ mod worker_entry {
         )
     }
 
+    pub(super) fn spike_route_error(method: worker::Method, path: &[&str]) -> Option<ApiResponse> {
+        if method != worker::Method::Get {
+            return Some(crate::error_response(crate::ApiError::not_found(
+                "not found",
+            )));
+        }
+        match path {
+            ["v1", "mb", "release", _, "recordings"]
+            | ["v1", "mb", "release-group", _, "releases"]
+            | ["v1", "mb", "artist", _, "urls"]
+            | ["v1", "mb", "recording", _, "videos" | "isrcs"] => {
+                Some(crate::error_response(crate::ApiError::internal_error()))
+            }
+            _ => None,
+        }
+    }
+
     /// Spike router: lookups and release search over the snapshot, with the
     /// same core handlers (validation, envelopes, error bodies) as the
     /// Postgres routes. Paths may carry a leading `/__mb-snap` segment.
@@ -696,7 +713,7 @@ mod worker_entry {
         let url = req.url()?;
         let path = url.path();
         let path = path.strip_prefix("/__mb-snap").unwrap_or(path);
-        if path == "/healthz" {
+        if path == "/healthz" && req.method() == worker::Method::Get {
             return plain(200, r#"{"ok":true}"#);
         }
         let expected = env
@@ -710,14 +727,17 @@ mod worker_entry {
                 r#"{"code":"not_found","message":"not found","retryable":false}"#,
             );
         }
+        let started = js_sys_now();
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        if let Some(api) = spike_route_error(req.method(), &segments) {
+            return render(api, started, 0);
+        }
         let prefix = env
             .var(SNAPSHOT_PREFIX_VAR)
             .map(|v| v.to_string())
             .unwrap_or_default();
         let bucket = env.bucket(SNAPSHOT_BINDING)?;
         let repo = SnapshotRepo::new(R2Source { bucket }, prefix);
-        let started = js_sys_now();
-        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
         let api = match segments.as_slice() {
             ["v1", "mb", "search"] => {
                 let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
@@ -759,6 +779,29 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn spike_route_errors_preserve_method_and_listing_contract() {
+        use worker::Method;
+        use worker_entry::spike_route_error;
+        let lookup = ["v1", "mb", "artist", "id"];
+        assert!(spike_route_error(Method::Get, &lookup).is_none());
+        for method in [Method::Post, Method::Put, Method::Delete, Method::Head] {
+            assert_eq!(spike_route_error(method, &lookup).unwrap().status, 404);
+        }
+        for (kind, listing) in [
+            ("release", "recordings"),
+            ("release-group", "releases"),
+            ("artist", "urls"),
+            ("recording", "videos"),
+            ("recording", "isrcs"),
+        ] {
+            let api = spike_route_error(Method::Get, &["v1", "mb", kind, "id", listing]).unwrap();
+            assert_eq!(api.status, 500);
+            assert!(api.body.contains("internal_error"));
+        }
+        assert!(spike_route_error(Method::Get, &["v1", "mb", "artist", "id", "unknown"]).is_none());
+    }
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut cx = Context::from_waker(Waker::noop());

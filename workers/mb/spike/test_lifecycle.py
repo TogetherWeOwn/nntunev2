@@ -176,5 +176,39 @@ class StageUploadGuard(unittest.TestCase):
             self.assertNotIn("object put", npx_log.read_text())
 
 
+class StageDeployGuard(unittest.TestCase):
+    def test_failed_deploy_still_attempts_worker_teardown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spike = root / "spike"
+            spike.mkdir()
+            stage = spike / "stage.sh"
+            shutil.copyfile(Path(__file__).with_name("stage.sh"), stage)
+            snap = root / "snap"
+            snap.mkdir()
+            (snap / "artist.idx").touch()
+            (snap / "artist.dat.000").touch()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for name, script in {
+                "python3": "#!/bin/sh\nexit 0\n",
+                "npx": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$NPX_LOG"\n'
+                       'case "$*" in *" deploy "*) exit 1;; *) exit 0;; esac\n',
+            }.items():
+                stub = bin_dir / name
+                stub.write_text(script)
+                stub.chmod(0o755)
+            log = root / "npx.log"
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "RUNNER_TEMP": str(root),
+                   "MB_DUMP": "synthetic-dump", "WRANGLER_VERSION": "0.0.0", "NPX_LOG": str(log)}
+            up = subprocess.run(["/bin/bash", str(stage), "up", str(snap)],
+                                env=env, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(up.returncode, 0)
+            down = subprocess.run(["/bin/bash", str(stage), "down"],
+                                  env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(down.returncode, 0, down.stderr)
+            self.assertIn(" delete --name nntune-mb-snap-staging --force", log.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -128,9 +128,11 @@ OUTPUT_SUFFIX = ".tsv.gz" if GZIP_OUTPUT else ".tsv"
 
 
 def open_input(path: Path):
+    packed = path.with_name(path.name + ".gz")
+    if path.is_file() and packed.is_file():
+        raise ValueError(f"ambiguous input: both {path} and {packed} exist")
     if path.is_file():
         return path, path.open("r", encoding="utf-8", newline="")
-    packed = path.with_name(path.name + ".gz")
     if packed.is_file():
         return packed, gzip.open(packed, "rt", encoding="utf-8", newline="")
     raise ValueError(f"missing input file: {path}")
