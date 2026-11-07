@@ -125,7 +125,11 @@ assertions require stripped padding, fresh comments, unchanged frame bytes,
 byte-derived tagged digest distinct from the input, exact R2 version, sealed plan,
 Queue recovery and immutable producer replay. Separate fixed owner/job/operation
 custody and an isolated bucket keep the earlier control's rows and deliberately
-replaced object from satisfying or blocking this one.
+replaced object from satisfying or blocking this one. The original-upload hash
+must also be distinct: the admin-job unique index is global, not per owner. Both
+seeded jobs must coexist with different hashes, with each admission key and original
+custody matching its own upload identity. The first structural-control Actions run
+failed at that seed index before parsing; it is not parser/tagger acceptance.
 The fixture is generated structural data: no PCM decoder or MD5 verification is
 performed, and historical seeded admission is still not authenticated HTTP upload.
 These new controls are written, not locally executed; require exact-head Actions

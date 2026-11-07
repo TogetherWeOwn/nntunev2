@@ -356,6 +356,14 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
 
   await t.test('real FLAC tag rewrite feeds Rust R2, sealed plan and Queue recovery', async () => {
     seed(true);
+    assert.equal(sql(`SELECT count(DISTINCT content_sha256) FROM ingest_jobs
+      WHERE id IN ('qualification-job','qualification-flac-job');`), '2',
+      'both fixture jobs must coexist with globally distinct upload identities');
+    assert.equal(sql(`SELECT count(*) FROM ingest_jobs j JOIN ingest_originals o
+      ON o.job_id = j.id AND o.content_sha256 = j.content_sha256
+      WHERE j.id IN ('qualification-job','qualification-flac-job')
+        AND j.idempotency_key = 'admin:' || j.content_sha256;`), '2',
+      'each fixture must keep its admission key and original custody bound to its upload');
     const composite = await mf.getWorker('composite-flac');
     const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
     const { input, audio, samples } = flacFixture();

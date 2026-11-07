@@ -30,6 +30,8 @@ export function seed(flac = false) {
   assert.equal(typeof flac, 'boolean');
   const owner = flac ? 'qualification-flac-owner' : 'qualification-owner';
   const job = flac ? 'qualification-flac-job' : 'qualification-job';
+  // Admin content identity is globally unique, independently of owner/job IDs.
+  const original = flac ? 'b' : 'a';
   const email = flac ? 'qualification-flac@example.invalid' : 'qualification@example.invalid';
   // Shape-valid historical admission custody, not an authenticated upload test.
   // The actual producer creates every plan, dispatch, receipt and attempt row.
@@ -38,12 +40,12 @@ export function seed(flac = false) {
       VALUES ('${owner}','${email}',1700000000,'admin');
     INSERT INTO ingest_jobs
       (id,user_id,idempotency_key,accepted_at,status,source,content_sha256,nzb_bytes,file_count,segment_count)
-      VALUES ('${job}','${owner}','admin:' || repeat('a',64),1700000000,
-        'queued','admin',repeat('a',64),79,1,1);
+      VALUES ('${job}','${owner}','admin:' || repeat('${original}',64),1700000000,
+        'queued','admin',repeat('${original}',64),79,1,1);
     INSERT INTO ingest_originals
       (job_id,content_sha256,nzb_bytes,nzb_ref_encrypted,nzb_ref_envelope_version,nzb_ref_kek_version,
        nzb_ref_dek_wrapped_nonce,nzb_ref_dek_wrapped,nzb_ref_payload_nonce,nzb_ref_payload_format,created_at)
-      VALUES ('${job}',repeat('a',64),79,decode(repeat('00',48),'hex'),2,1,
+      VALUES ('${job}',repeat('${original}',64),79,decode(repeat('00',48),'hex'),2,1,
         decode(repeat('00',12),'hex'),decode(repeat('00',48),'hex'),decode(repeat('00',12),'hex'),1,1700000000);
   `);
 }
