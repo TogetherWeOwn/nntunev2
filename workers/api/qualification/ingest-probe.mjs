@@ -15,6 +15,11 @@ export default class QualificationIngest extends WorkerEntrypoint {
     if (path === '/private') return this.env.API_PREPARATION_PLANS.fetch(request);
     if (path === '/disabled') return this.env.DISABLED_PLANS.fetch(request);
     if (path === '/probe' || path === '/fault') return this.env.PROBE.fetch(request);
+    if (path === '/configured-probe' || path === '/configured-fault') {
+      const probe = new Request(new URL(path === '/configured-fault' ? '/fault' : '/probe', request.url));
+      return this.env.CONFIGURED_PROBE.fetch(probe);
+    }
+    if (path === '/configured-private') return this.env.CONFIGURED_PLANS.fetch(request);
     if (path === '/seed') {
       await this.env.INGEST_SCRATCH.put('qualification-tagged', new Uint8Array([1, 2, 3]));
       await this.env.INGEST_QUEUE.send({ version: 1, id: 'qualification-pointer' });

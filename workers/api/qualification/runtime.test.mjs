@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,6 +56,17 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     ...await generatedModules(ingest),
   ];
   const mode = { GENERATION_PREPARATION_MODE: 'preparation_only' };
+  // Ephemeral harness-only keyring/session material, never real credentials.
+  // Successful health below must prove this isolate passed config_from_env.
+  const configured = {
+    ...mode,
+    HYPERDRIVE_CACHING_DISABLED: '1',
+    RP_ID: 'qualification.invalid',
+    RP_ORIGIN: 'https://qualification.invalid',
+    SESSION_SECRET_BASE64: randomBytes(32).toString('base64url'),
+    VAULT_KEK_BASE64: randomBytes(32).toString('base64url'),
+    VAULT_KEK_VERSION: '1',
+  };
   // The pinned runtime accepts v5 configs; use its shipped v4 option converter.
   // Resolve module paths from the explicit Workers root, not the harness cwd.
   const options = convertV4MiniflareOptions({
@@ -63,6 +75,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     port: 0,
     workers: [
       worker('api', apiModules, { bindings: mode }),
+      worker('api-configured', apiModules, { bindings: configured }),
       worker('api-disabled', apiModules, { bindings: { GENERATION_PREPARATION_MODE: 'disabled' } }),
       worker('ingest', ingestModules, {
         bindings: mode,
@@ -70,6 +83,8 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
           API_PREPARATION_PLANS: { name: 'api', entrypoint: 'IngestPreparationPlans' },
           DISABLED_PLANS: { name: 'api-disabled', entrypoint: 'IngestPreparationPlans' },
           PROBE: { name: 'api', entrypoint: 'QualificationProbe' },
+          CONFIGURED_PROBE: { name: 'api-configured', entrypoint: 'QualificationProbe' },
+          CONFIGURED_PLANS: { name: 'api-configured', entrypoint: 'IngestPreparationPlans' },
         },
         r2Buckets: { INGEST_SCRATCH: 'qualification-scratch' },
         queueProducers: { INGEST_QUEUE: 'qualification-queue' },
@@ -153,6 +168,45 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.equal(await response.text(), 'preparation unavailable');
     assert.equal((await probe()).bridgeCalls, before + 1);
+  });
+
+  await t.test('configured public router stays isolated while named lifecycle failure is reachable', async () => {
+    const publicConfigured = await mf.getWorker('api-configured');
+    const configuredProbe = () => entry.fetch('https://qualification.invalid/configured-probe').then(r => r.json());
+    const health = async () => {
+      const response = await publicConfigured.fetch('https://qualification.invalid/healthz');
+      assert.equal(response.status, 200, 'missing config must not short-circuit the route matrix');
+      assert.deepEqual(await response.json(), { ok: true, build_sha: 'unknown' });
+    };
+    await health();
+    assert.equal((await configuredProbe()).bridgeCalls, 0, 'configured isolate must be independent');
+    assert.equal((await entry.fetch('https://qualification.invalid/configured-fault')).status, 204);
+    const before = (await configuredProbe()).bridgeCalls;
+    for (const route of ['/', '/ingest_preparation_plan', '/preparation', '/v1/ingest/preparation']) {
+      for (const method of ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+        const response = await publicConfigured.fetch(`https://qualification.invalid${route}?entrypoint=IngestPreparationPlans`, {
+          method,
+          headers: {
+            origin: configured.RP_ORIGIN,
+            'x-preparation-mode': 'preparation_only',
+            'content-type': 'application/octet-stream',
+          },
+          ...(['GET', 'HEAD'].includes(method) ? {} : { body: new Uint8Array([255]) }),
+        });
+        assert.equal(response.status, 404, `configured public ${method} ${route} must stay unserved`);
+        await response.arrayBuffer();
+        assert.equal((await configuredProbe()).bridgeCalls, before);
+      }
+    }
+    // Positive control: the same injected bridge really is reachable through
+    // the named binding. Public 404s cannot be explained by a broken injection.
+    const response = await entry.fetch('https://qualification.invalid/configured-private', { method: 'POST' });
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(await response.text(), 'preparation unavailable');
+    assert.equal((await configuredProbe()).bridgeCalls, before + 1);
+    await health();
+    assert.equal((await configuredProbe()).bridgeCalls, before + 1);
   });
 
   await t.test('real R2 and Queue transport reaches generated consumer; unknown retains object', async () => {

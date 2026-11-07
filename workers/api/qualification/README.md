@@ -46,8 +46,17 @@ qualify the whole preparation foundation by itself.
 The fault probe replaces only the generated private method in its own test
 isolate, preserving the real generated constructor and platform lifecycle. It
 is an explicit fault injection, not production logic or successful DB evidence.
-The public matrix runs without API configuration; it is not a proof over every
-configured API route. No test uses candidate media keys, articles or manifests.
+The original public matrix runs without API configuration. A separate isolate
+now gets ephemeral harness-generated session/KEK inputs and must serve the real
+Rust health route before and after its matrix. That matrix requires exact 404s
+for four unserved paths across seven methods, despite a mode header, query hint
+and binary body. Per-request bridge counts stay unchanged. A named-binding
+positive control must reach the injected failure and increment the same count,
+while its response remains redacted and no-store. No generated/platform class
+is replaced. These configured routes do not need a DB; successful DB-backed
+private protocol, Rust producer and composite recovery acceptance remain open.
+This is not a proof over every configured API route or credential posture.
+No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
 activation, posting or R2 deletion authority.
 
