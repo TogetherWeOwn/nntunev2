@@ -80,9 +80,8 @@ async function releaseRejectedBody(response: Response): Promise<void> {
  * supersede) settles even when the producer ignores the request signal.
  * Null-body fallback only: when `response.body` is `null` there is no
  * stream to cancel, so the wait is bounded here instead. Streaming bodies
- * are read through a cancellable reader (`readFiniteBody`,
- * `readUnboundedBody`) — racing those through `response.arrayBuffer()`
- * would lock the stream and leave a timed-out read buffering in the
+ * are read through a cancellable reader (`readBody`) — racing those through
+ * `response.arrayBuffer()` would lock the stream and leave a timed-out read buffering in the
  * background. On abort the read rejects with `AbortError`, which the
  * caller converts to `TimeoutError` when its own deadline fired.
  */
@@ -110,32 +109,27 @@ function raceSignalAbort<T>(read: Promise<T>, response: Response, signal: AbortS
 }
 
 /**
- * Read at most `expectedLength` body bytes incrementally, so a finite
- * range never accumulates an oversized response before validation.
- * Accumulated buffers are bounded by `expectedLength` (a boundary
- * chunk is copied only up to the boundary); a single upstream chunk's
- * own allocation remains the producer's. With `exact`, a body longer
- * or shorter than `expectedLength` is rejected; without it, only the
- * prefix is collected and the unused remainder is cancelled. Aborting
- * `signal` cancels the reader, and the reader is always released.
+ * Read a body with a cancellable reader and always release its lock.
+ * Finite reads retain at most `expectedLength` bytes: exact reads probe
+ * for a remainder, while prefix reads cancel it. Without finite options,
+ * consume the whole stream; open-ended 206 validation stays with its caller.
  */
-async function readFiniteBody(
+async function readBody(
 	response: Response,
-	expectedLength: number,
 	signal: AbortSignal,
-	options: { exact: boolean; shortMessage: string; lengthMessage: string }
+	finite?: { expectedLength: number; exact: boolean; shortMessage: string; lengthMessage: string }
 ): Promise<Uint8Array> {
 	if (signal.aborted) throw abortError();
 	if (response.body === null) {
-		// No readable stream to bound; fall back to a length-checked read,
-		// still bounded by the seek deadline at the call site.
+		// No readable stream to cancel; the signal race still bounds the wait.
 		const buffer = await raceSignalAbort(response.arrayBuffer(), response, signal);
 		if (signal.aborted) throw abortError();
-		if (buffer.byteLength < expectedLength) throw new Error(options.shortMessage);
-		if (options.exact && buffer.byteLength !== expectedLength) {
-			throw new Error(options.lengthMessage);
+		if (finite === undefined) return new Uint8Array(buffer);
+		if (buffer.byteLength < finite.expectedLength) throw new Error(finite.shortMessage);
+		if (finite.exact && buffer.byteLength !== finite.expectedLength) {
+			throw new Error(finite.lengthMessage);
 		}
-		return new Uint8Array(buffer.slice(0, expectedLength));
+		return new Uint8Array(buffer.slice(0, finite.expectedLength));
 	}
 
 	const reader = response.body.getReader();
@@ -149,7 +143,7 @@ async function readFiniteBody(
 	let overflow = false;
 	let streamDone = false;
 	try {
-		while (collected < expectedLength) {
+		while (finite === undefined || collected < finite.expectedLength) {
 			const { done, value } = await reader.read();
 			if (signal.aborted) throw abortError();
 			if (done) {
@@ -157,35 +151,39 @@ async function readFiniteBody(
 				break;
 			}
 			if (value === undefined || value.byteLength === 0) continue;
-			const remaining = expectedLength - collected;
-			if (value.byteLength > remaining) overflow = true;
-			// Copy only up to the boundary so we never retain the excess
-			// of a boundary-crossing chunk.
-			parts.push(value.slice(0, remaining));
-			collected += Math.min(value.byteLength, remaining);
+			if (finite === undefined) {
+				parts.push(value);
+				collected += value.byteLength;
+			} else {
+				const remaining = finite.expectedLength - collected;
+				if (value.byteLength > remaining) overflow = true;
+				// Copy only up to the boundary, never retaining its excess.
+				parts.push(value.slice(0, remaining));
+				collected += Math.min(value.byteLength, remaining);
+			}
 		}
-		if (signal.aborted) throw abortError();
-		if (collected < expectedLength) throw new Error(options.shortMessage);
-		if (options.exact) {
-			if (overflow) throw new Error(options.lengthMessage);
-			if (!streamDone) {
-				// Exactly full: probe reads distinguish an exact body from
-				// one with an unrequested remainder. Empty chunks carry no
-				// bytes, so probe past them like the main loop does.
-				for (;;) {
-					const probe = await reader.read();
-					if (signal.aborted) throw abortError();
-					if (probe.done) {
-						streamDone = true;
-						break;
-					}
-					if (probe.value !== undefined && probe.value.byteLength > 0) {
-						throw new Error(options.lengthMessage);
+		if (finite !== undefined) {
+			if (signal.aborted) throw abortError();
+			if (collected < finite.expectedLength) throw new Error(finite.shortMessage);
+			if (finite.exact) {
+				if (overflow) throw new Error(finite.lengthMessage);
+				if (!streamDone) {
+					// Empty chunks carry no bytes; probe past them for a remainder.
+					for (;;) {
+						const probe = await reader.read();
+						if (signal.aborted) throw abortError();
+						if (probe.done) {
+							streamDone = true;
+							break;
+						}
+						if (probe.value !== undefined && probe.value.byteLength > 0) {
+							throw new Error(finite.lengthMessage);
+						}
 					}
 				}
 			}
 		}
-		const bytes = new Uint8Array(expectedLength);
+		const bytes = new Uint8Array(collected);
 		let offset = 0;
 		for (const part of parts) {
 			bytes.set(part, offset);
@@ -195,69 +193,7 @@ async function readFiniteBody(
 	} finally {
 		signal.removeEventListener('abort', onAbort);
 		if (!streamDone) {
-			// Prefix satisfied, body rejected, or seek aborted: cancel
-			// whatever remains so the producer stops and nothing leaks.
-			await reader.cancel().catch(() => undefined);
-		}
-		try {
-			reader.releaseLock();
-		} catch {
-			// Already released; nothing to free.
-		}
-	}
-}
-
-/**
- * Read a whole body of unknown length incrementally, so an open-ended 206
- * or a full 200 never buffers through `response.arrayBuffer()` while the
- * deadline fires. Unlike `arrayBuffer()`, the reader stays cancellable:
- * aborting `signal` cancels the reader, and the reader is always released.
- * With no stream (`body === null`) there is nothing to cancel, so the read
- * falls back to the signal race, still bounded by the seek deadline.
- */
-async function readUnboundedBody(response: Response, signal: AbortSignal): Promise<Uint8Array> {
-	if (signal.aborted) throw abortError();
-	if (response.body === null) {
-		// No readable stream to cancel; still bounded by the seek deadline
-		// at the call site through the race.
-		const buffer = await raceSignalAbort(response.arrayBuffer(), response, signal);
-		if (signal.aborted) throw abortError();
-		return new Uint8Array(buffer);
-	}
-
-	const reader = response.body.getReader();
-	const onAbort = () => {
-		void reader.cancel().catch(() => undefined);
-	};
-	signal.addEventListener('abort', onAbort, { once: true });
-
-	const parts: Uint8Array[] = [];
-	let total = 0;
-	let streamDone = false;
-	try {
-		for (;;) {
-			const { done, value } = await reader.read();
-			if (signal.aborted) throw abortError();
-			if (done) {
-				streamDone = true;
-				break;
-			}
-			if (value === undefined || value.byteLength === 0) continue;
-			parts.push(value);
-			total += value.byteLength;
-		}
-		const bytes = new Uint8Array(total);
-		let offset = 0;
-		for (const part of parts) {
-			bytes.set(part, offset);
-			offset += part.byteLength;
-		}
-		return bytes;
-	} finally {
-		signal.removeEventListener('abort', onAbort);
-		if (!streamDone) {
-			// Timed out, superseded, or body rejected: cancel whatever
-			// remains so the producer stops and nothing keeps buffering.
+			// Prefix satisfied, body rejected, or seek aborted: stop the producer.
 			await reader.cancel().catch(() => undefined);
 		}
 		try {
@@ -385,7 +321,8 @@ export class SeekController {
 					bytes =
 						requestedEnd === undefined
 							? await this.readOpenEnded206(response, expectedLength, controller.signal)
-							: await readFiniteBody(response, expectedLength, controller.signal, {
+							: await readBody(response, controller.signal, {
+									expectedLength,
 									exact: true,
 									shortMessage: 'Range response body length does not match Content-Range',
 									lengthMessage: 'Range response body length does not match Content-Range'
@@ -413,7 +350,8 @@ export class SeekController {
 				// the unused remainder instead of buffering the whole body.
 				let bytes: Uint8Array;
 				try {
-					bytes = await readFiniteBody(response, requestedEnd + 1, controller.signal, {
+					bytes = await readBody(response, controller.signal, {
+						expectedLength: requestedEnd + 1,
 						exact: false,
 						shortMessage: 'Full response is shorter than the requested byte range',
 						lengthMessage: 'Full response is shorter than the requested byte range'
@@ -428,7 +366,7 @@ export class SeekController {
 			}
 			let bytes: Uint8Array;
 			try {
-				bytes = await readUnboundedBody(response, controller.signal);
+				bytes = await readBody(response, controller.signal);
 			} catch (error) {
 				if (timedOut) throw timeoutError();
 				throw error;
@@ -452,7 +390,7 @@ export class SeekController {
 	): Promise<Uint8Array> {
 		// Reader-based, not `arrayBuffer()`: the reader stays cancellable so
 		// a deadline aborts the stalled body instead of leaving it buffering.
-		const bytes = await readUnboundedBody(response, signal);
+		const bytes = await readBody(response, signal);
 		if (bytes.byteLength !== expectedLength) {
 			throw new Error('Range response body length does not match Content-Range');
 		}
