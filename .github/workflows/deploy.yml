@@ -183,14 +183,12 @@ jobs:
         working-directory: workers/api
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
-          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
           set -euo pipefail
           missing=""
           [ -n "${HYPERDRIVE_ID_STAGING:-}" ] || missing="$missing HYPERDRIVE_ID_STAGING"
-          [ -n "${HYPERDRIVE_ID_MB:-}" ] || missing="$missing HYPERDRIVE_ID_MB"
           [ -n "${API_RP_ID_STAGING:-}" ] || missing="$missing API_RP_ID_STAGING"
           [ -n "${API_RP_ORIGIN_STAGING:-}" ] || missing="$missing API_RP_ORIGIN_STAGING"
           if [ -n "$missing" ]; then
@@ -256,12 +254,16 @@ jobs:
           # Mirror pin: the generated config binds HYPERDRIVE_ID_MB for the
           # catalogue slice-1 mirror probes (`MB_DB` in src/worker_entry.rs),
           # likewise bypassing binding-parity. The mirror is shared, so the
-          # manifest must name the same id in both environments.
+          # manifest must name the same id in both environments. The var is
+          # optional: absent or empty omits the MB_DB block (no-enrichment
+          # mode); a present id must equal the manifest id exactly.
           mb = next(b for b in api["binding"] if b["binding"] == "MB_DB")
           assert mb["staging"] == mb["prod"], \
               "api MB_DB must name the shared mirror id in both environments"
-          assert os.environ["HYPERDRIVE_ID_MB"] == mb["staging"], \
-              "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
+          mirror_id = os.environ.get("HYPERDRIVE_ID_MB", "")
+          if mirror_id:
+              assert mirror_id == mb["staging"], \
+                  "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
           PY
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
@@ -337,12 +339,19 @@ jobs:
           [[env.staging.hyperdrive]]
           binding = "HYPERDRIVE"
           id = "${HYPERDRIVE_ID_STAGING}"
+          EOF
+          if [ -n "${HYPERDRIVE_ID_MB:-}" ]; then
+            # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
+            cat >> wrangler.toml <<EOF
 
-          # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
           [[env.staging.hyperdrive]]
           binding = "MB_DB"
           id = "${HYPERDRIVE_ID_MB}"
           EOF
+            echo "mirror: configured (MB_DB bound)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "mirror: absent (no-enrichment mode)" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
         run: |

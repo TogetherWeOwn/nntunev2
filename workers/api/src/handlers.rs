@@ -3861,7 +3861,7 @@ where
                 rows.iter().map(crate::catalogue::artist_response).collect();
             catalogue_response(&entries)
         }
-        Err(_) => internal(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -3941,7 +3941,7 @@ where
                 .collect();
             catalogue_response(&entries)
         }
-        Err(_) => internal(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -3969,7 +3969,7 @@ where
                 rows.iter().map(crate::catalogue::track_response).collect();
             catalogue_response(&entries)
         }
-        Err(_) => internal(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -3977,7 +3977,7 @@ where
 /// order. Only single-segment, well-formed MBIDs reach the store (anything
 /// else — empty, nested, malformed — is the plain 404, indistinguishable
 /// from unknown); unknown and non-member releases are 404; store failure is
-/// the generic 500.
+/// the opaque 503 service-unavailable envelope.
 async fn catalogue_release<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -4005,7 +4005,7 @@ where
     };
     let release = match ctx.store.catalogue_release(&user_id, mbid).await {
         Ok(release) => release,
-        Err(_) => return internal(),
+        Err(_) => return unavailable(),
     };
     let Some(release) = release else {
         return not_found();
@@ -4014,7 +4014,7 @@ where
         Ok(tracks) => catalogue_response(&crate::catalogue::assemble_release_detail(
             &release, &tracks,
         )),
-        Err(_) => internal(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -21065,6 +21065,63 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_library_alias_preserves_unenriched_app_fields() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let page: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|ord| crate::catalogue::LibraryPageRow {
+                job_id: "job-1".into(),
+                release_mbid: Some(CAT_RELEASE.into()),
+                recording_mbids: vec![CAT_REC_A.into(), CAT_REC_A.into()],
+                recording_mbid: Some(CAT_REC_A.into()),
+                recording_ord: ord,
+            })
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "u1".into(),
+            crate::catalogue::assemble_library_rows(&page, &[], &[], &[]),
+        );
+        let v1 = h.call_full(
+            "GET",
+            "/v1/library",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        let alias = h.call_full("GET", "/api/library", None, Some(cookie), Some(ORIGIN));
+        assert_eq!(v1.status, 200);
+        assert_eq!(alias.status, 200);
+        assert_eq!(v1.body, alias.body);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&v1.body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0]["occurrence_key"], rows[1]["occurrence_key"]);
+        for row in rows {
+            assert_eq!(row["id"], CAT_REC_A);
+            assert_eq!(row["release_mbid"], CAT_RELEASE);
+            assert_eq!(
+                row["recording_mbids"],
+                serde_json::json!([CAT_REC_A, CAT_REC_A])
+            );
+            for field in [
+                "title",
+                "artist",
+                "artist_mbid",
+                "release",
+                "duration_ms",
+                "medium_no",
+                "track_no",
+            ] {
+                assert!(
+                    row.get(field).is_none_or(|value| value.is_null()),
+                    "{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn catalogue_library_alias_serves_identical_entries() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -21449,7 +21506,7 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_store_outage_is_500() {
+    fn catalogue_store_outage_is_opaque_and_entities_are_unavailable() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
@@ -21463,8 +21520,17 @@ mod tests {
             &format!("/v1/releases/{CAT_RELEASE}"),
         ] {
             let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
-            assert_eq!(resp.status, 500, "{path}");
-            assert_eq!(resp.body, r#"{"error":"internal error"}"#, "{path}");
+            if path.ends_with("/library") {
+                assert_eq!(resp.status, 500, "{path}");
+                assert_eq!(resp.body, r#"{"error":"internal error"}"#, "{path}");
+            } else {
+                assert_eq!(resp.status, 503, "{path}");
+                let error: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+                assert_eq!(error["code"], "service_unavailable");
+                assert_eq!(error["message"], "service unavailable");
+                assert_eq!(error["retryable"], true);
+                assert!(!resp.body.contains("mirror"));
+            }
         }
         // The alias's bearer-session transport hits the same store read,
         // so it outages the same way (auth succeeds, the read fails).
