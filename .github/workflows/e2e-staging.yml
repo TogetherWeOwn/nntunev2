@@ -285,7 +285,7 @@ jobs:
   # through the deploy.yml caller, a skipped/failed deploy — from
   # producing a full-journey PASS.
   e2e:
-    name: full journey (signup → library → meter → limits)
+    name: full journey (signup → billing → library)
     needs: [synthetic]
     if: ${{ inputs.post_deploy }}
     runs-on: ubuntu-latest
@@ -342,8 +342,12 @@ jobs:
       # including the capped stream leg, which needs a pre-seeded
       # streamable track — skips by name under TWO-1635 and reseeds when
       # admin ingest can seed a curated track on staging. Live legs are
-      # signup, library arrival, returning-user login and the provider
-      # 430 control; the gate below budgets the parked skips.
+      # signup, billing arrival, library reads, returning-user login and the
+      # provider 430 control. The gate requires named billing/library evidence
+      # and budgets the parked skips. Billing arrival is not subscription
+      # completion, and parked audio legs are not admin-ingested playback proof.
+      # The target path is invite signup -> subscribe -> admin-ingested play;
+      # its remaining legs need dedicated staging setup, not a user wizard.
 
       - name: Run full journey
         if: steps.staging.outputs.configured == 'true'

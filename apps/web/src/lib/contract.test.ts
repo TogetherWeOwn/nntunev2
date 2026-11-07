@@ -12,9 +12,9 @@ const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.sve
 	eager: true
 }) as Record<string, string>;
 
-// Legacy API fixtures retain the retired hooks; active web hooks still
+// Legacy API fixtures retain the retired import hooks; active web hooks
 // require a markup pin while the end-to-end contract is migrated.
-type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus' | `byop${string}`>;
+type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus'>;
 const routeForTestId: Record<ActiveTestId, string> = {
 	appRoot: '../routes/+page.svelte',
 	signupEmail: '../routes/signup/+page.svelte',
@@ -61,6 +61,13 @@ describe('retired user NZB import', () => {
 });
 
 describe('retired provider credential routes', () => {
+	it('declares no provider-setup hooks in the e2e contract', () => {
+		for (const [key, testid] of Object.entries(TESTIDS)) {
+			expect(key).not.toMatch(/^byop/i);
+			expect(testid).not.toMatch(/^byop-/);
+		}
+	});
+
 	it('has no provider form, route, navigation link, or vault call in active web source', () => {
 		const webSources = import.meta.glob(['../routes/**/*.{svelte,ts}', './api/client.ts'], {
 			query: '?raw', import: 'default', eager: true

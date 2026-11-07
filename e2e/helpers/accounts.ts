@@ -39,8 +39,8 @@ export interface TestAccount {
  * `__Host-` prefix locks the cookie to `Path=/`, `Secure`, no `Domain`
  * (host-only) by construction — the browser rejects any plant that
  * deviates, so the plant below pins exactly those attributes. Cookie
- * sessions are the only credential session routes (`POST /v1/vault/*`,
- * `/v1/session/*`, …) accept; the `Authorization` bearer is ignored there
+ * sessions are the only credential session routes (`/v1/session/*`, …)
+ * accept; the `Authorization` bearer is ignored there
  * (see security-sign-out-everywhere.spec.ts). Names only — never a value.
  */
 export const SESSION_COOKIE_NAME = '__Host-nntune-session';
@@ -409,11 +409,10 @@ export async function anonymousGet(
  *
  * Two credentials are installed for a session account. First, the minted
  * session is planted as the `__Host-` session cookie (see
- * browserSessionCookie): session routes (`POST /v1/vault/*` for the BYOP
- * wizard's test/save, `/v1/session/*`, …) authenticate by cookie only and
- * ignore the bearer, so without this plant every wizard test-connection
- * fails closed as unauthenticated. When no plant applies (a null account,
- * or a non-https offline double) any previously planted session cookie is
+ * browserSessionCookie): session routes (`/v1/session/*`, …) authenticate
+ * by cookie only and ignore the bearer, so without this plant browser
+ * session requests fail closed as unauthenticated. When no plant applies
+ * (a null account or a non-https offline double) any previously planted session cookie is
  * cleared instead, so a re-applied page is anonymous and cookieless rather
  * than leaking the earlier identity. Second, headers are attached ONLY to
  * the staging origin via a context route: `extraHTTPHeaders`/
@@ -446,7 +445,7 @@ export async function applyAccountToPage(
     );
   }
   // Cookie-first: session routes ignore the bearer, so the minted session
-  // must ride as the `__Host-` cookie before any navigation or wizard fetch.
+  // must ride as the `__Host-` cookie before any navigation or session fetch.
   // Null accounts (and non-https offline doubles) get no plant — any cookie
   // a previous apply planted is cleared instead, so the page stays
   // anonymous and cookieless even when identities are re-applied.
@@ -832,7 +831,7 @@ export async function submitPublicUiSignupToBilling(
   request: APIRequestContext,
   baseURL: string,
 ): Promise<TestAccount> {
-  const email = uniqueTestEmail('e2e-wizard');
+  const email = uniqueTestEmail('e2e-billing');
   await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await waitForHydration(page, 'signup');
   await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
