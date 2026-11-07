@@ -53,8 +53,8 @@ jobs:
       pr-number: ${{ inputs.pr_number || '' }}
       # No repo-specific generated paths: the script's built-in exclusions
       # already cover this repo's lockfiles (apps/web/pnpm-lock.yaml,
-      # e2e/package-lock.json) and fixture/test data (e2e/fixtures/,
-      # crates/nntune-core/testdata/). The hand-written migrations/*.sql
+      # e2e/package-lock.json) and fixture/test data (e2e/fixtures/).
+      # The hand-written migrations/*.sql
       # stay counted.
       exclude-extra: ""
 

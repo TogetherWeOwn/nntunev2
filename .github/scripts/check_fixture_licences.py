@@ -37,8 +37,9 @@ Rules (rule id -> shape):
     inventing keys.
 
 Scope notes: runtime-synthesized audio (generated tones/WAV bytes in
-test code, e.g. crates/nntune-test-nntp) is original test data, not a
-tracked audio file, and is out of scope here; the doc covers it.
+test code, e.g. crates/nntune-test-nntp via velmora-test-nntp) is
+original test data, not a tracked audio file, and is out of scope here;
+the doc covers it.
 Filename *literals* like "track.flac" inside parser tests are not R2
 keys and do not match audio-key-unlisted.
 

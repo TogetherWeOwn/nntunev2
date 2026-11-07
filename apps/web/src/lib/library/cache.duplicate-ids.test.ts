@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
 	decodeSnapshot,
 	loadSnapshot,
+	libraryItemKey,
 	MAX_SNAPSHOT_BYTES,
 	MAX_SNAPSHOT_ITEMS,
 	snapshotByteSize,
@@ -33,6 +35,39 @@ function memoryStorage(seed: Record<string, string> = {}): SnapshotStorage {
 function snapshotWith(items: unknown[]): string {
 	return JSON.stringify({ savedAt: '2026-10-15T12:00:00.000Z', items });
 }
+
+describe('catalogue occurrence identity', () => {
+	it.each([
+		['home', '{#each preview as item (libraryItemKey(item))}'],
+		['search', '{#each results as item (libraryItemKey(item))}'],
+		['library/liked', '{#each liked as item (libraryItemKey(item))}'],
+		['library', '{#each tracks as track (libraryItemKey(track))}'],
+		['library', '{#each favoriteTracks as track, index (libraryItemKey(track))}']
+	])('wires the shared occurrence key into the %s list', (route, each) => {
+		const source = readFileSync(new URL(`../../routes/${route}/+page.svelte`, import.meta.url), 'utf8');
+		expect(source).toContain(each);
+	});
+	it('preserves repeated recordings within and across jobs without changing stream ids', () => {
+		const rows = [
+			item('recording-a', { occurrence_key: 'job-a:1' }),
+			item('recording-a', { occurrence_key: 'job-a:2' }),
+			item('recording-a', { occurrence_key: 'job-b:1' })
+		];
+		expect(toLibraryItems([...rows, rows[0]])).toEqual(rows);
+		expect(decodeSnapshot(snapshotWith([...rows, rows[1]]))?.items).toEqual(rows);
+	});
+
+	it('falls back to legacy ids for absent or malformed occurrence keys', () => {
+		const rows = [item('a'), item('a', { occurrence_key: '' }), item('a', { occurrence_key: 42 })];
+		expect(toLibraryItems(rows)).toEqual([rows[0]]);
+	});
+
+	it('does not collide occurrence keys with legacy stream ids', () => {
+		const rows = [item('recording-a', { occurrence_key: 'job-a:1' }), item('job-a:1')];
+		expect(toLibraryItems(rows)).toEqual(rows);
+		expect(rows.map(libraryItemKey)).toEqual(['occurrence:job-a:1', 'id:job-a:1']);
+	});
+});
 
 describe('toLibraryItems keeps duplicate library IDs out of keyed rendering', () => {
 	it('deduplicates a bare-array payload, keeping the first occurrence and original order', () => {

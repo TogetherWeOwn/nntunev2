@@ -2,7 +2,7 @@
 name = "nntune-test-nntp"
 version = "0.1.0"
 edition = "2021"
-description = "Synthetic NNTP test server + fixture corpus for NNTune v2 CI (no real Usenet in CI)"
+description = "NNTune v2 shim over velmora-test-nntp (synthetic NNTP test server + fixture corpus; no real Usenet in CI)"
 license = "MIT"
 repository = "https://github.com/TogetherWeOwn/nntunev2"
 
@@ -11,8 +11,12 @@ name = "nntune_test_nntp"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# Same immutable pin as velmora in crates/nntune-core/Cargo.toml.
+velmora-test-nntp = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "c5e79d617896490a47d577a9b062cd0010e0bc8a" }
 
 [dev-dependencies]
+# Consumer-boundary acceptance (tests/pinned_engine_boundary.rs): the
+# nntune-core client against this server, both at the pinned velmora rev.
+# nntune-core never depends on this crate, so there is no cycle.
+nntune-core = { version = "0.1.0", path = "../nntune-core" }
 tokio = { version = "1", features = ["full"] }
-nntune-core = { version = "0.1.0", path = "../nntune-core", default-features = false, features = ["native-tls"] }

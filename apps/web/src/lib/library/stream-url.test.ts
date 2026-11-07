@@ -58,7 +58,8 @@ describe('library player wiring', () => {
 	it('normalizes a selected library item before it enters the shared queue', () => {
 		expect(library).toMatch(/function playableTrackFor\(item: LibraryItem\): Track \{\s*return \{ \.\.\.queuedTrackFor\(item\), streamUrl: resolveStreamUrl\(\{ streamUrl: item\.streamUrl \}\) \};\s*\}/);
 		expect(library).toContain('replaceQueue(addTrack(queue, playableTrackFor(item)))');
-		expect(library).toContain('player.setQueue(next, owner === null ? undefined : { owner, tracks: sourceProjections(next) })');
+		expect(library).toContain('player.setQueue(next, owner === null ? undefined : { owner, tracks: sourceProjections(next, source) })');
+		expect(library).toContain('function sourceProjections(next: QueueState, source: readonly LibraryItem[] = items)');
 		expect(library).toContain('const player = usePlayerSession()');
 	});
 

@@ -60,7 +60,8 @@ updates:
       prefix: "chore"
       include: "scope"
 
-  # Root workspace (covers crates/nntune-core; workers/* are excluded
+  # Root workspace (covers crates/nntune-core and its velmora git `rev`
+  # pin, which must move in every lockfile together; workers/* are excluded
   # standalone crates and get their own entries below).
   - package-ecosystem: "cargo"
     directory: "/"

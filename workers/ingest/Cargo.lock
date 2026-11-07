@@ -722,21 +722,10 @@ dependencies = [
 name = "nntune-core"
 version = "0.1.0"
 dependencies = [
- "aes",
- "cbc",
  "crc32fast",
- "crypto_secretbox",
- "getrandom 0.2.17",
- "libc",
- "md5",
- "quick-xml",
- "rustls",
  "serde",
  "serde_json",
- "sha2",
- "tokio",
- "tokio-rustls",
- "webpki-roots",
+ "velmora",
 ]
 
 [[package]]
@@ -784,7 +773,7 @@ version = "0.1.0"
 name = "nntune-test-nntp"
 version = "0.1.0"
 dependencies = [
- "tokio",
+ "velmora-test-nntp",
 ]
 
 [[package]]
@@ -1450,6 +1439,36 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "velmora"
+version = "0.1.0"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=c5e79d617896490a47d577a9b062cd0010e0bc8a#c5e79d617896490a47d577a9b062cd0010e0bc8a"
+dependencies = [
+ "aes",
+ "cbc",
+ "crc32fast",
+ "crypto_secretbox",
+ "getrandom 0.2.17",
+ "libc",
+ "md5",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
+
+[[package]]
+name = "velmora-test-nntp"
+version = "0.1.0"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=c5e79d617896490a47d577a9b062cd0010e0bc8a#c5e79d617896490a47d577a9b062cd0010e0bc8a"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "version_check"

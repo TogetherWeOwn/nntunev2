@@ -42,6 +42,12 @@ use crate::vault::{
 
 /// Hyperdrive binding name; must match `wrangler.toml.example`.
 const HYPERDRIVE_BINDING: &str = "HYPERDRIVE";
+/// Mirror Hyperdrive binding name for the MusicBrainz mirror cluster
+/// (ADR 0002 §1): the mirror lives on its own cluster, so catalogue reads
+/// split the app-side page (above) from mirror enrichment (this binding).
+/// Must match `wrangler.toml.example`; the shared `nntunev2-mb` config id
+/// is inventoried in docs/ops.md like the mb worker's `MB_DB_BINDING`.
+const MIRROR_HYPERDRIVE_BINDING: &str = "MB_DB";
 /// Fixed public DNS-over-HTTPS endpoint (never user-controlled).
 const DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 
@@ -781,6 +787,74 @@ impl PgStore {
         connected
     }
 
+    /// Mirror-cluster connection for the MusicBrainz enrichment reads (ADR
+    /// 0002 §1): same dial/handshake/timeout shape as [`Self::connect`],
+    /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
+    /// are the `mirror_*` literals so an incident names the cluster that
+    /// refused (every catalogue read touches both).
+    async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        if let Some(client) = self.test_client.borrow_mut().take() {
+            return Ok(client);
+        }
+        let env = self.env.as_ref().ok_or(StoreError)?;
+        // The phase in progress when the connect fails (or the deadline
+        // fires) names the `api.db.connect_failed.mirror_*` record below;
+        // the caller still sees only the opaque `StoreError`.
+        let reached = std::cell::Cell::new("api.db.connect_failed.mirror_binding");
+        let connected = with_deadline(
+            async {
+                let hyperdrive = env
+                    .hyperdrive(MIRROR_HYPERDRIVE_BINDING)
+                    .map_err(|_| StoreError)?;
+                reached.set("api.db.connect_failed.mirror_socket");
+                let socket = worker::Socket::builder()
+                    .secure_transport(worker::SecureTransport::StartTls)
+                    .connect(hyperdrive.host(), hyperdrive.port())
+                    .map_err(|_| StoreError)?;
+                reached.set("api.db.connect_failed.mirror_dial");
+                with_deadline(
+                    async { socket.opened().await.map(|_| ()).map_err(|_| StoreError) },
+                    DIAL_TIMEOUT_MS,
+                    StoreError,
+                )
+                .await?;
+                reached.set("api.db.connect_failed.mirror_handshake");
+                let config: tokio_postgres::Config = hyperdrive
+                    .connection_string()
+                    .parse()
+                    .map_err(|_| StoreError)?;
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| StoreError)?;
+                let trace_id = self.trace_id.clone();
+                let build_sha = build_sha_from_env(env);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
+                });
+                reached.set("api.db.connect_failed.mirror_set_timeout");
+                client
+                    .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(client)
+            },
+            TOTAL_TIMEOUT_MS,
+            StoreError,
+        )
+        .await;
+        if connected.is_err() {
+            let _ = Self::db_failure(
+                reached.get(),
+                &self.trace_id,
+                &build_sha_from_env(env),
+                None,
+            );
+        }
+        connected
+    }
+
     /// Map one `billing_operations` row to its single-flight shape: the
     /// payload fields parse tolerantly (a corrupt payload degrades to no
     /// reuse, never to a blocked flight).
@@ -951,6 +1025,148 @@ fn native_credential_from_row(
         label: row.try_get("label").map_err(|_| StoreError)?,
         created_from_ip: row.try_get("created_from_ip").map_err(|_| StoreError)?,
         last_used_at: last_used_at.map(u64_of).transpose()?,
+    })
+}
+
+/// Map one app-side library page row (migration 0035, no mirror data) to
+/// the catalogue page row. Selected ids arrive as `text`; the unnest
+/// ordinal arrives as bigint, the job array as `TEXT[]`.
+fn catalogue_library_page_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::LibraryPageRow, StoreError> {
+    Ok(crate::catalogue::LibraryPageRow {
+        job_id: row.try_get("job_id").map_err(|_| StoreError)?,
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+        recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+        recording_ord: row.try_get("recording_ord").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one mirror recording hit (title, duration by recording MBID) to the
+/// catalogue hit. `mbid::text` arrives lowercase; assembly normalizes both
+/// sides through `enrichment_key` anyway.
+fn catalogue_library_recording_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::LibraryRecordingHit, StoreError> {
+    Ok(crate::catalogue::LibraryRecordingHit {
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+        title: row.try_get("recording_title").map_err(|_| StoreError)?,
+        duration_ms: row.try_get("duration_ms").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one mirror occurrence hit (medium/track position for a
+/// (release, recording) pair) to the catalogue hit.
+fn catalogue_library_track_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::LibraryTrackHit, StoreError> {
+    Ok(crate::catalogue::LibraryTrackHit {
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+        medium_no: row.try_get("medium_no").map_err(|_| StoreError)?,
+        track_no: row.try_get("track_no").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one mirror release hit (title with artist) to the catalogue hit.
+fn catalogue_library_release_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::LibraryReleaseHit, StoreError> {
+    Ok(crate::catalogue::LibraryReleaseHit {
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+        title: row.try_get("release_title").map_err(|_| StoreError)?,
+        artist_mbid: row.try_get("artist_mbid").map_err(|_| StoreError)?,
+        artist_name: row.try_get("artist_name").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map an `mb_artist` row to the catalogue row (`country` is `CHAR(2)`,
+/// cast to text in SQL like the mirror worker's lookup).
+fn catalogue_artist_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::ArtistDbRow, StoreError> {
+    Ok(crate::catalogue::ArtistDbRow {
+        mbid: row.try_get("mbid").map_err(|_| StoreError)?,
+        name: row.try_get("name").map_err(|_| StoreError)?,
+        sort_name: row.try_get("sort_name").map_err(|_| StoreError)?,
+        artist_type: row.try_get("type").map_err(|_| StoreError)?,
+        country: row.try_get("country").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map an artist-joined `mb_release` row to the catalogue row.
+fn catalogue_release_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::ReleaseDbRow, StoreError> {
+    Ok(crate::catalogue::ReleaseDbRow {
+        mbid: row.try_get("mbid").map_err(|_| StoreError)?,
+        title: row.try_get("title").map_err(|_| StoreError)?,
+        release_type: row.try_get("release_type").map_err(|_| StoreError)?,
+        year: row.try_get("year").map_err(|_| StoreError)?,
+        artist_mbid: row.try_get("artist_mbid").map_err(|_| StoreError)?,
+        artist_name: row.try_get("artist_name").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map a fully joined `mb_track` occurrence row to the catalogue row.
+fn catalogue_track_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::TrackDbRow, StoreError> {
+    Ok(crate::catalogue::TrackDbRow {
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+        title: row.try_get("title").map_err(|_| StoreError)?,
+        duration_ms: row.try_get("duration_ms").map_err(|_| StoreError)?,
+        medium_no: row.try_get("medium_no").map_err(|_| StoreError)?,
+        track_no: row.try_get("track_no").map_err(|_| StoreError)?,
+        release_title: row.try_get("release_title").map_err(|_| StoreError)?,
+        artist_mbid: row.try_get("artist_mbid").map_err(|_| StoreError)?,
+        artist_name: row.try_get("artist_name").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one app-side member release row to the catalogue row.
+fn catalogue_member_release_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::MembershipReleaseRow, StoreError> {
+    Ok(crate::catalogue::MembershipReleaseRow {
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one app-side member (release, recording) pair row to the catalogue
+/// row.
+fn catalogue_member_pair_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::MembershipTrackPairRow, StoreError> {
+    Ok(crate::catalogue::MembershipTrackPairRow {
+        release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one app-side member recording row (one release's recordings for the
+/// release detail's member-only track read) to the catalogue row.
+fn catalogue_member_recording_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::MembershipReleaseRecordingRow, StoreError> {
+    Ok(crate::catalogue::MembershipReleaseRecordingRow {
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+    })
+}
+
+/// Map one release-detail track row (recording columns only; the release
+/// context joins in [`crate::catalogue::assemble_release_detail`]).
+fn catalogue_release_track_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::ReleaseTrackDbRow, StoreError> {
+    Ok(crate::catalogue::ReleaseTrackDbRow {
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+        title: row.try_get("title").map_err(|_| StoreError)?,
+        duration_ms: row.try_get("duration_ms").map_err(|_| StoreError)?,
+        medium_no: row.try_get("medium_no").map_err(|_| StoreError)?,
+        track_no: row.try_get("track_no").map_err(|_| StoreError)?,
     })
 }
 
@@ -3263,6 +3479,390 @@ impl Store for PgStore {
         .await
     }
 
+    /// Catalogue slice-1 reads. The statements live in
+    /// `crate::catalogue` (shape-pinned there); these impls only bind and
+    /// map. Collection bounds come from the catalogue constants, never
+    /// literals, so the bound and the statement cannot drift apart. The
+    /// pure-mirror reads below run on the mirror connection (ADR 0002 §1);
+    /// the library read splits across both databases (see below).
+    ///
+    /// The library read cannot join across databases, so it runs as four
+    /// statements: the app-side page (the `library` ledger is app-target,
+    /// migration 0035) plus three bounded mirror probes over the page's
+    /// well-formed MBIDs only — poisoned stored values never bind (the
+    /// probes' `$n::uuid[]` casts see only `enrichment_key` output, so they
+    /// cannot fail). [`crate::catalogue::assemble_library_rows`] joins the
+    /// four results with the old listing's per-field NULL degradation.
+    async fn catalogue_library(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::catalogue::LibraryDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                    .map_err(|_| StoreError)?;
+                let page = client
+                    .query_typed(
+                        crate::catalogue::library_page_statement(),
+                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_library")
+                    })?;
+                let page: Vec<crate::catalogue::LibraryPageRow> = page
+                    .iter()
+                    .map(catalogue_library_page_from_row)
+                    .collect::<Result<_, _>>()?;
+                // Well-formed page MBIDs only, deduplicated: malformed
+                // stored values never reach a mirror probe.
+                let mut recording_mbids: Vec<String> = page
+                    .iter()
+                    .filter_map(|row| {
+                        row.recording_mbid
+                            .as_deref()
+                            .and_then(crate::catalogue::enrichment_key)
+                    })
+                    .collect();
+                recording_mbids.sort();
+                recording_mbids.dedup();
+                let mut release_mbids: Vec<String> = page
+                    .iter()
+                    .filter_map(|row| {
+                        row.release_mbid
+                            .as_deref()
+                            .and_then(crate::catalogue::enrichment_key)
+                    })
+                    .collect();
+                release_mbids.sort();
+                release_mbids.dedup();
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_library");
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::library_recordings_statement(),
+                        &[(&recording_mbids, Type::TEXT_ARRAY)],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let recordings = rows
+                    .iter()
+                    .map(catalogue_library_recording_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::library_tracks_statement(),
+                        &[
+                            (&release_mbids, Type::TEXT_ARRAY),
+                            (&recording_mbids, Type::TEXT_ARRAY),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let tracks = rows
+                    .iter()
+                    .map(catalogue_library_track_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::library_releases_statement(),
+                        &[(&release_mbids, Type::TEXT_ARRAY)],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let releases = rows
+                    .iter()
+                    .map(catalogue_library_release_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(crate::catalogue::assemble_library_rows(
+                    &page,
+                    &recordings,
+                    &tracks,
+                    &releases,
+                ))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member-scoped artist collection: the caller's distinct member
+    /// releases from the app ledger (the whole ledger, uncapped — capping
+    /// the input at the page size drops artists whose releases sort past
+    /// the cap), then the first page of exactly those releases' artists
+    /// from the mirror. Shared deadline.
+    async fn catalogue_artists(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                    .map_err(|_| StoreError)?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_artists")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_artists");
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::artists_list_statement(),
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                rows.iter().map(catalogue_artist_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member-scoped release collection: same membership input as
+    /// [`Self::catalogue_artists`], then the first page of the member
+    /// releases themselves.
+    async fn catalogue_releases(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                    .map_err(|_| StoreError)?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_releases")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_releases");
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::releases_list_statement(),
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                rows.iter().map(catalogue_release_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member-scoped track-occurrence collection: the caller's distinct
+    /// member (release, recording) pairs from the app ledger (the whole
+    /// ledger, uncapped), then the mirror occurrences for exactly those
+    /// pairs — the pair join admits no cross-release rows, so the bound
+    /// applies to member occurrences, with exact-pair retention as the
+    /// safety net.
+    async fn catalogue_tracks(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::catalogue::TrackDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                    .map_err(|_| StoreError)?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_track_pairs_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_tracks")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipTrackPairRow> = member
+                    .iter()
+                    .map(catalogue_member_pair_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_pairs = crate::catalogue::member_pair_arrays(&member);
+                let (pair_releases, pair_recordings) =
+                    crate::catalogue::member_pair_columns(&member_pairs);
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_tracks");
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::tracks_list_statement(),
+                        &[
+                            (&pair_releases, Type::TEXT_ARRAY),
+                            (&pair_recordings, Type::TEXT_ARRAY),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let rows: Vec<crate::catalogue::TrackDbRow> = rows
+                    .iter()
+                    .map(catalogue_track_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok(crate::catalogue::retain_member_track_occurrences(
+                    rows,
+                    &member_pairs,
+                ))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Release detail, member-scoped: the app-side membership probe runs
+    /// first (case-insensitive, like the mirror's `::uuid` cast) and a
+    /// non-member id returns `None` before any mirror probe. The handler
+    /// answers 404 for `None`, so unknown and non-member releases stay
+    /// indistinguishable (no oracle).
+    async fn catalogue_release(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<Option<crate::catalogue::ReleaseDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                    return Ok(None);
+                };
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_release_membership_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release")
+                    })?;
+                if member.is_empty() {
+                    return Ok(None);
+                }
+                let mirror = self.connect_mirror().await?;
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::release_read_statement(),
+                        &[(&mbid, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // read is by primary key, so this is unreachable).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(catalogue_release_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Release tracks, member-scoped: same gate as [`Self::catalogue_release`]
+    /// so the tracks read is self-sufficient — a non-member id yields the
+    /// empty list (the handler only reaches this read for a member release).
+    /// A member release yields only the caller's own recordings on it, in
+    /// album order: the read returns catalog ids, so each one resolves
+    /// through the caller's memberships (ADR 0006), and non-member
+    /// recordings on a partly owned release stay out.
+    async fn catalogue_release_tracks(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                    return Ok(Vec::new());
+                };
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_release_membership_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
+                    })?;
+                if member.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_release_recordings_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRecordingRow> = member
+                    .iter()
+                    .map(catalogue_member_recording_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_recordings = crate::catalogue::member_recording_mbids(&member);
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::from(crate::catalogue::CATALOGUE_RELEASE_TRACKS_MAX);
+                let rows = mirror
+                    .query_typed(
+                        crate::catalogue::release_tracks_statement(),
+                        &[
+                            (&mbid, Type::TEXT),
+                            (&member_recordings, Type::TEXT_ARRAY),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
+                    })?;
+                rows.iter().map(catalogue_release_track_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
         Self::bounded(
             async {
@@ -4978,6 +5578,13 @@ fn served_display_path(path: &str) -> String {
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
     {
         "/v1/credentials/{id}".to_string()
+    } else if bare
+        .strip_prefix("/v1/releases/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        // Single-segment release ids only: nested shapes stay `unknown`
+        // (they 404 in dispatch), so probe paths never reach the log.
+        "/v1/releases/{mbid}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -5256,12 +5863,17 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 17] = [
+    const DB_FAILURE_EVENTS: [&str; 22] = [
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
         "api.db.connect_failed.handshake",
         "api.db.connect_failed.set_timeout",
+        "api.db.connect_failed.mirror_binding",
+        "api.db.connect_failed.mirror_socket",
+        "api.db.connect_failed.mirror_dial",
+        "api.db.connect_failed.mirror_handshake",
+        "api.db.connect_failed.mirror_set_timeout",
         "api.db.statement_failed.user_by_email",
         "api.db.statement_failed.insert_user",
         "api.db.statement_failed.insert_session",
@@ -5428,17 +6040,31 @@ mod tests {
             .split_once("\n    }\n")
             .expect("a closing brace must bound connect")
             .0;
-        assert!(
-            connect_body.contains("Self::db_failure(") && connect_body.contains("reached.get()"),
-            "a failed connect must emit the phase it reached"
-        );
+        let mirror_body = production
+            .split_once("async fn connect_mirror(&self)")
+            .expect("PgStore::connect_mirror must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("a closing brace must bound connect_mirror")
+            .0;
+        for body in [connect_body, mirror_body] {
+            assert!(
+                body.contains("Self::db_failure(") && body.contains("reached.get()"),
+                "a failed connect must emit the phase it reached"
+            );
+        }
         for event in DB_FAILURE_EVENTS {
             if let Some(phase) = event.strip_prefix("api.db.connect_failed.") {
                 let literal = format!("\"api.db.connect_failed.{phase}\"");
-                assert!(
-                    connect_body.contains(&literal),
-                    "connect must reach {event}"
-                );
+                // Mirror phases live in the mirror connect; the app
+                // phases in the app connect. Either body may not name
+                // the other's phases, so an incident names its cluster.
+                let body = if phase.starts_with("mirror_") {
+                    mirror_body
+                } else {
+                    connect_body
+                };
+                assert!(body.contains(&literal), "connect must reach {event}");
                 continue;
             }
             let (kind, operation) = event
@@ -5488,6 +6114,34 @@ mod tests {
             assert_eq!(served_display_path(path), "unknown");
         }
         assert_eq!(internal_response().body, r#"{"error":"internal error"}"#);
+    }
+
+    #[test]
+    fn dynamic_release_detail_logs_only_the_fixed_template() {
+        // Catalogue roots log bare (they are `is_known_path`); the release
+        // id itself never reaches the log — MBIDs are caller data, and
+        // unbounded distinct values would break log grouping.
+        for path in [
+            "/v1/library",
+            "/api/library",
+            "/v1/artists",
+            "/v1/releases",
+            "/v1/tracks",
+        ] {
+            assert_eq!(served_display_path(path), path);
+        }
+        let mbid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        assert_eq!(
+            served_display_path(&format!("/v1/releases/{mbid}")),
+            "/v1/releases/{mbid}"
+        );
+        for path in [
+            "/v1/releases/".to_string(),
+            format!("/v1/releases/{mbid}/art"),
+            format!("/v1/releases/{mbid}/tracks/extra"),
+        ] {
+            assert_eq!(served_display_path(&path), "unknown", "{path}");
+        }
     }
 
     #[test]

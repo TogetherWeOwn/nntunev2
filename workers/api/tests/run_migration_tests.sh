@@ -42,6 +42,6 @@ for f in "${migrations[@]}"; do
 done
 for f in "${tests[@]}"; do
   echo "test:    ${f#"$root"/}"
-  psql_run -f "$f"
+  psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" -f "$f"
 done
 echo "migration tests passed"

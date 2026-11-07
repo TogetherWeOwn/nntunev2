@@ -2,7 +2,11 @@
 
 Playwright suite covering the venture slice on **staging**: signup →
 library → playback with Range seeks → usage meter → plan-limit
-enforcement. Plus a fast synthetic smoke (`health.spec.ts`) that doubles
+enforcement. Today the playback, Range, meter and plan-limit legs are
+parked by name (user NZB ingest is retired; see the retired-leg notes
+below) and run only once admin-ingested tracks exist, so they are not live
+evidence yet; parking does not waive the catalogue task's real journey
+gate. Plus a fast synthetic smoke (`health.spec.ts`) that doubles
 as the post-deploy monitor.
 
 Public repo: **secret names only, never values.** Values live in GitHub

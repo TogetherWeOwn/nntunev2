@@ -155,6 +155,16 @@ const ALLOWED_SKIPS = [
   },
 ];
 
+// Full post-deploy runs require these exact fresh-account cases plus every
+// named M1 leg below. Empty-state evidence is deliberately not populated-row
+// isolation or playback evidence. Existing M1 skips retain their own reasons.
+const CATALOGUE_CASES = [
+  'catalogue aliases return the same empty library for each fresh account',
+  'catalogue collections expose empty-array contracts for a fresh account',
+  'Library renders the real API empty state for a fresh account',
+].map((match) => ({ file: 'catalogue.spec.ts', match }));
+const NAMED_JOURNEYS = [...CATALOGUE_CASES, ...ALLOWED_SKIPS];
+
 // Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
 // completable ingest until RAR read lands — the pipeline fails an RAR-only
 // subset permanent at transcode before any library row — hence no
@@ -295,6 +305,27 @@ function parseSkippedNames(xml) {
   return names;
 }
 
+function namedJourneyEvidence(xml) {
+  const cases = [...xml.matchAll(/<testcase\b[^>]*\/>|<testcase\b[^>]*>[\s\S]*?<\/testcase>/g)];
+  return NAMED_JOURNEYS.map((entry) => {
+    const matches = cases.filter(([text]) => {
+      const openTag = text.slice(0, text.indexOf('>') + 1);
+      const file = (attr(openTag, 'classname') ?? '').split(/[\\/]/).pop();
+      const name = attr(openTag, 'name') ?? '';
+      return file === entry.file && (name === entry.match || name.endsWith(` ${entry.match}`));
+    });
+    let outcome = 'missing';
+    if (matches.length > 1) outcome = 'duplicate';
+    else if (matches.length === 1) {
+      const text = matches[0][0];
+      outcome = /<(?:failure|error)[\s>/]/.test(text)
+        ? 'failed'
+        : /<skipped[\s>/]/.test(text) ? 'skipped' : 'passed';
+    }
+    return { ...entry, outcome };
+  });
+}
+
 // Summary carries only counts and static test titles — never failure text.
 let summaryLines = null;
 
@@ -371,6 +402,7 @@ const { skipped } = counts;
 const failed = failures + errors;
 const ran = tests - skipped;
 const skippedNames = parseSkippedNames(xml);
+const namedJourneys = namedJourneyEvidence(xml);
 // Each allow-list entry binds to its owning spec file and is consumed at
 // most once: a same-titled skip from another file cannot take its slot,
 // and one entry cannot cover two skips.
@@ -395,6 +427,13 @@ summaryLines = [
   '',
   `Skip budget (${REAL_NZB_MODE ? 'real-NZB mode' : 'standard mode'}): at most ${EFFECTIVE_BUDGET} ` +
     `from the documented allow-list (${ACTIVE_ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
+  '',
+  '| named case | outcome |',
+  '| --- | --- |',
+  ...namedJourneys.map((entry) => `| ${entry.file}: ${entry.match} | ${entry.outcome} |`),
+  '',
+  'Fresh-account catalogue cases do not establish populated-library isolation or row rendering. ' +
+    'Parked M1 legs are skips, never playback or metering proof.',
   '',
   ...(tokenMissing ? [tokenLine, ''] : []),
 ];
@@ -429,5 +468,15 @@ if (skippedNames.length < skipped) {
   );
 }
 if (failed > 0) fail(`${failed} failing test(s) — the journey is red.`);
+if (REQUIRE_QA_AUTH_TOKEN) {
+  const invalid = namedJourneys.filter((entry) =>
+    entry.outcome === 'missing' || entry.outcome === 'duplicate' || entry.outcome === 'failed' ||
+    (entry.file === 'catalogue.spec.ts' && entry.outcome !== 'passed'),
+  );
+  if (invalid.length > 0) {
+    fail('required named journey evidence is incomplete:\n' +
+      invalid.map((entry) => `- ${entry.file}: ${entry.match} (${entry.outcome})`).join('\n'));
+  }
+}
 
-appendSummary({ verdict: 'PASS: journey evidence complete.' });
+appendSummary({ verdict: 'PASS: journey evidence complete (see named outcomes and limitations above).' });
