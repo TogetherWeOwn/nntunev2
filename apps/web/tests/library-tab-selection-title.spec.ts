@@ -3,6 +3,7 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import type { QueueState, Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/library-tab-title/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * LIBTITLE protected acceptance bank (tests only; ship with the Builder's GREEN
@@ -29,6 +30,14 @@ import type {} from './fixtures/library-tab-title/mount.js';
  * exercises rapid replacement and unmount, which public controls cannot stage.
  * All APIs are mocked, foreign requests/media blocked. No provider credentials,
  * production calls, real audio, source-text assertions or new production API.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required. A further bounded exception opens only the title fixture's
+ * per-layout session/QueueView wiring and the ordinary-navigation lifetime
+ * premise in LIBTITLE-16; LIBTITLE-13/14/15/17 expectations stay unchanged.
  */
 const BASELINE = 'Library — NNTune';
 const CORAL_TITLE = 'Selected: Coral Night — Mira North — Library — NNTune';
@@ -148,6 +157,7 @@ test('LIBTITLE-02 metadata-only add identifies selection without claiming playba
 	const items = [{ ...CATALOGUE[0], token: 'PRIVATE_TITLE_CANARY', account: 'account-canary', url: 'https://provider.invalid/private' }];
 	await seed(page, baseURL!, { items, status: 200 });
 	await add(page, 'title-coral');
+	await openQueue(page);
 	await expect(queueRow(page, 'title-coral')).toHaveAttribute('aria-current', 'true');
 	await settle(page);
 	await check(info, { title: CORAL_TITLE, mediaSources: 0 }, {
@@ -160,6 +170,7 @@ test('LIBTITLE-03 real direct selection and Next follow the current identity, no
 	for (const track of TRACKS) await add(page, track.id);
 	const titles: string[] = [];
 	await settle(page); titles.push(await page.title());
+	await openQueue(page);
 	await queueRow(page, 'title-pine').getByRole('button', { name: 'Select Pine Morning', exact: true }).click();
 	await settle(page); titles.push(await page.title());
 	await page.getByTestId('player-next').click();
@@ -177,6 +188,7 @@ for (const vector of [
 	test(`${vector.id} canonical display fallback and literal text for ${vector.track.id}`, async ({ page, baseURL }, info) => {
 		await seed(page, baseURL!, { items: [vector.track], status: 200 });
 		await add(page, vector.track.id);
+		await openQueue(page);
 		await expect(queueRow(page, vector.track.id)).toHaveAttribute('aria-current', 'true');
 		await settle(page);
 		await check(info, vector.want, await page.title());
@@ -187,6 +199,7 @@ test('LIBTITLE-09 removal changes selected title and last removal/clear restore 
 	await seed(page, baseURL!);
 	await add(page, 'title-coral'); await add(page, 'title-pine');
 	const titles: string[] = [];
+	await openQueue(page);
 	await queueRow(page, 'title-coral').getByRole('button', { name: 'Remove Coral Night from queue', exact: true }).click();
 	await settle(page); titles.push(await page.title());
 	await queueRow(page, 'title-pine').getByRole('button', { name: 'Remove Pine Morning from queue', exact: true }).click();
@@ -215,6 +228,7 @@ for (const boundary of ['401', '403', 'auth event'] as const) {
 			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 		}
 		await expect(page.getByRole('alert')).toBeVisible();
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		await settle(page);
 		const denied = await page.title();
@@ -258,9 +272,18 @@ test('LIBTITLE-15 teardown cannot overwrite a newer route title', async ({ mount
 	await check(info, [CORAL_TITLE, 'Newer route — owned elsewhere'], [selected, await page.title()]);
 });
 
-test('LIBTITLE-16 SPA navigation owns the destination title and a new library visit starts empty', async ({ page, baseURL }, info) => {
+test('LIBTITLE-16 SPA navigation owns the destination title and retains session selection on return', async ({ page, baseURL }, info) => {
 	await seed(page, baseURL!); await add(page, 'title-coral'); await settle(page);
 	const selected = await page.title();
+	await openQueue(page);
+	const panel = (await page.getByTestId('queue-panel').elementHandle())!;
+	const expectRetained = async () => {
+		await expect(page.getByTestId('queue-item')).toHaveCount(1);
+		expect(await page.getByTestId('queue-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')))).toEqual(['title-coral']);
+		await expect(queueRow(page, 'title-coral')).toHaveAttribute('aria-current', 'true');
+		expect(await panel.evaluate((element) => element === document.querySelector('[data-testid="queue-panel"]'))).toBe(true);
+	};
+	await expectRetained();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
 	// User NZB import retired: the SPA leg runs through Account
 	// billing instead of the deleted /library/import route.
@@ -268,11 +291,13 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
 	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();
 	await expect(page).toHaveURL(/\/account\/billing$/); await settle(page);
+	await expect(page).toHaveTitle('Billing — NNTune v2');
 	const destination = await page.title();
+	await expectRetained();
 	await primary.getByRole('link', { name: 'Your Library', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
-	await expect(page.getByTestId('queue-item')).toHaveCount(0); await settle(page);
-	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', BASELINE], marker: 'same-document' }, {
+	await expectRetained(); await settle(page);
+	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', CORAL_TITLE], marker: 'same-document' }, {
 		titles: [selected, destination, await page.title()],
 		marker: await page.evaluate(() => (window as unknown as { titleNavMarker: string }).titleNavMarker)
 	});

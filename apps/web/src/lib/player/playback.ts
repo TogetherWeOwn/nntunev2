@@ -11,6 +11,7 @@ export interface AudioLike {
 	load(): void;
 	getAttribute(name: string): string | null;
 	readonly paused?: boolean;
+	readonly readyState?: number;
 	addEventListener?: EventTarget['addEventListener'];
 	removeEventListener?: EventTarget['removeEventListener'];
 }
@@ -76,6 +77,9 @@ export function createPlayback({
 		release();
 		reset();
 		observed = element;
+		// Ownership can begin after native play/playing already fired.
+		intended = element.paused === false;
+		hasPlayed = intended && (element.readyState ?? 0) >= 3; // HAVE_FUTURE_DATA
 		const source = element.getAttribute('src');
 		const isCurrent = () => release === cleanup && observed === element && element === audio() &&
 			element.getAttribute('src') === source;

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: star favorite library tracks locally (device-local Favorites).
@@ -41,6 +42,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * favorites queue-add + dedupe, FAV-08 zero network mutation. The unit
  * half (`favorites-local-acceptance.test.ts`) pins the same storage keys
  * at the `invalidateLibraryCache` boundary as FAV-U01..U03.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Fixture titles/artists deliberately avoid the words "star" and
@@ -126,6 +133,7 @@ test('[FAV-01] clicking a star toggle flips aria-pressed without touching the qu
 
 	await star.click();
 	await expect(star).toHaveAttribute('aria-pressed', 'true');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 
@@ -143,6 +151,7 @@ test('[FAV-02] Enter and Space toggle a focused star button', async ({ page }) =
 	await seedLibrary(page);
 
 	const star = starButton(page, 'fav-alpha');
+	await openQueue(page);
 	await star.focus();
 	await expect(star, 'star toggle must be keyboard-focusable').toBeFocused();
 
@@ -271,6 +280,7 @@ test('[FAV-07] favorites queue exactly like library rows and never duplicate', a
 	await row(page, 'fav-mike').click();
 	await (await favoriteControl(page, 'fav-mike')).click();
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	expect(await queueIds(page)).toEqual(['fav-mike']);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
@@ -299,6 +309,7 @@ test('[FAV-08] starring, unstarring and favorites queue-add issue zero network m
 
 	await starButton(page, 'fav-mike').click();
 	await (await favoriteControl(page, 'fav-mike')).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 
 	const mutations = requests.filter((request) => request.method !== 'GET');

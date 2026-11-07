@@ -1,27 +1,28 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, currentTrack, naturalEndPolicy, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { createPlayerSession } from '#lib/player/session.js';
+import { queueViewActions } from '#lib/player/queueViewActions.js';
+import { addTrack, createQueue, currentTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
 }) as Record<string, string>;
 
-// Exercise the real page handlers with mutable native getters. Lifecycle and
-// rendering are intentionally excluded here; the browser banks cover those.
+// Exercise the real persistent session (restart, relative jump, queue edits,
+// natural end) and the route's own share handlers with native getters and
+// events on one attached element. Component lifecycle and rendering are
+// intentionally excluded here; the browser banks cover those.
 function restartFixture() {
 	const source = sources['./+page.svelte'];
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
-		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
-		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
-		'currentAudioEvent', 'handleEnded', 'shortTitle'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'retireQueueWork', 'sourceProjections', 'libraryInputCurrent', 'syncMiniPlayerHint',
+		'applyShareLink', 'applyPendingShareSeek', 'supersedePositionSeek', 'supersedeShareSeek'
 	]);
 	const handlers = parsed.statements.filter((node) =>
 		ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text)
@@ -30,51 +31,92 @@ function restartFixture() {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const track = { id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' };
+	// The element's source is its attachment, not whatever row the queue selects.
+	const attachedSrc = track.streamUrl;
 	const location = { search: '' };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
-	const element = {
-		get duration() { return media.duration; },
-		get currentTime() { return media.position; },
-		set currentTime(value: number) {
-			writes.push(value);
-			if (media.refuse) throw new Error('native seek refused');
-			media.position = value;
+	const element = Object.assign(new EventTarget(), {
+		paused: true, ended: false, error: null, readyState: 4, isConnected: true,
+		volume: 0.6, muted: false, playbackRate: 1.25, pause() {}, play: () => Promise.resolve(), load() {},
+	});
+	Object.defineProperties(element, {
+		duration: { get: () => media.duration },
+		currentTime: {
+			get: () => media.position,
+			set: (value: number) => {
+				writes.push(value);
+				if (media.refuse) throw new Error('native seek refused');
+				media.position = value;
+			}
 		},
-		get seekable() {
-			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
-		},
-		getAttribute: (name: string) => name === 'src' ? track.streamUrl : null,
-		isConnected: true, ended: true, error: null,
-		volume: 0.6, muted: false, playbackRate: 1.25,
-		play: () => Promise.resolve()
-	};
+		seekable: { get: () => ({ length: 1, start: () => media.rangeStart, end: () => media.duration }) },
+		getAttribute: { value: (name: string) => name === 'src' ? attachedSrc : null }
+	});
 	const bindings = {
-		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
-		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy,
-		streamUrl: track.streamUrl,
-		tick: () => Promise.resolve(), window: { location }, element, track
+		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack,
+		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget,
+		clearMiniPlayerHint, setMiniPlayerHint, createPlayerSession, queueViewActions,
+		tick: () => Promise.resolve(), window: { location }, element, track, media
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), audioEl = element;
+		const player = createPlayerSession({ flush: () => Promise.resolve() });
+		player.setQueue(queue);
+		player.start(null);
+		const detach = player.attach(element);
+		const unsubscribe = player.subscribe((s) => { queue = s.queue; audioEl = s.audio ?? undefined; });
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
-		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
+		let queueConfirmGeneration = 0, libraryInputOwner = player.sourceInputOwner();
+		let queueAnnouncement = '';
 		const restartSupersededSources = new Set();
-		let playEpoch = 0, endGeneration = 0, queueAnnouncementVersion = 0;
-		let repeat = 'off', playingElement = element;
+		let playEpoch = 0;
 		${compiled}
+		const releaseRestart = player.onBeforeRestart(supersedeShareSeek);
+		const releaseIntent = player.onBeforePositionIntent(supersedePositionSeek);
+		const queueActions = queueViewActions(player);
+		const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 		return {
-			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
-			select: selectQueuedTrack, remove: removeQueuedTrack,
-			seeking: (target = element) => handleSeeking({ currentTarget: target }),			replaceQueue,
-			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
-			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue, jumpStatus })
+			restart: player.restart, applyShareLink, applyPendingShareSeek,
+			jump: player.jumpRelative,
+			select: queueActions.onselect, remove: queueActions.onremove,
+			seeking: (target) => {
+				// Only the attached element is observed; any other target is a distinct source.
+				const origin = target === undefined || target === element ? element : new EventTarget();
+				origin.dispatchEvent(new Event('seeking'));
+			},
+			replaceQueue,
+			end: async (mode) => {
+				player.setRepeat(mode);
+				// A genuine natural end: the element plays, its clock advances to the
+				// duration without a terminal seek, then it reports ended.
+				element.paused = false;
+				element.ended = false;
+				element.dispatchEvent(new Event('play'));
+				element.dispatchEvent(new Event('playing'));
+				const duration = media.duration;
+				if (Number.isFinite(duration) && media.position < duration) {
+					const step = (duration - media.position) / 4;
+					for (let i = 1; i <= 4; i += 1) {
+						media.position = i === 4 ? duration : media.position + step;
+						element.dispatchEvent(new Event('timeupdate'));
+					}
+				} else element.dispatchEvent(new Event('timeupdate'));
+				element.ended = true;
+				element.dispatchEvent(new Event('ended'));
+				await settle();
+			},
+			refresh: () => element.dispatchEvent(new Event('progress')),
+			dispose: () => { releaseIntent(); releaseRestart(); unsubscribe(); detach(); player.destroy(); },
+			read: () => ({
+				restartCanSeek: player.snapshot().restartAvailable,
+				restartStatus: player.snapshot().restartStatus,
+				restartStatusVersion: player.snapshot().restartVersion,
+				pendingShareSeek, queue: player.snapshot().queue,
+				jumpStatus: player.snapshot().jumpStatus
+			})
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -83,9 +125,11 @@ function restartFixture() {
 		jump: (direction: 'back' | 'forward') => void;
 		select: (index: number) => void;
 		remove: (index: number) => void;
-		seeking: (target?: unknown) => void;		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
+		seeking: (target?: unknown) => void;
+		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
 		end: (mode: 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
+		dispose: () => void;
 		read: () => {
 			restartCanSeek: boolean;
 			restartStatus: string;

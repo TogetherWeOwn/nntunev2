@@ -3,17 +3,21 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import type { QueueState, Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/library-now-playing/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * LIBNOWPLAY — native library player identity acceptance, tests-only handoff.
  *
  * Protected: this spec + tests/fixtures/library-now-playing/*.
- * Builder-owned implementation: src/routes/library/+page.svelte and, if needed,
- * src/lib/player/PlayerQueue.svelte / other src/lib/player/*.ts. Existing suites
- * remain unchanged. Continue the handoff branch; open a combined GREEN PR only.
+ * Engineering Lead authorized a one-time same-PR migration from library-local
+ * native controls to the approved persistent custom transport. The bounded
+ * executor exception covers obsolete chrome/ownership pins and the fixture input
+ * seam only; all other changes remain protected against Builder edits.
+ * Router-input seam: the fixture may change page.url and run navigation callbacks for /library and /now-playing only, through same-document pushState, replaceState and popstate in response to the real anchor gesture or goto. Session, audio, transport and readout are never replaced, and no network or media policy is widened.
  *
  * Presentation seam: data-testid="library-now-playing" is the ONE visible
- * title/artist readout IN the Player region containing native audio[controls].
+ * title/artist readout IN the Player region. The persistent layout owns one real
+ * audio-player without controls; the visible custom transport drives that node.
  * It is not the existing queue's data-testid="now-playing" live announcement.
  * Wording/separators are free; identity must be literal text, not HTML. Missing
  * artists produce no undefined/null placeholder; blank titles use stable ids.
@@ -22,9 +26,10 @@ import type {} from './fixtures/library-now-playing/mount.js';
  * no persistence or top/bottom selection UI. Do NOT implement streaming or new
  * controls/storage just to seed these tests. A test-only Vite pre-transform adds
  * ONE exported setter calling the page's existing replaceQueue. We mount the
- * REAL page and feed it playable queue states / existing selectTrack, moveTrack
- * and restoreQueue reducers. No readout, stream derivation, markup, transport or
- * announcement is replaced. Actual queue buttons still exercise page handlers.
+ * REAL layout with its REAL library child and feed playable queue states through
+ * existing selectTrack, moveTrack and restoreQueue reducers. Only router URL/env
+ * inputs are supplied by the fixture; no readout, stream derivation, markup,
+ * session, transport or announcement is replaced. Queue buttons use real handlers.
  * This tests restored-state rendering, not nonexistent library persistence.
  *
  * Setup (cached packages/browser required for offline use):
@@ -44,6 +49,12 @@ import type {} from './fixtures/library-now-playing/mount.js';
  * Breaks caught: stale/index-based identity, empty fallback, HTML interpretation,
  * wrong restored id, readout outside player, stale hidden text, duplicate live
  * path, progress chatter and narrow-screen overflow/low contrast.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const routePath = decodeURIComponent(new URL('../src/routes/library/+page.svelte', import.meta.url).pathname);
@@ -56,7 +67,9 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 			publicDir: false,
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
-				'$app/navigation': decodeURIComponent(new URL('./fixtures/library-now-playing/navigation.ts', import.meta.url).pathname)
+				'$app/navigation': decodeURIComponent(new URL('./fixtures/library-now-playing/navigation.ts', import.meta.url).pathname),
+				'$app/state': decodeURIComponent(new URL('./fixtures/library-now-playing/state.ts', import.meta.url).pathname),
+				'$app/env/public': decodeURIComponent(new URL('./fixtures/library-now-playing/env.ts', import.meta.url).pathname)
 			} },
 			plugins: [{
 				name: 'acceptance-library-queue-input', enforce: 'pre',
@@ -133,12 +146,13 @@ async function identity(page: Page, title: string, artist: string, stale = '') {
 		title: text.includes(title),
 		artist: artist ? text.includes(artist) : !/undefined|null/.test(text),
 		noStale: !stale || !text.includes(stale),
-		native: await player(page).locator('audio[controls]').count() === 1,
-		src: await player(page).locator('audio').getAttribute('src')
+		realAudio: await page.locator('audio[data-testid="audio-player"]').count() === 1 && await page.locator('audio').count() === 1,
+		custom: await page.getByTestId('player-bar').isVisible() && !await page.getByTestId('audio-player').evaluate((audio: HTMLAudioElement) => audio.controls),
+		src: await page.getByTestId('audio-player').getAttribute('src')
 	};
 }
 
-const named = { count: 1, visible: true, inPlayer: true, title: true, artist: true, noStale: true, native: true };
+const named = { count: 1, visible: true, inPlayer: true, title: true, artist: true, noStale: true, realAudio: true, custom: true };
 const expectedCoral = { ...named, src: '/__acceptance_audio__/coral.wav' };
 const expectedPine = { ...named, src: '/__acceptance_audio__/pine.wav' };
 const expectedEmber = { ...named, src: '/__acceptance_audio__/ember.wav' };
@@ -177,9 +191,23 @@ test.afterEach(async ({}, testInfo) => {
 	await testInfo.attach('acceptance-case.json', { body, contentType: 'application/json' });
 });
 
-test('LIBNOWPLAY-LN01 title and artist appear beside native controls', async ({ libraryPage: page }, info) => {
+test('LIBNOWPLAY-LN01 title and artist identify the real custom-controlled audio', async ({ libraryPage: page }, info) => {
 	await replace(page);
-	await check(info, expectedCoral, await identity(page, 'Coral Night', 'Mira North'));
+	const element = await page.getByTestId('audio-player').elementHandle();
+	// Wiring proof only, not decoded playback evidence: the real custom button
+	// must invoke play on this exact layout-owned HTMLAudioElement.
+	await element!.evaluate((audio: HTMLAudioElement) => {
+		audio.dataset.playCalls = '0';
+		audio.play = () => {
+			audio.dataset.playCalls = String(Number(audio.dataset.playCalls) + 1);
+			return new Promise<void>(() => {});
+		};
+	});
+	await page.getByTestId('player-play-pause').click();
+	await check(info, { identity: expectedCoral, exactElementDriven: true }, {
+		identity: await identity(page, 'Coral Night', 'Mira North'),
+		exactElementDriven: await element!.evaluate((audio) => audio === document.querySelector('[data-testid="audio-player"]') && audio.dataset.playCalls === '1')
+	});
 });
 
 test('LIBNOWPLAY-LN02 whitespace title falls back to stable id', async ({ libraryPage: page }, info) => {
@@ -216,6 +244,7 @@ test('LIBNOWPLAY-LN05 direct selection and bottom/top jumps follow identity, not
 test('LIBNOWPLAY-LN06 moving current to another slot preserves its readout and audio URL', async ({ libraryPage: page }, info) => {
 	await replace(page, state(1));
 	await page.evaluate(() => window.libraryNowPlaying.move(1, 2));
+	await openQueue(page);
 	await check(info, { identity: expectedPine, current: 'ln-pine', order: ['ln-coral', 'ln-ember', 'ln-pine'] }, {
 		identity: await identity(page, 'Pine Morning', 'South Ensemble', 'Coral Night'),
 		current: await page.locator('[data-testid="queue-item"][aria-current="true"]').getAttribute('data-track-id'),
@@ -225,6 +254,7 @@ test('LIBNOWPLAY-LN06 moving current to another slot preserves its readout and a
 
 test('LIBNOWPLAY-LN07 real play-next then Next updates both readout and stream', async ({ libraryPage: page }, info) => {
 	await replace(page);
+	await openQueue(page);
 	await row(page, 'ln-ember').getByRole('button', { name: 'Play Ember Noon next', exact: true }).click();
 	const beforeNext = await identity(page, 'Coral Night', 'Mira North', 'Ember Noon');
 	await page.getByTestId('player-next').click();
@@ -263,6 +293,7 @@ test('LIBNOWPLAY-LN11 real library metadata selection stays nonplayable', async 
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
 	await page.locator('[data-testid="library-item"][data-id="ln-coral"] button.nt-library-row').click();
+	await openQueue(page);
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
 	await check(info, { sections: 0, readouts: 0, audio: 0 }, await hidden(page));
 });
@@ -273,6 +304,7 @@ test('LIBNOWPLAY-LN12 stream loss and clear remove previously visible identity, 
 	await page.getByTestId('player-next').click();
 	const noStream = await hidden(page);
 	await replace(page);
+	await openQueue(page);
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
 	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await check(info, { before: expectedCoral, noStream: { sections: 0, readouts: 0, audio: 0 }, cleared: { sections: 0, readouts: 0, audio: 0 } }, {
@@ -343,3 +375,148 @@ for (const [index, theme] of ['light', 'dark'].entries()) {
 		});
 	});
 }
+
+test.describe('isolated fixture client navigation controls', () => {
+	test.use({ viewport: { width: 360, height: 740 }, colorScheme: 'light' });
+	test.afterEach(async ({}, info) => {
+		const body = JSON.stringify({ case_id: info.title.split(' ')[0], expected: 'passed', actual: info.status,
+			status: info.status === 'passed' ? 'GREEN' : 'RED', error_code: info.status === 'passed' ? null : 'FIXTURE_ROUTE_CONTROL',
+			next_action: info.status === 'passed' ? 'preserve acceptance' : 'inspect the route control assertion' });
+		console.log(body);
+		await info.attach('acceptance-case.json', { body, contentType: 'application/json' });
+	});
+	const miniLink = (page: Page) => page.getByTestId('mini-player').locator('a[href="/now-playing"]');
+	const expanded = (page: Page) => page.getByTestId('now-playing-route');
+
+	async function enter(page: Page) {
+		await miniLink(page).click();
+		await expect(expanded(page)).toBeVisible();
+		await settle(page);
+	}
+
+	async function audioSnapshot(page: Page) {
+		return page.getByTestId('audio-player').evaluate((audio: HTMLAudioElement) => ({
+			src: audio.getAttribute('src'), currentSrc: audio.currentSrc,
+			sources: Array.from(audio.querySelectorAll('source'), (source) => ({ src: source.getAttribute('src'), type: source.type }))
+		}));
+	}
+
+	test('LIBNOWPLAY-C1 mini gesture changes the real branch without replacing the document', async ({ libraryPage: page }) => {
+		await replace(page);
+		const entryURL = page.url();
+		const token = await page.evaluate(() => {
+			const doc = window as Window & { __docToken?: string };
+			return doc.__docToken = crypto.randomUUID();
+		});
+		let loads = 0;
+		page.on('load', () => { loads += 1; });
+		page.on('domcontentloaded', () => { loads += 1; });
+		await miniLink(page).click();
+		expect(new URL(page.url()).pathname, `entry URL: ${entryURL}`).toBe('/now-playing');
+		await expect(expanded(page)).toBeVisible();
+		expect(await page.evaluate(() => (window as Window & { __docToken?: string }).__docToken)).toBe(token);
+		expect(loads).toBe(0);
+	});
+
+	test('LIBNOWPLAY-C2 audio identity and source survive mini entry and Back', async ({ libraryPage: page }) => {
+		await replace(page);
+		await expect(page.locator('audio')).toHaveCount(1);
+		const audio = await page.getByTestId('audio-player').elementHandle();
+		const source = await audioSnapshot(page);
+		await enter(page);
+		for (const back of [false, true]) {
+			if (back) { await page.goBack(); await expect(page.getByTestId('library-item')).toHaveCount(3); }
+			await expect(page.locator('audio')).toHaveCount(1);
+			expect(await audio!.evaluate((node) => node.isConnected && node === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
+			expect(await audioSnapshot(page)).toEqual(source);
+		}
+	});
+
+	test('LIBNOWPLAY-C3 the real Layout persists and Library retires on entry', async ({ libraryPage: page }) => {
+		await replace(page);
+		const layout = await page.locator('.nt-body').elementHandle();
+		const text = await readout(page).innerText();
+		await expect(player(page)).toHaveCount(1);
+		await enter(page);
+		await expect(player(page)).toHaveCount(1);
+		expect(await layout!.evaluate((node) => node.isConnected && node === document.querySelector('.nt-body'))).toBe(true);
+		await expect(readout(page)).toHaveText(text);
+		const bridgeError = await page.evaluate(async (value) => {
+			try { await window.libraryNowPlaying.replace(value); return null; }
+			catch (error) { return error instanceof Error ? error.message : String(error); }
+		}, state());
+		expect(bridgeError).toBe('library child not mounted');
+		await page.goBack();
+		await expect(page.getByTestId('library-item')).toHaveCount(3);
+		await expect(player(page)).toHaveCount(1);
+		expect(await layout!.evaluate((node) => node.isConnected && node === document.querySelector('.nt-body'))).toBe(true);
+		await expect(readout(page)).toHaveText(text);
+	});
+
+	test('LIBNOWPLAY-C4 one Back restores the original entry and owners', async ({ libraryPage: page }) => {
+		await replace(page);
+		const entryURL = page.url();
+		const historyLength = await page.evaluate(() => history.length);
+		const token = await page.evaluate(() => {
+			const doc = window as Window & { __docToken?: string };
+			return doc.__docToken = crypto.randomUUID();
+		});
+		const audio = await page.getByTestId('audio-player').elementHandle();
+		const source = await audioSnapshot(page);
+		const layout = await page.locator('.nt-body').elementHandle();
+		await enter(page);
+		expect(await page.evaluate(() => history.length)).toBe(historyLength + 1);
+		await page.goBack();
+		expect(page.url()).toBe(entryURL);
+		await expect(page.getByTestId('library-item')).toHaveCount(3);
+		expect(await page.evaluate(() => (window as Window & { __docToken?: string }).__docToken)).toBe(token);
+		await expect(page.locator('audio')).toHaveCount(1);
+		expect(await audio!.evaluate((node) => node.isConnected && node === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
+		expect(await audioSnapshot(page)).toEqual(source);
+		await expect(player(page)).toHaveCount(1);
+		expect(await layout!.evaluate((node) => node.isConnected && node === document.querySelector('.nt-body'))).toBe(true);
+	});
+
+	test('LIBNOWPLAY-C5 client entry and Back keep the original request allow-set', async ({ libraryPage: page, libraryOrigin }) => {
+		await replace(page);
+		const requests: { url: string; type: string; method: string }[] = [];
+		page.on('request', (request) => requests.push({ url: request.url(), type: request.resourceType(), method: request.method() }));
+		let clickError: string | null = null;
+		try {
+			await miniLink(page).click();
+			await settle(page);
+			if (new URL(page.url()).pathname === '/now-playing') {
+				await page.goBack();
+				await expect(page.getByTestId('library-item')).toHaveCount(3);
+			}
+		} catch (error) { clickError = error instanceof Error ? error.message : String(error); }
+		const documents = requests.filter((request) => request.type === 'document');
+		expect(documents, `document requests after load: ${JSON.stringify(documents)}`).toEqual([]);
+		const forbidden = requests.filter((request) => {
+			const url = new URL(request.url);
+			return url.origin !== libraryOrigin || request.type === 'media' ||
+				(/^\/(?:api|v1|__acceptance_audio__)(?:\/|$)/.test(url.pathname) && !(url.pathname === '/api/library' && request.method === 'GET'));
+		});
+		expect(forbidden).toEqual([]);
+		expect(clickError).toBeNull();
+	});
+
+	test.describe('desktop default', () => {
+		test.use({ viewport: { width: 1000, height: 740 } });
+		test('LIBNOWPLAY-C6 default fixture URL and history stay unchanged without a gesture', async ({ libraryPage: page }) => {
+			const entryURL = page.url();
+			const historyLength = await page.evaluate(() => history.length);
+			await replace(page);
+			await settle(page);
+			expect(await page.evaluate(async () => {
+				const modulePath = '/state.ts';
+				const { page: fixturePage } = await import(modulePath);
+				return fixturePage.url.pathname;
+			})).toBe('/library');
+			expect(page.url()).toBe(entryURL);
+			expect(await page.evaluate(() => history.length)).toBe(historyLength);
+			await expect(page.getByTestId('library-item')).toHaveCount(3);
+			await expect(expanded(page)).toHaveCount(0);
+		});
+	});
+});

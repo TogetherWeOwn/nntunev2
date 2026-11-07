@@ -126,11 +126,10 @@ player-bar build changes product code only:
 - **New hooks**: `player-bar`, `player-play-pause`, `player-seek` (a native
   `input[type=range]` with slider semantics and an `aria-valuetext` like
   "1:23 of 3:45"), `player-volume`, plus shell hooks `shell-topbar` (both
-  shells), `shell-rail`, `shell-tabbar`, `mini-player`. They are declared
-  as `PENDING_TESTIDS` in `helpers/contract.ts` until their builds render
-  them, then move into `TESTIDS` (the web contract test requires every
-  `TESTIDS` hook in route markup, so the move happens in the PR that
-  renders the hook).
+  shells), `shell-rail`, `shell-tabbar`, `mini-player`. These are now in
+  `TESTIDS` in `helpers/contract.ts`, with their production component
+  sources pinned by the web contract test. The custom transport and its
+  seek helper activation ship together.
 - **Dual-generation driver** (`helpers/player-ui.ts`): seeks press the
   `player-seek` slider at the proportional position when it is visible and
   fall back to the native timeline while `controls` are still rendered;

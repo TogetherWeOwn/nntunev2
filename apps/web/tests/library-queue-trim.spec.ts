@@ -3,6 +3,7 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type QueueState, type Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/queue-trim/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * TRIM — protected independent acceptance, paired with
@@ -56,6 +57,12 @@ import type {} from './fixtures/queue-trim/mount.js';
  * controls are not evidence that trimming exists. Builder owns green and
  * same-head CI/review on the combined PR. No existing test or production file
  * is changed.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
@@ -172,6 +179,7 @@ async function seedLibrary(page: Page, origin: string, index: number) {
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(4);
 	for (const item of LIBRARY) await libraryRow(page, item.id).click();
+	await openQueue(page);
 	for (let next = 0; next < index; next += 1) await page.getByTestId('player-next').click();
 	await expect(currentRow(page)).toHaveAttribute('data-track-id', TRACKS[index]!.id);
 	expect(await order(page)).toEqual(['trim-zulu', 'trim-apple', 'trim-mango', 'trim-kiwi']);

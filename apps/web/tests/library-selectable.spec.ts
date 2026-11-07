@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: library rows are selectable (M1-f, queue-order un-fixme step 1).
@@ -31,6 +32,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Out of scope (not pinned): queue advancement/player behavior, toggle-off
  * semantics, duplicate selection.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -80,6 +87,7 @@ test('library rows render in API order with track-id hooks', async ({ page }) =>
 		.getByTestId('library-item')
 		.evaluateAll((items) => items.map((item) => item.getAttribute('data-id')));
 	expect(rendered).toEqual(['row-zulu', 'row-alpha', 'row-mike']);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });
 
@@ -90,6 +98,7 @@ test('clicking rows selects them in click order', async ({ page }) => {
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await selectedOrder(page)).toEqual(['row-mike', 'row-zulu']);
 });
@@ -98,6 +107,7 @@ test('Enter on a focused row selects it', async ({ page }) => {
 	await seedLibrary(page);
 
 	const control = await rowControl(page, 'row-alpha');
+	await openQueue(page);
 	await control.focus();
 	await expect(control, 'row control must be keyboard-focusable').toBeFocused();
 	await page.keyboard.press('Enter');
@@ -110,6 +120,7 @@ test('Space on a focused row selects it', async ({ page }) => {
 	await seedLibrary(page);
 
 	const control = await rowControl(page, 'row-zulu');
+	await openQueue(page);
 	await control.focus();
 	await expect(control, 'row control must be keyboard-focusable').toBeFocused();
 	await page.keyboard.press('Space');
@@ -123,6 +134,7 @@ test('mixed click and keyboard selection preserves gesture order', async ({ page
 
 	await row(page, 'row-mike').click();
 	const control = await rowControl(page, 'row-zulu');
+	await openQueue(page);
 	await control.focus();
 	await expect(control, 'row control must be keyboard-focusable').toBeFocused();
 	await page.keyboard.press('Enter');

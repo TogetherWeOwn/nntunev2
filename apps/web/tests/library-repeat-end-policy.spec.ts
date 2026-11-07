@@ -1,11 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Test-Author owned RED acceptance for LIBREPEAT: advance at end of track with
  * an explicit repeat Off/One/Queue control on `/library`. The Builder wires
  * `/library` to satisfy this file plus
  * `src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts` and must not
- * edit either file.
+ * edit either file, except for the narrowly authorized W11 owner-chain
+ * header and media-fixture lifecycle migration. Every behavior and expected
+ * outcome below stays protected; independent final review remains required.
  *
  * LOCKED PAGE CONTRACT (new hooks on `/library`; existing rows, queue,
  * favorites, order, share and filter hooks are unchanged):
@@ -42,7 +45,9 @@ import { expect, test, type Page } from '@playwright/test';
  * - `apps/web/tests/library-repeat-end-policy.spec.ts` (this file)
  * - `apps/web/src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts`
  * BUILDER-OWNED implementation surface:
- * - `apps/web/src/routes/library/+page.svelte` (only)
+ * - `apps/web/src/routes/library/+page.svelte` (repeat controls), root layout
+ *   and `lib/player/{PlayerAudio.svelte,context.ts,session.ts,transport.ts}`
+ *   (persistent production owner chain)
  * - Existing queue/resume/share/sleep suites stay unchanged.
  *
  * Run from the repository root (Node 24 / pnpm 10); builds + serves
@@ -54,14 +59,19 @@ import { expect, test, type Page } from '@playwright/test';
  * ending option parsing and selecting the entire suite. Ensure preview
  * port 4173 is free; never reuse another worktree's preview.
  *
- * RED NOW: `player-repeat` does not exist and the library audio has no `ended`
- * handler, so every case below fails at its control/advance assertion with a
- * NEXT action. No import/compile failure counts as RED: this file imports only
- * `@playwright/test`. Missing control is a SOFT assertion where transport is
- * also pinned: transport assertions still execute on baseline Off, proving
- * actual One/Queue failures rather than selector timeouts.
+ * W11 retains library repeat controls while moving audio into the persistent
+ * layout. Its session/transport consumes native lifecycle events; the fixture
+ * emits play/playing for every successful play, including automatic playback.
+ * Missing control remains a SOFT assertion where transport is also pinned;
+ * no import/compile failure counts as a behavioral RED.
  * Every RED assertion message is a compact JSON receipt:
  * {"case","expected","actual","status","error_code","next_action"}.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -119,6 +129,8 @@ async function openLibrary(
 				media.lastSrc = this.getAttribute('src') ?? '';
 				Object.defineProperty(this, 'paused', { value: false, configurable: true });
 				Object.defineProperty(this, 'ended', { value: false, configurable: true });
+				this.dispatchEvent(new Event('play'));
+				this.dispatchEvent(new Event('playing'));
 				return Promise.resolve();
 			};
 			HTMLMediaElement.prototype.pause = function () {
@@ -388,6 +400,7 @@ test('[LIBREP-02] Off advances mid-queue from zero with one announcement and no 
 	await selectRow(page, 'lib-coral', 'Coral Night');
 	await selectRow(page, 'lib-pine', 'Pine Morning');
 	await selectRow(page, 'lib-ember', 'Ember Line');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('audio-player')).toHaveCount(1);
 	await playCurrent(page);
@@ -436,6 +449,7 @@ test('[LIBREP-03] Off stops truthfully at the tail and stale ends stay inert', a
 	await setMode(page, 'LIBREP-03', 'off');
 	await selectRow(page, 'lib-coral', 'Coral Night');
 	await selectRow(page, 'lib-pine', 'Pine Morning');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	await page.getByTestId('player-next').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
@@ -480,6 +494,7 @@ test('[LIBREP-04] One replays the current track from zero without moving the sel
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
 	await playCurrent(page);
 	await setAudioTime(page, 31);
+	await openQueue(page);
 	const guards = await snapshotGuards(page);
 	const before = await mediaCalls(page);
 	await fireEnded(page);
@@ -526,6 +541,7 @@ test('[LIBREP-05] Queue follows the edited order then wraps to the first track',
 	await selectRow(page, 'lib-coral', 'Coral Night');
 	await selectRow(page, 'lib-ember', 'Ember Line');
 	// Arrange ember first via the queue move controls (edited order must win).
+	await openQueue(page);
 	const moveUp = page
 		.locator('[data-testid="queue-item"][data-track-id="lib-ember"]')
 		.getByRole('button', { name: /move .* up/i });
@@ -575,6 +591,7 @@ test('[LIBREP-05] Queue follows the edited order then wraps to the first track',
 
 test('[LIBREP-06] empty queues never render audio or autoplay', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(
 		page.getByTestId('audio-player'),
@@ -598,6 +615,7 @@ for (const value of ['one', 'queue'] as const) {
 		await openLibrary(page);
 		await setMode(page, `LIBREP-07-${value}`, value);
 		await selectRow(page, 'lib-pine', 'Pine Morning');
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(1);
 		await playCurrent(page);
 		await setAudioTime(page, 17);
@@ -637,6 +655,7 @@ test('[LIBREP-07-off] a singleton stops truthfully under Off without fabricating
 	await openLibrary(page);
 	await setMode(page, 'LIBREP-07-off', 'off');
 	await selectRow(page, 'lib-pine', 'Pine Morning');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await playCurrent(page);
 	const before = await mediaCalls(page);
@@ -754,6 +773,7 @@ test('[LIBREP-10] auth teardown clears pending end handling without advancing', 
 	await setMode(page, 'LIBREP-10', 'queue');
 	await selectRow(page, 'lib-coral', 'Coral Night');
 	await selectRow(page, 'lib-pine', 'Pine Morning');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	await playCurrent(page);
 	const audio = await page.getByTestId('audio-player').elementHandle();
@@ -832,6 +852,7 @@ test('[LIBREP-11] a stop stays terminal: no advance after it under any mode', as
 			await expectSilentAnnouncement(page, 'LIBREP-11-off');
 		} else {
 			// Clearing mid-mode must not let a detached end resurrect playback.
+			await openQueue(page);
 			const audio = await page.getByTestId('audio-player').elementHandle();
 			await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
 			await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
@@ -876,6 +897,7 @@ test('[LIBREP-12] explicit Next stays clamped at the tail under every mode', asy
 			)
 		).toBe(before.play);
 		await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
+		await openQueue(page);
 		expect(await queueOrder(page)).toEqual(['lib-coral', 'lib-pine']);
 	}
 });

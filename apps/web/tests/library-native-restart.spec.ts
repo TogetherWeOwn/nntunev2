@@ -1,18 +1,25 @@
 import { expect, test, type ElementHandle, type Page, type TestInfo } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * LIBRESTART — restart the current native library track, tests-only handoff.
  *
- * PROTECTED ACCEPTANCE BANK: this file is the only protected file. The paired
- * builder implements the control on this branch and must not edit this file.
- * Builder-owned implementation surface: `src/routes/library/+page.svelte`
- * (plus, if needed, `src/lib/player/*` it already uses). Do not import the
- * demo player's Range-fetch transport or shortcut controller: `/library`
- * plays through the native `audio-player` element only.
+ * PROTECTED ACCEPTANCE BANK: this file is protected. The paired builder
+ * implements the control on this branch and must not edit this file, with
+ * one exception. The Engineering Lead authorized a one-time, same-PR
+ * migration of this bank from library-local native controls to the approved
+ * persistent custom transport (layout-owned audio element plus transport
+ * bar). The bounded executor exception covers only: this header, the
+ * obsolete native-chrome and library-location assertions (CTRL-01, LR01,
+ * LR03), and LR14's obsolete "no `0` shortcut" expectation, which is now a
+ * positive guarded `0` restart plus full negatives. Every other behavior
+ * vector, case ID, compact receipt and tolerance is unchanged, and the
+ * general no-Builder-edit protection still applies to all other changes.
+ * Do not import the demo player's Range-fetch transport.
  *
  * LOCKED CONTRACT (new hooks; every existing library/queue/share hook stays):
  * - `library-restart`: ONE native <button> inside the Player region (the
- *   region holding the native `audio[controls]`), beside the player, with
+ *   library region named "Player"), beside the player, with
  *   accessible name matching /restart current track/i. Distinct from
  *   `player-next`; never a Previous-track action. Pointer, touch, Enter and
  *   Space all activate it; it is Tab-reachable with a visible focus ring.
@@ -41,8 +48,8 @@ import { expect, test, type ElementHandle, type Page, type TestInfo } from '@pla
  *   audio node itself (no reload/remount), queue order and current
  *   identity, `playbackRate` and `volume` are preserved; `play()`,
  *   `pause()` and `load()` are never called by the gesture; no track
- *   advance and no completion/ended accounting. NO global keyboard
- *   shortcut is added (the demo `0` binding does not exist here).
+ *   advance and no completion/ended accounting. The approved guarded `0`
+ *   shortcut restarts exactly like the button (LR14); `r`/`R` never do.
  * - An explicit restart SUPERSEDES any pending/remembered inbound-share
  *   seek for that source: later loadedmetadata/durationchange/canplay
  *   events for the same source must not move the position away from 0.
@@ -52,11 +59,12 @@ import { expect, test, type ElementHandle, type Page, type TestInfo } from '@pla
  *   element never redirect, disable or complete a restart.
  * - With no playable current track there is no enabled restart: the
  *   Player region (with the control) stays hidden as today, or the
- *   control is absent/disabled. Native controls stay intact. Layout
+ *   control is absent/disabled. The audio element has no native controls
+ *   (the custom transport drives it). Layout
  *   holds at 320px in light and dark with no horizontal overflow and
  *   readable (>= 4.5:1) control text.
  *
- * Harness: the real `/library` route with `/api/library` fulfilled
+ * Harness: the real production layout and `/library` route with `/api/library` fulfilled
  * in-test and `/test-audio/**` held pending, exactly like the library
  * share bank; per-element media doubles (duration/currentTime/seekable/
  * paused/readyState via `Object.defineProperty`) exactly like the demo
@@ -77,6 +85,12 @@ import { expect, test, type ElementHandle, type Page, type TestInfo } from '@pla
  * tests/player-restart.spec.ts, tests/library-native-now-playing.spec.ts,
  * tests/library-player-queue.spec.ts. Plus `pnpm --dir apps/web check`
  * and the full `pnpm --dir apps/web test` Vitest suite.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 test.setTimeout(30_000);
@@ -339,13 +353,27 @@ async function mountCoral(page: Page) {
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
 }
 
-test('CTRL-01 baseline library selection mounts one controlled native audio in the Player region', async ({ page }, info) => {
+test('CTRL-01 baseline library selection mounts one controlless layout-owned audio driven by the custom transport', async ({ page }, info) => {
 	await openLibrary(page);
 	await mountCoral(page);
-	await check(info, { region: 1, audioInRegion: 1, controls: true, src: '/test-audio/lr-coral', current: 'lr-coral' }, {
+	const before = await callsOf(page);
+	await page.getByTestId('player-play-pause').click();
+	await expect.poll(async () => (await callsOf(page)).play - before.play).toBeGreaterThan(0);
+	await openQueue(page);
+	await check(info, {
+		region: 1,
+		audioInDocument: 1,
+		controls: false,
+		transport: 1,
+		transportDrivesAudio: true,
+		src: '/test-audio/lr-coral',
+		current: 'lr-coral'
+	}, {
 		region: await playerRegion(page).count(),
-		audioInRegion: await playerRegion(page).locator('audio[controls]').count(),
+		audioInDocument: await page.locator('audio').count(),
 		controls: await audio(page).evaluate((el: HTMLAudioElement) => el.hasAttribute('controls')),
+		transport: await page.getByTestId('player-bar').count(),
+		transportDrivesAudio: (await callsOf(page)).play > before.play,
 		src: await audio(page).getAttribute('src'),
 		current: await currentQueueId(page)
 	});
@@ -370,6 +398,7 @@ test('CTRL-03 baseline inbound share seek lands on the library audio element', a
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
 	await expect(audio(page)).toHaveCount(1);
 	await expect.poll(() => timeOf(page)).toBe(77);
+	await openQueue(page);
 	await check(info, { current: 'lr-coral', time: 77, playCalls: 0 }, {
 		current: await currentQueueId(page),
 		time: await timeOf(page),
@@ -394,7 +423,7 @@ test('LIBRESTART-LR01 a labeled native Restart current track button lives in the
 		isButton: true,
 		nameOk: true,
 		distinctFromNext: true,
-		audioControls: true,
+		audioControls: false,
 		preStatusClean: true
 	}, {
 		count: await button.count(),
@@ -473,6 +502,7 @@ test('LIBRESTART-LR03 pointer restart while paused preserves intent src queue ra
 	});
 	await signalMedia(page);
 	await requireHook(page, 'LIBRESTART-LR03');
+	await openQueue(page);
 	const before = { calls: await callsOf(page), queue: await queueOrder(page) };
 
 	await restartButton(page).click();
@@ -488,7 +518,7 @@ test('LIBRESTART-LR03 pointer restart while paused preserves intent src queue ra
 		rate: 1.5,
 		volume: 0.4,
 		extraCalls: { play: 0, pause: 0, load: 0 },
-		audioControls: true,
+		audioControls: false,
 		outcome: okOutcome
 	}, {
 		time: await timeOf(page),
@@ -759,17 +789,19 @@ test('LIBRESTART-LR10 restart follows the current element and source after Next;
 
 	await mockMedia(page, { time: 50, duration: 200 });
 	await signalMedia(page);
-	if (replaced) {
-		await stale.evaluate((el: HTMLAudioElement) => {
-			el.dispatchEvent(new Event('loadedmetadata'));
-			el.dispatchEvent(new Event('durationchange'));
-		});
-		await settle(page);
-	}
+	// The production source-keyed attachment must retire the old owner. This
+	// unconditional detached-node vector cannot silently pass via a false branch.
+	expect(replaced).toBe(true);
+	await stale.evaluate((el: HTMLAudioElement) => {
+		el.dispatchEvent(new Event('loadedmetadata'));
+		el.dispatchEvent(new Event('durationchange'));
+	});
+	await settle(page);
 	const stateAfterStale = await hookState(page);
 	if (stateAfterStale === 'enabled') await restartButton(page).click();
 	await settle(page);
 
+	await openQueue(page);
 	await check(info, {
 		current: 'lr-pine',
 		src: '/test-audio/lr-pine',
@@ -782,9 +814,7 @@ test('LIBRESTART-LR10 restart follows the current element and source after Next;
 		src: await audio(page).getAttribute('src'),
 		stateAfterStale,
 		time: await timeOf(page),
-		staleTimeUntouched: replaced
-			? (await stale.evaluate((el: HTMLAudioElement) => el.currentTime)) === 30
-			: true,
+		staleTimeUntouched: (await stale.evaluate((el: HTMLAudioElement) => el.currentTime)) === 30,
 		outcome: await outcome(page, 'Pine Morning')
 	});
 });
@@ -809,6 +839,7 @@ test('LIBRESTART-LR11 an explicit restart supersedes a pending inbound-share see
 	});
 	await settle(page);
 
+	await openQueue(page);
 	await check(info, { time: 0, current: 'lr-coral', outcome: okOutcome }, {
 		time: await timeOf(page),
 		current: await currentQueueId(page),
@@ -833,6 +864,7 @@ test('LIBRESTART-LR12 a share seek for one track never lands on the next source'
 	await restartButton(page).click();
 	await expect.poll(() => timeOf(page)).toBe(0);
 
+	await openQueue(page);
 	await check(info, { beforeRestart: 12, time: 0, current: 'lr-pine', outcome: okOutcome }, {
 		beforeRestart,
 		time: await timeOf(page),
@@ -862,6 +894,7 @@ test('LIBRESTART-LR13 auth teardown clears restart and pending state; the next a
 	}, 'nntune.library.auth-transition.v1');
 	await otherTab.close();
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	const tornDownAudio = await audio(page).count();
 	const tornDownState = await hookState(page);
@@ -907,34 +940,217 @@ test('LIBRESTART-LR13 auth teardown clears restart and pending state; the next a
 	});
 });
 
-test('LIBRESTART-LR14 no global shortcut restarts the library track', async ({ page }, info) => {
-	await openLibrary(page);
-	await mountCoral(page);
-	await mockMedia(page, { time: 30, duration: 120 });
-	await signalMedia(page);
-	await requireHook(page, 'LIBRESTART-LR14');
-	const before = await callsOf(page);
+for (const paused of [true, false]) {
+	test(`LIBRESTART-LR14 guarded 0 preserves ${paused ? 'paused' : 'playing'} intent; typing, modal, slider, unavailable and r/R do not restart`, async ({ page }, info) => {
+		const errors: string[] = [];
+		page.on('pageerror', (error) => errors.push(String(error)));
+		await openLibrary(page);
+		await mountCoral(page);
+		await audio(page).evaluate((el: HTMLAudioElement & { __lrMarker?: string }) => {
+			el.__lrMarker = 'same-node';
+			el.playbackRate = 1.5;
+			el.volume = 0.4;
+		});
+		const seedValid = async (time = 30) => {
+			await mockMedia(page, { time, duration: 120, paused });
+			await signalMedia(page);
+		};
+		await openQueue(page);
+		const blurAll = () =>
+			page.evaluate(() => {
+				if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+			});
+		await seedValid();
+		const state = await requireHook(page, 'LIBRESTART-LR14');
+		const queue = await queueOrder(page);
+		const before = await callsOf(page);
 
-	await page.evaluate(() => {
-		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-	});
-	for (const key of ['0', 'r', 'R']) await page.keyboard.press(key);
-	await settle(page);
+		// Positive: eligible focus (body), usable current track at a nonzero time.
+		await restartStatus(page).evaluate((region) => {
+			region.dataset.outcomes = '0';
+			new MutationObserver(() => {
+				if (region.textContent?.trim()) region.dataset.outcomes = String(Number(region.dataset.outcomes) + 1);
+			}).observe(region, { childList: true, characterData: true, subtree: true });
+		});
+		await blurAll();
+		await page.keyboard.press('0');
+		await expect.poll(() => timeOf(page)).toBe(0);
+		const positive = {
+			time: await timeOf(page),
+			paused: await audio(page).evaluate((el: HTMLAudioElement) => el.paused),
+			src: await audio(page).getAttribute('src'),
+			sameNode: await audio(page).evaluate(
+				(el: HTMLAudioElement & { __lrMarker?: string }) => el.__lrMarker === 'same-node'
+			),
+			queue: await queueOrder(page),
+			current: await currentQueueId(page),
+			rate: await audio(page).evaluate((el: HTMLAudioElement) => el.playbackRate),
+			volume: await audio(page).evaluate((el: HTMLAudioElement) => el.volume),
+			outcome: await outcome(page, 'Coral Night'),
+			announcements: Number(await restartStatus(page).getAttribute('data-outcomes')),
+			livePaths: await page.locator('[role="status"], [role="alert"], [aria-live="polite"], [aria-live="assertive"]').evaluateAll((nodes) => nodes.filter((node) => /Restarted Coral Night/.test(node.textContent ?? '')).length)
+		};
 
-	await check(info, {
-		time: 30,
-		success: false,
-		extraCalls: { play: 0, pause: 0, load: 0 }
-	}, {
-		time: await timeOf(page),
-		success: (await outcome(page, 'Coral Night')).success,
-		extraCalls: await callsOf(page).then((after) => ({
-			play: after.play - before.play,
-			pause: after.pause - before.pause,
-			load: after.load - before.load
-		}))
+		// Negatives: reseed a nonzero position before each so an earlier zero
+		// cannot make a later guard pass vacuously.
+		const negative = async (label: string, prepare: () => Promise<void>, key = '0') => {
+			await seedValid();
+			await prepare();
+			const seeded = await timeOf(page);
+			await page.keyboard.press(key);
+			await settle(page);
+			const result = { label, seeded, time: await timeOf(page) };
+			await blurAll();
+			return result;
+		};
+		const inject = (html: string, selector: string) => async () => {
+			await page.evaluate(
+				([markup, target]) => {
+					document.getElementById('lr14-host')?.remove();
+					const host = document.createElement('div');
+					host.id = 'lr14-host';
+					host.innerHTML = markup;
+					document.body.appendChild(host);
+					(host.querySelector(target) as HTMLElement).focus();
+				},
+				[html, selector]
+			);
+		};
+		const negatives = [
+			await negative('input', inject('<input aria-label="lr14 input">', 'input')),
+			await negative('textarea', inject('<textarea aria-label="lr14 textarea"></textarea>', 'textarea')),
+			await negative(
+				'select',
+				inject('<select aria-label="lr14 select"><option>a</option><option>b</option></select>', 'select')
+			),
+			await negative(
+				'contenteditable',
+				inject('<div contenteditable="true" tabindex="0" aria-label="lr14 editable">x</div>', 'div')
+			),
+			await negative(
+				'nested-editable',
+				inject('<div contenteditable="true"><span tabindex="-1" id="lr14-nested">x</span></div>', '#lr14-nested')
+			),
+			await negative('aria-slider', inject('<div role="slider" tabindex="0" aria-label="lr14 slider"><span tabindex="-1">value</span></div>', 'span')),
+			await negative('volume-slider', async () => {
+				await page.getByTestId('player-volume').focus();
+			}),
+			await negative('r', blurAll, 'r'),
+			await negative('R', blurAll, 'R')
+		];
+		await page.evaluate(() => document.getElementById('lr14-host')?.remove());
+
+		// Seek slider: focus it once the live transport enables it.
+		await seedValid();
+		await expect(page.getByTestId('player-seek')).toBeEnabled();
+		negatives.push(await negative('seek-slider', async () => {
+			await page.getByTestId('player-seek').focus();
+		}));
+
+		// Modal: the real shortcut-help dialog; it also lists the 0 entry.
+		await seedValid();
+		await page.getByRole('button', { name: 'Keyboard shortcuts', exact: true }).click();
+		const dialog = page.locator('dialog[open]');
+		await expect(dialog).toHaveCount(1);
+		const helpText = ((await dialog.innerText()) ?? '').replace(/\s+/g, ' ');
+		const modalSeeded = await timeOf(page);
+		await page.keyboard.press('0');
+		await settle(page);
+		negatives.push({ label: 'modal', seeded: modalSeeded, time: await timeOf(page) });
+		await page.keyboard.press('Escape');
+		await expect(page.locator('dialog[open]')).toHaveCount(0);
+		await blurAll();
+
+		// Unavailable current media: nonfinite duration, then range excluding zero.
+		for (const [label, seed] of [
+			['unavailable-nan-duration', { time: 30, duration: Number.NaN, ranges: [] as [number, number][], readyState: 0 }],
+			['unavailable-range-excludes-zero', { time: 30, duration: 120, ranges: [[10, 120]] as [number, number][] }]
+		] as const) {
+			await mockMedia(page, seed);
+			await signalMedia(page);
+			await blurAll();
+			await page.keyboard.press('0');
+			await settle(page);
+			negatives.push({ label, seeded: 30, time: await timeOf(page) });
+		}
+		// A live node carrying the wrong source is stale even if its getters are
+		// otherwise usable. Restore it only after proving the shortcut refuses it.
+		await seedValid();
+		await audio(page).evaluate((el) => el.setAttribute('src', '/test-audio/stale-source'));
+		await signalMedia(page);
+		await blurAll();
+		await page.keyboard.press('0');
+		await settle(page);
+		negatives.push({ label: 'stale-source', seeded: 30, time: await timeOf(page) });
+		const staleDisabled = (await hookState(page)) === 'disabled';
+		await audio(page).evaluate((el) => el.setAttribute('src', '/test-audio/lr-coral'));
+		const restartEquivalent = await (async () => {
+			await seedValid();
+			return (await hookState(page)) === 'enabled';
+		})();
+
+		// Gesture-caused transport calls are measured before queue teardown.
+		const afterGestures = await callsOf(page);
+		const gestureCalls = {
+			play: afterGestures.play - before.play,
+			pause: afterGestures.pause - before.pause,
+			load: afterGestures.load - before.load
+		};
+
+		// Nonplayable: cleared current track has no audio and no restart.
+		await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+		await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+		await settle(page);
+		await blurAll();
+		const clearedStatusBefore = await statusText(page);
+		await page.keyboard.press('0');
+		await settle(page);
+		const cleared = {
+			audio: await audio(page).count(),
+			enabled: (await hookState(page)) === 'enabled',
+			statusUnchanged: (await statusText(page)) === clearedStatusBefore
+		};
+
+		const labels = [
+			'input', 'textarea', 'select', 'contenteditable', 'nested-editable', 'aria-slider', 'volume-slider', 'r', 'R',
+			'seek-slider',
+			'modal', 'unavailable-nan-duration', 'unavailable-range-excludes-zero', 'stale-source'
+		];
+		await check(info, {
+			state: 'enabled',
+			positive: {
+				time: 0,
+				paused,
+				src: '/test-audio/lr-coral',
+				sameNode: true,
+				queue,
+				current: 'lr-coral',
+				rate: 1.5,
+				volume: 0.4,
+				outcome: okOutcome,
+				announcements: 1,
+				livePaths: 1
+			},
+			negatives: labels.map((label) => ({ label, seeded: 30, time: 30 })),
+			helpListsZero: true,
+			restartEquivalent: true,
+			staleDisabled: true,
+			cleared: { audio: 0, enabled: false, statusUnchanged: true },
+			pageErrors: 0,
+			extraCalls: { play: 0, pause: 0, load: 0 }
+		}, {
+			state,
+			positive,
+			negatives: negatives,
+			helpListsZero: /\b0\b/.test(helpText) && /Restart track/i.test(helpText),
+			restartEquivalent,
+			staleDisabled,
+			cleared,
+			pageErrors: errors.length,
+			extraCalls: gestureCalls
+		});
 	});
-});
+}
 
 test('LIBRESTART-LR15 guard: no playable current track never exposes an enabled restart', async ({ page }, info) => {
 	const errors: string[] = [];
@@ -942,6 +1158,7 @@ test('LIBRESTART-LR15 guard: no playable current track never exposes an enabled 
 	await openLibrary(page);
 	await mountCoral(page);
 	await mockMedia(page, { time: 30, duration: 120 });
+	await openQueue(page);
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
 	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await settle(page);
@@ -1022,6 +1239,7 @@ test('LIBRESTART-LR18 a near-end restart does not advance or count a completion'
 	await mockMedia(page, { time: 119.9, duration: 120 });
 	await signalMedia(page);
 	await requireHook(page, 'LIBRESTART-LR18');
+	await openQueue(page);
 	const queue = await queueOrder(page);
 
 	await restartButton(page).click();

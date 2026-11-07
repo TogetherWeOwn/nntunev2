@@ -4,6 +4,7 @@
 </svelte:head>
 
 <script lang="ts">
+	import { createTrackListExport } from '#lib/player/trackListExport.js';
 	import { onMount, tick } from 'svelte';
 	import {
 		applySoundPreference,
@@ -168,77 +169,23 @@
 
 	let queueExportStatus = $state('');
 	let queueExportFallback = $state<string | null>(null);
-	let queueExportGeneration = 0;
 	let queueExportAlive = true;
-	let queueDownloadUrl: string | null = null;
+	const queueExporter = createTrackListExport({
+		getQueue: () => queue,
+		isActive: () => queueExportAlive,
+		onOutcome: (text, manual) => { queueExportStatus = text; queueExportFallback = manual; },
+		formatText: formatQueueText, formatM3U: formatQueueM3U,
+		noun: 'queue', filename: 'queue.m3u', savedDownloads: true
+	});
+	const copyQueueText = queueExporter.copy;
+	const downloadQueueM3U = queueExporter.download;
+	const releaseQueueDownload = () => queueExporter.reset(true);
 
-	function releaseQueueDownload(): void {
-		if (queueDownloadUrl !== null) URL.revokeObjectURL(queueDownloadUrl);
-		queueDownloadUrl = null;
-	}
-
-	// Every queue replacement (including selection) invalidates feedback.
-	// Handlers also compare snapshot identity to fence same-tick changes
-	// before this effect flushes. Export never writes the queue itself.
+	// Identity checks also fence same-tick edits before this effect flushes.
 	$effect(() => {
 		queue;
-		queueExportGeneration += 1;
-		queueExportStatus = '';
-		queueExportFallback = null;
+		queueExporter.reset();
 	});
-
-	function beginQueueExport(): number {
-		queueExportGeneration += 1;
-		queueExportStatus = '';
-		queueExportFallback = null;
-		return queueExportGeneration;
-	}
-
-	async function copyQueueText(): Promise<void> {
-		const generation = beginQueueExport();
-		const snapshot = queue;
-		if (!queueExportAlive || snapshot.tracks.length === 0) return;
-		const text = formatQueueText(snapshot);
-		try {
-			// Both the API getter and the write can fail. Neither is proof
-			// of a successful copy: expose selectable text instead.
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
-		} catch {
-			if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
-			queueExportStatus = 'Clipboard unavailable. Copy the queue manually below.';
-			queueExportFallback = text;
-			return;
-		}
-		if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
-		queueExportStatus = 'Copied queue as text.';
-	}
-
-	function downloadQueueM3U(): void {
-		beginQueueExport();
-		if (!queueExportAlive || queue.tracks.length === 0) return;
-		const link = document.createElement('a');
-		try {
-			// Retain at most one Blob URL until the next download or teardown,
-			// not an arbitrary timer while the browser may still be saving it.
-			releaseQueueDownload();
-			const blob = new Blob([formatQueueM3U(queue)], { type: 'audio/x-mpegurl;charset=utf-8' });
-			queueDownloadUrl = URL.createObjectURL(blob);
-			link.href = queueDownloadUrl;
-			link.download = 'queue.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			// The browser owns the save dialog: initiating it cannot prove
-			// that a file was saved to disk.
-			queueExportStatus = 'Download started. Check your browser’s saved downloads for queue.m3u.';
-		} catch {
-			releaseQueueDownload();
-			queueExportStatus = 'Could not start the download. Try again or copy the queue as text.';
-		} finally {
-			link.remove();
-		}
-	}
 
 	const playback = createPlayback({
 		audio: () => audioEl,
@@ -971,7 +918,8 @@
 		demoFilterInput?.focus();
 	}
 
-	function moveQueuedTrack(from: number, to: number): void {
+	async function moveQueuedTrack(from: number, to: number, control?: HTMLButtonElement): Promise<void> {
+		const heldFocus = !!control && document.activeElement === control;
 		const moved = queue.tracks[from];
 		if (!moved) return;
 		const reordered =
@@ -982,10 +930,18 @@
 					: moveTrack(queue, from, to);
 		if (reordered === queue) return;
 		queue = reordered;
+		const committedQueue = queue;
 		queueMoveAnnouncement = {
 			queue,
 			text: `${moved.title} moved to ${to + 1} of ${queue.tracks.length}`
 		};
+		await tick();
+		// Moving a keyed row can temporarily detach the focused button. Repair
+		// only this action's lost focus, never a newer focus choice or queue.
+		if (heldFocus && control?.isConnected && !control.disabled && queue === committedQueue &&
+			(document.activeElement === document.body || document.activeElement === null)) {
+			control.focus({ preventScroll: true });
+		}
 	}
 
 	function selectAt(index: number): void {
@@ -1678,7 +1634,6 @@
 			shareCopyAlive = false;
 			shareCopyGeneration += 1;
 			queueExportAlive = false;
-			queueExportGeneration += 1;
 			releaseQueueDownload();
 			window.removeEventListener('pagehide', persistOnPageHide);
 			document.removeEventListener('visibilitychange', resyncOnVisible);
@@ -2032,40 +1987,18 @@
 					>
 						{track.title} — {track.artist}{index === queue.currentIndex ? (visibleStatus === 'playing' ? ' (playing)' : ' (selected)') : ''}
 					</button>
-					<button
-						type="button"
-						data-testid="queue-move-up-{track.id}"
-						aria-label="Move {track.title} up"
-						disabled={index === 0}
-						onclick={() => moveQueuedTrack(index, index - 1)}
-					>
-						Up
-					</button>
-					<button
-						type="button"
-						data-testid="queue-move-down-{track.id}"
-						aria-label="Move {track.title} down"
-						disabled={index === queue.tracks.length - 1}
-						onclick={() => moveQueuedTrack(index, index + 1)}
-					>
-						Down
-					</button>
-					<button
-						type="button"
-						aria-label="Move {track.title} to top"
-						disabled={index === 0}
-						onclick={() => moveQueuedTrack(index, 0)}
-					>
-						Top
-					</button>
-					<button
-						type="button"
-						aria-label="Move {track.title} to bottom"
-						disabled={index === queue.tracks.length - 1}
-						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
-					>
-						Bottom
-					</button>
+					{#each ['Up', 'Down', 'Top', 'Bottom'] as move}
+						{@const first = move === 'Up' || move === 'Top'}
+						<button
+							type="button"
+							data-testid={move === 'Up' || move === 'Down' ? `queue-move-${move.toLowerCase()}-${track.id}` : undefined}
+							aria-label="Move {track.title} {move === 'Top' || move === 'Bottom' ? 'to ' : ''}{move.toLowerCase()}"
+							disabled={index === (first ? 0 : queue.tracks.length - 1)}
+							onclick={(event) => void moveQueuedTrack(index, move === 'Up' ? index - 1 : move === 'Down' ? index + 1 : first ? 0 : queue.tracks.length - 1, event.currentTarget)}
+						>
+							{move}
+						</button>
+					{/each}
 					<button
 						type="button"
 						class="queue-play-next"

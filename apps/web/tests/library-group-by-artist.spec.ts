@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the paired build makes this file pass without editing
@@ -91,6 +92,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Focused command (repo root, deterministic, offline):
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test tests/library-group-by-artist.spec.ts --workers=1 --retries=0
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -390,6 +397,7 @@ test('[GA-B00] control: shipped flat list, find and queueing work before groupin
 }) => {
 	const api = await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await expectFlat(page, API_IDS);
 	const field = await requireFind(page);
 	await field.fill('beta');
@@ -620,6 +628,7 @@ test('[GA-B05] selection composition: grouped checkboxes, counts and Append sele
 }) => {
 	await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	const kind = await requireGroup(page);
 	const field = await requireFind(page);
 	await setGrouped(page, kind, true);
@@ -664,6 +673,7 @@ test('[GA-B06] row actions: exact accessible names act on the exact track despit
 }) => {
 	await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	const kind = await requireGroup(page);
 	await setGrouped(page, kind, true);
 	await expectSections(page, GROUPED_ORIGINAL);
@@ -734,6 +744,7 @@ test('[GA-B07] view-only: toggling touches no network, media, queue, favorites, 
 	});
 	const api = await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	const kind = await requireGroup(page);
 
 	// Rich pre-state under a non-original ordering.

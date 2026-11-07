@@ -3,6 +3,7 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type QueueState, type Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/queue-orientation/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * QUEUE-ORIENTATION — protected independent runtime acceptance.
@@ -37,13 +38,24 @@ import type {} from './fixtures/queue-orientation/mount.js';
  * compile/runtime harness failures. Passing negative controls are not evidence
  * that the feature exists. Builder next action: implement shared PlayerQueue
  * only, then run this file plus protected regressions and same-head PR gates.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ *
+ * Cache exception: the Engineering Lead authorized only a per-worker Vite
+ * cacheDir for the standalone component server. Every test, fixture, assertion
+ * and restriction remains protected.
  */
 
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
-	componentOrigin: [async ({}, use) => {
+	componentOrigin: [async ({}, use, workerInfo) => {
 		const server = await createServer({
 			configFile: false,
 			root: decodeURIComponent(new URL('./fixtures/queue-orientation/', import.meta.url).pathname),
+			cacheDir: decodeURIComponent(new URL(`../node_modules/.vite/queue-orientation-${workerInfo.workerIndex}/`, import.meta.url).pathname),
 			publicDir: false,
 			plugins: [svelte({ configFile: false, compilerOptions: { runes: true } })],
 			server: { host: '127.0.0.1', port: 0, fs: { allow: [decodeURIComponent(new URL('../', import.meta.url).pathname)] } }
@@ -325,6 +337,7 @@ test.describe('mocked library integration', () => {
 		await localOnly(page, baseURL!, payload, apiCalls);
 		await page.goto('/library');
 		await expect(page.getByTestId('library-item')).toHaveCount(4);
+		await openQueue(page);
 		await expect(page.getByTestId('queue-position')).toContainText(/queue is empty/i);
 		await expect(page.getByRole('button', { name: 'Show current track', exact: true })).toBeDisabled();
 		await libraryRow(page, ZEBRA.id).click();
@@ -342,17 +355,18 @@ test.describe('mocked library integration', () => {
 		await expectPosition(page, 'Track 1 of 2', '1 upcoming');
 		await expect(currentRow(page)).toHaveAttribute('data-track-id', MANGO.id);
 		expect((await queueSnapshot(page)).rows.map((row) => row.id)).toEqual([MANGO.id, APPLE.id]);
-		// Empty library unmounts PlayerQueue (library/+page.svelte empty
-		// branch); assert the pinned page contract, not a missing hook.
+		// Empty catalogue prunes the session queue; its persistent panel stays
+		// mounted outside Library and must expose the real empty state.
 		payload.current = [];
 		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 		await expect(page.getByTestId('library-item')).toHaveCount(0);
 		await expect(page.getByRole('status').filter({ hasText: /library is empty/i })).toBeVisible();
-		await expect(page.getByTestId('queue-position')).toHaveCount(0);
-		await expect(page.getByRole('button', { name: 'Show current track', exact: true })).toHaveCount(0);
-		// The queue was dropped with the library, not just hidden: a
-		// re-mounted panel shows the empty state (assertion-RED without the
-		// feature, GREEN with it).
+		await expect(page.getByRole('main').getByTestId('queue-position')).toHaveCount(0);
+		await expect(page.getByTestId('queue-panel').getByTestId('queue-position')).toContainText(/queue is empty/i);
+		await expect(page.getByRole('main').getByRole('button', { name: 'Show current track', exact: true })).toHaveCount(0);
+		await expect(page.getByTestId('queue-panel').getByRole('button', { name: 'Show current track', exact: true })).toBeDisabled();
+		// A later catalogue must not restore the pruned queue merely because
+		// its presentation survived the empty Library branch.
 		payload.current = [LIBRARY[0]];
 		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 		await expect(page.getByTestId('library-item')).toHaveCount(1);
@@ -371,6 +385,7 @@ test.describe('mocked library integration', () => {
 			await localOnly(page, baseURL!, { current: items }, apiCalls);
 			await page.goto('/library');
 			await expect(page.getByTestId('library-item')).toHaveCount(31);
+			await openQueue(page);
 			// DOM events supply parent state without test-runner scrolling/focusing
 			// every row. Reveal itself below is a genuine keyboard gesture.
 			for (const item of items) await libraryRow(page, item.id).locator('button.nt-library-row').dispatchEvent('click');
@@ -414,6 +429,7 @@ test.describe('mocked library integration', () => {
 		await localOnly(page, baseURL!, { current: LIBRARY });
 		await page.goto('/library');
 		await expect(page.getByTestId('library-item')).toHaveCount(4);
+		await openQueue(page);
 		await libraryRow(page, ZEBRA.id).click();
 		await libraryRow(page, MANGO.id).click();
 		const next = page.getByTestId('player-next');

@@ -1,0 +1,269 @@
+<script lang="ts">
+	import { tick, type Snippet } from 'svelte';
+
+	let { queueToggle, expanded = false }: { queueToggle?: Snippet<[beforeOpen?: () => Promise<boolean>]>; expanded?: boolean } = $props();
+	import IconSvg from '../design/IconSvg.svelte';
+	import { FAVORITE_ICON_PATHS, TRANSPORT_ICON_PATHS } from '../design/icons.js';
+	import { formatDuration } from '../format.js';
+	import { displayArtist, displayTitle } from '../library/order.js';
+	import { usePlayerSession } from './context.js';
+	import { currentTrack } from './queue.js';
+	import { isModalOpen, isTypingTarget } from './shortcuts.js';
+	import { actionForPlayerKey, PLAYER_SHORTCUT_ROWS } from './appShortcuts.js';
+	import Artwork from './Artwork.svelte';
+	import { createCinemaController, type CinemaSnapshot } from './cinema.js';
+
+	const player = usePlayerSession();
+	const transport = $derived($player.transport);
+	const active = $derived(transport?.status === 'playing' || transport?.status === 'loading' || transport?.status === 'buffering');
+	const duration = $derived(transport?.duration ?? 0);
+	const position = $derived(Math.min(duration, transport?.position ?? 0));
+	const volume = $derived(Math.round((transport?.sound.volume ?? 1) * 100));
+	const sleep = $derived(transport?.sleep);
+	const sleepText = $derived(!sleep ? 'Sleep timer off' : sleep.kind === 'duration'
+		? `Sleep in ${Math.ceil(sleep.remainingMs / 60000)} minutes`
+		: sleep.kind === 'end-of-track' ? 'Sleep at end of track'
+		: `Sleep after ${sleep.remainingTracks} tracks`);
+	let feedback = $state('');
+	let dialog: HTMLDialogElement | undefined = $state();
+	let opener: HTMLElement | null = null;
+	let helpOpen = $state(false);
+	const id = $props.id();
+	const selected = $derived(currentTrack($player.queue));
+	const favorite = $derived(!!selected && $player.favorites.includes(selected.id));
+	let cinema = $state<CinemaSnapshot>({ supported: false, active: false, pending: false, failed: false, idle: false });
+	let cinemaController: ReturnType<typeof createCinemaController> | undefined;
+
+	function mountCinema(element: HTMLElement) {
+		cinemaController = createCinemaController(element, (state) => { cinema = state; });
+		return { destroy: () => { cinemaController?.destroy(); cinemaController = undefined; } };
+	}
+
+	$effect(() => {
+		// A failed seek belongs to its source, not to the next selection.
+		selected?.id;
+		selected?.streamUrl;
+		feedback = '';
+	});
+
+	function seek(seconds: number): void {
+		feedback = player.seek(seconds) ? '' : 'Could not seek this track. Try again once it has loaded.';
+	}
+
+	async function openHelp(): Promise<void> {
+		if (helpOpen) return;
+		opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		helpOpen = true;
+		await tick();
+		if (helpOpen) dialog?.showModal();
+	}
+
+	function closeHelp(): void {
+		dialog?.close();
+		helpOpen = false;
+		if (opener?.isConnected) opener.focus();
+		opener = null;
+	}
+
+	function onDialogKey(event: KeyboardEvent): void {
+		if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey || !dialog) return;
+		const buttons = [...dialog.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];
+		const first = buttons[0];
+		const last = buttons[buttons.length - 1];
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault(); last?.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault(); first?.focus();
+		}
+	}
+
+	function onKey(event: KeyboardEvent): void {
+		if (event.defaultPrevented || event.repeat || event.isComposing || isTypingTarget(event.target) || isModalOpen(document) ||
+			(event.target instanceof Element && event.target.closest('[role="slider"]'))) return;
+		if (event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+			event.preventDefault();
+			player.setVolume((transport?.sound.volume ?? 1) + (event.key === 'ArrowUp' ? 0.05 : -0.05));
+			return;
+		}
+		if (event.altKey || event.ctrlKey || event.metaKey) return;
+		if (event.key === 'Escape' && cinema.active) {
+			event.preventDefault();
+			void cinemaController?.exit();
+			return;
+		}
+		// Space still activates a focused native button/link; only passive
+		// player/main surfaces get the global transport equivalent.
+		const target = event.target instanceof HTMLElement ? event.target : null;
+		const space = event.key === ' ' && target?.closest('main, [data-player-transport]') &&
+			!target.closest('button, a, summary, [role="button"], [role="slider"]');
+		const action = space ? 'toggle-play' : actionForPlayerKey(event.key);
+		if (!action || action === 'close-shortcuts') return;
+		event.preventDefault();
+		switch (action) {
+			case 'toggle-play': player.togglePlay(); break;
+			case 'next-track': void player.next(); break;
+			case 'previous-track': void player.previous(); break;
+			case 'seek-back': seek((transport?.position ?? 0) - (event.shiftKey ? 30 : 10)); break;
+			case 'seek-forward': seek((transport?.position ?? 0) + (event.shiftKey ? 30 : 10)); break;
+			case 'restart-track': player.restart(); break;
+			case 'toggle-mute': player.toggleMute(); break;
+			case 'shuffle-upcoming': player.shuffle(); break;
+			case 'cycle-repeat': player.cycleRepeat(); break;
+			case 'toggle-favorite': player.toggleCurrentFavorite(); break;
+			case 'open-shortcuts': void openHelp(); break;
+		}
+	}
+
+	function onSleepChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value === 'off') player.cancelSleep();
+		else if (value === 'end') player.armSleep({ kind: 'end-of-track' });
+		else player.armSleep({ kind: 'duration', ms: Number(value) * 60000 });
+	}
+</script>
+
+<svelte:window onkeydown={onKey} />
+
+{#snippet favoriteControl()}
+	<button type="button" data-testid="player-favorite" aria-label={favorite ? 'Remove from Favorites' : 'Save to Favorites'} title={favorite ? 'Remove from Favorites' : 'Save to Favorites'} aria-pressed={favorite} onclick={() => player.toggleCurrentFavorite()}>
+		<IconSvg path={FAVORITE_ICON_PATHS[favorite ? 'heart-filled' : 'heart']} />
+	</button>
+{/snippet}
+
+{#snippet seekControl()}
+	<div class="seek">
+		<span>{formatDuration(position)}</span>
+		<input type="range" data-testid="player-seek" aria-label="Seek" aria-valuetext={`${formatDuration(position)} of ${duration ? formatDuration(duration) : 'unknown duration'}`} min="0" max={duration || 1} step="0.1" value={position} disabled={!duration} oninput={(event) => seek(Number(event.currentTarget.value))} />
+		<span>{duration ? formatDuration(duration) : '—'}</span>
+	</div>
+	<div class="transport-buttons">
+		<button type="button" data-testid="player-seek-back" onclick={() => player.jumpRelative('back')}>Back 10 seconds</button>
+		<button type="button" data-testid="player-seek-forward" onclick={() => player.jumpRelative('forward')}>Forward 10 seconds</button>
+	</div>
+	<p data-testid="player-seek-feedback" aria-live="polite">{#key $player.jumpStatusVersion}{$player.jumpStatus}{/key}</p>
+{/snippet}
+
+{#snippet restartControl()}
+	<button type="button" data-testid="library-restart" disabled={!$player.restartAvailable} aria-describedby={$player.restartAvailable ? undefined : `${id}-restart-hint`} onclick={() => player.restart()}>Restart current track</button>
+	{#if !$player.restartAvailable}<p id={`${id}-restart-hint`}>Restart is unavailable until this track can seek.</p>{/if}
+{/snippet}
+
+<section use:mountCinema class:expanded aria-label="Player" data-testid="player-bar" data-player-transport data-cinema-idle={cinema.idle} tabindex="-1">
+	{#if cinema.active || expanded}
+		<div class="cinema-artwork"><Artwork src={selected?.artworkUrl} /></div>
+	{/if}
+	<div class="cinema-controls">
+	<h2>Now playing</h2>
+	{#if selected}
+		<p class="identity" data-testid="library-now-playing">
+			{displayTitle(selected)}{#if displayArtist(selected)}{' — '}{displayArtist(selected)}{/if}
+		</p>
+		<p class="identity" data-testid="now-playing" role={$player.queueLiveRegions ? 'status' : undefined}>Now playing: {displayTitle(selected)}{#if selected.artist}{' — '}{selected.artist}{/if}</p>
+		{#if !expanded}{@render favoriteControl()}{/if}
+	{/if}
+	{#if expanded}{@render seekControl()}{/if}
+	<div class="transport-buttons">
+		<button type="button" aria-label="Shuffle upcoming tracks" title="Shuffle upcoming tracks" onclick={() => player.shuffle()} disabled={$player.queue.tracks.length - $player.queue.currentIndex < 3}>
+			<IconSvg path={TRANSPORT_ICON_PATHS.shuffle} />
+		</button>
+		<button type="button" aria-label="Previous track" title="Previous track" onclick={() => void player.previous()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-back']} /></button>
+		<button type="button" class="play" data-testid="player-play-pause" aria-label={active ? 'Pause' : 'Play'} title={active ? 'Pause' : 'Play'} onclick={() => player.togglePlay()}>
+			<IconSvg path={TRANSPORT_ICON_PATHS[active ? 'pause' : 'play']} />
+		</button>
+		<button type="button" data-testid="player-next" aria-label="Next track" title="Next track" onclick={() => void player.next()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-forward']} /></button>
+		<button type="button" aria-label={`Repeat: ${$player.repeat === 'off' ? 'Off' : $player.repeat === 'queue' ? 'Queue' : 'One'}`} title="Cycle repeat" aria-pressed={$player.repeat !== 'off'} onclick={() => player.cycleRepeat()}>
+			<IconSvg path={TRANSPORT_ICON_PATHS[$player.repeat === 'one' ? 'repeat-1' : 'repeat']} />
+		</button>
+	</div>
+	{#if !expanded}{@render restartControl()}{/if}
+	<p data-testid="library-restart-status" aria-live="polite">{#key $player.restartVersion}{$player.restartStatus}{/key}</p>
+	{#if !expanded}{@render seekControl()}{/if}
+	<div class="sound">
+		{#if expanded && selected}{@render favoriteControl()}{/if}
+		<button type="button" aria-label={transport?.sound.muted ? 'Unmute' : 'Mute'} aria-pressed={transport?.sound.muted ?? false} onclick={() => player.toggleMute()}>
+			<IconSvg path={TRANSPORT_ICON_PATHS[transport?.sound.muted ? 'volume-x' : 'volume-2']} />
+		</button>
+		<label for={`${id}-volume`}>Volume</label>
+		<input id={`${id}-volume`} data-testid="player-volume" type="range" min="0" max="100" step="5" value={volume} aria-valuetext={`${volume}%`} oninput={(event) => player.setVolume(Number(event.currentTarget.value) / 100)} />
+		{@render queueToggle?.(() => cinemaController?.exit() ?? Promise.resolve(false))}
+		<button type="button" data-testid="player-fullscreen" aria-label={cinema.active ? 'Exit full screen' : 'Enter full screen'} aria-pressed={cinema.active} aria-describedby={!cinema.supported ? `${id}-fullscreen-hint` : undefined} disabled={!cinema.supported || cinema.pending} onclick={() => void cinemaController?.toggle()}>{cinema.active ? 'Exit full screen' : 'Enter full screen'}</button>
+		<button type="button" aria-haspopup="dialog" onclick={() => void openHelp()}>Keyboard shortcuts</button>
+	</div>
+	<details>
+		<summary>Playback</summary>
+		<div class="playback-settings">
+			<label for={`${id}-speed`}>Playback speed</label>
+			<select id={`${id}-speed`} value={transport?.rate ?? 1} onchange={(event) => player.setSpeed(Number(event.currentTarget.value))}>
+				{#each [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as rate}<option value={rate}>{rate}×</option>{/each}
+			</select>
+			<label for={`${id}-sleep`}>Sleep timer</label>
+			<select id={`${id}-sleep`} value={!sleep ? 'off' : sleep.kind === 'end-of-track' ? 'end' : sleep.kind === 'duration' ? String(Math.ceil(sleep.remainingMs / 60000)) : 'off'} onchange={onSleepChange}>
+				<option value="off">Off</option>
+				{#each [15, 30, 60] as minutes}<option value={String(minutes)}>{minutes} minutes</option>{/each}
+				<option value="end">End of track</option>
+				{#if sleep?.kind === 'duration' && ![15, 30, 60].includes(Math.ceil(sleep.remainingMs / 60000))}
+					<option value={String(Math.ceil(sleep.remainingMs / 60000))}>{sleepText}</option>
+				{/if}
+			</select>
+			<p>{sleepText}</p>
+			{#if expanded}{@render restartControl()}{/if}
+		</div>
+	</details>
+	{#if transport?.sound.restricted}<p>Volume control is limited by this browser. Use your device volume controls.</p>{/if}
+	{#if transport?.status === 'buffering' || transport?.status === 'loading'}<p role="status">{transport.status === 'buffering' ? 'Buffering…' : 'Loading track…'}</p>{/if}
+	{#if transport?.status === 'error'}
+		<p role="alert">Could not play this track. Check your connection and try again.</p>
+		<button type="button" onclick={() => void player.retry()}>Retry playback</button>
+	{/if}
+	<p aria-live="polite">{feedback}</p>
+	{#if !cinema.supported}<p id={`${id}-fullscreen-hint`}>Full screen is unavailable in this browser.</p>{/if}
+	{#if cinema.failed}<p role="status">Could not change full screen. Try again or use your browser controls.</p>{/if}
+
+{#if helpOpen}
+	<dialog bind:this={dialog} data-testid="shortcuts-dialog" aria-labelledby={`${id}-help`} oncancel={(event) => { event.preventDefault(); closeHelp(); }} onkeydown={onDialogKey}>
+		<h2 id={`${id}-help`}>Keyboard shortcuts</h2>
+		<p>Shortcuts are inactive while typing, adjusting a slider, or using another dialog.</p>
+		<dl>{#each PLAYER_SHORTCUT_ROWS as row}<dt><kbd>{row.key}</kbd></dt><dd>{row.key === 'r' ? 'Cycle repeat: Off / Queue / One' : row.label}</dd>{/each}</dl>
+		<p>Space on the player or main view also plays or pauses. Shift+J/L seeks 30 seconds. Alt+↑/↓ changes volume by 5%.</p>
+		<button type="button" onclick={closeHelp}>Close keyboard shortcuts</button>
+	</dialog>
+{/if}
+	</div>
+</section>
+
+<style>
+	.expanded:not(:fullscreen) { display: flex; flex-direction: column; align-items: center; gap: var(--nt-space-3); }
+	.expanded:not(:fullscreen) .cinema-controls { width: 100%; min-width: 0; }
+	.expanded:not(:fullscreen) :where(button, input, summary, select) { scroll-margin-block: calc(var(--nt-control-lg) + var(--nt-space-2)); }
+	section:fullscreen { display: flex; flex-direction: column; align-items: center; justify-content: safe center; width: 100%; height: 100%; overflow: auto; box-sizing: border-box; gap: var(--nt-space-3); }
+	.cinema-artwork { flex: 0 1 auto; min-height: 0; width: min(58dvh, 100%); aspect-ratio: 1; }
+	.cinema-artwork :global(img), .cinema-artwork :global([role='img']) { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: var(--nt-radius-pane); }
+	section:fullscreen .cinema-controls { flex: 0 0 auto; width: min(100%, 64rem); background: var(--nt-bg-raised); }
+	@media (min-width: 768px) and (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+		section:fullscreen .cinema-artwork { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); height: 58dvh; width: min(58dvh, 100%); }
+		section:fullscreen .cinema-controls { position: relative; margin-top: auto; z-index: 1; }
+		section:fullscreen[data-cinema-idle='true']:not(:focus-within) .cinema-controls { opacity: 0; }
+	}
+	.identity { overflow-wrap: anywhere; }
+	section { padding: var(--nt-space-2) var(--nt-space-3); background: var(--nt-bg-raised); border-top: 1px solid var(--nt-border); color: var(--nt-fg); }
+	.transport-buttons, .sound, .seek { display: flex; align-items: center; justify-content: center; gap: var(--nt-space-2); }
+	button { display: inline-flex; align-items: center; justify-content: center; min-height: var(--nt-control); min-width: var(--nt-control); padding: var(--nt-space-2); border: 0; border-radius: var(--nt-radius-pill); background: var(--nt-surface-tint); color: var(--nt-fg); font: inherit; cursor: pointer; }
+	button:disabled { opacity: 0.5; cursor: default; }
+	button[aria-pressed='true'] { color: var(--nt-accent); }
+	.play { width: var(--nt-control-lg); height: var(--nt-control-lg); background: var(--nt-accent); color: var(--nt-accent-fg); }
+	.seek { margin-block: var(--nt-space-2); font-size: var(--nt-text-xs); font-variant-numeric: tabular-nums; }
+	.seek input { flex: 1; min-width: 0; max-width: 40rem; }
+	input[type='range'] { min-height: var(--nt-space-px-24); accent-color: var(--nt-accent); }
+	.sound { flex-wrap: wrap; }
+	.sound input { width: min(8rem, 35vw); }
+	details { margin-top: var(--nt-space-2); }
+	summary { cursor: pointer; min-height: var(--nt-control); align-content: center; }
+	.playback-settings { display: flex; flex-wrap: wrap; align-items: center; gap: var(--nt-space-2); }
+	select { min-height: var(--nt-control); background: var(--nt-bg); color: var(--nt-fg); border: 1px solid var(--nt-border); border-radius: var(--nt-radius-sm); padding: var(--nt-space-2); font: inherit; }
+	:where(button, input, summary, select):focus-visible { outline: var(--nt-focus-ring-width) solid var(--nt-focus-ring); outline-offset: var(--nt-focus-ring-offset); }
+	p:empty { display: none; }
+	dialog { max-width: min(38rem, calc(100vw - var(--nt-space-4))); max-height: 80dvh; padding: var(--nt-space-4); border: 1px solid var(--nt-border); border-radius: var(--nt-radius-dialog); background: var(--nt-bg-raised); color: var(--nt-fg); }
+	dialog::backdrop { background: var(--nt-scrim); }
+	dl { display: grid; grid-template-columns: auto 1fr; gap: var(--nt-space-2) var(--nt-space-3); }
+	dd { margin: 0; }
+</style>

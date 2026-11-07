@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Supplemental Test-Author-owned library repeat acceptance. Keep the original
@@ -7,6 +8,12 @@ import { expect, test, type Page } from '@playwright/test';
  * Behavioral breaks pinned here: announcing before play resolves, leaving native
  * audio playing across auth teardown, retaining manual-pause intent, resetting
  * native settings on completion, and restoring only Queue (but not One).
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const ITEMS = [
 	{ id: 'lib-coral', title: 'Coral Night', artist: 'Mira', streamUrl: '/test-audio/lib-coral' },
@@ -85,6 +92,7 @@ async function enqueue(page: Page, ids = ['lib-coral', 'lib-pine', 'lib-ember'])
 		await page.locator(`[data-testid="library-item"][data-id="${id}"]`)
 			.getByRole('button', { name: new RegExp(`^${item.title}( — |$)`) }).click();
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(ids.length);
 }
 

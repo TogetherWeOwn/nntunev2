@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: destructive queue clears require explicit in-page confirmation.
@@ -75,6 +76,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * in-page confirms in the shared queue component plus host clear/trim
  * announcements, then run this file plus the protected regressions and
  * same-head PR gates. No existing test or production file is changed here.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -130,7 +137,7 @@ function clearDialog(page: Page): Locator {
 	// triggers ("Clear queue") never carry the former, so this cannot
 	// match a trigger; the app-shell top bar lives outside the page main.
 	return page
-		.getByRole('main')
+		.getByTestId('queue-panel')
 		.getByTestId('queue-clear-confirm')
 		.filter({ hasText: IRREVERSIBLE })
 		.filter({ hasText: /remov|clear|delet|wip/i });
@@ -138,7 +145,7 @@ function clearDialog(page: Page): Locator {
 
 function trimDialog(page: Page): Locator {
 	return page
-		.getByRole('main')
+		.getByTestId('queue-panel')
 		.getByTestId('queue-clear-confirm')
 		.filter({ hasText: IRREVERSIBLE })
 		.filter({ hasText: /upcoming/i });
@@ -249,6 +256,7 @@ async function seedLibrary(
 	);
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	return { requests, errors };
 }
 
@@ -371,6 +379,7 @@ test('QC-B02 Confirm wipes the queue, announces once, focuses the empty target, 
 	// The restore channel keeps the wipe: reload stays cleared, never resurrected.
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(confirmButton(page)).toHaveCount(0);
@@ -555,6 +564,7 @@ test('QC-B07 confirm state never survives unmount or an account change', async (
 	// Unmount via reload and return: no dialog may survive the remount.
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	await expect(confirmButton(page)).toHaveCount(0);
 	await expect(cancelButton(page)).toHaveCount(0);
 	await expect(announcement(page)).toHaveText('');

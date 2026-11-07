@@ -2,15 +2,22 @@
 	import { tick } from 'svelte';
 	import { currentTrack, type QueueState, type Track } from './queue.js';
 	import { matchesQueueQuery } from './queueFilter.js';
-	import { pruneSelection, selectRange, selectAllDisplayed, toggleSelected } from '../library/selection.js';
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
+	import type { QueueSelection, QueueSelectionAction } from './queueSelection.js';
+	import type { PlayerSession } from './session.js';
 	import ContextMenu from '../interactions/ContextMenu.svelte';
+	import MoreActionsGlyph from '../interactions/MoreActionsGlyph.svelte';
 	import { pointerQueueDrag } from '../interactions/pointer-queue-drag.js';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '../interactions/context-menu.js';
 	import { activeTrackDrag, droppedTrackDrag, startTrackDrag, endTrackDrag } from '../interactions/track-drag.js';
 
+	type SelectionControls = Pick<PlayerSession, 'toggleQueueSelection' | 'selectAllQueueRows' | 'clearQueueSelection' | 'editQueueSelection'>;
+
 	interface Props {
 		state: QueueState;
+		/** Opt-in, session-owned multi-selection; demo and isolated panels omit it. */
+		selection?: QueueSelection;
+		selectionControls?: SelectionControls;
 		/** Transport stays with the host page: called when Next is activated. */
 		onnext?: () => void;
 		/** Queue-only edit: the host must not restart playback. */
@@ -76,6 +83,10 @@
 		 * Defaults to exposed; component harnesses leave it on.
 		 */
 		liveRegions?: boolean;
+		/** The persistent player owns identity and Next while its transport is mounted. */
+		showTransport?: boolean;
+		/** A persistent host may render the action region outside this panel. */
+		showAnnouncement?: boolean;
 		/**
 		 * Opt-in two-step guard for the two destructive intents (Clear queue,
 		 * Clear upcoming): the panel opens an inline Cancel/Confirm prompt and
@@ -90,6 +101,8 @@
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
 	let {
 		state: queue,
+		selection,
+		selectionControls,
 		onnext,
 		onshuffle,
 		radioActive = false,
@@ -115,6 +128,8 @@
 		announcementVersion = 0,
 		filterQuery = $bindable(''),
 		liveRegions = true,
+		showTransport = true,
+		showAnnouncement = true,
 		confirmDestructive = false,
 		confirmGeneration = 0
 	}: Props = $props();
@@ -179,17 +194,14 @@
 			if (row.getAttribute('data-track-id') !== trackId) continue;
 			const remove = row.querySelector<HTMLButtonElement>(selector);
 			if (!remove) return false;
-			remove.focus({ preventScroll: true });
-			remove.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+			focusVisible(remove);
 			return true;
 		}
 		return false;
 	}
 
 	function focusEmptyTarget(): void {
-		if (!emptyTarget) return;
-		emptyTarget.focus({ preventScroll: true });
-		emptyTarget.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+		focusVisible(emptyTarget);
 	}
 
 	/**
@@ -199,8 +211,7 @@
 	 */
 	function focusFilterEmptyTarget(): boolean {
 		if (!filterEmptyTarget) return false;
-		filterEmptyTarget.focus({ preventScroll: true });
-		filterEmptyTarget.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+		focusVisible(filterEmptyTarget);
 		return true;
 	}
 
@@ -425,8 +436,7 @@
 		}
 		const row = currentRowElement();
 		if (!row) return;
-		row.focus({ preventScroll: true });
-		row.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+		focusVisible(row);
 	}
 
 	/**
@@ -446,6 +456,54 @@
 		}
 	}
 
+	/** Native controls keep their own click/Space behavior; row gestures never invoke them. */
+	function selectionClick(event: MouseEvent): void {
+		if (!selectionControls || event.defaultPrevented || event.altKey ||
+			!(event.ctrlKey || event.metaKey || event.shiftKey) || !(event.target instanceof Element)) return;
+		if (event.target.closest('button, input, select, textarea, a, label, [contenteditable]')) return;
+		const row = event.target.closest<HTMLElement>('[data-testid="queue-item"]');
+		const id = row?.dataset.trackId;
+		if (!row || !id || !list?.contains(row)) return;
+		event.preventDefault();
+		selectionControls.toggleQueueSelection(id, event.shiftKey);
+	}
+
+	function selectionKey(event: KeyboardEvent): void {
+		if (!selectionControls || event.defaultPrevented || event.repeat || event.isComposing ||
+			event.altKey || !(event.target instanceof HTMLElement) ||
+			event.target.closest('textarea, select, [contenteditable], input:not([type="checkbox"])')) return;
+		if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+			event.preventDefault();
+			selectionControls.selectAllQueueRows();
+		} else if (event.key === ' ' && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
+			selection?.active && event.target.matches('[data-testid="queue-item"]')) {
+			event.preventDefault();
+			selectionControls.toggleQueueSelection(event.target.dataset.trackId!);
+		}
+	}
+
+	async function reportSelection(event: Event, action?: QueueSelectionAction): Promise<void> {
+		const button = event.currentTarget;
+		const heldFocus = button instanceof HTMLElement && document.activeElement === button;
+		const beforeIds = visibleEntries.map((entry) => entry.track.id);
+		const first = beforeIds.find((id) => selection?.ids.includes(id));
+		const generation = confirmGeneration;
+		if (!selectionControls) return;
+		if (action) {
+			if (!selectionControls.editQueueSelection(action)) return;
+		} else selectionControls.clearQueueSelection();
+		await tick();
+		if (generation !== confirmGeneration || !focusStranded(heldFocus, button)) return;
+		const rows = [...(list?.querySelectorAll<HTMLElement>('[data-testid="queue-item"]') ?? [])];
+		const ids = new Set(rows.map((row) => row.dataset.trackId!));
+		const target = action === 'remove' ? survivorId(beforeIds, first, ids) : first ?? beforeIds[0];
+		const row = rows.find((row) => row.dataset.trackId === target);
+		const checkbox = row?.querySelector<HTMLElement>('input[type="checkbox"]');
+		if (checkbox) focusVisible(checkbox);
+		else if (queue.tracks.length > 0 && focusFilterEmptyTarget()) return;
+		else focusEmptyTarget();
+	}
+
 	/**
 	 * Report one direct-selection intent with the ORIGINAL queue coordinate.
 	 * Runs only on explicit activation — prop-only updates never reach here,
@@ -457,89 +515,17 @@
 	let trackMenu = $state<MenuRequest | null>(null);
 	let dropRow = $state<string | null>(null);
 	let dropAfter = $state(false);
-	let batchIds = $state<string[]>([]);
+	const batchIds = $derived(selection?.ids ?? []);
 	const orderedBatch = $derived(queue.tracks.filter((track) => batchIds.includes(track.id)).map((track) => track.id));
-	let batchAnchor = $state<string | null>(null);
 	let moveBefore = $state('');
 	$effect(() => {
 		if (moveBefore && (batchIds.includes(moveBefore) || !queue.tracks.some((track) => track.id === moveBefore))) {
 			moveBefore = '';
 		}
 	});
-	let selectionGeneration: number | undefined;
-
-	$effect(() => {
-		const ids = queue.tracks.map((track) => track.id);
-		if (selectionGeneration !== confirmGeneration) {
-			selectionGeneration = confirmGeneration;
-			batchIds = [];
-			batchAnchor = null;
-		} else {
-			batchIds = pruneSelection(batchIds, ids);
-			if (batchAnchor && !ids.includes(batchAnchor)) batchAnchor = null;
-		}
-	});
-
-	async function clearBatch(event: Event): Promise<void> {
-		const button = event.currentTarget;
-		const heldFocus = button instanceof HTMLElement && document.activeElement === button;
-		const returnId = visibleEntries.find(({ track }) => batchIds.includes(track.id))?.track.id;
-		batchIds = [];
-		batchAnchor = null;
-		await tick();
-		if (!focusStranded(heldFocus, button)) return;
-		const row = [...(list?.querySelectorAll<HTMLElement>('[data-testid="queue-item"]') ?? [])]
-			.find((row) => row.dataset.trackId === returnId);
-		const target = row?.querySelector<HTMLInputElement>('input[type="checkbox"]');
-		if (target) target.focus({ preventScroll: true });
-		else if (currentRowElement()) currentRowElement()?.focus({ preventScroll: true });
-		else if (queue.tracks.length) focusFilterEmptyTarget();
-		else focusEmptyTarget();
-	}
 
 	function batchFor(id: string): string[] {
 		return batchIds.includes(id) ? orderedBatch : [id];
-	}
-
-	function toggleBatch(id: string, range = false): void {
-		batchIds = range
-			? selectRange(batchIds, visibleEntries.map(({ track }) => track.id), batchAnchor, id)
-			: toggleSelected(batchIds, id);
-		batchAnchor = id;
-	}
-
-	function rowClick(event: MouseEvent, id: string): void {
-		if (!onreorder || (!event.ctrlKey && !event.metaKey && !event.shiftKey)) return;
-		if (event.target instanceof Element && event.target.closest('input, .queue-grip')) return;
-		event.preventDefault();
-		event.stopPropagation();
-		toggleBatch(id, event.shiftKey);
-	}
-
-	function listKey(event: KeyboardEvent): void {
-		if (!onreorder || !(event.target instanceof Element)) return;
-		if (event.target.closest('input:not([type="checkbox"]), select, textarea, [contenteditable="true"]')) return;
-		if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
-			event.preventDefault();
-			event.stopPropagation();
-			batchIds = selectAllDisplayed(batchIds, visibleEntries.map(({ track }) => track.id));
-		} else if (event.key === ' ' && batchIds.length && event.target.matches('[data-testid="queue-item"]')) {
-			event.preventDefault();
-			event.stopPropagation();
-			const id = (event.target as HTMLElement).dataset.trackId;
-			if (id) toggleBatch(id, event.shiftKey);
-		}
-	}
-
-	async function removeBatch(ids: readonly string[]): Promise<void> {
-		const beforeIds = visibleEntries.map(({ track }) => track.id);
-		onremoveids?.(ids);
-		await tick();
-		if (document.activeElement !== document.body && document.activeElement?.isConnected) return;
-		const survivor = survivorId(beforeIds, ids[0], new Set(queue.tracks.map((track) => track.id)));
-		if (survivor && focusRemoveFor(survivor)) return;
-		if (queue.tracks.length && focusFilterEmptyTarget()) return;
-		focusEmptyTarget();
 	}
 
 	$effect(() => {
@@ -712,15 +698,16 @@
 {#if oninsert || onreorder}
 	<h2 tabindex="-1" bind:this={menuHeading}>Queue</h2>
 {/if}
-<p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
-	{#if current}
-		<!-- String expression: Svelte trims the leading space of ` — ` after
-			{#if}, rendering an asymmetric `Title— Artist`. -->
-		Now playing: {displayTitle(current)}{#if current.artist}{' — '}{current.artist}{/if}
-	{:else}
-		Queue is empty
-	{/if}
-</p>
+{#if showTransport}
+	<p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
+		{#if current}
+			<!-- String expression preserves the spaces around the separator. -->
+			Now playing: {displayTitle(current)}{#if current.artist}{' — '}{current.artist}{/if}
+		{:else}
+			Queue is empty
+		{/if}
+	</p>
+{/if}
 
 <p data-testid="queue-position">
 	{#if trackCount === 0}
@@ -734,16 +721,20 @@
 </p>
 
 <!-- Keep the live region mounted; refresh only its content for equal-title actions. -->
-<p data-testid="queue-announcement" role={liveRegions ? 'status' : undefined}>{#key announcementVersion}{announcement}{/key}</p>
+{#if showAnnouncement}
+	<p data-testid="queue-announcement" role={liveRegions ? 'status' : undefined}>{#key announcementVersion}{announcement}{/key}</p>
+{/if}
 
-<button
-	type="button"
-	data-testid="player-next"
-	disabled={!current}
-	onclick={() => onnext?.()}
->
-	Next
-</button>
+{#if showTransport}
+	<button
+		type="button"
+		data-testid="player-next"
+		disabled={!current}
+		onclick={() => onnext?.()}
+	>
+		Next
+	</button>
+{/if}
 
 <button
 	type="button"
@@ -782,29 +773,36 @@
 	<p data-testid="queue-filter-empty" tabindex="-1" bind:this={filterEmptyTarget}>No matches in this queue</p>
 {/if}
 
-{#if onreorder && batchIds.length > 0}
-	<div class="queue-selection" data-testid="queue-selection-toolbar" aria-label="Selected queue tracks">
-		<p role={liveRegions ? 'status' : undefined}>{batchIds.length} selected in queue</p>
-		{#if onplaynextids}<button type="button" onclick={() => onplaynextids?.(orderedBatch)}>Play next</button>{/if}
-		<label>Move selected before
-			<select bind:value={moveBefore}>
-				<option value="">End of queue</option>
-				{#each queue.tracks.filter((track) => !batchIds.includes(track.id)) as track (track.id)}
-					<option value={track.id}>{displayTitle(track)}</option>
-				{/each}
-			</select>
-		</label>
-		<button type="button" onclick={() => onreorder?.(orderedBatch, moveBefore || null)}>Move selected</button>
-		{#if onremoveids}<button type="button" onclick={() => void removeBatch(batchIds)}>Remove selected from queue</button>{/if}
-		<button type="button" onclick={clearBatch}>Done</button>
+{#if selection && selectionControls && selection.active}
+	<div class="queue-filter" role="group" data-testid="queue-selection-toolbar" aria-label="Selected queue tracks">
+		<p role={liveRegions ? 'status' : undefined}>{selection.ids.length} selected in queue</p>
+		<button type="button" disabled={visibleEntries.length === 0} onclick={() => selectionControls?.selectAllQueueRows()}>Select all displayed</button>
+		<button type="button" disabled={selection.ids.length === 0 || selectedIndex < 0} onclick={(event) => void reportSelection(event, 'playNext')}>Play next</button>
+		{#if onreorder}
+			<label>Move selected before
+				<select bind:value={moveBefore}>
+					<option value="">End of queue</option>
+					{#each queue.tracks.filter((track) => !batchIds.includes(track.id)) as track (track.id)}
+						<option value={track.id}>{displayTitle(track)}</option>
+					{/each}
+				</select>
+			</label>
+			<button type="button" disabled={selection.ids.length === 0} onclick={() => onreorder?.(orderedBatch, moveBefore || null)}>Move selected</button>
+		{/if}
+		<button type="button" disabled={selection.ids.length === 0} onclick={(event) => void reportSelection(event, 'remove')}>Remove selected from queue</button>
+		<button type="button" onclick={(event) => void reportSelection(event)}>Done</button>
 	</div>
+	{@const hiddenCount = selection.ids.filter((id) => !visibleEntries.some(({ track }) => track.id === id)).length}
+	{#if hiddenCount > 0}
+		<p>{hiddenCount} selected {hiddenCount === 1 ? 'track is' : 'tracks are'} hidden by this filter.</p>
+	{/if}
 {/if}
 
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions: list-scoped selection shortcuts preserve native input handling. -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions: delegated row modifiers have native checkbox equivalents; controls keep their own keyboard/click behavior. -->
 <ol aria-label="Playback queue" bind:this={list}
 	data-testid="queue-drop-target"
 	data-accepts-tracks={oninsert ? '' : undefined}
-	onkeydown={listKey}
+	onclick={selectionClick} onkeydown={selectionKey}
 	ondragover={dragover} ondrop={drop}
 	ondragleave={(event) => { if (!(event.relatedTarget instanceof Node) || !list?.contains(event.relatedTarget)) dropRow = null; }}
 >
@@ -820,16 +818,26 @@
 			data-testid="queue-item"
 			data-track-id={track.id}
 			data-selected={batchIds.includes(track.id) ? '' : undefined}
-			onclickcapture={(event) => rowClick(event, track.id)}
 			aria-current={index === selectedIndex ? 'true' : undefined}
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
-			{#if onreorder}
-				<label class="queue-batch-select">
+			{#if selection && selectionControls}
+				<label class="queue-selection">
 					<input type="checkbox" aria-label="Select {displayTitle(track)} for queue actions"
-						checked={batchIds.includes(track.id)}
-						onclick={(event) => { event.stopPropagation(); toggleBatch(track.id, event.shiftKey); event.currentTarget.checked = batchIds.includes(track.id); }}
-						onkeydown={(event) => { if (event.key === ' ' && event.shiftKey) { event.preventDefault(); toggleBatch(track.id, true); } }} />
+						checked={selection.ids.includes(track.id)}
+						onclick={(event) => {
+							if (!event.currentTarget.isConnected || !list?.contains(event.currentTarget)) return;
+							const selected = selectionControls?.toggleQueueSelection(track.id, event.shiftKey);
+							event.currentTarget.checked = selected?.ids.includes(track.id) ?? false;
+						}}
+						onkeydown={(event) => {
+							if (event.key !== ' ' || !event.shiftKey || event.defaultPrevented || event.repeat ||
+								event.isComposing || event.altKey || event.ctrlKey || event.metaKey ||
+								!event.currentTarget.isConnected || !list?.contains(event.currentTarget)) return;
+							event.preventDefault();
+							selectionControls?.toggleQueueSelection(track.id, true);
+						}} />
+					Select
 				</label>
 			{/if}
 			{#if onreorder}
@@ -851,7 +859,7 @@
 				<button type="button" class="queue-more" data-testid="queue-more" aria-haspopup="menu"
 					aria-label="More actions for {displayTitle(track)}" aria-disabled={interactionsUnavailable}
 					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
-				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+				><MoreActionsGlyph /></button>
 			{/if}
 			{#if ontogglefavorite}
 				<button
@@ -875,40 +883,17 @@
 					Copy link
 				</button>
 			{/if}
-			<button
-				type="button"
-				aria-label="Move {displayTitle(track)} up"
-				disabled={index === 0}
-				onclick={() => onmove?.(index, index - 1)}
-			>
-				Up
-			</button>
-			<button
-				type="button"
-				aria-label="Move {displayTitle(track)} down"
-				disabled={index === trackCount - 1}
-				onclick={() => onmove?.(index, index + 1)}
-			>
-				Down
-			</button>
-			{#if trackCount > 1}
+			{#each trackCount > 1 ? ['Up', 'Down', 'Top', 'Bottom'] : ['Up', 'Down'] as move}
+				{@const target = move === 'Up' ? index - 1 : move === 'Down' ? index + 1 : move === 'Top' ? 0 : trackCount - 1}
 				<button
 					type="button"
-					aria-label="Move {displayTitle(track)} to top"
-					disabled={index === 0}
-					onclick={() => onmove?.(index, 0)}
+					aria-label="Move {displayTitle(track)} {move === 'Top' || move === 'Bottom' ? 'to ' : ''}{move.toLowerCase()}"
+					disabled={target < 0 || target >= trackCount || target === index}
+					onclick={() => onmove?.(index, target)}
 				>
-					Top
+					{move}
 				</button>
-				<button
-					type="button"
-					aria-label="Move {displayTitle(track)} to bottom"
-					disabled={index === trackCount - 1}
-					onclick={() => onmove?.(index, trackCount - 1)}
-				>
-					Bottom
-				</button>
-			{/if}
+			{/each}
 			<button
 				type="button"
 				aria-label="Play {displayTitle(track)} next"
@@ -1013,16 +998,11 @@
 <style>
 	ol { min-height: 48px; }
 	.queue-grip { cursor: grab; min-height: 40px; touch-action: none; }
-	.queue-more, .queue-batch-select { min-width: 40px; min-height: 40px; }
+	.queue-more { min-width: 40px; min-height: 40px; }
 	.queue-more[aria-disabled='true'] { color: var(--nt-fg-muted); cursor: default; background: transparent; }
-	.queue-batch-select { display: inline-flex; align-items: center; justify-content: center; }
-	.queue-batch-select input { width: 1.5rem; height: 1.5rem; }
 	.queue-row[data-selected] { background: var(--nt-bg-raised); outline: 1px solid var(--nt-accent); }
-	.queue-selection { display: flex; flex-wrap: wrap; gap: var(--nt-space-2); align-items: center; }
-	.queue-selection button, .queue-selection select { min-height: 40px; font: inherit; }
 	@media (pointer: coarse) {
-		.queue-grip, .queue-more, .queue-batch-select, .queue-selection button, .queue-selection select { min-width: 48px; min-height: 48px; }
-		.queue-more, .queue-batch-select { min-width: 48px; }
+		.queue-grip, .queue-more { min-width: 48px; min-height: 48px; }
 	}
 	:global(html[data-track-dragging='library']) ol[data-accepts-tracks] {
 		outline: 2px dashed var(--nt-accent);
@@ -1062,6 +1042,20 @@
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
+	}
+
+	.queue-selection {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--nt-space-2);
+		min-height: 2.75rem;
+		padding-inline: var(--nt-space-2);
+		cursor: pointer;
+	}
+
+	.queue-selection input:focus-visible {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
 	}
 
 	.queue-star {

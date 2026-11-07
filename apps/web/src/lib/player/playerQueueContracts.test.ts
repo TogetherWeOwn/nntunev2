@@ -70,6 +70,29 @@ describe('PlayerQueue empty-queue contract', () => {
 	});
 });
 
+describe('PlayerQueue delegated transport', () => {
+	it('omits only action feedback when the persistent host owns the live region', () => {
+		const body = render(PlayerQueue, {
+			props: { state: createQueue([FIRST, SECOND]), showAnnouncement: false, announcement: 'Removed track.' }
+		}).body;
+		expect(body).not.toContain('data-testid="queue-announcement"');
+		expect(body).not.toContain('Removed track.');
+		expect(queueItemTags(body)).toHaveLength(2);
+		expect(body).toContain('data-testid="queue-position"');
+		expect(body).toContain('data-testid="queue-reveal-current"');
+	});
+	it('omits only identity and Next when the persistent transport owns them', () => {
+		const state = createQueue([FIRST, SECOND]);
+		const body = render(PlayerQueue, { props: { state, showTransport: false } }).body;
+		expect(nowPlayingText(body)).toBeNull();
+		expect(playerNextTag(body)).toBeNull();
+		expect(queueItemTags(body)).toHaveLength(2);
+		expect(body).toContain('data-testid="queue-position"');
+		expect(body).toContain('data-testid="queue-announcement"');
+		expect(body).toContain('data-testid="queue-reveal-current"');
+	});
+});
+
 describe('PlayerQueue current-item marking', () => {
 	it('marks exactly the first item current on a fresh queue', () => {
 		const tags = queueItemTags(renderQueue(createQueue([FIRST, SECOND, THIRD])));

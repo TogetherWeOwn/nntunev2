@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 const rows = [
 	{ id: 'recording-a', occurrence_key: 'job-a:1', title: 'Echo One', artist: 'First Artist' },
@@ -9,6 +10,7 @@ const rows = [
 test('selecting the second occurrence queues its metadata with the recording id', async ({ page }) => {
 	await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 	await page.goto('/library');
+	await openQueue(page);
 	const second = page.getByTestId('library-item').filter({ hasText: 'Echo Two' });
 	await second.getByRole('button', { name: 'Echo Two — Second Artist', exact: true }).click();
 	const queued = page.getByTestId('queue-item');
@@ -36,6 +38,7 @@ test('the second occurrence copy link names the row but links the recording', as
 	});
 	await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 	await page.goto('/library');
+	await openQueue(page);
 	await page.getByTestId('library-item').filter({ hasText: 'Echo Two' }).getByTestId('library-copy-link').click();
 	await expect(page.getByTestId('library-share-status')).toHaveText('Copied link for Echo Two.');
 	const copied = await page.evaluate(() => sessionStorage.getItem('copied-occurrence-link'));
@@ -47,6 +50,7 @@ test('dragging the second occurrence queues its own metadata', async ({ page }) 
 	await page.setViewportSize({ width: 1280, height: 1800 });
 	await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 	await page.goto('/library');
+	await openQueue(page);
 	await page.getByTestId('library-item').filter({ hasText: 'Echo Two' }).dragTo(
 		page.getByTestId('queue-drop-target'), { sourcePosition: { x: 4, y: 4 } }
 	);
@@ -61,6 +65,7 @@ test('dragging the second occurrence queues its own metadata', async ({ page }) 
 test('a selected recording menu counts once and retains the invoked occurrence', async ({ page }) => {
 	await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 	await page.goto('/library');
+	await openQueue(page);
 	const second = page.getByTestId('library-item').filter({ hasText: 'Echo Two' });
 	await second.getByRole('checkbox', { name: 'Select Echo Two', exact: true }).check();
 	await second.getByTestId('track-more').click();
@@ -77,6 +82,7 @@ for (const action of ['Play now', 'Play next', 'Add to queue']) {
 	test(`second occurrence ${action} keeps its own queue metadata`, async ({ page }) => {
 		await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 		await page.goto('/library');
+		await openQueue(page);
 		const second = page.getByTestId('library-item').filter({ hasText: 'Echo Two' });
 		await second.getByTestId('track-more').click();
 		await expect(page.getByRole('menu')).toHaveAccessibleName('Actions for Echo Two');

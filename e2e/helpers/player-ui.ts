@@ -1,5 +1,5 @@
 import type { Locator, Page } from '@playwright/test';
-import { PENDING_TESTIDS } from './contract.js';
+import { TESTIDS } from './contract.js';
 
 /**
  * Player-UI actions for the player-contract migration.
@@ -199,7 +199,7 @@ export async function waitForPaused(
  * by name when neither exists (a player with no toggle cannot pass).
  */
 export async function togglePlayViaPlayerUi(page: Page, player: Locator): Promise<void> {
-  const playPause = page.getByTestId(PENDING_TESTIDS.playerPlayPause);
+  const playPause = page.getByTestId(TESTIDS.playerPlayPause);
   if ((await playPause.count()) > 0 && (await playPause.isVisible())) {
     await playPause.click();
     return;
@@ -234,7 +234,7 @@ export async function seekViaPlayerUi(
   player: Locator,
   fraction: number,
 ): Promise<SeekTarget> {
-  const slider = page.getByTestId(PENDING_TESTIDS.playerSeek);
+  const slider = page.getByTestId(TESTIDS.playerSeek);
   const sliderVisible =
     (await slider.count()) > 0 ? await slider.isVisible() : false;
   const hasControls = await player.evaluate((el) => (el as HTMLAudioElement).controls);

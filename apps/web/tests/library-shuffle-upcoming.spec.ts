@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned pin: the /library Shuffle upcoming binding.
@@ -18,6 +19,12 @@ import { expect, test, type Page } from '@playwright/test';
  * [first, second, third] must yield [first, third, second], which also
  * distinguishes a real shuffle from a no-op handler (an identity result is a
  * valid random outcome, so only the forced draw makes the no-op red).
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -64,6 +71,7 @@ async function queueOrder(page: Page): Promise<(string | null)[]> {
 
 test('/library Shuffle upcoming permutes only the upcoming suffix', async ({ page }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	const button = page.getByRole('button', { name: /^shuffle upcoming$/i });
 	await expect(button).toHaveCount(1);
