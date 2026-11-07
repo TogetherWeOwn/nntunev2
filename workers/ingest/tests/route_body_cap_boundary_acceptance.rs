@@ -137,11 +137,17 @@ fn upload_cap_fits_maximally_escaped_nzb() {
 }
 
 #[test]
-fn routes_enforce_caps_via_read_capped_text() {
-    assert!(
-        LIB_RS.contains("read_capped_text(req, MAX_SEARCH_BODY_BYTES)"),
-        "POST /v1/ingest/search must stream through read_capped_text with MAX_SEARCH_BODY_BYTES (lib.rs:1156)"
-    );
+fn upload_enforces_cap_and_retired_search_never_reads_a_body() {
+    let search = LIB_RS
+        .split_once("async fn search(req: &mut Request")
+        .unwrap()
+        .1;
+    let search = search.split_once("\n}\n").unwrap().0;
+    assert!(search.contains("ApiError::not_found(\"not found\")"));
+    assert!(!search.contains("read_capped_text("));
+    assert!(!search.contains(".text()"));
+    assert!(!search.contains(".bytes()"));
+    assert!(!search.contains(".stream()"));
     assert!(
         LIB_RS.contains("read_capped_text(req, MAX_UPLOAD_BODY_BYTES)"),
         "POST /v1/ingest/nzb must stream through read_capped_text with MAX_UPLOAD_BODY_BYTES (lib.rs:1219)"

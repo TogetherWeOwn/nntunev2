@@ -1,6 +1,24 @@
 # workers/ingest — ingest pipeline (slices 1–2: contracts + Queue wiring)
 
-User-scoped ingest jobs via Queues (no Workflow class yet):
+## Current admission status
+
+`POST /v1/ingest/search` is retired: the caller is authenticated as before,
+then receives the generic non-retryable 404 without a body read, admission,
+checkpoint, throttle or meter operation. Initial enqueue, progress
+continuation and consumer validation all reject search-sourced messages.
+Previously queued search messages exhaust native Queue delivery into the
+configured dead-letter queue without running a pipeline step or creating a
+checkpoint; the pipeline attempt budget and provider connections are untouched.
+Catalogue search is a separate read-only feature and is not changed here.
+
+Admin dispatch/publication remains fail-closed pending authenticated
+durable-original execution and the publication gates. No deployment or
+consumer activation is authorized by closing search intake. The old search
+builders and throttle tests remain compatibility coverage, not a live route.
+
+## Legacy pipeline reference
+
+User-scoped upload jobs via Queues (no Workflow class yet):
 
 ```text
 Indexer search (admin-ingest indexer; fetch unwired) ─────┐
@@ -41,9 +59,9 @@ NZB upload ───────────────────────
   `LibraryWrite` — all carry the idempotency key. MB calls target the
   `workers/mb` read API (`/v1/mb/release/:mbid`, `/v1/mb/recording/:mbid`,
   `/v1/mb/release/:mbid/recordings`, `/v1/mb/search?type=…`).
-- Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
-  ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
-  for JSON escaping, then the versioned intake guard) — malformed JSON is
+- Routes (`src/lib.rs`): the retired `POST /v1/ingest/search` refuses without
+  reading a body; `POST /v1/ingest/nzb` retains its wire cap accounting
+  for JSON escaping, then the versioned intake guard — malformed JSON is
   400, intake refusals use the registered API code plus `intake_code` (bad
   input 400, over-cap 413 with measured + cap fields), busy store/queue is
   503; success is 202 + enqueue with job id + idempotency key. NZB uploads
@@ -323,10 +341,10 @@ stub whose NZB references fixture message-ids.
   a failed send, shared-parser upload validation, and the pool-DO segment
   probe for uploads), and the `[[queues.consumers]]` stanza in
   `workers/ingest/wrangler.toml` is live: the consumer goes live the moment
-  this environment deploys, so the staging deploy lane must stay
-  operator-disabled until search intake is closed (a search job would
-  burn its retry budget against the unwired search boundary and
-  quarantine). The library-schema and repair re-verify gates below remain.
+  this environment deploys. Search intake is now closed; that alone does
+  not authorize enabling the staging lane. Durable admin execution and
+  publication remain fail-closed. The library-schema and repair re-verify
+  gates below remain for the legacy path.
 - Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
   `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
   scoped `ingest:write` that the `api` Worker mints for the session user,
@@ -348,7 +366,7 @@ stub whose NZB references fixture message-ids.
   feedback loop is still open. After a repair round, `Verifying` re-runs
   the verify driver over the pool body route (`src/queue_consumer.rs:701-704`,
   `PoolBodySource::fetch_body` via `call_pool_body` at
-  `src/queue_consumer.rs:903`) and does not yet consume the repair
+  `src/queue_consumer.rs:874`) and does not yet consume the repair
   round's `out/` objects (the repair Worker streams outputs back to `out/`
   per `workers/repair/README.md:23-28`; key shapes in
   `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
@@ -357,10 +375,10 @@ stub whose NZB references fixture message-ids.
   `[[queues.consumers]]` is live in `workers/ingest/wrangler.toml`
   (top-level `:76-82`, staging `:177-181`, production `:241-245`), and
   ingest stays unable to finish a `Repairing` job
-  (`workers/repair/README.md:40-44`) — this is one gate alongside the
-  search step, which is also not wired yet, so enabling the lane now would
-  burn search jobs' retry budget (per-env `max_retries = 4` in the same
-  stanza).
+  (`workers/repair/README.md:40-44`). Search-sourced messages are now
+  rejected before any checkpoint or step; their native delivery limit
+  (`max_retries = 4` in the same stanza) leads only to dead-letter delivery.
+  Closing that intake does not lift the remaining execution gates.
   A checkpoint reaching `Repairing` without a recorded `par2_set_id` is a
   permanent failure — there is nothing a redelivery could add
   (`src/queue_consumer.rs:258-266`; the missing-inputs arm at

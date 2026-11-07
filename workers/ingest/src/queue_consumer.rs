@@ -65,14 +65,13 @@
 //! `Verifying`), `Transcoding` (the transcode Worker through the
 //! `TRANSCODE_CONTAINER` service binding, publishing artifacts to
 //! the audio bucket plus `cache_objects`), and `Matching`/`Writing`
-//! are executable. Indexer
-//! search (hence probing for search-sourced jobs) has no executable
-//! consumer wiring yet, so those states settle as transient failures
-//! through the shared retry budget. The `[[queues.consumers]]` stanza in
-//! `wrangler.toml` is therefore live config behind a lane gate: the
-//! staging deploy lane must stay operator-disabled until TWO-1660 closes
-//! search intake, or enabling it would burn search jobs' retry budget and
-//! quarantine them.
+//! are executable for legacy uploads. Indexer search intake is retired:
+//! initial producers, continuations and the consumer reject that source
+//! before it can reach a checkpoint or spend provider reads. Old queued
+//! messages use native retries to the dead-letter queue, not pipeline
+//! attempts. Admin dispatch still fails closed until authenticated durable
+//! original loading and publication gates are wired. The live consumer
+//! stanza in `wrangler.toml` does not authorize activation or deployment.
 
 use futures_util::{Stream, StreamExt};
 use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
@@ -85,14 +84,13 @@ use crate::jobs::{
     advance_checkpoint, validate_job_id, JobCheckpoint, JobSource, JobState, MAX_ATTEMPTS,
     MAX_REPAIR_ROUNDS,
 };
-use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use crate::parse::{ParsedFile, ParsedNzb};
 use crate::pool_body::{build_body_request, call_pool_body, BodyFetch, PoolBodyError};
 use crate::pool_probe::{call_pool_probe, check_outcome, PoolProbeError};
 use crate::probe::{
     apply_probe_batch, build_probe_request_with_ranges, ProbeOutcome, ProbeRequest, ProbeTally,
 };
-use crate::queue::{validate_indexer_ref, validate_provider_id, QueueMsg};
+use crate::queue::{validate_provider_id, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
@@ -157,7 +155,9 @@ enum Settlement {
     Quarantine(Box<DlqEntry>),
 }
 
-fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
+/// Shared by producers and the consumer so a retired source cannot enter
+/// through either initial admission or a progress continuation.
+pub(crate) fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     if !validate_job_id(&msg.job_id) || !validate_user_id(&msg.user_id) {
         return Err("invalid job or user id");
     }
@@ -178,38 +178,9 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
         // Fail closed until the authenticated, durable admin-original
         // dispatch is wired; legacy payload handles cannot select it.
         JobSource::AdminUpload => return Err("admin dispatch unavailable"),
-        JobSource::IndexerSearch => {
-            let query = msg.query.as_deref().ok_or("missing search query")?;
-            let indexer_ref = msg.indexer_ref.as_deref().ok_or("missing indexer handle")?;
-            let limit = msg.limit.ok_or("missing search limit")?;
-            let page = msg.page.ok_or("missing search page")?;
-            if msg.payload_ref.is_some()
-                || query.trim().is_empty()
-                || !validate_indexer_ref(indexer_ref)
-                || limit == 0
-                || limit > MAX_LIMIT
-                || page > MAX_PAGE
-                || msg.categories.len() > MAX_CATEGORIES
-            {
-                return Err("invalid search input");
-            }
-            let mut expected = crate::dispatch::build_search_dispatch(
-                &msg.user_id,
-                query,
-                indexer_ref,
-                &msg.categories,
-                limit,
-                page,
-            )
-            .map_err(|_| "invalid search input")?;
-            // Trace IDs are observability metadata, not job identity: the
-            // route stamps them after building, and the consumer re-stamps
-            // every delivery, so they stay out of the identity comparison.
-            expected.trace_id = msg.trace_id.clone();
-            if expected != *msg {
-                return Err("search fields do not match job identity");
-            }
-        }
+        // Reject even an identity-valid message from an old producer before
+        // reading or creating a checkpoint. It must never enter Searching.
+        JobSource::IndexerSearch => return Err("search intake retired"),
         JobSource::NzbUpload => {
             let payload_ref = msg.payload_ref.as_deref().ok_or("missing payload handle")?;
             let sha = payload_ref
@@ -2016,6 +1987,9 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
 /// job twice; the batch-index-keyed tally and checkpoint identity make
 /// that an idempotent re-ask, never a double-count.
 async fn send_continuation(env: &Env, msg: &QueueMsg) -> bool {
+    if validate_queue_msg(msg).is_err() {
+        return false;
+    }
     match env.queue(INGEST_QUEUE_BINDING) {
         Ok(queue) => {
             match queue
@@ -2156,7 +2130,7 @@ mod tests {
 
     #[test]
     fn validates_message_identity_and_source_inputs_before_checkpointing() {
-        let valid = search_message();
+        let valid = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         assert!(validate_queue_msg(&valid).is_ok());
 
         let mut wrong_user = valid.clone();
@@ -2166,10 +2140,6 @@ mod tests {
         let mut wrong_state = valid.clone();
         wrong_state.state = JobState::Done;
         assert!(validate_queue_msg(&wrong_state).is_err());
-
-        let mut incomplete_search = valid;
-        incomplete_search.indexer_ref = None;
-        assert!(validate_queue_msg(&incomplete_search).is_err());
 
         let mut incomplete_upload =
             build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
@@ -2215,27 +2185,57 @@ mod tests {
     }
 
     #[test]
-    fn traced_search_messages_keep_their_identity() {
-        // The route stamps the resolved inbound trace after building, and the
-        // consumer re-stamps every delivery: the trace must not affect the
-        // identity comparison, or no search job ever runs.
-        let mut traced = search_message();
-        traced.trace_id = Some("9f3a1b2c4d5e6f708192a3b4c5d64e6f".into());
-        assert!(validate_queue_msg(&traced).is_ok());
+    fn retired_search_messages_never_reach_checkpoints_or_steps() {
+        let mut msg = search_message();
+        for trace in [None, Some("9f3a1b2c4d5e6f708192a3b4c5d64e6f".into())] {
+            msg.trace_id = trace;
+            assert_eq!(validate_queue_msg(&msg), Err("search intake retired"));
+        }
+        msg.indexer_ref = None;
+        assert_eq!(validate_queue_msg(&msg), Err("search intake retired"));
 
-        // A tampered search still fails with a trace present: leaving the
-        // trace out of the comparison must not mask an identity mismatch.
-        let mut tampered = traced.clone();
-        tampered.query = Some("other query".into());
-        assert!(validate_queue_msg(&tampered).is_err());
+        let source = include_str!("queue_consumer.rs");
+        let process = source.split_once("async fn process_message(").unwrap().1;
+        let process = process.split_once("\n}\n").unwrap().0;
+        let refusal = process.find("if validate_queue_msg(msg).is_err()").unwrap();
+        let retry = process
+            .find("return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)")
+            .unwrap();
+        assert!(refusal < retry);
+        assert!(retry < process.find("crate::checkpoint::get(").unwrap());
+        assert!(retry < process.find("crate::checkpoint::initial(").unwrap());
+        assert!(retry < process.find("run_step(").unwrap());
 
-        // A legacy untraced message, stamped on delivery the way
-        // `process_raw_message` does, validates too.
-        let mut legacy = search_message();
-        assert!(legacy.trace_id.is_none());
-        let trace_id = nntune_logging::resolve_trace_id(legacy.trace_id.as_deref());
-        legacy.trace_id = Some(trace_id);
-        assert!(validate_queue_msg(&legacy).is_ok());
+        for (source, signature, guard) in [
+            (
+                include_str!("lib.rs"),
+                "async fn try_enqueue(",
+                "queue_consumer::validate_queue_msg(msg).is_err()",
+            ),
+            (
+                source,
+                "async fn send_continuation(",
+                "validate_queue_msg(msg).is_err()",
+            ),
+        ] {
+            let producer = source.split_once(signature).unwrap().1;
+            let producer = producer.split_once("\n}\n").unwrap().0;
+            let validation = producer.find(guard).unwrap();
+            let refusal = producer.find("return false;").unwrap();
+            let binding = producer.find("env.queue(").unwrap();
+            assert!(validation < refusal && refusal < binding);
+        }
+    }
+
+    #[test]
+    fn traced_upload_messages_keep_their_identity() {
+        let mut msg = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
+        for trace in [None, Some("9f3a1b2c4d5e6f708192a3b4c5d64e6f".into())] {
+            msg.trace_id = trace;
+            assert!(validate_queue_msg(&msg).is_ok());
+        }
+        msg.user_id = "other_user".into();
+        assert!(validate_queue_msg(&msg).is_err());
     }
 
     #[test]
