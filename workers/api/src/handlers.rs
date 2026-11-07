@@ -7509,12 +7509,14 @@ where
         // bypasses the bearer gate above like the cookie/session paths do
         // — and the scope map keeps the path `Deny` so bearer credentials
         // can never enter it. Deliberately outside `is_known_path`.
-        ("POST", BILLING_WEBHOOK_PATH) => billing_webhook(ctx, req).await,
+        // Keep billing's large reconciliation futures out of the shared
+        // dispatcher state, including for unrelated session-only routes.
+        ("POST", BILLING_WEBHOOK_PATH) => Box::pin(billing_webhook(ctx, req)).await,
         // User-facing billing: session cookie only. The scope map keeps
         // both paths `SessionOnly`, so the bearer gate above skips them
         // and a presented bearer is never rescued into a purchase.
-        ("POST", BILLING_CHECKOUT_PATH) => billing_checkout(ctx, req).await,
-        ("POST", BILLING_PORTAL_PATH) => billing_portal(ctx, req).await,
+        ("POST", BILLING_CHECKOUT_PATH) => Box::pin(billing_checkout(ctx, req)).await,
+        ("POST", BILLING_PORTAL_PATH) => Box::pin(billing_portal(ctx, req)).await,
         // Catalogue slice 1: session-or-bearer reads over the
         // ingest ledger plus the MusicBrainz mirror.
         ("GET", "/v1/library") => catalogue_library(ctx, req, bearer_user.as_deref()).await,

@@ -271,21 +271,22 @@ async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response
         source_ip: "127.0.0.1".into(),
         stripe: &nntune_api::stripe::NoStripeTransport,
     };
-    handlers::handle(
-        &ctx,
-        &Request {
-            method: "POST".into(),
-            path: "/v1/session/refresh".into(),
-            cookie: Some(cookie.into()),
-            origin: Some(cfg.origin.clone()),
-            authorization: None,
-            stripe_signature: None,
-            body: serde_json::json!({"retry_key": retry_key})
-                .to_string()
-                .into_bytes(),
-        },
-    )
-    .await
+    let req = Request {
+        method: "POST".into(),
+        path: "/v1/session/refresh".into(),
+        cookie: Some(cookie.into()),
+        origin: Some(cfg.origin.clone()),
+        authorization: None,
+        stripe_signature: None,
+        body: serde_json::json!({"retry_key": retry_key})
+            .to_string()
+            .into_bytes(),
+    };
+    let response = handlers::handle(&ctx, &req);
+    // Leave room for nested polls and debug-build moves on the default
+    // 2 MiB test thread; unrelated routes must not inline billing's state.
+    assert!(std::mem::size_of_val(&response) <= 512 * 1024);
+    response.await
 }
 
 #[tokio::test]
