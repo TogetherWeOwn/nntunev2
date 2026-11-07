@@ -100,8 +100,19 @@ return, and any observed dead-letter delivery vetoes the positive control. This
 is not direct instrumentation of the native ack call or an unbounded no-retry
 proof. Ordinary failed-recovery/native-DLQ acceptance remains separate above.
 
-These new controls are written, not locally executed; require exact-head Actions
-before claiming their runtime result. Process crashes, ambiguous DB commits,
+The first composite execution reached the actual Rust R2 reader, then panicked
+at the locked SDK's class-typed `Object::range` getter: workerd returns a plain
+range dictionary, not an exported Wasm `R2Range` instance. The adapter now uses
+the locked raw bucket binding and checks the response dictionary before bounded
+body streaming. Exact key/version, numeric offset/length, absent suffix, valid
+size and exact streamed length remain required. Harness-only GET response faults
+cover offset, length, type, suffix, null range, version, non-finite size and short/
+long bodies. Each must refuse before DB dispatch while retaining the R2 object;
+the unchanged real multi-range producer/recovery path is the positive control.
+No runtime/provider guard or test expectation is relaxed to hide the panic.
+
+These corrected controls are written, not locally executed; require exact-head
+Actions before claiming their runtime result. Process crashes, ambiguous DB commits,
 large-file/deadline limits, deployed lifecycle/drain, actual staging/restore and
 remaining foundation review are still unqualified.
 No test uses candidate media keys, articles or manifests.

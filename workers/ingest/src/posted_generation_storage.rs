@@ -257,31 +257,59 @@ impl TaggedObjectStore for R2TaggedObjectStore {
         {
             return Err(StoreError::InvalidInput);
         }
-        let object = self
-            .bucket
-            .get(format!("{PREFIX}{}", expected.id()))
-            .range(worker::Range::OffsetWithLength {
-                offset,
-                length: limit as u64,
-            })
-            .execute()
-            .await
-            .map_err(|_| StoreError::Database)?
-            .ok_or(StoreError::Inconsistent)?;
-        if metadata(&object, expected.id())?.object != *expected
-            || object.range().map_err(|_| StoreError::Inconsistent)?
-                != (worker::Range::OffsetWithLength {
-                    offset,
-                    length: limit as u64,
-                })
+        use worker::js_sys::{Object, Reflect};
+        use worker::wasm_bindgen::{JsCast, JsValue};
+        use worker::wasm_bindgen_futures::JsFuture;
+        use worker::worker_sys::{R2Bucket, R2ObjectBody};
+
+        // The locked SDK's Object::range getter expects an exported Wasm class,
+        // but R2 returns a plain dictionary. Read that dictionary through the raw
+        // binding, retaining exact range validation without the SDK's unwrap.
+        let options = Object::new();
+        let range = Object::from(worker::Range::OffsetWithLength {
+            offset,
+            length: limit as u64,
+        });
+        Reflect::set(&options, &JsValue::from_str("range"), &range)
+            .map_err(|_| StoreError::Inconsistent)?;
+        let bucket: &R2Bucket = self.bucket.as_ref().unchecked_ref();
+        let value = JsFuture::from(
+            bucket
+                .get(format!("{PREFIX}{}", expected.id()), options.into())
+                .map_err(|_| StoreError::Database)?,
+        )
+        .await
+        .map_err(|_| StoreError::Database)?;
+        let property = |object: &JsValue, name: &str| {
+            Reflect::get(object, &JsValue::from_str(name)).map_err(|_| StoreError::Inconsistent)
+        };
+        if !value.is_object() || value.is_null() {
+            return Err(StoreError::Inconsistent);
+        }
+        let returned_range = property(&value, "range")?;
+        if !returned_range.is_object()
+            || returned_range.is_null()
+            || property(&value, "key")?.as_string() != Some(format!("{PREFIX}{}", expected.id()))
+            || property(&value, "version")?.as_string().as_deref() != Some(expected.version())
+            || property(&returned_range, "offset")?.as_f64() != Some(offset as f64)
+            || property(&returned_range, "length")?.as_f64() != Some(limit as f64)
+            || !property(&returned_range, "suffix")?.is_undefined()
         {
             return Err(StoreError::Inconsistent);
         }
-        let mut stream = object
-            .body()
-            .ok_or(StoreError::Inconsistent)?
-            .stream()
-            .map_err(|_| StoreError::Inconsistent)?;
+        let size = property(&value, "size")?
+            .as_f64()
+            .ok_or(StoreError::Inconsistent)?;
+        if !size.is_finite()
+            || size.fract() != 0.0
+            || size > MAX_EXACT_INTEGER as f64
+            || size < (offset + limit as u64) as f64
+        {
+            return Err(StoreError::Inconsistent);
+        }
+        let object: R2ObjectBody = value.unchecked_into();
+        let mut stream =
+            worker::ByteStream::from(object.body().map_err(|_| StoreError::Inconsistent)?);
         let mut bytes = Vec::with_capacity(limit);
         while let Some(chunk) = stream.next().await {
             let mut chunk = chunk.map_err(|_| StoreError::Database)?;

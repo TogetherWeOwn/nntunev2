@@ -276,6 +276,17 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     // Fixed synthetic fixture only. No caller identity or startup is selected by
     // the ordinary fetch router (whose generated prototype was pinned above).
     const prepare = () => composite.fetch('https://qualification.invalid/prepare', { method: 'POST' });
+    const initial = state();
+    for (const fault of ['offset', 'length', 'string', 'suffix', 'null', 'version', 'size', 'short', 'long']) {
+      const response = await composite.fetch(`https://qualification.invalid/prepare-range-fault/${fault}`, {
+        method: 'POST',
+      });
+      assert.equal(response.status, 503, `malformed R2 range response must refuse: ${fault}`);
+      assert.equal(response.headers.get('x-qualification-range-reads'), '1', 'fault must reach the real R2 GET');
+      assert.equal(await response.text(), 'qualification unavailable');
+      assert.equal(state(), initial, `range refusal must precede DB dispatch: ${fault}`);
+      assert.equal((await bucket.list()).objects.length, 1, 'refusal retains the tagged R2 object');
+    }
     assert.equal((await prepare()).status, 202, 'actual Rust producer must acknowledge its Queue send');
     const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
       SELECT id,object_id,object_version,plan_id,plaintext_bytes,plaintext_sha256,send_acknowledged

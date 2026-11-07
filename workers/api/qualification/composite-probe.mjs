@@ -6,6 +6,45 @@ export default class QualificationComposite extends WorkerEntrypoint {
   async fetch(request) {
     const worker = new generated.default(this.ctx, this.env);
     const path = new URL(request.url).pathname;
+    if (path.startsWith('/prepare-range-fault/')) {
+      // Fault only the GET response after the actual create-only R2 PUT/HEAD.
+      // Preserve the real body except in the explicit stream-length controls.
+      const fault = path.slice('/prepare-range-fault/'.length);
+      const bucket = this.env.INGEST_SCRATCH;
+      let reads = 0;
+      const patched = new Proxy(bucket, {
+        get(target, property) {
+          if (property === 'get') return async (...args) => {
+            const object = await target.get(...args);
+            reads += 1;
+            if (!object) return object;
+            const result = { key: object.key, version: object.version, size: object.size,
+              range: { ...object.range }, body: object.body };
+            if (fault === 'offset') result.range.offset += 1;
+            else if (fault === 'length') result.range.length -= 1;
+            else if (fault === 'string') result.range.offset = String(result.range.offset);
+            else if (fault === 'suffix') result.range.suffix = 1;
+            else if (fault === 'null') result.range = null;
+            else if (fault === 'version') result.version = 'wrong-version';
+            else if (fault === 'size') result.size = NaN;
+            else if (fault === 'short' || fault === 'long') {
+              result.body = new ReadableStream({ start(controller) {
+                controller.enqueue(new Uint8Array(object.range.length + (fault === 'short' ? -1 : 1)));
+                controller.close();
+              } });
+            } else throw new Error('unknown qualification fault');
+            return result;
+          };
+          const value = Reflect.get(target, property, target);
+          // EnvBinding validates constructor.name; it is not a bucket method.
+          return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
+        },
+      });
+      const response = await worker.qualification_prepare(request, { ...this.env, INGEST_SCRATCH: patched });
+      const headers = new Headers(response.headers);
+      headers.set('x-qualification-range-reads', String(reads));
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (path === '/prepare') return worker.qualification_prepare(request, this.env);
     if (path === '/recover') return worker.qualification_recover(request, this.env);
     if (path === '/abi') {

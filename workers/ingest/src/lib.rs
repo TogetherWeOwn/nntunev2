@@ -54,10 +54,10 @@ pub mod pool_probe;
 pub mod posted_files;
 pub mod posted_generations;
 pub mod probe;
-pub mod queue;
-pub mod queue_consumer;
 #[cfg(all(target_arch = "wasm32", feature = "preparation-qualification"))]
 mod qualification;
+pub mod queue;
+pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
