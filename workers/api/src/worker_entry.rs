@@ -664,11 +664,66 @@ pub async fn with_deadline<T, E>(
     // Both futures are dropped here, before the caller observes the result.
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorBinding {
+    Unconfigured,
+    Configured,
+}
+
+impl MirrorBinding {
+    fn from_env(env: &Env) -> Self {
+        // Only a genuinely absent binding enables no-enrichment mode. A
+        // present invalid binding (or a lookup exception) still fails through
+        // connect_mirror's opaque mirror_binding diagnostic, never degrades.
+        match worker::js_sys::Reflect::get(
+            env,
+            &worker::wasm_bindgen::JsValue::from_str(MIRROR_HYPERDRIVE_BINDING),
+        ) {
+            Ok(value) if value.is_undefined() => Self::Unconfigured,
+            _ => Self::Configured,
+        }
+    }
+}
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
+    mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_mirror: Option<CatalogueTestMirror>,
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+struct CatalogueTestMirror {
+    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+/// Inject connection acquisition only; execute the production catalogue SQL,
+/// decoders, early returns and error propagation against disposable PostgreSQL.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn catalogue_store_for_postgres_test(
+    app: tokio_postgres::Client,
+    mirror_configured: bool,
+    mirror: Result<tokio_postgres::Client, StoreError>,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+) -> impl Store {
+    PgStore {
+        env: None,
+        trace_id: "postgres-catalogue-test".into(),
+        mirror_binding: if mirror_configured {
+            MirrorBinding::Configured
+        } else {
+            MirrorBinding::Unconfigured
+        },
+        test_client: std::cell::RefCell::new(Some(app)),
+        test_mirror: Some(CatalogueTestMirror {
+            client: std::cell::RefCell::new(Some(mirror)),
+            attempts,
+        }),
+    }
 }
 
 /// Inject only connection acquisition; the handler still executes the real
@@ -680,7 +735,9 @@ pub fn session_retry_store_for_postgres_test(
     PgStore {
         env: None,
         trace_id: "postgres-refresh-test".into(),
+        mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_mirror: None,
     }
 }
 
@@ -787,15 +844,23 @@ impl PgStore {
         connected
     }
 
+    fn require_mirror(&self) -> Result<(), StoreError> {
+        match self.mirror_binding {
+            MirrorBinding::Configured => Ok(()),
+            MirrorBinding::Unconfigured => Err(self.statement_failed("api.db.mirror_unconfigured")),
+        }
+    }
+
     /// Mirror-cluster connection for the MusicBrainz enrichment reads (ADR
     /// 0002 §1): same dial/handshake/timeout shape as [`Self::connect`],
     /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
     /// are the `mirror_*` literals so an incident names the cluster that
-    /// refused (every catalogue read touches both).
+    /// refused; empty app results never need a mirror connection.
     async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = self.test_client.borrow_mut().take() {
-            return Ok(client);
+        if let Some(mirror) = &self.test_mirror {
+            mirror.attempts.set(mirror.attempts.get() + 1);
+            return mirror.client.borrow_mut().take().ok_or(StoreError)?;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -3517,6 +3582,17 @@ impl Store for PgStore {
                     .iter()
                     .map(catalogue_library_page_from_row)
                     .collect::<Result<_, _>>()?;
+                if page.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(crate::catalogue::assemble_library_rows(
+                        &page,
+                        &[],
+                        &[],
+                        &[],
+                    ));
+                }
                 // Well-formed page MBIDs only, deduplicated: malformed
                 // stored values never reach a mirror probe.
                 let mut recording_mbids: Vec<String> = page
@@ -3620,6 +3696,10 @@ impl Store for PgStore {
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.catalogue_artists");
@@ -3665,6 +3745,10 @@ impl Store for PgStore {
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.catalogue_releases");
@@ -3713,6 +3797,10 @@ impl Store for PgStore {
                     .map(catalogue_member_pair_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_pairs = crate::catalogue::member_pair_arrays(&member);
+                if member_pairs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let (pair_releases, pair_recordings) =
                     crate::catalogue::member_pair_columns(&member_pairs);
                 let mirror = self.connect_mirror().await?;
@@ -3773,6 +3861,7 @@ impl Store for PgStore {
                 if member.is_empty() {
                     return Ok(None);
                 }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let rows = mirror
                     .query_typed(
@@ -3841,6 +3930,10 @@ impl Store for PgStore {
                     .map(catalogue_member_recording_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_recordings = crate::catalogue::member_recording_mbids(&member);
+                if member_recordings.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let limit = i64::from(crate::catalogue::CATALOGUE_RELEASE_TRACKS_MAX);
                 let rows = mirror
@@ -5767,8 +5860,11 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         store: &PgStore {
             env: Some(env.clone()),
             trace_id: trace_id.clone(),
+            mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_mirror: None,
         },
         mailer: &WebhookMailer {
             origin: config.origin.clone(),
@@ -5863,7 +5959,8 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 22] = [
+    const DB_FAILURE_EVENTS: [&str; 23] = [
+        "api.db.mirror_unconfigured",
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -6054,6 +6151,17 @@ mod tests {
             );
         }
         for event in DB_FAILURE_EVENTS {
+            if event == "api.db.mirror_unconfigured" {
+                let gate = production
+                    .split_once("fn require_mirror(&self)")
+                    .unwrap()
+                    .1
+                    .split_once("\n    }\n")
+                    .unwrap()
+                    .0;
+                assert!(gate.contains("self.statement_failed(\"api.db.mirror_unconfigured\")"));
+                continue;
+            }
             if let Some(phase) = event.strip_prefix("api.db.connect_failed.") {
                 let literal = format!("\"api.db.connect_failed.{phase}\"");
                 // Mirror phases live in the mirror connect; the app
