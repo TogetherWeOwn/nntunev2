@@ -175,6 +175,37 @@ export default class QualificationComposite extends WorkerEntrypoint {
       headers.set('x-qualification-plan-calls', String(calls));
       return new Response(response.body, { status: response.status, headers });
     }
+    if (path.startsWith('/recover-binding-fault/')) {
+      // Exercise actual absent/default/wrong service bindings, not fake protocol
+      // replies. Keep the real Rust recovery and all other capabilities intact.
+      const fault = path.slice('/recover-binding-fault/'.length);
+      const env = { ...this.env };
+      let calls = 0;
+      let status = 'absent';
+      if (fault === 'missing') delete env.API_PREPARATION_PLANS;
+      else {
+        const target = fault === 'default' ? this.env.DEFAULT_PREPARATION_PLANS
+          : fault === 'wrong' ? this.env.WRONG_PREPARATION_PLANS : null;
+        if (!target) throw new Error('unknown qualification binding fault');
+        env.API_PREPARATION_PLANS = new Proxy(target, {
+          get(target, property) {
+            if (property === 'fetch') return async (...args) => {
+              calls += 1;
+              const response = await target.fetch(...args);
+              status = String(response.status);
+              return response;
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
+          },
+        });
+      }
+      const response = await worker.qualification_recover(request, env);
+      const headers = new Headers(response.headers);
+      headers.set('x-qualification-plan-calls', String(calls));
+      headers.set('x-qualification-binding-status', status);
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (path === '/recover') return worker.qualification_recover(request, this.env);
     if (path === '/abi') {
       return Response.json(Object.getOwnPropertyNames(generated.default.prototype).sort());

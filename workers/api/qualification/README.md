@@ -298,7 +298,14 @@ send counts and custody/recovery assertions are unchanged. Exact-head Actions
 must reach one send and one dropped acknowledgement completion, then an ordinary
 202 retry preserving the same rows. If it still fails, inspect payload-free
 phase/frame timings rather than widening the deadline or weakening assertions.
-No local runtime execution is claimed.
+No local runtime execution is claimed. At head `9b4c637a`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42399052738/job/128482708931)
+passes all twenty runtime subtests (21 Node passes including the enclosing test),
+including all four committed-response-loss phases and the final exact retry.
+The acknowledgement phase completes in about 1.34 seconds. This supports the
+correction, not an isolated measurement proving the latency's cause. The same
+head's [database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42399052738/job/128482708836)
+explicitly reports 255 required cases passed.
 
 These controls cover the committed/lost-response branch, not an uncommitted or
 rolled-back COMMIT, server storage failure, maximum-media/cancellation, deployed
@@ -322,6 +329,16 @@ explicitly reports 255 required cases passed. The injected stream-error diagnost
 retain the earlier limits; this is not clean-diagnostic or IO-cancellation proof.
 These controls qualify bounded range stream handling, not maximum-media sizing,
 network cancellation or abrupt crash.
+
+The successful Rust composite now also repeats read-only recovery with an absent
+plan binding, the configured API's default entrypoint, and the unrelated ingest
+service. The latter two use real platform Fetchers, not fake response bodies;
+call counts and returned HTTP statuses must prove that dispatch reached the
+mistargeted service. Each refusal preserves full DB fingerprints, R2 inventory,
+exact tagged bytes/version and callback markers. Genuine named-binding recovery
+must succeed after each fault without changing that same custody. This covers
+binding refusal during recovery, not initial producer misconfiguration or a
+capability grant/deployment. These added controls await exact-head Actions.
 
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production

@@ -109,7 +109,11 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       worker('composite', compositeModules, {
         bindings: { ...mode, HYPERDRIVE_CACHING_DISABLED: '1' },
         hyperdrives: { LIBRARY_DB: database },
-        serviceBindings: { API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' } },
+        serviceBindings: {
+          API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' },
+          DEFAULT_PREPARATION_PLANS: { name: 'api-database' },
+          WRONG_PREPARATION_PLANS: { name: 'ingest' },
+        },
         r2Buckets: { INGEST_SCRATCH: 'qualification-composite' },
         queueProducers: { INGEST_QUEUE: 'qualification-composite-queue' },
         queueConsumers: { 'qualification-composite-queue': {
@@ -343,6 +347,27 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     });
     assert.equal((await recover(pointer)).status, 204);
     assert.equal(state(), persisted, 'explicit duplicate recovery is read-only');
+    const bindingInventory = await bucket.list();
+    for (const fault of ['missing', 'default', 'wrong']) {
+      const response = await composite.fetch(`https://qualification.invalid/recover-binding-fault/${fault}`, {
+        method: 'POST', body: JSON.stringify(pointer),
+      });
+      assert.equal(response.status, 503, `misconfigured private binding must refuse: ${fault}`);
+      assert.equal(await response.text(), 'qualification unavailable');
+      assert.equal(response.headers.get('x-qualification-plan-calls'), fault === 'missing' ? '0' : '1',
+        'real Fetcher dispatch must be reached unless the binding is absent');
+      assert.match(response.headers.get('x-qualification-binding-status') ?? '',
+        fault === 'missing' ? /^absent$/ : /^[1-5][0-9]{2}$/,
+        'a mistargeted service must return an actual platform HTTP response');
+      assert.equal(state(), persisted, 'binding refusal cannot change authority or custody');
+      assert.deepEqual(await bucket.list(), bindingInventory, 'binding refusal cannot write R2 markers or objects');
+      const retained = await bucket.get(objectKey);
+      assert.equal(retained.version, row.object_version);
+      assert.deepEqual(new Uint8Array(await retained.arrayBuffer()), expected);
+      assert.equal((await recover(pointer)).status, 204, 'genuine named-binding recovery must still work');
+      assert.equal(state(), persisted);
+      assert.deepEqual(await bucket.list(), bindingInventory);
+    }
     assert.equal((await prepare()).status, 202, 'exact producer replay reuses the same custody');
     assert.equal(state(), persisted, 'producer replay must not remint or renew');
     assert.equal((await bucket.get(objectKey)).version, row.object_version, 'create-only replay preserves R2 version');
