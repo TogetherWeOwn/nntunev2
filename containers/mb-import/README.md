@@ -41,8 +41,8 @@ missing artist_type, release credit-name rows, track recording, medium
 release);
 the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
-`etl.py:197-206` (`DUMP_TS` validation), `:223-228` (temp SQLite projection), `:319-335` (immutable
-snapshot + atomic `curated` swap, previous snapshots retained);
+`etl.py` `validate_timestamp` (`DUMP_TS` validation), `main` (temp SQLite projection; immutable
+snapshot + atomic `curated` symlink swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
 `.github/workflows/ci.yml:298-313`.)
 
@@ -83,12 +83,12 @@ field order; use an extract from the matching schema revision. Derivations:
   `release_group.type` through `release_group_primary_type.name` (otherwise
   NULL). `year` is the minimum non-NULL raw `date_year` across release events
   in `release_country` and `release_unknown_country` (otherwise NULL).
-  (Sources: `etl.py:15-67` (pinned positions/field counts), `:435-472`
+  (Sources: `etl.py` column-position constants and `FIELD_COUNTS`, `main`
   (artist/release-group/release queries).)
 - `caa_url` is emitted as
   `https://coverartarchive.org/release/<release-mbid>/front-250`; it is a
   deterministic Cover Art Archive endpoint, not proof artwork exists.
-  (Sources: `etl.py:469-475` (row transform).)
+  (Sources: `etl.py` `main` (release row transform).)
 - A recording's release is obtained through `track.medium -> medium.release`.
   If a recording appears more than once, select by lowest release table id,
   then medium position, track position, and track id. `track_no` is the selected
@@ -102,7 +102,7 @@ field order; use an extract from the matching schema revision. Derivations:
   `fk_missing_release` / `fk_missing_recording`; negative positions are
   validator poison (`negative_position`). Parent lookups use the
   validator's normalized IDs while the DLQ keeps the exact original dump
-  bytes. (Sources: `etl.py:476-517`
+  bytes. (Sources: `etl.py` `main`
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
   `import.sh:538-545` (FK specs);
   `crates/mb-import-validate/src/lib.rs` (`Position` check).)
@@ -118,21 +118,21 @@ field order; use an extract from the matching schema revision. Derivations:
   duplicate). `recording_music_video` rows are undirected pairs in
   canonical `(lowercased GID)` order, so one link is one row whichever side
   the dump lists first. ISRCs are deduplicated and uppercased to the mirror
-  CHECK's canonical 12-character form. (Sources: `etl.py:70-84` (pinned
-  GIDs), `:277-321` (allowlist resolution, kept-link set, empty-slice
-  refusal), `:519-586` (url, artist/recording-url, music-video and ISRC
+  CHECK's canonical 12-character form. (Sources: `etl.py` pinned `*_GID`
+  constants, `main` (allowlist resolution, kept-link set, empty-slice
+  refusal; url, artist/recording-url, music-video and ISRC
   projections); `migrations/0030_mb_mirror_w6b.sql`.)
 - Orphan references fail the ETL before any curated file is written:
   artist type/area/country, artist-credit artists, group primary types,
   release groups/credits/years, track mediums/recordings, medium releases,
   link attribute types, and every relationship endpoint (artist/recording
-  URLs, music-video sides, ISRC recordings). (Sources: `etl.py:386-431`
-  (reference checks); `tests/test_etl_reference_graphs.sh`.)
+  URLs, music-video sides, ISRC recordings). (Sources: `etl.py` `main`
+  (`bad_*` reference checks); `tests/test_etl_reference_graphs.sh`.)
 - Every row gets the single supplied `DUMP_TS`; no row-specific time is created.
   Missing inputs, wrong field counts, and non-empty input that projects
   to zero rows (or a row-count mismatch on the exact projections) fail closed.
-  (Sources: `etl.py:125-141` (loads), `:188-196,216` (`DUMP_TS`),
-  `:596-610` (fail-closed projections).)
+  (Sources: `etl.py` `load`/`load_filtered`/`rows` (loads), `validate_timestamp`
+  and `insert_select` (`DUMP_TS`, fail-closed projections).)
 - Snapshots curated before `mb_track` have no `mbdump-track.tsv`, and
   snapshots curated before the W6b slice lack the six newer files: re-run
   the ETL for such a dump instead of pointing the new `import.sh` at it

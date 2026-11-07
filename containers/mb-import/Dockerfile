@@ -2,8 +2,9 @@
 # Interactive traffic never touches this image (ADR 0001/0007).
 FROM postgres:18-bookworm@sha256:5c4783a8cc3f0074912164f94dfa1be4e043438f0f707cf968d7af9a0d31a2c8 AS base
 
+# lbzip2: parallel decode of the streamed dump archive (stream_extract.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates python3 \
+    curl ca-certificates python3 lbzip2 \
  && rm -rf /var/lib/apt/lists/*
 
 FROM base AS test
