@@ -20,6 +20,9 @@ export async function commitProxy() {
   const server = createServer(client => {
     const upstream = createConnection({ host: target.hostname, port: Number(target.port) });
     for (const socket of [client, upstream]) {
+      // Frame-by-frame forwarding must not add Nagle/delayed-ACK stalls to the
+      // real producer's unchanged deadline before the selected COMMIT fault.
+      socket.setNoDelay(true);
       sockets.add(socket);
       socket.on('error', () => {}); // Expected connection loss contains no diagnostic payload.
       socket.on('close', () => { sockets.delete(socket); client.destroy(); upstream.destroy(); });

@@ -281,12 +281,30 @@ asynchronous callback timing. An ordinary final producer retry must preserve eve
 DB row and yield a new successful native Queue recovery marker. An accepted callback
 is completed before runtime replacement, not counted as pending-Queue durability.
 
-These controls are written, **not locally executed**. Exact-head Actions must
-validate both protocol handling and application assertions. They cover the
-committed/lost-response branch, not an uncommitted or rolled-back COMMIT, server
-storage failure, maximum-media/cancellation, deployed drain or staging/restore.
-The previously passing restart/client-drop and trigger-rollback banks retain
-those narrower scopes; they were not actual commit-response injection.
+At head `6b8ec3c1`,
+[qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42397515966/job/128477977149)
+passes the plan, dispatch and startup committed-response-loss controls, then
+fails the acknowledgement phase after about ten seconds with zero Queue sends.
+Its final retry also refuses; because the preceding assertion can leave the
+fault armed, that retry is not independent unarmed-path evidence. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42397515966/job/128477977179)
+explicitly reports 255 required cases passed, not full runtime qualification.
+
+The proxy now disables Nagle on both sockets: forwarding individual protocol
+frames must not introduce delayed-ACK stalls into the producer's existing
+ten-second operation deadline. That is the working latency diagnosis, not a
+measured root cause or corrected-runtime pass. The deadline, COMMIT suppression,
+send counts and custody/recovery assertions are unchanged. Exact-head Actions
+must reach one send and one dropped acknowledgement completion, then an ordinary
+202 retry preserving the same rows. If it still fails, inspect payload-free
+phase/frame timings rather than widening the deadline or weakening assertions.
+No local runtime execution is claimed.
+
+These controls cover the committed/lost-response branch, not an uncommitted or
+rolled-back COMMIT, server storage failure, maximum-media/cancellation, deployed
+drain or staging/restore. The previously passing restart/client-drop and
+trigger-rollback banks retain those narrower scopes; they were not actual
+commit-response injection.
 
 A separate R2 recovery control retains the actual GET metadata and faults only
 its body: an open oversized chunk, two individually bounded chunks whose total
