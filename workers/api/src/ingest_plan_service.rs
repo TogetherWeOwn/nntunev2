@@ -219,7 +219,7 @@ async fn handle(mut req: worker::Request, env: worker::Env) -> worker::Result<wo
 /// Ordinary Wasm bridge, not a second fetch event or public route. Only the
 /// outer named facade may delegate here once its generated ABI is qualified.
 #[cfg(all(target_arch = "wasm32", feature = "preparation-service"))]
-#[worker::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = worker::wasm_bindgen, wasm_bindgen_futures = worker::wasm_bindgen_futures)]
+#[worker::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = worker::wasm_bindgen, wasm_bindgen_futures = worker::wasm_bindgen_futures, js_sys = worker::js_sys)]
 pub async fn ingest_preparation_plan(
     req: worker::web_sys::Request,
     env: worker::Env,
