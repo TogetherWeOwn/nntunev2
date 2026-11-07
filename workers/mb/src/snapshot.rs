@@ -696,11 +696,16 @@ mod worker_entry {
             )));
         }
         match path {
-            ["v1", "mb", "release", _, "recordings"]
-            | ["v1", "mb", "release-group", _, "releases"]
-            | ["v1", "mb", "artist", _, "urls"]
-            | ["v1", "mb", "recording", _, "videos" | "isrcs"] => {
-                Some(crate::error_response(crate::ApiError::internal_error()))
+            ["v1", "mb", "release", mbid, "recordings"]
+            | ["v1", "mb", "release-group", mbid, "releases"]
+            | ["v1", "mb", "artist", mbid, "urls"]
+            | ["v1", "mb", "recording", mbid, "videos" | "isrcs"] => {
+                let error = if crate::is_valid_mbid(mbid) {
+                    crate::ApiError::internal_error()
+                } else {
+                    crate::ApiError::invalid_request("invalid mbid (must be UUID)")
+                };
+                Some(crate::error_response(error))
             }
             _ => None,
         }
@@ -796,9 +801,34 @@ mod tests {
             ("recording", "videos"),
             ("recording", "isrcs"),
         ] {
-            let api = spike_route_error(Method::Get, &["v1", "mb", kind, "id", listing]).unwrap();
-            assert_eq!(api.status, 500);
-            assert!(api.body.contains("internal_error"));
+            for mbid in [
+                "123e4567-e89b-12d3-a456-426614174000",
+                "123E4567-E89B-12D3-A456-426614174000",
+            ] {
+                let api =
+                    spike_route_error(Method::Get, &["v1", "mb", kind, mbid, listing]).unwrap();
+                assert_eq!(api.status, 500);
+                assert!(api.body.contains("internal_error"));
+            }
+            for mbid in ["not-a-uuid", "", "123e4567-e89b-12d3-a456-42661417400"] {
+                let api =
+                    spike_route_error(Method::Get, &["v1", "mb", kind, mbid, listing]).unwrap();
+                assert_eq!(api.status, 400);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&api.body).unwrap(),
+                    serde_json::json!({
+                        "code": "invalid_request",
+                        "message": "invalid mbid (must be UUID)",
+                        "retryable": false,
+                    })
+                );
+                assert_eq!(
+                    spike_route_error(Method::Post, &["v1", "mb", kind, mbid, listing])
+                        .unwrap()
+                        .status,
+                    404
+                );
+            }
         }
         assert!(spike_route_error(Method::Get, &["v1", "mb", "artist", "id", "unknown"]).is_none());
     }
