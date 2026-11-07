@@ -206,9 +206,25 @@ Unknown recovery refuses; exact R2 bytes/version and the object inventory surviv
 without reseeding. No callback or dead-letter marker may appear during direct
 recovery. The existing lost-reply send and ordinary acknowledgement-only retry
 then run through these fresh isolates and require new native callback markers.
-This control is written, not locally executed; exact-head Actions is required.
-It qualifies durable **unsent dispatch** recovery after graceful restart, not
-persistence of accepted pending Queue messages, abrupt crash or ambiguous commit.
+At head `0d91fa6e`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42390548525/job/128457068748)
+passes all thirteen runtime subtests (fourteen Node passes including the enclosing
+test), including this unsent-dispatch restart. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42390548525/job/128457068794)
+explicitly reports 255 required cases passed. This qualifies durable **unsent
+dispatch** recovery after graceful restart, not persistence of accepted pending
+Queue messages, abrupt crash or ambiguous commit.
+
+The accepted-but-lost-reply send now also precedes runtime replacement, after its
+native callback has positively completed. Its marker is removed before shutdown;
+fresh Rust/private API isolates must recover that same unacknowledged pointer
+without changing any DB row, deadline, R2 byte/version or inventory. Unknown
+recovery refuses and direct recovery cannot recreate a callback marker. The
+ordinary producer retry must then acknowledge only the existing dispatch and
+produce a fresh native callback. This additional control is written, not locally
+executed; exact-head Actions is required. It covers graceful restart after a
+simulated lost reply and completed native delivery, **not** persistence or replay
+of an accepted pending Queue message, an abrupt crash or an ambiguous DB commit.
 
 A separate R2 recovery control retains the actual GET metadata and faults only
 its body: an open oversized chunk, two individually bounded chunks whose total

@@ -466,6 +466,44 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       } else {
         assert.deepEqual(await compositeDelivery(bucket), { count: 1 },
           'lost acknowledgement must follow a real send and successful Rust Queue recovery');
+        await t.test('fresh workerd recovers a dispatch after an accepted Queue send loses its reply', async () => {
+          const key = `prepared-tagged/${pendingVersion.object_id}`;
+          const object = await bucket.get(key);
+          assert.ok(object);
+          const bytes = Buffer.from(await object.arrayBuffer());
+          assert.equal(object.version, pendingVersion.object_version);
+          assert.equal(state(), pending, 'completed Queue recovery must not acknowledge the producer send');
+          // The accepted callback has completed. Remove its marker so it cannot
+          // stand in for a new delivery after replacing all runtime isolates.
+          await bucket.delete('qualification-composite-delivered');
+          const objects = (await bucket.list()).objects.map(o => ({ key: o.key, version: o.version }));
+          await mf.dispose();
+          mf = undefined;
+          mf = new Miniflare(options);
+          composite = await mf.getWorker('composite-flac');
+          bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+          assert.equal((await composite.fetch('https://qualification.invalid/healthz')).status, 200);
+          assert.equal(state(), pending, 'runtime replacement cannot turn Queue acceptance into a DB acknowledgement');
+          assert.equal(await bucket.get('qualification-composite-delivered'), null);
+          const recover = pointer => composite.fetch('https://qualification.invalid/recover', {
+            method: 'POST', body: JSON.stringify(pointer),
+          });
+          const pointer = { version: 1, id: pendingVersion.id };
+          assert.equal((await recover(pointer)).status, 204, 'fresh isolates must recover accepted-but-unacknowledged custody');
+          assert.equal((await recover(pointer)).status, 204, 'duplicate recovery remains read-only');
+          assert.equal((await recover({ version: 1, id: 'unknown-lost-reply-pointer' })).status, 503);
+          assert.equal(state(), pending, 'restart recovery cannot renew deadlines or replace persisted authority');
+          assert.equal(sql(`SELECT send_acknowledged FROM ingest_file_dispatches
+            WHERE job_id = 'qualification-flac-job';`), 'f');
+          const retained = await bucket.get(key);
+          assert.ok(retained);
+          assert.equal(retained.version, pendingVersion.object_version);
+          assert.deepEqual(Buffer.from(await retained.arrayBuffer()), bytes);
+          assert.deepEqual((await bucket.list()).objects.map(o => ({ key: o.key, version: o.version })), objects);
+          assert.equal(await bucket.get('qualification-composite-delivered'), null,
+            'direct recovery must not send or recreate an earlier callback marker');
+          assert.equal(await bucket.get('qualification-refused'), null);
+        });
       }
       assert.equal(state(), pending, 'failed send/recovery must preserve full persisted rows');
       const retained = await bucket.get(`prepared-tagged/${pendingVersion.object_id}`);
