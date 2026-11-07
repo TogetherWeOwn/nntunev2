@@ -338,7 +338,16 @@ mistargeted service. Each refusal preserves full DB fingerprints, R2 inventory,
 exact tagged bytes/version and callback markers. Genuine named-binding recovery
 must succeed after each fault without changing that same custody. This covers
 binding refusal during recovery, not initial producer misconfiguration or a
-capability grant/deployment. These added controls await exact-head Actions.
+capability grant/deployment. At `c800560d`, the
+[qualification job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42400891623/job/128488216516)
+reached the first missing-binding refusal and unchanged DB check, then failed
+because it compared RPC proxy objects (including fresh inspection functions)
+directly. The default/wrong-binding cases and later assertions in that subtest
+were not reached. Nineteen runtime subtests passed; Node reports nineteen passes
+and two failures including the enclosing test. The corrected inventory compares
+complete, sorted object keys, versions and sizes, with an unchanged-list positive
+control; exact tagged bytes/version and full DB checks remain. Corrected controls
+await exact-head Actions; no runtime pass is claimed for the correction.
 
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production

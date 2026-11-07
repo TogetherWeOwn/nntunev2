@@ -347,7 +347,17 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     });
     assert.equal((await recover(pointer)).status, 204);
     assert.equal(state(), persisted, 'explicit duplicate recovery is read-only');
-    const bindingInventory = await bucket.list();
+    // Node's R2 objects are RPC proxies with fresh inspection functions on each
+    // list call. Compare persisted identity, not proxy/function identity. Any
+    // object write changes its version; include marker objects as well as data.
+    const bindingObjects = async () => {
+      const result = await bucket.list();
+      assert.equal(result.truncated, false, 'binding custody inventory must be complete');
+      return result.objects.map(o => ({ key: o.key, version: o.version, size: o.size }))
+        .sort((a, b) => a.key.localeCompare(b.key));
+    };
+    const bindingInventory = await bindingObjects();
+    assert.deepEqual(await bindingObjects(), bindingInventory, 'unchanged R2 custody must compare equal');
     for (const fault of ['missing', 'default', 'wrong']) {
       const response = await composite.fetch(`https://qualification.invalid/recover-binding-fault/${fault}`, {
         method: 'POST', body: JSON.stringify(pointer),
@@ -360,13 +370,13 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
         fault === 'missing' ? /^absent$/ : /^[1-5][0-9]{2}$/,
         'a mistargeted service must return an actual platform HTTP response');
       assert.equal(state(), persisted, 'binding refusal cannot change authority or custody');
-      assert.deepEqual(await bucket.list(), bindingInventory, 'binding refusal cannot write R2 markers or objects');
+      assert.deepEqual(await bindingObjects(), bindingInventory, 'binding refusal cannot write R2 markers or objects');
       const retained = await bucket.get(objectKey);
       assert.equal(retained.version, row.object_version);
       assert.deepEqual(new Uint8Array(await retained.arrayBuffer()), expected);
       assert.equal((await recover(pointer)).status, 204, 'genuine named-binding recovery must still work');
       assert.equal(state(), persisted);
-      assert.deepEqual(await bucket.list(), bindingInventory);
+      assert.deepEqual(await bindingObjects(), bindingInventory);
     }
     assert.equal((await prepare()).status, 202, 'exact producer replay reuses the same custody');
     assert.equal(state(), persisted, 'producer replay must not remint or renew');
