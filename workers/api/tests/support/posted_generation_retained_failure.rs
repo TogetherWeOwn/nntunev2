@@ -179,16 +179,22 @@ fn postgres_retained_failure_intact_content_vetoes_absence_and_mismatched_conten
             let f = withdrawn(&mut db).await;
             seed_repair(&db, &f).await;
             let s = &f.case.sealed;
-            db.execute(
-                "INSERT INTO posted_file_content_checks \
-                 (generation_id, round, side, backbone, state, checked_articles) \
-                 SELECT p.id, h.round, 0, CASE WHEN $2 THEN 'wrong-pool' ELSE p.backbone_post END, \
-                 'intact', p.article_count FROM posted_files p JOIN posted_file_health h \
-                 ON h.generation_id = p.id WHERE p.id = $1",
-                &[&s.generation, &malformed],
-            )
-            .await
-            .quiet("seed contradicting full content");
+            let inserted = db
+                .execute(
+                    "INSERT INTO posted_file_content_checks \
+                     (generation_id, round, side, backbone, state, checked_articles, checked_at) \
+                     SELECT p.id, h.round, 0, CASE WHEN $2 THEN 'wrong-pool' ELSE p.backbone_post END, \
+                     'intact', p.article_count, floor(extract(epoch FROM clock_timestamp()))::bigint \
+                     FROM posted_files p JOIN posted_file_health h \
+                     ON h.generation_id = p.id WHERE p.id = $1",
+                    &[&s.generation, &malformed],
+                )
+                .await
+                .quiet("seed contradicting full content");
+            assert!(
+                inserted == 1,
+                "content veto requires one persisted observation"
+            );
             let permit = serving(&mut db, &f, "prepare content veto").await;
             let before = frozen(&db, s).await;
             let result = conclude_retained_failure(&mut db, &permit).await;
