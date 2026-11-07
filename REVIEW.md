@@ -26,6 +26,14 @@ never replaces same-build staging, migrations, rollback or exact-head
 production authorization. This analysis-only review is not the final
 merge/approval stage described in CONTRIBUTING.
 
+## Dependency-bump PRs
+
+For dependency version-bump PRs (including Dependabot-style updates):
+
+- Evaluate the bump against the dependency's own changelog and this repository's actual usage.
+- Do not flag lockfile or transitive-dependency churn unless it affects a changed API this repository calls, or introduces or leaves unfixed a known security advisory. Identify the affected call site or advisory and its concrete impact.
+- Follow this repository's existing dependency policy for pins versus ranges; do not substitute reviewer preference.
+
 ## Before you flag a security issue
 
 - Require a concrete exploit path at the exact reviewed commit: who the
