@@ -255,6 +255,10 @@ for (const width of [320, 360, 390]) {
 			const seek = surface.getByTestId('player-seek');
 			await seek.focus();
 			await expect(seek).toBeFocused();
+			for (const id of ['player-seek-back', 'player-seek-forward']) {
+				await page.keyboard.press('Tab');
+				await expect(surface.getByTestId(id)).toBeFocused();
+			}
 			await page.keyboard.press('Tab');
 			await expect(surface.getByRole('button', { name: 'Previous track', exact: true })).toBeFocused();
 			for (const id of ['player-play-pause', 'player-next']) {

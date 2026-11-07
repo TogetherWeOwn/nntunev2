@@ -12,10 +12,11 @@ const sources = import.meta.glob('./{icons.ts,strings.ts,Icon.svelte,IconSvg.sve
 }) as Record<string, string>;
 
 function svg(body: string): string {
-	let markup = body.match(/<svg\b[\s\S]*?<\/svg>/)?.[0];
-	if (!markup) throw new Error('Missing SVG');
+	const match = body.match(/<svg\b[\s\S]*?<\/svg>/)?.[0];
+	if (!match) throw new Error('Missing SVG');
+	let markup: string = match;
 	while (markup.includes('<!--')) {
-		const next = markup.replace(/<!--[\s\S]*?-->/g, '');
+		const next: string = markup.replace(/<!--[\s\S]*?-->/g, '');
 		if (next === markup) throw new Error('Unterminated SVG comment');
 		markup = next;
 	}

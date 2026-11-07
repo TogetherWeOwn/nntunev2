@@ -131,7 +131,9 @@ for (const width of [390, 1280]) {
 		await page.keyboard.press('Enter');
 		await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
 		await expect(page.getByTestId('queue-panel')).toBeVisible();
-		await expect(page.getByRole('heading', { name: 'Queue', exact: true })).toBeFocused();
+		const host = page.getByTestId(width < 800 ? 'queue-route' : 'right-panel');
+		await expect(host.getByRole('heading', { name: 'Queue', exact: true })
+			.and(host.locator(width < 800 ? ':scope > h1' : ':scope > h2'))).toBeFocused();
 		await page.getByRole('button', { name: 'Close queue', exact: true }).click();
 		await expect(page.getByTestId('player-queue-toggle')).toBeFocused();
 		expect(await original.evaluate((el) => el === document.querySelector('[data-testid="audio-player"]'))).toBe(true);

@@ -40,7 +40,9 @@ test('desktop starts closed, opens without navigation, and keyboard close restor
 	await toggle.focus();
 	await page.keyboard.press('Enter');
 	await expect(page.getByTestId('queue-panel')).toBeVisible();
-	await expect(page.getByRole('heading', { name: 'Queue', exact: true })).toBeFocused();
+	const host = page.getByTestId('right-panel');
+	await expect(host.getByRole('heading', { name: 'Queue', exact: true })
+		.and(host.locator(':scope > h2'))).toBeFocused();
 	expect(page.url()).toBe(url);
 	await page.keyboard.press('Escape');
 	await expect(page.getByTestId('queue-panel')).toHaveCount(0);

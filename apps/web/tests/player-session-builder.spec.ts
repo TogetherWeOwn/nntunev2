@@ -51,9 +51,18 @@ async function openLibrary(page: Page, items = ITEMS) {
 		else return fulfill(route);
 	});
 	const wav = silentWav();
-	await page.route('**/test-audio/**', (route) =>
-		route.fulfill({ contentType: 'audio/wav', body: wav })
-	);
+	await page.route('**/test-audio/**', (route) => {
+		const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers()['range'] ?? '');
+		const start = range ? Number(range[1]) : 0;
+		const end = range?.[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
+		if (start > end) return route.fulfill({ status: 416, headers: { 'Content-Range': `bytes */${wav.length}` } });
+		return route.fulfill({
+			status: range ? 206 : 200,
+			contentType: 'audio/wav',
+			headers: { 'Accept-Ranges': 'bytes', ...(range ? { 'Content-Range': `bytes ${start}-${end}/${wav.length}` } : {}) },
+			body: wav.subarray(start, end + 1)
+		});
+	});
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(items.length);
 	for (const item of items) {
