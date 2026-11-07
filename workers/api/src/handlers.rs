@@ -11385,8 +11385,11 @@ mod tests {
         let report = block_on(run_billing_reconcile_sweep(&h.ctx()));
         assert_eq!(report.operations_attempted, 1);
         assert_eq!(report.operations_failed, 0);
-        assert_eq!(report.subscriptions_attempted, 1);
+        // The operation fold creates u1's active row before the subscription
+        // claim, so active-row polling must include both u1 and failing u2.
+        assert_eq!(report.subscriptions_attempted, 2);
         assert_eq!(report.subscriptions_failed, 1);
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
         let live = live_for(&h, "u1").expect("sweep folded the paid session");
         assert_eq!(live.status, "active");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD),);

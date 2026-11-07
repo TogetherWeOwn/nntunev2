@@ -55,7 +55,7 @@ FROM generate_series(1, 125) AS i;
 INSERT INTO subscriptions
     (id, user_id, stripe_subscription_id, stripe_customer_id,
      stripe_subscription_item_id, stripe_price_id, plan_id, status,
-     current_period_end, cancel_at_period_end, trial_end, paid_through_at,
+     current_period_end, cancel_at_period_end, paid_through_at,
      paid_invoice_id, grace_until, reconcile_attempted_at)
 SELECT ('00000000-0000-0000-0002-' || lpad(i::text, 12, '0'))::uuid,
        'user-sw-sub-' || lpad(i::text, 3, '0'),
@@ -69,7 +69,6 @@ SELECT ('00000000-0000-0000-0002-' || lpad(i::text, 12, '0'))::uuid,
                   WHEN 4 THEN NULL
                   ELSE '2026-01-01 00:00:00+00'::timestamptz END,
        (i % 7 = 0),
-       CASE WHEN i % 3 = 0 THEN '2026-02-01 00:00:00+00'::timestamptz END,
        '2026-03-01 00:00:00+00'::timestamptz + (i || ' minutes')::interval,
        'in_sw_' || i,
        CASE WHEN i % 2 = 0 THEN '2026-04-01 00:00:00+00'::timestamptz END,
