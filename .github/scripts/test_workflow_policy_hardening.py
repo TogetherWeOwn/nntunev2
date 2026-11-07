@@ -110,6 +110,14 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("python3 .github/scripts/test_workflow_policy_hardening.py", job(ci, "public-text"))
         self.assertIn("public-text", job(ci, "ci-ok"))
 
+    def test_codeql_reports_on_every_pull_request(self):
+        # The code_scanning ruleset waits for CodeQL on every PR; a path filter
+        # leaves Rust/docs-only PRs waiting forever.
+        text = (WORKFLOWS / "codeql.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("  pull_request:\n", triggers)
+        self.assertNotRegex(triggers, r"(?m)^\s+paths(-ignore)?:")
+
 
 if __name__ == "__main__":
     unittest.main()
