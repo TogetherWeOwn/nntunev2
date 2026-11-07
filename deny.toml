@@ -13,7 +13,8 @@
 # used under MIT), which the allow list below satisfies without LGPL.
 # Notable single-license crates: `ring` (Apache-2.0 AND ISC),
 # `webpki-roots` (CDLA-Permissive-2.0, Mozilla's permissive cert-data
-# license). No git or non-crates.io sources exist in any lockfile.
+# license). The only non-crates.io source is the reviewed velmora git
+# repo (see [sources]).
 
 [graph]
 # The two targets CI ever builds: native tests/lints and the Worker
@@ -62,7 +63,12 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [sources]
-# Every dependency must come from crates.io. A new git or registry source
-# fails the gate until it is reviewed and added here deliberately.
+# Every dependency must come from crates.io, except the one reviewed git
+# source below. A new git or registry source fails the gate until it is
+# reviewed and added here deliberately.
 unknown-registry = "deny"
 unknown-git = "deny"
+# velmora: the shared Usenet engine behind nntune-core and nntune-test-nntp
+# (MIT, TogetherWeOwn-owned, public). Consumers pin it by immutable git
+# `rev` only; the Cargo.lock entries record that exact commit.
+allow-git = ["https://github.com/TogetherWeOwn/velmora"]

@@ -953,17 +953,10 @@ dependencies = [
 name = "nntune-core"
 version = "0.1.0"
 dependencies = [
- "aes",
- "cbc",
  "crc32fast",
- "crypto_secretbox",
- "getrandom 0.2.17",
- "libc",
- "md5",
- "quick-xml",
  "serde",
  "serde_json",
- "sha2",
+ "velmora",
 ]
 
 [[package]]
@@ -1829,6 +1822,24 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "velmora"
+version = "0.1.0"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=c5e79d617896490a47d577a9b062cd0010e0bc8a#c5e79d617896490a47d577a9b062cd0010e0bc8a"
+dependencies = [
+ "aes",
+ "cbc",
+ "crc32fast",
+ "crypto_secretbox",
+ "getrandom 0.2.17",
+ "libc",
+ "md5",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "version_check"
