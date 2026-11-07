@@ -5,7 +5,36 @@ import * as generated from '../../ingest/build/worker/shim.mjs';
 export default class QualificationComposite extends WorkerEntrypoint {
   async fetch(request) {
     const worker = new generated.default(this.ctx, this.env);
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === '/prepare-flac' && url.searchParams.has('queue-fault')) {
+      // Keep the actual Rust producer and native Queue. Fail only at the send
+      // boundary: before acceptance, or after acceptance with a lost reply.
+      const fault = url.searchParams.get('queue-fault');
+      if (!['before', 'after'].includes(fault)) throw new Error('unknown qualification Queue fault');
+      const queue = this.env.INGEST_QUEUE;
+      let attempts = 0;
+      let accepted = 0;
+      const patched = new Proxy(queue, {
+        get(target, property) {
+          if (property === 'send') return async (...args) => {
+            attempts += 1;
+            if (fault === 'after') {
+              await target.send(...args);
+              accepted += 1;
+            }
+            throw new Error('qualification Queue reply unavailable');
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
+        },
+      });
+      const response = await worker.qualification_prepare(request, { ...this.env, INGEST_QUEUE: patched });
+      const headers = new Headers(response.headers);
+      headers.set('x-qualification-send-attempts', String(attempts));
+      headers.set('x-qualification-send-accepted', String(accepted));
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (path.startsWith('/prepare-range-fault/')) {
       // Fault only the GET response after the actual create-only R2 PUT/HEAD.
       // Preserve the real body except in the explicit stream-length controls.

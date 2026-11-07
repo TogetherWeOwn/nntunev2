@@ -164,8 +164,14 @@ precede the existing ten-second operation deadline, not depend on EOF or digest
 rejection. A one-byte stalled stream must instead reach that deadline. Every
 control requires exactly one successful real plan call, a redacted refusal,
 unchanged full DB fingerprints and exact R2 version/digest, no new objects or
-Queue marker, and successful genuine recovery afterward. These controls are
-written, not locally executed; require their exact-head Actions result. The
+Queue marker, and successful genuine recovery afterward. At head `b95b392f`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42385014133/job/128440474769)
+passes all eleven runtime subtests (twelve Node passes including the enclosing
+test), including these response controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42385014133/job/128440475247)
+explicitly reports 255 required cases passed. Workerd emits critical-error
+messages during injected stream failure; the refusal, unchanged-state and later
+genuine recovery assertions pass. This is not clean runtime diagnostics. The
 digest fault changes only the original-digest field, preserving canonical format
 and geometry; this exercises end-to-end integrity, not one particular duplicate
 digest check. Truncation does not isolate length from digest/decoder refusal.
@@ -176,6 +182,19 @@ bounded private response handling, not maximum supported media-file sizing,
 network cancellation, a process crash or ambiguous commit. Process crashes,
 ambiguous DB commits, pending-Queue replay, large-media limits, deployed
 lifecycle/drain, actual staging/restore and remaining foundation review stay open.
+The FLAC composite now also faults the native Queue send before acceptance and
+after a successful real send (lost reply). Each producer call must reach exactly
+one send attempt and return a static refusal while the persisted dispatch stays
+unacknowledged. Direct recovery must work before any send; after the lost reply,
+a fresh callback marker must prove actual Rust Queue recovery. Full DB
+fingerprints must remain unchanged across both faults. An ordinary producer retry
+then sets the acknowledgement bit, changes no other persisted field, preserves
+the exact R2 version and requires another fresh callback marker. No DB reset,
+manual acknowledgement or replacement custody is used. These added controls are
+written, not locally executed; require exact-head Actions. The post-send throw
+simulates a lost Queue reply, not a process crash, ambiguous DB commit or pending
+Queue persistence across restart.
+
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
 activation, posting or R2 deletion authority.

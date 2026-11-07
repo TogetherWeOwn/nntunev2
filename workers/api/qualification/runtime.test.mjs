@@ -401,7 +401,48 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       assert.equal(state(), initial);
       assert.deepEqual((await bucket.list()).objects, [], 'parser refusal must not write R2');
     }
+    let pending;
+    let custody;
+    let pendingVersion;
+    for (const fault of ['before', 'after']) {
+      const response = await composite.fetch(`https://qualification.invalid/prepare-flac?queue-fault=${fault}`, {
+        method: 'POST', body: input,
+      });
+      assert.equal(response.status, 503, `unacknowledged Queue send must remain pending: ${fault}`);
+      assert.equal(await response.text(), 'qualification unavailable');
+      assert.equal(response.headers.get('x-qualification-send-attempts'), '1');
+      assert.equal(response.headers.get('x-qualification-send-accepted'), fault === 'after' ? '1' : '0');
+      assert.equal(sql(`SELECT send_acknowledged FROM ingest_file_dispatches
+        WHERE job_id = 'qualification-flac-job';`), 'f');
+      if (fault === 'before') {
+        pending = state();
+        custody = state(true);
+        const dispatch = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+          SELECT id,object_id,object_version FROM ingest_file_dispatches
+          WHERE job_id = 'qualification-flac-job') q;`));
+        pendingVersion = dispatch;
+        assert.equal(await bucket.get('qualification-composite-delivered'), null,
+          'pre-send refusal must not invoke the native consumer');
+        assert.equal((await composite.fetch('https://qualification.invalid/recover', {
+          method: 'POST', body: JSON.stringify({ version: 1, id: dispatch.id }),
+        })).status, 204, 'persisted preparation is recoverable even before Queue acceptance');
+      } else {
+        assert.deepEqual(await compositeDelivery(bucket), { count: 1 },
+          'lost acknowledgement must follow a real send and successful Rust Queue recovery');
+      }
+      assert.equal(state(), pending, 'failed send/recovery must preserve full persisted rows');
+      const retained = await bucket.get(`prepared-tagged/${pendingVersion.object_id}`);
+      assert.ok(retained, 'unacknowledged send retains the prepared object');
+      assert.equal(retained.version, pendingVersion.object_version);
+      assert.equal(await bucket.get('qualification-refused'), null);
+    }
+    // A fresh marker must come from the ordinary retry, not the lost-reply send.
+    await bucket.delete('qualification-composite-delivered');
     assert.equal((await prepare(input)).status, 202);
+    assert.deepEqual(await compositeDelivery(bucket), { count: 1 });
+    assert.equal(state(true), custody, 'successful retry changes only send acknowledgement');
+    assert.equal((await bucket.get(`prepared-tagged/${pendingVersion.object_id}`)).version,
+      pendingVersion.object_version, 'retry must not rewrite the prepared R2 object');
     const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
       SELECT id,object_id,object_version,plaintext_bytes,plaintext_sha256,send_acknowledged
       FROM ingest_file_dispatches WHERE job_id = 'qualification-flac-job') q;`));

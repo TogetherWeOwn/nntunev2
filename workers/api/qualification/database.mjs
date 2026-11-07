@@ -50,10 +50,13 @@ export function seed(flac = false) {
   `);
 }
 
-export function state() {
+export function state(ignoreSendAcknowledged = false) {
   // Fingerprint complete persisted rows without exposing envelope/token bytes.
+  // The send-replay control may exclude only the monotonic acknowledgement bit.
+  assert.equal(typeof ignoreSendAcknowledged, 'boolean');
+  const dispatch = ignoreSendAcknowledged ? "to_jsonb(d) - 'send_acknowledged'" : 'to_jsonb(d)';
   return sql(`SELECT md5(concat_ws('|',
-    (SELECT jsonb_agg(to_jsonb(d) ORDER BY id)::text FROM ingest_file_dispatches d),
+    (SELECT jsonb_agg(${dispatch} ORDER BY id)::text FROM ingest_file_dispatches d),
     (SELECT jsonb_agg(to_jsonb(p) ORDER BY id)::text FROM ingest_preparation_plans p),
     (SELECT jsonb_agg(to_jsonb(a) ORDER BY job_id)::text FROM posted_file_job_attempts a),
     (SELECT jsonb_agg(to_jsonb(r) ORDER BY job_id,request_id)::text FROM posted_file_attempt_receipts r),
