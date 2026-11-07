@@ -27,10 +27,11 @@ shim revs and affected committed lockfiles together (root, `workers/api`,
 `workers/ingest`, `workers/repair`, `workers/transcode`). `deny.toml`
 allows velmora as the only git source.
 
-The draft restack targets `5af1bfe901d15b5f041a5d1973b866436d988b19` for
-`velmora`, `velmora-test-nntp` and `velmora-ssrf-guard`. It is incomplete
-until the Actions-generated locks and all three shim manifests land together;
-the existing pin does not supply the new auth/qualification APIs yet.
+The three shims pin `5af1bfe901d15b5f041a5d1973b866436d988b19` for
+`velmora`, `velmora-test-nntp` and `velmora-ssrf-guard`, with matching
+Actions-generated locks. The shared engine owns the authentication guard,
+SSRF predicate and qualification-only TLS transport; this pin does not
+qualify or enable Worker dialing.
 
 ## Features
 
