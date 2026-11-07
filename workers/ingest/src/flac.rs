@@ -590,9 +590,19 @@ fn crc8(data: &[u8]) -> u8 {
     crc
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CRC16_WORK_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn crc16(data: &[u8]) -> u16 {
+    crc16_continue(0, data)
+}
+
+fn crc16_continue(mut crc: u16, data: &[u8]) -> u16 {
+    #[cfg(test)]
+    CRC16_WORK_BYTES.with(|work| work.set(work.get() + data.len()));
     let table = crc16_table();
-    let mut crc = 0u16;
     for byte in data {
         crc = (crc << 8) ^ table[(((crc >> 8) ^ u16::from(*byte)) & 0xFF) as usize];
     }
@@ -941,11 +951,15 @@ fn walk_frames(
         if min_end > bytes.len() {
             return Err(FlacReject::Truncated);
         }
-        // Find the next validated sync (or EOF for the last frame).
+        // Bound the sync search and advance the prefix CRC monotonically:
+        // false headers must never rehash an already scanned frame prefix.
         let mut next_start: Option<usize> = None;
         let mut scan = pos + header.header_len + 1;
-        while scan < bytes.len() {
-            let Some(rel) = bytes[scan..].iter().position(|b| *b == 0xFF) else {
+        let scan_limit = bytes.len().min(pos.saturating_add(MAX_FRAME_BYTES + 1));
+        let mut crc_end = scan;
+        let mut frame_crc = crc16(&bytes[pos..crc_end]);
+        while scan < scan_limit {
+            let Some(rel) = bytes[scan..scan_limit].iter().position(|b| *b == 0xFF) else {
                 break;
             };
             scan += rel;
@@ -962,12 +976,13 @@ fn walk_frames(
                 continue;
             }
             let after = expected_sample + u64::from(header.block_samples);
-            if parse_frame_header(bytes, scan, streaminfo, after).is_ok()
-                && crc16(&bytes[pos..scan - 2])
-                    == u16::from_be_bytes([bytes[scan - 2], bytes[scan - 1]])
-            {
-                next_start = Some(scan);
-                break;
+            if parse_frame_header(bytes, scan, streaminfo, after).is_ok() {
+                frame_crc = crc16_continue(frame_crc, &bytes[crc_end..scan - 2]);
+                crc_end = scan - 2;
+                if frame_crc == u16::from_be_bytes([bytes[scan - 2], bytes[scan - 1]]) {
+                    next_start = Some(scan);
+                    break;
+                }
             }
             scan += 1;
         }
@@ -987,7 +1002,8 @@ fn walk_frames(
         if frame_len > MAX_FRAME_BYTES {
             return Err(FlacReject::FrameTooLarge);
         }
-        if crc16(&bytes[pos..end - 2]) != u16::from_be_bytes([bytes[end - 2], bytes[end - 1]]) {
+        frame_crc = crc16_continue(frame_crc, &bytes[crc_end..end - 2]);
+        if frame_crc != u16::from_be_bytes([bytes[end - 2], bytes[end - 1]]) {
             return Err(FlacReject::BadFrameCrc);
         }
         let frame_samples = header.block_samples;
@@ -1690,6 +1706,79 @@ mod tests {
         let walk = walk_flac(&bytes).expect("sample data is not a frame boundary");
         assert_eq!(walk.frame_count, 2);
         assert_eq!(walk.total_samples, 2 * u64::from(TEST_BLOCK));
+    }
+
+    #[test]
+    fn crc16_continuation_matches_whole_input() {
+        let bytes: Vec<u8> = (0..256).map(|value| value as u8).collect();
+        let expected = crc16(&bytes);
+        for split in 0..=bytes.len() {
+            assert_eq!(
+                crc16_continue(crc16(&bytes[..split]), &bytes[split..]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn walk_crc_work_is_linear_with_continuous_false_headers() {
+        let next_frame = test_frame(1, TEST_BLOCK, 0);
+        let mut frame = test_frame(0, TEST_BLOCK, 0)[..6].to_vec();
+        let mut prefix_crc = crc16(&frame);
+        let mut false_headers = Vec::new();
+        for _ in 0..2048 {
+            let padding = [0x01; 8];
+            frame.extend_from_slice(&padding);
+            prefix_crc = crc16_continue(prefix_crc, &padding);
+            let wrong_footer = if prefix_crc == 0 { [0, 1] } else { [0, 0] };
+            frame.extend_from_slice(&wrong_footer);
+            false_headers.push(frame.len());
+            frame.extend_from_slice(&next_frame[..6]);
+            prefix_crc = crc16_continue(prefix_crc, &wrong_footer);
+            prefix_crc = crc16_continue(prefix_crc, &next_frame[..6]);
+        }
+        frame.extend_from_slice(&prefix_crc.to_be_bytes());
+        let streaminfo = parse_streaminfo(&test_streaminfo(384, [0; 16])).unwrap();
+        for &offset in &false_headers {
+            assert!(parse_frame_header(&frame, offset, &streaminfo, 192).is_ok());
+        }
+        let mut bytes = flac_with_frames(&[], false);
+        let start = bytes.len();
+        bytes.extend_from_slice(&frame);
+        bytes.extend_from_slice(&next_frame);
+        CRC16_WORK_BYTES.with(|work| work.set(0));
+        let walk = walk_flac(&bytes).expect("false headers preserve the real boundary");
+        let work = CRC16_WORK_BYTES.with(|work| work.get());
+        assert_eq!(walk.frame_count, 2);
+        assert_eq!(walk.frame_spans[0].byte_len as usize, frame.len());
+        assert_eq!(
+            walk.frame_spans[1].byte_offset as usize,
+            start + frame.len()
+        );
+        assert!(work <= bytes.len(), "CRC work must be linear, got {work}");
+
+        bytes[start + frame.len() - 1] ^= 1;
+        CRC16_WORK_BYTES.with(|work| work.set(0));
+        assert_eq!(walk_flac(&bytes).unwrap_err(), FlacReject::BadFrameCrc);
+        let work = CRC16_WORK_BYTES.with(|work| work.get());
+        assert!(work <= bytes.len(), "rejected CRC work must also be linear");
+    }
+
+    #[test]
+    fn walk_enforces_frame_byte_limit_at_next_header() {
+        let mut frame = test_frame(0, TEST_BLOCK, 0);
+        frame.truncate(frame.len() - 2);
+        frame.resize(MAX_FRAME_BYTES - 2, 0);
+        let footer = crc16(&frame);
+        frame.extend_from_slice(&footer.to_be_bytes());
+        let mut bytes = flac_with_frames(&[], false);
+        bytes.extend_from_slice(&frame);
+        bytes.extend_from_slice(&test_frame(1, TEST_BLOCK, 0));
+        let walk = walk_flac(&bytes).expect("boundary at the exact frame limit");
+        assert_eq!(walk.frame_count, 2);
+        assert_eq!(walk.frame_spans[0].byte_len as usize, MAX_FRAME_BYTES);
+        bytes.insert(walk.first_frame_offset as usize + 10, 0);
+        assert_eq!(walk_flac(&bytes).unwrap_err(), FlacReject::FrameTooLarge);
     }
 
     #[test]
