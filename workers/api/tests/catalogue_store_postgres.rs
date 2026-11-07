@@ -58,24 +58,28 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 async fn library_continuation_binds_every_key_and_preserves_owner_scope() {
     use nntune_api::catalogue::LibraryCursor;
     for caller in ["u1", "fresh"] {
-        let app = client(false).await;
-        app.execute(
-            "INSERT INTO library SELECT NULL, 'same-job', $1, ARRAY[$2], 'shared-' || lpad(g::text, 3, '0')
-             FROM generate_series(1,55) g",
-            &[&RELEASE, &RECORDING],
-        ).await.unwrap();
-        app.execute(
-            "INSERT INTO library VALUES ('u1','same-job',$1,ARRAY[$2],'own'),
-             ('other','same-job',$1,ARRAY[$2],'other')",
-            &[&RELEASE, &RECORDING],
-        )
-        .await
-        .unwrap();
         let attempts = Rc::new(Cell::new(0));
-        let s = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
         let mut after = None;
         let mut seen = std::collections::HashSet::new();
         for turn in 0..3 {
+            // PgStore acquires a connection per request; the test seam lends
+            // its injected connection once. Seed the same isolated snapshot
+            // on each request rather than reusing an exhausted store seam.
+            let app = client(false).await;
+            app.execute(
+                "INSERT INTO library SELECT NULL, 'same-job', $1, ARRAY[$2], 'shared-' || lpad(g::text, 3, '0')
+                 FROM generate_series(1,55) g",
+                &[&RELEASE, &RECORDING],
+            ).await.unwrap();
+            app.execute(
+                "INSERT INTO library VALUES ('u1','same-job',$1,ARRAY[$2],'own'),
+                 ('other','same-job',$1,ARRAY[$2],'other')",
+                &[&RELEASE, &RECORDING],
+            )
+            .await
+            .unwrap();
+            let s =
+                catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
             let mut rows = s.catalogue_library(caller, after.as_ref()).await.unwrap();
             if turn == 0 {
                 assert_eq!(rows.len(), 51, "one lookahead row");
