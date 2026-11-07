@@ -36,6 +36,7 @@ export async function navigate(path: string, options: { type: Navigation['type']
 	} else {
 		history.pushState({ fixtureRoute: path, idx: ++idx }, '', path);
 	}
+	url = target;
 	await tick();
 	for (const callback of after) callback(navigation);
 }
