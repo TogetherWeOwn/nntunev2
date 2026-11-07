@@ -1,7 +1,7 @@
 // Harness-only platform probe; all fetch/queue delegation uses the actual shim.
 // The R2 write/send below tests platform composition, NOT the Rust producer.
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import * as generated from '../../ingest/build/worker/shim.mjs';
+import * as generated from '../../ingest/build-ordinary/worker/shim.mjs';
 
 export default class QualificationIngest extends WorkerEntrypoint {
   async fetch(request) {

@@ -6,8 +6,9 @@ adoption must read that same manifest rather than introduce a competing pin.
 No deploy workflow, Wrangler main/build command, binding grant or runtime mode
 is changed. The API bridge is built only into this job's qualification artifact.
 
-Both actual release Workers are generated using the selected builder and all
-three verified tool overrides, including wasm-opt. Any missing override, fallback
+Both actual release Workers and a separate synthetic-producer qualification
+artifact are generated using the selected builder and all three verified tool
+overrides, including wasm-opt. Any missing override, fallback
 download, nonempty builder download cache, lock drift or version mismatch fails
 the job. The builder and bindgen crate archives are checked against both the
 selected SHA-256 and registry index; the Binaryen archive is checked against the
@@ -40,8 +41,8 @@ failed-recovery retention**, not a test of the Rust tagged-object producer:
 the seed write/send are harness JavaScript. It does not establish successful
 DB-backed prepare/freeze/open, authenticated admission, the actual Rust R2
 create-only/range adapter, process-crash/ambiguous-commit recovery or deployment
-lifecycle acceptance. Those acceptance gaps remain open; this job does not
-qualify the whole preparation foundation by itself.
+lifecycle acceptance. The separate composite control below addresses some of
+those gaps; neither control qualifies the whole foundation by itself.
 
 The fault probe replaces only the generated private method in its own test
 isolate, preserving the real generated constructor and platform lifecycle. It
@@ -67,6 +68,42 @@ while its response remains redacted and no-store. No generated/platform class
 is replaced. These configured routes do not need a DB; successful DB-backed
 private protocol, Rust producer and composite recovery acceptance remain open.
 This is not a proof over every configured API route or credential posture.
+
+## Rust producer and database-backed composite control
+
+The ordinary ingest artifact is preserved separately and its exact prototype
+must omit both qualification bridges. Only a third, Actions-only build selects
+`preparation-qualification`; no effective Wrangler build selects that feature.
+Its raw methods have no public router entry, accept no caller-selected producer
+identity and call the existing `prepare_and_send` and `recover_delivery` directly.
+The fixed tagged-output fixture crosses the 64-KiB reader boundary, but is not a
+real FLAC parser/tagger result. These are test bridges, not a business entrypoint.
+
+A disposable loopback PostgreSQL service receives the full migration/replay/SQL
+bank. The harness refuses a missing or non-Actions/non-loopback/non-test-database
+DSN. It seeds shape-valid historical admission custody, not an authenticated
+HTTP upload or genuine original envelope. The actual Rust producer must create
+its tagged R2 object, canonical plan, encrypted API-keyring DB envelope, dispatch,
+receipt and attempt, then send through the real Queue producer. The plan service
+is the unchanged named facade in a separate generated API isolate with ephemeral
+KEK/session inputs and its own Hyperdrive binding. No JS plan freeze/open double,
+R2 write or Queue send supplies the successful producer path.
+
+The control requires exact object version/bytes/byte-derived digest, one sealed
+plan/attempt/receipt, acknowledged send, successful Rust pointer recovery in the
+real Queue callback and unchanged full-row DB fingerprints across recovery and
+producer replay. R2 must contain no plan object. Unknown pointers and replacement
+of the tagged object with a new version must refuse without DB changes or R2
+deletion. The real generated Queue consumer still owns native ack/retry; an extra
+read-only Rust recovery observes success before it, a marker observes callback
+return, and any observed dead-letter delivery vetoes the positive control. This
+is not direct instrumentation of the native ack call or an unbounded no-retry
+proof. Ordinary failed-recovery/native-DLQ acceptance remains separate above.
+
+These new controls are written, not locally executed; require exact-head Actions
+before claiming their runtime result. Process crashes, ambiguous DB commits,
+large-file/deadline limits, deployed lifecycle/drain, actual staging/restore and
+remaining foundation review are still unqualified.
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
 activation, posting or R2 deletion authority.

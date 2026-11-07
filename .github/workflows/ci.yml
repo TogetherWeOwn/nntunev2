@@ -1556,6 +1556,18 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: nntune_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nntune_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1596,11 +1608,25 @@ jobs:
         run: |
           set -euo pipefail
           worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/qualification-ingest.log"
+          mv build build-ordinary
+      - name: Build synthetic-only Rust producer qualification bridge
+        working-directory: workers/ingest
+        run: |
+          set -euo pipefail
+          worker-build --release -- --locked --features preparation-qualification 2>&1 | tee "$RUNNER_TEMP/qualification-composite.log"
+      - name: Apply disposable qualification schema and replay tests
+        run: |
+          command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+          bash workers/api/tests/run_migration_tests.sh
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Refuse builder tool-download fallbacks
         run: python3 -I .github/scripts/qualification_tools.py check-builds
       - name: Qualify generated ABI and real workerd transport boundaries
         working-directory: workers/api/qualification
         run: pnpm qualification
+        env:
+          QUALIFICATION_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci?sslmode=disable
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.

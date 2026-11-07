@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
 import test from 'node:test';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
+import { database, seed, sql, state } from './database.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const api = 'api/';
 const ingest = 'ingest/';
 
-async function generatedModules(prefix) {
+async function generatedModules(prefix, folder = 'build') {
   const modules = [];
   async function visit(relative) {
     for (const item of await readdir(path.join(root, relative), { withFileTypes: true })) {
@@ -26,7 +27,7 @@ async function generatedModules(prefix) {
       }
     }
   }
-  await visit(`${prefix}build`);
+  await visit(`${prefix}${folder}`);
   assert.ok(modules.some(m => m.type === 'CompiledWasm'), 'actual Wasm artifact required');
   return modules;
 }
@@ -53,6 +54,10 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
   ];
   const ingestModules = [
     await sourceModule(`${api}qualification/ingest-probe.mjs`),
+    ...await generatedModules(ingest, 'build-ordinary'),
+  ];
+  const compositeModules = [
+    await sourceModule(`${api}qualification/composite-probe.mjs`),
     ...await generatedModules(ingest),
   ];
   const mode = { GENERATION_PREPARATION_MODE: 'preparation_only' };
@@ -77,6 +82,24 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       worker('api', apiModules, { bindings: mode }),
       worker('api-configured', apiModules, { bindings: configured }),
       worker('api-disabled', apiModules, { bindings: { GENERATION_PREPARATION_MODE: 'disabled' } }),
+      worker('api-database', [
+        await sourceModule(`${api}src/runtime.mjs`), ...await generatedModules(api),
+      ], { bindings: configured, hyperdrives: { HYPERDRIVE: database } }),
+      worker('composite', compositeModules, {
+        bindings: { ...mode, HYPERDRIVE_CACHING_DISABLED: '1' },
+        hyperdrives: { LIBRARY_DB: database },
+        serviceBindings: { API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' } },
+        r2Buckets: { INGEST_SCRATCH: 'qualification-composite' },
+        queueProducers: { INGEST_QUEUE: 'qualification-composite-queue' },
+        queueConsumers: { 'qualification-composite-queue': {
+          maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 0,
+          deadLetterQueue: 'qualification-composite-dead-letter',
+        } },
+      }),
+      worker('composite-dead-letter', [await sourceModule(`${api}qualification/dead-letter-probe.mjs`)], {
+        r2Buckets: { INGEST_SCRATCH: 'qualification-composite' },
+        queueConsumers: { 'qualification-composite-dead-letter': { maxBatchSize: 1, maxBatchTimeout: 0 } },
+      }),
       worker('ingest', ingestModules, {
         bindings: mode,
         serviceBindings: {
@@ -242,5 +265,65 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     assert.deepEqual(result.refused, [{ version: 1, id: 'qualification-pointer' }],
       'native retry must reach the dead-letter observer; callback completion is not settlement');
     assert.deepEqual(result.bytes, [1, 2, 3]);
+  });
+
+  await t.test('Rust producer freezes real R2 and sealed DB plan, sends Queue and recovers read-only', async () => {
+    seed();
+    const composite = await mf.getWorker('composite');
+    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite');
+    assert.deepEqual(await composite.fetch('https://qualification.invalid/abi').then(r => r.json()),
+      ['constructor', 'fetch', 'qualification_prepare', 'qualification_recover', 'queue']);
+    // Fixed synthetic fixture only. No caller identity or startup is selected by
+    // the ordinary fetch router (whose generated prototype was pinned above).
+    const prepare = () => composite.fetch('https://qualification.invalid/prepare', { method: 'POST' });
+    assert.equal((await prepare()).status, 202, 'actual Rust producer must acknowledge its Queue send');
+    const row = JSON.parse(sql(`SELECT row_to_json(q) FROM (
+      SELECT id,object_id,object_version,plan_id,plaintext_bytes,plaintext_sha256,send_acknowledged
+      FROM ingest_file_dispatches WHERE job_id = 'qualification-job') q;`));
+    assert.equal(row.send_acknowledged, true);
+    assert.equal(row.plaintext_bytes, 65_537);
+    assert.equal(sql(`SELECT count(*) FROM ingest_preparation_plans
+      WHERE job_id = 'qualification-job' AND octet_length(encrypted) = plaintext_bytes + 16;`), '1');
+    assert.equal(sql(`SELECT count(*) FROM posted_file_job_attempts
+      WHERE job_id = 'qualification-job' AND attempt = 1;`), '1');
+    assert.equal(sql(`SELECT count(*) FROM posted_file_attempt_receipts
+      WHERE job_id = 'qualification-job';`), '1');
+    const expected = Uint8Array.from({ length: 65_537 }, (_, i) => i % 251);
+    assert.equal(row.plaintext_sha256, createHash('sha256').update(expected).digest('hex'));
+    const objectKey = `prepared-tagged/${row.object_id}`;
+    const object = await bucket.get(objectKey);
+    assert.ok(object, 'only the Rust producer wrote the tagged object');
+    assert.equal(object.version, row.object_version);
+    assert.deepEqual(new Uint8Array(await object.arrayBuffer()), expected);
+    const persisted = state();
+    let delivered;
+    for (let i = 0; i < 400; i++) {
+      assert.equal(await bucket.get('qualification-refused'), null, 'successful recovery must not reach DLQ');
+      const marker = await bucket.get('qualification-composite-delivered');
+      if (marker) { delivered = await marker.json(); break; }
+      await setTimeout(50);
+    }
+    assert.deepEqual(delivered, { count: 1 }, 'real Queue callback must positively observe Rust recovery');
+    assert.equal(state(), persisted, 'Queue recovery must not start or renew attempts');
+    const pointer = { version: 1, id: row.id };
+    const recover = body => composite.fetch('https://qualification.invalid/recover', {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    assert.equal((await recover(pointer)).status, 204);
+    assert.equal(state(), persisted, 'explicit duplicate recovery is read-only');
+    assert.equal((await prepare()).status, 202, 'exact producer replay reuses the same custody');
+    assert.equal(state(), persisted, 'producer replay must not remint or renew');
+    assert.equal((await bucket.get(objectKey)).version, row.object_version, 'create-only replay preserves R2 version');
+    assert.equal((await recover({ version: 1, id: 'unknown-qualification-pointer' })).status, 503);
+    assert.equal(state(), persisted, 'unknown pointer cannot borrow current authority');
+    const keys = (await bucket.list()).objects.map(o => o.key).sort();
+    assert.deepEqual(keys, [objectKey, 'qualification-composite-delivered'].sort(),
+      'no plaintext plan object may be stored in R2');
+    // Test-only replacement gives a new version even at the same key. Recovery
+    // must refuse, leave exact DB custody untouched and never delete the object.
+    await bucket.put(objectKey, new Uint8Array([9]));
+    assert.equal((await recover(pointer)).status, 503);
+    assert.equal(state(), persisted);
+    assert.ok(await bucket.get(objectKey), 'unknown/version mismatch retains R2');
   });
 });

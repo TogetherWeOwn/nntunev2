@@ -9,6 +9,11 @@ license = "MIT"
 # cdylib for the worker; rlib so tests/ integration targets can link the crate.
 crate-type = ["cdylib", "rlib"]
 
+# Only the secretless generated-artifact Actions harness selects this feature.
+# It must never be selected by an effective deployment build.
+[features]
+preparation-qualification = []
+
 [dependencies]
 worker = { version = "0.8", features = ["http", "queue", "tokio-postgres"] }
 http = "1"

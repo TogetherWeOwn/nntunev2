@@ -165,14 +165,14 @@ def check_builds():
     cache = Path(os.environ["XDG_CACHE_HOME"]) / "worker-build"
     if cache.exists() and any(cache.iterdir()):
         raise ValueError("worker-build downloaded or cached an unverified tool")
-    for name in ("api", "ingest"):
+    for name in ("api", "ingest", "composite"):
         text = (Path(os.environ["RUNNER_TEMP"]) / f"qualification-{name}.log").read_text()
         for override in ("WASM_BINDGEN_BIN", "ESBUILD_BIN", "WASM_OPT_BIN"):
             if not re.search(rf"Using custom .* from {override}:", text):
                 raise ValueError(f"{name}: missing verified override {override}")
         if "falling back to internal" in text or "Downloading " in text:
             raise ValueError("worker-build attempted a tool download")
-    print("both release builds used all three overrides; download cache empty")
+    print("all three release builds used all three overrides; download cache empty")
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ class QualificationToolsTests(unittest.TestCase):
                 lines = [f"Using custom tool from {name}: /verified/tool\n" for name in (
                     "WASM_BINDGEN_BIN", "ESBUILD_BIN", "WASM_OPT_BIN",
                 )]
-                for name in ("api", "ingest"):
+                for name in ("api", "ingest", "composite"):
                     (temp / f"qualification-{name}.log").write_text("".join(lines))
                 TOOLS.check_builds()
                 (temp / "qualification-api.log").write_text("".join(lines[:-1]))
@@ -56,6 +56,14 @@ class QualificationToolsTests(unittest.TestCase):
         self.assertIn("pnpm install --frozen-lockfile --ignore-scripts", section)
         self.assertIn("worker-build --release -- --locked --features preparation-service", section)
         self.assertIn("worker-build --release -- --locked 2>&1", section)
+        self.assertIn("mv build build-ordinary", section)
+        self.assertIn("worker-build --release -- --locked --features preparation-qualification", section)
+        self.assertIn("bash workers/api/tests/run_migration_tests.sh", section)
+        # Synthetic producer bridges must never enter an effective build.
+        for config in ROOT.glob("workers/*/wrangler*.toml"):
+            self.assertNotIn("preparation-qualification", config.read_text())
+        ingest = (ROOT / "workers/ingest/src/lib.rs").read_text()
+        self.assertIn('#[cfg(all(target_arch = "wasm32", feature = "preparation-qualification"))]\nmod qualification;', ingest)
         self.assertIn("set -euo pipefail", section)
         self.assertIn("qualification_tools.py check-builds", section)
         self.assertIn("worker-preparation-qualification", text.split("  ci-ok:\n", 1)[1])
