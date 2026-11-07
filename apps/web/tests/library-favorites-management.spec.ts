@@ -1,5 +1,6 @@
 import { expect, type JSHandle, type Locator, type Page } from '@playwright/test';
 import { openQueue } from './helpers/queue-host';
+import { tabTo } from './support/tab-to';
 import { test, observedQueue, expectMobileQueue, returnToMobileLibrary, metadataManagementState, mobileQueueTransport } from './helpers/favorites-mobile';
 
 /**
@@ -254,21 +255,6 @@ async function fault(page: Page, operation: 'getItem' | 'setItem') {
 }
 async function restore(page: Page) {
 	await page.evaluate(() => Reflect.get(window, '__managementRestoreStorage')());
-}
-async function tabTo(page: Page, target: Locator) {
-	await expect(target).toBeVisible();
-	for (let i = 0; i < 80; i += 1) {
-		if (await target.evaluate((node) => node === document.activeElement)) break;
-		await page.keyboard.press('Tab');
-	}
-	await expect(target, 'control must be reachable by Tab').toBeFocused();
-	const visibleFocus = await target.evaluate((node) => {
-		const css = getComputedStyle(node);
-		return node.matches(':focus-visible') && (
-			(css.outlineStyle !== 'none' && parseFloat(css.outlineWidth) > 0) || css.boxShadow !== 'none'
-		);
-	});
-	expect(visibleFocus, 'keyboard focus needs a visible outline or focus ring').toBe(true);
 }
 
 test.beforeEach(async ({ context }) => {
