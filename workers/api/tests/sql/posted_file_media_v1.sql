@@ -91,6 +91,9 @@ BEGIN
     END;
 END $$;
 
+-- Flush deferred constraint triggers before replaying DDL in this transaction.
+-- Production migration application and its ordinary replay happen before writes.
+SET CONSTRAINTS ALL IMMEDIATE;
 CREATE TEMP TABLE media_custody_before AS SELECT id, to_jsonb(p) AS data FROM posted_files p;
 \ir ../../../../migrations/0050_posted_file_media_v1.sql
 DO $$
