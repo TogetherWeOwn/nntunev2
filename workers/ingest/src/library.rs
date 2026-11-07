@@ -120,6 +120,38 @@ pub fn upsert_library_sql() -> &'static str {
      recording_mbids = EXCLUDED.recording_mbids"
 }
 
+/// Shared publish (ADR 0013): NULL owner, fenced by the publishing job's
+/// existence, never the admin's account. The consumer must persist the job
+/// before executing this statement; enablement remains separate.
+pub fn upsert_shared_library_sql() -> &'static str {
+    include_str!("library_shared_upsert.sql").trim_end()
+}
+
+pub const SHARED_UPSERT_PARAM_ORDER: [&str; 4] = [
+    "job_id",
+    "idempotency_key",
+    "release_mbid",
+    "recording_mbids",
+];
+
+/// Owner-free bindings for [`upsert_shared_library_sql`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedUpsertParams<'a> {
+    pub job_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub release_mbid: Option<&'a str>,
+    pub recording_mbids: &'a [String],
+}
+
+pub fn shared_upsert_params(write: &LibraryWrite) -> SharedUpsertParams<'_> {
+    SharedUpsertParams {
+        job_id: &write.job_id,
+        idempotency_key: &write.idempotency_key,
+        release_mbid: write.release_mbid.as_deref(),
+        recording_mbids: &write.recording_mbids,
+    }
+}
+
 /// Outcome of a fenced [`upsert_library_sql`] write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertOutcome {
@@ -205,11 +237,16 @@ pub fn is_deterministic_sqlstate(sqlstate: Option<&str>) -> bool {
 
 /// Check a [`LibraryWrite`] before it touches the database.
 pub fn validate_library_write(write: &LibraryWrite) -> Result<(), &'static str> {
-    if !validate_job_id(&write.job_id) {
-        return Err("job id must be 1..=64 url-safe chars");
-    }
     if write.user_id.is_empty() || write.user_id.len() > 128 {
         return Err("user id must be 1..=128 chars");
+    }
+    validate_shared_library_write(&shared_upsert_params(write))
+}
+
+/// Same key/MBID bounds as the legacy writer, without an owner requirement.
+pub fn validate_shared_library_write(write: &SharedUpsertParams<'_>) -> Result<(), &'static str> {
+    if !validate_job_id(write.job_id) {
+        return Err("job id must be 1..=64 url-safe chars");
     }
     if write.idempotency_key.len() > 640
         || !write.idempotency_key.starts_with("ingest:")
@@ -253,6 +290,54 @@ mod tests {
             release_mbid: Some("f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f".into()),
             recording_mbids: vec!["f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f".into()],
         }
+    }
+
+    #[test]
+    fn shared_upsert_binds_no_owner_and_locks_the_job() {
+        let sql = upsert_shared_library_sql();
+        assert!(sql.contains("SELECT $1, NULL, $2, $3, $4"));
+        assert!(sql
+            .contains("FROM (SELECT id FROM ingest_jobs WHERE id = $1 FOR SHARE) AS writer_fence"));
+        assert!(!sql.contains("FROM users"));
+        assert!(!sql.contains("deleting_at"));
+        assert!(!sql.contains("$5"));
+        assert!(sql.contains("ON CONFLICT (idempotency_key) DO UPDATE SET"));
+        assert!(sql.contains("user_id = EXCLUDED.user_id"));
+        assert_eq!(
+            SHARED_UPSERT_PARAM_ORDER,
+            [
+                "job_id",
+                "idempotency_key",
+                "release_mbid",
+                "recording_mbids"
+            ]
+        );
+        let mut w = write();
+        w.user_id.clear();
+        let params = shared_upsert_params(&w);
+        assert_eq!(
+            [
+                params.job_id,
+                params.idempotency_key,
+                params.release_mbid.unwrap()
+            ],
+            [
+                w.job_id.as_str(),
+                w.idempotency_key.as_str(),
+                w.release_mbid.as_deref().unwrap()
+            ]
+        );
+        assert_eq!(params.recording_mbids, w.recording_mbids);
+        assert_eq!(params, shared_upsert_params(&w.clone()));
+        assert!(validate_shared_library_write(&params).is_ok());
+        assert!(validate_library_write(&w).is_err());
+        w.recording_mbids.push(w.recording_mbids[0].clone());
+        assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_err());
+        w.recording_mbids.clear();
+        w.release_mbid = None;
+        assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_ok());
+        w.job_id.clear();
+        assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_err());
     }
 
     #[test]
