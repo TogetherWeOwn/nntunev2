@@ -39,7 +39,7 @@
 
 <div bind:this={root}>
 	<Layout>
-		{#if page.url.pathname === '/library'}
+		{#if page.url.pathname === '/library' || page.url.pathname === '/now-playing'}
 			<Library bind:this={library} />
 		{:else if page.url.pathname === '/now-playing'}
 			<NowPlaying />
