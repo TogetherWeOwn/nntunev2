@@ -1,0 +1,4 @@
+# Isolated workspace: this directory is its own pnpm root.
+packages: []
+minimumReleaseAge: 4320
+ignoreScripts: true
