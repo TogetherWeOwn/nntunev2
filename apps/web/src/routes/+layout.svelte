@@ -721,7 +721,7 @@
 			{/if}
 		</div>
 	</div>
-	<div class="nt-body">
+	<div class="nt-body" class:nt-mini-loaded={!!miniHint && !nowPlayingRoute}>
 		<div class="nt-rail" data-testid="shell-rail">
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
 				{@render primaryLinks()}
@@ -1107,6 +1107,23 @@
 	.nt-miniplayer-progress span { display: block; height: 100%; background: var(--nt-accent); }
 
 	@media (max-width: 799px) {
+		/* Keep content and native focus scrolling clear of the sticky player/nav. */
+		.nt-body {
+			padding-bottom: calc(var(--nt-control) + 1px + var(--nt-space-2));
+		}
+
+		.nt-body.nt-mini-loaded {
+			padding-bottom: calc(var(--nt-control) + 1px + var(--nt-control-lg) + var(--nt-space-2));
+		}
+
+		.nt-body :global(:where(a, button, input, select, textarea, [tabindex])) {
+			scroll-margin-block-end: calc(var(--nt-control) + 1px + var(--nt-space-2));
+		}
+
+		.nt-body.nt-mini-loaded :global(:where(a, button, input, select, textarea, [tabindex])) {
+			scroll-margin-block-end: calc(var(--nt-control) + 1px + var(--nt-control-lg) + var(--nt-space-2));
+		}
+
 		.nt-rail {
 			display: none;
 		}
