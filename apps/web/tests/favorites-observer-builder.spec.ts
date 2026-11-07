@@ -8,6 +8,34 @@ const items = [
 	{ id: 'observer-charlie', title: 'Observer Charlie' }
 ];
 
+test('selection version changes only with the actual owner selection', async ({ page, observeMobileLibrary }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
+	await page.goto(await observeMobileLibrary());
+	await page.getByRole('button', { name: 'Observer Alpha', exact: true }).click();
+	const alpha = { ids: [items[0].id], currentIndex: 0, currentId: items[0].id, selectedTitle: items[0].title };
+	const owner = await expectMobileQueue(page, alpha);
+	const version = await owner.evaluate((binding) => binding.selectionVersion);
+	expect(Number.isInteger(version)).toBe(true);
+	if (version === undefined) throw new Error('Missing selection version');
+	await returnToMobileLibrary(page);
+	await page.getByRole('button', { name: 'Observer Bravo', exact: true }).click();
+	const appended = { ...alpha, ids: [items[0].id, items[1].id] };
+	await expectMobileQueue(page, appended);
+	expect(await owner.evaluate((binding) => binding.selectionVersion)).toBe(version);
+	await page.getByTestId('player-next').click();
+	const bravo = { ...appended, currentIndex: 1, currentId: items[1].id, selectedTitle: items[1].title };
+	await expect.poll(() => observedQueue(page)).toEqual(bravo);
+	expect(await owner.evaluate((binding) => binding.selectionVersion)).toBe(version + 1);
+	await returnToMobileLibrary(page);
+	// Repeat publishes a new session state with the same queue selection.
+	await page.getByTestId('player-repeat').selectOption('one');
+	await expect(page.getByTestId('repeat-status')).toHaveText('Repeat: One');
+	expect(await observedQueue(page)).toEqual(bravo);
+	expect(await owner.evaluate((binding) => binding.selectionVersion)).toBe(version + 1);
+	expect(await owner.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+});
+
 for (const colorScheme of ['light', 'dark'] as const) {
 	for (const instrumented of [false, true]) {
 		test(`mobile queue ${instrumented ? 'observer calibration' : 'uninstrumented surface'} in ${colorScheme}`, async ({ page, observeMobileLibrary }) => {

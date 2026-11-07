@@ -11,7 +11,7 @@ export type FavoritesQueueSnapshot = {
 
 declare global {
 	interface Window {
-		__favoritesQueueOwner?: { readonly snapshot: FavoritesQueueSnapshot };
+		__favoritesQueueOwner?: { readonly snapshot: FavoritesQueueSnapshot; readonly selectionVersion?: number };
 	}
 }
 
@@ -21,19 +21,30 @@ export function attachFavoritesObserver(player: PlayerSession): () => void {
 	if (window.__favoritesQueueOwner) throw new Error('Duplicate Favorites queue observer');
 	let latest: FavoritesQueueSnapshot | undefined;
 	let disposed = false;
+	let selectionVersion = 0;
 	const unsubscribe = player.subscribe((state) => {
 		const selected = currentTrack(state.queue);
+		const currentId = selected?.id ?? null;
+		const selectedTitle = selected ? displayTitle(selected) : null;
+		if (latest && (latest.currentIndex !== state.queue.currentIndex ||
+			latest.currentId !== currentId || latest.selectedTitle !== selectedTitle)) {
+			selectionVersion += 1;
+		}
 		latest = {
 			ids: state.queue.tracks.map((track) => track.id),
 			currentIndex: state.queue.currentIndex,
-			currentId: selected?.id ?? null,
-			selectedTitle: selected ? displayTitle(selected) : null
+			currentId,
+			selectedTitle
 		};
 	});
 	const binding = Object.freeze({
 		get snapshot(): FavoritesQueueSnapshot {
 			if (disposed || !latest) throw new Error('Disposed or uninitialized Favorites queue observer');
 			return structuredClone(latest);
+		},
+		get selectionVersion(): number {
+			if (disposed || !latest) throw new Error('Disposed or uninitialized Favorites queue observer');
+			return selectionVersion;
 		}
 	});
 	window.__favoritesQueueOwner = binding;
