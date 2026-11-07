@@ -23,23 +23,16 @@ mkdir -p "$state"
 wrangler() { npx --yes "wrangler@${WRANGLER_VERSION}" "$@"; }
 RULE=expire-spike-snapshots
 
-has_expiry_rule() {
-  local rules
-  rules=$(wrangler r2 bucket lifecycle list "$BUCKET") || return 1
-  grep -q "$RULE" <<< "$rules" && grep -q "snap/" <<< "$rules"
-}
-
 up() {
   local snap=$1
   if ! wrangler r2 bucket info "$BUCKET" > /dev/null 2>&1; then
     wrangler r2 bucket create "$BUCKET"
   fi
   # No upload without a confirmed expiry rule: it is the backstop when
-  # teardown fails or the run is cancelled. Add only if missing (reruns).
-  if ! has_expiry_rule; then
-    wrangler r2 bucket lifecycle add "$BUCKET" "$RULE" snap/ --expire-days 14
-    has_expiry_rule || { echo "stage: cannot confirm the $RULE expiry rule; not uploading" >&2; exit 1; }
-  fi
+  # teardown fails or the run is cancelled. lifecycle.py checks one rule
+  # for name, prefix, 14-day expiry and enabled, and repairs it if not.
+  python3 "$here/lifecycle.py" ensure "$BUCKET" \
+    || { echo "stage: cannot confirm the $RULE expiry rule; not uploading" >&2; exit 1; }
   for file in "$snap"/*.idx "$snap"/*.dat.*; do
     wrangler r2 object put "$BUCKET/$PREFIX$(basename "$file")" --file "$file" --remote > /dev/null
     basename "$file" >> "$state/objects.txt"

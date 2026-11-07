@@ -558,6 +558,8 @@ jobs:
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike gate 2 verdict tests
         run: python3 workers/mb/spike/test_bench.py
+      - name: Run R2 snapshot spike expiry-rule check tests
+        run: python3 workers/mb/spike/test_lifecycle.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
