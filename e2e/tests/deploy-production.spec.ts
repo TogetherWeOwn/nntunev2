@@ -618,7 +618,6 @@ test.describe('smoke checker (fixture server, CLI contract)', () => {
     '/signup': { html: '<html><body>Get started</body></html>' },
     '/pricing': { html: '<html><body>Plans and pricing</body></html>' },
     '/login': { html: '<html><body>Sign in</body></html>' },
-    '/onboarding/byop': { html: '<html><body>BYOP server host</body></html>' },
   });
 
   test.beforeAll(async () => {
@@ -673,7 +672,9 @@ test.describe('smoke checker (fixture server, CLI contract)', () => {
 
   test('healthy fixture passes with the version-override header on every probe', async () => {
     // The fixture 500s any probe without the override header, so exit 0
-    // proves the header rode on all 8 probes (3 JSON + 5 HTML).
+    // proves the header rode on all 7 active probes (3 JSON + 4 HTML).
+    // Removed routes are absent from the fixture and return 404, so probing
+    // a retired onboarding surface would fail this healthy smoke.
     requireOverride = true;
     const result = await runCli(
       base,
@@ -685,8 +686,8 @@ test.describe('smoke checker (fixture server, CLI contract)', () => {
     );
     expect(result.status).toBe(0);
     expect(result.output).toContain('smoke ok');
-    expect(totalHits).toBe(8);
-    expect(overrideHits).toBe(8);
+    expect(totalHits).toBe(7);
+    expect(overrideHits).toBe(7);
   });
 
   test('wrong expected SHA fails closed', async () => {
