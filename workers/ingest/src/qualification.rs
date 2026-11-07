@@ -44,6 +44,7 @@ async fn prepare(mut req: worker::Request, env: worker::Env) -> worker::Result<w
         return worker::Response::error("qualification unavailable", 503);
     }
     let flac = req.path() == "/prepare-flac";
+    let commit = req.path() == "/prepare-commit";
     let tagged = if flac {
         use futures_util::StreamExt;
         let mut stream = req.stream()?;
@@ -80,12 +81,16 @@ async fn prepare(mut req: worker::Request, env: worker::Env) -> worker::Result<w
     let result = prepare_and_send(
         &env,
         PreparationInput {
-            job: if flac {
+            job: if commit {
+                "qualification-commit-job"
+            } else if flac {
                 "qualification-flac-job"
             } else {
                 "qualification-job"
             },
-            operation: if flac {
+            operation: if commit {
+                "qualification-commit-file"
+            } else if flac {
                 "qualification-flac-file"
             } else {
                 "qualification-file"

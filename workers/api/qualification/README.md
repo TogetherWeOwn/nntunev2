@@ -245,12 +245,48 @@ Fresh Rust/private API isolates must recover and replay the same unacknowledged
 pointer, with full DB fingerprints/deadlines, exact R2 bytes/version and object
 inventory unchanged after removing only harness sentinels. Unknown pointers
 refuse. The ordinary retry afterward must change only the acknowledgement bit
-and produce a fresh native callback. These new assertions are written, not locally
-executed; exact-head Actions is required. They test **outbox recovery after an
-actual abrupt process crash**, not whether the emulator persists accepted pending
-Queue messages. A callback may have completed before the kill, so it cannot
-supply the post-crash retry's marker. No ambiguous DB commit, maximum-media,
+and produce a fresh native callback. At head `c2ca640a`,
+[qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42395148261/job/128470796833)
+passes all fifteen runtime subtests (sixteen Node passes including the enclosing
+test), including this SIGKILL control. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42395148261/job/128470797054)
+explicitly reports 255 required cases passed. They test **outbox recovery after
+an actual abrupt process crash**, not whether the emulator persists accepted
+pending Queue messages. A callback may have completed before the kill, so it
+cannot supply the post-crash retry's marker. No ambiguous DB commit, maximum-media,
 cancellation, deployed drain or actual staging/restore proof is inferred.
+
+### Committed transaction with an unavailable acknowledgement
+
+The Actions-only loopback PostgreSQL proxy targets four actual producer mutation
+transactions: sealed-plan freeze, immutable dispatch insert, atomic startup with
+attempt acquisition, and send acknowledgement. It parses bounded wire frames,
+waits for PostgreSQL's `CommandComplete(COMMIT)`, then drops that frame and the
+connection before the real Rust client receives success. No SQL statement,
+trigger, production adapter or credential is changed, and wire contents are never
+logged. Independent direct DB reads must prove the selected mutation committed;
+a redacted 503 and exactly one suppressed completion are both required. A trigger
+exception, pre-commit disconnect or merely discarding an already successful Rust
+result cannot satisfy this control.
+
+One fixed third fixture progresses through all four faults. Between them, fresh
+workerd/API isolates must retain the same sealed envelope, version, outbox ID,
+R2 bytes/version and later acquired token/deadlines. Pointer-only recovery refuses
+before acquisition; it cannot repair an absent receipt by starting work. Once
+startup commits, recovery is read-only. The acknowledgement commit may change
+only its monotonic bit. Native send instrumentation must record zero attempts
+for the first three faults and exactly one for the acknowledgement fault; marker
+absence is checked before that send and after earlier restarts, not inferred from
+asynchronous callback timing. An ordinary final producer retry must preserve every
+DB row and yield a new successful native Queue recovery marker. An accepted callback
+is completed before runtime replacement, not counted as pending-Queue durability.
+
+These controls are written, **not locally executed**. Exact-head Actions must
+validate both protocol handling and application assertions. They cover the
+committed/lost-response branch, not an uncommitted or rolled-back COMMIT, server
+storage failure, maximum-media/cancellation, deployed drain or staging/restore.
+The previously passing restart/client-drop and trigger-rollback banks retain
+those narrower scopes; they were not actual commit-response injection.
 
 A separate R2 recovery control retains the actual GET metadata and faults only
 its body: an open oversized chunk, two individually bounded chunks whose total

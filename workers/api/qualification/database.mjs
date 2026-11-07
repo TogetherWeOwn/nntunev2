@@ -25,14 +25,15 @@ export function sql(text) {
 }
 
 export function seed(flac = false) {
-  // Two fixed fixtures get separate DB custody as well as separate R2 buckets.
-  // No SQL identifier or value comes from a request or arbitrary fixture label.
-  assert.equal(typeof flac, 'boolean');
-  const owner = flac ? 'qualification-flac-owner' : 'qualification-owner';
-  const job = flac ? 'qualification-flac-job' : 'qualification-job';
+  // Fixed fixtures get separate DB custody. No SQL value comes from a request
+  // or arbitrary fixture label; the commit transport uses the third identity.
+  assert.ok(flac === false || flac === true || flac === 'commit');
+  const commit = flac === 'commit';
+  const owner = commit ? 'qualification-commit-owner' : flac ? 'qualification-flac-owner' : 'qualification-owner';
+  const job = commit ? 'qualification-commit-job' : flac ? 'qualification-flac-job' : 'qualification-job';
   // Admin content identity is globally unique, independently of owner/job IDs.
-  const original = flac ? 'b' : 'a';
-  const email = flac ? 'qualification-flac@example.invalid' : 'qualification@example.invalid';
+  const original = commit ? 'c' : flac ? 'b' : 'a';
+  const email = commit ? 'qualification-commit@example.invalid' : flac ? 'qualification-flac@example.invalid' : 'qualification@example.invalid';
   // Shape-valid historical admission custody, not an authenticated upload test.
   // The actual producer creates every plan, dispatch, receipt and attempt row.
   sql(`

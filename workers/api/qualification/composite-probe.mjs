@@ -100,6 +100,23 @@ export default class QualificationComposite extends WorkerEntrypoint {
       headers.set('x-qualification-range-reads', String(reads));
       return new Response(response.body, { status: response.status, headers });
     }
+    if (path === '/prepare-commit') {
+      let attempts = 0;
+      const patched = new Proxy(this.env.INGEST_QUEUE, {
+        get(target, property) {
+          if (property === 'send') return async (...args) => {
+            attempts += 1;
+            return target.send(...args);
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' && property !== 'constructor' ? value.bind(target) : value;
+        },
+      });
+      const response = await worker.qualification_prepare(request, { ...this.env, INGEST_QUEUE: patched });
+      const headers = new Headers(response.headers);
+      headers.set('x-qualification-send-attempts', String(attempts));
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (path === '/prepare' || path === '/prepare-flac') return worker.qualification_prepare(request, this.env);
     if (path.startsWith('/recover-plan-fault/')) {
       // Open real stored custody first, then fault only the private response.

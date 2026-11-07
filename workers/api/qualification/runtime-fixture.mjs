@@ -42,16 +42,16 @@ export function worker(name, modules, options = {}) {
 
 // The ordinary suite and crash subprocess must use exactly the same storage,
 // private service, native Queue and generated Rust artifacts for this fixture.
-export async function flacWorkers(configured) {
+export async function flacWorkers(configured, connection = database) {
   return [
     worker('api-database', [
       await sourceModule('api/src/runtime.mjs'), ...await generatedModules('api/'),
-    ], { bindings: configured, hyperdrives: { HYPERDRIVE: database } }),
+    ], { bindings: configured, hyperdrives: { HYPERDRIVE: connection } }),
     worker('composite-flac', [
       await sourceModule('api/qualification/composite-probe.mjs'), ...await generatedModules('ingest/'),
     ], {
       bindings: { GENERATION_PREPARATION_MODE: 'preparation_only', HYPERDRIVE_CACHING_DISABLED: '1' },
-      hyperdrives: { LIBRARY_DB: database },
+      hyperdrives: { LIBRARY_DB: connection },
       serviceBindings: { API_PREPARATION_PLANS: { name: 'api-database', entrypoint: 'IngestPreparationPlans' } },
       r2Buckets: { INGEST_SCRATCH: 'qualification-flac' },
       queueProducers: { INGEST_QUEUE: 'qualification-flac-queue' },

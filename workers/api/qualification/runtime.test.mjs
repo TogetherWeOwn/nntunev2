@@ -11,6 +11,7 @@ import test from 'node:test';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { database, seed, sql, state } from './database.mjs';
 import { flacFixture, metadataBlocks } from './flac-fixture.mjs';
+import { committedAcknowledgements } from './commit-runtime.mjs';
 
 import { flacWorkers, generatedModules, root, sourceModule, worker } from './runtime-fixture.mjs';
 
@@ -709,4 +710,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       assert.equal(state(), persisted);
     }
   });
+
+  await t.test('committed PostgreSQL outcomes survive lost acknowledgements and fresh runtimes',
+    { timeout: 60_000 }, t => committedAcknowledgements(t, configured));
 });
