@@ -7380,8 +7380,10 @@ mod tests {
         catalogue_release_tracks:
             RefCell<HashMap<String, Vec<crate::catalogue::ReleaseTrackDbRow>>>,
         /// Catalogue store-error pin: when set, every catalogue read fails
-        /// like a production query outage (the handlers answer 500).
+        /// like a production query outage.
         fail_catalogue_reads: RefCell<bool>,
+        /// Fail only the second read in release detail, after membership.
+        fail_catalogue_release_tracks: RefCell<bool>,
     }
 
     impl FakeStore {
@@ -8431,7 +8433,7 @@ mod tests {
             user_id: &str,
             mbid: &str,
         ) -> Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
+            if *self.fail_catalogue_reads.borrow() || *self.fail_catalogue_release_tracks.borrow() {
                 return Err(StoreError);
             }
             let Some(key) = crate::catalogue::enrichment_key(mbid) else {
@@ -21541,6 +21543,31 @@ mod tests {
         let outage = h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
         assert_eq!(outage.status, 500, "{}", outage.body);
         assert_eq!(outage.body, r#"{"error":"internal error"}"#);
+    }
+
+    #[test]
+    fn catalogue_release_track_outage_is_opaque_after_member_release_lookup() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_catalogue(&h);
+        seed_library(&h, "u1");
+        let path = format!("/v1/releases/{CAT_RELEASE}");
+        let available = h.call_full("GET", &path, None, Some(cookie.clone()), Some(ORIGIN));
+        assert_eq!(available.status, 200, "{}", available.body);
+
+        *h.store.fail_catalogue_release_tracks.borrow_mut() = true;
+        let outage = h.call_full("GET", &path, None, Some(cookie), Some(ORIGIN));
+        assert_eq!(outage.status, 503, "{}", outage.body);
+        let error: serde_json::Value = serde_json::from_str(&outage.body).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "code": "service_unavailable",
+                "message": "service unavailable",
+                "retryable": true,
+            })
+        );
     }
 
     #[test]
