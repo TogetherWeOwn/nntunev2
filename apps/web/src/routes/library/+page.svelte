@@ -337,6 +337,7 @@
 	let shareInvalid = $state(false);
 	let shareGeneration = 0;
 	let shareAlive = true;
+	let draggedLibraryItem: LibraryItem | null = null;
 	// Queue-row share outcomes live apart from the browse share feedback so a
 	// queue action never touches browse-row announcements (and vice versa).
 	// An outcome belongs to the queue it was produced for: any queue or
@@ -410,6 +411,7 @@
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
+			draggedLibraryItem = null;
 			items = state.items;
 			staleAt = state.staleAt;
 			loading = state.loading;
@@ -609,8 +611,7 @@
 		};
 	}
 
-	function selectTrack(id: string): void {
-		const item = items.find((track) => track.id === id);
+	function selectTrack(id: string, item = items.find((track) => track.id === id)): void {
 		if (!item) return;
 		clearShareFeedback();
 		pendingShareSeek = null;
@@ -692,7 +693,7 @@
 		const before = queue.tracks.length;
 		// Use the shelf's resolved star order and the same deduping path as
 		// individual taps. No persistence, playback, or account lookup here.
-		for (const track of favoriteTracks) selectTrack(track.id);
+		for (const track of favoriteTracks) selectTrack(track.id, track);
 		const added = queue.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
 	}
@@ -973,10 +974,9 @@
 		else setQueueShareOutcome('', url);
 	}
 
-	async function copyTrackLink(id: string): Promise<void> {
+	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
 		clearShareFeedback();
 		const generation = shareGeneration;
-		const item = items.find((track) => track.id === id);
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queue);
 		const seconds =
@@ -1715,7 +1715,15 @@
 
 
 	function interactionIds(id: string): string[] {
-		return selectedIds.includes(id) ? renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id) : [id];
+		return selectedIds.includes(id) ? [...new Set(renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id))] : [id];
+	}
+
+	// Re-resolve deferred actions after refresh without substituting another occurrence.
+	function occurrenceItems(item: LibraryItem): LibraryItem[] {
+		const key = libraryItemKey(item);
+		const current = items.find((track) => libraryItemKey(track) === key);
+		const others = items.filter((track) => track.id !== item.id);
+		return current ? [current, ...others] : others;
 	}
 
 	function announceInteraction(text: string): void {
@@ -1723,8 +1731,8 @@
 		queueAnnouncementVersion += 1;
 	}
 
-	function availableInteractionIds(ids: readonly string[], queued = false): string[] {
-		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : items;
+	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
+		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : source;
 		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
@@ -1735,15 +1743,15 @@
 		return missing ? ` ${missing} ${missing === 1 ? 'track is' : 'tracks are'} no longer available.` : '';
 	}
 
-	async function playLibraryIds(ids: readonly string[]): Promise<void> {
-		const surviving = availableInteractionIds(ids);
-		const first = items.find((item) => item.id === surviving[0]);
+	async function playLibraryIds(ids: readonly string[], catalogue: readonly LibraryItem[] = items): Promise<void> {
+		const surviving = availableInteractionIds(ids, false, catalogue);
+		const first = catalogue.find((item) => item.id === surviving[0]);
 		if (!first) return;
 		const added = surviving.filter((id) => !queue.tracks.some((track) => track.id === id)).length;
 		// Play now moves the complete selection, including a previously current
 		// member. Only Play next deliberately leaves the current track in place.
 		const boundary = queue.tracks.slice(queue.currentIndex + 1).find((track) => !surviving.includes(track.id));
-		const base = insertTracks(queue, knownTracks(surviving), boundary?.id ?? null);
+		const base = insertTracks(queue, knownTracks(surviving, catalogue), boundary?.id ?? null);
 		const index = base.tracks.findIndex((track) => track.id === first.id);
 		const target = base.tracks[index];
 		if (!target) return;
@@ -1755,16 +1763,16 @@
 		await playSelectedTrack(target, source, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
-	function appendInteractionIds(ids: readonly string[]): void {
-		const surviving = availableInteractionIds(ids);
+	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, false, source);
 		if (!surviving.length) return;
-		const result = appendSelection(queue, surviving, items);
+		const result = appendSelection(queue, surviving, source);
 		replaceQueue(result.queue);
 		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
 	}
 
-	function favoriteInteractionIds(ids: readonly string[], queued = false): void {
-		const surviving = availableInteractionIds(ids, queued);
+	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, queued, source);
 		if (!surviving.length) return;
 		const remove = surviving.every((id) => favoriteIds.has(id));
 		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
@@ -1772,7 +1780,7 @@
 		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		const already = surviving.length - changed.length;
 		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
-		const track = (queued ? queue.tracks : items).find((track) => track.id === surviving[0]);
+		const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
 		const subject = ids.length === 1 && track ? displayTitle(track) : count;
 		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
 			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
@@ -1782,25 +1790,27 @@
 		}
 	}
 
-	function knownTracks(ids: readonly string[]): Track[] {
+	function knownTracks(ids: readonly string[], source: readonly LibraryItem[] = items): Track[] {
 		if (loading || libraryUnavailable) return [];
 		return ids.flatMap((id) => {
-			const item = items.find((item) => item.id === id);
+			const item = source.find((item) => item.id === id);
 			return item ? [queuedTrackFor(item)] : [];
 		});
 	}
 
-	function queueNextIds(ids: readonly string[]): void {
-		const surviving = availableInteractionIds(ids);
+	function queueNextIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
+		const surviving = availableInteractionIds(ids, false, source);
 		if (!surviving.length) return;
-		const next = insertTracksNext(queue, knownTracks(surviving));
+		const next = insertTracksNext(queue, knownTracks(surviving, source));
 		if (next === queue) return;
 		replaceQueue(next);
 		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
 	}
 
 	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
-		const next = insertTracks(queue, knownTracks(ids), beforeId);
+		const source = draggedLibraryItem ? occurrenceItems(draggedLibraryItem) : items;
+		draggedLibraryItem = null;
+		const next = insertTracks(queue, knownTracks(ids, source), beforeId);
 		if (next === queue) return;
 		const added = next.tracks.length - queue.tracks.length;
 		replaceQueue(next);
@@ -1835,26 +1845,31 @@
 		queueAnnouncementVersion += 1;
 	}
 
-	function playbackMenuActions(ids: readonly string[]): MenuAction[] {
+	function playbackMenuActions(ids: readonly string[], source: () => readonly LibraryItem[] = () => items): MenuAction[] {
 		return [
-			{ label: 'Play now', run: () => void playLibraryIds(ids) },
-			{ label: 'Play next', run: () => queueNextIds(ids) },
-			{ label: 'Add to queue', run: () => appendInteractionIds(ids) }
+			{ label: 'Play now', run: () => void playLibraryIds(ids, source()) },
+			{ label: 'Play next', run: () => queueNextIds(ids, source()) },
+			{ label: 'Add to queue', run: () => appendInteractionIds(ids, source()) }
 		];
 	}
 
-	function openTrackMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }): void {
-		if (loading || libraryUnavailable || !items.some((item) => item.id === id)) return;
+	function openTrackMenu(item: LibraryItem, invoker: HTMLElement, point?: { x: number; y: number }): void {
+		if (loading || libraryUnavailable || !items.includes(item)) return;
+		const id = item.id;
+		const source = (): LibraryItem[] => occurrenceItems(item);
 		const ids = interactionIds(id);
 		const starred = ids.every((id) => favoriteIds.has(id));
-		const actions = playbackMenuActions(ids);
+		const actions = playbackMenuActions(ids, source);
 		actions.push(
-			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids) },
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, false, source()) },
 			unavailablePlaylistAction
 		);
-		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } });
+		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => {
+			const current = source().find((track) => track.id === id);
+			if (current && availableInteractionIds([id]).length) void copyTrackLink(id, current);
+		} });
 		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="track-more"]') ?? invoker : invoker;
-		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(items.find((item) => item.id === id)!)}`;
+		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(item)}`;
 		const displayedIds = renderedItems.map((item) => item.id);
 		const index = displayedIds.indexOf(id);
 		trackMenu = { ...menuAt(target, label, actions), fallbackFocus: () => {
@@ -2143,7 +2158,7 @@
 								type="button"
 								class="nt-favorite-row"
 								data-context-menu-longpress
-								onclick={() => selectTrack(track.id)}
+								onclick={() => selectTrack(track.id, track)}
 							>
 								{displayTitle(track)}
 								{#if displayArtist(track)}
@@ -2635,10 +2650,14 @@
 			<li class="nt-library-item" data-testid="library-item" data-id={track.id}
 				tabindex="-1"
 				data-selected={selectedIds.includes(track.id) ? '' : undefined}
-				use:contextMenu={(invoker, point) => openTrackMenu(track.id, invoker, point)}
+				use:contextMenu={(invoker, point) => openTrackMenu(track, invoker, point)}
 				onclickcapture={(event) => libraryRowClick(event, track.id)}
 				draggable="true"
-				ondragstart={(event) => startTrackDrag(event, interactionIds(track.id))}
+				ondragstart={(event) => {
+					draggedLibraryItem = track;
+					startTrackDrag(event, interactionIds(track.id));
+				}}
+				ondragend={() => { draggedLibraryItem = null; }}
 			>
 				<input
 					class="nt-library-select"
@@ -2663,7 +2682,7 @@
 						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 						: undefined}
 					aria-pressed={queued ? true : undefined}
-					onclick={() => selectTrack(track.id)}
+					onclick={() => selectTrack(track.id, track)}
 				>
 					{displayTitle(track)}
 					{#if displayArtist(track)}
@@ -2676,14 +2695,14 @@
 				<button type="button" class="nt-library-more"
 					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
 					aria-haspopup="menu"
-					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
+					onclick={(event) => openTrackMenu(track, event.currentTarget)}
 				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 				<button
 					type="button"
 					class="nt-library-copy"
 					data-testid="library-copy-link"
 					aria-label={`Copy link ${displayTitle(track)}`}
-					onclick={() => void copyTrackLink(track.id)}
+					onclick={() => void copyTrackLink(track.id, track)}
 				>
 					Copy link
 				</button>
