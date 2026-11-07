@@ -49,6 +49,7 @@
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
+	import MoreActionsGlyph from '#lib/interactions/MoreActionsGlyph.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
 	import { startTrackDrag, endTrackDrag } from '#lib/interactions/track-drag.js';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
@@ -1615,7 +1616,7 @@
 							<button type="button" class="nt-favorite-more" data-testid="favorite-more"
 								aria-label={`More actions for ${displayTitle(track)}`} aria-haspopup="menu"
 								onclick={(event) => openFavoriteMenu(track.id, event.currentTarget)}
-								><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+								><MoreActionsGlyph /></button>
 						</li>
 					{/each}
 				</ul>
@@ -2008,7 +2009,7 @@
 					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
 					aria-haspopup="menu"
 					onclick={(event) => openTrackMenu(track, event.currentTarget)}
-				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+				><MoreActionsGlyph /></button>
 				<button
 					type="button"
 					class="nt-library-copy"

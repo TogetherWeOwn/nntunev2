@@ -6,6 +6,7 @@
 	import type { QueueSelection, QueueSelectionAction } from './queueSelection.js';
 	import type { PlayerSession } from './session.js';
 	import ContextMenu from '../interactions/ContextMenu.svelte';
+	import MoreActionsGlyph from '../interactions/MoreActionsGlyph.svelte';
 	import { pointerQueueDrag } from '../interactions/pointer-queue-drag.js';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '../interactions/context-menu.js';
 	import { activeTrackDrag, droppedTrackDrag, startTrackDrag, endTrackDrag } from '../interactions/track-drag.js';
@@ -858,7 +859,7 @@
 				<button type="button" class="queue-more" data-testid="queue-more" aria-haspopup="menu"
 					aria-label="More actions for {displayTitle(track)}" aria-disabled={interactionsUnavailable}
 					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
-				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+				><MoreActionsGlyph /></button>
 			{/if}
 			{#if ontogglefavorite}
 				<button
