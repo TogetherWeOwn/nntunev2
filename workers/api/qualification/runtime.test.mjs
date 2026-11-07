@@ -373,7 +373,7 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
     assert.ok(await bucket.get(objectKey), 'unknown/version mismatch retains R2');
   });
 
-  await t.test('real FLAC tag rewrite feeds Rust R2, sealed plan and Queue recovery', async () => {
+  await t.test('real FLAC tag rewrite feeds Rust R2, sealed plan and Queue recovery', async t => {
     seed(true);
     assert.equal(sql(`SELECT count(DISTINCT content_sha256) FROM ingest_jobs
       WHERE id IN ('qualification-job','qualification-flac-job');`), '2',
@@ -383,8 +383,8 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
       WHERE j.id IN ('qualification-job','qualification-flac-job')
         AND j.idempotency_key = 'admin:' || j.content_sha256;`), '2',
       'each fixture must keep its admission key and original custody bound to its upload');
-    const composite = await mf.getWorker('composite-flac');
-    const bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+    let composite = await mf.getWorker('composite-flac');
+    let bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
     const { input, audio, samples } = flacFixture();
     const prepare = body => composite.fetch('https://qualification.invalid/prepare-flac', {
       method: 'POST', body,
@@ -426,6 +426,43 @@ test('generated release artifacts in real workerd', { timeout: 120_000 }, async 
         assert.equal((await composite.fetch('https://qualification.invalid/recover', {
           method: 'POST', body: JSON.stringify({ version: 1, id: dispatch.id }),
         })).status, 204, 'persisted preparation is recoverable even before Queue acceptance');
+        await t.test('fresh workerd recovers an unsent dispatch before retrying Queue', async () => {
+          const key = `prepared-tagged/${dispatch.object_id}`;
+          const object = await bucket.get(key);
+          assert.ok(object);
+          const bytes = Buffer.from(await object.arrayBuffer());
+          const objects = (await bucket.list()).objects.map(o => ({ key: o.key, version: o.version }));
+          assert.equal(object.version, dispatch.object_version);
+          assert.equal(state(), pending, 'read-only recovery before restart must preserve all rows');
+          // Only committed DB/R2 custody and the same ephemeral keyring survive.
+          // The failed send accepted no Queue message, so none can supply a marker.
+          await mf.dispose();
+          mf = undefined;
+          mf = new Miniflare(options);
+          composite = await mf.getWorker('composite-flac');
+          bucket = await mf.getR2Bucket('INGEST_SCRATCH', 'composite-flac');
+          assert.equal((await composite.fetch('https://qualification.invalid/healthz')).status, 200);
+          assert.equal(state(), pending, 'runtime startup must not acknowledge or renew the dispatch');
+          assert.equal(await bucket.get('qualification-composite-delivered'), null);
+          const recover = pointer => composite.fetch('https://qualification.invalid/recover', {
+            method: 'POST', body: JSON.stringify(pointer),
+          });
+          assert.equal((await recover({ version: 1, id: dispatch.id })).status, 204,
+            'fresh Rust and private API isolates must open unacknowledged custody');
+          assert.equal((await recover({ version: 1, id: dispatch.id })).status, 204);
+          assert.equal((await recover({ version: 1, id: 'unknown-unsent-pointer' })).status, 503);
+          assert.equal(state(), pending, 'fresh recovery/replay must preserve full pending authority');
+          assert.equal(sql(`SELECT send_acknowledged FROM ingest_file_dispatches
+            WHERE job_id = 'qualification-flac-job';`), 'f');
+          const retained = await bucket.get(key);
+          assert.ok(retained, 'restart must not reseed or replace the prepared object');
+          assert.equal(retained.version, dispatch.object_version);
+          assert.deepEqual(Buffer.from(await retained.arrayBuffer()), bytes);
+          assert.deepEqual((await bucket.list()).objects.map(o => ({ key: o.key, version: o.version })), objects);
+          assert.equal(await bucket.get('qualification-composite-delivered'), null,
+            'direct restart recovery must not send Queue work');
+          assert.equal(await bucket.get('qualification-refused'), null);
+        });
       } else {
         assert.deepEqual(await compositeDelivery(bucket), { count: 1 },
           'lost acknowledgement must follow a real send and successful Rust Queue recovery');

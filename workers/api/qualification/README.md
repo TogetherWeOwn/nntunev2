@@ -199,6 +199,17 @@ explicitly reports 255 required cases passed. The post-send throw simulates a lo
 Queue reply, not a process crash, ambiguous DB commit or pending Queue persistence
 across restart.
 
+The pre-send refusal now also precedes a full runtime replacement. A fresh
+workerd/Rust/private API composition must recover and replay that still-unsent
+pointer without changing any DB row, including acknowledgement and deadlines.
+Unknown recovery refuses; exact R2 bytes/version and the object inventory survive
+without reseeding. No callback or dead-letter marker may appear during direct
+recovery. The existing lost-reply send and ordinary acknowledgement-only retry
+then run through these fresh isolates and require new native callback markers.
+This control is written, not locally executed; exact-head Actions is required.
+It qualifies durable **unsent dispatch** recovery after graceful restart, not
+persistence of accepted pending Queue messages, abrupt crash or ambiguous commit.
+
 A separate R2 recovery control retains the actual GET metadata and faults only
 its body: an open oversized chunk, two individually bounded chunks whose total
 exceeds the requested range, a stream error and a stalled prefix. All must reach
@@ -206,9 +217,15 @@ exactly one real GET and return the static redacted refusal. Oversize/error
 refusals must precede the existing ten-second operation deadline; the stalled
 body must instead reach it. Full DB rows and every R2 key/version must stay
 unchanged, exact tagged bytes/digest must survive, no Queue marker may change,
-and genuine recovery must succeed after each fault. These controls are written,
-not locally executed; require exact-head Actions. They qualify bounded range
-stream handling, not maximum-media sizing, network cancellation or abrupt crash.
+and genuine recovery must succeed after each fault. At head `5909f250`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42388757301/job/128451700283)
+passes all twelve runtime subtests (thirteen Node passes including the enclosing
+test), including these R2 stream controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42388757301/job/128451700112)
+explicitly reports 255 required cases passed. The injected stream-error diagnostics
+retain the earlier limits; this is not clean-diagnostic or IO-cancellation proof.
+These controls qualify bounded range stream handling, not maximum-media sizing,
+network cancellation or abrupt crash.
 
 No test uses candidate media keys, articles or manifests.
 Passing this job is not security review, staging/restore proof, production
