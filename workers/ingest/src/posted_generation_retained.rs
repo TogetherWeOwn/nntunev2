@@ -14,6 +14,10 @@
 
 use super::*;
 
+#[path = "posted_generation_retained_failure.rs"]
+mod failure;
+pub use failure::{conclude_retained_failure, RetainedFailureOutcome};
+
 #[path = "posted_generation_retained_content.rs"]
 mod content_reads;
 pub use content_reads::{
@@ -92,6 +96,7 @@ struct RetainedFence {
     reference_token: String,
     registry_revision: i64,
     selected_generation: Option<String>,
+    pending_operation: Option<String>,
 }
 
 // Match candidate/publication lock order: owning job/attempt, hash registry,
@@ -105,12 +110,25 @@ async fn lock_retained(
     kind: RetainedReferenceKind,
     owner: &str,
 ) -> Result<Option<RetainedFence>, StoreError> {
+    lock_retained_with_terminal(tx, attempt, generation, kind, owner, false).await
+}
+
+// Terminal access is receipt-only and is used by the conclusion transaction,
+// never preparation or a network callback.
+async fn lock_retained_with_terminal(
+    tx: &Transaction<'_>,
+    attempt: &AttemptHandle,
+    generation: &str,
+    kind: RetainedReferenceKind,
+    owner: &str,
+    terminal: bool,
+) -> Result<Option<RetainedFence>, StoreError> {
     if !lock_attempt(tx, attempt).await? {
         return Ok(None);
     }
     let Some(registry) = tx
         .query_opt(
-            "SELECT r.revision, r.selected_generation FROM posted_file_registry r \
+            "SELECT r.revision, r.selected_generation, r.pending_operation FROM posted_file_registry r \
              JOIN posted_files p ON p.plaintext_sha256 = r.plaintext_sha256 \
              WHERE p.id = $1 FOR UPDATE OF r",
             &[&generation],
@@ -134,9 +152,11 @@ async fn lock_retained(
     }
     let health = tx
         .query_opt(
-            "SELECT revision, round, round_token FROM posted_file_health \
-             WHERE generation_id = $1 AND state IN ('unknown', 'usable') FOR UPDATE",
-            &[&generation],
+            "SELECT revision, round, round_token, state, failure_kind, verified_at, \
+             retention_checked_at FROM posted_file_health \
+             WHERE generation_id = $1 AND (state IN ('unknown', 'usable') \
+             OR ($2 AND state = 'terminal_failed')) FOR UPDATE",
+            &[&generation, &terminal],
         )
         .await
         .map_err(database_error)?;
@@ -163,6 +183,7 @@ async fn lock_retained(
         reference_token: reference.get("reference_token"),
         registry_revision: registry.get("revision"),
         selected_generation: registry.get("selected_generation"),
+        pending_operation: registry.get("pending_operation"),
     }))
 }
 

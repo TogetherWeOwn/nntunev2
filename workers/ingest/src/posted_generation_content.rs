@@ -331,14 +331,22 @@ pub(super) async fn load_checks(
     tx: &Transaction<'_>,
     handle: &GenerationHandle,
 ) -> Result<[Option<ContentCheckState>; 2], StoreError> {
-    let bundle = stored(tx, &handle.generation).await?;
+    load_generation_checks(tx, &handle.generation, handle.round).await
+}
+
+pub(super) async fn load_generation_checks(
+    tx: &Transaction<'_>,
+    generation: &str,
+    round: i64,
+) -> Result<[Option<ContentCheckState>; 2], StoreError> {
+    let bundle = stored(tx, generation).await?;
     let custody = bundle.custody()?;
     let mut checks = [None; 2];
     for row in tx
         .query(
             "SELECT side, backbone, state, checked_articles FROM posted_file_content_checks \
              WHERE generation_id = $1 AND round = $2",
-            &[&handle.generation, &handle.round],
+            &[&generation, &round],
         )
         .await
         .map_err(database_error)?

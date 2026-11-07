@@ -20,6 +20,14 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_retained::failure::postgres_retained_failure_snapshots_repair_evidence_and_preserves_custody_on_exact_replay",
+    "posted_generation_retained::failure::postgres_retained_failure_unknown_partial_transport_and_pre_repair_evidence_never_conclude",
+    "posted_generation_retained::failure::postgres_retained_failure_intact_content_vetoes_absence_and_mismatched_content_refuses",
+    "posted_generation_retained::failure::postgres_retained_failure_requires_current_selected_origin_and_rejects_selection_aba",
+    "posted_generation_retained::failure::postgres_retained_failure_reference_recreation_and_changed_health_retire_original_permits",
+    "posted_generation_retained::failure::postgres_retained_failure_receipt_error_rolls_back_health_and_same_permit_can_retry",
+    "posted_generation_retained::failure::postgres_retained_failure_concurrent_decisions_commit_once_and_lease_expiry_after_wait_refuses",
+    "posted_generation_retained::failure::postgres_retained_failure_decision_is_immutable_and_forward_migration_replay_preserves_receipt",
     "posted_generation_retained::provenance::postgres_retained_unknown_provenance_binds_original_attempt_reference_round_and_selection",
     "posted_generation_retained::provenance::postgres_retained_content_provenance_keeps_each_nonaffirmative_verdict_and_side",
     "posted_generation_retained::provenance::postgres_retained_provenance_distinguishes_selection_aba_from_historical_reference_health",

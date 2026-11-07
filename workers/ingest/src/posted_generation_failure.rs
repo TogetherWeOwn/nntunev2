@@ -58,7 +58,23 @@ pub async fn fail_candidate_verification(
         return Ok(VerificationFailureOutcome::InsufficientEvidence);
     }
     let bundle = stored(&tx, &handle.generation).await?;
-    let custody = bundle.custody()?;
+    if !repair_failure_is_conclusive(&checkpoint, &bundle.custody()?)? {
+        return Ok(VerificationFailureOutcome::InsufficientEvidence);
+    }
+    stop_candidate(&tx, handle, CandidateStop::VerificationFailed).await?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(VerificationFailureOutcome::Applied)
+}
+
+// Candidate and retained conclusions consume the same repair-first policy. The
+// caller owns the transaction/fences; a checkpoint is evidence, not authority.
+pub(super) fn repair_failure_is_conclusive(
+    checkpoint: &GenerationCheckpoint,
+    custody: &PostedFileParams<'_>,
+) -> Result<bool, StoreError> {
+    if checkpoint.schedule != Some(RecheckSchedule::Exhausted) {
+        return Ok(false);
+    }
     let mut progress = TwoSpoolProgress::new(
         custody.backbone_post,
         custody.backbone_verify,
@@ -85,12 +101,6 @@ pub async fn fail_candidate_verification(
         };
     }
     // Do not feed timer-only unknowns through conclude's keep-original branch.
-    if !progress.is_settled()
-        || !matches!(conclude(&progress), TwoSpoolOutcome::RepostExhausted { .. })
-    {
-        return Ok(VerificationFailureOutcome::InsufficientEvidence);
-    }
-    stop_candidate(&tx, handle, CandidateStop::VerificationFailed).await?;
-    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(VerificationFailureOutcome::Applied)
+    Ok(progress.is_settled()
+        && matches!(conclude(&progress), TwoSpoolOutcome::RepostExhausted { .. }))
 }

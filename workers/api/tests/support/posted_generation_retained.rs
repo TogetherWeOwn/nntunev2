@@ -23,6 +23,8 @@ use nntune_ingest::posted_generations::{
 
 #[path = "posted_generation_retained_content.rs"]
 mod content;
+#[path = "posted_generation_retained_failure.rs"]
+mod failure;
 #[path = "posted_generation_retained_provenance.rs"]
 mod provenance;
 

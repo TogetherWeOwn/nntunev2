@@ -65,14 +65,22 @@ pub(super) async fn load_schedule(
     tx: &Transaction<'_>,
     handle: &GenerationHandle,
 ) -> Result<Option<RecheckSchedule>, StoreError> {
-    if handle.round == 0 {
+    load_generation_schedule(tx, &handle.generation, handle.round).await
+}
+
+pub(super) async fn load_generation_schedule(
+    tx: &Transaction<'_>,
+    generation: &str,
+    round: i64,
+) -> Result<Option<RecheckSchedule>, StoreError> {
+    if round == 0 {
         return Ok(None);
     }
     let row = tx
         .query_opt(
             "SELECT completed_passes, state, not_before FROM posted_file_recheck_schedule \
              WHERE generation_id = $1 AND round = $2",
-            &[&handle.generation, &handle.round],
+            &[&generation, &round],
         )
         .await
         .map_err(database_error)?

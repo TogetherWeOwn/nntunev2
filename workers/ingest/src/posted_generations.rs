@@ -72,9 +72,10 @@ pub use rechecks::{
 #[path = "posted_generation_retained.rs"]
 mod retained;
 pub use retained::{
-    drive_retained_content_read, invalidate_retained_check, prepare_retained_check,
-    prepare_retained_content_check, record_retained_content_check, RetainedCheckPermit,
-    RetainedContentPermit, RetainedCustody, RetainedInvalidation, RetainedReferenceKind,
+    conclude_retained_failure, drive_retained_content_read, invalidate_retained_check,
+    prepare_retained_check, prepare_retained_content_check, record_retained_content_check,
+    RetainedCheckPermit, RetainedContentPermit, RetainedCustody, RetainedFailureOutcome,
+    RetainedInvalidation, RetainedReferenceKind,
 };
 
 const LEASE_SECONDS: i64 = 300;
@@ -1378,18 +1379,34 @@ async fn checkpoint_locked(
     handle: &GenerationHandle,
     current: &Row,
 ) -> Result<GenerationCheckpoint, StoreError> {
-    let count = current.get::<_, i32>("article_count");
+    checkpoint_generation_locked(
+        tx,
+        &handle.generation,
+        handle.round,
+        current.get("article_count"),
+        current.get::<_, Option<i64>>("verified_at").is_some(),
+    )
+    .await
+}
+
+async fn checkpoint_generation_locked(
+    tx: &Transaction<'_>,
+    generation: &str,
+    round: i64,
+    count: i32,
+    presence_verified: bool,
+) -> Result<GenerationCheckpoint, StoreError> {
     if !(1..=MAX_ARTICLE_COUNT).contains(&count) {
         return Err(StoreError::Inconsistent);
     }
-    let bundle = stored(tx, &handle.generation).await?;
+    let bundle = stored(tx, generation).await?;
     let mut slots = vec![[SlotProgress::default(); 2]; count as usize];
     for row in tx
         .query(
             "SELECT slot, side, confirmed, repost_attempts, presence_verdict, \
              presence_repost_attempts FROM posted_file_article_progress \
              WHERE generation_id = $1 AND round = $2",
-            &[&handle.generation, &handle.round],
+            &[&generation, &round],
         )
         .await
         .map_err(database_error)?
@@ -1402,13 +1419,13 @@ async fn checkpoint_locked(
         slots[slot as usize][side as usize] = slot_progress(&row)?;
     }
     let checkpoint = GenerationCheckpoint {
-        generation: handle.generation.clone(),
+        generation: generation.to_owned(),
         plan: bundle.plan_sha256().to_owned(),
-        round: handle.round,
+        round,
         slots,
-        schedule: rechecks::load_schedule(tx, handle).await?,
-        content_checks: content::load_checks(tx, handle).await?,
-        presence_verified: current.get::<_, Option<i64>>("verified_at").is_some(),
+        schedule: rechecks::load_generation_schedule(tx, generation, round).await?,
+        content_checks: content::load_generation_checks(tx, generation, round).await?,
+        presence_verified,
     };
     Ok(checkpoint)
 }
