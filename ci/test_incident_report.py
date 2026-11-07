@@ -7,6 +7,7 @@ import importlib.util
 import os
 import re
 import unittest
+from datetime import datetime, timedelta, timezone
 
 CI_DIR = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location(
@@ -241,6 +242,168 @@ class ReportTests(unittest.TestCase):
         self.assertIn("No production change is authorized", api.writes[0][2]["body"])
 
 
+def ago(minutes):
+    stamp = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class StatefulAPI(ir.API):
+    """Runs, jobs and issues live in memory; writes mutate them."""
+
+    def __init__(self, runs=(), jobs=None, issues=()):
+        super().__init__("token")
+        self.runs = list(runs)
+        self.jobs = jobs or {}
+        self.issues = [dict(i) for i in issues]
+        self.writes, self.listings = [], []
+
+    def request(self, method, path, body=None):
+        if method != "GET":
+            self.writes.append((method, path, body))
+            if path == "/issues":
+                self.issues.append({"number": 100 + len(self.issues), "state": "open",
+                                    "body": body["body"], "updated_at": ago(0)})
+                return {"number": self.issues[-1]["number"]}
+            if (m := re.fullmatch(r"/issues/(\d+)", path)):
+                target = next(i for i in self.issues if i["number"] == int(m.group(1)))
+                target["body"] = body["body"]
+                target["state"] = body["state"]
+            return {"number": 1}
+        page = int(m.group(1)) if (m := re.search(r"[?&]page=(\d+)", path)) else 1
+        window = slice((page - 1) * 100, page * 100)
+        if (m := re.fullmatch(r"/actions/runs/(\d+)", path)):
+            return next(r for r in self.runs if r["id"] == int(m.group(1)))
+        if (m := re.fullmatch(r"/actions/workflows/([\w.-]+)/runs\?.*", path)):
+            self.listings.append(path)
+            rows = [r for r in self.runs if r["path"].endswith("/" + m.group(1))]
+            return {"workflow_runs": rows[window]}
+        if (m := re.search(r"/actions/runs/(\d+)/attempts/(\d+)/jobs", path)):
+            return {"jobs": self.jobs.get((int(m.group(1)), int(m.group(2))), [])[window]}
+        return self.issues[window]
+
+
+def recent_run(run_id, minutes=5, updated=1, **over):
+    """Created `minutes` ago, last updated (completed) `updated` minutes ago."""
+    return make_run(run_id, created_at=ago(minutes), updated_at=ago(updated), **over)
+
+
+class RecentTests(unittest.TestCase):
+    def incident_state(self, api):
+        return [(i["number"], i["state"]) for i in api.issues]
+
+    def test_ordered_fail_repeat_green_opens_comments_closes_once(self):
+        runs = [recent_run(23, 1), recent_run(22, 2), recent_run(21, 3), recent_run(20, 4)]
+        jobs = {(20, 1): [smoke("failure")], (21, 1): [smoke("failure")],
+                (22, 1): [smoke("success")]}
+        api = StatefulAPI(runs=runs, jobs=jobs)
+        ir.recent(api)
+        self.assertEqual([w[:2] for w in api.writes], [
+            ("POST", "/issues"), ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"),
+            ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
+        self.assertEqual(self.incident_state(api), [(100, "closed")])
+        self.assertEqual(sum(1 for w in api.writes if w[1] == "/issues"), 1)
+        self.assertEqual(len(api.listings), len(ir.WORKFLOWS))
+        self.assertTrue(all("branch=main" in p and "per_page=100" in p for p in api.listings))
+        # Rerunning the scan over the same window must not duplicate anything.
+        done = len(api.writes)
+        ir.recent(api)
+        self.assertEqual(len(api.writes), done)
+        self.assertEqual(self.incident_state(api), [(100, "closed")])
+
+    def test_ordered_scan_matches_unordered_default_on_history_lookup(self):
+        # Default report() still supersedes an older run when newer history exists.
+        runs = [recent_run(21), recent_run(20)]
+        api = StatefulAPI(runs=runs, jobs={(20, 1): [smoke("failure")],
+                                           (21, 1): [smoke("failure")]})
+        self.assertEqual(ir.report(api, 20), ["superseded"])
+        self.assertEqual(api.writes, [])
+
+    def test_skipped_later_run_preserves_earlier_failure(self):
+        runs = [recent_run(31, 1), recent_run(30, 2)]
+        jobs = {(30, 1): [smoke("failure")], (31, 1): [smoke("skipped")]}
+        api = StatefulAPI(runs=runs, jobs=jobs)
+        ir.recent(api)
+        self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
+        self.assertEqual(self.incident_state(api), [(100, "open")])
+
+    def test_old_and_untrusted_and_incomplete_rows_are_ignored(self):
+        failing = {(n, 1): [smoke("failure")] for n in (40, 41, 42, 43, 44)}
+        runs = [recent_run(40, 100, updated=90), recent_run(41, head_branch="feature"),
+                recent_run(42, status="in_progress"),
+                recent_run(43, head_repository={"full_name": "evil/fork"}),
+                recent_run(44, event="pull_request")]
+        api = StatefulAPI(runs=runs, jobs=failing)
+        ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_old_updated_at_is_ignored_even_if_created_recently(self):
+        run = make_run(50, created_at=ago(10), updated_at=ago(120))
+        api = StatefulAPI(runs=[run], jobs={(50, 1): [smoke("failure")]})
+        ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_long_running_older_created_run_completed_recently_is_retained(self):
+        run = make_run(51, created_at=ago(180), updated_at=ago(2))
+        api = StatefulAPI(runs=[run], jobs={(51, 1): [smoke("failure")]})
+        ir.recent(api)
+        self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
+
+    def test_more_than_ten_recent_runs_raises_before_any_write(self):
+        runs = [recent_run(60 + n, 1 + n % 5) for n in range(11)]
+        api = StatefulAPI(runs=runs, jobs={(r["id"], 1): [smoke("failure")] for r in runs})
+        with self.assertRaises(ir.ReportError):
+            ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_ten_recent_runs_is_within_bound(self):
+        runs = [recent_run(60 + n, 1 + n % 5) for n in range(10)]
+        api = StatefulAPI(runs=runs, jobs={(r["id"], 1): [smoke("success")] for r in runs})
+        ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_full_page_with_history_older_than_window_is_allowed(self):
+        rows = [recent_run(1000 + n, 180 + n, updated=170) for n in range(99)]
+        api = StatefulAPI(runs=[recent_run(70)] + rows, jobs={(70, 1): [smoke("failure")]})
+        self.assertEqual(len(api.runs), 100)
+        ir.recent(api)
+        self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
+
+    def test_saturated_recent_history_refuses_before_any_write(self):
+        rows = [recent_run(1000 + n, 30, updated=30) for n in range(99)]
+        api = StatefulAPI(runs=[recent_run(70)] + rows, jobs={(70, 1): [smoke("failure")]})
+        self.assertEqual(len(api.runs), 100)
+        with self.assertRaises(ir.ReportError):
+            ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_more_than_one_hundred_rows_is_malformed(self):
+        api = StatefulAPI(runs=[recent_run(70)], jobs={(70, 1): [smoke("failure")]})
+        real = api.request
+        api.request = lambda m, path, body=None: (
+            {"workflow_runs": [recent_run(2000 + n, 180, updated=170) for n in range(101)]}
+            if m == "GET" and path.startswith("/actions/workflows/") else real(m, path, body))
+        with self.assertRaises(ir.ReportError):
+            ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_ordered_report_skips_latest_lookup_entirely(self):
+        runs = [recent_run(92), recent_run(91)]
+        api = StatefulAPI(runs=runs, jobs={(91, 1): [smoke("failure")]})
+        self.assertEqual(ir.report(api, 91, ordered=True), [f"opened: {SMOKE}"])
+        self.assertEqual(api.listings, [])
+
+    def test_ordered_report_still_checks_recorded_source_and_trust(self):
+        run = recent_run(80)
+        api = StatefulAPI(runs=[run], jobs={(80, 1): [smoke("failure")]},
+                          issues=[issue(7, source=(81, 1), state="open")])
+        self.assertEqual(ir.report(api, 80, ordered=True), ["superseded"])
+        self.assertEqual(api.writes, [])
+        bad = StatefulAPI(runs=[recent_run(82, head_branch="x")],
+                          jobs={(82, 1): [smoke("failure")]})
+        with self.assertRaises(ir.ReportError):
+            ir.report(bad, 82, ordered=True)
+        self.assertEqual(bad.writes, [])
+
 class WorkflowWiringTests(unittest.TestCase):
     def setUp(self):
         root = os.path.dirname(CI_DIR)
@@ -259,6 +422,23 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("upload-artifact", self.wf)
         self.assertNotIn("download-artifact", self.wf)
         self.assertNotIn("/logs", self.wf)
+
+    def test_schedule_and_dispatch_triggers_with_documented_scopes(self):
+        lines = [l for l in self.wf.splitlines() if not l.lstrip().startswith("#")]
+        code = "\n".join(lines)
+        on = code.split("\npermissions:")[0]
+        self.assertIn("schedule:", on)
+        self.assertRegex(on, r"cron: ['\"]?7,17,27,37,47,57 \* \* \* \*['\"]?")
+        self.assertIn("workflow_dispatch:", on)
+        self.assertNotRegex(on, r"workflow_dispatch:\s*\n\s+inputs:")
+        for banned in ("workflow_run", "pull_request_target"):
+            self.assertNotIn(banned, code)
+        self.assertIn("python3 -I ci/incident_report.py --recent", code)
+        self.assertNotIn("--run-id", code)
+        jobs = code.split("\njobs:\n")[1]
+        self.assertRegex(jobs, r"(?m)^  report:")
+        for scope in ("contents: read", "actions: read", "issues: write"):
+            self.assertIn(scope, jobs)
 
     def test_serial_queue_and_ci_command(self):
         self.assertIn("group: gate-incident-writer", self.wf)

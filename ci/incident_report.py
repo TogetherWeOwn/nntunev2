@@ -6,6 +6,7 @@ secrets, triggering-run source, or exception response bodies. Stdlib only.
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -121,7 +122,32 @@ def source(issue):
     return tuple(map(int, match.groups())) if match else None
 
 
-def report(api, run_id, dry_run=False):
+def recent(api, dry_run=False):
+    # Overlap scans for delayed schedules; source markers make replay idempotent.
+    # Read the whole bounded snapshot before writes, then process in source order
+    # so even a transient failure followed by recovery leaves an incident trail.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    runs = []
+    for workflow in WORKFLOWS:
+        rows = api.request("GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise ReportError("Gate history malformed")
+        if len(rows) == 100 and datetime.strptime(
+                rows[-1]["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff:
+            raise ReportError("Gate history window saturated")
+        for run in rows:
+            if trusted(run) and datetime.strptime(
+                    run["updated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff:
+                runs.append(run)
+    if len(runs) > 10:
+        raise ReportError("Recent gate history exceeds bound")
+    actions = []
+    for run in sorted(runs, key=lambda r: (r["id"], r["run_attempt"])):
+        actions.extend(report(api, run["id"], dry_run, ordered=True))
+    return actions
+
+
+def report(api, run_id, dry_run=False, ordered=False):
     run = api.request("GET", f"/actions/runs/{run_id}")
     if not trusted(run):
         raise ReportError("Untrusted or incomplete gate run")
@@ -131,7 +157,8 @@ def report(api, run_id, dry_run=False):
     # in the workflow, then ignore superseded runs, including newer attempts.
     # Runs are newest-created first: a newer run, if any, is in this page.
     # Do not walk all history (a busy repository can exceed the search bound).
-    latest = api.request("GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
+    latest = [] if ordered else api.request(
+        "GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
     newer = [r for r in latest if trusted(r) and (r["id"], r["run_attempt"]) > (run_id, attempt)]
     if len(newer) > 10:
         raise ReportError("Gate history replay exceeds bound")
@@ -212,15 +239,19 @@ def report(api, run_id, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", type=int, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--run-id", type=int)
+    mode.add_argument("--recent", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.run_id <= 0 or os.environ.get("GITHUB_REPOSITORY") != REPO:
+    if (args.run_id is not None and args.run_id <= 0) or os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise ReportError("Invalid incident reporting context")
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ReportError("Missing GitHub token")
-    for action in report(API(token), args.run_id, args.dry_run):
+    api = API(token)
+    actions = recent(api, args.dry_run) if args.recent else report(api, args.run_id, args.dry_run)
+    for action in actions:
         print(("DRY RUN: " if args.dry_run else "") + action)
 
 

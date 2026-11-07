@@ -782,8 +782,10 @@ lane. Complete every box on the exact head being promoted.
 
 ### Gate incident reporting
 
-`gate-incidents.yml` observes completed main-branch `deploy`, `e2e-staging`
-and `deploy-production` runs. Its separate issue-writer job opens one
+`gate-incidents.yml` scans completed main-branch `deploy`, `e2e-staging`
+and `deploy-production` runs every ten minutes (or on manual dispatch from
+`main`), without the privileged `workflow_run` trigger. Its separate
+issue-writer job opens one
 `incident` issue per workflow/job key, comments on repeats and closes it
 with a recovery comment after a successful job with its required evidence
 step. Unconfigured/skipped smoke and skipped deployment jobs do not recover
@@ -808,7 +810,20 @@ The observer needs only `contents: read`, `actions: read` and job-scoped
 exist. API failures fail the reporting job; inspect the observer's Actions
 run if an expected incident is absent. The existing incident intake owns
 routing issues to an accountable responder; an issue alone is not a hold
-owner. No new credential, runtime, probe or schedule is introduced.
+owner. The Actions-only reporting schedule performs API reads and issue
+writes; it never starts staging resources, alarms, probes or keep-alive,
+and introduces no always-on staging/preview runtime or new credential.
+
+Each scan considers the latest 100 created runs per workflow and selects
+trusted completed runs updated within the last hour, at most ten total.
+The snapshot is collected before writing, then processed oldest source first
+so a short failure followed by recovery still leaves an incident trail.
+Repeated scans do not repeat the same source occurrence. A saturated recent
+history window or more than ten candidates fails before writes, rather than
+silently truncating. Inspect reporting failures promptly: Actions schedules
+can be delayed, and an outage beyond one hour or a rerun older than the latest
+100 created runs requires deliberate run-ID replay after checking newer
+evidence. The scan is bounded catch-up, not durable all-history delivery.
 
 There is no scheduled production promotion workflow here: production is
 manual-only. Consequently there is no scheduled six-hour production-hold
