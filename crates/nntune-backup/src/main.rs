@@ -9,8 +9,9 @@ use nntune_backup::bundle;
 use nntune_backup::drill::{self, DrillError};
 use nntune_backup::verify::{self, Keyring};
 
-/// Default fixture size: 3 full 64 KiB rclone blocks + a partial block,
-/// so the drill always crosses block boundaries via ranged reads.
+/// Default fixture size: 3 full 64 KiB `velmora.media.v1` chunks + a
+/// partial chunk, so the drill always crosses chunk boundaries via ranged
+/// reads.
 const DEFAULT_FIXTURE_BYTES: usize = 3 * 65536 + 12345;
 
 fn usage() -> ! {
