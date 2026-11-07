@@ -590,7 +590,7 @@ BEGIN
     VALUES ('cccccccc-1111-2222-3333-444444444444',
             '55555555-1111-2222-3333-444444444444', 1, 1);
     -- No library owner is bound, even while the acting admin is deleting.
-    UPDATE users SET deleting_at = 1700000001 WHERE id = 'user-lib-1';
+    UPDATE users SET deleting_at = to_timestamp(1700000001) WHERE id = 'user-lib-1';
     FOR publish_count IN 1..2 LOOP
         EXECUTE (SELECT sql FROM shared_publish_query)
             USING 'job_shared'::text, 'ingest:fixture:shared'::text,
