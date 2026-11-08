@@ -11379,7 +11379,7 @@ mod tests {
                         price,
                         BILLING_NOW,
                         BILLING_NOW + BILLING_PERIOD,
-                        BILLING_NOW + 1,
+                        BILLING_NOW + 120,
                     ),
                 ];
                 if reverse {
@@ -11439,7 +11439,7 @@ mod tests {
                     PRICE_PRO,
                     BILLING_NOW,
                     BILLING_NOW + BILLING_PERIOD,
-                    BILLING_NOW + 1,
+                    BILLING_NOW + 120,
                 ),
             ];
             let fold = |status, price| {
@@ -11453,8 +11453,13 @@ mod tests {
                 )
             };
             let switched = fold("active", PRICE_PRO);
+            assert_eq!(switched.row.plan_id, PLAN_PRO);
+            assert_eq!(switched.row.paid_invoice_id.as_deref(), Some("in_switch"));
             let terminal = fold("canceled", PRICE_PRO);
             if terminal_first {
+                // Identical read proof cannot order status-only changes;
+                // this control needs a fresh cancellation below, not an
+                // automatic retry claim for the pre-existing race.
                 block_on(h.store.store_reconcile_outcome("u1", &terminal)).unwrap();
                 block_on(h.store.store_reconcile_outcome("u1", &switched)).unwrap();
             } else {
@@ -11639,6 +11644,11 @@ mod tests {
         let terminal = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
             .expect("new terminal insert is outside the unique live index");
         assert_eq!(terminal.row.status, "canceled");
+        assert_eq!(terminal.row.plan_id, "free");
+        assert_eq!(terminal.row.paid_through_unix, None);
+        assert_eq!(terminal.row.paid_invoice_id, None);
+        assert_eq!(terminal.read_plan, None);
+        assert_eq!(terminal.read_anchor, None);
         assert_eq!(h.store.billing_rows.borrow()["u1"], holder.row);
         assert_eq!(
             h.store.billing_nonlive_rows.borrow()["sub_test_1"],

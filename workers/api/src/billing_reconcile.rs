@@ -2039,13 +2039,20 @@ mod tests {
     }
 
     #[test]
-    fn terminal_replay_does_not_use_replacement_subscription_anchor() {
+    fn retained_fields_never_use_replacement_subscription_proof() {
         // A delayed completed Checkout for the old subscription can be
         // retrieved after its replacement owns the user's live slot. That
         // replacement's invoice cannot prove the old subscription stale.
         let mut input = anchored("plus", NOW + 100, "in_replacement");
         input.live.as_mut().expect("live").stripe_subscription_id = "sub_replacement".to_string();
-        for status in ["canceled", "incomplete_expired"] {
+        for status in [
+            "canceled",
+            "incomplete_expired",
+            "incomplete",
+            "unpaid",
+            "paused",
+            "trialing",
+        ] {
             for empty in [false, true] {
                 let remote = RemoteSubscription {
                     subscription: subscription(status, PRICE_PLUS),
@@ -2062,7 +2069,15 @@ mod tests {
                     },
                 };
                 let outcome = reconcile_subscription(&input, &remote, NOW);
-                assert_eq!(outcome.fail_closed, None);
+                assert_eq!(
+                    outcome.fail_closed,
+                    (status == "trialing").then_some(FailClosedReason::UnknownStatus)
+                );
+                assert_eq!(outcome.row.plan_id, "free");
+                assert_eq!(outcome.row.paid_through_unix, None);
+                assert_eq!(outcome.row.paid_invoice_id, None);
+                assert_eq!(outcome.read_plan, None);
+                assert_eq!(outcome.read_anchor, None);
                 assert_eq!(outcome.row.stripe_subscription_id, "sub_123");
                 assert_eq!(
                     outcome.row.status, status,
