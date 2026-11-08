@@ -253,6 +253,7 @@ pub fn redrive_checkpoint(cp: &mut JobCheckpoint) {
     cp.failure_code = None;
     cp.failure_reason = None;
     cp.probe_tally = None;
+    cp.admin_release_mbid = None;
     cp.par2_set_id = None;
     cp.missing_blocks = 0;
 }
@@ -495,6 +496,7 @@ mod tests {
             attempt: msg.attempt,
             repair_rounds: msg.repair_rounds,
             probe_tally: None,
+            admin_release_mbid: None,
             par2_set_id: None,
             missing_blocks: 0,
             failure_code: None,

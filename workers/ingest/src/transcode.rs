@@ -1305,6 +1305,7 @@ mod tests {
             attempt: 1,
             repair_rounds: 1,
             probe_tally: None,
+            admin_release_mbid: None,
             par2_set_id: None,
             missing_blocks: 0,
             failure_code: None,

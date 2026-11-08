@@ -267,6 +267,7 @@ async fn authenticated_original_drives_the_existing_admin_parse_transition() {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            admin_release_mbid: None,
             par2_set_id: None,
             missing_blocks: 0,
             failure_code: None,

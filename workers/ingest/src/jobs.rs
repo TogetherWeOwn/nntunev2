@@ -78,6 +78,11 @@ pub struct JobCheckpoint {
     /// (a crash before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
+    /// Catalogue-only match identity for admin execution. No parser content
+    /// is retained. Old admin checkpoints lack a match and fail closed before
+    /// probing/publication; legacy uploads do not use this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_release_mbid: Option<String>,
     /// PAR2 set covering the damaged files, recorded by `Verifying`
     /// before it hands off to `Repairing`. `None` until verify runs;
     /// `#[serde(default)]` keeps pre-existing checkpoints readable.
@@ -160,14 +165,32 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
 
 /// Advance a checkpointed job one step, bounding the verify↔repair loop.
 ///
-/// Every transition except `Verifying` with `repair_needed` delegates to
-/// [`advance`]. A repair start increments `repair_rounds` and moves to
+/// Admin match/probe/write transitions require the retained match and probe
+/// evidence (see [`crate::admin_gates`]); other transitions delegate to
+/// [`advance`] except `Verifying` with `repair_needed`. A repair start
+/// increments `repair_rounds` and moves to
 /// `Repairing` while `repair_rounds < MAX_REPAIR_ROUNDS`; once the budget is
 /// spent the job moves to `Failed` with `failure_reason` set instead of
 /// dispatching another Container repair. A par2 set with too few recovery
 /// blocks therefore terminates instead of cycling forever. `attempt` is left
 /// alone (it belongs to Queue redelivery, not to in-job loops).
 pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobState {
+    if cp.source == JobSource::AdminUpload {
+        match cp.state {
+            // Match completion must explicitly record the selected release
+            // and start a fresh probe plan, never reuse an earlier tally.
+            JobState::Matching => {
+                cp.state = JobState::NeedsReview;
+                return cp.state;
+            }
+            JobState::Probing => return crate::admin_gates::advance_probe(cp),
+            JobState::Writing if !crate::admin_gates::publish_ready(cp) => {
+                cp.state = JobState::NeedsReview;
+                return cp.state;
+            }
+            _ => {}
+        }
+    }
     match cp.state {
         JobState::Verifying if repair_needed && cp.source != JobSource::AdminUpload => {
             if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
@@ -224,6 +247,8 @@ pub fn resume_archive(cp: &mut JobCheckpoint) -> bool {
         return false;
     }
     cp.state = JobState::Parsing;
+    cp.admin_release_mbid = None;
+    cp.probe_tally = None;
     true
 }
 
@@ -418,6 +443,7 @@ mod tests {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            admin_release_mbid: None,
             par2_set_id: None,
             missing_blocks: 0,
             failure_code: None,
@@ -432,14 +458,21 @@ mod tests {
     fn admin_matches_before_probe_and_publishes_without_artifact_stages() {
         let mut cp = checkpoint_at(JobState::Queued);
         cp.source = JobSource::AdminUpload;
-        for expected in [
-            JobState::Parsing,
-            JobState::Matching,
-            JobState::Probing,
-            JobState::Writing,
-            JobState::Done,
-            JobState::Done,
-        ] {
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Parsing);
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Matching);
+        assert!(crate::admin_gates::complete_match(
+            &mut cp,
+            Some("11111111-1111-4111-8111-111111111111"),
+            1,
+        ));
+        assert_eq!(cp.state, JobState::Probing);
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Probing);
+        cp.probe_tally
+            .as_mut()
+            .unwrap()
+            .missing_by_batch
+            .insert(0, 0);
+        for expected in [JobState::Writing, JobState::Done, JobState::Done] {
             assert_eq!(advance_checkpoint(&mut cp, false), expected);
             assert_eq!(cp.attempt, 1);
             assert_eq!(cp.repair_rounds, 0);
