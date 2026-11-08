@@ -537,14 +537,29 @@ mod tests {
 
     #[test]
     fn statements_are_owner_scoped_fenced_and_cast_free() {
-        // Every app statement scopes on the caller's bound id.
+        // Every app statement scopes on the caller's bound id: the reads
+        // filter `user_id = $1`; the insert binds the id through the
+        // `(user_id, kind, mbid)` column list and the delete through the
+        // qualified predicate.
+        for sql in [collection_state_statement(), collection_list_statement()] {
+            assert!(sql.contains("user_id = $1"), "{sql}");
+        }
+        assert!(
+            collection_save_statement().contains("(user_id, kind, mbid)"),
+            "{}",
+            collection_save_statement()
+        );
+        assert!(
+            collection_delete_statement().contains("collection_saves.user_id = $1"),
+            "{}",
+            collection_delete_statement()
+        );
         for sql in [
             collection_state_statement(),
             collection_list_statement(),
             collection_save_statement(),
             collection_delete_statement(),
         ] {
-            assert!(sql.contains("user_id = $1"), "{sql}");
             assert!(!sql.contains("::uuid"), "{sql}");
             assert!(
                 sql.contains("lower(mbid)") || sql.contains("mbid, saved_at"),
