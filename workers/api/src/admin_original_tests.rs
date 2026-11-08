@@ -1,6 +1,9 @@
 use super::*;
 use std::cell::RefCell;
 
+#[path = "admin_stage_tests.rs"]
+mod stages;
+
 struct Keys {
     requested: RefCell<Vec<u32>>,
     available: bool,
