@@ -1,13 +1,15 @@
-//! Internal PostgreSQL stage authority. No live dispatch or public route uses
-//! this adapter yet. Ordered schema integration, upload initialization, manual
-//! controls and atomic publication/Done remain separate required integration.
+//! Internal PostgreSQL stage/publication authority. No live dispatch or public
+//! route uses this adapter yet. Ordered schema integration, upload initialization
+//! and manual controls remain separate required integration.
 //! The caller supplies the authenticated original, captures the trusted queue
 //! generation, and applies its existing database/service deadline. No KV fallback.
 
 use crate::{
     admin_checkpoint::{Identity, Snapshot, MAX_CHECKPOINT_BYTES},
-    admin_execution::validate_stage_transition,
-    jobs::JobCheckpoint,
+    admin_execution::{validate_publication, validate_stage_transition},
+    admin_writers::{write_album, AlbumWrite, FileGeometry, SourceSealer, WriteError},
+    jobs::{self, JobCheckpoint, JobState},
+    matching::MbRecording,
 };
 use tokio_postgres::{Client, GenericClient};
 
@@ -135,7 +137,6 @@ pub async fn persist_stage(
     let successor = expected
         .successor(next.clone(), false, &bound)
         .map_err(|_| StoreError::Invalid)?;
-    let next_encoded = successor.encode().map_err(|_| StoreError::Invalid)?;
     let tx = client
         .transaction()
         .await
@@ -144,9 +145,21 @@ pub async fn persist_stage(
     if current != *expected {
         return Err(StoreError::Stale);
     }
+    update_on(&tx, expected, &current_encoded, &successor).await?;
+    tx.commit().await.map_err(|_| StoreError::Database)?;
+    Ok(successor)
+}
+
+async fn update_on(
+    tx: &impl GenericClient,
+    expected: &Snapshot,
+    current_encoded: &str,
+    successor: &Snapshot,
+) -> Result<(), StoreError> {
     // After strict whole-snapshot comparison, retain the selected representation
     // for SQL equality: optional null vs omitted fields need not round-trip to
     // the same JSON keys. Revision prevents ABA when checkpoint contents repeat.
+    let next_encoded = successor.encode().map_err(|_| StoreError::Invalid)?;
     let count = tx
         .execute(
             "UPDATE ingest_jobs SET admin_checkpoint = $5::text::jsonb,
@@ -155,7 +168,7 @@ pub async fn persist_stage(
                AND admin_checkpoint_revision = $3
                AND admin_checkpoint = $4::text::jsonb",
             &[
-                &original.job_id,
+                &expected.checkpoint().job_id,
                 &expected.status(),
                 &expected.revision(),
                 &current_encoded,
@@ -169,6 +182,76 @@ pub async fn persist_stage(
     if count != 1 {
         return Err(StoreError::Stale);
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationError {
+    Checkpoint(StoreError),
+    Album(WriteError),
+}
+
+impl From<StoreError> for PublicationError {
+    fn from(error: StoreError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+/// Commit album rows and Done in one outer transaction, never merely release
+/// the album savepoint. The caller has already authenticated the original and
+/// obtained CC0 mirror recordings and trusted decoded-file geometry; no network
+/// work belongs under this lock. The sealer is local API/keyring work. The caller
+/// applies its bounded deadline to the whole future, including sealing/commit.
+/// Any error/drop before commit rolls back all rows. A commit-result error is
+/// uncertain: reload authority before deciding whether publication succeeded.
+pub async fn publish(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    expected: &Snapshot,
+    recordings: &[MbRecording],
+    geometry: &[FileGeometry],
+    sealer: &mut impl SourceSealer,
+) -> Result<Snapshot, PublicationError> {
+    let bound = identity(original);
+    let encoded = expected.encode().map_err(|_| StoreError::Invalid)?;
+    Snapshot::decode(&encoded, expected.revision(), &bound).map_err(|_| StoreError::Invalid)?;
+    validate_publication(
+        expected.checkpoint(),
+        original.job_id,
+        original.idempotency_key,
+        original.parsed,
+    )
+    .map_err(|_| StoreError::Invalid)?;
+    let mut done = expected.checkpoint().clone();
+    if jobs::advance_checkpoint(&mut done, false) != JobState::Done {
+        return Err(StoreError::Invalid.into());
+    }
+    let successor = expected
+        .successor(done, false, &bound)
+        .map_err(|_| StoreError::Invalid)?;
+    let mut tx = client
+        .transaction()
+        .await
+        .map_err(|_| StoreError::Database)?;
+    let (current, current_encoded) = load_on(&tx, original, expected.generation(), true).await?;
+    if current != *expected {
+        return Err(StoreError::Stale.into());
+    }
+    write_album(
+        &mut tx,
+        sealer,
+        &AlbumWrite {
+            checkpoint: current.checkpoint(),
+            original_job: original.job_id,
+            original_key: original.idempotency_key,
+            parsed: original.parsed,
+            recordings,
+            geometry,
+        },
+    )
+    .await
+    .map_err(PublicationError::Album)?;
+    update_on(&tx, expected, &current_encoded, &successor).await?;
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
 }

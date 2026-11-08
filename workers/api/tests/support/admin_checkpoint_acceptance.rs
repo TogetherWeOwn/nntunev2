@@ -1,5 +1,5 @@
-//! Disposable PostgreSQL stage-CAS tests. Test seeding is not an admission or
-//! manual-control adapter, and temporary columns do not prove migration checks.
+//! Disposable PostgreSQL stage/publication-CAS tests. Test seeding is not an
+//! admission/manual adapter; temporary columns do not prove migration checks.
 use super::*;
 use nntune_ingest::admin_checkpoint_store::{self as store, StageOriginal, StoreError};
 
@@ -43,6 +43,42 @@ async fn seed(app: &tokio_postgres::Client, snapshot: &Snapshot) {
         "UPDATE ingest_jobs SET admin_checkpoint = $1::text::jsonb, admin_checkpoint_revision = $2, status = $3",
         &[&snapshot.encode().unwrap(), &snapshot.revision(), &snapshot.status()],
     ).await.unwrap();
+}
+
+async fn publication_fixture() -> (
+    tokio_postgres::Client,
+    OriginalBody,
+    Snapshot,
+    Vec<MbRecording>,
+    Vec<FileGeometry>,
+) {
+    let (mut app, original, mut cp, recordings, geometry) = fixture().await;
+    app.batch_execute("ALTER TABLE ingest_jobs ADD COLUMN admin_checkpoint JSONB, ADD COLUMN admin_checkpoint_revision BIGINT NOT NULL DEFAULT 0").await.unwrap();
+    cp.state = JobState::Queued;
+    cp.admin_release_mbid = None;
+    cp.probe_tally = None;
+    let snapshot = Snapshot::initial(cp.clone(), &identity(&original)).unwrap();
+    seed(&app, &snapshot).await;
+    let mut runtime = DatabaseRuntime {
+        app: &mut app,
+        original: &original,
+        snapshot,
+        services: Runtime(cp.clone()),
+    };
+    for _ in 0..4 {
+        run_stage(
+            &mut runtime,
+            &mut cp,
+            original.job_id(),
+            original.idempotency_key(),
+            original.parsed(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(cp.state, JobState::Writing);
+    let snapshot = runtime.snapshot;
+    (app, original, snapshot, recordings, geometry)
 }
 
 struct DatabaseRuntime<'a> {
@@ -344,6 +380,218 @@ async fn store_accepts_semantic_optional_null_and_never_restarts_parked_or_termi
         );
         assert!(store::load(&app, &input(&original), 1).await.unwrap() == settled);
     }
+}
+
+#[tokio::test]
+async fn publication_commits_real_album_and_done_once_after_persisted_stages() {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let mut sealer = Sealer::default();
+    let done = store::publish(
+        &mut app,
+        &input(&original),
+        &writing,
+        &recordings,
+        &geometry,
+        &mut sealer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (done.status(), done.revision(), done.generation()),
+        ("done", 6, 1)
+    );
+    assert_eq!(counts(&app).await, (1, 1, 1));
+    assert!(store::load(&app, &input(&original), 1).await.unwrap() == done);
+    assert_eq!(sealer.calls, 1);
+    assert_eq!(
+        store::publish(
+            &mut app,
+            &input(&original),
+            &writing,
+            &recordings,
+            &geometry,
+            &mut sealer,
+        )
+        .await
+        .err(),
+        Some(store::PublicationError::Checkpoint(StoreError::Stale))
+    );
+    assert_eq!(
+        store::publish(
+            &mut app,
+            &input(&original),
+            &done,
+            &recordings,
+            &geometry,
+            &mut sealer,
+        )
+        .await
+        .err(),
+        Some(store::PublicationError::Checkpoint(StoreError::Invalid))
+    );
+    assert_eq!(sealer.calls, 1);
+    assert_eq!(counts(&app).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn publication_refuses_stale_full_checkpoint_revision_generation_and_rejection_before_sealing(
+) {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let mut sealer = Sealer::default();
+    for mode in 0..4 {
+        let mut cp = writing.checkpoint().clone();
+        let current = match mode {
+            0 => {
+                // Same counters/status/identity, different complete checkpoint.
+                let mut encoded: serde_json::Value =
+                    serde_json::from_str(&writing.encode().unwrap()).unwrap();
+                encoded["checkpoint"]["failure_code"] = "parse_failed".into();
+                Snapshot::decode(
+                    &encoded.to_string(),
+                    writing.revision(),
+                    &identity(&original),
+                )
+                .unwrap()
+            }
+            1 => writing.successor(cp, false, &identity(&original)).unwrap(),
+            2 => writing.successor(cp, true, &identity(&original)).unwrap(),
+            _ => {
+                cp.state = JobState::Rejected;
+                cp.admin_release_mbid = None;
+                cp.probe_tally = None;
+                writing.successor(cp, true, &identity(&original)).unwrap()
+            }
+        };
+        // Simulated authority mutations are not the missing manual adapter.
+        seed(&app, &current).await;
+        assert_eq!(
+            store::publish(
+                &mut app,
+                &input(&original),
+                &writing,
+                &recordings,
+                &geometry,
+                &mut sealer,
+            )
+            .await
+            .err(),
+            Some(store::PublicationError::Checkpoint(StoreError::Stale))
+        );
+        assert_eq!(sealer.calls, 0);
+        assert_eq!(counts(&app).await, (0, 0, 0));
+        assert!(
+            store::load(&app, &input(&original), current.generation())
+                .await
+                .unwrap()
+                == current
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_rolls_back_album_if_done_update_errors_or_affects_no_row() {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let mut sealer = Sealer::default();
+    for mode in 0..2 {
+        let trigger = if mode == 0 {
+            "CREATE FUNCTION pg_temp.refuse_done() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$"
+        } else {
+            "CREATE OR REPLACE FUNCTION pg_temp.refuse_done() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+        };
+        app.batch_execute(trigger).await.unwrap();
+        app.batch_execute("CREATE TRIGGER refuse_done BEFORE UPDATE ON ingest_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_done()").await.unwrap();
+        let error = store::publish(
+            &mut app,
+            &input(&original),
+            &writing,
+            &recordings,
+            &geometry,
+            &mut sealer,
+        )
+        .await
+        .err();
+        assert_eq!(
+            error,
+            Some(store::PublicationError::Checkpoint(if mode == 0 {
+                StoreError::Database
+            } else {
+                StoreError::Stale
+            }))
+        );
+        assert_eq!(counts(&app).await, (0, 0, 0));
+        assert!(store::load(&app, &input(&original), 1).await.unwrap() == writing);
+        app.batch_execute("DROP TRIGGER refuse_done ON ingest_jobs")
+            .await
+            .unwrap();
+    }
+    store::publish(
+        &mut app,
+        &input(&original),
+        &writing,
+        &recordings,
+        &geometry,
+        &mut sealer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts(&app).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn publication_seal_error_and_cancellation_leave_no_album_or_done() {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let mut sealer = Sealer {
+        fail: true,
+        ..Sealer::default()
+    };
+    assert_eq!(
+        store::publish(
+            &mut app,
+            &input(&original),
+            &writing,
+            &recordings,
+            &geometry,
+            &mut sealer,
+        )
+        .await
+        .err(),
+        Some(store::PublicationError::Album(WriteError::Seal))
+    );
+    assert_eq!(counts(&app).await, (0, 0, 0));
+    assert!(store::load(&app, &input(&original), 1).await.unwrap() == writing);
+    sealer.fail = false;
+    sealer.pending = true;
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store::publish(
+            &mut app,
+            &input(&original),
+            &writing,
+            &recordings,
+            &geometry,
+            &mut sealer,
+        )
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        sealer.calls, 2,
+        "cancellation must reach the sealer after track insertion"
+    );
+    assert_eq!(counts(&app).await, (0, 0, 0));
+    assert!(store::load(&app, &input(&original), 1).await.unwrap() == writing);
+    sealer.pending = false;
+    store::publish(
+        &mut app,
+        &input(&original),
+        &writing,
+        &recordings,
+        &geometry,
+        &mut sealer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts(&app).await, (1, 1, 1));
 }
 
 #[tokio::test]
