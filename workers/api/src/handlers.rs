@@ -59,15 +59,17 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route and the admin NZB
-/// upload route accept document uploads, every other route takes
-/// API-sized bodies. Both the entry's collection gate and the pre-routing
-/// size check call this, so the two caps cannot drift apart.
+/// Per-route request-body bound: NZB intake accepts document uploads and
+/// likes import accepts a bounded batch of catalogue IDs. Other routes
+/// take API-sized bodies. Both the entry's collection gate and the
+/// pre-routing size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
     if method == "POST" && path == "/api/ingest" {
         INGEST_BODY_LIMIT_BYTES
     } else if method == "POST" && path == "/v1/admin/ingest" {
         admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/me/likes/import" {
+        crate::taste::IMPORT_MAX_BODY_BYTES
     } else {
         MAX_BODY_BYTES
     }

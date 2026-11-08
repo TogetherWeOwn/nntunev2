@@ -230,7 +230,7 @@ async fn preference_sql_is_owner_scoped_replay_safe_and_erased_with_account() {
     );
 
     tx.execute(
-        "UPDATE public.users SET deleting_at = 1100 WHERE id = $1",
+        "UPDATE public.users SET deleting_at = to_timestamp(1100) WHERE id = $1",
         &[&a],
     )
     .await

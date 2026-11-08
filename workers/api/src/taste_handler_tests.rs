@@ -412,6 +412,92 @@ fn taste_import_is_tenant_scoped_and_a_hide_is_upgraded_not_counted_already() {
 }
 
 #[test]
+fn taste_import_full_length_batches_use_the_bounded_collection_allowance() {
+    use crate::worker_entry::{
+        collect_body_with_cap, BodyChunkStream, BodyReadError, BodySource, CollectedBody,
+    };
+    struct OneChunk(Option<Vec<u8>>);
+    impl BodyChunkStream for OneChunk {
+        fn poll_next_chunk(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+            std::task::Poll::Ready(self.0.take().map(Ok))
+        }
+    }
+    let h = harness();
+    let cookie = taste_user(&h, "import-cap");
+    taste_library(&h, "import-cap");
+    let long_id = "t".repeat(crate::taste::MAX_TARGET_ID_LEN);
+    h.store
+        .catalogue_library
+        .borrow_mut()
+        .get_mut("import-cap")
+        .unwrap()
+        .push(unmatched_library_row(&long_id));
+    let path = "/v1/me/likes/import";
+    let cap = max_body_bytes("POST", path);
+    assert_eq!(cap, crate::taste::IMPORT_MAX_BODY_BYTES);
+    assert_eq!(max_body_bytes("PUT", path), MAX_BODY_BYTES);
+    assert_eq!(max_body_bytes("POST", "/v1/me/taste"), MAX_BODY_BYTES);
+    for target in [TASTE_REC, long_id.as_str()] {
+        let body = serde_json::json!({"items": (0..crate::taste::IMPORT_MAX_ITEMS)
+            .map(|_| serde_json::json!({"kind":"track", "target_id": target}))
+            .collect::<Vec<_>>()})
+        .to_string()
+        .into_bytes();
+        assert!(body.len() > MAX_BODY_BYTES);
+        assert!(body.len() <= cap);
+        for declared in [None, Some(body.len())] {
+            let collected = block_on(collect_body_with_cap(
+                declared,
+                BodySource::Stream(OneChunk(Some(body.clone()))),
+                cap,
+            ));
+            let CollectedBody::Complete(bytes) = collected else {
+                panic!("legal batch refused by collection gate");
+            };
+            assert_eq!(bytes, body);
+            let req = Request {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                cookie: Some(cookie.clone()),
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: bytes,
+            };
+            let resp = block_on(handle(&h.ctx(), &req));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let value = taste_json(&resp);
+            assert_eq!(
+                value["added"].as_u64().unwrap() + value["already"].as_u64().unwrap(),
+                500
+            );
+            assert!(value["rejected"].as_array().unwrap().is_empty());
+        }
+    }
+    for declared in [None, Some(cap + 1)] {
+        let collected = block_on(collect_body_with_cap(
+            declared,
+            BodySource::Stream(OneChunk(Some(vec![b' '; cap + 1]))),
+            cap,
+        ));
+        assert!(matches!(collected, CollectedBody::Oversized));
+    }
+    let req = Request {
+        method: "POST".to_string(),
+        path: path.to_string(),
+        cookie: Some(cookie),
+        origin: Some(ORIGIN.to_string()),
+        authorization: None,
+        stripe_signature: None,
+        body: vec![b' '; cap + 1],
+    };
+    assert_eq!(block_on(handle(&h.ctx(), &req)).status, 400);
+}
+
+#[test]
 fn taste_import_rejects_bad_bodies_and_oversize_batches_without_panicking() {
     let h = harness();
     let cookie = taste_user(&h, "tb-1");

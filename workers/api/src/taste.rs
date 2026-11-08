@@ -57,6 +57,10 @@ pub const HISTORY_MAX_LIST: i64 = 50;
 /// a rejected item never fails the batch and a retried import converges.
 pub const IMPORT_MAX_ITEMS: usize = 500;
 
+/// Bounded JSON allowance for 500 targets at the 512-byte target cap,
+/// including item fields and ordinary serialization overhead.
+pub const IMPORT_MAX_BODY_BYTES: usize = 320 * 1024;
+
 /// Target id bound: opaque track ids (recording MBID or ingest `job_id`)
 /// and release MBIDs share the ledger-column cap.
 pub const MAX_TARGET_ID_LEN: usize = 512;
