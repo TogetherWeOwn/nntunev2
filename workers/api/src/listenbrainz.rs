@@ -181,13 +181,18 @@ impl std::fmt::Debug for LinkInput {
     }
 }
 
-fn scope(user_id: &str) -> Result<String, LinkError> {
-    let ok = !user_id.is_empty()
+/// Opaque owner id shape: 1..=64 ASCII alphanumerics, `-` or `_`. Shared by
+/// credential scoping and the rotation keyset cursor; no canonicalization.
+pub(crate) fn valid_user_id(user_id: &str) -> bool {
+    !user_id.is_empty()
         && user_id.len() <= MAX_USER_ID_BYTES
         && user_id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-    if ok {
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn scope(user_id: &str) -> Result<String, LinkError> {
+    if valid_user_id(user_id) {
         Ok(format!("user:{user_id}"))
     } else {
         Err(LinkError::InvalidUserId)

@@ -173,9 +173,9 @@ fn check_shape(user_id: &str, link: &StoredLink) -> Result<(), StoreError> {
 
 /// Keyset page of owner ids whose wrap is older than `below_version`.
 /// Selects only `user_id` (no envelope, username or key material), orders by
-/// byte order of the canonical UUID text (equals UUID order) and uses a strict
+/// ASCII byte order of the opaque owner id (`COLLATE "C"`) and uses a strict
 /// `>` cursor, never OFFSET. Arguments are rejected before the query. A row
-/// whose id is not a canonical UUID, or an oversize/unordered result, fails
+/// whose id is not a valid opaque owner id, or an oversize/unordered result, fails
 /// the whole scan closed rather than being skipped.
 pub(crate) async fn rotation_candidates(
     client: &Client,

@@ -15,7 +15,7 @@
 //!
 //! [`rotate_batch`] adds a bounded keyset candidate scan in front of that
 //! per-user helper: one scan page (at most [`MAX_SCAN_LIMIT`] owner ids, in
-//! UUID keyset order, strictly after an optional typed cursor) and one
+//! ASCII byte keyset order, strictly after an optional typed cursor) and one
 //! [`rotate_link`] per candidate. It validates the page (count, order, strict
 //! cursor advancement) before ANY write and returns scalar counts plus a
 //! resume cursor only. It does not persist progress, retry, schedule or
@@ -39,21 +39,17 @@ use crate::{
 /// Largest candidate page one scan may request.
 pub const MAX_SCAN_LIMIT: u32 = 100;
 
-/// Canonical lowercase hyphenated UUID owner id used as a keyset cursor.
-/// Byte order of this form equals UUID order. Not a secret, but never listed
-/// in bulk by this module: only the resume cursor leaves a batch.
+/// Opaque owner id used as a keyset cursor: the same 1..=64 byte ASCII
+/// alphanumeric/`-`/`_` shape the credential scope accepts (account ids are
+/// 22-char base64url, not UUIDs). No canonicalization or case folding; order
+/// is plain ASCII byte order (`COLLATE "C"` in SQL). Not a secret, but never
+/// listed in bulk by this module: only the resume cursor leaves a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerCursor(String);
 
 impl OwnerCursor {
     pub fn parse(s: &str) -> Option<Self> {
-        let b = s.as_bytes();
-        let ok = b.len() == 36
-            && b.iter().enumerate().all(|(i, c)| match i {
-                8 | 13 | 18 | 23 => *c == b'-',
-                _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
-            });
-        ok.then(|| Self(s.to_owned()))
+        crate::listenbrainz::valid_user_id(s).then(|| Self(s.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -605,7 +601,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     fn uid(n: u32) -> String {
-        format!("00000000-0000-4000-8000-{n:012x}")
+        format!("acct{n:018}")
     }
 
     fn cur(n: u32) -> OwnerCursor {
@@ -706,19 +702,72 @@ mod tests {
     }
 
     #[test]
-    fn cursor_accepts_only_canonical_lowercase_uuid() {
+    fn cursor_accepts_the_credential_scope_id_shape_only() {
         assert!(OwnerCursor::parse(&uid(1)).is_some());
+        let max = "a".repeat(64);
+        for ok in ["u-1", "A_b-9", "dGVzdC1hY2NvdW50LTAwMQ", max.as_str()] {
+            assert_eq!(OwnerCursor::parse(ok).unwrap().as_str(), ok, "{ok}");
+        }
+        let long = "a".repeat(65);
         for bad in [
             "",
-            "u-1",
-            "00000000-0000-4000-8000-00000000000G",
-            "00000000-0000-4000-8000-00000000000A",
-            "000000000000-4000-8000-000000000001",
-            "00000000-0000-4000-8000-0000000000011",
-            " 00000000-0000-4000-8000-000000000001",
+            "bad id!",
+            "a.b",
+            "a/b",
+            "a+b",
+            "a=",
+            "\u{e9}",
+            long.as_str(),
         ] {
             assert!(OwnerCursor::parse(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn opaque_ids_page_in_ascii_byte_order_without_case_folding() {
+        // Digits < uppercase < `_` < lowercase; `-` < digits. 22-char
+        // base64url account ids included.
+        let ids = [
+            "dGVzdC1hY2NvdW50LTAwMQ",
+            "Zm9vYmFyYmF6cXV4MTIzNA",
+            "a-b",
+            "a_b",
+            "aB",
+            "ab",
+            "0AAAAAAAAAAAAAAAAAAAAA",
+            "-AAAAAAAAAAAAAAAAAAAAA",
+        ];
+        let m = Multi::default();
+        for id in ids {
+            m.rows.borrow_mut().insert(id.to_owned(), sealed(id, 1));
+        }
+        let mut want: Vec<&str> = ids.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            want,
+            [
+                "-AAAAAAAAAAAAAAAAAAAAA",
+                "0AAAAAAAAAAAAAAAAAAAAA",
+                "Zm9vYmFyYmF6cXV4MTIzNA",
+                "a-b",
+                "aB",
+                "a_b",
+                "ab",
+                "dGVzdC1hY2NvdW50LTAwMQ"
+            ]
+        );
+        let mut after: Option<OwnerCursor> = None;
+        let mut seen = Vec::new();
+        loop {
+            let r = batch(&m, 2, after.as_ref(), 3).unwrap();
+            seen.extend(m.cas_users.borrow().iter().skip(seen.len()).cloned());
+            after = r.resume_after;
+            if r.end_of_keyset {
+                break;
+            }
+        }
+        assert_eq!(seen, want);
+        assert!(m.rows.borrow().values().all(|r| r.kek_version == 2));
     }
 
     #[test]

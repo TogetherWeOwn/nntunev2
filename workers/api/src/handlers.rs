@@ -760,7 +760,7 @@ pub trait Store {
         }
     }
     /// Bounded keyset scan of owner ids whose ListenBrainz link has
-    /// `kek_version < below_version` (nonzero), ascending by UUID and strictly
+    /// `kek_version < below_version` (nonzero), ascending by opaque-id ASCII byte order and strictly
     /// after `after`, at most `limit` (1..=100). Returns ids only: no
     /// envelopes or usernames. Default refuses (fail closed).
     fn listenbrainz_rotation_candidates(

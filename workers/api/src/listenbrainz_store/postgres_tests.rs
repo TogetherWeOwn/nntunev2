@@ -519,8 +519,8 @@ async fn scan_client() -> Client {
     db
 }
 
-fn scan_uuid(n: u32) -> String {
-    format!("00000000-0000-4000-8000-{n:012x}")
+fn scan_id(n: u32) -> String {
+    format!("acct{n:018}")
 }
 
 async fn scan_put(db: &Client, id: &str, username: &str, version: i32) {
@@ -544,10 +544,10 @@ async fn rotation_scan_filters_orders_bounds_and_resumes_by_strict_cursor() {
     let db = scan_client().await;
     // Insert out of order; versions 1 and 2 are below target 3, 3 and 4 are not.
     for (n, v) in [(5, 1), (2, 2), (9, 3), (1, 1), (7, 4), (4, 2), (3, 1)] {
-        scan_put(&db, &scan_uuid(n), "alice", v).await;
+        scan_put(&db, &scan_id(n), "alice", v).await;
     }
     let all = rotation_candidates(&db, 3, None, 100).await.unwrap();
-    assert_eq!(ids(&all), [1, 2, 3, 4, 5].map(scan_uuid));
+    assert_eq!(ids(&all), [1, 2, 3, 4, 5].map(scan_id));
     // Target below every version, and a lower target, exclude by strict `<`.
     assert!(rotation_candidates(&db, 1, None, 100)
         .await
@@ -555,61 +555,82 @@ async fn rotation_scan_filters_orders_bounds_and_resumes_by_strict_cursor() {
         .is_empty());
     assert_eq!(
         ids(&rotation_candidates(&db, 2, None, 100).await.unwrap()),
-        [1, 3, 5].map(scan_uuid)
+        [1, 3, 5].map(scan_id)
     );
     // Bound and keyset paging without gaps or repeats.
     let p1 = rotation_candidates(&db, 3, None, 2).await.unwrap();
-    assert_eq!(ids(&p1), [1, 2].map(scan_uuid));
+    assert_eq!(ids(&p1), [1, 2].map(scan_id));
     let p2 = rotation_candidates(&db, 3, p1.last(), 2).await.unwrap();
-    assert_eq!(ids(&p2), [3, 4].map(scan_uuid));
+    assert_eq!(ids(&p2), [3, 4].map(scan_id));
     let p3 = rotation_candidates(&db, 3, p2.last(), 2).await.unwrap();
-    assert_eq!(ids(&p3), [5].map(scan_uuid));
+    assert_eq!(ids(&p3), [5].map(scan_id));
     // Strict: a cursor equal to the last id yields nothing; a cursor that is
     // not itself a row (and not a candidate) still skips lower ids.
     assert!(rotation_candidates(&db, 3, p3.last(), 2)
         .await
         .unwrap()
         .is_empty());
-    let between = OwnerCursor::parse(&scan_uuid(6)).unwrap();
+    let between = OwnerCursor::parse(&scan_id(6)).unwrap();
     assert!(rotation_candidates(&db, 3, Some(&between), 100)
         .await
         .unwrap()
         .is_empty());
-    let low = OwnerCursor::parse(&scan_uuid(2)).unwrap();
+    let low = OwnerCursor::parse(&scan_id(2)).unwrap();
     assert_eq!(
         ids(&rotation_candidates(&db, 3, Some(&low), 100).await.unwrap()),
-        [3, 4, 5].map(scan_uuid)
+        [3, 4, 5].map(scan_id)
     );
 }
 
 #[tokio::test]
-async fn rotation_scan_orders_by_uuid_bytes_across_hex_digit_classes() {
+async fn rotation_scan_orders_opaque_ids_by_ascii_bytes() {
     let db = scan_client().await;
-    let low = "0aaaaaaa-0000-4000-8000-000000000000";
-    let mid = "9fffffff-0000-4000-8000-000000000000";
-    let high = "a0000000-0000-4000-8000-000000000000";
-    for id in [high, low, mid] {
+    // 22-char base64url account ids plus digit/upper/lower/_/- boundaries.
+    // A locale collation would fold case and ignore punctuation; byte order
+    // puts '-' < digits < uppercase < '_' < lowercase.
+    let want = [
+        "-AAAAAAAAAAAAAAAAAAAAA",
+        "0AAAAAAAAAAAAAAAAAAAAA",
+        "Zm9vYmFyYmF6cXV4MTIzNA",
+        "a-b",
+        "aB",
+        "a_b",
+        "ab",
+        "dGVzdC1hY2NvdW50LTAwMQ",
+    ];
+    for id in [
+        want[5], want[7], want[1], want[3], want[6], want[0], want[4], want[2],
+    ] {
         scan_put(&db, id, "alice", 1).await;
     }
     let page = rotation_candidates(&db, 2, None, 100).await.unwrap();
-    assert_eq!(ids(&page), [low, mid, high]);
-    let sql_order: Vec<String> = db
-        .query(
-            "SELECT user_id FROM listenbrainz_links ORDER BY user_id::uuid",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    assert_eq!(ids(&page), sql_order);
+    assert_eq!(ids(&page), want);
+    // Keyset paging over the same ids, 3 at a time, with no gap or repeat.
+    let mut after: Option<OwnerCursor> = None;
+    let mut seen = Vec::new();
+    loop {
+        let p = rotation_candidates(&db, 2, after.as_ref(), 3)
+            .await
+            .unwrap();
+        seen.extend(ids(&p));
+        match p.last() {
+            Some(last) if p.len() == 3 => after = Some(last.clone()),
+            _ => break,
+        }
+    }
+    assert_eq!(seen, want);
+    // Case is significant: a cursor "aB" excludes it and lower ids only.
+    let c = OwnerCursor::parse("aB").unwrap();
+    assert_eq!(
+        ids(&rotation_candidates(&db, 2, Some(&c), 100).await.unwrap()),
+        ["a_b", "ab", "dGVzdC1hY2NvdW50LTAwMQ"]
+    );
 }
 
 #[tokio::test]
 async fn rotation_scan_rejects_bad_arguments_before_querying() {
     let db = scan_client().await;
-    scan_put(&db, &scan_uuid(1), "alice", 1).await;
+    scan_put(&db, &scan_id(1), "alice", 1).await;
     // Every rejected call errors in the argument check; the fixture stays
     // intact and a valid call still succeeds afterwards.
     for (target, limit) in [(0, 10), (2, 0), (2, 101), (2, u32::MAX), (u32::MAX, 10)] {
@@ -621,23 +642,24 @@ async fn rotation_scan_rejects_bad_arguments_before_querying() {
     assert!(rotation_candidates(&db, 2, None, 100).await.is_ok());
     assert_eq!(
         ids(&rotation_candidates(&db, 2, None, 1).await.unwrap()),
-        [scan_uuid(1)]
+        [scan_id(1)]
     );
 }
 
 #[tokio::test]
-async fn rotation_scan_reads_ids_only_and_fails_closed_on_non_uuid_owner() {
+async fn rotation_scan_reads_ids_only_and_fails_closed_on_malformed_owner() {
     let db = scan_client().await;
     // A username the envelope decoder would reject must not matter: the scan
     // selects user_id only and never decodes a link.
-    scan_put(&db, &scan_uuid(1), "bad name!", 1).await;
-    assert!(read(&db, &scan_uuid(1)).await.is_err());
+    scan_put(&db, &scan_id(1), "bad name!", 1).await;
+    assert!(read(&db, &scan_id(1)).await.is_err());
     assert_eq!(
         ids(&rotation_candidates(&db, 2, None, 10).await.unwrap()),
-        [scan_uuid(1)]
+        [scan_id(1)]
     );
-    // A non-canonical owner id fails the scan closed instead of being skipped.
-    for bad in ["not-a-uuid", "00000000-0000-4000-8000-00000000000A"] {
+    // An id outside the credential-scope shape fails the scan closed instead
+    // of being skipped (the table has no such CHECK).
+    for bad in ["bad id!", "a.b"] {
         scan_put(&db, bad, "alice", 1).await;
         assert!(
             rotation_candidates(&db, 2, None, 10).await.is_err(),
