@@ -139,7 +139,7 @@ async function expectExposedStatus(page: Page, text: string) {
 	} finally {
 		await session.detach();
 	}
-	const region = page.getByRole('status').filter({ hasText: text });
+	const region = page.getByRole('status').filter({ hasText: new RegExp(`^${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) });
 	await expect(region).toHaveCount(1);
 	expect(await region.evaluate((element) => element.closest('[aria-busy="true"]') === null)).toBe(true);
 }
