@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import itertools
 import json
 import re
 import types
@@ -400,8 +401,38 @@ def _display(value) -> str:
     return "".join(f"\\u{ord(c):04x}" if unicodedata.category(c).startswith("C") and c not in "\r\n" else c for c in text)
 
 
-def _csv(rows: list[list]) -> bytes:
-    out = io.StringIO(newline="")
+class _OutputBudget:
+    def __init__(self, limit=None):
+        self.remaining = MAX_ARCHIVE_BYTES if limit is None else limit
+
+
+class _Utf8Buffer:
+    def __init__(self, budget):
+        self.budget = budget
+        self.out = io.BytesIO()
+
+    def write(self, text):
+        # Check even before encoding, then charge actual UTF-8 bytes before retaining
+        # them. Repeated identifiers in CSV must not amplify into unbounded output.
+        if len(text) > self.budget.remaining:
+            raise ExportError("archive size limit exceeded")
+        encoded = text.encode("utf-8")
+        if len(encoded) > self.budget.remaining:
+            raise ExportError("archive size limit exceeded")
+        self.budget.remaining -= len(encoded)
+        self.out.write(encoded)
+        return len(text)
+
+
+def _utf8(chunks, budget):
+    buffer = _Utf8Buffer(budget)
+    for chunk in chunks:
+        buffer.write(chunk)
+    return buffer.out.getvalue()
+
+
+def _csv(rows, budget=None) -> bytes:
+    out = _Utf8Buffer(_OutputBudget() if budget is None else budget)
     writer = csv.writer(out, lineterminator="\r\n")
     for row in rows:
         cells = []
@@ -411,7 +442,7 @@ def _csv(rows: list[list]) -> bytes:
                 cell = "'" + cell
             cells.append(cell)
         writer.writerow(cells)
-    return out.getvalue().encode("utf-8")
+    return out.out.getvalue()
 
 
 TRACK_COLUMNS = ["title", "artist", "release", "recording_mbid", "release_mbid", "artist_mbids", "duration_seconds", "available", "catalogue_missing"]
@@ -430,8 +461,10 @@ def _playlist_name(index: int, name: str) -> str:
 def export_archive(snapshot: Snapshot) -> bytes:
     """Return a complete deterministic STORE ZIP, or raise ExportError; never write files."""
     data = project(snapshot)
+    budget = _OutputBudget()
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, indent=2)
     files = {
-        "account.json": (json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        "account.json": _utf8(itertools.chain(encoder.iterencode(data), ("\n",)), budget),
     }
     library = [["library_name", "library_created_at", "added_at", *TRACK_COLUMNS]]
     for row in data["libraries"]["rows"]:
@@ -439,19 +472,19 @@ def export_archive(snapshot: Snapshot) -> bytes:
             library.append([row["name"], row["created_at"], item["added_at"], *_track_cells(item["track"])])
     for item in data["legacy_library"]["rows"]:
         library.append(["", "", item["added_at"], *_track_cells(item["track"])])
-    files["library.csv"] = _csv(library)
+    files["library.csv"] = _csv(library, budget)
     history = [["recorded_at", "stream_seconds", *TRACK_COLUMNS]]
     for row in data["listening_history"]["rows"]:
         history.append([row["recorded_at"], row["stream_seconds"], *_track_cells(row["track"])])
-    files["listening_history.csv"] = _csv(history)
+    files["listening_history.csv"] = _csv(history, budget)
     playlist_files = []
     for index, row in enumerate(data["playlists"]["rows"], 1):
         name = _playlist_name(index, row["name"])
         entries = row["entries"]["rows"]
-        files[name + ".csv"] = _csv([
-            ["playlist_public_id", "position", "unavailable", *TRACK_COLUMNS],
-            *[[row["public_id"], e["position"], not e["track"]["available"], *_track_cells(e["track"])] for e in entries],
-        ])
+        files[name + ".csv"] = _csv(itertools.chain(
+            (["playlist_public_id", "position", "unavailable", *TRACK_COLUMNS],),
+            ([row["public_id"], e["position"], not e["track"]["available"], *_track_cells(e["track"])] for e in entries),
+        ), budget)
         lines = ["#EXTM3U", "# Metadata only; no media locations."]
         for entry in entries:
             track = entry["track"]
@@ -459,10 +492,10 @@ def export_archive(snapshot: Snapshot) -> bytes:
             label = "".join(f"\\u{ord(c):04x}" if unicodedata.category(c).startswith("C") or unicodedata.category(c) in ("Zl", "Zp") or c in "\r\n" else c for c in label)
             duration = track["duration_seconds"] if track["duration_seconds"] is not None else -1
             lines.append(f"#EXTINF:{duration},{label}")
-        files[name + ".m3u8"] = ("\n".join(lines) + "\n").encode("utf-8")
+        files[name + ".m3u8"] = _utf8((line + "\n" for line in lines), budget)
         playlist_files.append(f'{name}.csv / {name}.m3u8: playlist public_id {json.dumps(row["public_id"], ensure_ascii=True)}')
     coverage = [f'{key}: {data[key]["status"]} ({len(data[key]["rows"])} rows)' for key in SECTIONS]
-    files["README.txt"] = ("\n".join([
+    readme = [
         "NNTune account export — schema_version 1",
         f'Generated at {data["generated_at"]}',
         "Offline snapshot supplied by caller; this helper is not an authorization or collection check.",
@@ -482,8 +515,8 @@ def export_archive(snapshot: Snapshot) -> bytes:
         "request/webhook bodies and audit source_ip (not accepted for this format).",
         "Provider-vault metadata includes only existence and update time. Sessions contain only an eight-character id prefix.",
         "Not a live export: no delivery, expiry, rate limit, auth, step-up, erasure synchronization or storage is implemented.",
-        "",
-    ])).encode("utf-8")
+    ]
+    files["README.txt"] = _utf8((line + "\n" for line in readme), budget)
     if sum(map(len, files.values())) > MAX_ARCHIVE_BYTES:
         raise ExportError("archive size limit exceeded")
     output = io.BytesIO()

@@ -291,6 +291,10 @@ class LeakTests(unittest.TestCase):
 
     def test_subclass_source_objects_do_not_leak_extras(self):
         extras = dict(secret=SENTINEL, debug={"k": SENTINEL}, password_hash=SENTINEL, source_ip=SENTINEL, raw=SENTINEL)
+        for key in ("hmac", "public_key", "token", "payload", "nonce", "ciphertext", "pepper",
+                    "invite_code_hash", "dek", "request_payload", "webhook_data", "nc_tags",
+                    "audio_url", "nzb_url", "cover_url", "internal_row_id"):
+            extras[key] = SENTINEL
         snap = full_snapshot()
         sections = dict(snap.sections)
         sections["sessions"] = sec(own(leaky(Session("abcdefgh-" + SENTINEL, T0, T1, False), **extras)))
@@ -749,6 +753,10 @@ class InvalidInputTests(unittest.TestCase):
         self.assertRejected(with_section("genres", SubSection("collected", ())))
         self.assertRejected(with_section("genres", Section("collected", (SubOwned(OWNER, Genre("g", "n", True, T0)),))))
 
+    def test_malformed_ownership_identities_fail(self):
+        for owner in (0, True, "", object()):
+            self.assertRejected(with_section("genres", sec(Owned(owner, Genre("g", "n", True, T0)))))
+
     def test_rows_without_ownership_wrapper_fail(self):
         for raw in (Genre("g", "n", True, T0), None, (OWNER, Genre("g", "n", True, T0)), {"owner": OWNER}):
             self.assertRejected(with_section("genres", Section("collected", (raw,))))
@@ -970,6 +978,26 @@ class LimitTests(unittest.TestCase):
         with patch.object(ae, "MAX_INPUT_TEXT_BYTES", 200):
             data = ae.project(snap)
         self.assertEqual(len(data["listening_history"]["rows"]), 1)
+
+    def test_csv_amplification_stops_before_consuming_all_rows(self):
+        consumed = []
+
+        def rows():
+            for index in range(1000):
+                consumed.append(index)
+                yield ["p" * 64, index]
+
+        with patch.object(ae, "MAX_ARCHIVE_BYTES", 256):
+            with self.assertRaises(ExportError):
+                ae._csv(rows())
+        self.assertLess(len(consumed), 5)
+
+    def test_csv_files_share_one_output_budget(self):
+        budget = ae._OutputBudget(100)
+        ae._csv([["x" * 60]], budget)
+        with self.assertRaises(ExportError):
+            ae._csv([["y" * 60]], budget)
+        self.assertEqual(budget.remaining, 38)
 
     def test_archive_size_limit_boundary(self):
         snap = full_snapshot()

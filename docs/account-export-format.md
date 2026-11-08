@@ -123,8 +123,10 @@ This deliberately is not a playlist capable of starting playback.
 
 Projection rejects more than 100,000 aggregate rows/tuple elements, individual
 strings above 64 KiB UTF-8, more than 8 MiB aggregate projected text, or file
-contents above 64 MiB. Limits fail the entire export; there is no truncation.
-ZIP64 is disabled. This bounded in-memory serializer is not a large-account
+contents above 64 MiB. A single shared output budget charges each UTF-8 chunk
+before retaining it, including repeated CSV identifiers, so a small input cannot
+amplify into an unbounded CSV before the size check. Limits fail the entire export;
+there is no truncation. ZIP64 is disabled. This bounded in-memory serializer is not a large-account
 streaming strategy; a future integration must handle a limit as failure, not offer
 a partial ZIP, and may require a separately reviewed streaming implementation.
 
