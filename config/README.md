@@ -11,7 +11,7 @@ makes drift fail CI.
 |---|---|
 | `schema.json` | Source of truth (currently `schema_version` 1). Every key declares `type` (one of `u64`, `bool`, `string`), `default` (or `null` when the key must be set per environment), `required`, `env_overridable`, and `env_var`. |
 | `staging.json` / `prod.json` | The expected key sets per environment. Keys and types must match across both files; **values may differ** (hostnames and per-env tuning are the point). |
-| `fixtures/` | Matching + drifted pairs consumed by the parity self-tests. `values-differ-prod.json` proves value differences stay green; `drift-*` files prove the missing-key, type-mismatch, and undeclared-key modes red (key-set asymmetry is pinned with a synthetic optional-key case in the self-tests, not a `drift-*` file). |
+| `fixtures/` | Legacy matching + drifted pairs consumed by the parity self-tests. Matching and value-only comparisons use the same legacy key set on both sides; optional defaulted keys may be absent from both. Shipped staging/prod parity is checked separately. `values-differ-prod.json` proves value differences stay green; `drift-*` files prove the missing-key, type-mismatch, and undeclared-key modes red (key-set asymmetry is pinned with a synthetic optional-key case in the self-tests, not a `drift-*` file). |
 | `../crates/nntune-config` | Typed Rust accessor over the same key table (native + wasm32). |
 
 ## Rules
