@@ -311,6 +311,8 @@ jobs:
         run: python3 .github/scripts/test_ci_rust_cache.py
       - name: Structural-test the required-check concurrency policy
         run: python3 .github/scripts/test_ci_required_check_concurrency.py
+      - name: Test download-only diagnostic boundaries (offline doubles)
+        run: python3 -I .github/scripts/test_release_download_diagnostic.py
       - name: Test the public PR security caller and fail-closed aggregation
         run: python3 .github/scripts/test_ci_public_pr_security.py
       - name: Structural-test the CC0 fixture secret wiring

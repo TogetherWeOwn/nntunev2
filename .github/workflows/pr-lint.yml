@@ -23,6 +23,10 @@ on:
         description: "PR number to validate"
         required: true
         type: string
+      release_download_diagnostic:
+        description: "Download-only probe of original pinned release assets (not a scan)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -99,3 +103,21 @@ jobs:
             echo "::error::PR title must be 'type(scope): summary' (types: feat fix perf refactor test docs build ci chore revert style security), <=100 chars, no trailing period."
             exit 1
           fi
+
+  # Existing registered dispatch entry point; never run downloads on PR/push.
+  # This evidence cannot replace any required scan, policy audit or ci-ok.
+  release-download-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_download_diagnostic
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify download diagnostic contracts (offline doubles)
+        run: python3 -I .github/scripts/test_release_download_diagnostic.py
+      - name: Retrieve original pinned bytes without execution
+        run: python3 -I .github/scripts/release_download_diagnostic.py
