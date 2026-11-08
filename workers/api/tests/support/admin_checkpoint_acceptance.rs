@@ -115,6 +115,342 @@ impl StageRuntime for DatabaseRuntime<'_> {
     }
 }
 
+#[derive(Default)]
+struct DeliveryQueue {
+    messages: Vec<String>,
+    calls: usize,
+    reject: bool,
+    uncertain: bool,
+    pending: bool,
+}
+
+impl store::DeliverySender for DeliveryQueue {
+    type Error = StoreError;
+
+    async fn send(&mut self, encoded: String) -> Result<(), Self::Error> {
+        self.calls += 1;
+        if self.reject {
+            return Err(StoreError::Database);
+        }
+        self.messages.push(encoded);
+        if self.pending {
+            return std::future::pending().await;
+        }
+        if self.uncertain {
+            return Err(StoreError::Database);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn delivery_recovers_lost_and_uncertain_sends_from_committed_progress_without_reset() {
+    let (mut app, original, initial) = seeded().await;
+    let before = authority_row(&app).await;
+    let mut queue = DeliveryQueue {
+        reject: true,
+        ..DeliveryQueue::default()
+    };
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Err(store::DeliveryError::Send)
+    );
+    assert!(queue.messages.is_empty());
+    assert_eq!(authority_row(&app).await, before);
+    queue.reject = false;
+    queue.uncertain = true;
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Err(store::DeliveryError::Send)
+    );
+    queue.uncertain = false;
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Ok(true)
+    );
+    assert_eq!(queue.messages.len(), 2);
+    assert_eq!(queue.messages[0], queue.messages[1]);
+    let hint = store::Delivery::decode(&queue.messages[0]).unwrap();
+    assert_eq!(
+        (hint.job_id(), hint.idempotency_key(), hint.generation()),
+        (original.job_id(), original.idempotency_key(), 1)
+    );
+    assert_eq!(authority_row(&app).await, before);
+    let mut snapshot = initial;
+    for _ in 0..4 {
+        // Simulate loss of each new continuation. Even the first delivery must
+        // reload persisted progress, never trust its original stage/attempt.
+        let loaded = store::load_delivery(&app, &input(&original), &hint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded == snapshot);
+        let mut cp = loaded.checkpoint().clone();
+        let mut runtime = DatabaseRuntime {
+            app: &mut app,
+            original: &original,
+            snapshot: loaded,
+            services: Runtime(cp.clone()),
+        };
+        run_stage(
+            &mut runtime,
+            &mut cp,
+            original.job_id(),
+            original.idempotency_key(),
+            original.parsed(),
+        )
+        .await
+        .unwrap();
+        snapshot = runtime.snapshot;
+        assert_eq!(
+            store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+            Ok(true)
+        );
+        let continuation = store::Delivery::decode(queue.messages.last().unwrap()).unwrap();
+        assert!(continuation == hint);
+        assert!(
+            store::load_delivery(&app, &input(&original), &continuation)
+                .await
+                .unwrap()
+                .unwrap()
+                == snapshot
+        );
+    }
+    assert_eq!(
+        (
+            snapshot.checkpoint().state,
+            snapshot.revision(),
+            snapshot.generation()
+        ),
+        (JobState::Writing, 5, 1)
+    );
+    assert_eq!(counts(&app).await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn delivery_send_cancellation_and_manual_controls_never_adopt_a_newer_generation() {
+    let (mut app, original, initial) = seeded().await;
+    let before = authority_row(&app).await;
+    let mut queue = DeliveryQueue {
+        pending: true,
+        ..DeliveryQueue::default()
+    };
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue)
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        queue.messages.len(),
+        1,
+        "send accepted before its response was cancelled"
+    );
+    assert_eq!(authority_row(&app).await, before);
+    queue.pending = false;
+    let old = store::Delivery::decode(&queue.messages[0]).unwrap();
+    let mut cp = initial.checkpoint().clone();
+    cp.state = JobState::NeedsReview;
+    let parked = initial.successor(cp, false, &identity(&original)).unwrap();
+    seed(&app, &parked).await;
+    assert!(store::load_delivery(&app, &input(&original), &old)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Ok(false)
+    );
+    assert_eq!(queue.calls, 1);
+    let restarted =
+        store::apply_control(&mut app, &input(&original), &parked, Control::RetryReview)
+            .await
+            .unwrap();
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Err(store::DeliveryError::Authority(StoreError::Stale))
+    );
+    assert_eq!(
+        store::load_delivery(&app, &input(&original), &old)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+    assert_eq!(queue.calls, 1);
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), restarted.generation(), &mut queue).await,
+        Ok(true)
+    );
+    let new = store::Delivery::decode(queue.messages.last().unwrap()).unwrap();
+    assert_eq!(new.generation(), restarted.generation());
+    assert!(
+        store::load_delivery(&app, &input(&original), &new)
+            .await
+            .unwrap()
+            .unwrap()
+            == restarted
+    );
+    let rejected = store::apply_control(&mut app, &input(&original), &restarted, Control::Reject)
+        .await
+        .unwrap();
+    assert_eq!(
+        store::load_delivery(&app, &input(&original), &new)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), new.generation(), &mut queue).await,
+        Err(store::DeliveryError::Authority(StoreError::Stale))
+    );
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), rejected.generation(), &mut queue).await,
+        Ok(false)
+    );
+    assert_eq!(queue.calls, 2);
+    assert!(
+        store::load(&app, &input(&original), rejected.generation())
+            .await
+            .unwrap()
+            == rejected
+    );
+}
+
+#[tokio::test]
+async fn delivery_refuses_missing_malformed_or_unlinked_authority_before_sending() {
+    let (app, original, _) = seeded().await;
+    let mut queue = DeliveryQueue::default();
+    let hint = store::prepare_delivery(&app, &input(&original), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let encoded = hint.encode().unwrap();
+    for field in ["job_id", "idempotency_key"] {
+        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        value[field] = if field == "job_id" {
+            "other_job".into()
+        } else {
+            format!("admin:{}", "0".repeat(64)).into()
+        };
+        let foreign = store::Delivery::decode(&value.to_string()).unwrap();
+        assert_eq!(
+            store::load_delivery(&app, &input(&original), &foreign)
+                .await
+                .err(),
+            Some(StoreError::Invalid)
+        );
+    }
+    for generation in [0, -1, 2] {
+        let expected = if generation <= 0 {
+            StoreError::Invalid
+        } else {
+            StoreError::Stale
+        };
+        assert_eq!(
+            store::enqueue_delivery(&app, &input(&original), generation, &mut queue).await,
+            Err(store::DeliveryError::Authority(expected))
+        );
+    }
+    for (change, restore, expected) in [
+        (
+            "UPDATE ingest_jobs SET admin_checkpoint = NULL",
+            "",
+            StoreError::Invalid,
+        ),
+        (
+            "UPDATE ingest_jobs SET admin_checkpoint = '{}'::jsonb",
+            "",
+            StoreError::Invalid,
+        ),
+        (
+            "UPDATE ingest_jobs SET status = 'running'",
+            "UPDATE ingest_jobs SET status = 'queued'",
+            StoreError::Invalid,
+        ),
+        (
+            "UPDATE ingest_jobs SET source = 'upload'",
+            "UPDATE ingest_jobs SET source = 'admin'",
+            StoreError::Stale,
+        ),
+        (
+            "UPDATE ingest_originals SET nzb_bytes = nzb_bytes + 1",
+            "UPDATE ingest_originals SET nzb_bytes = nzb_bytes - 1",
+            StoreError::Stale,
+        ),
+    ] {
+        let saved = authority_row(&app).await;
+        app.batch_execute(change).await.unwrap();
+        let before = authority_row(&app).await;
+        assert_eq!(
+            store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+            Err(store::DeliveryError::Authority(expected))
+        );
+        assert_eq!(
+            store::load_delivery(&app, &input(&original), &hint)
+                .await
+                .err(),
+            Some(expected)
+        );
+        assert_eq!(authority_row(&app).await, before);
+        if restore.is_empty() {
+            app.execute(
+                "UPDATE ingest_jobs SET admin_checkpoint = $1::text::jsonb",
+                &[&saved.2],
+            )
+            .await
+            .unwrap();
+        } else {
+            app.batch_execute(restore).await.unwrap();
+        }
+    }
+    app.batch_execute("DELETE FROM ingest_originals")
+        .await
+        .unwrap();
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
+        Err(store::DeliveryError::Authority(StoreError::Stale))
+    );
+    assert_eq!(queue.calls, 0);
+    assert!(queue.messages.is_empty());
+}
+
+#[tokio::test]
+async fn delivery_replay_after_atomic_publication_does_not_enqueue_or_publish_again() {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let hint = store::prepare_delivery(&app, &input(&original), writing.generation())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut sealer = Sealer::default();
+    let done = store::publish(
+        &mut app,
+        &input(&original),
+        &writing,
+        &recordings,
+        &geometry,
+        &mut sealer,
+    )
+    .await
+    .unwrap();
+    assert!(store::load_delivery(&app, &input(&original), &hint)
+        .await
+        .unwrap()
+        .is_none());
+    let mut queue = DeliveryQueue::default();
+    assert_eq!(
+        store::enqueue_delivery(&app, &input(&original), hint.generation(), &mut queue).await,
+        Ok(false)
+    );
+    assert_eq!((queue.calls, sealer.calls), (0, 1));
+    assert_eq!(counts(&app).await, (1, 1, 1));
+    assert!(
+        store::load(&app, &input(&original), hint.generation())
+            .await
+            .unwrap()
+            == done
+    );
+}
+
 async fn authority_row(app: &tokio_postgres::Client) -> (String, i64, Option<String>) {
     let row = app
         .query_one(

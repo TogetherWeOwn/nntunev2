@@ -33,6 +33,156 @@ pub enum StoreError {
     Database,
 }
 
+/// A bounded wake hint, not checkpoint or execution authority. No payload,
+/// uploader, provider, stage or attempt rides on the queue. Kept separate from
+/// legacy QueueMsg so its KV consumer cannot initialize or execute admin work.
+/// No Debug: consumers report fixed error categories, never raw message bodies.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Delivery(DeliveryWire);
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryWire {
+    schema_version: u8,
+    job_id: String,
+    idempotency_key: String,
+    generation: i64,
+}
+
+impl Delivery {
+    pub fn job_id(&self) -> &str {
+        &self.0.job_id
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.0.idempotency_key
+    }
+
+    pub fn generation(&self) -> i64 {
+        self.0.generation
+    }
+
+    /// Strict wire decoding only. The authenticated original reader and SQL
+    /// authority must still bind this hint before any provider work or mutation.
+    pub fn decode(encoded: &str) -> Result<Self, StoreError> {
+        if encoded.len() > 512 {
+            return Err(StoreError::Invalid);
+        }
+        let wire: DeliveryWire = serde_json::from_str(encoded).map_err(|_| StoreError::Invalid)?;
+        if wire.schema_version != 1
+            || wire.generation <= 0
+            || !jobs::validate_job_id(&wire.job_id)
+            || !crate::library::valid_admin_key(&wire.idempotency_key)
+        {
+            return Err(StoreError::Invalid);
+        }
+        Ok(Self(wire))
+    }
+
+    pub fn encode(&self) -> Result<String, StoreError> {
+        serde_json::to_string(&self.0).map_err(|_| StoreError::Invalid)
+    }
+}
+
+fn executable(snapshot: &Snapshot) -> bool {
+    matches!(
+        snapshot.checkpoint().state,
+        JobState::Queued
+            | JobState::Parsing
+            | JobState::Matching
+            | JobState::Probing
+            | JobState::Writing
+    )
+}
+
+/// Prepare initial send, progress continuation or explicit recovery only from
+/// committed SQL authority for the generation the caller already captured. A
+/// send failure/unknown send result retries this same generation, never reads
+/// and adopts the latest one. Manual commit uncertainty requires resolving that
+/// action separately; it does not authorize selecting a newer generation here.
+///
+/// Sending happens after this read, outside a transaction. Duplicate sends are
+/// safe wake hints: the consumer reloads current authority and every subsequent
+/// side effect still uses full-snapshot CAS. No delivery/ack marker is written,
+/// so a lost continuation can be prepared again without resetting progress.
+/// This is not a scanner, queue binding, automatic reconciliation or live route.
+pub async fn prepare_delivery(
+    client: &Client,
+    original: &StageOriginal<'_>,
+    generation: i64,
+) -> Result<Option<Delivery>, StoreError> {
+    let snapshot = load(client, original, generation).await?;
+    Ok(executable(&snapshot).then(|| {
+        Delivery(DeliveryWire {
+            schema_version: 1,
+            job_id: original.job_id.into(),
+            idempotency_key: original.idempotency_key.into(),
+            generation: snapshot.generation(),
+        })
+    }))
+}
+
+/// The future queue adapter sends only the encoded wake hint. An error can mean
+/// rejection or accepted-but-response-lost; callers must treat both as uncertain.
+/// This seam installs no live Queue binding and grants no authentication.
+pub trait DeliverySender {
+    type Error;
+
+    fn send(
+        &mut self,
+        encoded: String,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryError {
+    Authority(StoreError),
+    Send,
+}
+
+/// Reload committed authority, then send outside any transaction. True means
+/// the sender confirmed acceptance, not that execution or publication occurred.
+/// False means the current generation is parked/terminal. On failure, timeout
+/// or cancellation, recovery repeats this call with the SAME captured generation.
+/// No acknowledgment marker/reset can make progress disappear after a lost send.
+pub async fn enqueue_delivery(
+    client: &Client,
+    original: &StageOriginal<'_>,
+    generation: i64,
+    sender: &mut impl DeliverySender,
+) -> Result<bool, DeliveryError> {
+    let Some(delivery) = prepare_delivery(client, original, generation)
+        .await
+        .map_err(DeliveryError::Authority)?
+    else {
+        return Ok(false);
+    };
+    let encoded = delivery.encode().map_err(DeliveryError::Authority)?;
+    sender
+        .send(encoded)
+        .await
+        .map_err(|_| DeliveryError::Send)?;
+    Ok(true)
+}
+
+/// Reload for every delivery (including redelivery), never execute an embedded
+/// stage or blindly initialize a missing checkpoint. A parked/terminal current
+/// generation needs no work; a generation invalidated by controls is stale.
+/// Caller authenticates/opens the original first and applies its deadline.
+pub async fn load_delivery(
+    client: &Client,
+    original: &StageOriginal<'_>,
+    delivery: &Delivery,
+) -> Result<Option<Snapshot>, StoreError> {
+    if delivery.job_id() != original.job_id
+        || delivery.idempotency_key() != original.idempotency_key
+    {
+        return Err(StoreError::Invalid);
+    }
+    let snapshot = load(client, original, delivery.generation()).await?;
+    Ok(executable(&snapshot).then_some(snapshot))
+}
+
 fn identity<'a>(original: &StageOriginal<'a>) -> Identity<'a> {
     Identity {
         job_id: original.job_id,
@@ -369,3 +519,7 @@ pub async fn publish(
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
 }
+
+#[cfg(test)]
+#[path = "admin_delivery_tests.rs"]
+mod delivery_tests;
