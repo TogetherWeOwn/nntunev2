@@ -35,8 +35,12 @@ test('demo player emits start on playing, complete on end, and survives a 401', 
 		.poll(() => bodies.some((b) => b.playback_id === first.playback_id && b.event === 'complete'))
 		.toBe(true);
 	// Playback still works after telemetry is refused.
+	// Ignore anything from natural auto-advance: look only for a NEW refused start.
 	status = 401;
+	const before = bodies.length;
 	await page.getByTestId('queue-select-second-signal').click();
-	await expect.poll(() => bodies.some((b) => b.track_id === 'second-signal')).toBe(true);
+	await expect
+		.poll(() => bodies.slice(before).some((b) => b.track_id === 'second-signal' && b.event === 'start'))
+		.toBe(true);
 	await expect(page.getByTestId('player-error')).toHaveCount(0);
 });

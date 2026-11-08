@@ -19,7 +19,9 @@ function fakeAudio() {
 	};
 }
 
-function setup(track: string | undefined = 'track-a') {
+function setup(...args: [track?: string]) {
+	// An explicit `undefined` must stay undefined (no default substitution).
+	const track = args.length ? args[0] : 'track-a';
 	const sent: ListenEvent[] = [];
 	const audio = fakeAudio();
 	let n = 0;
@@ -207,11 +209,14 @@ describe('createListenEventSender', () => {
 
 	it('reset drops pending retries so nothing uploads for a new account', async () => {
 		const fetchFn = vi.fn(async () => new Response('', { status: 500 }));
+		vi.useFakeTimers();
 		const sender = createListenEventSender({ baseUrl: '', fetchFn, retryDelaysMs: [30] });
 		sender.send(ev('start'));
-		await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
+		// Flush microtasks only: the first attempt runs, the retry timer has not fired.
+		await vi.advanceTimersByTimeAsync(0);
+		expect(fetchFn).toHaveBeenCalledTimes(1);
 		sender.reset();
-		await new Promise((r) => setTimeout(r, 60));
+		await vi.advanceTimersByTimeAsync(1000);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 

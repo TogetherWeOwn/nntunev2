@@ -1768,9 +1768,9 @@
 		<audio
 			bind:this={audioEl}
 			use:releaseAudio={current?.id}
-			use:listenEvents={() => current?.id}
 			data-testid="demo-audio"
 			src={current?.streamUrl}
+			use:listenEvents={() => current?.id}
 			preload="metadata"
 			controls
 			onplay={handlePlay}

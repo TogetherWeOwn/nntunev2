@@ -2575,10 +2575,10 @@
 				{#key `${currentTrack?.id}:${streamUrl}`}
 					<audio
 						bind:this={audioEl}
-						use:listenEvents={() => currentTrack?.id}
 						data-testid="audio-player"
 						controls
 						src={streamUrl}
+						use:listenEvents={() => currentTrack?.id}
 						onplay={handlePlay}
 						onplaying={handlePlay}
 						onpause={handlePause}

@@ -274,3 +274,38 @@ fn listen_history_throttles_before_unbounded_writes() {
     assert_eq!(refused.retry_after, Some(60));
     assert_eq!(h.store.listen_events.borrow().len(), 1);
 }
+
+#[test]
+fn listen_history_clear_requires_fresh_session_and_origin() {
+    let h = harness();
+    let cookie = play_user(&h);
+    assert_eq!(
+        history_call(
+            &h,
+            &cookie,
+            "POST",
+            crate::listen_history::EVENTS_PATH,
+            history_body("start")
+        )
+        .status,
+        200
+    );
+    let mut ctx = h.ctx();
+    ctx.now = NOW + 601;
+    let mut req = Request {
+        method: "DELETE".into(),
+        path: crate::listen_history::EVENTS_PATH.into(),
+        cookie: Some(cookie),
+        origin: Some(ORIGIN.into()),
+        authorization: None,
+        stripe_signature: None,
+        body: Vec::new(),
+    };
+    let stale = block_on(handle(&ctx, &req));
+    assert_eq!(stale.status, 401, "{}", stale.body);
+    assert!(stale.body.contains("reauth_required"));
+    ctx.now = NOW;
+    req.origin = None;
+    assert_eq!(block_on(handle(&ctx, &req)).status, 401);
+    assert_eq!(h.store.listen_events.borrow().len(), 1);
+}
