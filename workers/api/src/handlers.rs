@@ -8581,10 +8581,16 @@ mod tests {
                         .map_or(0, |row| row.retry_after_secs(now)),
                 });
             }
-            if let Some((owner, session, until)) = self.private_session_before_acquire.borrow_mut().take() {
-                self.private_sessions.borrow_mut().insert((owner, session), until);
+            if let Some((owner, session, until)) =
+                self.private_session_before_acquire.borrow_mut().take()
+            {
+                self.private_sessions
+                    .borrow_mut()
+                    .insert((owner, session), until);
             }
-            let private = self.private_session_active(user_id, session_id, now).await?;
+            let private = self
+                .private_session_active(user_id, session_id, now)
+                .await?;
             if let Some(existing) = self.playback_leases.borrow().get(user_id) {
                 if existing.is_live(now) && existing.session_id != session_id && !takeover {
                     return Ok(crate::playback::LeaseAcquire::Held {
@@ -14187,17 +14193,24 @@ mod tests {
         assert!(h.store.private_sessions.borrow().is_empty());
         // Activation completes after the handler's preflight but before the
         // atomic store boundary. Both this acquisition and the next are private.
-        *h.store.private_session_before_acquire.borrow_mut() = Some((
-            user.to_string(), "tab-a".to_string(), NOW + 600,
-        ));
+        *h.store.private_session_before_acquire.borrow_mut() =
+            Some((user.to_string(), "tab-a".to_string(), NOW + 600));
         for track in ["track-9", "track-10"] {
-            let issued = play_call(&h, &cookie, serde_json::json!({
-                "track_id": track, "session_id": "tab-a",
-            }));
+            let issued = play_call(
+                &h,
+                &cookie,
+                serde_json::json!({
+                    "track_id": track, "session_id": "tab-a",
+                }),
+            );
             assert_eq!(issued.status, 200, "{}", issued.body);
             let play = taste_json(&issued)["play_id"].as_str().unwrap().to_string();
             let key = crate::ledger::derive_play_idempotency_key(user, track, &play).unwrap();
-            assert!(h.store.private_plays.borrow().contains(&(user.to_string(), key)));
+            assert!(h
+                .store
+                .private_plays
+                .borrow()
+                .contains(&(user.to_string(), key)));
         }
         assert_eq!(h.store.playback_leases.borrow()[user].epoch, 2);
         assert_eq!(h.store.private_plays.borrow().len(), 2);

@@ -2894,8 +2894,9 @@ impl Store for PgStore {
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
-                let play_key = crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
-                    .map_err(|_| StoreError)?;
+                let play_key =
+                    crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
+                        .map_err(|_| StoreError)?;
                 let mut client = self.connect().await?;
                 let transaction = client
                     .build_transaction()
@@ -2904,18 +2905,27 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| StoreError)?;
                 let eligible = transaction
-                    .query_typed(crate::taste::private_issuance_fence_statement(), &[(&user_id, Type::TEXT)])
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?;
                 if eligible.is_empty() {
-                    return Ok(crate::playback::LeaseAcquire::Held { retry_after_secs: 0 });
+                    return Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: 0,
+                    });
                 }
                 // Separate statements after the lock give READ COMMITTED a fresh
                 // snapshot. Privacy and the lease commit together, or neither does.
                 let private = transaction
                     .query_typed(
                         crate::taste::private_session_active_statement(),
-                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -2923,12 +2933,19 @@ impl Store for PgStore {
                     transaction
                         .query_typed(
                             crate::taste::private_play_mark_statement(),
-                            &[(&user_id, Type::TEXT), (&play_key, Type::TEXT), (&i64_of(now)?, Type::INT8)],
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&play_key, Type::TEXT),
+                                (&i64_of(now)?, Type::INT8),
+                            ],
                         )
                         .await
                         .map_err(|_| StoreError)?;
                     if transaction
-                        .query_typed(crate::taste::private_play_probe_statement(), &[(&user_id, Type::TEXT), (&play_key, Type::TEXT)])
+                        .query_typed(
+                            crate::taste::private_play_probe_statement(),
+                            &[(&user_id, Type::TEXT), (&play_key, Type::TEXT)],
+                        )
                         .await
                         .map_err(|_| StoreError)?
                         .is_empty()
@@ -2964,11 +2981,17 @@ impl Store for PgStore {
                     // unused privacy mark, without compensating holder writes.
                     None => {
                         let held = transaction
-                            .query_typed(crate::playback::playback_lease_select_statement(), &[(&user_id, Type::TEXT)])
+                            .query_typed(
+                                crate::playback::playback_lease_select_statement(),
+                                &[(&user_id, Type::TEXT)],
+                            )
                             .await
                             .map_err(|_| StoreError)?;
                         let retry_after_secs = match held.first() {
-                            Some(row) => u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?.saturating_sub(now),
+                            Some(row) => {
+                                u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?
+                                    .saturating_sub(now)
+                            }
                             None => 0,
                         };
                         Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
@@ -4276,7 +4299,10 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| StoreError)?;
                 if transaction
-                    .query_typed(crate::taste::private_issuance_fence_statement(), &[(&user_id, Type::TEXT)])
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?
                     .is_empty()
@@ -4322,7 +4348,10 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| StoreError)?;
                 if transaction
-                    .query_typed(crate::taste::private_issuance_fence_statement(), &[(&user_id, Type::TEXT)])
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?
                     .is_empty()
