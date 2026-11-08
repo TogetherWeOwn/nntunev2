@@ -4028,6 +4028,7 @@ impl Store for PgStore {
     async fn load_reconcile_input(
         &self,
         user_id: &str,
+        target_subscription_id: Option<&str>,
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
         Self::bounded(
             async {
@@ -4052,13 +4053,25 @@ impl Store for PgStore {
                     })
                     .transpose()?
                     .flatten();
-                let live_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_live_select_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
+                let live_rows = match target_subscription_id {
+                    Some(subscription_id) => {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::reconcile_target_select_statement(),
+                                &[(&user_id, Type::TEXT), (&subscription_id, Type::TEXT)],
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::reconcile_live_select_statement(),
+                                &[(&user_id, Type::TEXT)],
+                            )
+                            .await
+                    }
+                }
+                .map_err(|_| failed())?;
                 if live_rows.len() > 1 {
                     return Err(StoreError);
                 }
@@ -4174,7 +4187,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 let row = &outcome.row;
-                transaction
+                let written = transaction
                     .query_typed(
                         crate::billing_reconcile::store_reconciled_subscription_statement(),
                         &[
@@ -4197,6 +4210,13 @@ impl Store for PgStore {
                     )
                     .await
                     .map_err(|_| failed())?;
+                if crate::billing_reconcile::reconcile_write_requires_retry(
+                    outcome,
+                    !written.is_empty(),
+                ) {
+                    transaction.rollback().await.map_err(|_| failed())?;
+                    return Err(StoreError);
+                }
                 for history in &outcome.history {
                     transaction
                         .query_typed(
