@@ -240,7 +240,9 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
         String::new()
     };
 
-    let app = SubsonicApp::new(MemStore::empty());
+    // Keep the production surface fail-closed until the authenticated async
+    // store and shared playback adapter replace this empty store.
+    let app = SubsonicApp::production(MemStore::empty());
     let res = app.handle(&method, &path, &query, &body);
     respond(&res)
 }
@@ -249,6 +251,7 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
 fn respond(res: &nntune_subsonic::HttpResponse) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
     let mut response = Response::from_bytes(res.body.clone())?;
     response = response.with_status(res.status);
     *response.headers_mut() = headers;
