@@ -5952,11 +5952,7 @@ pub(crate) async fn retrieve_billing_observation(
     let mut invoices = Vec::with_capacity(listed.len());
     for mut invoice in listed {
         loop {
-            let has_more = invoice
-                .lines
-                .as_ref()
-                .map(|lines| lines.has_more)
-                .unwrap_or(false);
+            let has_more = invoice.lines.as_ref().ok_or(StoreError)?.has_more;
             if !has_more {
                 break;
             }
@@ -5985,18 +5981,9 @@ pub(crate) async fn retrieve_billing_observation(
             {
                 return Err(StoreError);
             }
-            match invoice.lines.as_mut() {
-                Some(lines) => {
-                    lines.data.extend(page.data);
-                    lines.has_more = page.has_more;
-                }
-                None => {
-                    invoice.lines = Some(crate::stripe::InvoiceLines {
-                        data: page.data,
-                        has_more: page.has_more,
-                    });
-                }
-            }
+            let lines = invoice.lines.as_mut().ok_or(StoreError)?;
+            lines.data.extend(page.data);
+            lines.has_more = page.has_more;
         }
         invoices.push(invoice);
     }
@@ -13001,6 +12988,33 @@ mod tests {
             webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
             assert_eq!(h.store.invoice_history.borrow().len(), 1);
         }
+    }
+
+    #[test]
+    fn billing_missing_invoice_lines_are_not_an_exhausted_observation() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        let mut invoice = test_invoice(
+            "in_test_1",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            BILLING_NOW + BILLING_PERIOD,
+            BILLING_NOW + 60,
+        );
+        invoice.lines = None;
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert(invoice.id.clone(), invoice);
+        assert!(block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).is_err());
+        assert!(h.store.billing_rows.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
     }
 
     #[test]

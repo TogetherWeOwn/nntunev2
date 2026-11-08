@@ -4303,53 +4303,69 @@ impl Store for PgStore {
                     .start()
                     .await
                     .map_err(|_| failed())?;
-                // Server-side backstops bounded by the time left: a hung
-                // statement, or a backend left idle in transaction while
-                // the provider fetch runs (or after this future is
-                // dropped), is cancelled/terminated by Postgres, which
-                // rolls back and releases the advisory lock.
-                Self::set_local_timeouts(&transaction, remaining_ms())
-                    .await
-                    .map_err(|_| failed())?;
-                // Lock BEFORE any decision input or provider retrieval, so
-                // the fold's view of local state cannot be overtaken by a
-                // competing pass between read and write.
-                transaction
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_lock_statement(),
-                        &[(&user_id, Type::TEXT)],
+                let applied = async {
+                    // Server-side backstops bounded by the time left: a hung
+                    // statement, or a backend left idle in transaction while
+                    // the provider fetch runs (or after this future is
+                    // dropped), is cancelled/terminated by Postgres, which
+                    // rolls back and releases the advisory lock.
+                    Self::set_local_timeouts(&transaction, remaining_ms())
+                        .await
+                        .map_err(|_| failed())?;
+                    // Lock BEFORE any decision input or provider retrieval, so
+                    // the fold's view of local state cannot be overtaken by a
+                    // competing pass between read and write.
+                    transaction
+                        .query_typed(
+                            crate::billing_reconcile::reconcile_lock_statement(),
+                            &[(&user_id, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                    let input = Self::load_reconcile_input_on(
+                        &transaction,
+                        user_id,
+                        &failed,
+                        Some(&remaining_ms),
                     )
-                    .await
-                    .map_err(|_| failed())?;
-                let input = Self::load_reconcile_input_on(
-                    &transaction,
-                    user_id,
-                    &failed,
-                    Some(&remaining_ms),
-                )
-                .await?;
-                // Lock wait and local reads consumed part of the same budget.
-                // Narrow the idle backstop before yielding to provider I/O.
-                Self::set_local_timeouts(&transaction, remaining_ms())
-                    .await
-                    .map_err(|_| failed())?;
-                let remote =
-                    crate::handlers::retrieve_billing_observation(stripe, subscription_id).await?;
-                let outcome =
-                    crate::billing_reconcile::reconcile_subscription(&input, &remote, now_unix);
-                Self::write_reconcile_outcome_on(
-                    &transaction,
-                    user_id,
-                    &outcome,
-                    &failed,
-                    &remaining_ms,
-                )
-                .await?;
-                Self::set_local_timeouts(&transaction, remaining_ms())
-                    .await
-                    .map_err(|_| failed())?;
-                transaction.commit().await.map_err(|_| failed())?;
-                Ok(outcome)
+                    .await?;
+                    // Lock wait and local reads consumed part of the same budget.
+                    // Narrow the idle backstop before yielding to provider I/O.
+                    Self::set_local_timeouts(&transaction, remaining_ms())
+                        .await
+                        .map_err(|_| failed())?;
+                    let remote =
+                        crate::handlers::retrieve_billing_observation(stripe, subscription_id)
+                            .await?;
+                    let outcome =
+                        crate::billing_reconcile::reconcile_subscription(&input, &remote, now_unix);
+                    Self::write_reconcile_outcome_on(
+                        &transaction,
+                        user_id,
+                        &outcome,
+                        &failed,
+                        &remaining_ms,
+                    )
+                    .await?;
+                    Self::set_local_timeouts(&transaction, remaining_ms())
+                        .await
+                        .map_err(|_| failed())?;
+                    Ok::<_, StoreError>(outcome)
+                }
+                .await;
+                match applied {
+                    Ok(outcome) => {
+                        transaction.commit().await.map_err(|_| failed())?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        // Ordinary errors finish rollback before returning.
+                        // Cancellation/expiry instead drops the transaction,
+                        // whose driver queues rollback before client teardown.
+                        transaction.rollback().await.map_err(|_| failed())?;
+                        Err(error)
+                    }
+                }
             },
             TOTAL_TIMEOUT_MS,
         )
