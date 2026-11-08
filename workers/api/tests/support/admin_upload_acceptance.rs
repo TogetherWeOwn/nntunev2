@@ -2,11 +2,42 @@
 //! acceptance or live dispatch. Reuse the existing synthetic corpus in memory.
 use super::*;
 use intake::{AdminIngestAttempt, AdminIngestUploadOutcome, FailureReason};
-use nntune_api::worker_entry::admin_ingest_upload_for_postgres_test as upload;
+use nntune_api::{
+    handlers::StoreError,
+    worker_entry::admin_ingest_upload_for_postgres_test as upload_with_checkpoint,
+};
 use nntune_ingest::{
+    admin_checkpoint::{Identity, Snapshot},
     admin_checkpoint_store::{self as checkpoints, StageOriginal},
     jobs::JobState,
 };
+
+fn fresh_checkpoint(job_id: &str, idempotency_key: &str) -> Result<String, StoreError> {
+    Snapshot::new_admission(&Identity {
+        job_id,
+        user_id: "",
+        idempotency_key,
+    })
+    .and_then(|snapshot| snapshot.encode())
+    .map_err(|_| StoreError)
+}
+
+async fn upload(
+    app: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+    initialize_checkpoint: bool,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
+    upload_with_checkpoint(
+        app,
+        attempt,
+        if initialize_checkpoint {
+            Some(fresh_checkpoint)
+        } else {
+            None
+        },
+    )
+    .await
+}
 
 async fn database() -> tokio_postgres::Client {
     let app = client(false).await;
@@ -159,6 +190,60 @@ async fn upload_replay_never_repairs_or_resets_any_existing_authority() {
         .unwrap()
         .get(0);
     assert_eq!(duplicate_audits, 7);
+}
+
+#[tokio::test]
+async fn checkpoint_constructor_refusal_aborts_fresh_upload_but_replay_never_calls_it() {
+    fn refuse(_: &str, _: &str) -> Result<String, StoreError> {
+        Err(StoreError)
+    }
+    fn unexpected(_: &str, _: &str) -> Result<String, StoreError> {
+        panic!("checkpoint constructor must not run")
+    }
+    let mut app = database().await;
+    let attempt = attempt();
+    assert!(upload_with_checkpoint(&mut app, &attempt, Some(refuse))
+        .await
+        .is_err());
+    assert_eq!(counts(&app).await, (0, 0, 0));
+
+    upload(&mut app, &attempt, true).await.unwrap();
+    let before = authority(&app).await;
+    let replay = upload_with_checkpoint(&mut app, &attempt, Some(unexpected))
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        AdminIngestUploadOutcome::Stored {
+            deduplicated: true,
+            ..
+        }
+    ));
+    assert_eq!(authority(&app).await, before);
+    assert_eq!(counts(&app).await, (1, 1, 2));
+
+    let mut rejected = database().await;
+    let mut rejection = self::attempt();
+    rejection.failure = Some(FailureReason::Malformed);
+    rejection.original = None;
+    upload_with_checkpoint(&mut rejected, &rejection, Some(unexpected))
+        .await
+        .unwrap();
+    assert_eq!(authority(&rejected).await, ("failed".into(), 0, None));
+    assert_eq!(counts(&rejected).await, (1, 0, 1));
+
+    let mut denied = database().await;
+    denied
+        .batch_execute("UPDATE users SET role = 'member'")
+        .await
+        .unwrap();
+    assert_eq!(
+        upload_with_checkpoint(&mut denied, &attempt, Some(unexpected))
+            .await
+            .unwrap(),
+        AdminIngestUploadOutcome::ActorNotAdmin,
+    );
+    assert_eq!(counts(&denied).await, (0, 0, 0));
 }
 
 #[tokio::test]

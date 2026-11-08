@@ -1726,14 +1726,14 @@ async fn admin_ingest_upload_on(
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     // Keep live admission on the pre-schema path until ordered schema
     // integration. No column detection or fallback can enable execution.
-    admin_ingest_upload_with_authority_on(client, attempt, false).await
+    admin_ingest_upload_with_authority_on(client, attempt, None).await
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub async fn admin_ingest_upload_for_postgres_test(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
-    initialize_checkpoint: bool,
+    initialize_checkpoint: Option<fn(&str, &str) -> Result<String, StoreError>>,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     admin_ingest_upload_with_authority_on(client, attempt, initialize_checkpoint).await
 }
@@ -1741,10 +1741,14 @@ pub async fn admin_ingest_upload_for_postgres_test(
 /// The checkpoint-enabled branch is prepared for ordered schema integration,
 /// not selected by the live caller yet. Only a fresh accepted insert initializes;
 /// duplicates return above it without reading or resetting checkpoint authority.
+/// The internal coordinator must supply the ingest-owned strict fresh-checkpoint
+/// constructor. API owns the transaction, not the pipeline wire format, and must
+/// not link another Worker's runtime merely to construct this evidence. Refusal
+/// aborts the transaction; absence explicitly selects the pre-schema path.
 async fn admin_ingest_upload_with_authority_on(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
-    initialize_checkpoint: bool,
+    initialize_checkpoint: Option<fn(&str, &str) -> Result<String, StoreError>>,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     transaction
@@ -1868,7 +1872,7 @@ async fn admin_ingest_upload_with_authority_on(
             deduplicated: true,
         });
     }
-    let checkpoint = if initialize_checkpoint {
+    let checkpoint = if let Some(initialize) = initialize_checkpoint {
         match (&attempt.failure, &attempt.original) {
             (None, Some(envelope)) => {
                 let bytes = usize::try_from(attempt.nzb_bytes).map_err(|_| StoreError)?;
@@ -1881,15 +1885,7 @@ async fn admin_ingest_upload_with_authority_on(
                 {
                     return Err(StoreError);
                 }
-                let snapshot = nntune_ingest::admin_checkpoint::Snapshot::new_admission(
-                    &nntune_ingest::admin_checkpoint::Identity {
-                        job_id: &attempt.job_id,
-                        user_id: "",
-                        idempotency_key: &attempt.idempotency_key,
-                    },
-                )
-                .map_err(|_| StoreError)?;
-                Some(snapshot.encode().map_err(|_| StoreError)?)
+                Some(initialize(&attempt.job_id, &attempt.idempotency_key)?)
             }
             (Some(_), None) => None,
             _ => return Err(StoreError),
