@@ -309,38 +309,43 @@ async fn owner_lock_timeout_aborts_batch_without_partial_progress() {
 }
 
 #[tokio::test]
-async fn deferred_commit_statement_timeout_rolls_back_wrap_audit_and_checkpoint() {
+async fn deferred_commit_failure_rolls_back_wrap_audit_and_checkpoint() {
     let mut f = Fixture::new().await;
     f.link("a").await;
     open(&mut f.db, "run", "stage", 2, &Keys).await.unwrap();
     // This fires only at COMMIT, after every wrap, audit and checkpoint write.
-    // The production SET LOCAL statement timeout must interrupt it there too.
+    // Sequence advancement survives rollback and proves the fault was reached.
     f.db.batch_execute(
-        "CREATE FUNCTION stall_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        "CREATE SEQUENCE commit_fault_seen;
+         CREATE FUNCTION reject_commit() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
-             PERFORM pg_sleep(60);
-             RETURN NEW;
+             PERFORM nextval('commit_fault_seen');
+             RAISE EXCEPTION 'injected deferred commit failure';
          END $$;
-         CREATE CONSTRAINT TRIGGER stall_commit AFTER UPDATE
+         CREATE CONSTRAINT TRIGGER reject_commit AFTER UPDATE
              ON listenbrainz_rotation_runs DEFERRABLE INITIALLY DEFERRED
-             FOR EACH ROW EXECUTE FUNCTION stall_commit()",
+             FOR EACH ROW EXECUTE FUNCTION reject_commit()",
     )
     .await
     .unwrap();
-    let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(15),
         batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1001),
     )
     .await
-    .expect("COMMIT must settle under its statement timeout, not the 30s deadline");
+    .expect("the injected COMMIT rejection must settle");
     assert!(result.is_err());
-    assert!(
-        started.elapsed() >= Duration::from_secs(4),
-        "must reach the injected COMMIT stall, not fail early"
-    );
     // Settle the driver before taking any error as evidence of rollback.
-    f.db.simple_query("SELECT 1").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.db.simple_query("SELECT 1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let reached: bool =
+        f.db.query_one("SELECT is_called FROM commit_fault_seen", &[])
+            .await
+            .unwrap()
+            .get(0);
+    assert!(reached, "must reach the injected deferred COMMIT failure");
     let mut observer = f.other().await;
     let saved = reconcile(&mut observer, "run", "stage", 2).await.unwrap();
     assert_eq!((saved.checkpoint_seq, saved.scanned), (0, 0));
@@ -348,7 +353,7 @@ async fn deferred_commit_statement_timeout_rolls_back_wrap_audit_and_checkpoint(
     assert!(!saved.finished);
     assert_eq!(read(&observer, "a").await.unwrap().unwrap().kek_version, 1);
     assert_eq!(f.audits().await, 0);
-    f.db.batch_execute("DROP TRIGGER stall_commit ON listenbrainz_rotation_runs")
+    f.db.batch_execute("DROP TRIGGER reject_commit ON listenbrainz_rotation_runs")
         .await
         .unwrap();
     let resumed = batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1002)
@@ -356,6 +361,70 @@ async fn deferred_commit_statement_timeout_rolls_back_wrap_audit_and_checkpoint(
         .unwrap();
     assert_eq!((resumed.checkpoint_seq, resumed.rewrapped), (1, 1));
     assert_eq!(f.audits().await, 1);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn commit_outliving_caller_deadline_is_reconciled_without_replay() {
+    let mut f = Fixture::new().await;
+    let old = f.link("a").await;
+    open(&mut f.db, "run", "stage", 2, &Keys).await.unwrap();
+    // PostgreSQL disables statement_timeout during deferred COMMIT work.
+    // Dropping a pending driver COMMIT does not queue ROLLBACK: the caller
+    // deadline bounds waiting, not backend settlement or the final outcome.
+    f.db.batch_execute(
+        "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_sleep(33);
+             RETURN NEW;
+         END $$;
+         CREATE CONSTRAINT TRIGGER slow_commit AFTER UPDATE
+             ON listenbrainz_rotation_runs DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION slow_commit()",
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(45),
+        batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1001),
+    )
+    .await
+    .expect("the caller deadline must bound waiting even during COMMIT");
+    assert!(result.is_err(), "must discard the unacknowledged report");
+    assert!(
+        started.elapsed() >= Duration::from_secs(29),
+        "an early error must not pass as a deadline during COMMIT"
+    );
+    tokio::time::timeout(Duration::from_secs(15), f.db.simple_query("SELECT 1"))
+        .await
+        .expect("the delayed COMMIT must settle before reconciliation")
+        .unwrap();
+    let mut observer = f.other().await;
+    let saved = reconcile(&mut observer, "run", "stage", 2).await.unwrap();
+    assert_eq!(
+        (saved.checkpoint_seq, saved.scanned, saved.rewrapped),
+        (1, 1, 1)
+    );
+    assert!(saved.finished);
+    assert_eq!(saved.owner_cursor.as_ref().unwrap().as_str(), "a");
+    let new = read(&observer, "a").await.unwrap().unwrap();
+    assert_eq!(new.kek_version, 2);
+    assert_eq!(new.envelope.payload_nonce, old.envelope.payload_nonce);
+    assert_eq!(new.envelope.ciphertext, old.envelope.ciphertext);
+    assert_eq!(f.audits().await, 1);
+    assert_eq!(
+        open(&mut f.db, "run", "stage", 2, &Keys).await.unwrap(),
+        saved
+    );
+    assert!(batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1002)
+        .await
+        .is_err());
+    assert_eq!(
+        reconcile(&mut observer, "run", "stage", 2).await.unwrap(),
+        saved
+    );
+    assert_eq!(f.audits().await, 1, "never replay committed deltas");
     f.cleanup().await;
 }
 
