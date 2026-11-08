@@ -159,7 +159,7 @@ jobs:
       group: ${{ github.workflow }}-staging-api-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -201,6 +201,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build api with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-api.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true'
@@ -276,8 +288,7 @@ jobs:
           main = "build/worker/shim.mjs"
           compatibility_date = "2026-10-01"
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-api-staging"
@@ -451,7 +462,7 @@ jobs:
       group: ${{ github.workflow }}-staging-mb-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -489,6 +500,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build mb with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/mb
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-mb.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-mb.log"
+          git diff --exit-code -- Cargo.lock
       - name: Generate staging wrangler.toml
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/mb
@@ -525,8 +548,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-mb-staging"
@@ -649,7 +671,7 @@ jobs:
       group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -703,6 +725,18 @@ jobs:
               echo "Enable only after search intake closes — runbook step 1."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build ingest with canonical tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        working-directory: workers/ingest
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-ingest.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-ingest.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
@@ -759,8 +793,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-ingest-staging"
