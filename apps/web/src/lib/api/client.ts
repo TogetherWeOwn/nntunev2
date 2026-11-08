@@ -243,6 +243,28 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+/**
+ * Token-free `GET`/`DELETE /v1/me/listenbrainz` status: `linked` plus the
+ * canonical `username` only. The wire never carries a token, so neither does
+ * this type.
+ */
+export type ListenBrainzStatus = { linked: false } | { linked: true; username: string };
+
+/**
+ * Guard the status body and keep only `linked`/`username`, so an unexpected
+ * extra field can never reach the UI.
+ */
+function validateListenBrainzStatus(data: unknown, status: number): ListenBrainzStatus {
+	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+		const record = data as Record<string, unknown>;
+		if (record.linked === false) return { linked: false };
+		if (record.linked === true && isNonEmptyString(record.username)) {
+			return { linked: true, username: record.username };
+		}
+	}
+	throw passkeyStartShapeFailure(status);
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -336,6 +358,27 @@ export class ApiClient {
 		return this.request<{ ok: true }>(`/v1/credentials/${encodeURIComponent(id)}`, {
 			method: 'DELETE'
 		});
+	}
+
+	/** Read the account's token-free ListenBrainz link status. */
+	async getListenBrainzStatus(signal?: AbortSignal): Promise<ListenBrainzStatus> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/me/listenbrainz', {
+			method: 'GET',
+			signal
+		});
+		return validateListenBrainzStatus(data, status);
+	}
+
+	/**
+	 * Delete the stored ListenBrainz link. Needs a fresh session: a stale one
+	 * fails with `reauth_required`. Never retried here.
+	 */
+	async unlinkListenBrainz(signal?: AbortSignal): Promise<ListenBrainzStatus> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/me/listenbrainz', {
+			method: 'DELETE',
+			signal
+		});
+		return validateListenBrainzStatus(data, status);
 	}
 
 	/**
