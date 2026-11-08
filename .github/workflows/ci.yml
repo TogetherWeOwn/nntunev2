@@ -1042,6 +1042,8 @@ jobs:
         run: python3 ci/test_staging_admission.py
       - name: Unit-test the receipt archive bounds
         run: python3 ci/test_read_promotion_receipt.py
+      - name: Unit-test gate incident reporting (offline API fixtures)
+        run: python3 -I ci/test_incident_report.py
       - name: Promotion proof scripts parse clean
         run: |
           node --check ci/release-promotion-proof.cjs

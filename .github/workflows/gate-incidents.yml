@@ -1,0 +1,37 @@
+name: gate-incidents
+
+# Observe conclusions, never change a deployment or qualification gate. Read
+# completed runs through the API; never execute their source or download artifacts.
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One issue writer; queue completions instead of dropping pending reports.
+concurrency:
+  group: gate-incident-writer
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  report:
+    name: Report completed gate incidents
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # Read trusted run and job conclusions, never logs or artifacts.
+      issues: write # Open, update and recover keyed incidents only.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Open, update or recover gate incidents
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I ci/incident_report.py --recent

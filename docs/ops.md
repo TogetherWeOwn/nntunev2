@@ -780,6 +780,109 @@ Notes, all referencing (not changing) owning-lane state:
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
 
+### Gate incident reporting
+
+`gate-incidents.yml` scans completed main-branch `deploy`, `e2e-staging`
+and `deploy-production` runs every ten minutes (or on manual dispatch from
+`main`), without the privileged `workflow_run` trigger. Existing `deploy`
+runs triggered by either `push` or `workflow_dispatch` are included; schedule
+is not a supported event for that workflow. All sources must be completed,
+same-repository main-branch runs with a valid SHA. Its separate
+issue-writer job opens one
+`incident` issue per workflow/job key, comments on repeats and closes it
+with a recovery comment after a successful job with its required evidence
+step. Unconfigured/skipped smoke and skipped deployment jobs do not recover
+an incident. Ordering is per gate: a newer run that skips the gate cannot
+erase its earlier failure or recovery. Each keyed issue records its last
+source run/attempt, including after closure; issue activity time is not a
+proxy for failure time. Older evidence cannot close/reopen a newer episode.
+Recurrence reopens the existing keyed issue. Repeat and recovery comments carry
+an occurrence identity: retries reconcile delivery before skipping a recorded
+source, including when a write succeeded but its response was lost. Initial
+issue creation is the opening notification, not an additional repeat comment.
+Delivery intent, occurrence and progress cursor are persisted on the issue
+before posting. Comment receipt lookup uses the read-only GraphQL comments
+connection, with at most ten requests per reconciliation, **including failed
+oversize reads**. Pages start at at most 100 complete bodies; the hard HTTP
+response limit remains 2,097,152 bytes (the reader requests one extra byte to
+detect overflow). A byte-saturated read halves the page size, down to one,
+without moving the cursor. Bodies and receipt markers are never truncated.
+The reduced size and last examined cursor are saved on budget exhaustion and
+reused on later invocations; old state without a size starts at 100. A single
+comment response still exceeding the byte limit leaves delivery pending and
+prints a fixed diagnostic requiring manual investigation. It never marks
+delivery successful or prevents unrelated gates from being processed. Other
+API errors, including refusals, still fail the reporting job.
+
+Reaching the request budget saves progress and defers only that gate, rather
+than assuming an unexamined receipt absent. Later scans resume the persisted
+intent even when its source run has left the recent-run window. **Newer
+transitions deferred behind it are not queued.** After the old intent drains,
+a missed newer transition can require deliberate run-ID replay after checking
+newer evidence; repeated scans are not an all-occurrence delivery guarantee.
+Existing issues without delivery state migrate by scanning from the beginning;
+subsequent occurrences retain the last completed delivery's lower bound.
+Accumulated comment history has no fixed lifetime count ceiling, subject to
+these byte, request and catch-up limits. A delivered marker prevents duplicate
+notifications after a lost response or failed final PATCH; recovery closes only
+after delivery is confirmed. Keep existing gate keys stable.
+The existing MB/ingest job names are observed only; reporting does not
+enable those lanes or change their retirement/qualification holds.
+
+This observer reads job/step conclusions only, never logs, artifacts or
+triggering-run code. Issues carry the source SHA, attempt URL, fixed gate
+name, failing step numbers and expected-versus-observed job conclusion.
+Numeric journey counts remain in the linked gate summary; absence from the
+jobs API is not a fabricated measurement. A manual promotion's source SHA
+is not its selected target SHA; consult that run's preflight for the target.
+Reporting success is neither staging qualification nor production approval.
+
+The observer needs only `contents: read`, `actions: read` and job-scoped
+`issues: write` with the existing workflow token. The `incident` label must
+exist. API failures fail the reporting job; inspect the observer's Actions
+run if an expected incident is absent. The inherited all-state labelled-issue
+listing is bounded to ten REST pages of 100 rows: it succeeds only below
+1,000 listed rows, and **exactly 1,000 also refuses**, because no shorter final
+page established completeness. Listed pull requests count toward this ceiling,
+even though they are excluded from incident matching. Saturation prevents
+pending reconciliation as well as new delivery; this observer does not claim
+population-scale or all-history coverage. The existing incident intake owns
+routing issues to an accountable responder; an issue alone is not a hold
+owner. The Actions-only reporting schedule performs API reads and issue
+writes; it never starts staging resources, alarms, probes or keep-alive,
+and introduces no always-on staging/preview runtime or new credential.
+
+Each scan considers the latest 100 created runs per workflow and selects
+trusted completed runs updated within the last hour, at most ten total.
+The snapshot is collected before writing, then processed oldest source first
+so observed failures followed by recovery leave an incident trail. The runs
+listing exposes the latest attempt, not every attempt: a failure rerun green
+between scans can be missed; exhaustive attempt delivery is not claimed.
+Newer completed sources outside that one-hour candidate window still supply
+per-gate supersession evidence from the same history snapshot, even with no
+prior incident or after closure. Skipped/unevidenced gates do not supersede.
+At most ten such additional sources are read before any writes; exceeding
+that evidence bound fails the scan. Repeated scans reconcile missing delivery
+without repeating a delivered occurrence. A saturated recent history window
+or more than ten candidates also fails before writes, rather than silently
+truncating. Inspect reporting failures promptly: Actions schedules
+can be delayed, and an outage beyond one hour or a rerun older than the latest
+100 created runs requires deliberate run-ID replay after checking newer
+evidence. The scan is bounded catch-up, not durable all-history delivery.
+
+There is no scheduled production promotion workflow here: production is
+manual-only. Consequently there is no scheduled six-hour production-hold
+detector. Completed failed/cancelled promotion attempts are reported, but
+an attempt still waiting on an environment approval is not completed and
+is not detected by this observer. Do not claim unattended hold coverage.
+
+Read-only replay of a completed main-branch run:
+`GITHUB_REPOSITORY=TogetherWeOwn/nntunev2 python3 -I ci/incident_report.py --run-id <run-id> --dry-run`
+(with a granted `GITHUB_TOKEN`). Dry runs perform REST GETs and read-only
+GraphQL queries and print planned issue actions without writing. Superseded runs print `superseded` instead
+of replaying stale alerts. Offline API-fixture tests run in the required
+`release-proof` CI job; neither mode touches staging or production.
+
 ### Production seed precondition (one-time)
 
 The production lane (`.github/workflows/deploy-production.yml`) promotes
