@@ -775,6 +775,42 @@ Notes, all referencing (not changing) owning-lane state:
   `NNTP_POOL`, `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` per environment
   once each target Worker deploys (see the operator runbook below).
 
+## Worker build tools
+
+The api, mb and ingest release builds share the exact tool versions in
+`.github/worker-toolchain.json`. The Actions-only helper
+`.github/scripts/worker_tools.py install` prepares worker-build and
+wasm-bindgen-cli with exact-version, locked Cargo installs, checks their
+crate archives against the manifest, and prepares checksum-verified esbuild
+and wasm-opt executables. Each download has a fresh directory; only the
+selected regular executable is read from each binary archive. No npm
+package scripts are run. Cargo has no stable native release-age filter or
+blanket build-script/proc-macro refusal; exact pins, registry/archive checks
+and credential-free Actions builds do not eliminate that residual trust.
+
+The helper exports absolute `WASM_BINDGEN_BIN`, `ESBUILD_BIN` and
+`WASM_OPT_BIN` paths and a fresh `XDG_CACHE_HOME`. It refuses Cloudflare
+environment variables. The committed Wrangler build commands invoke only
+`worker-build --release -- --locked`; prepare the canonical tools first.
+Do not add another version pin to a workflow or config example. Local full
+builds are not part of this procedure: use the
+[Actions verification contract](../CONTRIBUTING.md#verification-github-actions-first).
+
+The staging lanes prepare tools and build before any Cloudflare credential
+step. Each captures the release build log and runs `worker_tools.py
+check-build <log>` to require all three resolved overrides and an empty
+worker-build download cache. A failed build or verification prevents upload.
+Wrangler then uploads the existing bundle with `--no-build`. Existing
+configuration, Hyperdrive, schema, ingest-enable and deployment outcome gates
+remain in force. Production workflow and secret scope are unchanged.
+
+The required `worker-release-builds` CI job exercises the same tool
+preparation and all three ordinary release builds without deployment
+credentials. Its negative tests cover changed archives, missing overrides,
+fallbacks, cache contents and workflow/config agreement. Retain its
+exact-head Actions job link and build-log artifact with review evidence;
+a skipped staging lane is not deployment evidence.
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated

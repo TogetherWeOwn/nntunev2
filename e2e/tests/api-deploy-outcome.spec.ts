@@ -107,7 +107,7 @@ function assertWiring(source: string) {
   expect(step('Generate staging wrangler.toml', source)).toContain('working-directory: workers/api');
   expect(step('Hyperdrive cache-disabled gate', source)).not.toContain('--allow-skip');
   expect(source.indexOf('- name: Record API deployment outcome')).toBeGreaterThan(source.indexOf('- name: Deploy api to staging'));
-  expect(step('Deploy api to staging', source)).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
+  expect(step('Deploy api to staging', source)).toContain('command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}');
 }
 
 test.describe('API deployment outcome (offline workflow contract)', () => {

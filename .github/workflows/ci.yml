@@ -1552,11 +1552,47 @@ jobs:
       - name: Run health-alert acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
 
+  worker-release-builds:
+    name: worker release builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test canonical tool preparation and workflow boundaries
+        run: |
+          python3 -I .github/scripts/test_worker_tools.py
+          python3 -I .github/scripts/test_worker_build_workflow.py
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - name: Prepare canonical Worker tools
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build ordinary Worker release bundles
+        run: |
+          set -euo pipefail
+          for worker in api mb ingest; do
+            (cd "workers/$worker" && worker-build --release -- --locked) 2>&1 | tee "$RUNNER_TEMP/worker-$worker.log"
+            python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-$worker.log"
+          done
+      - name: Upload Worker build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: worker-release-builds-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-*.log
+          retention-days: 7
+          if-no-files-found: warn
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
