@@ -16,6 +16,8 @@
 #[allow(dead_code)] // User dispatch remains unwired.
 pub(crate) mod coordinator;
 #[allow(dead_code)]
+pub(crate) mod link;
+#[allow(dead_code)]
 mod transport;
 
 use serde::Deserialize;

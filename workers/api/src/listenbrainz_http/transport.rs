@@ -128,7 +128,7 @@ fn redirect_policy() -> RequestRedirect {
 /// Only fixed `ApiRequest` endpoints are representable. Redirects are returned
 /// as unavailable, never followed, including same-origin redirects. No retry,
 /// cache API, logging, inherited browser headers or configurable URL is used.
-pub(super) async fn exchange(request: ApiRequest) -> Exchange {
+pub(super) async fn exchange(request: &ApiRequest) -> Exchange {
     let head = Cell::new(None);
     let operation = async {
         let headers = Headers::new();

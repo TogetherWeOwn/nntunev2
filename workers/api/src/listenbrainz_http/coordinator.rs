@@ -14,7 +14,7 @@ use super::{transport::Exchange, ApiRequest, WireError};
 
 pub(crate) async fn exchange(
     store: &impl Store,
-    request: ApiRequest,
+    request: &ApiRequest,
 ) -> Result<Exchange, WireError> {
     coordinate(
         store.claim_listenbrainz_outbound(),

@@ -29,6 +29,7 @@ pub mod legacy_playlist_fixtures;
 pub mod library;
 pub mod listenbrainz;
 pub mod listenbrainz_http;
+pub mod listenbrainz_rotation;
 mod listenbrainz_store;
 mod magic_redemption;
 pub mod meter_sink;
