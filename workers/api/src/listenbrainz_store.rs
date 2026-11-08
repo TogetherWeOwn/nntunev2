@@ -1,0 +1,182 @@
+//! Durable ListenBrainz credential lifecycle. No HTTP or provider calls.
+//!
+//! Callers authenticate/freshness-check the session and validate the token's
+//! upstream username before replacing a link. Both mutations lock the owner
+//! row (including when no link exists), reject the account-deletion fence,
+//! and commit the credential change and scalar-only audit together. Relinking
+//! deletes then inserts; there is no second credential copy or UPSERT.
+
+use tokio_postgres::{types::Type, Client, Row};
+
+use crate::{
+    account_deletion::FencedWriteOutcome,
+    field_envelope::FieldEnvelope,
+    handlers::StoreError,
+    listenbrainz::{StoredLink, Username},
+};
+
+pub(crate) async fn read(client: &Client, user_id: &str) -> Result<Option<StoredLink>, StoreError> {
+    let rows = client
+        .query_typed(
+            "SELECT user_id, username, kek_version, dek_wrapped_nonce, dek_wrapped, \
+             payload_nonce, ciphertext FROM listenbrainz_links WHERE user_id = $1",
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first().map(decode).transpose()
+}
+
+fn decode(row: &Row) -> Result<StoredLink, StoreError> {
+    let version: i32 = row.try_get("kek_version").map_err(|_| StoreError)?;
+    let username: String = row.try_get("username").map_err(|_| StoreError)?;
+    let nonce: Vec<u8> = row.try_get("dek_wrapped_nonce").map_err(|_| StoreError)?;
+    let payload_nonce: Vec<u8> = row.try_get("payload_nonce").map_err(|_| StoreError)?;
+    let link = StoredLink {
+        user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+        username: Username::parse(&username).map_err(|_| StoreError)?,
+        kek_version: u32::try_from(version).map_err(|_| StoreError)?,
+        envelope: FieldEnvelope {
+            dek_wrapped_nonce: nonce.try_into().map_err(|_| StoreError)?,
+            dek_wrapped: row.try_get("dek_wrapped").map_err(|_| StoreError)?,
+            payload_nonce: payload_nonce.try_into().map_err(|_| StoreError)?,
+            ciphertext: row.try_get("ciphertext").map_err(|_| StoreError)?,
+        },
+    };
+    check_shape(&link.user_id, &link)?;
+    Ok(link)
+}
+
+fn check_shape(user_id: &str, link: &StoredLink) -> Result<(), StoreError> {
+    if link.user_id != user_id
+        || link.kek_version == 0
+        || i32::try_from(link.kek_version).is_err()
+        || link.envelope.dek_wrapped.len() != 48
+        || link.envelope.ciphertext.len() != 52
+    {
+        return Err(StoreError);
+    }
+    Ok(())
+}
+
+pub(crate) async fn replace(
+    client: &mut Client,
+    user_id: &str,
+    link: &StoredLink,
+    source_ip: &str,
+    now: u64,
+) -> Result<FencedWriteOutcome, StoreError> {
+    check_shape(user_id, link)?;
+    mutate(client, user_id, Some(link), source_ip, now).await
+}
+
+pub(crate) async fn unlink(
+    client: &mut Client,
+    user_id: &str,
+    source_ip: &str,
+    now: u64,
+) -> Result<FencedWriteOutcome, StoreError> {
+    mutate(client, user_id, None, source_ip, now).await
+}
+
+async fn mutate(
+    client: &mut Client,
+    user_id: &str,
+    replacement: Option<&StoredLink>,
+    source_ip: &str,
+    now: u64,
+) -> Result<FencedWriteOutcome, StoreError> {
+    let now = i64::try_from(now).map_err(|_| StoreError)?;
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    // FOR UPDATE serializes absent-row inserts, relinks and unlinks. The
+    // same lock conflicts with scheduling deletion and with user erasure.
+    let owners = transaction
+        .query_typed(
+            "SELECT deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if owners.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(owner) = owners.first() else {
+        return Ok(FencedWriteOutcome::NoRow);
+    };
+    if owner
+        .try_get::<_, bool>("deleting")
+        .map_err(|_| StoreError)?
+    {
+        return Ok(FencedWriteOutcome::AccountDeleting);
+    }
+    let removed = transaction
+        .query_typed(
+            "DELETE FROM listenbrainz_links WHERE user_id = $1 RETURNING user_id",
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if removed.len() > 1 {
+        return Err(StoreError);
+    }
+    let action = if let Some(link) = replacement {
+        let inserted = transaction
+            .query_typed(
+                "INSERT INTO listenbrainz_links \
+                 (user_id, username, kek_version, dek_wrapped_nonce, dek_wrapped, \
+                  payload_nonce, ciphertext, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING user_id",
+                &[
+                    (&user_id, Type::TEXT),
+                    (&link.username.as_str(), Type::TEXT),
+                    (
+                        &i32::try_from(link.kek_version).map_err(|_| StoreError)?,
+                        Type::INT4,
+                    ),
+                    (&link.envelope.dek_wrapped_nonce.as_slice(), Type::BYTEA),
+                    (&link.envelope.dek_wrapped, Type::BYTEA),
+                    (&link.envelope.payload_nonce.as_slice(), Type::BYTEA),
+                    (&link.envelope.ciphertext, Type::BYTEA),
+                    (&now, Type::INT8),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if inserted.len() != 1 {
+            return Err(StoreError);
+        }
+        if removed.is_empty() {
+            "listenbrainz.link"
+        } else {
+            "listenbrainz.relink"
+        }
+    } else {
+        "listenbrainz.unlink"
+    };
+    // No username, token, envelope, key version or provider response in audit.
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, '{}'::jsonb)",
+            &[
+                (&user_id, Type::TEXT),
+                (&action, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&now, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    // Unlinking an already-unlinked account is idempotent success.
+    Ok(FencedWriteOutcome::Written)
+}
+
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+mod postgres_tests;

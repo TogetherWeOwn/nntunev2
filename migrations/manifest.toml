@@ -177,3 +177,8 @@ sha256 = "fcca71547ad14366c7ba7d37920fba476fa6237b40ee8986ecee3d19f604efc0"
 file = "0036_library_shared_owner.sql"
 target = "app"
 sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
+
+[[migration]]
+file = "0037_listenbrainz_links.sql"
+target = "app"
+sha256 = "cdcdf6da1610f26c39614b7f72ce9ca97c59e862e1c516c65046031fcdc4767f"

@@ -671,6 +671,46 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Server-side encrypted link read, scoped only to the session user.
+    /// Never serialize this row; return `StoredLink::summary` to clients.
+    fn listenbrainz_link(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::listenbrainz::StoredLink>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// After fresh-session/CSRF checks and upstream token validation, delete
+    /// then store exactly one encrypted row with an atomic audit. Serialize
+    /// with unlink/relink and account deletion on the owner's users row.
+    /// Default refuses: no separately committed delete/insert fallback.
+    fn replace_listenbrainz_link(
+        &self,
+        user_id: &str,
+        link: &crate::listenbrainz::StoredLink,
+        source_ip: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::account_deletion::FencedWriteOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, link, source_ip, now);
+            Err(StoreError)
+        }
+    }
+    /// Idempotent encrypted-row deletion and audit in the same transaction,
+    /// using the same owner lock and deletion fence as replacement.
+    fn unlink_listenbrainz_link(
+        &self,
+        user_id: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::account_deletion::FencedWriteOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, source_ip, now);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,

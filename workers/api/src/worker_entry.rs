@@ -2199,6 +2199,53 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn listenbrainz_link(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::listenbrainz::StoredLink>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                crate::listenbrainz_store::read(&client, user_id).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn replace_listenbrainz_link(
+        &self,
+        user_id: &str,
+        link: &crate::listenbrainz::StoredLink,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<crate::account_deletion::FencedWriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::listenbrainz_store::replace(&mut client, user_id, link, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn unlink_listenbrainz_link(
+        &self,
+        user_id: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<crate::account_deletion::FencedWriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::listenbrainz_store::unlink(&mut client, user_id, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
