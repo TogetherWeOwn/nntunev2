@@ -84,7 +84,7 @@ rand = "0.8"
 # transaction tests and the session refresh-retry suite). Never enable Tokio's
 # socket runtime in the Worker production dependency graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time", "io-util"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 # Standalone crate (also excluded in the parent workspace manifest): declaring

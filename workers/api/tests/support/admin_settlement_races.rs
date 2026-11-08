@@ -1,6 +1,8 @@
 //! Real overlapping transactions, not sequential stale-action simulation. The
 //! shared schema copies only this test's isolated fixture; no migration/app DB
 //! is touched. These cases do not establish ordered-schema or broker acceptance.
+#[path = "admin_commit_transport.rs"]
+mod commit_transport;
 use super::super::super::database_client;
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
