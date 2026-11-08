@@ -11,3 +11,10 @@ CREATE TABLE IF NOT EXISTS public.listenbrainz_links (
     ciphertext BYTEA NOT NULL CHECK (octet_length(ciphertext) = 52),
     created_at BIGINT NOT NULL CHECK (created_at >= 0)
 );
+
+-- One fleet-wide provider budget, not one per account/token or isolate.
+-- No credentials, user identifiers or response metadata are stored here.
+CREATE TABLE IF NOT EXISTS public.listenbrainz_outbound_rate (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    next_allowed_at_ms BIGINT NOT NULL CHECK (next_allowed_at_ms >= 0)
+);

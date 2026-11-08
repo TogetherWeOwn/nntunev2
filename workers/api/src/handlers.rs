@@ -671,6 +671,24 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Fleet-shared outbound admission, using database time. Every provider
+    /// request must claim first; false or error means do not send. No token,
+    /// account or caller-chosen key can split the global budget.
+    fn claim_listenbrainz_outbound(&self) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Persist the parsed relative provider cooldown before returning an
+    /// upstream outcome. Concurrent/older replies cannot shorten the floor.
+    /// Default refuses: a process-local cooldown is not fleet enforcement.
+    fn defer_listenbrainz_outbound(
+        &self,
+        wait_s: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = wait_s;
+            Err(StoreError)
+        }
+    }
     /// Server-side encrypted link read, scoped only to the session user.
     /// Never serialize this row; return `StoredLink::summary` to clients.
     fn listenbrainz_link(

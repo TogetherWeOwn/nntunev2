@@ -2199,6 +2199,28 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn claim_listenbrainz_outbound(&self) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                crate::listenbrainz_store::claim_outbound(&client).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn defer_listenbrainz_outbound(&self, wait_s: u64) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                crate::listenbrainz_store::defer_outbound(&client, wait_s).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn listenbrainz_link(
         &self,
         user_id: &str,

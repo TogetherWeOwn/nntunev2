@@ -6,6 +6,8 @@ use crate::{listenbrainz::LinkInput, rotation::KekSource};
 use std::time::Duration;
 use tokio_postgres::{Config, NoTls};
 
+mod rates;
+
 const TOKEN_A: &str = "0b9e2f4a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
 const TOKEN_B: &str = "1b9e2f4a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
 

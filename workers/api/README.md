@@ -125,9 +125,18 @@ session receives 401 `reauth_required`; a deleting account receives the typed
 failure is generic 500, never a successful unlinked projection. Unlink remains
 possible without a provider request or a usable decryption key.
 
-Link/relink routes, provider transport, shared outbound rate enforcement,
-feedback delivery, rotation orchestration, account UI and actual-listen
-submission are not enabled by this checkpoint. The encrypted-link migration
+The store exposes an atomic fleet-wide outbound claim and monotonic cooldown
+write, using database time in milliseconds and one credential-free singleton
+row. A claim spends at least one second of budget; concurrent callers cannot
+split it by user, token or isolate. Cooldowns never shorten an existing floor,
+and oversized waits saturate to deny rather than wrapping. Store failures and
+denials forbid sending. These are storage primitives, not an enabled transport
+or serialization of in-flight responses; response ordering and cooldown-write
+failure handling still need integration before any provider request is enabled.
+
+Link/relink routes, provider transport, live outbound rate enforcement, feedback
+delivery, rotation orchestration, account UI and actual-listen submission are
+not enabled by this checkpoint. The encrypted-link migration
 must follow the normal migration acceptance/apply gate before deployment. See
 [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails);
 this adds no playback, external data ingestion or cover-art caching.

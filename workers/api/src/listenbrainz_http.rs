@@ -4,8 +4,13 @@
 //! `recordings.html` and `feedback-json.html` documentation. Tokens travel
 //! only in Authorization, never in a URL or JSON body. A future transport
 //! must disable redirects, bound response collection before allocation,
-//! enforce a total deadline, and atomically claim the shared rate budget
-//! before sending. It must never log request headers or upstream bodies.
+//! enforce a total deadline, and call `Store::claim_listenbrainz_outbound`
+//! before sending. It must persist the parsed relative cooldown through
+//! `Store::defer_listenbrainz_outbound` before returning an upstream outcome.
+//! Both use one database-clock budget for the whole fleet, never a token or
+//! isolate-local key. Admission errors/denials forbid sending; persistence
+//! errors forbid success. These storage primitives do not serialize in-flight
+//! responses or enable transport. Never log request headers or upstream bodies.
 
 use serde::Deserialize;
 use zeroize::Zeroizing;

@@ -15,6 +15,61 @@ use crate::{
     listenbrainz::{RewrapOutcome, StoredLink, Username},
 };
 
+/// Atomically spend the one fleet-wide outbound slot. The database clock
+/// (rounded UP to milliseconds) avoids isolate clock skew and second-boundary
+/// bursts. A failed/denied claim is never permission to send. No refund: an
+/// uncertain send must not make the slot available again.
+pub(crate) async fn claim_outbound(client: &Client) -> Result<bool, StoreError> {
+    let interval_ms = i64::try_from(crate::listenbrainz::MIN_REQUEST_INTERVAL_S * 1000)
+        .map_err(|_| StoreError)?;
+    let rows = client
+        .query_typed(
+            "WITH clock AS MATERIALIZED \
+             (SELECT ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms) \
+             INSERT INTO listenbrainz_outbound_rate (singleton, next_allowed_at_ms) \
+             SELECT TRUE, ms + $1 FROM clock WHERE TRUE \
+             ON CONFLICT (singleton) DO UPDATE \
+             SET next_allowed_at_ms = EXCLUDED.next_allowed_at_ms \
+             WHERE listenbrainz_outbound_rate.next_allowed_at_ms \
+             < EXCLUDED.next_allowed_at_ms - $1 RETURNING singleton",
+            &[(&interval_ms, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    match rows.len() {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StoreError),
+    }
+}
+
+/// Persist a relative provider cooldown using the database's clock, never
+/// shorten a stored floor even for an older response. Saturate unrepresentable
+/// waits at BIGINT's maximum (deny, not wrap or a shorter fallback). Callers
+/// must persist the parsed delay before returning any upstream outcome; errors
+/// must fail closed. This does not implement transport or response ordering.
+pub(crate) async fn defer_outbound(client: &Client, wait_s: u64) -> Result<(), StoreError> {
+    let wait_ms = wait_s.saturating_mul(1000).min(i64::MAX as u64) as i64;
+    let rows = client
+        .query_typed(
+            "WITH clock AS MATERIALIZED \
+             (SELECT ceil(extract(epoch FROM clock_timestamp()) * 1000) AS ms) \
+             INSERT INTO listenbrainz_outbound_rate (singleton, next_allowed_at_ms) \
+             SELECT TRUE, LEAST(ms + $1::numeric, 9223372036854775807)::bigint \
+             FROM clock WHERE TRUE \
+             ON CONFLICT (singleton) DO UPDATE SET next_allowed_at_ms = \
+             GREATEST(listenbrainz_outbound_rate.next_allowed_at_ms, \
+             EXCLUDED.next_allowed_at_ms) RETURNING singleton",
+            &[(&wait_ms, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() != 1 {
+        return Err(StoreError);
+    }
+    Ok(())
+}
+
 pub(crate) async fn read(client: &Client, user_id: &str) -> Result<Option<StoredLink>, StoreError> {
     let rows = client
         .query_typed(
