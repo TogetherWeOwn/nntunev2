@@ -16,6 +16,7 @@ pub mod account_deletion;
 pub mod admin;
 pub mod admin_ingest;
 pub mod api_error;
+pub mod artwork;
 pub mod auth;
 pub mod b64;
 pub mod billing;
