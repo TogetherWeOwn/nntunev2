@@ -521,7 +521,7 @@ pub fn parse_list_window(limit_raw: Option<&str>, offset_raw: Option<&str>) -> (
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Minimal valid NZB: one file, two contiguous segments. Test

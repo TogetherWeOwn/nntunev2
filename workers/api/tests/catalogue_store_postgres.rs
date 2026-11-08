@@ -55,6 +55,101 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 }
 
 #[tokio::test]
+async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs() {
+    use nntune_api::admin_original::{OriginalRepository, PostgresOriginalRepository};
+    let app = client(false).await;
+    app.batch_execute(
+        "CREATE TEMP TABLE ingest_jobs (id TEXT PRIMARY KEY, source TEXT, status TEXT, content_sha256 TEXT, idempotency_key TEXT, nzb_bytes BIGINT);
+         CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY, content_sha256 TEXT, nzb_bytes BIGINT, nzb_ref_envelope_version SMALLINT, nzb_ref_payload_format SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_encrypted BYTEA, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA)",
+    ).await.unwrap();
+    let job = format!("adm_{}", "a".repeat(43));
+    let hash = "a".repeat(64);
+    app.execute(
+        "INSERT INTO ingest_jobs VALUES ($1, 'admin', 'queued', $2, 'admin:' || $2, 1);
+        ",
+        &[&job, &hash],
+    )
+    .await
+    .unwrap();
+    app.execute(
+        "INSERT INTO ingest_originals VALUES ($1, $2, 1, 2, 1, 7, $3, $4, $5, $4)",
+        &[&job, &hash, &vec![0u8; 17], &vec![0u8; 12], &vec![0u8; 48]],
+    )
+    .await
+    .unwrap();
+    let mut repo = PostgresOriginalRepository { client: &app };
+    let mut rows = repo.metadata(&job).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let selected = rows.pop().unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_some());
+    assert!(repo.mark_running(&selected).await.unwrap());
+    assert!(
+        repo.mark_running(&selected).await.unwrap(),
+        "replay converges"
+    );
+    let status: String = app
+        .query_one("SELECT status FROM ingest_jobs WHERE id = $1", &[&job])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "running");
+
+    // Rotation or a corrupt byte shape after metadata selection refuses the
+    // byte load and the running projection.
+    app.execute("UPDATE ingest_originals SET nzb_ref_kek_version = 8", &[])
+        .await
+        .unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.mark_running(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_originals SET nzb_ref_kek_version = 7, nzb_ref_encrypted = $1",
+        &[&vec![0u8; 18]],
+    )
+    .await
+    .unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.mark_running(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_originals SET nzb_ref_encrypted = $1",
+        &[&vec![0u8; 17]],
+    )
+    .await
+    .unwrap();
+    for status in [
+        "done",
+        "failed",
+        "needs_review",
+        "needs_archive_read",
+        "rejected",
+    ] {
+        app.execute("UPDATE ingest_jobs SET status = $1", &[&status])
+            .await
+            .unwrap();
+        assert!(repo.metadata(&job).await.unwrap().is_empty());
+        assert!(repo.envelope(&selected).await.unwrap().is_none());
+        assert!(!repo.mark_running(&selected).await.unwrap());
+    }
+    app.execute(
+        "UPDATE ingest_jobs SET status = 'queued', source = 'pipeline'",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(repo.metadata(&job).await.unwrap().is_empty());
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.mark_running(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_jobs SET source = 'admin', content_sha256 = $1",
+        &[&"b".repeat(64)],
+    )
+    .await
+    .unwrap();
+    assert!(repo.metadata(&job).await.unwrap().is_empty());
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.mark_running(&selected).await.unwrap());
+}
+
+#[tokio::test]
 async fn library_continuation_binds_every_key_and_preserves_owner_scope() {
     use nntune_api::catalogue::LibraryCursor;
     for caller in ["u1", "fresh"] {
