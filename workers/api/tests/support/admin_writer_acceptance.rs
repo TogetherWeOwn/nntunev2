@@ -3,7 +3,8 @@
 //! production schema acceptance or atomic Done/publication integration.
 #[path = "admin_checkpoint_acceptance.rs"]
 mod checkpoint_acceptance;
-
+#[path = "admin_upload_acceptance.rs"]
+mod upload_acceptance;
 use super::{client, OTHER_RELEASE, RECORDING, RELEASE};
 use nntune_api::{
     admin_ingest as intake,

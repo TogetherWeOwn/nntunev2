@@ -99,6 +99,17 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    /// Fresh owner-free Queued evidence for a newly inserted admin job only.
+    /// This constructs no database authority: the admission transaction must
+    /// persist it with that job, its encrypted original and accepted audit row.
+    /// Never use it to replace an existing job's missing or invalid checkpoint.
+    pub fn new_admission(identity: &Identity<'_>) -> Result<Self, CheckpointError> {
+        if !identity.user_id.is_empty() {
+            return Err(CheckpointError::Invalid);
+        }
+        Self::reconciled(identity, 0)
+    }
+
     /// Counter/shape construction only, for explicit legacy reconciliation.
     /// Storage must prove SQL NULL and an eligible status under the job lock;
     /// this cannot replace populated authority or grant authorization itself.

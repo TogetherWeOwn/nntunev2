@@ -60,6 +60,23 @@ fn strict_round_trip_and_checked_generation_revision_metadata() {
 }
 
 #[test]
+fn fresh_admission_constructs_only_owner_free_queued_evidence() {
+    let cp = checkpoint();
+    let snapshot = Snapshot::new_admission(&identity(&cp)).unwrap();
+    assert!(snapshot == initial());
+    assert_eq!((snapshot.revision(), snapshot.generation()), (1, 1));
+    let mut invalid = cp.clone();
+    invalid.user_id = "stage_user".into();
+    assert!(Snapshot::new_admission(&identity(&invalid)).is_err());
+    invalid = cp.clone();
+    invalid.job_id.clear();
+    assert!(Snapshot::new_admission(&identity(&invalid)).is_err());
+    invalid = cp;
+    invalid.idempotency_key.clear();
+    assert!(Snapshot::new_admission(&identity(&invalid)).is_err());
+}
+
+#[test]
 fn reconciliation_starts_fresh_at_checked_monotonic_revision_and_generation() {
     let cp = checkpoint();
     for previous in [0, 7, i64::MAX - 1] {

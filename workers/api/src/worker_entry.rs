@@ -1724,6 +1724,28 @@ async fn admin_ingest_upload_on(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
+    // Keep live admission on the pre-schema path until ordered schema
+    // integration. No column detection or fallback can enable execution.
+    admin_ingest_upload_with_authority_on(client, attempt, false).await
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub async fn admin_ingest_upload_for_postgres_test(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+    initialize_checkpoint: bool,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
+    admin_ingest_upload_with_authority_on(client, attempt, initialize_checkpoint).await
+}
+
+/// The checkpoint-enabled branch is prepared for ordered schema integration,
+/// not selected by the live caller yet. Only a fresh accepted insert initializes;
+/// duplicates return above it without reading or resetting checkpoint authority.
+async fn admin_ingest_upload_with_authority_on(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+    initialize_checkpoint: bool,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     transaction
         .query_typed(
@@ -1846,6 +1868,35 @@ async fn admin_ingest_upload_on(
             deduplicated: true,
         });
     }
+    let checkpoint = if initialize_checkpoint {
+        match (&attempt.failure, &attempt.original) {
+            (None, Some(envelope)) => {
+                let bytes = usize::try_from(attempt.nzb_bytes).map_err(|_| StoreError)?;
+                if bytes == 0
+                    || bytes > admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+                    || envelope.ciphertext.len() != bytes.checked_add(16).ok_or(StoreError)?
+                    || envelope.dek_wrapped.len() != 48
+                    || attempt.kek_version == 0
+                    || attempt.idempotency_key != format!("admin:{}", attempt.content_sha256_hex)
+                {
+                    return Err(StoreError);
+                }
+                let snapshot = nntune_ingest::admin_checkpoint::Snapshot::new_admission(
+                    &nntune_ingest::admin_checkpoint::Identity {
+                        job_id: &attempt.job_id,
+                        user_id: "",
+                        idempotency_key: &attempt.idempotency_key,
+                    },
+                )
+                .map_err(|_| StoreError)?;
+                Some(snapshot.encode().map_err(|_| StoreError)?)
+            }
+            (Some(_), None) => None,
+            _ => return Err(StoreError),
+        }
+    } else {
+        None
+    };
     let db_status = if attempt.failure.is_some() {
         "failed"
     } else {
@@ -1909,6 +1960,21 @@ async fn admin_ingest_upload_on(
             )
             .await
             .map_err(|_| StoreError)?;
+    }
+    if let Some(encoded) = &checkpoint {
+        let initialized = transaction
+            .query_typed(
+                "UPDATE ingest_jobs SET admin_checkpoint = $2::text::jsonb, \
+                 admin_checkpoint_revision = 1 \
+                 WHERE id = $1 AND source = 'admin' AND status = 'queued' \
+                 AND admin_checkpoint IS NULL AND admin_checkpoint_revision = 0 RETURNING id",
+                &[(&attempt.job_id, Type::TEXT), (encoded, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if initialized.len() != 1 {
+            return Err(StoreError);
+        }
     }
     if let Some(reason) = failure_reason.as_deref() {
         transaction
