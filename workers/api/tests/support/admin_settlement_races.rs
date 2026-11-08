@@ -27,6 +27,8 @@ impl SharedRows {
             .await
             .unwrap();
         for table in [
+            "users",
+            "audit_log",
             "ingest_jobs",
             "ingest_originals",
             "tracks",
@@ -41,7 +43,8 @@ impl SharedRows {
             .unwrap();
         }
         app.batch_execute(&format!(
-            "ALTER TABLE {schema}.ingest_originals ADD FOREIGN KEY (job_id) REFERENCES {schema}.ingest_jobs(id);
+            "ALTER TABLE {schema}.audit_log ADD FOREIGN KEY (user_id) REFERENCES {schema}.users(id);
+             ALTER TABLE {schema}.ingest_originals ADD FOREIGN KEY (job_id) REFERENCES {schema}.ingest_jobs(id);
              ALTER TABLE {schema}.track_sources ADD FOREIGN KEY (track_id) REFERENCES {schema}.tracks(id),
                  ADD FOREIGN KEY (source_job_id) REFERENCES {schema}.ingest_jobs(id)"
         )).await.unwrap();
@@ -157,7 +160,13 @@ async fn publication_holds_job_lock_and_concurrent_rejection_loses_after_done_co
     let rejection = async {
         started.await.unwrap();
         let original = input(&original);
-        let action = store::apply_control(&mut controller, &original, &writing, Control::Reject);
+        let action = store::apply_control(
+            &mut controller,
+            actor(),
+            &original,
+            &writing,
+            Control::Reject,
+        );
         tokio::pin!(action);
         let (early, blocked) = tokio::select! {
             result = &mut action => (Some(result), false),
@@ -224,8 +233,13 @@ async fn rejection_holds_job_lock_and_concurrent_publication_loses_without_seali
         .await
         .unwrap();
     let original_input = input(&original);
-    let rejection =
-        store::apply_control(&mut controller, &original_input, &writing, Control::Reject);
+    let rejection = store::apply_control(
+        &mut controller,
+        actor(),
+        &original_input,
+        &writing,
+        Control::Reject,
+    );
     let mut sealer = Sealer::default();
     let publication = async {
         let control_blocked = blocked_by(&rows.observer, controller_pid, observer_pid).await;
@@ -298,4 +312,174 @@ async fn rejection_holds_job_lock_and_concurrent_publication_loses_without_seali
     assert!(decoded == rejected);
     assert_eq!(album_counts, (0, 0, 0));
     assert_eq!(sealer.calls, 0);
+}
+
+#[tokio::test]
+async fn actor_change_committed_while_mutation_waits_is_rechecked_before_job_write() {
+    for reconcile in [false, true] {
+        for deleting in [false, true] {
+            let (app, original, writing, _, _) = publication_fixture().await;
+            if reconcile {
+                app.batch_execute("UPDATE ingest_jobs SET admin_checkpoint = NULL")
+                    .await
+                    .unwrap();
+            }
+            let mut rows = SharedRows::copy_from(&app).await;
+            let mut controller = rows.client().await;
+            let watcher = rows.client().await;
+            let controller_pid = pid(&controller).await;
+            let observer_pid = pid(&rows.observer).await;
+            let before = authority_row(&rows.observer).await;
+            let tx = rows.observer.transaction().await.unwrap();
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+                &[],
+            )
+            .await
+            .unwrap();
+            tx.batch_execute(if deleting {
+                "UPDATE users SET deleting_at = 1"
+            } else {
+                "UPDATE users SET role = 'user'"
+            })
+            .await
+            .unwrap();
+            let original_input = input(&original);
+            let mutation = async {
+                if reconcile {
+                    store::reconcile_null(
+                        &mut controller,
+                        actor(),
+                        &original_input,
+                        "running",
+                        writing.revision(),
+                    )
+                    .await
+                } else {
+                    store::apply_control(
+                        &mut controller,
+                        actor(),
+                        &original_input,
+                        &writing,
+                        Control::Reject,
+                    )
+                    .await
+                }
+            };
+            tokio::pin!(mutation);
+            let (early, blocked) = tokio::select! {
+                result = &mut mutation => (Some(result), false),
+                blocked = blocked_by(&watcher, controller_pid, observer_pid) => (None, blocked),
+            };
+            tx.commit().await.unwrap();
+            let result = match early {
+                Some(result) => result,
+                None => mutation.await,
+            };
+            let after = authority_row(&rows.observer).await;
+            let audits: i64 = rows
+                .observer
+                .query_one("SELECT count(*) FROM audit_log", &[])
+                .await
+                .unwrap()
+                .get(0);
+            rows.cleanup().await;
+            assert!(
+                blocked,
+                "mutation must wait for the actual actor change transaction"
+            );
+            assert_eq!(
+                result.err(),
+                Some(if deleting {
+                    StoreError::AccountDeleting
+                } else {
+                    StoreError::ActorNotAdmin
+                })
+            );
+            assert_eq!(after, before);
+            assert_eq!(audits, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_audit_rolls_back_control_and_reconciliation_authority() {
+    for reconcile in [false, true] {
+        let (app, original, writing, _, _) = publication_fixture().await;
+        if reconcile {
+            app.batch_execute("UPDATE ingest_jobs SET admin_checkpoint = NULL")
+                .await
+                .unwrap();
+        }
+        let rows = SharedRows::copy_from(&app).await;
+        let mut controller = rows.client().await;
+        let controller_pid = pid(&controller).await;
+        let observer_pid = pid(&rows.observer).await;
+        let gate = i64::from(observer_pid);
+        let before = authority_row(&rows.observer).await;
+        rows.observer
+            .query_one("SELECT pg_advisory_lock($1)", &[&gate])
+            .await
+            .unwrap();
+        rows.observer
+            .batch_execute(&format!(
+                "CREATE FUNCTION {}.hold_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_advisory_xact_lock({gate}::bigint); RETURN NEW; END $$;
+             CREATE TRIGGER hold_audit BEFORE INSERT ON audit_log FOR EACH ROW
+             EXECUTE FUNCTION {}.hold_audit()",
+                rows.schema, rows.schema,
+            ))
+            .await
+            .unwrap();
+        let original_input = input(&original);
+        let blocked = {
+            let mutation = async {
+                if reconcile {
+                    store::reconcile_null(
+                        &mut controller,
+                        actor(),
+                        &original_input,
+                        "running",
+                        writing.revision(),
+                    )
+                    .await
+                } else {
+                    store::apply_control(
+                        &mut controller,
+                        actor(),
+                        &original_input,
+                        &writing,
+                        Control::Reject,
+                    )
+                    .await
+                }
+            };
+            tokio::pin!(mutation);
+            tokio::select! {
+                _ = &mut mutation => false,
+                blocked = blocked_by(&rows.observer, controller_pid, observer_pid) => blocked,
+            }
+            // Drop the real future while INSERT is blocked, after the job update.
+        };
+        rows.observer
+            .query_one("SELECT pg_advisory_unlock($1)", &[&gate])
+            .await
+            .unwrap();
+        // Same connection orders this read after the dropped transaction rollback.
+        let after = authority_row(&controller).await;
+        let audits: i64 = controller
+            .query_one("SELECT count(*) FROM audit_log", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let album_counts = counts(&controller).await;
+        rows.cleanup().await;
+        assert!(
+            blocked,
+            "cancellation must reach the audit INSERT after the job update"
+        );
+        assert_eq!(after, before);
+        assert_eq!(audits, 0);
+        assert_eq!(album_counts, (0, 0, 0));
+    }
 }

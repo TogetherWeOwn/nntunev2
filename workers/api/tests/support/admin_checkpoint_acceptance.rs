@@ -2,10 +2,30 @@
 //! admission or authenticated control routing; temporary columns do not prove
 //! migration checks. Sequential stale-action cases are not concurrent race proof;
 //! settlement_races adds two-connection lock-order coverage on shared scratch rows.
+#[path = "admin_control_audit_acceptance.rs"]
+mod control_audit;
 #[path = "admin_settlement_races.rs"]
 mod settlement_races;
 use super::*;
-use nntune_ingest::admin_checkpoint_store::{self as store, StageOriginal, StoreError};
+use nntune_ingest::admin_checkpoint_store::{
+    self as store, ControlActor, StageOriginal, StoreError,
+};
+
+fn actor() -> ControlActor<'static> {
+    ControlActor {
+        user_id: "controller",
+        source_ip: None,
+        now: 123,
+    }
+}
+
+async fn control_tables(app: &tokio_postgres::Client) {
+    app.batch_execute(
+        "CREATE TEMP TABLE users (id TEXT PRIMARY KEY, role TEXT, deleting_at BIGINT);
+         INSERT INTO users VALUES ('controller', 'admin', NULL);
+         CREATE TEMP TABLE audit_log (user_id TEXT REFERENCES users(id), action TEXT NOT NULL, ok BOOLEAN NOT NULL, source_ip TEXT NOT NULL, at BIGINT NOT NULL, subject_user_id TEXT, details JSONB NOT NULL)",
+    ).await.unwrap();
+}
 
 fn input(original: &OriginalBody) -> StageOriginal<'_> {
     StageOriginal {
@@ -32,6 +52,7 @@ fn identity(original: &OriginalBody) -> Identity<'_> {
 
 async fn seeded() -> (tokio_postgres::Client, OriginalBody, Snapshot) {
     let (app, original, mut cp, _, _) = fixture().await;
+    control_tables(&app).await;
     app.batch_execute("ALTER TABLE ingest_jobs ADD COLUMN admin_checkpoint JSONB, ADD COLUMN admin_checkpoint_revision BIGINT NOT NULL DEFAULT 0").await.unwrap();
     cp.state = JobState::Queued;
     cp.admin_release_mbid = None;
@@ -58,6 +79,7 @@ async fn publication_fixture() -> (
     Vec<FileGeometry>,
 ) {
     let (mut app, original, mut cp, recordings, geometry) = fixture().await;
+    control_tables(&app).await;
     app.batch_execute("ALTER TABLE ingest_jobs ADD COLUMN admin_checkpoint JSONB, ADD COLUMN admin_checkpoint_revision BIGINT NOT NULL DEFAULT 0").await.unwrap();
     cp.state = JobState::Queued;
     cp.admin_release_mbid = None;
@@ -265,10 +287,15 @@ async fn delivery_send_cancellation_and_manual_controls_never_adopt_a_newer_gene
         Ok(false)
     );
     assert_eq!(queue.calls, 1);
-    let restarted =
-        store::apply_control(&mut app, &input(&original), &parked, Control::RetryReview)
-            .await
-            .unwrap();
+    let restarted = store::apply_control(
+        &mut app,
+        actor(),
+        &input(&original),
+        &parked,
+        Control::RetryReview,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         store::enqueue_delivery(&app, &input(&original), 1, &mut queue).await,
         Err(store::DeliveryError::Authority(StoreError::Stale))
@@ -293,9 +320,15 @@ async fn delivery_send_cancellation_and_manual_controls_never_adopt_a_newer_gene
             .unwrap()
             == restarted
     );
-    let rejected = store::apply_control(&mut app, &input(&original), &restarted, Control::Reject)
-        .await
-        .unwrap();
+    let rejected = store::apply_control(
+        &mut app,
+        actor(),
+        &input(&original),
+        &restarted,
+        Control::Reject,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         store::load_delivery(&app, &input(&original), &new)
             .await
@@ -475,9 +508,10 @@ async fn explicit_null_reconciliation_commits_fresh_queued_authority_without_res
             store::load(&app, &input(&original), 1).await.err(),
             Some(StoreError::Invalid)
         );
-        let reconciled = store::reconcile_null(&mut app, &input(&original), status, revision)
-            .await
-            .unwrap();
+        let reconciled =
+            store::reconcile_null(&mut app, actor(), &input(&original), status, revision)
+                .await
+                .unwrap();
         assert_eq!(
             (
                 reconciled.revision(),
@@ -503,7 +537,7 @@ async fn explicit_null_reconciliation_commits_fresh_queued_authority_without_res
             );
         }
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), status, revision)
+            store::reconcile_null(&mut app, actor(), &input(&original), status, revision)
                 .await
                 .err(),
             Some(StoreError::Stale)
@@ -539,7 +573,7 @@ async fn null_reconciliation_refuses_populated_authority_and_parked_or_terminal_
         app.execute("UPDATE ingest_jobs SET status = 'queued', admin_checkpoint = $1::text::jsonb, admin_checkpoint_revision = 0", &[&encoded]).await.unwrap();
         let before = authority_row(&app).await;
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), "queued", 0)
+            store::reconcile_null(&mut app, actor(), &input(&original), "queued", 0)
                 .await
                 .err(),
             Some(StoreError::Stale)
@@ -558,13 +592,13 @@ async fn null_reconciliation_refuses_populated_authority_and_parked_or_terminal_
         let before = authority_row(&app).await;
         // Lying about the expected eligible status must not bypass the row check.
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), "queued", 0)
+            store::reconcile_null(&mut app, actor(), &input(&original), "queued", 0)
                 .await
                 .err(),
             Some(StoreError::Stale)
         );
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), status, 0)
+            store::reconcile_null(&mut app, actor(), &input(&original), status, 0)
                 .await
                 .err(),
             Some(StoreError::Invalid)
@@ -580,7 +614,7 @@ async fn null_reconciliation_rechecks_expected_status_revision_and_original_link
     let before = authority_row(&app).await;
     for (status, revision) in [("queued", 7), ("running", 6), ("running", 8)] {
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), status, revision)
+            store::reconcile_null(&mut app, actor(), &input(&original), status, revision)
                 .await
                 .err(),
             Some(StoreError::Stale)
@@ -597,7 +631,7 @@ async fn null_reconciliation_rechecks_expected_status_revision_and_original_link
         ("UPDATE ingest_originals SET nzb_ref_encrypted = nzb_ref_encrypted || decode('00','hex')", "UPDATE ingest_originals SET nzb_ref_encrypted = substring(nzb_ref_encrypted for octet_length(nzb_ref_encrypted) - 1)"),
     ] {
         app.batch_execute(change).await.unwrap();
-        assert_eq!(store::reconcile_null(&mut app, &input(&original), "running", 7).await.err(), Some(StoreError::Stale));
+        assert_eq!(store::reconcile_null(&mut app, actor(), &input(&original), "running", 7).await.err(), Some(StoreError::Stale));
         assert_eq!(authority_row(&app).await, before);
         app.batch_execute(restore).await.unwrap();
     }
@@ -605,7 +639,7 @@ async fn null_reconciliation_rechecks_expected_status_revision_and_original_link
         .await
         .unwrap();
     assert_eq!(
-        store::reconcile_null(&mut app, &input(&original), "running", 7)
+        store::reconcile_null(&mut app, actor(), &input(&original), "running", 7)
             .await
             .err(),
         Some(StoreError::Stale)
@@ -624,7 +658,7 @@ async fn null_reconciliation_sql_failure_zero_row_and_overflow_leave_legacy_auth
     ] {
         app.batch_execute(function).await.unwrap();
         app.batch_execute("CREATE TRIGGER refuse_reconciliation BEFORE UPDATE ON ingest_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_reconciliation()").await.unwrap();
-        assert_eq!(store::reconcile_null(&mut app, &input(&original), "running", 7).await.err(), Some(error));
+        assert_eq!(store::reconcile_null(&mut app, actor(), &input(&original), "running", 7).await.err(), Some(error));
         assert_eq!(authority_row(&app).await, before);
         app.batch_execute("DROP TRIGGER refuse_reconciliation ON ingest_jobs").await.unwrap();
     }
@@ -637,7 +671,7 @@ async fn null_reconciliation_sql_failure_zero_row_and_overflow_leave_legacy_auth
         .unwrap();
         let before = authority_row(&app).await;
         assert_eq!(
-            store::reconcile_null(&mut app, &input(&original), "running", revision)
+            store::reconcile_null(&mut app, actor(), &input(&original), "running", revision)
                 .await
                 .err(),
             Some(StoreError::Invalid)
@@ -719,7 +753,7 @@ async fn legacy_user_terminal_sql_cannot_mutate_or_converge_admin_authority() {
         TransitionOutcome,
     };
     let (app, original, initial, _, _) = publication_fixture().await;
-    app.batch_execute("CREATE TEMP TABLE users (id TEXT PRIMARY KEY, deleting_at BIGINT); INSERT INTO users VALUES ('uploader', NULL); ALTER TABLE ingest_jobs ADD COLUMN user_id TEXT; UPDATE ingest_jobs SET user_id = 'uploader'").await.unwrap();
+    app.batch_execute("INSERT INTO users VALUES ('uploader', 'user', NULL); ALTER TABLE ingest_jobs ADD COLUMN user_id TEXT; UPDATE ingest_jobs SET user_id = 'uploader'").await.unwrap();
     for state in [
         JobState::Queued,
         JobState::Parsing,
@@ -1325,7 +1359,7 @@ async fn review_controls_rotate_generation_and_clear_previous_match_probe_and_fa
         } else {
             Control::RetryReview
         };
-        let saved = store::apply_control(&mut app, &input(&original), &parked, action)
+        let saved = store::apply_control(&mut app, actor(), &input(&original), &parked, action)
             .await
             .unwrap();
         assert_eq!(
@@ -1358,7 +1392,7 @@ async fn review_controls_rotate_generation_and_clear_previous_match_probe_and_fa
             Some(StoreError::Stale)
         );
         assert_eq!(
-            store::apply_control(&mut app, &input(&original), &parked, action)
+            store::apply_control(&mut app, actor(), &input(&original), &parked, action)
                 .await
                 .err(),
             Some(StoreError::Stale)
@@ -1416,7 +1450,8 @@ async fn controls_enforce_existing_states_and_never_restart_terminal_jobs() {
             ),
         ] {
             seed(&app, &expected).await;
-            let result = store::apply_control(&mut app, &input(&original), &expected, action).await;
+            let result =
+                store::apply_control(&mut app, actor(), &input(&original), &expected, action).await;
             if allowed {
                 let saved = result.unwrap();
                 assert_eq!(saved.checkpoint().state, next_state);
@@ -1433,9 +1468,15 @@ async fn controls_enforce_existing_states_and_never_restart_terminal_jobs() {
 #[tokio::test]
 async fn rejection_invalidates_old_publication_and_done_refuses_later_controls() {
     let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
-    let rejected = store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-        .await
-        .unwrap();
+    let rejected = store::apply_control(
+        &mut app,
+        actor(),
+        &input(&original),
+        &writing,
+        Control::Reject,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         (
             rejected.status(),
@@ -1475,13 +1516,19 @@ async fn rejection_invalidates_old_publication_and_done_refuses_later_controls()
     .await
     .unwrap();
     assert_eq!(
-        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-            .await
-            .err(),
+        store::apply_control(
+            &mut app,
+            actor(),
+            &input(&original),
+            &writing,
+            Control::Reject
+        )
+        .await
+        .err(),
         Some(StoreError::Stale)
     );
     assert_eq!(
-        store::apply_control(&mut app, &input(&original), &done, Control::Reject)
+        store::apply_control(&mut app, actor(), &input(&original), &done, Control::Reject)
             .await
             .err(),
         Some(StoreError::Invalid)
@@ -1517,9 +1564,15 @@ async fn control_cas_compares_full_snapshot_revision_generation_and_original_lin
         };
         seed(&app, &current).await;
         assert_eq!(
-            store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-                .await
-                .err(),
+            store::apply_control(
+                &mut app,
+                actor(),
+                &input(&original),
+                &writing,
+                Control::Reject
+            )
+            .await
+            .err(),
             Some(StoreError::Stale)
         );
         assert!(
@@ -1534,16 +1587,28 @@ async fn control_cas_compares_full_snapshot_revision_generation_and_original_lin
         .await
         .unwrap();
     assert_eq!(
-        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-            .await
-            .err(),
+        store::apply_control(
+            &mut app,
+            actor(),
+            &input(&original),
+            &writing,
+            Control::Reject
+        )
+        .await
+        .err(),
         Some(StoreError::Stale)
     );
     app.batch_execute("UPDATE ingest_originals SET nzb_bytes = nzb_bytes - 1; UPDATE ingest_jobs SET source = 'upload'").await.unwrap();
     assert_eq!(
-        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-            .await
-            .err(),
+        store::apply_control(
+            &mut app,
+            actor(),
+            &input(&original),
+            &writing,
+            Control::Reject
+        )
+        .await
+        .err(),
         Some(StoreError::Stale)
     );
 }
@@ -1560,9 +1625,15 @@ async fn control_sql_failure_zero_row_and_overflow_preserve_status_checkpoint_an
         app.batch_execute(trigger).await.unwrap();
         app.batch_execute("CREATE TRIGGER refuse_control BEFORE UPDATE ON ingest_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_control()").await.unwrap();
         assert_eq!(
-            store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
-                .await
-                .err(),
+            store::apply_control(
+                &mut app,
+                actor(),
+                &input(&original),
+                &writing,
+                Control::Reject
+            )
+            .await
+            .err(),
             Some(if mode == 0 {
                 StoreError::Database
             } else {
@@ -1582,9 +1653,15 @@ async fn control_sql_failure_zero_row_and_overflow_preserve_status_checkpoint_an
     .unwrap();
     let limit = store::load(&app, &input(&original), 1).await.unwrap();
     assert_eq!(
-        store::apply_control(&mut app, &input(&original), &limit, Control::Reject)
-            .await
-            .err(),
+        store::apply_control(
+            &mut app,
+            actor(),
+            &input(&original),
+            &limit,
+            Control::Reject
+        )
+        .await
+        .err(),
         Some(StoreError::Invalid)
     );
     assert!(store::load(&app, &input(&original), 1).await.unwrap() == limit);

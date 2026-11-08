@@ -31,6 +31,103 @@ pub enum StoreError {
     Invalid,
     Stale,
     Database,
+    ActorNotAdmin,
+    AccountDeleting,
+}
+
+/// Trusted session actor and server clock, never queue/request authority. The
+/// route must authenticate before opening the original and gate archive resume
+/// on the existing capability. SQL rechecks role/deletion at mutation time.
+/// IP has a typed representation so audit cannot retain arbitrary header text.
+#[derive(Clone, Copy)]
+pub struct ControlActor<'a> {
+    pub user_id: &'a str,
+    pub source_ip: Option<std::net::IpAddr>,
+    pub now: i64,
+}
+
+impl ControlActor<'_> {
+    fn validate(&self) -> Result<(), StoreError> {
+        if !crate::dispatch::validate_user_id(self.user_id) || self.now < 0 {
+            return Err(StoreError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+// Match the API's admin writer lock order. Demotion/deletion either commits
+// first and is observed here or waits for this whole mutation/audit transaction.
+// No provider work or queue send belongs under these locks.
+async fn lock_actor(tx: &impl GenericClient, actor: ControlActor<'_>) -> Result<(), StoreError> {
+    tx.query(
+        "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+        &[],
+    )
+    .await
+    .map_err(|_| StoreError::Database)?;
+    let rows = tx
+        .query(
+            "SELECT role, deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
+            &[&actor.user_id],
+        )
+        .await
+        .map_err(|_| StoreError::Database)?;
+    if rows.len() > 1 {
+        return Err(StoreError::Invalid);
+    }
+    let Some(row) = rows.first() else {
+        return Err(StoreError::ActorNotAdmin);
+    };
+    let role: Option<String> = row.try_get("role").map_err(|_| StoreError::Invalid)?;
+    if role.as_deref() != Some("admin") {
+        return Err(StoreError::ActorNotAdmin);
+    }
+    let deleting: bool = row.try_get("deleting").map_err(|_| StoreError::Invalid)?;
+    if deleting {
+        return Err(StoreError::AccountDeleting);
+    }
+    Ok(())
+}
+
+async fn audit_control(
+    tx: &impl GenericClient,
+    actor: ControlActor<'_>,
+    operation: &str,
+    previous_status: &str,
+    previous_revision: i64,
+    successor: &Snapshot,
+) -> Result<(), StoreError> {
+    let source_ip = actor
+        .source_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let count = tx
+        .execute(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details)
+         VALUES ($1, 'ingest.controlled', TRUE, $2, $3, NULL,
+             jsonb_build_object('job_id', $4::text, 'operation', $5::text,
+                 'previous_status', $6::text, 'status', $7::text,
+                 'previous_revision', $8::bigint, 'revision', $9::bigint,
+                 'generation', $10::bigint))",
+            &[
+                &actor.user_id,
+                &source_ip,
+                &actor.now,
+                &successor.checkpoint().job_id,
+                &operation,
+                &previous_status,
+                &successor.status(),
+                &previous_revision,
+                &successor.revision(),
+                &successor.generation(),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError::Database)?;
+    if count != 1 {
+        return Err(StoreError::Database);
+    }
+    Ok(())
 }
 
 /// A bounded wake hint, not checkpoint or execution authority. No payload,
@@ -266,9 +363,10 @@ pub async fn load(
 }
 
 /// Explicit reconciliation of historical SQL-NULL authority only. The caller
-/// must authorize the admin action, supply the authenticated original, capture
-/// expected status/revision, and apply its deadline. This is not automatic
-/// repair, upload dedupe, an audit sink or a live route. Populated (even invalid)
+/// must authenticate the actor, supply the authenticated original, capture
+/// expected status/revision, and apply its deadline. Role/deletion are rechecked
+/// under the API's admin lock order; the redacted audit commits atomically. This
+/// is not automatic repair, upload dedupe or a live route. Populated (even invalid)
 /// checkpoints and parked/terminal rows need their separate legal control path.
 /// All evidence starts fresh at Queued; revision/generation never reset. Enqueue
 /// only after commit; commit-result uncertainty requires authority reload.
@@ -276,10 +374,12 @@ pub async fn load(
 /// This function never sends work or reads KV.
 pub async fn reconcile_null(
     client: &mut Client,
+    actor: ControlActor<'_>,
     original: &StageOriginal<'_>,
     expected_status: &str,
     expected_revision: i64,
 ) -> Result<Snapshot, StoreError> {
+    actor.validate()?;
     if !matches!(expected_status, "queued" | "running") {
         return Err(StoreError::Invalid);
     }
@@ -291,6 +391,7 @@ pub async fn reconcile_null(
         .transaction()
         .await
         .map_err(|_| StoreError::Database)?;
+    lock_actor(&tx, actor).await?;
     let rows = tx
         .query(
             &format!("{SELECT} FOR UPDATE OF j FOR SHARE OF o"),
@@ -331,6 +432,15 @@ pub async fn reconcile_null(
     if count != 1 {
         return Err(StoreError::Stale);
     }
+    audit_control(
+        &tx,
+        actor,
+        "reconcile",
+        expected_status,
+        expected_revision,
+        &successor,
+    )
+    .await?;
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
 }
@@ -374,19 +484,27 @@ pub async fn persist_stage(
     Ok(successor)
 }
 
-/// Commit one explicit, already-authorized admin control. The caller enforces
-/// admin authorization (and archive capability for resume), supplies the original
-/// holder and expected snapshot, and applies its bounded database deadline. This
-/// internal adapter is not an auth boundary, audit sink or live manual endpoint.
+/// Commit one explicit admin control with actor revalidation and atomic audit.
+/// The caller authenticates the session (and archive capability for resume),
+/// supplies its actor context, original holder and expected snapshot, and applies
+/// its bounded database deadline. This is not a session-auth or live endpoint.
 /// Rotate generation even on rejection so all old queue/service results lose.
 /// Enqueue only the committed generation after success; commit errors require
 /// authority reload, not blind replay. This function never sends queue work.
 pub async fn apply_control(
     client: &mut Client,
+    actor: ControlActor<'_>,
     original: &StageOriginal<'_>,
     expected: &Snapshot,
     control: Control<'_>,
 ) -> Result<Snapshot, StoreError> {
+    actor.validate()?;
+    let operation = match control {
+        Control::ApproveReview { .. } => "approve",
+        Control::RetryReview => "retry",
+        Control::ResumeArchive => "resume_archive",
+        Control::Reject => "reject",
+    };
     let bound = identity(original);
     let encoded = expected.encode().map_err(|_| StoreError::Invalid)?;
     Snapshot::decode(&encoded, expected.revision(), &bound).map_err(|_| StoreError::Invalid)?;
@@ -405,11 +523,21 @@ pub async fn apply_control(
         .transaction()
         .await
         .map_err(|_| StoreError::Database)?;
+    lock_actor(&tx, actor).await?;
     let (current, current_encoded) = load_on(&tx, original, expected.generation(), true).await?;
     if current != *expected {
         return Err(StoreError::Stale);
     }
     update_on(&tx, expected, &current_encoded, &successor).await?;
+    audit_control(
+        &tx,
+        actor,
+        operation,
+        expected.status(),
+        expected.revision(),
+        &successor,
+    )
+    .await?;
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
 }
