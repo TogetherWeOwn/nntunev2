@@ -38,8 +38,14 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Catalog reads: artists, releases, tracks, search, library, playlist
-/// reads, cover art (ADR 0010).
+/// reads, cover art (ADR 0010). Also reads per-account collection saves
+/// (`GET /v1/me/library/…`); writes need `library:write`.
 pub const SCOPE_LIBRARY_READ: &str = "library:read";
+/// Per-account collection preference writes: saved-album add/remove and
+/// artist follow/unfollow (`PUT`/`DELETE /v1/me/library/…`). An
+/// account-scoped preference, not an ingest, playback or billing
+/// operation; existing credentials never carry it.
+pub const SCOPE_LIBRARY_WRITE: &str = "library:write";
 /// Playlist create/edit/delete (ADR 0010).
 pub const SCOPE_PLAYLISTS_WRITE: &str = "playlists:write";
 /// Scrobble / play events (ADR 0010).
@@ -49,13 +55,16 @@ pub const SCOPE_STREAM_READ: &str = "stream:read";
 /// Ingest job submission (ADR 0010).
 pub const SCOPE_INGEST_SUBMIT: &str = "ingest:submit";
 
-/// Full scope vocabulary, in ADR order. Parsing is exact against these.
-pub const ALL_SCOPES: [&str; 5] = [
+/// Full scope vocabulary, in ADR order (the collection-saves write scope
+/// appends after it, so existing scope strings and parse results stay
+/// byte-identical).
+pub const ALL_SCOPES: [&str; 6] = [
     SCOPE_LIBRARY_READ,
     SCOPE_PLAYLISTS_WRITE,
     SCOPE_PLAYS_WRITE,
     SCOPE_STREAM_READ,
     SCOPE_INGEST_SUBMIT,
+    SCOPE_LIBRARY_WRITE,
 ];
 
 /// A single granted scope. Exact, case-sensitive, no trimming: anything
@@ -68,6 +77,7 @@ pub enum Scope {
     PlaysWrite,
     StreamRead,
     IngestSubmit,
+    LibraryWrite,
 }
 
 impl Scope {
@@ -79,6 +89,7 @@ impl Scope {
             Scope::PlaysWrite => SCOPE_PLAYS_WRITE,
             Scope::StreamRead => SCOPE_STREAM_READ,
             Scope::IngestSubmit => SCOPE_INGEST_SUBMIT,
+            Scope::LibraryWrite => SCOPE_LIBRARY_WRITE,
         }
     }
 
@@ -91,6 +102,7 @@ impl Scope {
             SCOPE_PLAYS_WRITE => Some(Scope::PlaysWrite),
             SCOPE_STREAM_READ => Some(Scope::StreamRead),
             SCOPE_INGEST_SUBMIT => Some(Scope::IngestSubmit),
+            SCOPE_LIBRARY_WRITE => Some(Scope::LibraryWrite),
             _ => None,
         }
     }
@@ -483,6 +495,16 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             {
                 return Bearer(Scope::LibraryRead);
             }
+            // Collection-save reads: the bounded lists and one-segment
+            // state probes ride `library:read`; the bare `/v1/me/library`
+            // root serves nothing and stays Deny.
+            if path == "/v1/me/library/albums"
+                || path == "/v1/me/library/artists"
+                || one_segment_after("/v1/me/library/albums/", path)
+                || one_segment_after("/v1/me/library/artists/", path)
+            {
+                return Bearer(Scope::LibraryRead);
+            }
             if path == "/v1/stream" || path.starts_with("/v1/stream/") {
                 return Bearer(Scope::StreamRead);
             }
@@ -552,6 +574,16 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             {
                 return Bearer(Scope::LibraryRead);
             }
+            // HEAD revalidates the collection-save reads like the GETs
+            // they shadow (state probe only; the lists have no HEAD
+            // dispatch reader today but revalidate the same scope).
+            if path == "/v1/me/library/albums"
+                || path == "/v1/me/library/artists"
+                || one_segment_after("/v1/me/library/albums/", path)
+                || one_segment_after("/v1/me/library/artists/", path)
+            {
+                return Bearer(Scope::LibraryRead);
+            }
             Deny
         }
         "POST" => {
@@ -604,6 +636,13 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
+            // Collection-save writes: the preference mutation is its own
+            // scope, never implied by `library:read`.
+            if one_segment_after("/v1/me/library/albums/", path)
+                || one_segment_after("/v1/me/library/artists/", path)
+            {
+                return Bearer(Scope::LibraryWrite);
+            }
             if path == "/v1/me" {
                 return SessionOnly;
             }
@@ -632,6 +671,12 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Single-segment item shapes only (see PUT).
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
+            }
+            // Collection-save removals: same write scope as the saves.
+            if one_segment_after("/v1/me/library/albums/", path)
+                || one_segment_after("/v1/me/library/artists/", path)
+            {
+                return Bearer(Scope::LibraryWrite);
             }
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
@@ -744,6 +789,62 @@ mod tests {
             "{CREDENTIAL_PREFIX}{}",
             "0".repeat(SECRET_ENTROPY_BASE62_LEN)
         )));
+    }
+
+    #[test]
+    fn collection_saves_map_splits_read_and_write_scopes() {
+        const MBID: &str = "12345678-1234-1234-1234-1234567890ab";
+        for collection in ["albums", "artists"] {
+            let root = format!("/v1/me/library/{collection}");
+            let item = format!("{root}/{MBID}");
+            assert_eq!(
+                scope_for_operation("GET", &root),
+                RouteDecision::Bearer(Scope::LibraryRead),
+                "GET {root}"
+            );
+            assert_eq!(
+                scope_for_operation("GET", &item),
+                RouteDecision::Bearer(Scope::LibraryRead),
+                "GET {item}"
+            );
+            assert_eq!(
+                scope_for_operation("PUT", &item),
+                RouteDecision::Bearer(Scope::LibraryWrite),
+                "PUT {item}"
+            );
+            assert_eq!(
+                scope_for_operation("DELETE", &item),
+                RouteDecision::Bearer(Scope::LibraryWrite),
+                "DELETE {item}"
+            );
+            // Collection roots are read-only: writes on them deny.
+            assert_eq!(
+                scope_for_operation("PUT", &root),
+                RouteDecision::Deny,
+                "PUT {root}"
+            );
+            // Nested and trailing-slash shapes deny before any spend.
+            assert_eq!(
+                scope_for_operation("GET", &format!("{item}/x")),
+                RouteDecision::Deny
+            );
+            assert_eq!(
+                scope_for_operation("DELETE", &format!("{item}/")),
+                RouteDecision::Deny
+            );
+        }
+        // The bare `/v1/me/library` root serves nothing on any method.
+        for method in ["GET", "PUT", "DELETE", "HEAD"] {
+            assert_eq!(
+                scope_for_operation(method, "/v1/me/library"),
+                RouteDecision::Deny,
+                "{method}"
+            );
+        }
+        // The write scope never authorizes reads, and the read scope
+        // never authorizes writes — separate vocabulary entries.
+        assert_eq!(Scope::parse("library:write"), Some(Scope::LibraryWrite));
+        assert_ne!(Scope::LibraryRead, Scope::LibraryWrite);
     }
 
     #[test]

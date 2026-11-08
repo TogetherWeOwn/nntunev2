@@ -3956,6 +3956,268 @@ impl Store for PgStore {
         .await
     }
 
+    /// Collection-saves state probe (migration 0037): caller-scoped
+    /// app read, reached only after the handler validated the target.
+    async fn collection_save_state(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_state_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_state")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("saved_at").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Bounded collection page, caller-scoped app read; the statement
+    /// itself orders `saved_at DESC, mbid ASC` and binds the shared page
+    /// cap so the response can never grow with the saved set.
+    async fn collection_save_page(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+    ) -> Result<Vec<crate::collection::CollectionListRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_list_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_page")
+                    })?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(crate::collection::CollectionListRow {
+                            mbid: row.try_get("mbid").map_err(|_| StoreError)?,
+                            saved_at: row.try_get("saved_at").map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Fenced idempotent save: one statement (the `INSERT … ON CONFLICT`
+    /// carries the ADR 0002 rule-3 writer fence), returning the stored
+    /// first-save instant on land or replay; zero rows means the fence
+    /// refused, which the handler classifies into the typed 409.
+    async fn collection_save(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+        now: u64,
+    ) -> Result<Option<i64>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let saved_at = i64::try_from(now).map_err(|_| StoreError)?;
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_save_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                            (&saved_at, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_save")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("saved_at").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Fenced idempotent removal: `execute` reports the affected-row
+    /// count the handler splits (idempotent no-op vs. fence-refused).
+    async fn collection_remove(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        crate::collection::collection_delete_statement(),
+                        &[&user_id, &kind.as_str(), &mbid],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.collection_remove"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member-artist probe for follow validation: the caller's whole
+    /// uncapped member release set drives a single mirror `EXISTS`, so an
+    /// artist owning only releases past the listing cap still validates.
+    /// App-side empty membership (or a malformed target) answers `false`
+    /// before any mirror connection.
+    async fn collection_artist_member(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                    return Ok(false);
+                };
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artist_member")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(false);
+                }
+                self.require_mirror()?;
+                let mirror = self.connect_mirror().await?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::artist_membership_statement(),
+                        &[(&member_releases, Type::TEXT_ARRAY), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artist_member")
+                    })?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Mirror release enrichment for the saved-album page: arbitrary
+    /// well-formed MBIDs, no owner data. An unconfigured mirror degrades
+    /// to `Ok(vec![])` (per-field nulls, never dropped saves); a
+    /// configured-but-failed mirror propagates the real error.
+    async fn collection_releases(
+        &self,
+        mbids: &[String],
+    ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                if mbids.is_empty() || self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(Vec::new());
+                }
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::releases_by_mbid_statement(),
+                        &[(&mbids, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_releases")
+                    })?;
+                rows.iter().map(catalogue_release_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Mirror artist enrichment for the followed-artist page: same
+    /// absence/failure split as [`Self::collection_releases`].
+    async fn collection_artists(
+        &self,
+        mbids: &[String],
+    ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                if mbids.is_empty() || self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(Vec::new());
+                }
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::artists_by_mbid_statement(),
+                        &[(&mbids, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artists")
+                    })?;
+                rows.iter().map(catalogue_artist_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
         Self::bounded(
             async {
@@ -5678,6 +5940,16 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/me/library/albums/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        "/v1/me/library/albums/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/me/library/artists/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        "/v1/me/library/artists/{mbid}".to_string()
     } else {
         "unknown".to_string()
     }
