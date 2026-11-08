@@ -1276,7 +1276,7 @@ fn over_long_scope_list_is_validation_failed_and_mints_nothing() {
 fn duplicate_scopes_are_deduplicated_in_response_and_stored_row() {
     let (harness, cookie) = logged_in_harness();
 
-    // Raw length stays within the cap (5 == ALL_SCOPES.len()), so the
+    // Raw length stays within the cap (6 == ALL_SCOPES.len()), so the
     // request is otherwise valid; only its duplicates are in question.
     // First-seen order here is stream:read before library:read, which
     // differs from both canonical ALL_SCOPES order and alphabetical
@@ -1287,6 +1287,7 @@ fn duplicate_scopes_are_deduplicated_in_response_and_stored_row() {
         "stream:read",
         "library:read",
         "stream:read",
+        "library:read",
     ];
     assert_eq!(scopes.len(), ALL_SCOPES.len());
 
