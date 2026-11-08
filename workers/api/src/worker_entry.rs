@@ -690,14 +690,14 @@ struct PgStore {
     trace_id: String,
     mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-    test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    test_client: Option<tokio_postgres::Client>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
-    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    client: Result<tokio_postgres::Client, StoreError>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
@@ -718,9 +718,9 @@ pub fn catalogue_store_for_postgres_test(
         } else {
             MirrorBinding::Unconfigured
         },
-        test_client: std::cell::RefCell::new(Some(app)),
+        test_client: Some(app),
         test_mirror: Some(CatalogueTestMirror {
-            client: std::cell::RefCell::new(Some(mirror)),
+            client: mirror,
             attempts,
         }),
     }
@@ -736,7 +736,7 @@ pub fn session_retry_store_for_postgres_test(
         env: None,
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
-        test_client: std::cell::RefCell::new(Some(client)),
+        test_client: Some(client),
         test_mirror: None,
     }
 }
@@ -773,9 +773,12 @@ impl PgStore {
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+        // The injected client is cloned, not taken: tokio_postgres shares
+        // the one connection (and its per-connection temp tables) across
+        // clones, so repeated store calls in one test keep their state.
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = self.test_client.borrow_mut().take() {
-            return Ok(client);
+        if let Some(client) = &self.test_client {
+            return Ok(client.clone());
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -860,7 +863,9 @@ impl PgStore {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(mirror) = &self.test_mirror {
             mirror.attempts.set(mirror.attempts.get() + 1);
-            return mirror.client.borrow_mut().take().ok_or(StoreError)?;
+            // Same clone-not-take rationale as `connect`: repeated mirror
+            // probes share the injected connection.
+            return mirror.client.clone();
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -6134,7 +6139,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-            test_client: std::cell::RefCell::new(None),
+            test_client: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },

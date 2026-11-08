@@ -475,6 +475,14 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         path.strip_prefix(prefix)
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
     }
+    /// Collection item routes add the MBID shape gate to the single-segment
+    /// test: a malformed item denies here — before any bearer lookup or
+    /// rate-limit spend — instead of reaching the gate and earning a
+    /// scope-class answer for a path the dispatch would 404 anyway.
+    fn collection_item_after(prefix: &str, path: &str) -> bool {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| crate::collection::normalize_mbid(rest).is_some())
+    }
     match method {
         "GET" => {
             // Catalog reads → library:read (roots and subpaths). The
@@ -500,8 +508,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // root serves nothing and stays Deny.
             if path == "/v1/me/library/albums"
                 || path == "/v1/me/library/artists"
-                || one_segment_after("/v1/me/library/albums/", path)
-                || one_segment_after("/v1/me/library/artists/", path)
+                || collection_item_after("/v1/me/library/albums/", path)
+                || collection_item_after("/v1/me/library/artists/", path)
             {
                 return Bearer(Scope::LibraryRead);
             }
@@ -579,8 +587,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // dispatch reader today but revalidate the same scope).
             if path == "/v1/me/library/albums"
                 || path == "/v1/me/library/artists"
-                || one_segment_after("/v1/me/library/albums/", path)
-                || one_segment_after("/v1/me/library/artists/", path)
+                || collection_item_after("/v1/me/library/albums/", path)
+                || collection_item_after("/v1/me/library/artists/", path)
             {
                 return Bearer(Scope::LibraryRead);
             }
@@ -638,8 +646,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Collection-save writes: the preference mutation is its own
             // scope, never implied by `library:read`.
-            if one_segment_after("/v1/me/library/albums/", path)
-                || one_segment_after("/v1/me/library/artists/", path)
+            if collection_item_after("/v1/me/library/albums/", path)
+                || collection_item_after("/v1/me/library/artists/", path)
             {
                 return Bearer(Scope::LibraryWrite);
             }
@@ -673,8 +681,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::PlaylistsWrite);
             }
             // Collection-save removals: same write scope as the saves.
-            if one_segment_after("/v1/me/library/albums/", path)
-                || one_segment_after("/v1/me/library/artists/", path)
+            if collection_item_after("/v1/me/library/albums/", path)
+                || collection_item_after("/v1/me/library/artists/", path)
             {
                 return Bearer(Scope::LibraryWrite);
             }
@@ -832,6 +840,15 @@ mod tests {
                 scope_for_operation("DELETE", &format!("{item}/")),
                 RouteDecision::Deny
             );
+            // Malformed item segments deny at the gate — never a scope
+            // answer for a path the dispatch would 404 anyway.
+            for method in ["GET", "HEAD", "PUT", "DELETE"] {
+                assert_eq!(
+                    scope_for_operation(method, &format!("{root}/not-an-mbid")),
+                    RouteDecision::Deny,
+                    "{method} {root}/not-an-mbid"
+                );
+            }
         }
         // The bare `/v1/me/library` root serves nothing on any method.
         for method in ["GET", "PUT", "DELETE", "HEAD"] {
