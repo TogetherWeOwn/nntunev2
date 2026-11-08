@@ -63,11 +63,13 @@ impl Exchange {
     }
 }
 
-struct AbortOnDrop(worker::AbortController);
+struct AbortOnDrop(Option<worker::AbortController>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(controller) = self.0.take() {
+            controller.abort();
+        }
     }
 }
 
@@ -158,8 +160,9 @@ pub(crate) async fn exchange(request: ApiRequest) -> Exchange {
         init.with_headers(headers);
         let outgoing =
             Request::new_with_init(request.url(), &init).map_err(|_| WireError::Unavailable)?;
-        let abort = AbortOnDrop(worker::AbortController::default());
-        let signal = abort.0.signal();
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let _abort = AbortOnDrop(Some(controller));
         let mut response = Fetch::Request(outgoing)
             .send_with_signal(&signal)
             .await
