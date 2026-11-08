@@ -30,6 +30,8 @@
 	let accountDeleting = $state(false);
 	let unlinkError = $state<string | null>(null);
 	let statusMessage = $state('');
+	let confirmStatus = $state('');
+	let reauthStatus = $state('');
 
 	let heading = $state<HTMLElement>();
 	let unlinkButton = $state<HTMLButtonElement>();
@@ -84,12 +86,23 @@
 	function openConfirm() {
 		if (!canWrite || accountDeleting) return;
 		unlinkError = null;
+		statusMessage = '';
 		confirmDialog?.showModal();
 		cancelButton?.focus();
 	}
 
-	function closeConfirm() {
+	async function closeConfirm() {
+		confirmStatus = '';
+		await tick();
 		if (confirmDialog?.open) confirmDialog.close();
+		await tick();
+	}
+
+	async function closeReauth() {
+		reauthStatus = '';
+		await tick();
+		if (reauthDialog?.open) reauthDialog.close();
+		await tick();
 	}
 
 	async function focusHeading() {
@@ -118,25 +131,26 @@
 			phase !== 'linked' ||
 			navigator.onLine === false
 		) {
-			closeConfirm();
+			await closeConfirm();
 			await focusUnlink();
 			return;
 		}
 		busy = true;
-		statusMessage = 'Unlinking…';
+		if (afterReauth) statusMessage = 'Unlinking…';
+		else confirmStatus = 'Unlinking…';
 		unlinkError = null;
 		const outcome = await unlink(client, { afterReauth, signal: lifetime.signal });
 		if (lifetime.signal.aborted) return;
-		closeConfirm();
-		busy = false;
+		await closeConfirm();
+		if (lifetime.signal.aborted) return;
 		statusMessage = '';
 		switch (outcome.kind) {
 			case 'unlinked':
 				username = '';
 				phase = 'unlinked';
-				statusMessage = 'ListenBrainz unlinked';
-				pushToast('ListenBrainz unlinked');
 				await focusHeading();
+				statusMessage = 'Unlinked';
+				pushToast('ListenBrainz unlinked');
 				break;
 			case 'reauth_required':
 				reauthError = false;
@@ -146,22 +160,23 @@
 				reauthHeading?.focus();
 				break;
 			case 'reauth_again':
-				unlinkError = "Couldn't confirm it's you. Try again.";
 				await focusUnlink();
+				unlinkError = "Couldn't confirm it's you. Try again.";
 				break;
 			case 'signed_out':
 				phase = 'signed_out';
 				await focusHeading();
 				break;
 			case 'account_deleting':
-				accountDeleting = true;
 				await focusHeading();
+				accountDeleting = true;
 				break;
 			case 'failed':
-				unlinkError = "Couldn't unlink ListenBrainz. Your link is unchanged — try again.";
 				await focusUnlink();
+				unlinkError = "Couldn't unlink ListenBrainz. Your link is unchanged — try again.";
 				break;
 		}
+		busy = false;
 	}
 
 	async function confirmUnlink() {
@@ -169,40 +184,44 @@
 		await runUnlink(false);
 	}
 
-	function cancelConfirm() {
+	async function cancelConfirm() {
 		if (busy) return;
-		closeConfirm();
-		void focusUnlink();
+		await closeConfirm();
+		await focusUnlink();
 	}
 
 	/** Cancel/Esc: abort the ceremony, retry nothing, return focus to Unlink. */
-	function cancelReauth() {
+	async function cancelReauth() {
 		ceremony?.abort();
 		ceremony = null;
 		reauthWorking = false;
 		statusMessage = '';
-		if (reauthDialog?.open) reauthDialog.close();
-		void focusUnlink();
+		await closeReauth();
+		await focusUnlink();
 	}
 
 	async function continueWithPasskey() {
 		if (reauthWorking || busy || accountDeleting || phase !== 'linked') return;
 		reauthWorking = true;
-		statusMessage = 'Waiting for your passkey…';
+		reauthStatus = 'Waiting for your passkey…';
 		reauthError = false;
 		const attempt = new AbortController();
 		ceremony = attempt;
 		const outcome = await confirmWithPasskey(client, attempt.signal);
 		if (lifetime.signal.aborted || ceremony !== attempt) return;
-		ceremony = null;
-		reauthWorking = false;
-		statusMessage = '';
+		reauthStatus = '';
 		if (outcome === 'dismissed') {
-			cancelReauth();
+			await cancelReauth();
 		} else if (outcome === 'failed') {
+			ceremony = null;
+			reauthWorking = false;
 			reauthError = true;
 		} else {
-			if (reauthDialog?.open) reauthDialog.close();
+			await closeReauth();
+			await focusUnlink();
+			if (lifetime.signal.aborted || ceremony !== attempt) return;
+			ceremony = null;
+			reauthWorking = false;
 			await runUnlink(true);
 		}
 	}
@@ -229,9 +248,10 @@
 	}
 </script>
 
-<section aria-labelledby="settings-listenbrainz-heading" aria-busy={phase === 'loading' || busy || reauthWorking}>
+<section aria-labelledby="settings-listenbrainz-heading">
 	<h2 id="settings-listenbrainz-heading" tabindex="-1" bind:this={heading}>ListenBrainz</h2>
 
+	<div aria-busy={phase === 'loading' || busy}>
 	{#if phase === 'loading'}
 		{#if showLoading}
 			<p class="lb-muted">Loading your ListenBrainz link…</p>
@@ -278,7 +298,7 @@
 				aria-disabled={busy}
 				onclick={openConfirm}
 			>
-				Unlink
+				{busy ? 'Unlinking…' : 'Unlink'}
 			</button>
 			{#if !online}
 				<p class="lb-muted">You're offline. Connect to change ListenBrainz.</p>
@@ -286,6 +306,7 @@
 		{/if}
 	{/if}
 
+	</div>
 	<p class="lb-sr-only" role="status">{statusMessage}</p>
 </section>
 
@@ -321,6 +342,7 @@
 			Cancel
 		</button>
 	</div>
+	<p class="lb-sr-only" role="status">{confirmStatus}</p>
 </dialog>
 
 <dialog
@@ -353,6 +375,7 @@
 		</button>
 		<button type="button" class="lb-button lb-button--ghost" onclick={cancelReauth}>Cancel</button>
 	</div>
+	<p class="lb-sr-only" role="status">{reauthStatus}</p>
 </dialog>
 {/if}
 

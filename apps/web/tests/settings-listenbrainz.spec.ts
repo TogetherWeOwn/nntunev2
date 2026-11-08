@@ -117,6 +117,32 @@ const section = (page: Page) => page.locator('section[aria-labelledby="settings-
 const unlinkButton = (page: Page) => section(page).getByRole('button', { name: 'Unlink' });
 const confirmDialog = (page: Page) => page.getByRole('dialog', { name: 'Unlink ListenBrainz?' });
 const reauthDialog = (page: Page) => page.getByRole('dialog', { name: "Confirm it's you" });
+const content = (page: Page) => section(page).locator(':scope > div');
+const sectionStatus = (page: Page) => section(page).locator(':scope > [role="status"]');
+
+/** Read Chromium's exposed AX nodes, not a DOM query that includes inert nodes. */
+async function expectExposedStatus(page: Page, text: string) {
+	const session = await page.context().newCDPSession(page);
+	try {
+		await expect.poll(async () => {
+			const { nodes } = await session.send('Accessibility.getFullAXTree');
+			const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+			const textOf = (id: string): string => {
+				const node = byId.get(id);
+				if (!node || node.ignored) return '';
+				if (node.role?.value === 'StaticText') return String(node.name?.value ?? '');
+				return (node.childIds ?? []).map(textOf).join('');
+			};
+			return nodes.filter((node) => !node.ignored && node.role?.value === 'status')
+				.map((node) => textOf(node.nodeId)).filter((value) => value === text);
+		}).toEqual([text]);
+	} finally {
+		await session.detach();
+	}
+	const region = page.getByRole('status').filter({ hasText: text });
+	await expect(region).toHaveCount(1);
+	expect(await region.evaluate((element) => element.closest('[aria-busy="true"]') === null)).toBe(true);
+}
 
 async function openLinked(page: Page) {
 	await page.goto('/settings');
@@ -171,8 +197,11 @@ for (const result of ['success', 'failure'] as const) {
 			await expect(active).toBeFocused();
 			await expect(active).toHaveAttribute('aria-disabled', 'true');
 			await expect(active).not.toHaveAttribute('disabled', '');
-			await expect(section(page).getByRole('status', { includeHidden: true })).toHaveText('Unlinking…');
-			await expect(section(page)).toHaveAttribute('aria-busy', 'true');
+			await expect(confirmDialog(page).getByRole('status')).toHaveText('Unlinking…');
+			await expect(sectionStatus(page)).toBeEmpty();
+			await expectExposedStatus(page, 'Unlinking…');
+			await expect(content(page)).toHaveAttribute('aria-busy', 'true');
+			await expect(section(page)).not.toHaveAttribute('aria-busy');
 			// DOM activation tests the handler guards even though aria-disabled blocks normal clicks.
 			await active.evaluate((button: HTMLButtonElement) => button.click());
 			await confirmDialog(page).getByRole('button', { name: 'Cancel' }).evaluate((button: HTMLButtonElement) => button.click());
@@ -184,14 +213,17 @@ for (const result of ['success', 'failure'] as const) {
 			settle(result === 'success' ? json(UNLINKED) : json({ code: 'internal_error', message: 'x', retryable: true }, 503));
 		}
 		await expect(confirmDialog(page)).toBeHidden();
-		await expect(section(page)).toHaveAttribute('aria-busy', 'false');
+		await expect(content(page)).toHaveAttribute('aria-busy', 'false');
 		if (result === 'success') {
 			const heading = section(page).getByRole('heading', { name: 'ListenBrainz' });
 			await expect(heading).toBeFocused();
 			await expect(heading).toHaveAttribute('tabindex', '-1');
+			await expectExposedStatus(page, 'Unlinked');
 		} else {
 			await expect(unlinkButton(page)).toBeFocused();
 			await expect(section(page).getByRole('alert')).toHaveText("Couldn't unlink ListenBrainz. Your link is unchanged — try again.");
+			await expect(sectionStatus(page)).toBeEmpty();
+			await expect(page.locator('#lb-unlink-heading').locator('..').locator('[role="status"]')).toBeEmpty();
 		}
 		expect(traffic.deletes).toBe(1);
 	});
@@ -216,7 +248,8 @@ test('status loading text appears only while the read is pending, with no contro
 	});
 	await page.goto('/settings');
 	await expect(section(page).getByText('Loading your ListenBrainz link…')).toBeVisible({ timeout: 1200 });
-	await expect(section(page)).toHaveAttribute('aria-busy', 'true');
+	await expect(content(page)).toHaveAttribute('aria-busy', 'true');
+	await expect(section(page)).not.toHaveAttribute('aria-busy');
 	await expect(section(page).getByText('Loading your ListenBrainz link…')).not.toHaveAttribute('role');
 	await expect(section(page).getByRole('status')).toBeEmpty();
 	await expect(section(page).getByRole('button')).toHaveCount(0);
@@ -320,6 +353,44 @@ test('reauth_required opens the dialog; passkey success retries the DELETE exact
 	await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
 });
 
+for (const result of ['success', 'failure'] as const) {
+	test(`retried DELETE exposes section progress with focus on Unlink and settles ${result}`, async ({ page }) => {
+		await installPasskeyDouble(page);
+		let settle!: (response: ReturnType<typeof json>) => void;
+		const pending = new Promise<ReturnType<typeof json>>((resolve) => { settle = resolve; });
+		const traffic = await routeApi(page, { del: (n) => n === 1 ? REAUTH_REQUIRED : pending });
+		await openLinked(page);
+		await startUnlink(page);
+		await confirmDialog(page).getByRole('button', { name: 'Unlink' }).click();
+		await expect(reauthDialog(page)).toBeVisible();
+		await expect(page.locator('dialog[open]')).toHaveCount(1);
+		await reauthDialog(page).getByRole('button', { name: 'Continue with passkey' }).click();
+		try {
+			const active = section(page).getByRole('button', { name: 'Unlinking…' });
+			await expect(active).toBeFocused();
+			await expect(active).toHaveAttribute('aria-disabled', 'true');
+			await expect(page.locator('dialog[open]')).toHaveCount(0);
+			await expect(page.locator('dialog [role="status"]')).toHaveText(['', '']);
+			await expect(content(page)).toHaveAttribute('aria-busy', 'true');
+			await expectExposedStatus(page, 'Unlinking…');
+			await active.evaluate((button: HTMLButtonElement) => button.click());
+			expect(traffic.deletes).toBe(2);
+		} finally {
+			settle(result === 'success' ? json(UNLINKED) : json({ code: 'internal_error', message: 'x', retryable: true }, 503));
+		}
+		await expect(content(page)).toHaveAttribute('aria-busy', 'false');
+		if (result === 'success') {
+			await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
+			await expectExposedStatus(page, 'Unlinked');
+		} else {
+			await expect(unlinkButton(page)).toBeFocused();
+			await expect(sectionStatus(page)).toBeEmpty();
+			await expect(section(page).getByRole('alert')).toHaveText("Couldn't unlink ListenBrainz. Your link is unchanged — try again.");
+		}
+		expect(traffic.deletes).toBe(2);
+	});
+}
+
 test('a second reauth_required after the retry shows text and does not loop', async ({ page }) => {
 	await installPasskeyDouble(page);
 	const traffic = await routeApi(page, { del: () => REAUTH_REQUIRED });
@@ -344,15 +415,21 @@ for (const how of ['Cancel button', 'Escape'] as const) {
 		await startUnlink(page);
 		await confirmDialog(page).getByRole('button', { name: 'Unlink' }).click();
 		await reauthDialog(page).getByRole('button', { name: 'Continue with passkey' }).click();
-		await expect(reauthDialog(page).getByRole('button', { name: 'Waiting for your passkey…' })).toBeVisible();
-		await expect(section(page)).toHaveAttribute('aria-busy', 'true');
+		await expect(reauthDialog(page).getByRole('button', { name: 'Waiting for your passkey…' })).toBeFocused();
+		await expect(reauthDialog(page).getByRole('status')).toHaveText('Waiting for your passkey…');
+		await expect(sectionStatus(page)).toBeEmpty();
+		await expectExposedStatus(page, 'Waiting for your passkey…');
+		await expect(content(page)).toHaveAttribute('aria-busy', 'false');
+		await expect(page.locator('dialog[open]')).toHaveCount(1);
 
 		if (how === 'Escape') await page.keyboard.press('Escape');
 		else await reauthDialog(page).getByRole('button', { name: 'Cancel' }).click();
 
 		await expect(reauthDialog(page)).toBeHidden();
 		await expect(unlinkButton(page)).toBeFocused();
-		await expect(section(page)).toHaveAttribute('aria-busy', 'false');
+		await expect(content(page)).toHaveAttribute('aria-busy', 'false');
+		await expect(sectionStatus(page)).toBeEmpty();
+		await expect(page.locator('#lb-reauth-heading').locator('..').locator('[role="status"]')).toBeEmpty();
 		await expect(section(page).getByText('Linked as')).toBeVisible();
 		expect(traffic.deletes).toBe(1);
 		expect(traffic.reauthFinishes).toBe(0);
