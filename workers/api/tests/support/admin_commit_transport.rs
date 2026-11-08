@@ -159,6 +159,217 @@ async fn cut_connection(cut_at: CutAt) -> (Client, TransportCut) {
     )
 }
 
+#[derive(Default)]
+struct MatchService {
+    calls: usize,
+    transient: bool,
+}
+
+impl store::StageServices for MatchService {
+    async fn match_release(&mut self, _: &Document) -> Result<Option<String>, store::ServiceError> {
+        self.calls += 1;
+        if self.transient {
+            Err(store::ServiceError::Transient {
+                retry_after_secs: Some(300),
+            })
+        } else {
+            Ok(Some(RELEASE.into()))
+        }
+    }
+
+    async fn probe(&mut self, _: &ProbeRequest) -> Result<ProbeOutcome, store::ServiceError> {
+        panic!("one matching stage must not reach probe")
+    }
+}
+
+async fn continuation_commit_disconnect(transient: bool) {
+    for cut_at in [CutAt::BeforeCommit, CutAt::AfterCommit] {
+        let (mut app, original, initial) = seeded().await;
+        let mut cp = initial.checkpoint().clone();
+        let matching = {
+            let mut runtime = DatabaseRuntime {
+                app: &mut app,
+                original: &original,
+                snapshot: initial,
+                services: Runtime(cp.clone()),
+            };
+            for _ in 0..2 {
+                run_stage(
+                    &mut runtime,
+                    &mut cp,
+                    original.job_id(),
+                    original.idempotency_key(),
+                    original.parsed(),
+                )
+                .await
+                .unwrap();
+            }
+            runtime.snapshot
+        };
+        assert_eq!(matching.checkpoint().state, JobState::Matching);
+        let delivery = store::prepare_delivery(&app, &input(&original), matching.generation())
+            .await
+            .unwrap()
+            .unwrap();
+        let rows = SharedRows::copy_from(&app).await;
+        // An uncut canonical call is the full-successor/outcome control, not a
+        // copied checkpoint oracle or a production crash-recovery protocol.
+        let mut healthy_services = MatchService {
+            transient,
+            calls: 0,
+        };
+        let mut healthy_queue = DeliveryQueue::default();
+        let healthy = store::run_delivery_and_enqueue(
+            &mut app,
+            &input(&original),
+            &delivery,
+            &mut healthy_services,
+            &mut healthy_queue,
+        )
+        .await
+        .unwrap();
+        let expected = store::load(&app, &input(&original), delivery.generation())
+            .await
+            .unwrap();
+        let (mut worker, mut transport) = cut_connection(cut_at).await;
+        rows.select_schema(&worker).await;
+        let mut services = MatchService {
+            transient,
+            calls: 0,
+        };
+        let mut queue = DeliveryQueue::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            store::run_delivery_and_enqueue(
+                &mut worker,
+                &input(&original),
+                &delivery,
+                &mut services,
+                &mut queue,
+            ),
+        )
+        .await;
+        drop(worker);
+        let cut_proved = transport.finish(cut_at).await;
+        drop(transport);
+        let saved = store::load(&rows.observer, &input(&original), delivery.generation())
+            .await
+            .unwrap();
+        let sends_after_error = queue.calls;
+        let mut recovery = rows.client().await;
+        if cut_at == CutAt::BeforeCommit {
+            // The independent reload proves rollback; redoing this replayable
+            // provider read is allowed, and commits exactly one budget change.
+            let replay = store::run_delivery_and_enqueue(
+                &mut recovery,
+                &input(&original),
+                &delivery,
+                &mut services,
+                &mut queue,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay, healthy);
+        } else {
+            // Known test outcome from the healthy control, not inferred from
+            // Err(Database). This proves send-only recovery does not rerun the
+            // provider; durable retry-due/outcome recovery is still required.
+            assert_eq!(
+                store::continue_delivery(
+                    &recovery,
+                    &input(&original),
+                    &delivery,
+                    healthy.outcome,
+                    &mut queue,
+                )
+                .await,
+                Ok(true)
+            );
+        }
+        let recovered = store::load(&rows.observer, &input(&original), delivery.generation())
+            .await
+            .unwrap();
+        let rejected = store::apply_control(
+            &mut recovery,
+            actor(),
+            &input(&original),
+            &recovered,
+            Control::Reject,
+        )
+        .await
+        .unwrap();
+        let stale = store::continue_delivery(
+            &recovery,
+            &input(&original),
+            &delivery,
+            healthy.outcome,
+            &mut queue,
+        )
+        .await;
+        let final_authority = store::load(&rows.observer, &input(&original), rejected.generation())
+            .await
+            .unwrap();
+        let album_counts = counts(&rows.observer).await;
+        let audits: i64 = rows
+            .observer
+            .query_one("SELECT count(*) FROM audit_log", &[])
+            .await
+            .unwrap()
+            .get(0);
+        rows.cleanup().await;
+
+        assert!(
+            cut_proved,
+            "expected COMMIT cut and failed driver must be observed"
+        );
+        assert!(matches!(result, Ok(Err(StoreError::Database))));
+        assert_eq!(sends_after_error, 0);
+        assert_eq!(healthy_services.calls, 1);
+        assert_eq!(healthy.continuation, Ok(true));
+        assert_eq!(healthy_queue.calls, 1);
+        assert_eq!(healthy_queue.delays, [if transient { 300 } else { 0 }]);
+        assert_eq!(expected.revision(), matching.revision() + 1);
+        assert_eq!(expected.generation(), matching.generation());
+        assert_eq!(expected.checkpoint().attempt, if transient { 2 } else { 1 });
+        if cut_at == CutAt::AfterCommit {
+            assert!(saved == expected);
+            assert_eq!(services.calls, 1);
+        } else {
+            assert!(saved == matching);
+            assert_eq!(services.calls, 2);
+        }
+        assert!(recovered == expected);
+        assert_eq!(queue.calls, 1);
+        assert_eq!(queue.delays, healthy_queue.delays);
+        assert_eq!(queue.messages, healthy_queue.messages);
+        assert_eq!(
+            stale,
+            Err(store::DeliveryError::Authority(StoreError::Stale))
+        );
+        assert!(final_authority == rejected);
+        assert!(rejected.generation() > delivery.generation());
+        assert_eq!(audits, 1);
+        assert_eq!(album_counts, (0, 0, 0));
+        assert_eq!(counts(&app).await, (0, 0, 0));
+        assert!(
+            store::load(&app, &input(&original), delivery.generation())
+                .await
+                .unwrap()
+                == expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn continuation_commit_disconnect_never_sends_uncertain_stage_progress() {
+    continuation_commit_disconnect(false).await;
+}
+
+#[tokio::test]
+async fn continuation_commit_disconnect_never_sends_or_respends_uncertain_service_budget() {
+    continuation_commit_disconnect(true).await;
+}
+
 #[tokio::test]
 async fn publication_commit_disconnect_reloads_atomic_authority_and_never_duplicates_album() {
     for cut_at in [CutAt::BeforeCommit, CutAt::AfterCommit] {
