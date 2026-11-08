@@ -115,6 +115,198 @@ impl StageRuntime for DatabaseRuntime<'_> {
     }
 }
 
+async fn authority_row(app: &tokio_postgres::Client) -> (String, i64, Option<String>) {
+    let row = app
+        .query_one(
+            "SELECT status, admin_checkpoint_revision, admin_checkpoint::text FROM ingest_jobs",
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+#[tokio::test]
+async fn explicit_null_reconciliation_commits_fresh_queued_authority_without_reset_or_replay() {
+    let (mut app, original, _) = seeded().await;
+    for (status, revision) in [("queued", 0_i64), ("running", 7)] {
+        // Historical sentinel setup, never an automatic production reset.
+        app.execute("UPDATE ingest_jobs SET status = $1, admin_checkpoint = NULL, admin_checkpoint_revision = $2", &[&status, &revision]).await.unwrap();
+        assert_eq!(
+            store::load(&app, &input(&original), 1).await.err(),
+            Some(StoreError::Invalid)
+        );
+        let reconciled = store::reconcile_null(&mut app, &input(&original), status, revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                reconciled.revision(),
+                reconciled.generation(),
+                reconciled.status()
+            ),
+            (revision + 1, revision + 1, "queued")
+        );
+        let cp = reconciled.checkpoint();
+        assert_eq!((cp.state, cp.attempt), (JobState::Queued, 1));
+        assert!(cp.admin_release_mbid.is_none() && cp.probe_tally.is_none());
+        assert!(cp.failure_code.is_none() && cp.failure_reason.is_none());
+        assert!(
+            store::load(&app, &input(&original), revision + 1)
+                .await
+                .unwrap()
+                == reconciled
+        );
+        if revision > 0 {
+            assert_eq!(
+                store::load(&app, &input(&original), 1).await.err(),
+                Some(StoreError::Stale)
+            );
+        }
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), status, revision)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert!(
+            store::load(&app, &input(&original), revision + 1)
+                .await
+                .unwrap()
+                == reconciled
+        );
+        let mut next = cp.clone();
+        next.state = JobState::Parsing;
+        let parsed = store::persist_stage(&mut app, &input(&original), &reconciled, &next)
+            .await
+            .unwrap();
+        assert_eq!(
+            (parsed.revision(), parsed.generation(), parsed.status()),
+            (revision + 2, revision + 1, "running")
+        );
+    }
+}
+
+#[tokio::test]
+async fn null_reconciliation_refuses_populated_authority_and_parked_or_terminal_jobs() {
+    let (mut app, original, initial) = seeded().await;
+    let oversized = serde_json::json!({"extra": "a".repeat(16_384)}).to_string();
+    for encoded in [
+        initial.encode().unwrap(),
+        "{}".into(),
+        "null".into(),
+        oversized,
+    ] {
+        app.execute("UPDATE ingest_jobs SET status = 'queued', admin_checkpoint = $1::text::jsonb, admin_checkpoint_revision = 0", &[&encoded]).await.unwrap();
+        let before = authority_row(&app).await;
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), "queued", 0)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert_eq!(authority_row(&app).await, before);
+    }
+    for status in [
+        "needs_review",
+        "needs_archive_read",
+        "rejected",
+        "done",
+        "failed",
+        "other",
+    ] {
+        app.execute("UPDATE ingest_jobs SET status = $1, admin_checkpoint = NULL, admin_checkpoint_revision = 0", &[&status]).await.unwrap();
+        let before = authority_row(&app).await;
+        // Lying about the expected eligible status must not bypass the row check.
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), "queued", 0)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), status, 0)
+                .await
+                .err(),
+            Some(StoreError::Invalid)
+        );
+        assert_eq!(authority_row(&app).await, before);
+    }
+}
+
+#[tokio::test]
+async fn null_reconciliation_rechecks_expected_status_revision_and_original_linkage() {
+    let (mut app, original, _) = seeded().await;
+    app.batch_execute("UPDATE ingest_jobs SET status = 'running', admin_checkpoint = NULL, admin_checkpoint_revision = 7").await.unwrap();
+    let before = authority_row(&app).await;
+    for (status, revision) in [("queued", 7), ("running", 6), ("running", 8)] {
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), status, revision)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert_eq!(authority_row(&app).await, before);
+    }
+    for (change, restore) in [
+        ("UPDATE ingest_jobs SET source = 'upload'", "UPDATE ingest_jobs SET source = 'admin'"),
+        ("UPDATE ingest_jobs SET idempotency_key = idempotency_key || 'a'", "UPDATE ingest_jobs SET idempotency_key = left(idempotency_key, length(idempotency_key) - 1)"),
+        ("UPDATE ingest_jobs SET content_sha256 = content_sha256 || 'a'", "UPDATE ingest_jobs SET content_sha256 = left(content_sha256, length(content_sha256) - 1)"),
+        ("UPDATE ingest_originals SET nzb_bytes = nzb_bytes + 1", "UPDATE ingest_originals SET nzb_bytes = nzb_bytes - 1"),
+        ("UPDATE ingest_originals SET content_sha256 = content_sha256 || 'a'", "UPDATE ingest_originals SET content_sha256 = left(content_sha256, length(content_sha256) - 1)"),
+        ("UPDATE ingest_originals SET nzb_ref_envelope_version = 1", "UPDATE ingest_originals SET nzb_ref_envelope_version = 2"),
+        ("UPDATE ingest_originals SET nzb_ref_encrypted = nzb_ref_encrypted || decode('00','hex')", "UPDATE ingest_originals SET nzb_ref_encrypted = substring(nzb_ref_encrypted for octet_length(nzb_ref_encrypted) - 1)"),
+    ] {
+        app.batch_execute(change).await.unwrap();
+        assert_eq!(store::reconcile_null(&mut app, &input(&original), "running", 7).await.err(), Some(StoreError::Stale));
+        assert_eq!(authority_row(&app).await, before);
+        app.batch_execute(restore).await.unwrap();
+    }
+    app.batch_execute("DELETE FROM ingest_originals")
+        .await
+        .unwrap();
+    assert_eq!(
+        store::reconcile_null(&mut app, &input(&original), "running", 7)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+    assert_eq!(authority_row(&app).await, before);
+}
+
+#[tokio::test]
+async fn null_reconciliation_sql_failure_zero_row_and_overflow_leave_legacy_authority_untouched() {
+    let (mut app, original, _) = seeded().await;
+    app.batch_execute("UPDATE ingest_jobs SET status = 'running', admin_checkpoint = NULL, admin_checkpoint_revision = 7").await.unwrap();
+    let before = authority_row(&app).await;
+    for (function, error) in [
+        ("CREATE OR REPLACE FUNCTION pg_temp.refuse_reconciliation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$", StoreError::Database),
+        ("CREATE OR REPLACE FUNCTION pg_temp.refuse_reconciliation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$", StoreError::Stale),
+    ] {
+        app.batch_execute(function).await.unwrap();
+        app.batch_execute("CREATE TRIGGER refuse_reconciliation BEFORE UPDATE ON ingest_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_reconciliation()").await.unwrap();
+        assert_eq!(store::reconcile_null(&mut app, &input(&original), "running", 7).await.err(), Some(error));
+        assert_eq!(authority_row(&app).await, before);
+        app.batch_execute("DROP TRIGGER refuse_reconciliation ON ingest_jobs").await.unwrap();
+    }
+    for revision in [-1_i64, i64::MAX] {
+        app.execute(
+            "UPDATE ingest_jobs SET admin_checkpoint_revision = $1",
+            &[&revision],
+        )
+        .await
+        .unwrap();
+        let before = authority_row(&app).await;
+        assert_eq!(
+            store::reconcile_null(&mut app, &input(&original), "running", revision)
+                .await
+                .err(),
+            Some(StoreError::Invalid)
+        );
+        assert_eq!(authority_row(&app).await, before);
+    }
+}
+
 #[tokio::test]
 async fn original_reads_preserve_fenced_state_and_do_not_reconcile_legacy_authority() {
     let (app, original, initial) = seeded().await;

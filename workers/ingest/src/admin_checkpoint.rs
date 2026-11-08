@@ -99,6 +99,45 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    /// Counter/shape construction only, for explicit legacy reconciliation.
+    /// Storage must prove SQL NULL and an eligible status under the job lock;
+    /// this cannot replace populated authority or grant authorization itself.
+    pub(crate) fn reconciled(
+        identity: &Identity<'_>,
+        previous_revision: i64,
+    ) -> Result<Self, CheckpointError> {
+        if previous_revision < 0 {
+            return Err(CheckpointError::Invalid);
+        }
+        let revision = previous_revision
+            .checked_add(1)
+            .ok_or(CheckpointError::Exhausted)?;
+        let mut snapshot = Self::initial(
+            JobCheckpoint {
+                job_id: identity.job_id.into(),
+                user_id: identity.user_id.into(),
+                idempotency_key: identity.idempotency_key.into(),
+                source: JobSource::AdminUpload,
+                state: JobState::Queued,
+                attempt: 1,
+                repair_rounds: 0,
+                probe_tally: None,
+                admin_release_mbid: None,
+                par2_set_id: None,
+                missing_blocks: 0,
+                failure_code: None,
+                failure_reason: None,
+                provider_id: None,
+                transcode_inputs: vec![],
+                transcode_next: 0,
+            },
+            identity,
+        )?;
+        snapshot.revision = revision;
+        snapshot.generation = revision;
+        Ok(snapshot)
+    }
+
     pub fn checkpoint(&self) -> &JobCheckpoint {
         &self.checkpoint
     }

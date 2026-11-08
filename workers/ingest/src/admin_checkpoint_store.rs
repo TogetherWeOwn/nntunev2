@@ -1,6 +1,7 @@
 //! Internal PostgreSQL stage/control/publication authority. No live dispatch or
 //! public route uses this adapter yet. Ordered schema integration, upload
-//! initialization and authenticated control routes remain required integration.
+//! initialization and authenticated control/reconciliation routes remain required
+//! integration. Null-only reconciliation below is an explicit internal primitive.
 //! The caller supplies the authenticated original, captures the trusted queue
 //! generation, and applies its existing database/service deadline. No KV fallback.
 
@@ -44,6 +45,7 @@ fn identity<'a>(original: &StageOriginal<'a>) -> Identity<'a> {
 // malformed/oversized checkpoints are all non-executable, not initializations.
 // Original identity/length is rechecked after asynchronous provider reads.
 const SELECT: &str = "SELECT j.status, j.admin_checkpoint_revision,
+    j.admin_checkpoint IS NULL AS legacy_null,
     CASE WHEN octet_length(j.admin_checkpoint::text) <= 16384
          THEN j.admin_checkpoint::text ELSE NULL END AS checkpoint
     FROM ingest_jobs j JOIN ingest_originals o ON o.job_id = j.id
@@ -111,6 +113,76 @@ pub async fn load(
     load_on(client, original, generation, false)
         .await
         .map(|(snapshot, _)| snapshot)
+}
+
+/// Explicit reconciliation of historical SQL-NULL authority only. The caller
+/// must authorize the admin action, supply the authenticated original, capture
+/// expected status/revision, and apply its deadline. This is not automatic
+/// repair, upload dedupe, an audit sink or a live route. Populated (even invalid)
+/// checkpoints and parked/terminal rows need their separate legal control path.
+/// All evidence starts fresh at Queued; revision/generation never reset. Enqueue
+/// only after commit; commit-result uncertainty requires authority reload.
+/// New uploads instead initialize with their job/original admission transaction.
+/// This function never sends work or reads KV.
+pub async fn reconcile_null(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    expected_status: &str,
+    expected_revision: i64,
+) -> Result<Snapshot, StoreError> {
+    if !matches!(expected_status, "queued" | "running") {
+        return Err(StoreError::Invalid);
+    }
+    let successor = Snapshot::reconciled(&identity(original), expected_revision)
+        .map_err(|_| StoreError::Invalid)?;
+    let encoded = successor.encode().map_err(|_| StoreError::Invalid)?;
+    let bytes = i64::try_from(original.nzb_bytes).map_err(|_| StoreError::Invalid)?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|_| StoreError::Database)?;
+    let rows = tx
+        .query(
+            &format!("{SELECT} FOR UPDATE OF j FOR SHARE OF o"),
+            &[&original.job_id, &original.idempotency_key, &bytes],
+        )
+        .await
+        .map_err(|_| StoreError::Database)?;
+    if rows.len() != 1 {
+        return Err(StoreError::Stale);
+    }
+    let row = &rows[0];
+    let legacy_null: bool = row
+        .try_get("legacy_null")
+        .map_err(|_| StoreError::Invalid)?;
+    let status: String = row.try_get("status").map_err(|_| StoreError::Invalid)?;
+    let revision: i64 = row
+        .try_get("admin_checkpoint_revision")
+        .map_err(|_| StoreError::Invalid)?;
+    if !legacy_null || status != expected_status || revision != expected_revision {
+        return Err(StoreError::Stale);
+    }
+    let count = tx
+        .execute(
+            "UPDATE ingest_jobs SET admin_checkpoint = $4::text::jsonb,
+                admin_checkpoint_revision = $5, status = 'queued'
+             WHERE id = $1 AND source = 'admin' AND status = $2
+               AND admin_checkpoint_revision = $3 AND admin_checkpoint IS NULL",
+            &[
+                &original.job_id,
+                &expected_status,
+                &expected_revision,
+                &encoded,
+                &successor.revision(),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError::Database)?;
+    if count != 1 {
+        return Err(StoreError::Stale);
+    }
+    tx.commit().await.map_err(|_| StoreError::Database)?;
+    Ok(successor)
 }
 
 /// Persist one ordinary stage and its status in a short job-locked transaction.

@@ -60,6 +60,34 @@ fn strict_round_trip_and_checked_generation_revision_metadata() {
 }
 
 #[test]
+fn reconciliation_starts_fresh_at_checked_monotonic_revision_and_generation() {
+    let cp = checkpoint();
+    for previous in [0, 7, i64::MAX - 1] {
+        let snapshot = Snapshot::reconciled(&identity(&cp), previous).unwrap();
+        assert_eq!(
+            (snapshot.revision(), snapshot.generation()),
+            (previous + 1, previous + 1)
+        );
+        assert_eq!(snapshot.checkpoint(), &cp);
+        assert!(
+            Snapshot::decode(&snapshot.encode().unwrap(), previous + 1, &identity(&cp)).unwrap()
+                == snapshot
+        );
+    }
+    assert!(matches!(
+        Snapshot::reconciled(&identity(&cp), -1),
+        Err(CheckpointError::Invalid)
+    ));
+    assert!(matches!(
+        Snapshot::reconciled(&identity(&cp), i64::MAX),
+        Err(CheckpointError::Exhausted)
+    ));
+    let mut invalid = cp;
+    invalid.idempotency_key.clear();
+    assert!(Snapshot::reconciled(&identity(&invalid), 0).is_err());
+}
+
+#[test]
 fn envelope_rejects_null_unknown_missing_and_invalid_counter_types() {
     assert!(decode(&Value::Null).is_err());
     for path in [
