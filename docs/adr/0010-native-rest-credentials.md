@@ -140,9 +140,14 @@ dispatch, even alongside a valid session cookie and Origin: cookies never
 rescue an invalid bearer. With no bearer presented, the existing session
 issuance, heartbeat, entitlement and lease rules are unchanged.
 
-Native bearer play-event handling and grant issuance remain separate
-product/implementation work. This clarification changes neither the scope
-map nor authorization and does not claim either capability is delivered.
+Client-reported history uses the distinct `POST /v1/plays/events` seam
+with `plays:write` bearer authentication or a cookie session plus exact
+Origin. It does not issue a grant or change meter/lease state. Private
+history export (`POST /v1/plays/export`) and clearing
+(`DELETE /v1/plays/events`) remain session-only; clearing requires a fresh
+session. See [listen history](../listen-history.md) for payloads, retention,
+and verification limits. Native bearer grant issuance remains separate
+product/implementation work; `/v1/plays` keeps the boundary above.
 
 ### Issuance, expiry, revocation
 

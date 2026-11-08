@@ -1233,6 +1233,28 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Persist an immutable client history event, fenced against account deletion.
+    /// Retries must match the original track/event; terminals require a start.
+    fn record_listen_event(
+        &self,
+        _user_id: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Owner-scoped keyset export, at most EXPORT_PAGE_SIZE + 1 rows.
+    fn export_listen_events(
+        &self,
+        _user_id: &str,
+        _before_id: Option<i64>,
+    ) -> impl Future<Output = Result<Vec<crate::listen_history::ListenRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Explicit history clearing; never touches meter receipts or playback leases.
+    fn delete_listen_events(&self, _user_id: &str) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
     // --- Stripe billing reconciliation (migrations 0021/0029) ------------------
     //
     // The webhook and the inline/API paths share one reconciliation
@@ -5460,6 +5482,125 @@ fn play_grant_response(
     }
 }
 
+// Listen history is client-reported product data, not proof of streamed seconds.
+// A bearer may write history with plays:write, never use it to mint a grant.
+async fn listen_event_write<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = match bearer {
+        Some(user_id) => user_id.to_string(),
+        None => match ctx.authenticate(req, true).await {
+            Ok((claims, _)) => claims.user_id,
+            Err(resp) => return resp,
+        },
+    };
+    let Some(body) = parse_body::<crate::listen_history::ListenEventBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !body.valid() {
+        return validation_failed("invalid history event");
+    }
+    match ctx
+        .store
+        .reserve_rate_limit(
+            &user_id,
+            "plays.history",
+            u64::from(crate::listen_history::EVENTS_PER_MINUTE),
+            ctx.now,
+            60,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return throttled(60),
+        Err(_) => return internal(),
+    }
+    match ctx
+        .store
+        .record_listen_event(&user_id, &body, ctx.now)
+        .await
+    {
+        Ok(crate::listen_history::WriteOutcome::Written) => {
+            json_response(200, serde_json::json!({"ok": true}))
+        }
+        Ok(crate::listen_history::WriteOutcome::AccountDeleting) => account_deleting_response(),
+        Ok(crate::listen_history::WriteOutcome::Conflict) => {
+            validation_failed("history event conflicts with playback")
+        }
+        Err(_) => internal(),
+    }
+}
+
+async fn listen_history_export<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // POST is intentional: the cursor is not placed in URLs/logs, and this
+    // private export is cookie-session-only with the same exact Origin pin.
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<crate::listen_history::ExportBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let before = match crate::listen_history::export_cursor(body.before_id.as_deref()) {
+        Ok(cursor) => cursor,
+        Err(message) => return validation_failed(message),
+    };
+    match ctx
+        .store
+        .export_listen_events(&claims.user_id, before)
+        .await
+    {
+        Ok(mut rows) => {
+            let has_more = rows.len() > crate::listen_history::EXPORT_PAGE_SIZE;
+            rows.truncate(crate::listen_history::EXPORT_PAGE_SIZE);
+            let next_cursor = if has_more {
+                rows.last().map(|row| row.id.clone())
+            } else {
+                None
+            };
+            json_response(
+                200,
+                serde_json::json!({
+                    "events": rows, "next_cursor": next_cursor,
+                    "retention": "account_lifetime",
+                }),
+            )
+        }
+        Err(_) => internal(),
+    }
+}
+
+async fn listen_history_delete<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.delete_listen_events(&claims.user_id).await {
+        Ok(()) => json_response(200, serde_json::json!({"ok": true})),
+        Err(_) => internal(),
+    }
+}
+
 async fn play_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6837,6 +6978,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/revoke-all"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
+            | "/v1/plays/events"
+            | "/v1/plays/export"
             | "/v1/credentials"
             | "/v1/plans"
             | "/v1/me/usage"
@@ -7045,6 +7188,11 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        ("POST", crate::listen_history::EVENTS_PATH) => {
+            listen_event_write(ctx, req, bearer_user.as_deref()).await
+        }
+        ("POST", crate::listen_history::EXPORT_PATH) => listen_history_export(ctx, req).await,
+        ("DELETE", crate::listen_history::EVENTS_PATH) => listen_history_delete(ctx, req).await,
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
         // map denies this path to bearer credentials, so the gate
@@ -7227,8 +7375,12 @@ mod tests {
         })
     }
 
+    include!("listen_history_handler_tests.rs");
+
     #[derive(Default)]
     struct FakeStore {
+        listen_events: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
+        fail_listen: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
@@ -8448,6 +8600,91 @@ mod tests {
                 .get(mbid)
                 .cloned()
                 .unwrap_or_default())
+        }
+        async fn record_listen_event(
+            &self,
+            user_id: &str,
+            body: &crate::listen_history::ListenEventBody,
+            now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            use crate::listen_history::{ListenEvent, ListenRow, WriteOutcome};
+            if *self.fail_listen.borrow() {
+                return Err(StoreError);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(WriteOutcome::AccountDeleting);
+            }
+            let mut rows = self.listen_events.borrow_mut();
+            if let Some((_, row)) = rows.iter().find(|(owner, row)| {
+                owner == user_id
+                    && row.playback_id == body.playback_id
+                    && row.event.phase() == body.event.phase()
+            }) {
+                return Ok(
+                    if row.track_id == body.track_id && row.event == body.event {
+                        WriteOutcome::Written
+                    } else {
+                        WriteOutcome::Conflict
+                    },
+                );
+            }
+            if body.event != ListenEvent::Start
+                && !rows.iter().any(|(owner, row)| {
+                    owner == user_id
+                        && row.playback_id == body.playback_id
+                        && row.track_id == body.track_id
+                        && row.event == ListenEvent::Start
+                })
+            {
+                return Ok(WriteOutcome::Conflict);
+            }
+            let id = rows
+                .iter()
+                .map(|(_, row)| row.id.parse::<u64>().unwrap())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            rows.push((
+                user_id.to_string(),
+                ListenRow {
+                    id: id.to_string(),
+                    playback_id: body.playback_id.clone(),
+                    track_id: body.track_id.clone(),
+                    event: body.event,
+                    recorded_at: now as i64,
+                },
+            ));
+            Ok(WriteOutcome::Written)
+        }
+        async fn export_listen_events(
+            &self,
+            user_id: &str,
+            before_id: Option<i64>,
+        ) -> Result<Vec<crate::listen_history::ListenRow>, StoreError> {
+            if *self.fail_listen.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .listen_events
+                .borrow()
+                .iter()
+                .rev()
+                .filter(|(owner, row)| {
+                    owner == user_id
+                        && before_id.is_none_or(|before| row.id.parse::<i64>().unwrap() < before)
+                })
+                .take(crate::listen_history::EXPORT_PAGE_SIZE + 1)
+                .map(|(_, row)| row.clone())
+                .collect())
+        }
+        async fn delete_listen_events(&self, user_id: &str) -> Result<(), StoreError> {
+            if *self.fail_listen.borrow() {
+                return Err(StoreError);
+            }
+            self.listen_events
+                .borrow_mut()
+                .retain(|(owner, _)| owner != user_id);
+            Ok(())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))

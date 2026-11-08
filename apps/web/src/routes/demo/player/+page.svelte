@@ -31,6 +31,7 @@
 		type MediaSessionSeekDetails
 	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
+	import { listenEvents } from '#lib/player/listenEventsAction.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import {
 		clampPlaybackSpeed,
@@ -1767,6 +1768,7 @@
 		<audio
 			bind:this={audioEl}
 			use:releaseAudio={current?.id}
+			use:listenEvents={() => current?.id}
 			data-testid="demo-audio"
 			src={current?.streamUrl}
 			preload="metadata"
