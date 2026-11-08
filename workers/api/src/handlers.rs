@@ -4965,6 +4965,91 @@ fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> 
     }
 }
 
+/// Session-bound original for an explicit control or null reconciliation. No
+/// Debug/Serialize, session token, key material or public constructor. Opening
+/// this holder changes no job state and grants no execution lease. The mutation
+/// adapter must still recheck actor role/deletion and the whole saved authority.
+pub struct AdminControlOriginal {
+    original: crate::admin_original::OriginalBody,
+    actor_user_id: String,
+    source_ip: Option<std::net::IpAddr>,
+    now: i64,
+}
+
+impl AdminControlOriginal {
+    pub fn original(&self) -> &crate::admin_original::OriginalBody {
+        &self.original
+    }
+
+    pub fn actor_user_id(&self) -> &str {
+        &self.actor_user_id
+    }
+
+    pub fn source_ip(&self) -> Option<std::net::IpAddr> {
+        self.source_ip
+    }
+
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+}
+
+struct ControlOriginalAuthorization<'a>(&'a str);
+
+impl crate::admin_original::OriginalAuthorization for ControlOriginalAuthorization<'_> {
+    fn authorize(&self, job_id: &str) -> Result<(), crate::admin_original::OriginalError> {
+        if job_id == self.0 {
+            Ok(())
+        } else {
+            Err(crate::admin_original::OriginalError::Denied)
+        }
+    }
+}
+
+/// Internal preparation only: no public route dispatches here yet. Apply the
+/// caller's database deadline to this entire operation. The existing admin
+/// mutation guard checks cookie signature, current session row, Origin, current
+/// role and freshness BEFORE touching the original repository or keyring. Native
+/// credentials (even alongside a cookie) cannot enter this path. Archive resume
+/// additionally needs its existing capability gate at the eventual caller.
+pub async fn read_admin_control_original<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    job_id: &str,
+    repository: &mut impl crate::admin_original::OriginalRepository,
+) -> Result<AdminControlOriginal, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = ctx.authenticate_admin(req, true).await?;
+    match ctx.store.account_deleting(&claims.user_id).await {
+        Ok(false) => {}
+        Ok(true) => return Err(account_deleting_response()),
+        Err(_) => return Err(internal()),
+    }
+    let now = i64::try_from(ctx.now).map_err(|_| internal())?;
+    let original = crate::admin_original::read_original(
+        &ControlOriginalAuthorization(job_id),
+        repository,
+        ctx.cfg,
+        job_id,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::admin_original::OriginalError::Missing => not_found(),
+        _ => internal(),
+    })?;
+    Ok(AdminControlOriginal {
+        original,
+        actor_user_id: claims.user_id,
+        source_ip: ctx.source_ip.parse().ok(),
+        now,
+    })
+}
+
 /// `POST /v1/admin/ingest` — accept one raw NZB upload. The guard runs
 /// first (mutation, so a stale admin session steps up); the body then
 /// classifies in intake order (empty, too large, not-NZB heuristic,
@@ -7335,6 +7420,7 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
+        fail_account_deleting_lookup: RefCell<bool>,
         /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
@@ -8504,6 +8590,9 @@ mod tests {
                 .unwrap_or_default())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_account_deleting_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
@@ -16075,6 +16164,10 @@ mod tests {
         );
         assert!(audit.subject_user_id.is_none());
         serde_json::from_str(audit.details.as_ref().expect("details")).unwrap()
+    }
+
+    mod control_original {
+        include!("admin_control_original_tests.rs");
     }
 
     #[test]
