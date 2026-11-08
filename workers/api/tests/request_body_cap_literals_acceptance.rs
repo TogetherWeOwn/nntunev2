@@ -268,7 +268,7 @@ impl handlers::Store for UnreachableStore {
     unreachable_store! {
         user_by_email(email: &str) -> Result<Option<handlers::UserRecord>, handlers::StoreError>,
         insert_user(user: &handlers::UserRecord) -> Result<(), handlers::StoreError>,
-        insert_challenge(challenge: &auth::PasskeyChallenge, user_id: Option<&str>, purpose: &str) -> Result<(), handlers::StoreError>,
+        insert_challenge(challenge: &auth::PasskeyChallenge, user_id: Option<&str>, purpose: &str, receipt: Option<&handlers::InviteBudgetReceipt>) -> Result<(), handlers::StoreError>,
         challenge_by_id(id: &str) -> Result<Option<handlers::ChallengeRow>, handlers::StoreError>,
         insert_credential(credential: &auth::PasskeyCredential) -> Result<(), handlers::StoreError>,
         credential_by_id(cred_id_b64url: &str) -> Result<Option<auth::PasskeyCredential>, handlers::StoreError>,

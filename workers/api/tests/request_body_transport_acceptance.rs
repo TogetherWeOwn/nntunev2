@@ -584,6 +584,7 @@ impl handlers::Store for CountingStore {
         _challenge: &auth::PasskeyChallenge,
         _user_id: Option<&str>,
         _purpose: &str,
+        _receipt: Option<&handlers::InviteBudgetReceipt>,
     ) -> Result<(), handlers::StoreError> {
         self.bump();
         Ok(())

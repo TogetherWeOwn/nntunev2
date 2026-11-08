@@ -589,12 +589,48 @@ pub const PURPOSE_REAUTH: &str = "reauth";
 /// counter becomes the baseline; counterless authenticators stay at 0.
 const ENROLLMENT_SIGN_COUNT: u32 = 0;
 
+/// Accounting evidence for one invite guess already charged at register/start.
+/// Stored only with its challenge; never accepted from a request or used as
+/// invite validity or enrollment authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteBudgetReceipt {
+    pub invite_code_hash: String,
+    pub email_budget_key: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChallengeRow {
     pub challenge: PasskeyChallenge,
     pub user_id: Option<String>,
     /// Immutable ceremony purpose recorded at insert (migration 0004).
     pub purpose: String,
+    pub invite_budget_receipt: Option<InviteBudgetReceipt>,
+}
+
+impl ChallengeRow {
+    fn admits_invite_email(
+        &self,
+        cfg: &Config,
+        challenge_id: &str,
+        user_id: &str,
+        code: Option<&str>,
+        email_budget_key: &str,
+        now: u64,
+    ) -> bool {
+        self.purpose == PURPOSE_REGISTER
+            && self.user_id.as_deref() == Some(user_id)
+            && self.challenge.id == challenge_id
+            && !self.challenge.consumed
+            && self.challenge.expires_at > now
+            && self.challenge.rp_id == cfg.rp_id
+            && self.challenge.origin == cfg.origin
+            && self.invite_budget_receipt.as_ref().is_some_and(|receipt| {
+                receipt.email_budget_key == email_budget_key
+                    && code.is_some_and(|code| {
+                        receipt.invite_code_hash == auth::hash_invite_code(code)
+                    })
+            })
+    }
 }
 
 /// One `plans` row (migration 0021 as reseeded by 0026). Plan prices and
@@ -681,6 +717,7 @@ pub trait Store {
         challenge: &PasskeyChallenge,
         user_id: Option<&str>,
         purpose: &str,
+        receipt: Option<&InviteBudgetReceipt>,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn challenge_by_id(
         &self,
@@ -2397,7 +2434,7 @@ where
     // finish, so this check is no cheaper an oracle than finishing.
     // Consumption still happens only inside `complete_registration`;
     // a valid pre-check leaves the code redeemable.
-    if let Some(code) = &body.invite_code {
+    let invite_budget_receipt = if let Some(code) = &body.invite_code {
         let attempt_key = format!("invite:{}:start", rate_limit_ip_key(&ctx.source_ip));
         let email_key = email_rate_limit_key(ctx.cfg, &email);
         let allowed = matches!(
@@ -2446,7 +2483,13 @@ where
         if auth::prepare_invite_redemption(invite, code, &redemption).is_err() {
             return generic_auth();
         }
-    }
+        Some(InviteBudgetReceipt {
+            invite_code_hash: auth::hash_invite_code(code),
+            email_budget_key: email_key,
+        })
+    } else {
+        None
+    };
     // Identical 200 shape for every admitted outcome below (new email,
     // abandoned signup, already-registered account): this route must not be
     // an account-existence oracle. A taken email gets an unbound challenge
@@ -2561,7 +2604,12 @@ where
     // user and preserves that challenge, so either ordering can recover.
     if ctx
         .store
-        .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+        .insert_challenge(
+            &challenge,
+            Some(&user.id),
+            PURPOSE_REGISTER,
+            invite_budget_receipt.as_ref(),
+        )
         .await
         .is_err()
     {
@@ -2577,7 +2625,12 @@ where
                 }
                 if ctx
                     .store
-                    .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                    .insert_challenge(
+                        &challenge,
+                        Some(&user.id),
+                        PURPOSE_REGISTER,
+                        invite_budget_receipt.as_ref(),
+                    )
                     .await
                     .is_err()
                 {
@@ -2606,11 +2659,17 @@ where
                             && row.challenge.expires_at == challenge.expires_at
                             && !row.challenge.consumed
                             && row.user_id.as_deref() == Some(user.id.as_str())
-                            && row.purpose == PURPOSE_REGISTER => {}
+                            && row.purpose == PURPOSE_REGISTER
+                            && row.invite_budget_receipt == invite_budget_receipt => {}
                     Ok(None) => {
                         if ctx
                             .store
-                            .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                            .insert_challenge(
+                                &challenge,
+                                Some(&user.id),
+                                PURPOSE_REGISTER,
+                                invite_budget_receipt.as_ref(),
+                            )
                             .await
                             .is_err()
                         {
@@ -2739,35 +2798,52 @@ where
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
     let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
-        // Atomic redemption budgets BEFORE the lookup, claimed as one
-        // all-or-none pair: the per-client key (10/300s, keyed by client
-        // prefix and account, per `auth::invite_attempt_allowed`) and
-        // the per-email key (5/hour), so rotating IPs or pre-created
-        // rows cannot multiply guesses against one invited address.
-        // Denial is the generic error — it never reveals which limit
-        // fired (no throttle oracle).
+        // Reserve BEFORE invite lookup. An immutable challenge receipt
+        // pays only for the exact email/code guess charged at start; the
+        // existing finish client guard is always charged. Other tuples
+        // still reserve the original all-or-none client/email pair.
         let attempt_key = format!("invite:{}:{}", rate_limit_ip_key(&ctx.source_ip), user_id);
         let email_key = email_rate_limit_key(ctx.cfg, &magic.email);
-        let allowed = matches!(
+        let allowed = if row.admits_invite_email(
+            ctx.cfg,
+            &body.challenge,
+            &user_id,
+            body.invite_code.as_deref(),
+            &email_key,
+            ctx.now,
+        ) {
             ctx.store
-                .reserve_rate_limit_pair(
-                    RateLimitBudget {
-                        scope_key: &attempt_key,
-                        action: "auth.invite_redeem",
-                        limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
-                        window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
-                    },
-                    RateLimitBudget {
-                        scope_key: &email_key,
-                        action: "auth.invite_redeem_email",
-                        limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
-                        window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
-                    },
+                .reserve_rate_limit(
+                    &attempt_key,
+                    "auth.invite_redeem",
+                    u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
                     ctx.now,
+                    auth::INVITE_REDEMPTION_WINDOW_SECS,
                 )
-                .await,
-            Ok(PairAdmission::Allowed)
-        );
+                .await
+                .unwrap_or(false)
+        } else {
+            matches!(
+                ctx.store
+                    .reserve_rate_limit_pair(
+                        RateLimitBudget {
+                            scope_key: &attempt_key,
+                            action: "auth.invite_redeem",
+                            limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                            window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
+                        },
+                        RateLimitBudget {
+                            scope_key: &email_key,
+                            action: "auth.invite_redeem_email",
+                            limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
+                            window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
+                        },
+                        ctx.now,
+                    )
+                    .await,
+                Ok(PairAdmission::Allowed)
+            )
+        };
         if !allowed {
             return generic_auth();
         }
@@ -2931,6 +3007,7 @@ where
                 &challenge,
                 user.as_ref().map(|user| user.id.as_str()),
                 PURPOSE_LOGIN,
+                None,
             )
             .await
             .is_err()
@@ -2981,7 +3058,7 @@ where
     if ctx.store.prune_expired_challenges(ctx.now).await.is_err()
         || ctx
             .store
-            .insert_challenge(&challenge, Some(&claims.user_id), PURPOSE_REAUTH)
+            .insert_challenge(&challenge, Some(&claims.user_id), PURPOSE_REAUTH, None)
             .await
             .is_err()
     {
@@ -7240,6 +7317,8 @@ mod tests {
         /// Next surrogate invite id to hand out (mirror of the
         /// migration 0033 identity column).
         next_invite_id: RefCell<i64>,
+        invite_reads: RefCell<usize>,
+        fail_invite_audit: RefCell<bool>,
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
@@ -7463,7 +7542,11 @@ mod tests {
             challenge: &PasskeyChallenge,
             user_id: Option<&str>,
             purpose: &str,
+            receipt: Option<&InviteBudgetReceipt>,
         ) -> Result<(), StoreError> {
+            if receipt.is_some() && (purpose != PURPOSE_REGISTER || user_id.is_none()) {
+                return Err(StoreError);
+            }
             if let Some(id) = self.delete_user_before_next_challenge.borrow_mut().take() {
                 self.users.borrow_mut().remove(&id);
             }
@@ -7484,6 +7567,7 @@ mod tests {
                     challenge: challenge.clone(),
                     user_id: user_id.map(str::to_string),
                     purpose: purpose.to_string(),
+                    invite_budget_receipt: receipt.cloned(),
                 },
             );
             if let Some(id) = self.delete_user_after_next_challenge.borrow_mut().take() {
@@ -7560,6 +7644,9 @@ mod tests {
                         .borrow_mut()
                         .insert(credential.user_id.clone(), claimed_issuer);
                     let audit = invite_audit.ok_or(StoreError)?;
+                    if *self.fail_invite_audit.borrow() {
+                        return Err(StoreError);
+                    }
                     self.audits.borrow_mut().push(audit.clone());
                 }
                 self.insert_credential(credential).await
@@ -8026,6 +8113,7 @@ mod tests {
             &self,
             code_hash: &str,
         ) -> Result<Option<InviteRecord>, StoreError> {
+            *self.invite_reads.borrow_mut() += 1;
             // Mirror the production join: the issuer's current email
             // rides the record so the pure prepare can refuse
             // self-invites.
@@ -14925,7 +15013,11 @@ mod tests {
             expires_at: NOW.saturating_sub(1),
             consumed: false,
         };
-        block_on(h.store.insert_challenge(&expired, None, PURPOSE_LOGIN)).unwrap();
+        block_on(
+            h.store
+                .insert_challenge(&expired, None, PURPOSE_LOGIN, None),
+        )
+        .unwrap();
         let _ = h.call(
             "POST",
             "/v1/auth/passkey/login/start",
@@ -17413,6 +17505,11 @@ mod tests {
         include!("../tests/support/invite_budget_boundary.rs");
     }
 
+    mod invite_budget_receipts {
+        use super::*;
+        include!("../tests/support/invite_budget_receipts.rs");
+    }
+
     #[test]
     fn invite_redemption_enrolls_once_and_stamps_invited_by() {
         let mut h = harness();
@@ -17665,7 +17762,7 @@ mod tests {
             let challenge_id = challenge.id.clone();
             block_on(
                 h.store
-                    .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+                    .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER, None),
             )
             .unwrap();
             let (token, record) =
@@ -18847,7 +18944,7 @@ mod tests {
         let challenge_id = challenge.id.clone();
         block_on(
             h.store
-                .insert_challenge(&challenge, Some("victim"), PURPOSE_LOGIN),
+                .insert_challenge(&challenge, Some("victim"), PURPOSE_LOGIN, None),
         )
         .unwrap();
         let (token, record) =
@@ -20092,7 +20189,11 @@ mod tests {
             expires_at: NOW.saturating_sub(1),
             consumed: false,
         };
-        block_on(h.store.insert_challenge(&expired, None, PURPOSE_LOGIN)).unwrap();
+        block_on(
+            h.store
+                .insert_challenge(&expired, None, PURPOSE_LOGIN, None),
+        )
+        .unwrap();
         let resp = h.call(
             "POST",
             "/v1/auth/passkey/register/start",
@@ -20145,10 +20246,12 @@ mod tests {
         // Finish consumes the challenge before credential insertion; cleanup
         // must still protect the user during that in-flight interval.
         finishing_challenge.consumed = true;
-        block_on(
-            h.store
-                .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
-        )
+        block_on(h.store.insert_challenge(
+            &finishing_challenge,
+            Some("active"),
+            PURPOSE_REGISTER,
+            None,
+        ))
         .unwrap();
         h.store
             .deleting_users
@@ -20237,13 +20340,17 @@ mod tests {
         assert!(
             block_on(
                 h.store
-                    .insert_challenge(&challenge, Some("ghost"), PURPOSE_REGISTER)
+                    .insert_challenge(&challenge, Some("ghost"), PURPOSE_REGISTER, None)
             )
             .is_err(),
             "bound challenge for a missing user must fail"
         );
         assert!(
-            block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).is_ok(),
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, None, PURPOSE_LOGIN, None)
+            )
+            .is_ok(),
             "unbound login challenges stay allowed"
         );
     }
@@ -20492,7 +20599,11 @@ mod tests {
         let h = harness();
         let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
         let challenge_id = challenge.id.clone();
-        block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).unwrap();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, None, PURPOSE_LOGIN, None),
+        )
+        .unwrap();
         for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
             assert!(block_on(h.store.reserve_rate_limit(
                 "198.51.100.9",
@@ -20658,7 +20769,7 @@ mod tests {
             let challenge_id = challenge.id.clone();
             block_on(
                 h.store
-                    .insert_challenge(&challenge, Some(user_id), PURPOSE_REGISTER),
+                    .insert_challenge(&challenge, Some(user_id), PURPOSE_REGISTER, None),
             )
             .unwrap();
             let (token, record) = auth::issue_magic_link(user_id, email, NOW).expect("issue");
@@ -20745,7 +20856,7 @@ mod tests {
         let challenge_id = challenge.id.clone();
         block_on(
             h.store
-                .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER, None),
         )
         .unwrap();
         let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
@@ -20790,7 +20901,7 @@ mod tests {
         let challenge_id2 = challenge2.id.clone();
         block_on(
             h.store
-                .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER),
+                .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER, None),
         )
         .unwrap();
         let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
@@ -20847,7 +20958,7 @@ mod tests {
         let challenge_id = challenge.id.clone();
         block_on(
             h.store
-                .insert_challenge(&challenge, Some("u1"), PURPOSE_LOGIN),
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_LOGIN, None),
         )
         .unwrap();
         let forged = serde_json::json!({
