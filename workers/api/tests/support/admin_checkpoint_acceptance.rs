@@ -4,6 +4,8 @@
 //! settlement_races adds two-connection lock-order coverage on shared scratch rows.
 #[path = "admin_control_audit_acceptance.rs"]
 mod control_audit;
+#[path = "admin_delivery_stage_acceptance.rs"]
+mod delivery_stage;
 #[path = "admin_service_failure_acceptance.rs"]
 mod service_failure;
 #[path = "admin_settlement_races.rs"]

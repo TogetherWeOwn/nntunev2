@@ -121,6 +121,128 @@ async fn blocked_by(observer: &Client, waiting: i32, holding: i32) -> bool {
     .is_ok()
 }
 
+struct PausedMatch {
+    entered: Option<oneshot::Sender<()>>,
+    release: oneshot::Receiver<()>,
+    transient: bool,
+}
+
+impl store::StageServices for PausedMatch {
+    async fn match_release(&mut self, _: &Document) -> Result<Option<String>, store::ServiceError> {
+        self.entered.take().unwrap().send(()).unwrap();
+        (&mut self.release).await.unwrap();
+        if self.transient {
+            Err(store::ServiceError::Transient {
+                retry_after_secs: None,
+            })
+        } else {
+            Ok(Some(RELEASE.into()))
+        }
+    }
+
+    async fn probe(&mut self, _: &ProbeRequest) -> Result<ProbeOutcome, store::ServiceError> {
+        panic!("one matching stage must not reach probe")
+    }
+}
+
+#[tokio::test]
+async fn delivery_stage_reads_hold_no_transaction_and_rejection_fences_success_or_failure() {
+    for transient in [false, true] {
+        let (mut app, original, initial) = seeded().await;
+        let mut cp = initial.checkpoint().clone();
+        let matching = {
+            let mut runtime = DatabaseRuntime {
+                app: &mut app,
+                original: &original,
+                snapshot: initial,
+                services: Runtime(cp.clone()),
+            };
+            for _ in 0..2 {
+                run_stage(
+                    &mut runtime,
+                    &mut cp,
+                    original.job_id(),
+                    original.idempotency_key(),
+                    original.parsed(),
+                )
+                .await
+                .unwrap();
+            }
+            runtime.snapshot
+        };
+        assert_eq!(matching.checkpoint().state, JobState::Matching);
+        let rows = SharedRows::copy_from(&app).await;
+        let mut worker = rows.client().await;
+        let mut controller = rows.client().await;
+        let worker_pid = pid(&worker).await;
+        let delivery = store::prepare_delivery(&worker, &input(&original), matching.generation())
+            .await
+            .unwrap()
+            .unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut services = PausedMatch {
+            entered: Some(entered),
+            release: released,
+            transient,
+        };
+        let original_input = input(&original);
+        let stage =
+            store::run_delivery_stage(&mut worker, &original_input, &delivery, &mut services);
+        let control = async {
+            started.await.unwrap();
+            let idle: bool = rows.observer.query_one(
+                "SELECT state = 'idle' AND xact_start IS NULL FROM pg_stat_activity WHERE pid = $1",
+                &[&worker_pid],
+            ).await.unwrap().get(0);
+            // Must commit while the provider response is withheld. A provider
+            // call under a job lock would deadlock this bounded join instead.
+            let rejected = store::apply_control(
+                &mut controller,
+                actor(),
+                &input(&original),
+                &matching,
+                Control::Reject,
+            )
+            .await;
+            release.send(()).unwrap();
+            (idle, rejected)
+        };
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(stage, control)
+        })
+        .await;
+        let authority = authority_row(&rows.observer).await;
+        let album_counts = counts(&rows.observer).await;
+        let audits: i64 = rows
+            .observer
+            .query_one("SELECT COUNT(*) FROM audit_log", &[])
+            .await
+            .unwrap()
+            .get(0);
+        rows.cleanup().await;
+        let (result, (idle, rejected)) =
+            settled.expect("control must finish before provider release");
+        let rejected = rejected.unwrap();
+        assert!(idle, "provider reads must hold no database transaction");
+        assert_eq!(result, Err(StoreError::Stale));
+        assert_eq!(authority.0, "rejected");
+        assert_eq!(authority.1, rejected.revision());
+        assert!(
+            Snapshot::decode(
+                authority.2.as_deref().unwrap(),
+                authority.1,
+                &identity(&original)
+            )
+            .unwrap()
+                == rejected
+        );
+        assert_eq!(rejected.checkpoint().attempt, matching.checkpoint().attempt);
+        assert!(rejected.generation() > delivery.generation());
+        assert_eq!((album_counts, audits), ((0, 0, 0), 1));
+    }
+}
+
 struct PausedSealer {
     entered: Option<oneshot::Sender<()>>,
     release: oneshot::Receiver<()>,

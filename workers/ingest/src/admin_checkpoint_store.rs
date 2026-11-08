@@ -9,7 +9,8 @@ use crate::{
     admin_checkpoint::{Identity, Snapshot, MAX_CHECKPOINT_BYTES},
     admin_execution::{
         controlled_checkpoint, service_failure_checkpoint, validate_publication,
-        validate_stage_transition, Control, ServiceFailureOutcome, StageError,
+        validate_stage_transition, Control, ServiceFailureOutcome, StageError, StageOutcome,
+        StageRuntime,
     },
     admin_writers::{write_album, AlbumWrite, FileGeometry, SourceSealer, WriteError},
     jobs::{self, JobCheckpoint, JobState},
@@ -279,6 +280,156 @@ pub async fn load_delivery(
     }
     let snapshot = load(client, original, delivery.generation()).await?;
     Ok(executable(&snapshot).then_some(snapshot))
+}
+
+/// Provider adapters expose fixed categories only; they cannot inject database,
+/// stale-write or commit-uncertain errors into the service retry budget.
+#[derive(Clone, Copy)]
+pub enum ServiceError {
+    Invalid,
+    Transient { retry_after_secs: Option<u32> },
+}
+
+/// Replayable reads from the CC0 mirror and authorized probe service. The
+/// authenticated original remains borrowed and no database transaction is open
+/// during either call. Implementations must not log their inputs or raw errors.
+pub trait StageServices {
+    fn match_release(
+        &mut self,
+        parsed: &nntune_core::nzb::Document,
+    ) -> impl std::future::Future<Output = Result<Option<String>, ServiceError>>;
+
+    fn probe(
+        &mut self,
+        request: &crate::probe::ProbeRequest,
+    ) -> impl std::future::Future<Output = Result<crate::probe::ProbeOutcome, ServiceError>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStageOutcome {
+    Inactive,
+    Advanced(StageOutcome),
+    ServiceFailure(ServiceFailureOutcome),
+}
+
+struct DeliveryRuntime<'a, 'doc, S> {
+    client: &'a mut Client,
+    original: &'a StageOriginal<'doc>,
+    snapshot: Snapshot,
+    services: &'a mut S,
+    store_error: Option<StoreError>,
+    retry_after_secs: Option<u32>,
+}
+
+impl<S: StageServices> DeliveryRuntime<'_, '_, S> {
+    fn service_error(&mut self, error: ServiceError, stage: StageError) -> StageError {
+        match error {
+            ServiceError::Invalid => StageError::Invalid,
+            ServiceError::Transient { retry_after_secs } => {
+                self.retry_after_secs = retry_after_secs;
+                stage
+            }
+        }
+    }
+}
+
+impl<S: StageServices> StageRuntime for DeliveryRuntime<'_, '_, S> {
+    async fn match_release(
+        &mut self,
+        parsed: &nntune_core::nzb::Document,
+    ) -> Result<Option<String>, StageError> {
+        self.services
+            .match_release(parsed)
+            .await
+            .map_err(|error| self.service_error(error, StageError::Match))
+    }
+
+    async fn probe(
+        &mut self,
+        request: &crate::probe::ProbeRequest,
+    ) -> Result<crate::probe::ProbeOutcome, StageError> {
+        self.services
+            .probe(request)
+            .await
+            .map_err(|error| self.service_error(error, StageError::Probe))
+    }
+
+    async fn persist(
+        &mut self,
+        expected: &JobCheckpoint,
+        next: &JobCheckpoint,
+    ) -> Result<bool, StageError> {
+        if expected != self.snapshot.checkpoint() {
+            self.store_error = Some(StoreError::Stale);
+            return Ok(false);
+        }
+        match persist_stage(self.client, self.original, &self.snapshot, next).await {
+            Ok(saved) => {
+                self.snapshot = saved;
+                Ok(true)
+            }
+            Err(error) => {
+                self.store_error = Some(error);
+                Err(StageError::Store)
+            }
+        }
+    }
+}
+
+/// Compose one captured-generation delivery with the runner and real SQL CAS.
+/// Reload before provider work; persist progress or typed transient failure
+/// before returning. A retry result is a scheduling instruction, not a timer or
+/// queue send. Redelivery reloads committed progress, never adopts a generation.
+/// Database errors (including uncertain COMMIT) return unchanged as store errors
+/// and must be resolved by authority reload, never by spending service attempts.
+///
+/// Caller authenticates/opens the original and applies a bounded deadline. No
+/// live route, broker binding, recovery scanner or schema activation is installed
+/// here. ReadyToPublish only validates saved evidence; it does not write an album.
+pub async fn run_delivery_stage(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    delivery: &Delivery,
+    services: &mut impl StageServices,
+) -> Result<DeliveryStageOutcome, StoreError> {
+    let Some(snapshot) = load_delivery(client, original, delivery).await? else {
+        return Ok(DeliveryStageOutcome::Inactive);
+    };
+    let mut cp = snapshot.checkpoint().clone();
+    let mut runtime = DeliveryRuntime {
+        client,
+        original,
+        snapshot,
+        services,
+        store_error: None,
+        retry_after_secs: None,
+    };
+    match crate::admin_execution::run_stage(
+        &mut runtime,
+        &mut cp,
+        original.job_id,
+        original.idempotency_key,
+        original.parsed,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(DeliveryStageOutcome::Advanced(outcome)),
+        Err(failure @ (StageError::Match | StageError::Probe)) => {
+            let (_, outcome) = persist_service_failure(
+                runtime.client,
+                original,
+                &runtime.snapshot,
+                failure,
+                runtime.retry_after_secs,
+            )
+            .await?;
+            Ok(DeliveryStageOutcome::ServiceFailure(outcome))
+        }
+        Err(StageError::Invalid) => Err(StoreError::Invalid),
+        Err(StageError::Store | StageError::Stale) => {
+            Err(runtime.store_error.unwrap_or(StoreError::Invalid))
+        }
+    }
 }
 
 fn identity<'a>(original: &StageOriginal<'a>) -> Identity<'a> {
