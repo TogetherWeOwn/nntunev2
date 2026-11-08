@@ -171,11 +171,15 @@ async fn successful_claim_samples_time_after_waiting_for_expired_row_lock() {
          CREATE TABLE {schema}.listenbrainz_outbound_rate \
          (LIKE public.listenbrainz_outbound_rate INCLUDING ALL); \
          INSERT INTO {schema}.listenbrainz_outbound_rate VALUES (TRUE, 0); \
-         SET search_path = {schema}, pg_temp, public; \
-         BEGIN; SELECT singleton FROM listenbrainz_outbound_rate FOR UPDATE"
+         SET search_path = {schema}, pg_temp, public"
     ))
     .await
     .unwrap();
+    // Commit setup before the explicit transaction so the contender can see
+    // the schema and row, rather than finishing early with a lookup error.
+    db.batch_execute("BEGIN; SELECT singleton FROM listenbrainz_outbound_rate FOR UPDATE")
+        .await
+        .unwrap();
     other
         .batch_execute(&format!("SET search_path = {schema}, pg_temp, public"))
         .await
@@ -188,10 +192,15 @@ async fn successful_claim_samples_time_after_waiting_for_expired_row_lock() {
     let blocked = tokio::time::timeout(Duration::from_millis(1200), &mut pending).await;
     let release_ms = db_now_ms(&db).await;
     db.batch_execute("COMMIT").await.unwrap();
-    let admitted = tokio::time::timeout(Duration::from_secs(3), &mut pending)
-        .await
-        .unwrap()
-        .unwrap();
+    let waited = blocked.is_err();
+    // Never poll a completed future again: preserve an early SQL error as
+    // the actual test diagnostic rather than an async-resume panic.
+    let admitted = match blocked {
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), &mut pending)
+            .await
+            .unwrap(),
+        Ok(result) => result,
+    };
     let floor: i64 = db
         .query_one(
             "SELECT next_allowed_at_ms FROM listenbrainz_outbound_rate",
@@ -203,8 +212,11 @@ async fn successful_claim_samples_time_after_waiting_for_expired_row_lock() {
     db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
-    assert!(blocked.is_err(), "claim must wait for the held row");
-    assert!(admitted);
+    assert!(
+        admitted.unwrap(),
+        "claim must succeed after releasing the row"
+    );
+    assert!(waited, "claim must wait for the held row");
     assert!(
         floor >= release_ms + 1000,
         "successful claim must spend a fresh interval"
