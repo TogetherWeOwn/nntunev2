@@ -1729,11 +1729,13 @@ async fn admin_ingest_upload_on(
     admin_ingest_upload_with_authority_on(client, attempt, None).await
 }
 
+type AdminCheckpointConstructor = fn(&str, &str) -> Result<String, StoreError>;
+
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub async fn admin_ingest_upload_for_postgres_test(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
-    initialize_checkpoint: Option<fn(&str, &str) -> Result<String, StoreError>>,
+    initialize_checkpoint: Option<AdminCheckpointConstructor>,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     admin_ingest_upload_with_authority_on(client, attempt, initialize_checkpoint).await
 }
@@ -1748,7 +1750,7 @@ pub async fn admin_ingest_upload_for_postgres_test(
 async fn admin_ingest_upload_with_authority_on(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
-    initialize_checkpoint: Option<fn(&str, &str) -> Result<String, StoreError>>,
+    initialize_checkpoint: Option<AdminCheckpointConstructor>,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     transaction

@@ -138,7 +138,7 @@ async fn fresh_upload_commits_original_audit_and_loadable_owner_free_authority()
     assert!(cp.admin_release_mbid.is_none() && cp.probe_tally.is_none());
     assert!(cp.failure_code.is_none() && cp.failure_reason.is_none());
     let audit = app
-        .query_one("SELECT action, details FROM audit_log", &[])
+        .query_one("SELECT action, details::text FROM audit_log", &[])
         .await
         .unwrap();
     assert_eq!(
@@ -146,7 +146,7 @@ async fn fresh_upload_commits_original_audit_and_loadable_owner_free_authority()
         intake::INGEST_UPLOAD_AUDIT_ACTION
     );
     assert_eq!(
-        audit.get::<_, serde_json::Value>(1),
+        serde_json::from_str::<serde_json::Value>(&audit.get::<_, String>(1)).unwrap(),
         serde_json::json!({"job_id":attempt.job_id,"outcome":"accepted"})
     );
 }
