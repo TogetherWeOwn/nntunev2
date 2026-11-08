@@ -11916,6 +11916,8 @@ mod tests {
         assert_eq!(h.store.checkout_ops.borrow()["op_test_1"].state, "pending");
         assert!(h.store.invoice_history.borrow().is_empty());
         assert_eq!(h.store.billing_rows.borrow()["u1"], holder.row);
+        holder.read_plan = Some(holder.row.plan_id.clone());
+        holder.read_anchor = holder.row.paid_invoice_id.clone();
         holder.row.status = "canceled".into();
         block_on(h.store.store_reconcile_outcome("u1", &holder)).expect("release slot");
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
