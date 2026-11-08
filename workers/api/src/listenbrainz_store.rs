@@ -15,23 +15,41 @@ use crate::{
     listenbrainz::{RewrapOutcome, StoredLink, Username},
 };
 
-/// Atomically spend the one fleet-wide outbound slot. The database clock
-/// (rounded UP to milliseconds) avoids isolate clock skew and second-boundary
-/// bursts. A failed/denied claim is never permission to send. No refund: an
-/// uncertain send must not make the slot available again.
+// Initialization grants nothing and never resets an existing cooldown. Keep
+// it separate so absent-row uniqueness waits finish before sampling the clock.
+async fn initialize_outbound(client: &Client) -> Result<(), StoreError> {
+    client
+        .query_typed(
+            "INSERT INTO listenbrainz_outbound_rate (singleton, next_allowed_at_ms) \
+             VALUES (TRUE, 0) ON CONFLICT (singleton) DO NOTHING",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// Atomically spend the one fleet-wide outbound slot. Materialized dependencies
+/// force the clock sample AFTER row locking, so a queued winner still spends a
+/// fresh interval. Rounding up plus strict expiry avoids sub-millisecond bursts.
+/// A failed/denied claim is never permission to send. No refund after an
+/// uncertain send. Both statements may run on pooled connections independently;
+/// only the locked statement decides admission and holds the lock until write.
 pub(crate) async fn claim_outbound(client: &Client) -> Result<bool, StoreError> {
+    initialize_outbound(client).await?;
     let interval_ms = i64::try_from(crate::listenbrainz::MIN_REQUEST_INTERVAL_S * 1000)
         .map_err(|_| StoreError)?;
     let rows = client
         .query_typed(
-            "WITH clock AS MATERIALIZED \
-             (SELECT ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms) \
-             INSERT INTO listenbrainz_outbound_rate (singleton, next_allowed_at_ms) \
-             SELECT TRUE, ms + $1 FROM clock WHERE TRUE \
-             ON CONFLICT (singleton) DO UPDATE \
-             SET next_allowed_at_ms = EXCLUDED.next_allowed_at_ms \
-             WHERE listenbrainz_outbound_rate.next_allowed_at_ms \
-             < EXCLUDED.next_allowed_at_ms - $1 RETURNING singleton",
+            "WITH locked AS MATERIALIZED \
+             (SELECT singleton, next_allowed_at_ms FROM listenbrainz_outbound_rate \
+              WHERE singleton = TRUE FOR UPDATE), \
+             clock AS MATERIALIZED \
+             (SELECT singleton, next_allowed_at_ms, \
+              ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms FROM locked) \
+             UPDATE listenbrainz_outbound_rate AS budget SET next_allowed_at_ms = clock.ms + $1 \
+             FROM clock WHERE budget.singleton = clock.singleton \
+             AND clock.next_allowed_at_ms < clock.ms RETURNING budget.singleton",
             &[(&interval_ms, Type::INT8)],
         )
         .await
@@ -49,17 +67,20 @@ pub(crate) async fn claim_outbound(client: &Client) -> Result<bool, StoreError> 
 /// must persist the parsed delay before returning any upstream outcome; errors
 /// must fail closed. This does not implement transport or response ordering.
 pub(crate) async fn defer_outbound(client: &Client, wait_s: u64) -> Result<(), StoreError> {
+    initialize_outbound(client).await?;
     let wait_ms = wait_s.saturating_mul(1000).min(i64::MAX as u64) as i64;
     let rows = client
         .query_typed(
-            "WITH clock AS MATERIALIZED \
-             (SELECT ceil(extract(epoch FROM clock_timestamp()) * 1000) AS ms) \
-             INSERT INTO listenbrainz_outbound_rate (singleton, next_allowed_at_ms) \
-             SELECT TRUE, LEAST(ms + $1::numeric, 9223372036854775807)::bigint \
-             FROM clock WHERE TRUE \
-             ON CONFLICT (singleton) DO UPDATE SET next_allowed_at_ms = \
-             GREATEST(listenbrainz_outbound_rate.next_allowed_at_ms, \
-             EXCLUDED.next_allowed_at_ms) RETURNING singleton",
+            "WITH locked AS MATERIALIZED \
+             (SELECT singleton, next_allowed_at_ms FROM listenbrainz_outbound_rate \
+              WHERE singleton = TRUE FOR UPDATE), \
+             clock AS MATERIALIZED \
+             (SELECT singleton, next_allowed_at_ms, \
+              ceil(extract(epoch FROM clock_timestamp()) * 1000) AS ms FROM locked) \
+             UPDATE listenbrainz_outbound_rate AS budget SET next_allowed_at_ms = \
+             GREATEST(clock.next_allowed_at_ms, \
+              LEAST(clock.ms + $1::numeric, 9223372036854775807)::bigint) \
+             FROM clock WHERE budget.singleton = clock.singleton RETURNING budget.singleton",
             &[(&wait_ms, Type::INT8)],
         )
         .await

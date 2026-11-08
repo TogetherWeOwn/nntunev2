@@ -156,6 +156,62 @@ async fn separate_connections_observe_committed_cooldown_after_claim_race() {
 }
 
 #[tokio::test]
+async fn successful_claim_samples_time_after_waiting_for_expired_row_lock() {
+    let db = client().await;
+    let other = client().await;
+    let id: String = db
+        .query_one("SELECT replace(gen_random_uuid()::text, '-', '')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    let schema = format!("lb_rate_{id}");
+    db.batch_execute(&format!(
+        "CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.listenbrainz_outbound_rate \
+         (LIKE public.listenbrainz_outbound_rate INCLUDING ALL); \
+         INSERT INTO {schema}.listenbrainz_outbound_rate VALUES (TRUE, 0); \
+         SET search_path = {schema}, pg_temp, public; \
+         BEGIN; SELECT singleton FROM listenbrainz_outbound_rate FOR UPDATE"
+    ))
+    .await
+    .unwrap();
+    other
+        .batch_execute(&format!("SET search_path = {schema}, pg_temp, public"))
+        .await
+        .unwrap();
+    let pending = claim_outbound(&other);
+    tokio::pin!(pending);
+    // Deliberately hold the expired row longer than the admission interval.
+    // The old implementation sampled before the wait and returned an already
+    // expired floor; no production/provider access or host sleep is involved.
+    let blocked = tokio::time::timeout(Duration::from_millis(1200), &mut pending).await;
+    let release_ms = db_now_ms(&db).await;
+    db.batch_execute("COMMIT").await.unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(3), &mut pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let floor: i64 = db
+        .query_one(
+            "SELECT next_allowed_at_ms FROM listenbrainz_outbound_rate",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    assert!(blocked.is_err(), "claim must wait for the held row");
+    assert!(admitted);
+    assert!(
+        floor >= release_ms + 1000,
+        "successful claim must spend a fresh interval"
+    );
+}
+
+#[tokio::test]
 async fn pipelined_claims_on_absent_row_have_one_winner() {
     let db = rate_client().await;
     let (a, b, c, d) = tokio::join!(
