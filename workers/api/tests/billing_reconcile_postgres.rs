@@ -929,3 +929,252 @@ async fn equal_end_plan_switch_converges_in_both_commit_orders() {
     }
     assert_eq!(finals[0], finals[1], "commit order must not matter");
 }
+
+#[tokio::test]
+async fn trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence() {
+    // `trialing` is fail-closed and sits outside the live select, so the
+    // recovery pass folds with no live row: read_plan/read_anchor are NULL
+    // while the stored row still holds the same paid end and anchor.
+    for status in ["active", "past_due"] {
+        let mut fx = Fx::new().await;
+        let seed = fx.seed_active("u1", "sub_a").await;
+        if status == "past_due" {
+            // Stored grace comes from a first failed renewal on the paid end.
+            let due = fx
+                .fold(
+                    "u1",
+                    &remote(
+                        "sub_a",
+                        status,
+                        PRICE_PLUS,
+                        false,
+                        T + 2 * P,
+                        &invoices("sub_a", 2),
+                    ),
+                )
+                .await;
+            fx.put("u1", &due).await;
+            assert!(fx.snap("sub_a").await.unwrap().grace.is_some());
+        }
+        let trial = fx
+            .fold(
+                "u1",
+                &remote(
+                    "sub_a",
+                    "trialing",
+                    PRICE_PRO,
+                    false,
+                    T + P + 1,
+                    &invoices("sub_a", 2),
+                ),
+            )
+            .await;
+        assert!(trial.fail_closed.is_some());
+        fx.put("u1", &trial).await;
+        let trialing = fx.snap("sub_a").await.unwrap();
+        assert_eq!(trialing.status, "trialing");
+        assert_eq!(trialing.price, PRICE_PRO);
+        assert_eq!(trialing.paid_through, seed.paid_through);
+        assert_eq!(trialing.anchor, seed.anchor);
+        assert!(
+            fx.live("u1").await.is_none(),
+            "trialing is outside the live select"
+        );
+
+        let back = fx
+            .fold(
+                "u1",
+                &remote(
+                    "sub_a",
+                    status,
+                    PRICE_PLUS,
+                    true,
+                    T + 3 * P,
+                    &invoices("sub_a", 2),
+                ),
+            )
+            .await;
+        assert_eq!(
+            (back.read_plan.as_deref(), back.read_anchor.as_deref()),
+            (None, None)
+        );
+        assert_eq!(back.row.paid_through_unix, seed.paid_through);
+        assert_eq!(back.row.paid_invoice_id, seed.anchor);
+        fx.put("u1", &back).await;
+
+        // Static red expectation: the equal-end read-mismatch guard treats
+        // NULL read_plan as "moved since read" and keeps the trialing fields.
+        let snap = fx.snap("sub_a").await.unwrap();
+        assert_eq!(snap.status, status, "{status}");
+        assert_eq!(snap.price, PRICE_PLUS, "{status}");
+        assert_eq!(snap.item, seed.item, "{status}");
+        assert_eq!(snap.customer, seed.customer, "{status}");
+        assert_eq!(snap.period_end, Some(T + 3 * P), "{status}");
+        assert!(snap.cancel, "{status}");
+        assert_eq!(snap.grace, back.row.grace_until_unix, "{status}");
+        assert_eq!(snap.plan, "plus");
+        assert_eq!(snap.paid_through, seed.paid_through);
+        assert_eq!(snap.anchor, seed.anchor);
+        let live = fx.live("u1").await.expect("recovered row is live again");
+        assert_eq!(live.stripe_subscription_id, "sub_a");
+        assert_eq!(live.status, status);
+        assert_eq!(live.paid_invoice_id, seed.anchor);
+    }
+}
+
+#[tokio::test]
+async fn no_read_equal_end_outcome_preserves_live_and_terminal_state() {
+    for status in ["active", "canceled", "incomplete_expired"] {
+        let mut fx = Fx::new().await;
+        fx.seed_active("u1", "sub_a").await;
+        let delayed = fold_with(
+            None,
+            &remote(
+                "sub_a",
+                "active",
+                PRICE_PLUS,
+                false,
+                T + 2 * P,
+                &invoices("sub_a", 2),
+            ),
+        );
+        let current = fx
+            .fold(
+                "u1",
+                &remote(
+                    "sub_a",
+                    status,
+                    PRICE_PLUS,
+                    true,
+                    T + 3 * P,
+                    &invoices("sub_a", 2),
+                ),
+            )
+            .await;
+        fx.put("u1", &current).await;
+        let stored = fx.snap("sub_a").await.unwrap();
+        assert_eq!(stored.status, status);
+        fx.put("u1", &delayed).await;
+        assert_eq!(fx.snap("sub_a").await.unwrap(), stored, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn no_read_equal_end_outcome_cannot_undo_a_committed_plan_switch() {
+    // Control for the trialing recovery: an equal-end outcome that read no
+    // live row (NULL read_plan/read_anchor) but whose stored row has since
+    // switched plan/anchor must still be suppressed. Relaxing the guard for
+    // a NULL read_plan alone would relabel the row back to Plus.
+    let mut fx = Fx::new().await;
+    fx.seed_active("u1", "sub_a").await;
+    let delayed = fold_with(
+        None,
+        &remote(
+            "sub_a",
+            "active",
+            PRICE_PLUS,
+            true,
+            T + 2 * P + 5,
+            &invoices("sub_a", 2),
+        ),
+    );
+    assert_eq!(
+        (delayed.read_plan.as_deref(), delayed.read_anchor.as_deref()),
+        (None, None)
+    );
+    assert_eq!(delayed.row.paid_through_unix, Some(T + 2 * P));
+
+    let mut pro = invoice("sub_a", 2);
+    pro.id = "inv_sub_a_pro".into();
+    pro.status_transitions = Some(InvoiceStatusTransitions {
+        paid_at: Some(T + P + 10),
+    });
+    pro.lines.as_mut().unwrap().data[0].price = Some(PRICE_PRO.into());
+    let mut switched_invoices = invoices("sub_a", 2);
+    switched_invoices.push(pro);
+    let switched = fx
+        .fold(
+            "u1",
+            &remote(
+                "sub_a",
+                "active",
+                PRICE_PRO,
+                false,
+                T + 3 * P,
+                &switched_invoices,
+            ),
+        )
+        .await;
+    fx.put("u1", &switched).await;
+    let stored = fx.snap("sub_a").await.unwrap();
+    assert_eq!(stored.plan, "pro");
+    assert_eq!(stored.anchor.as_deref(), Some("inv_sub_a_pro"));
+    assert_eq!(stored.paid_through, Some(T + 2 * P));
+
+    fx.put("u1", &delayed).await;
+    assert_eq!(fx.snap("sub_a").await.unwrap(), stored);
+}
+
+#[tokio::test]
+async fn new_terminal_row_beside_a_live_one_commits_without_disturbing_it() {
+    let mut fx = Fx::new().await;
+    let live_b = fx.seed_active("u1", "sub_b").await;
+
+    // Terminal A is not a live-slot holder: the row and its confirmed
+    // history are accepted and B keeps the slot unchanged.
+    let mut terminal_a = fold_with(
+        None,
+        &remote(
+            "sub_a",
+            "canceled",
+            PRICE_PLUS,
+            false,
+            T + P,
+            &invoices("sub_a", 1),
+        ),
+    );
+    terminal_a.history = fold_with(
+        None,
+        &remote(
+            "sub_a",
+            "active",
+            PRICE_PLUS,
+            false,
+            T + P,
+            &invoices("sub_a", 2),
+        ),
+    )
+    .history;
+    assert_eq!(terminal_a.history.len(), 2);
+    fx.put("u1", &terminal_a).await;
+    assert_eq!(fx.snap("sub_a").await.unwrap().status, "canceled");
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert_eq!(fx.snap("sub_b").await.unwrap(), live_b);
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_b");
+
+    // Control: a genuinely new live C conflicts with B, retryably, and
+    // rolls back its row and history.
+    let live_c = fold_with(
+        None,
+        &remote(
+            "sub_c",
+            "active",
+            PRICE_PLUS,
+            false,
+            T + P,
+            &invoices("sub_c", 1),
+        ),
+    );
+    let error = fx
+        .try_put("u1", &live_c)
+        .await
+        .expect_err("live slot is held");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    );
+    assert!(fx.snap("sub_c").await.is_none());
+    assert_eq!(fx.history_rows("sub_c").await, 0);
+    assert_eq!(fx.snap("sub_b").await.unwrap(), live_b);
+    assert_eq!(fx.rows("u1").await, 2);
+}

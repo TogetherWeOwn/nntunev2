@@ -7301,6 +7301,8 @@ mod tests {
         /// All subscription keys, including terminal rows no longer projected
         /// by the per-user map, distinguish an upsert update from an insert.
         billing_subscription_ids: RefCell<HashSet<String>>,
+        /// New non-live rows accepted beside the current live projection.
+        billing_nonlive_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
         /// Land a replacement at input load, after the remote retrieve.
         replacement_on_reconcile_load:
@@ -8686,9 +8688,20 @@ mod tests {
                     .borrow()
                     .contains(&outcome.row.stripe_subscription_id)
             {
-                // A new paid subscription must fail/retry on the unique slot,
-                // not silently acknowledge a checkout without storing its row.
-                return Err(StoreError);
+                if matches!(
+                    outcome.row.status.as_str(),
+                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                ) {
+                    // Only a new live row conflicts with the partial index.
+                    return Err(StoreError);
+                }
+                self.billing_nonlive_rows.borrow_mut().insert(
+                    outcome.row.stripe_subscription_id.clone(),
+                    outcome.row.clone(),
+                );
+                self.billing_subscription_ids
+                    .borrow_mut()
+                    .insert(outcome.row.stripe_subscription_id.clone());
             }
             let skip = outcome.stale_snapshot || different_live;
             if !skip {
@@ -8718,6 +8731,13 @@ mod tests {
                         // keep never relabels either.
                         && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
                         && existing.paid_invoice_id == outcome.read_anchor;
+                        // Recover the unsupported trial state on matching
+                        // paid proof, never a live or terminal row.
+                        let recovers_trial = outcome.read_plan.is_none()
+                            && outcome.row.paid_invoice_id.is_some()
+                            && existing.status == "trialing"
+                            && outcome.row.plan_id == existing.plan_id
+                            && outcome.row.paid_invoice_id == existing.paid_invoice_id;
                         let stale =
                             match (outcome.row.paid_through_unix, existing.paid_through_unix) {
                                 (Some(end), Some(previous)) => {
@@ -8725,9 +8745,11 @@ mod tests {
                                         || (end == previous
                                             && ((outcome.row.paid_invoice_id.is_none()
                                                 && existing.paid_invoice_id.is_some())
-                                                || outcome.read_plan.as_deref()
-                                                    != Some(existing.plan_id.as_str())
-                                                || outcome.read_anchor != existing.paid_invoice_id))
+                                                || (!recovers_trial
+                                                    && (outcome.read_plan.as_deref()
+                                                        != Some(existing.plan_id.as_str())
+                                                        || outcome.read_anchor
+                                                            != existing.paid_invoice_id))))
                                 }
                                 _ => false,
                             };
@@ -11220,6 +11242,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn billing_duplicate_checkout_recovers_nonlive_equal_end_state() {
+        for status in ["active", "past_due"] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            let body = deliver_first_period(&h, "evt_recovery");
+            // An existing paid subscription can enter an unsupported state.
+            // Re-delivery follows the real caller and preserves its paid proof.
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .get_mut("sub_test_1")
+                .unwrap()
+                .status = "trialing".into();
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            assert!(live_for(&h, "u1").is_none());
+            let held = h.store.billing_rows.borrow()["u1"].clone();
+            assert_eq!(held.status, "trialing");
+            assert_eq!(held.paid_invoice_id.as_deref(), Some("in_test_1"));
+            assert_eq!(
+                h.store.checkout_ops.borrow()["op_test_1"].state,
+                "needs_reconcile"
+            );
+
+            let mut recovered = test_subscription("sub_test_1", "cus_test_1", status, PRICE_PLUS);
+            recovered.current_period_end = Some(BILLING_NOW + 2 * BILLING_PERIOD);
+            recovered.cancel_at_period_end = true;
+            recovered.items.as_mut().unwrap().data[0].id = "si_recovered".into();
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .insert(recovered.id.clone(), recovered.clone());
+            let input = block_on(h.store.load_reconcile_input("u1")).unwrap();
+            assert!(input.live.is_none());
+            let expected = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: recovered,
+                    invoices: h.stripe.invoices.borrow().values().cloned().collect(),
+                },
+                BILLING_NOW,
+            );
+            assert_eq!(expected.read_plan, None);
+            assert_eq!(expected.read_anchor, None);
+            assert!(!expected.stale_snapshot);
+            assert_eq!(expected.row.paid_through_unix, held.paid_through_unix);
+            assert_eq!(expected.row.paid_invoice_id, held.paid_invoice_id);
+            assert_eq!(
+                expected.row.grace_until_unix, None,
+                "the fold treats observed money without a live row as recovery"
+            );
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            assert_eq!(h.store.billing_rows.borrow()["u1"], expected.row);
+            assert_eq!(live_for(&h, "u1").unwrap().status, status);
+            assert_eq!(
+                h.store.checkout_ops.borrow()["op_test_1"].state,
+                "succeeded"
+            );
+            assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn billing_no_read_equal_end_cannot_replace_live_or_terminal_state() {
+        for status in ["active", "canceled", "incomplete_expired"] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            let body = deliver_first_period(&h, "evt_no_read");
+            let mut input = block_on(h.store.load_reconcile_input("u1")).unwrap();
+            input.live = None;
+            let delayed = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "active",
+                        PRICE_PLUS,
+                    ),
+                    invoices: h.stripe.invoices.borrow().values().cloned().collect(),
+                },
+                BILLING_NOW,
+            );
+            let mut current = h.stripe.subscriptions.borrow()["sub_test_1"].clone();
+            current.status = status.into();
+            current.cancel_at_period_end = true;
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .insert(current.id.clone(), current);
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            let stored = h.store.billing_rows.borrow()["u1"].clone();
+            assert_eq!(stored.status, status);
+            block_on(h.store.store_reconcile_outcome("u1", &delayed)).unwrap();
+            assert_eq!(h.store.billing_rows.borrow()["u1"], stored, "{status}");
+        }
+    }
+
+    #[test]
+    fn billing_new_terminal_subscription_keeps_replacement_live_projection() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".into(), "cus_test_1".into());
+        let mut holder = stored_seed(
+            PLAN_PRO,
+            "active",
+            Some(BILLING_NOW + BILLING_PERIOD),
+            Some("in_holder"),
+            None,
+        );
+        holder.row.stripe_subscription_id = "sub_holder".into();
+        block_on(h.store.store_reconcile_outcome("u1", &holder)).unwrap();
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "canceled", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_terminal".into(),
+            test_invoice(
+                "in_terminal",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            ),
+        );
+        let terminal = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("new terminal insert is outside the unique live index");
+        assert_eq!(terminal.row.status, "canceled");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], holder.row);
+        assert_eq!(
+            h.store.billing_nonlive_rows.borrow()["sub_test_1"],
+            terminal.row
+        );
+        assert!(h
+            .store
+            .billing_subscription_ids
+            .borrow()
+            .contains("sub_test_1"));
+        assert!(
+            h.store.invoice_history.borrow().is_empty(),
+            "terminal caller does not fold history"
+        );
+        // Confirmed history remains independently insertable in the same
+        // store transaction even when the existing A update is suppressed.
+        let mut with_history = terminal.clone();
+        with_history.history = crate::billing_reconcile::reconcile_subscription(
+            &crate::billing_reconcile::ReconcileInput {
+                stripe_customer_id: Some("cus_test_1".into()),
+                live: None,
+                bindings: test_bindings(),
+            },
+            &crate::billing_reconcile::RemoteSubscription {
+                subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+                invoices: h.stripe.invoices.borrow().values().cloned().collect(),
+            },
+            BILLING_NOW,
+        )
+        .history;
+        assert_eq!(with_history.history.len(), 1);
+        block_on(h.store.store_reconcile_outcome("u1", &with_history)).unwrap();
+        block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).expect("replay");
+        assert_eq!(
+            h.store.billing_nonlive_rows.borrow()["sub_test_1"],
+            terminal.row
+        );
+        assert_eq!(
+            live_for(&h, "u1").unwrap().stripe_subscription_id,
+            "sub_holder"
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }
 
     #[test]
