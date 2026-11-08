@@ -47,7 +47,10 @@ impl OriginalRepository for Repository {
 fn fixture() -> (Vec<u8>, String, Repository, Keys) {
     // Reuse the existing synthetic corpus; never add payload/subject/segment
     // literals, and never print parsed content or plaintext in assertions.
-    let body = intake::tests::minimal_nzb();
+    fixture_for(intake::tests::minimal_nzb())
+}
+
+fn fixture_for(body: Vec<u8>) -> (Vec<u8>, String, Repository, Keys) {
     let job = intake::derive_job_id(&body);
     let hash = intake::content_sha256_hex(&body);
     let envelope = intake::encrypt_ingest_original(&[9; 32], 7, &hash, &job, &body).unwrap();
@@ -216,6 +219,103 @@ async fn lost_active_row_discards_plaintext_instead_of_executing() {
         Err(OriginalError::Missing)
     ));
     assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+}
+
+#[tokio::test]
+async fn authenticated_original_drives_the_existing_admin_parse_transition() {
+    use nntune_ingest::jobs::{
+        complete_admin_parse, resume_archive, JobCheckpoint, JobSource, JobState,
+    };
+
+    for (suffix, expected) in [
+        (".flac", JobState::Matching),
+        (".rar", JobState::NeedsArchiveRead),
+        (".7z", JobState::NeedsArchiveRead),
+    ] {
+        // Reuse the existing synthetic corpus without adding payload,
+        // subject, filename or segment identity literals.
+        let body = nntune_ingest::fixtures::SMALL_NZB
+            .replace(".flac", suffix)
+            .into_bytes();
+        let (body, job, mut repo, keys) = fixture_for(body);
+        let opened = read_original(&Authorization(true), &mut repo, &keys, &job)
+            .await
+            .unwrap();
+        let counts = intake::classify_upload(&body).unwrap();
+        assert_eq!(opened.parsed().files.len() as u64, counts.file_count);
+        assert_eq!(
+            opened
+                .parsed()
+                .files
+                .iter()
+                .map(|f| f.segments.len() as u64)
+                .sum::<u64>(),
+            counts.segment_count
+        );
+        assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+        assert_eq!(opened.job_id(), job);
+        assert_eq!(
+            opened.idempotency_key(),
+            intake::idempotency_key(&intake::content_sha256_hex(&body))
+        );
+        let mut cp = JobCheckpoint {
+            job_id: opened.job_id().into(),
+            user_id: String::new(),
+            idempotency_key: opened.idempotency_key().into(),
+            source: JobSource::AdminUpload,
+            state: JobState::Parsing,
+            attempt: 1,
+            repair_rounds: 0,
+            probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
+            failure_code: None,
+            failure_reason: None,
+            provider_id: None,
+            transcode_inputs: vec![],
+            transcode_next: 0,
+        };
+        let mut changed = cp.clone();
+        changed.state = expected;
+        assert!(complete_admin_parse(&mut cp, opened.parsed()));
+        assert_eq!(cp, changed);
+        // Redelivery cannot advance a parked or matched checkpoint.
+        assert!(!complete_admin_parse(&mut cp, opened.parsed()));
+        assert_eq!(cp, changed);
+        if expected == JobState::NeedsArchiveRead {
+            assert!(resume_archive(&mut cp));
+            assert!(complete_admin_parse(&mut cp, opened.parsed()));
+            assert_eq!(cp, changed);
+        }
+        // No parser content entered the checkpoint; only its state changed.
+        assert!(opened.as_bytes() == body.as_slice());
+    }
+}
+
+#[tokio::test]
+async fn execution_parse_uses_admin_body_limit_not_the_legacy_upload_limit() {
+    let mut body = intake::tests::minimal_nzb();
+    body.resize(3 * 1024 * 1024, b' ');
+    let (body, job, mut repo, keys) = fixture_for(body);
+    let opened = read_original(&Authorization(true), &mut repo, &keys, &job)
+        .await
+        .unwrap();
+    let counts = intake::classify_upload(&body).unwrap();
+    assert_eq!(opened.parsed().files.len() as u64, counts.file_count);
+    assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+}
+
+#[tokio::test]
+async fn authenticated_invalid_document_never_returns_a_parse_or_marks_running() {
+    let (body, _, _, _) = fixture();
+    // Authenticated identity and envelope are valid, but the retained input
+    // has been truncated. Do not expose the parser's payload-bearing error.
+    let (_, job, mut repo, keys) = fixture_for(body[..body.len() / 2].to_vec());
+    assert!(matches!(
+        read_original(&Authorization(true), &mut repo, &keys, &job).await,
+        Err(OriginalError::Invalid)
+    ));
+    assert_eq!(repo.events, ["metadata", "envelope"]);
 }
 
 #[test]

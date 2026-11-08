@@ -5,7 +5,7 @@
 //! and the ingest-job-fenced writers are integrated.
 
 use std::future::Future;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{admin_ingest as intake, rotation::KekSource};
 
@@ -101,13 +101,45 @@ pub trait OriginalRepository {
     ) -> impl Future<Output = Result<bool, OriginalError>>;
 }
 
-/// Plaintext exists only in this non-debuggable, non-serializable zeroizing
-/// holder. The next parser stage borrows it; no payload is checkpointed here.
-pub struct OriginalBody(Zeroizing<Vec<u8>>);
+/// Authenticated original and bounded parser output, held only in memory.
+/// No Debug/Serialize: neither raw bytes nor parsed content may become a
+/// checkpoint, response or diagnostic dump. Raw bytes are zeroized on drop.
+/// Identity accessors let execution use the checked job/key, not queue input.
+pub struct OriginalBody {
+    body: Zeroizing<Vec<u8>>,
+    parsed: nntune_core::nzb::Document,
+    job_id: String,
+    idempotency_key: String,
+}
 
 impl OriginalBody {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.body
+    }
+
+    pub fn parsed(&self) -> &nntune_core::nzb::Document {
+        &self.parsed
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+}
+
+impl Drop for OriginalBody {
+    fn drop(&mut self) {
+        for file in &mut self.parsed.files {
+            file.subject.zeroize();
+            file.filename.zeroize();
+            for segment in &mut file.segments {
+                segment.message_id.zeroize();
+            }
+        }
+        self.parsed.segment_digest.zeroize();
     }
 }
 
@@ -156,11 +188,19 @@ pub async fn read_original(
     {
         return Err(OriginalError::Invalid);
     }
-    intake::classify_upload(&body).map_err(|_| OriginalError::Invalid)?;
+    let parsed = intake::parse_upload(&body).map_err(|_| OriginalError::Invalid)?;
+    let original = OriginalBody {
+        body,
+        parsed,
+        job_id: selected.job_id.clone(),
+        idempotency_key: intake::idempotency_key(&selected.content_sha256),
+    };
+    // Construct the holder before awaiting persistence so its parsed strings
+    // are also cleared if the row is lost, storage fails or the future drops.
     if !repository.mark_running(&selected).await? {
         return Err(OriginalError::Missing);
     }
-    Ok(OriginalBody(body))
+    Ok(original)
 }
 
 /// The caller lends its deadline-bounded application connection. No keyring,

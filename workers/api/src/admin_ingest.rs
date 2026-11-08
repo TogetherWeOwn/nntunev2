@@ -147,6 +147,18 @@ pub struct ValidatedNzb {
 /// `Ok` carries counts; `Err` carries the fixed reason (never parser
 /// detail). Empty and over-cap bodies fail before the parser runs.
 pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
+    let document = parse_upload(body)?;
+    Ok(ValidatedNzb {
+        file_count: document.files.len() as u64,
+        segment_count: document.files.iter().map(|f| f.segments.len() as u64).sum(),
+        declared_bytes: document.encoded_bytes.max(0) as u64,
+    })
+}
+
+/// Internal execution uses exactly the intake parser and caps, without a
+/// second parse under the legacy user-upload limits. Parser content stays
+/// in memory: only `classify_upload`'s counts may enter an intake response.
+pub(crate) fn parse_upload(body: &[u8]) -> Result<nntune_core::nzb::Document, FailureReason> {
     if body.is_empty() {
         return Err(FailureReason::Empty);
     }
@@ -181,7 +193,6 @@ pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
         },
         _ => FailureReason::Malformed,
     })?;
-    let file_count = document.files.len() as u64;
     let mut segment_count: u64 = 0;
     for file in &document.files {
         segment_count = segment_count.saturating_add(file.segments.len() as u64);
@@ -189,11 +200,7 @@ pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
     if segment_count > ADMIN_MAX_TOTAL_SEGMENTS as u64 {
         return Err(FailureReason::TooManySegments);
     }
-    Ok(ValidatedNzb {
-        file_count,
-        segment_count,
-        declared_bytes: document.encoded_bytes.max(0) as u64,
-    })
+    Ok(document)
 }
 
 /// Content identity: lowercase hex SHA-256 of the raw upload bytes.
