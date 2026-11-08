@@ -120,12 +120,15 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
       [" && steps.schema.outcome == 'success'", ''],
       ['id: schema\n', 'id: renamed\n'],
       ['steps.deployment.outputs.deployed', 'steps.config.outputs.configured'],
-      ["if: steps.config.outputs.configured == 'true'", 'if: always()'],
       ['id: deploy\n', 'id: renamed\n'],
     ]) {
       expect(api).toContain(from!);
       expect(() => assertWiring(api.replace(from!, to!))).toThrow();
     }
+    const hyperdrive = step('Hyperdrive cache-disabled gate');
+    const bypassed = hyperdrive.replace("if: steps.config.outputs.configured == 'true'", 'if: always()');
+    expect(bypassed).not.toBe(hyperdrive);
+    expect(() => assertWiring(api.replace(hyperdrive, bypassed))).toThrow();
   });
 
   // All seven incomplete combinations of the three required vars preserve safe

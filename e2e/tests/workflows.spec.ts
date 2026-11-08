@@ -1655,7 +1655,7 @@ ${MB_INVENTORY}`);
     expect(step).toContain("if: steps.config.outputs.configured == 'true'");
     expect(step).toContain('workingDirectory: workers/api');
     expect(step?.match(/^          command: (.+)$/m)?.[1]).toBe(
-      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
     );
   });
 
@@ -1771,7 +1771,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
 
   const assertDeployBody = (body: string) => {
     expect(body.match(/wrangler-action/g) ?? []).toHaveLength(4);
-    expect(body.match(/deploy --env/g) ?? []).toHaveLength(4);
+    expect(body.match(/deploy(?: --no-build)? --env/g) ?? []).toHaveLength(4);
     // Exact command pin: staging-web deploys to staging and staging-api
     // deploys the api Worker to staging with the public BUILD_SHA var —
     // no `preview` lane exists. A bare `command: deploy` (no --env)
@@ -1786,9 +1786,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
     ).toEqual([
       'deploy --env staging',
-      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
-      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
-      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
     ]);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
