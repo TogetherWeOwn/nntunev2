@@ -338,9 +338,10 @@ pub fn reconcile_subscription(
     let previous = local.live.as_ref();
     if is_terminal_status(status) || is_held_status(status) {
         if let Some(kept) = previous.filter(|row| {
-            row.paid_invoice_id
-                .as_ref()
-                .is_some_and(|anchor| !remote.invoices.iter().any(|invoice| &invoice.id == anchor))
+            row.stripe_subscription_id == sub.id
+                && row.paid_invoice_id.as_ref().is_some_and(|anchor| {
+                    !remote.invoices.iter().any(|invoice| &invoice.id == anchor)
+                })
         }) {
             // The exhausted listing proves staleness even without folding
             // money. Do not re-pin an equal-end anchor: the write must still
@@ -1978,6 +1979,42 @@ mod tests {
                     }
                 );
                 assert_eq!(outcome.row.stripe_price_id, PRICE_PRO);
+                assert!(outcome.history.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_replay_does_not_use_replacement_subscription_anchor() {
+        // A delayed completed Checkout for the old subscription can be
+        // retrieved after its replacement owns the user's live slot. That
+        // replacement's invoice cannot prove the old subscription stale.
+        let mut input = anchored("plus", NOW + 100, "in_replacement");
+        input.live.as_mut().expect("live").stripe_subscription_id = "sub_replacement".to_string();
+        for status in ["canceled", "incomplete_expired"] {
+            for empty in [false, true] {
+                let remote = RemoteSubscription {
+                    subscription: subscription(status, PRICE_PLUS),
+                    invoices: if empty {
+                        vec![]
+                    } else {
+                        vec![paid_invoice(
+                            "in_old",
+                            PRICE_PLUS,
+                            NOW - 100,
+                            NOW,
+                            NOW - 100,
+                        )]
+                    },
+                };
+                let outcome = reconcile_subscription(&input, &remote, NOW);
+                assert_eq!(outcome.fail_closed, None);
+                assert_eq!(outcome.row.stripe_subscription_id, "sub_123");
+                assert_eq!(
+                    outcome.row.status, status,
+                    "old subscription must not become active"
+                );
+                assert_eq!(outcome.row.grace_until_unix, None);
                 assert!(outcome.history.is_empty());
             }
         }
