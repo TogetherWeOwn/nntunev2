@@ -11307,10 +11307,15 @@ mod tests {
             let held = h.store.billing_rows.borrow()["u1"].clone();
             assert_eq!(held.status, "trialing");
             assert_eq!(held.paid_invoice_id.as_deref(), Some("in_test_1"));
+            // The initial delivery retired this operation. Reconciliation
+            // still runs, but a duplicate cannot reopen its checkout flight.
             assert_eq!(
                 h.store.checkout_ops.borrow()["op_test_1"].state,
-                "needs_reconcile"
+                "succeeded"
             );
+            assert!(block_on(h.store.open_checkout_operation("u1"))
+                .unwrap()
+                .is_none());
 
             let mut recovered = test_subscription("sub_test_1", "cus_test_1", status, PRICE_PLUS);
             recovered.current_period_end = Some(BILLING_NOW + 2 * BILLING_PERIOD);
