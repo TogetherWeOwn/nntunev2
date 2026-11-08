@@ -845,7 +845,10 @@ pub async fn publish(
 
 #[path = "admin_continuation.rs"]
 mod continuation;
-pub use continuation::{continue_delivery, run_delivery_and_enqueue, DeliveryCompletion};
+pub use continuation::{
+    apply_control_and_enqueue, continue_delivery, reconcile_null_and_enqueue,
+    run_delivery_and_enqueue, ControlCompletion, DeliveryCompletion,
+};
 
 #[cfg(test)]
 #[path = "admin_delivery_tests.rs"]

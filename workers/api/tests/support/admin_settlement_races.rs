@@ -3,6 +3,8 @@
 //! is touched. These cases do not establish ordered-schema or broker acceptance.
 #[path = "admin_commit_transport.rs"]
 mod commit_transport;
+#[path = "admin_control_continuation_acceptance.rs"]
+mod control_continuation;
 use super::super::super::database_client;
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

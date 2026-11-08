@@ -544,3 +544,144 @@ async fn control_commit_disconnect_reloads_rotated_generation_and_exactly_one_au
         );
     }
 }
+
+#[tokio::test]
+async fn control_and_reconciliation_commit_disconnects_send_nothing_before_outcome_resolution() {
+    for reconcile in [false, true] {
+        for cut_at in [CutAt::BeforeCommit, CutAt::AfterCommit] {
+            let (mut app, original, writing, _, _) = publication_fixture().await;
+            let mut cp = writing.checkpoint().clone();
+            cp.state = JobState::NeedsReview;
+            let expected = writing.successor(cp, false, &identity(&original)).unwrap();
+            seed(&app, &expected).await;
+            if reconcile {
+                app.batch_execute(
+                    "UPDATE ingest_jobs SET admin_checkpoint = NULL, status = 'running'",
+                )
+                .await
+                .unwrap();
+            }
+            let rows = SharedRows::copy_from(&app).await;
+            let before = authority_row(&rows.observer).await;
+            // A healthy control establishes the exact intended successor, not
+            // a conclusion inferred from the uncertain database error.
+            let control = if reconcile {
+                store::reconcile_null(
+                    &mut app,
+                    actor(),
+                    &input(&original),
+                    "running",
+                    expected.revision(),
+                )
+                .await
+            } else {
+                store::apply_control(
+                    &mut app,
+                    actor(),
+                    &input(&original),
+                    &expected,
+                    Control::RetryReview,
+                )
+                .await
+            }
+            .unwrap();
+            let (mut controller, mut transport) = cut_connection(cut_at).await;
+            rows.select_schema(&controller).await;
+            let mut queue = DeliveryQueue::default();
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                if reconcile {
+                    store::reconcile_null_and_enqueue(
+                        &mut controller,
+                        actor(),
+                        &input(&original),
+                        "running",
+                        expected.revision(),
+                        &mut queue,
+                    )
+                    .await
+                } else {
+                    store::apply_control_and_enqueue(
+                        &mut controller,
+                        actor(),
+                        &input(&original),
+                        &expected,
+                        Control::RetryReview,
+                        &mut queue,
+                    )
+                    .await
+                }
+            })
+            .await;
+            drop(controller);
+            let cut_proved = transport.finish(cut_at).await;
+            drop(transport);
+            assert!(cut_proved);
+            assert!(matches!(result, Ok(Err(StoreError::Database))));
+            assert_eq!(queue.calls, 0);
+            let mut recovery = rows.client().await;
+            if cut_at == CutAt::BeforeCommit {
+                assert_eq!(authority_row(&rows.observer).await, before);
+                let recovered = if reconcile {
+                    store::reconcile_null_and_enqueue(
+                        &mut recovery,
+                        actor(),
+                        &input(&original),
+                        "running",
+                        expected.revision(),
+                        &mut queue,
+                    )
+                    .await
+                } else {
+                    store::apply_control_and_enqueue(
+                        &mut recovery,
+                        actor(),
+                        &input(&original),
+                        &expected,
+                        Control::RetryReview,
+                        &mut queue,
+                    )
+                    .await
+                }
+                .unwrap();
+                assert!(recovered.snapshot == control);
+                assert_eq!(recovered.continuation, Ok(true));
+            } else {
+                let resolved = store::load(&rows.observer, &input(&original), control.generation())
+                    .await
+                    .unwrap();
+                assert!(resolved == control);
+                assert_eq!(
+                    store::enqueue_delivery(
+                        &recovery,
+                        &input(&original),
+                        resolved.generation(),
+                        &mut queue,
+                    )
+                    .await,
+                    Ok(true)
+                );
+            }
+            let saved = store::load(&rows.observer, &input(&original), control.generation())
+                .await
+                .unwrap();
+            let audits: i64 = rows
+                .observer
+                .query_one("SELECT count(*) FROM audit_log", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert!(saved == control);
+            assert_eq!(audits, 1);
+            assert_eq!(queue.calls, 1);
+            assert_eq!(queue.delays, [0]);
+            assert_eq!(
+                store::Delivery::decode(&queue.messages[0])
+                    .unwrap()
+                    .generation(),
+                control.generation()
+            );
+            assert_eq!(counts(&rows.observer).await, (0, 0, 0));
+            rows.cleanup().await;
+        }
+    }
+}
