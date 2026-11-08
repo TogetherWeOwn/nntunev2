@@ -1,4 +1,6 @@
 //! Canonical delivery/runner/SQL composition, not live broker or schema acceptance.
+#[path = "admin_continuation_acceptance.rs"]
+mod continuation;
 use super::*;
 use nntune_ingest::{
     admin_checkpoint_store::{DeliveryStageOutcome as Outcome, ServiceError, StageServices},

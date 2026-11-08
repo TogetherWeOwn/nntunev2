@@ -221,15 +221,16 @@ pub async fn prepare_delivery(
     }))
 }
 
-/// The future queue adapter sends only the encoded wake hint. An error can mean
-/// rejection or accepted-but-response-lost; callers must treat both as uncertain.
-/// This seam installs no live Queue binding and grants no authentication.
+/// Send only the encoded wake hint with an explicit delivery delay (zero for
+/// immediate work). An error can mean rejection or accepted-but-response-lost;
+/// callers must treat both as uncertain. This installs no live Queue binding.
 pub trait DeliverySender {
     type Error;
 
     fn send(
         &mut self,
         encoded: String,
+        delay_secs: u32,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 }
 
@@ -258,7 +259,7 @@ pub async fn enqueue_delivery(
     };
     let encoded = delivery.encode().map_err(DeliveryError::Authority)?;
     sender
-        .send(encoded)
+        .send(encoded, 0)
         .await
         .map_err(|_| DeliveryError::Send)?;
     Ok(true)
@@ -841,6 +842,10 @@ pub async fn publish(
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
 }
+
+#[path = "admin_continuation.rs"]
+mod continuation;
+pub use continuation::{continue_delivery, run_delivery_and_enqueue, DeliveryCompletion};
 
 #[cfg(test)]
 #[path = "admin_delivery_tests.rs"]

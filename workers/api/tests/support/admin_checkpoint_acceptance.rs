@@ -147,6 +147,7 @@ impl StageRuntime for DatabaseRuntime<'_> {
 #[derive(Default)]
 struct DeliveryQueue {
     messages: Vec<String>,
+    delays: Vec<u32>,
     calls: usize,
     reject: bool,
     uncertain: bool,
@@ -156,8 +157,9 @@ struct DeliveryQueue {
 impl store::DeliverySender for DeliveryQueue {
     type Error = StoreError;
 
-    async fn send(&mut self, encoded: String) -> Result<(), Self::Error> {
+    async fn send(&mut self, encoded: String, delay_secs: u32) -> Result<(), Self::Error> {
         self.calls += 1;
+        self.delays.push(delay_secs);
         if self.reject {
             return Err(StoreError::Database);
         }
