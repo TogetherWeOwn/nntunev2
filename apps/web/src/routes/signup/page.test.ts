@@ -44,6 +44,7 @@ describe('signup page initial state', () => {
 		expect(body).toMatch(/<h1[^>]*>Get started<\/h1>/);
 		expect(body).toContain('data-testid="signup-email"');
 		expect(body).toContain('data-testid="signup-submit"');
+		expect(body).toContain('name="invite_code"');
 		expect(body).not.toContain('role="alert"');
 	});
 });
@@ -124,12 +125,11 @@ describe('signup code-error and start-over rendering', () => {
 		expect(source).toMatch(/\{:else\}[\s\S]*?data-testid="signup-email"/);
 	});
 
-	it('records invite-field behavior on retry as implemented (no redesign)', () => {
+	it('retains the early invite for finish retries until Start over clears it', () => {
 		const source = readSignupPage();
 
-		// Implemented behavior: a code-error retry keeps the typed codes in
-		// place — the generic catch only flips status, so the invite field
-		// stays bound and is re-sent with the retry. Only Start over clears it.
+		// The invite is collected at start, then retained for finish retries.
+		// Only Start over clears it.
 		expect(source).toContain('name="invite_code"');
 		expect(source).toMatch(/bind:value=\{inviteCode\}/);
 		expect(source).toMatch(/inviteCode\.trim\(\)\.length > 0 \? \{ inviteCode:/);

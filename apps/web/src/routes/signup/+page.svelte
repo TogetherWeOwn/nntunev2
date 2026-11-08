@@ -54,7 +54,7 @@
 			// The API answers the same shape for every email (never an
 			// existence oracle) and mails an inbox-proof code when the
 			// address can still enroll.
-			const options = await client.registerStart(email.trim(), attempt.signal);
+			const options = await client.registerStart(email.trim(), attempt.signal, inviteCode.trim());
 			if (attempt.signal.aborted) return;
 			pending = options;
 			status = 'code-sent';
@@ -199,8 +199,8 @@
 			{/if}
 			{#if status === 'code-error'}
 				<p id="signup-code-error" role="alert">
-					That didn't work — re-enter the code (and invite code, if you have one) from the
-					email and try again. If it keeps failing, start over to get a fresh code.
+					That didn't work — re-enter the code from the email and try again.
+					If it keeps failing, start over to get a fresh code.
 				</p>
 			{/if}
 			{#if status === 'code-sent' || status === 'dismissed' || status === 'code-error'}
@@ -222,17 +222,6 @@
 					disabled={status === 'finishing'}
 				/>
 			</label>
-			<label>
-				Invite code (only if you were given one)
-				<input
-					type="text"
-					name="invite_code"
-					autocomplete="off"
-					aria-describedby={status === 'code-error' ? 'signup-code-error' : undefined}
-					bind:value={inviteCode}
-					disabled={status === 'finishing'}
-				/>
-			</label>
 			<button class="nt-button" type="submit" disabled={status === 'finishing'}>
 				{status === 'finishing' ? 'Creating…' : 'Finish creating account'}
 			</button>
@@ -251,6 +240,18 @@
 					aria-invalid={status === 'error'}
 					aria-describedby={status === 'error' ? 'signup-email-error' : undefined}
 					bind:value={email}
+					disabled={status === 'working'}
+				/>
+			</label>
+			<label>
+				Invite code (only if you were given one)
+				<input
+					type="text"
+					name="invite_code"
+					autocomplete="off"
+					aria-invalid={status === 'error'}
+					aria-describedby={status === 'error' ? 'signup-email-error' : undefined}
+					bind:value={inviteCode}
 					disabled={status === 'working'}
 				/>
 			</label>
