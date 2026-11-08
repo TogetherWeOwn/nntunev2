@@ -1560,6 +1560,164 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
+    /// Caller-member target probe for the preference slice
+    /// (`taste::member_target_statement`): true when the target names a
+    /// catalogue member for this caller — a recording MBID or ingest
+    /// `job_id` for `track`, a release MBID for `release`. Default `Err`
+    /// fails closed: a store that cannot answer membership must not
+    /// admit writes.
+    fn catalogue_member_target(
+        &self,
+        _user_id: &str,
+        _kind: crate::taste::TargetKind,
+        _target_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _kind, _target_id);
+            Err(StoreError)
+        }
+    }
+    /// Store-or-replace one taste signal (`taste::taste_upsert_statement`).
+    /// The write is fenced on `users.deleting_at`: `Ok(true)` = applied,
+    /// `Ok(false)` = fenced (the handler's `account_deleting` probe
+    /// classifies the 409). Default `Err` fails closed.
+    fn taste_upsert(
+        &self,
+        _user_id: &str,
+        _kind: crate::taste::TargetKind,
+        _target_id: &str,
+        _signal: crate::taste::TasteSignal,
+        _snooze_until: Option<u64>,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _kind, _target_id, _signal, _snooze_until, _now);
+            Err(StoreError)
+        }
+    }
+    /// Read back the stored signal row on a target (`None` = absent).
+    fn taste_get(
+        &self,
+        _user_id: &str,
+        _kind: crate::taste::TargetKind,
+        _target_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::taste::TasteDbRow>, StoreError>> {
+        async move {
+            let _ = (_user_id, _kind, _target_id);
+            Err(StoreError)
+        }
+    }
+    /// Unlike: delete the row only when its signal is `love`.
+    fn like_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::taste::TargetKind,
+        _target_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _kind, _target_id);
+            Err(StoreError)
+        }
+    }
+    /// Clear any stored signal on a target.
+    fn taste_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::taste::TargetKind,
+        _target_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _kind, _target_id);
+            Err(StoreError)
+        }
+    }
+    /// The liked page (`love` rows, newest-first, bounded).
+    fn likes_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::taste::TasteDbRow>, StoreError>> {
+        async move {
+            let _ = _user_id;
+            Err(StoreError)
+        }
+    }
+    /// The taste page: live signals only (expired snoozes filtered in
+    /// the statement), newest-first, bounded. `now` is the expiry
+    /// reference instant.
+    fn taste_list(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Vec<crate::taste::TasteDbRow>, StoreError>> {
+        async move {
+            let _ = (_user_id, _now);
+            Err(StoreError)
+        }
+    }
+    /// The recent-plays page: metered `stream_play_ledger` rows minus
+    /// private marks, newest-first, bounded.
+    fn history_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::taste::HistoryDbRow>, StoreError>> {
+        async move {
+            let _ = _user_id;
+            Err(StoreError)
+        }
+    }
+    /// Enable/refresh one private session (server-side TTL applied by
+    /// the caller). `Ok(true)` = applied, `Ok(false)` = fenced.
+    fn private_session_upsert(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _expires_at: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _session_id, _expires_at);
+            Err(StoreError)
+        }
+    }
+    /// Clear one private session (idempotent).
+    fn private_session_delete(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (_user_id, _session_id);
+            Err(StoreError)
+        }
+    }
+    /// Whether an unexpired private session names this
+    /// `(user_id, session_id)` at `now`. Default `Err` fails closed —
+    /// and `play_issue` fails closed on that `Err`, so an outage can
+    /// never silently issue a grant whose private mark did not persist.
+    fn private_session_active(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _session_id, _now);
+            Err(StoreError)
+        }
+    }
+    /// Mark one minted play private before its grant is issued, keyed by
+    /// the derived ledger idempotency key. Fenced like every writer:
+    /// `Ok(true)` = mark persisted, `Ok(false)` = fenced.
+    fn private_play_mark(
+        &self,
+        _user_id: &str,
+        _play_key: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (_user_id, _play_key, _now);
+            Err(StoreError)
+        }
+    }
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
@@ -4018,6 +4176,572 @@ where
     }
 }
 
+// --- Per-account library preference slice ------------------------------------------
+//
+// `/v1/me/likes*`, `/v1/me/taste`, `/v1/me/history` and
+// `/v1/me/private-session`: durable likes, taste signals, real-play
+// history and private-session capture (migration 0037, `taste.rs`).
+// Every route is `SessionOnly` in the bearer scope map — `ntk_` keys get
+// the gate's uniform 404 — so the cookie session is the only identity
+// and the Origin pin inside `authenticate(req, true)` is the CSRF guard
+// for every mutation. The owner is always the session user id: no body
+// or path field may name an account, and every store statement filters
+// `user_id` server-side, so cross-account reads/writes are impossible
+// by construction. Malformed and non-member targets answer the same 404
+// (the catalogue detail posture): the membership probe never
+// distinguishes "unknown" from "not yours".
+//
+// Import payload: one `items` array of `{kind, target_id}`.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TasteImportItem {
+    kind: String,
+    target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LikesImportBody {
+    items: Vec<TasteImportItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TastePutBody {
+    kind: String,
+    target_id: String,
+    signal: String,
+    snooze_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TasteDeleteBody {
+    kind: String,
+    target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateSessionBody {
+    session_id: String,
+    enabled: bool,
+}
+
+async fn preference_authenticate<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    mutation: bool,
+) -> Result<(SessionClaims, String), Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.authorization.is_some() {
+        return Err(not_found());
+    }
+    let pair = ctx.authenticate(req, mutation).await?;
+    match ctx.store.account_deleting(&pair.0.user_id).await {
+        Ok(false) => Ok(pair),
+        Ok(true) => Err(account_deleting_response()),
+        Err(_) => Err(unavailable()),
+    }
+}
+
+/// Resolve a preference-slice target to a parsed kind plus validated
+/// membership: `Some((kind, target))` only when the kind parses, the id
+/// is within the column bound (and MBID-shaped for `release`), and the
+/// caller's `library` membership probe confirms it. Every failure —
+/// malformed, unknown or non-member — is the same `None` so the caller's
+/// 404 never distinguishes them; a store error is `Err` for the
+/// caller's 503.
+async fn preference_member_target<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    kind_raw: &str,
+    target_id: &str,
+) -> Result<Option<(crate::taste::TargetKind, String)>, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(kind) = crate::taste::TargetKind::parse(kind_raw) else {
+        return Ok(None);
+    };
+    if !crate::taste::valid_target_id(target_id) {
+        return Ok(None);
+    }
+    if kind == crate::taste::TargetKind::Release && !crate::catalogue::is_catalogue_mbid(target_id)
+    {
+        return Ok(None);
+    }
+    let target = crate::taste::canonical_target_id(target_id);
+    match ctx
+        .store
+        .catalogue_member_target(user_id, kind, &target)
+        .await
+    {
+        Ok(true) => Ok(Some((kind, target))),
+        Ok(false) => Ok(None),
+        Err(_) => Err(unavailable()),
+    }
+}
+
+/// Classify a fenced taste/privacy write: `false` from a writer fence
+/// means the owner's `users` row is deleting (or gone) — the typed 409
+/// when the probe agrees, else the opaque 500.
+async fn fenced_write_response<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, user_id: &str) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    match ctx.store.account_deleting(user_id).await {
+        Ok(true) => account_deleting_response(),
+        _ => internal(),
+    }
+}
+
+/// `GET /v1/me/likes`: the caller's liked page as `{"items":[…]}`,
+/// newest-first, store-capped. Session read; store failure is the
+/// opaque 503 like the catalogue collections.
+async fn me_likes_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.likes_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "created_at": row.created_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+/// Shared body for `PUT`/`DELETE /v1/me/likes/track/{target_id}`: the
+/// kind is fixed to `track` by the route shape; anything else in the
+/// path never reaches dispatch.
+async fn me_likes_put<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target_id: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some((_kind, target)) =
+        (match preference_member_target(ctx, &claims.user_id, "track", target_id).await {
+            Ok(found) => found,
+            Err(resp) => return resp,
+        })
+    else {
+        return not_found();
+    };
+    // Idempotent upsert: the first `created_at` wins; a re-PUT refreshes
+    // `updated_at` and still answers 200 with the stored row.
+    match ctx
+        .store
+        .taste_upsert(
+            &claims.user_id,
+            crate::taste::TargetKind::Track,
+            &target,
+            crate::taste::TasteSignal::Love,
+            None,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return fenced_write_response(ctx, &claims.user_id).await,
+        Err(_) => return unavailable(),
+    }
+    match ctx
+        .store
+        .taste_get(&claims.user_id, crate::taste::TargetKind::Track, &target)
+        .await
+    {
+        Ok(Some(row)) => json_response(
+            200,
+            serde_json::json!({"target_id": row.target_id, "liked_at": row.created_at}),
+        ),
+        Ok(None) => internal(),
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_likes_delete<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target_id: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let target = match preference_member_target(ctx, &claims.user_id, "track", target_id).await {
+        Ok(Some((_, target))) => target,
+        Ok(None) => return not_found(),
+        Err(resp) => return resp,
+    };
+    // Idempotent remove: only a `love` row is deleted (a suppression
+    // signal survives an unlike); a missing row still answers 200.
+    match ctx
+        .store
+        .like_delete(&claims.user_id, crate::taste::TargetKind::Track, &target)
+        .await
+    {
+        Ok(_) => json_response(
+            200,
+            serde_json::json!({"target_id": target, "liked": false}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
+/// `POST /v1/me/likes/import`: bounded bulk like. Per-item atomic —
+/// each item validates shape then membership, so one bad item lands in
+/// `rejected` without failing the batch; a retried import converges to
+/// `already`.
+async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<LikesImportBody>(req) else {
+        return validation_failed("invalid body");
+    };
+    if body.items.len() > crate::taste::IMPORT_MAX_ITEMS {
+        return validation_failed("too many items");
+    }
+    let mut added: u64 = 0;
+    let mut already: u64 = 0;
+    let mut rejected: Vec<serde_json::Value> = Vec::new();
+    for item in &body.items {
+        let mut reject = |reason: &str| {
+            rejected.push(serde_json::json!({
+                "target_id": item.target_id.chars().take(crate::taste::IMPORT_REJECT_ID_MAX).collect::<String>(),
+                "reason": reason,
+            }));
+        };
+        let Some(kind) = crate::taste::TargetKind::parse(&item.kind) else {
+            reject("invalid");
+            continue;
+        };
+        if !crate::taste::valid_target_id(&item.target_id)
+            || (kind == crate::taste::TargetKind::Release
+                && !crate::catalogue::is_catalogue_mbid(&item.target_id))
+        {
+            reject("invalid");
+            continue;
+        }
+        let target = crate::taste::canonical_target_id(&item.target_id);
+        let member = match ctx
+            .store
+            .catalogue_member_target(&claims.user_id, kind, &target)
+            .await
+        {
+            Ok(member) => member,
+            Err(_) => return unavailable(),
+        };
+        if !member {
+            reject("not_member");
+            continue;
+        }
+        let prior = match ctx.store.taste_get(&claims.user_id, kind, &target).await {
+            Ok(prior) => prior,
+            Err(_) => return unavailable(),
+        };
+        match ctx
+            .store
+            .taste_upsert(
+                &claims.user_id,
+                kind,
+                &target,
+                crate::taste::TasteSignal::Love,
+                None,
+                ctx.now,
+            )
+            .await
+        {
+            Ok(true) => {
+                if prior.is_some_and(|row| row.signal == "love") {
+                    already += 1;
+                } else {
+                    added += 1;
+                }
+            }
+            Ok(false) => return fenced_write_response(ctx, &claims.user_id).await,
+            Err(_) => return unavailable(),
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({"added": added, "already": already, "rejected": rejected}),
+    )
+}
+
+/// `PUT /v1/me/taste`: upsert one durable signal on a member target.
+/// `snooze_seconds` is allowed on `snooze` only (bounded 60 s..30 d);
+/// any other signal clears `snooze_until`.
+async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<TastePutBody>(req) else {
+        return validation_failed("invalid body");
+    };
+    if crate::taste::TargetKind::parse(&body.kind).is_none() {
+        return validation_failed("invalid kind");
+    }
+    let Some(signal) = crate::taste::TasteSignal::parse(&body.signal) else {
+        return validation_failed("invalid signal");
+    };
+    let snooze_until = match (signal, body.snooze_seconds) {
+        (crate::taste::TasteSignal::Snooze, Some(secs))
+            if (crate::taste::SNOOZE_MIN_SECS..=crate::taste::SNOOZE_MAX_SECS).contains(&secs) =>
+        {
+            Some(ctx.now.saturating_add(secs))
+        }
+        (crate::taste::TasteSignal::Snooze, _) => {
+            return validation_failed("invalid snooze_seconds");
+        }
+        (_, Some(_)) => return validation_failed("snooze_seconds requires snooze"),
+        (_, None) => None,
+    };
+    let Some((kind, target)) =
+        (match preference_member_target(ctx, &claims.user_id, &body.kind, &body.target_id).await {
+            Ok(found) => found,
+            Err(resp) => return resp,
+        })
+    else {
+        return not_found();
+    };
+    match ctx
+        .store
+        .taste_upsert(
+            &claims.user_id,
+            kind,
+            &target,
+            signal,
+            snooze_until,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(true) => json_response(
+            200,
+            serde_json::json!({
+                "kind": kind.as_str(),
+                "target_id": target,
+                "signal": signal.as_str(),
+                "until": snooze_until,
+            }),
+        ),
+        Ok(false) => fenced_write_response(ctx, &claims.user_id).await,
+        Err(_) => unavailable(),
+    }
+}
+
+/// `DELETE /v1/me/taste`: clear the stored signal on a member target
+/// (idempotent: a missing row still answers 200).
+async fn me_taste_delete<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<TasteDeleteBody>(req) else {
+        return validation_failed("invalid body");
+    };
+    if crate::taste::TargetKind::parse(&body.kind).is_none() {
+        return validation_failed("invalid kind");
+    }
+    let Some((kind, target)) =
+        (match preference_member_target(ctx, &claims.user_id, &body.kind, &body.target_id).await {
+            Ok(found) => found,
+            Err(resp) => return resp,
+        })
+    else {
+        return not_found();
+    };
+    match ctx.store.taste_delete(&claims.user_id, kind, &target).await {
+        Ok(cleared) => json_response(200, serde_json::json!({"cleared": cleared})),
+        Err(_) => unavailable(),
+    }
+}
+
+/// `GET /v1/me/taste`: the caller's live signals page (expired snoozes
+/// filtered in the statement), newest-first, store-capped.
+async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.taste_list(&claims.user_id, ctx.now).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "signal": row.signal,
+                        "until": row.snooze_until,
+                        "updated_at": row.updated_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+/// `GET /v1/me/history`: the caller's real recent plays — metered
+/// `stream_play_ledger` rows minus private marks — newest-first,
+/// store-capped. Rows whose key cannot parse a `play_id` are skipped
+/// rather than half-served.
+async fn me_history_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.history_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "play_id": row.play_id,
+                        "track_id": row.track_id,
+                        "played_at": row.played_at,
+                        "stream_seconds": row.stream_seconds,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+/// `PUT /v1/me/private-session`: enable (upsert with the server-side
+/// TTL) or clear one private-listening session. Enabled sessions mark
+/// every play minted under their `session_id` private at grant
+/// issuance — billing unaffected, exposure suppressed from first use.
+async fn me_private_session_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<PrivateSessionBody>(req) else {
+        return validation_failed("invalid body");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    if body.enabled {
+        let expires_at = ctx
+            .now
+            .saturating_add(crate::taste::PRIVATE_SESSION_TTL_SECS);
+        match ctx
+            .store
+            .private_session_upsert(&claims.user_id, &body.session_id, expires_at)
+            .await
+        {
+            Ok(true) => json_response(
+                200,
+                serde_json::json!({"session_id": body.session_id, "private_until": expires_at}),
+            ),
+            Ok(false) => fenced_write_response(ctx, &claims.user_id).await,
+            Err(_) => unavailable(),
+        }
+    } else {
+        match ctx
+            .store
+            .private_session_delete(&claims.user_id, &body.session_id)
+            .await
+        {
+            Ok(()) => json_response(
+                200,
+                serde_json::json!({"session_id": body.session_id, "private_until": null}),
+            ),
+            Err(_) => unavailable(),
+        }
+    }
+}
+
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
 // Session-authenticated issuance surface only: `POST /v1/credentials`
@@ -5421,6 +6145,57 @@ fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Respon
     }
 }
 
+/// Private-session mark at grant issuance (migration 0037): when an
+/// unexpired `private_sessions` row names this `(user_id, session_id)`,
+/// persist the `private_plays` mark for the play about to be granted
+/// — before the grant leaves the server, so the play is suppressed
+/// from history/taste exposure from first use while billing still
+/// meters it. `None` = clear to issue; `Some(response)` = the caller
+/// answers it instead. Fail-closed on the mark, never on the probe
+/// alone: a session probe error cannot silently skip a mark (the
+/// answer is 503, not a grant for an unmarked private play), and a
+/// fenced mark answers through `account_deleting` like every fenced
+/// write. Marks are idempotent on `(user_id, play_key)` — a
+/// continuation re-mark is a no-op. `derive_play_idempotency_key` is
+/// infallible here: the handler already ran the same probe before any
+/// lease write.
+async fn mark_private_play<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+) -> Option<Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    match ctx
+        .store
+        .private_session_active(user_id, session_id, ctx.now)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(_) => return Some(unavailable()),
+    }
+    let Ok(play_key) = crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
+    else {
+        return Some(internal());
+    };
+    match ctx
+        .store
+        .private_play_mark(user_id, &play_key, ctx.now)
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(fenced_write_response(ctx, user_id).await),
+        Err(_) => Some(unavailable()),
+    }
+}
+
 /// Mint the grant for an already-acquired lease hold and render the
 /// issuance body. The minter re-checks the identity field rule, so an
 /// unmeterable identity still cannot mint even though the handler
@@ -5536,6 +6311,9 @@ where
                 .await
             {
                 Ok(true) => {
+                    // Privacy is fixed at new-play issuance. Refreshing a
+                    // public play must not retroactively classify it private;
+                    // existing private marks remain even after disabling mode.
                     return play_grant_response(
                         secret,
                         &claims.user_id,
@@ -5627,15 +6405,28 @@ where
         )
         .await
     {
-        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
-            secret,
-            &claims.user_id,
-            &body.track_id,
-            &play_id,
-            epoch,
-            ctx.now,
-            lease_expires_at,
-        ),
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => {
+            if let Some(resp) = mark_private_play(
+                ctx,
+                &claims.user_id,
+                &body.session_id,
+                &body.track_id,
+                &play_id,
+            )
+            .await
+            {
+                return resp;
+            }
+            play_grant_response(
+                secret,
+                &claims.user_id,
+                &body.track_id,
+                &play_id,
+                epoch,
+                ctx.now,
+                lease_expires_at,
+            )
+        }
         Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
             // Zero rows back can also mean the deletion fence closed
             // after the up-front check (the marker landed mid-request):
@@ -6841,6 +7632,11 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
+            | "/v1/me/likes"
+            | "/v1/me/likes/import"
+            | "/v1/me/taste"
+            | "/v1/me/history"
+            | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
             | "/v1/artists"
@@ -7031,6 +7827,42 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        // Per-account preference slice (migration 0037): session-only
+        // routes — the scope map keeps every `/v1/me/*` shape `Deny`
+        // to bearer keys, so the cookie session is the only identity
+        // and the Origin pin inside the handlers' `authenticate` is the
+        // CSRF guard.
+        ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
+        ("PUT", path)
+            if path
+                .strip_prefix("/v1/me/likes/track/")
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
+            me_likes_put(
+                ctx,
+                req,
+                path.strip_prefix("/v1/me/likes/track/").unwrap_or(""),
+            )
+            .await
+        }
+        ("DELETE", path)
+            if path
+                .strip_prefix("/v1/me/likes/track/")
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
+            me_likes_delete(
+                ctx,
+                req,
+                path.strip_prefix("/v1/me/likes/track/").unwrap_or(""),
+            )
+            .await
+        }
+        ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
+        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
+        ("DELETE", "/v1/me/taste") => me_taste_delete(ctx, req).await,
+        ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
+        ("PUT", "/v1/me/private-session") => me_private_session_put(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -7134,6 +7966,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll, Waker};
+
+    include!("taste_handler_tests.rs");
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let waker = Waker::noop();
@@ -7384,6 +8218,22 @@ mod tests {
         fail_catalogue_reads: RefCell<bool>,
         /// Fail only the second read in release detail, after membership.
         fail_catalogue_release_tracks: RefCell<bool>,
+        /// Shared-catalogue member targets (production `library` rows with
+        /// `user_id IS NULL`): `(kind, target_id)` pairs any caller may
+        /// resolve. Own membership comes from `catalogue_library` rows
+        /// (release MBID, each recording MBID, and the `job_id` — matching
+        /// `taste::member_target_statement`).
+        shared_member_targets: RefCell<std::collections::HashSet<(String, String)>>,
+        /// Preference slice state (migration 0037): taste rows keyed by
+        /// `(user_id, kind, target_id)`, private sessions by
+        /// `(user_id, session_id)`, private-play marks by
+        /// `(user_id, play_key)`.
+        taste_rows: RefCell<HashMap<(String, String, String), crate::taste::TasteDbRow>>,
+        private_sessions: RefCell<HashMap<(String, String), u64>>,
+        private_plays: RefCell<std::collections::HashSet<(String, String)>>,
+        fail_private_probe: RefCell<bool>,
+        fail_private_mark: RefCell<bool>,
+        taste_write_budget: RefCell<Option<usize>>,
     }
 
     impl FakeStore {
@@ -7438,6 +8288,36 @@ mod tests {
             pairs.sort();
             pairs.dedup();
             pairs
+        }
+        /// Member `(kind, target_id)` pairs for a fake user, mirroring
+        /// `taste::member_target_statement`: each own ledger row
+        /// contributes its release MBID (`release`), every recording
+        /// MBID plus its `job_id` (`track`), and the shared fixture set
+        /// contributes the `user_id IS NULL` half.
+        fn fake_member_targets(&self, user_id: &str) -> Vec<(String, String)> {
+            let mut targets: Vec<(String, String)> = self
+                .catalogue_library
+                .borrow()
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|row| {
+                    let mut row_targets: Vec<(String, String)> =
+                        vec![("track".to_string(), row.job_id.clone())];
+                    if let Some(release) = row.release_mbid.as_deref() {
+                        row_targets.push(("release".to_string(), release.to_lowercase()));
+                    }
+                    row_targets.extend(
+                        row.recording_mbids
+                            .iter()
+                            .map(|recording| ("track".to_string(), recording.to_lowercase())),
+                    );
+                    row_targets
+                })
+                .collect();
+            targets.extend(self.shared_member_targets.borrow().iter().cloned());
+            targets
         }
     }
 
@@ -8451,6 +9331,278 @@ mod tests {
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))
+        }
+        async fn catalogue_member_target(
+            &self,
+            user_id: &str,
+            kind: crate::taste::TargetKind,
+            target_id: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            // Production folds MBID comparisons (`lower(m) = lower($2)`)
+            // but compares `job_id` exactly; the fixture set stores
+            // MBIDs lowered and job ids verbatim, so an exact or
+            // case-folded hit counts.
+            let lowered = target_id.to_lowercase();
+            Ok(self
+                .fake_member_targets(user_id)
+                .iter()
+                .any(|(k, t)| k.as_str() == kind.as_str() && (t == target_id || t == &lowered)))
+        }
+        async fn taste_upsert(
+            &self,
+            user_id: &str,
+            kind: crate::taste::TargetKind,
+            target_id: &str,
+            signal: crate::taste::TasteSignal,
+            snooze_until: Option<u64>,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            if let Some(remaining) = self.taste_write_budget.borrow_mut().as_mut() {
+                if *remaining == 0 {
+                    return Err(StoreError);
+                }
+                *remaining -= 1;
+            }
+            // Mirror the production writer fence: a deleting (or
+            // nonexistent) user writes zero rows.
+            if self.deleting_users.borrow().contains(user_id)
+                || !self.users.borrow().contains_key(user_id)
+            {
+                return Ok(false);
+            }
+            let key = (
+                user_id.to_string(),
+                kind.as_str().to_string(),
+                target_id.to_string(),
+            );
+            let mut rows = self.taste_rows.borrow_mut();
+            match rows.get_mut(&key) {
+                Some(row) => {
+                    row.signal = signal.as_str().to_string();
+                    row.snooze_until = snooze_until.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+                    row.updated_at = i64::try_from(now).unwrap_or(i64::MAX);
+                }
+                None => {
+                    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+                    rows.insert(
+                        key,
+                        crate::taste::TasteDbRow {
+                            kind: kind.as_str().to_string(),
+                            target_id: target_id.to_string(),
+                            signal: signal.as_str().to_string(),
+                            snooze_until: snooze_until
+                                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                            created_at: now_i64,
+                            updated_at: now_i64,
+                        },
+                    );
+                }
+            }
+            Ok(true)
+        }
+        async fn taste_get(
+            &self,
+            user_id: &str,
+            kind: crate::taste::TargetKind,
+            target_id: &str,
+        ) -> Result<Option<crate::taste::TasteDbRow>, StoreError> {
+            Ok(self
+                .taste_rows
+                .borrow()
+                .get(&(
+                    user_id.to_string(),
+                    kind.as_str().to_string(),
+                    target_id.to_string(),
+                ))
+                .cloned())
+        }
+        async fn like_delete(
+            &self,
+            user_id: &str,
+            kind: crate::taste::TargetKind,
+            target_id: &str,
+        ) -> Result<bool, StoreError> {
+            let key = (
+                user_id.to_string(),
+                kind.as_str().to_string(),
+                target_id.to_string(),
+            );
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows.get(&key).is_some_and(|row| row.signal == "love") {
+                rows.remove(&key);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        async fn taste_delete(
+            &self,
+            user_id: &str,
+            kind: crate::taste::TargetKind,
+            target_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(self
+                .taste_rows
+                .borrow_mut()
+                .remove(&(
+                    user_id.to_string(),
+                    kind.as_str().to_string(),
+                    target_id.to_string(),
+                ))
+                .is_some())
+        }
+        async fn likes_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::taste::TasteDbRow>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows: Vec<crate::taste::TasteDbRow> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((user, _, _), row)| user == user_id && row.signal == "love")
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then(a.kind.cmp(&b.kind))
+                    .then(a.target_id.cmp(&b.target_id))
+            });
+            rows.truncate(crate::taste::TASTE_MAX_LIST as usize);
+            Ok(rows)
+        }
+        async fn taste_list(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<Vec<crate::taste::TasteDbRow>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+            let mut rows: Vec<crate::taste::TasteDbRow> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((user, _, _), row)| {
+                    user == user_id
+                        && (row.signal != "snooze"
+                            || row.snooze_until.is_none_or(|until| until > now_i64))
+                })
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then(a.kind.cmp(&b.kind))
+                    .then(a.target_id.cmp(&b.target_id))
+            });
+            rows.truncate(crate::taste::TASTE_MAX_LIST as usize);
+            Ok(rows)
+        }
+        async fn history_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::taste::HistoryDbRow>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            // Mirror `history_list_statement`: `play:` keys with
+            // delivered bytes, minus the caller's private marks,
+            // newest-first; the `play_id` parses from the key.
+            let private = self.private_plays.borrow();
+            let mut rows: Vec<crate::taste::HistoryDbRow> = self
+                .play_windows
+                .borrow()
+                .values()
+                .filter(|window| {
+                    window.user_id == user_id
+                        && window.idempotency_key.starts_with("play:")
+                        && window.bytes_served > 0
+                        && !private.contains(&(user_id.to_string(), window.idempotency_key.clone()))
+                })
+                .filter_map(|window| {
+                    Some(crate::taste::HistoryDbRow {
+                        play_id: crate::taste::play_id_from_key(&window.idempotency_key)?,
+                        track_id: window.track_id.clone(),
+                        played_at: i64::try_from(window.recorded_at).unwrap_or(i64::MAX),
+                        stream_seconds: i64::try_from(window.stream_seconds).unwrap_or(i64::MAX),
+                    })
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                b.played_at
+                    .cmp(&a.played_at)
+                    .then(a.play_id.cmp(&b.play_id))
+            });
+            rows.truncate(crate::taste::HISTORY_MAX_LIST as usize);
+            Ok(rows)
+        }
+        async fn private_session_upsert(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            expires_at: u64,
+        ) -> Result<bool, StoreError> {
+            // Same writer fence as the other preference writers.
+            if self.deleting_users.borrow().contains(user_id)
+                || !self.users.borrow().contains_key(user_id)
+            {
+                return Ok(false);
+            }
+            self.private_sessions
+                .borrow_mut()
+                .insert((user_id.to_string(), session_id.to_string()), expires_at);
+            Ok(true)
+        }
+        async fn private_session_delete(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<(), StoreError> {
+            self.private_sessions
+                .borrow_mut()
+                .remove(&(user_id.to_string(), session_id.to_string()));
+            Ok(())
+        }
+        async fn private_session_active(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_probe.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .private_sessions
+                .borrow()
+                .get(&(user_id.to_string(), session_id.to_string()))
+                .is_some_and(|expires| *expires > now))
+        }
+        async fn private_play_mark(
+            &self,
+            user_id: &str,
+            play_key: &str,
+            _now: u64,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_mark.borrow() {
+                return Err(StoreError);
+            }
+            if self.deleting_users.borrow().contains(user_id)
+                || !self.users.borrow().contains_key(user_id)
+            {
+                return Ok(false);
+            }
+            self.private_plays
+                .borrow_mut()
+                .insert((user_id.to_string(), play_key.to_string()));
+            Ok(true)
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
             // Mirror the production EXISTS probe: credential, any

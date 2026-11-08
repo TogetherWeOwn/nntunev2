@@ -40,6 +40,7 @@ pub mod rotation;
 pub mod session;
 pub mod session_retry_store;
 pub mod stripe;
+pub mod taste;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;
