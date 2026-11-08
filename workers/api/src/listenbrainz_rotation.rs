@@ -13,6 +13,18 @@
 //!    row. A lost CAS (relink, concurrent rotation, unlink) is reported and
 //!    never retried or overwritten here: the caller reloads on a later run.
 //!
+//! [`rotate_batch`] adds a bounded keyset candidate scan in front of that
+//! per-user helper: one scan page (at most [`MAX_SCAN_LIMIT`] owner ids, in
+//! UUID keyset order, strictly after an optional typed cursor) and one
+//! [`rotate_link`] per candidate. It validates the page (count, order, strict
+//! cursor advancement) before ANY write and returns scalar counts plus a
+//! resume cursor only. It does not persist progress, retry, schedule or
+//! serialize jobs: the caller must durably record progress, run one job at a
+//! time and repeat from the start for deferred or failed rows. Reaching the
+//! end of the keyset means only that this pass ran out of candidates; it is
+//! NOT proof that every link is rotated (poison, changed, late-created or
+//! lost-CAS rows can remain), so it must not be used alone to retire a key.
+//!
 //! Results are scalar enums only: no envelope, key, username or error detail
 //! can reach a caller or a log. This module emits no log calls.
 
@@ -24,10 +36,55 @@ use crate::{
     rotation::KekSource,
 };
 
-/// The two store operations the orchestrator needs. Blanket-implemented for
+/// Largest candidate page one scan may request.
+pub const MAX_SCAN_LIMIT: u32 = 100;
+
+/// Canonical lowercase hyphenated UUID owner id used as a keyset cursor.
+/// Byte order of this form equals UUID order. Not a secret, but never listed
+/// in bulk by this module: only the resume cursor leaves a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerCursor(String);
+
+impl OwnerCursor {
+    pub fn parse(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        let ok = b.len() == 36
+            && b.iter().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => *c == b'-',
+                _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
+            });
+        ok.then(|| Self(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Reject bad scan arguments. Callers run this before connecting or querying.
+pub(crate) fn check_scan_args(below_version: u32, limit: u32) -> Result<(), StoreError> {
+    if below_version == 0
+        || i32::try_from(below_version).is_err()
+        || limit == 0
+        || limit > MAX_SCAN_LIMIT
+    {
+        return Err(StoreError);
+    }
+    Ok(())
+}
+
+/// The store operations the orchestrator needs. Blanket-implemented for
 /// every [`Store`], so production reuses `listenbrainz_link` and
 /// `cas_rewrap_listenbrainz_link`; tests supply a small fake.
 pub trait LinkRewrapStore {
+    /// Owner ids whose link has `kek_version < below_version`, ascending,
+    /// strictly after `after`, at most `limit` (1..=[`MAX_SCAN_LIMIT`]).
+    fn list_candidates(
+        &self,
+        below_version: u32,
+        after: Option<&OwnerCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<OwnerCursor>, StoreError>>;
     fn read_link(
         &self,
         user_id: &str,
@@ -42,6 +99,15 @@ pub trait LinkRewrapStore {
 }
 
 impl<S: Store> LinkRewrapStore for S {
+    fn list_candidates(
+        &self,
+        below_version: u32,
+        after: Option<&OwnerCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<OwnerCursor>, StoreError>> {
+        self.listenbrainz_rotation_candidates(below_version, after, limit)
+    }
+
     fn read_link(
         &self,
         user_id: &str,
@@ -154,6 +220,95 @@ pub async fn rotate_link(
     }
 }
 
+/// Why a batch did not start rotating. Nothing was written in any variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationBatchError {
+    /// Target version or limit out of range; no store call was made.
+    InvalidArguments,
+    /// The candidate scan failed; reported, not swallowed.
+    ScanFailed,
+    /// The store returned an oversize, unordered or non-advancing page.
+    InvalidScan,
+}
+
+/// Scalar result of one batch. No identity list, envelope or key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationBatchReport {
+    pub scanned: u32,
+    pub rewrapped: u32,
+    /// Row vanished (unlinked or deleted) before it could be rotated.
+    pub no_link: u32,
+    /// Reload showed the row already at or above the target (raced rotation).
+    pub already_current: u32,
+    /// Lost CAS or owner being deleted; nothing written. Needs a later pass.
+    pub deferred: u32,
+    /// Read/CAS store failure, unknown key, corrupt or unauthenticated row.
+    /// Not retried; needs a later pass and likely operator attention.
+    pub failed: u32,
+    /// Pass this as the next cursor: last candidate scanned, else the input.
+    pub resume_after: Option<OwnerCursor>,
+    /// The page was short, so this keyset pass has no further candidates.
+    /// Not global readiness: see the module docs.
+    pub end_of_keyset: bool,
+}
+
+/// Rotate one scan page to `target_version`. One scan, then exactly one
+/// [`rotate_link`] per candidate (it reloads the full row and does one CAS;
+/// nothing is retried). The page is validated before any write.
+pub async fn rotate_batch(
+    store: &impl LinkRewrapStore,
+    keks: &impl KekSource,
+    target_version: u32,
+    after: Option<&OwnerCursor>,
+    limit: u32,
+    now: u64,
+) -> Result<RotationBatchReport, RotationBatchError> {
+    check_scan_args(target_version, limit).map_err(|_| RotationBatchError::InvalidArguments)?;
+    let candidates = store
+        .list_candidates(target_version, after, limit)
+        .await
+        .map_err(|StoreError| RotationBatchError::ScanFailed)?;
+    if candidates.len() > limit as usize {
+        return Err(RotationBatchError::InvalidScan);
+    }
+    let mut previous = after;
+    for c in &candidates {
+        if previous.is_some_and(|p| c.as_str() <= p.as_str()) {
+            return Err(RotationBatchError::InvalidScan);
+        }
+        previous = Some(c);
+    }
+    let mut report = RotationBatchReport {
+        scanned: candidates.len() as u32,
+        rewrapped: 0,
+        no_link: 0,
+        already_current: 0,
+        deferred: 0,
+        failed: 0,
+        resume_after: candidates.last().or(after).cloned(),
+        end_of_keyset: candidates.len() < limit as usize,
+    };
+    for c in &candidates {
+        let counter = match rotate_link(store, keks, c.as_str(), target_version, now).await {
+            LinkRotationOutcome::Rewrapped => &mut report.rewrapped,
+            LinkRotationOutcome::NoLink => &mut report.no_link,
+            LinkRotationOutcome::NotIncreasing => &mut report.already_current,
+            LinkRotationOutcome::ClaimLost | LinkRotationOutcome::AccountDeleting => {
+                &mut report.deferred
+            }
+            LinkRotationOutcome::InvalidTargetVersion
+            | LinkRotationOutcome::InvalidUser
+            | LinkRotationOutcome::OwnerMismatch
+            | LinkRotationOutcome::UnknownKey
+            | LinkRotationOutcome::Corrupt
+            | LinkRotationOutcome::Crypto
+            | LinkRotationOutcome::StoreFailed => &mut report.failed,
+        };
+        *counter += 1;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +381,15 @@ mod tests {
     }
 
     impl LinkRewrapStore for Fake {
+        async fn list_candidates(
+            &self,
+            _below_version: u32,
+            _after: Option<&OwnerCursor>,
+            _limit: u32,
+        ) -> Result<Vec<OwnerCursor>, StoreError> {
+            Err(StoreError)
+        }
+
         async fn read_link(&self, _user_id: &str) -> Result<Option<StoredLink>, StoreError> {
             self.reads.set(self.reads.get() + 1);
             if self.read_err {
@@ -434,5 +598,264 @@ mod tests {
         assert_eq!(run(&g, &Keys, "u-1", 2), LinkRotationOutcome::StoreFailed);
         assert_eq!(g.cas_calls.get(), 1);
         assert_eq!(g.row.borrow().as_ref().unwrap().kek_version, 1);
+    }
+
+    // ---- batch orchestration ----
+
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    fn uid(n: u32) -> String {
+        format!("00000000-0000-4000-8000-{n:012x}")
+    }
+
+    fn cur(n: u32) -> OwnerCursor {
+        OwnerCursor::parse(&uid(n)).unwrap()
+    }
+
+    #[derive(Default)]
+    struct Multi {
+        rows: RefCell<BTreeMap<String, StoredLink>>,
+        /// Replaces the scan result (misbehaving store).
+        scan_override: RefCell<Option<Vec<OwnerCursor>>>,
+        scan_err: bool,
+        scans: RefCell<Vec<(u32, Option<String>, u32)>>,
+        vanish_before_read: RefCell<HashSet<String>>,
+        swap_on_cas: RefCell<HashMap<String, StoredLink>>,
+        cas_users: RefCell<Vec<String>>,
+        reads: RefCell<Vec<String>>,
+    }
+
+    impl LinkRewrapStore for Multi {
+        async fn list_candidates(
+            &self,
+            below: u32,
+            after: Option<&OwnerCursor>,
+            limit: u32,
+        ) -> Result<Vec<OwnerCursor>, StoreError> {
+            self.scans
+                .borrow_mut()
+                .push((below, after.map(|a| a.as_str().to_owned()), limit));
+            if self.scan_err {
+                return Err(StoreError);
+            }
+            if let Some(v) = self.scan_override.borrow().clone() {
+                return Ok(v);
+            }
+            Ok(self
+                .rows
+                .borrow()
+                .iter()
+                .filter(|(k, r)| {
+                    r.kek_version < below && after.is_none_or(|a| k.as_str() > a.as_str())
+                })
+                .take(limit as usize)
+                .map(|(k, _)| OwnerCursor::parse(k).unwrap())
+                .collect())
+        }
+
+        async fn read_link(&self, user_id: &str) -> Result<Option<StoredLink>, StoreError> {
+            self.reads.borrow_mut().push(user_id.to_owned());
+            if self.vanish_before_read.borrow().contains(user_id) {
+                self.rows.borrow_mut().remove(user_id);
+            }
+            Ok(self.rows.borrow().get(user_id).cloned())
+        }
+
+        async fn cas_rewrap_link(
+            &self,
+            user_id: &str,
+            captured: &StoredLink,
+            replacement: &StoredLink,
+            _now: u64,
+        ) -> Result<RewrapOutcome, StoreError> {
+            self.cas_users.borrow_mut().push(user_id.to_owned());
+            if let Some(newer) = self.swap_on_cas.borrow_mut().remove(user_id) {
+                self.rows.borrow_mut().insert(user_id.to_owned(), newer);
+            }
+            let mut rows = self.rows.borrow_mut();
+            match rows.get(user_id) {
+                None => Ok(RewrapOutcome::NoRow),
+                Some(cur) if same(cur, captured) => {
+                    rows.insert(user_id.to_owned(), replacement.clone());
+                    Ok(RewrapOutcome::Rewrapped)
+                }
+                Some(_) => Ok(RewrapOutcome::ClaimLost),
+            }
+        }
+    }
+
+    fn multi(versions: &[(u32, u32)]) -> Multi {
+        let m = Multi::default();
+        for (n, v) in versions {
+            m.rows.borrow_mut().insert(uid(*n), sealed(&uid(*n), *v));
+        }
+        m
+    }
+
+    fn batch(
+        m: &Multi,
+        target: u32,
+        after: Option<&OwnerCursor>,
+        limit: u32,
+    ) -> Result<RotationBatchReport, RotationBatchError> {
+        block_on(rotate_batch(m, &Keys, target, after, limit, 1000))
+    }
+
+    fn version_of(m: &Multi, n: u32) -> Option<u32> {
+        m.rows.borrow().get(&uid(n)).map(|r| r.kek_version)
+    }
+
+    #[test]
+    fn cursor_accepts_only_canonical_lowercase_uuid() {
+        assert!(OwnerCursor::parse(&uid(1)).is_some());
+        for bad in [
+            "",
+            "u-1",
+            "00000000-0000-4000-8000-00000000000G",
+            "00000000-0000-4000-8000-00000000000A",
+            "000000000000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-0000000000011",
+            " 00000000-0000-4000-8000-000000000001",
+        ] {
+            assert!(OwnerCursor::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bad_scan_arguments_fail_before_any_store_call() {
+        let m = multi(&[(1, 1)]);
+        for (target, limit) in [(0, 10), (2, 0), (2, MAX_SCAN_LIMIT + 1), (2, u32::MAX)] {
+            assert_eq!(
+                batch(&m, target, None, limit),
+                Err(RotationBatchError::InvalidArguments)
+            );
+        }
+        assert_eq!(
+            batch(&m, i32::MAX as u32 + 1, None, 10),
+            Err(RotationBatchError::InvalidArguments)
+        );
+        assert!(m.scans.borrow().is_empty());
+        assert!(m.reads.borrow().is_empty());
+        assert!(check_scan_args(2, MAX_SCAN_LIMIT).is_ok());
+        assert!(check_scan_args(i32::MAX as u32, 1).is_ok());
+    }
+
+    #[test]
+    fn one_batch_is_bounded_ordered_and_resumes_by_cursor() {
+        let m = multi(&[(1, 1), (2, 1), (3, 1), (4, 1), (5, 3)]);
+        let r = batch(&m, 2, None, 3).unwrap();
+        assert_eq!((r.scanned, r.rewrapped), (3, 3));
+        assert!(!r.end_of_keyset);
+        assert_eq!(r.resume_after, Some(cur(3)));
+        assert_eq!(*m.cas_users.borrow(), vec![uid(1), uid(2), uid(3)]);
+        assert_eq!(version_of(&m, 4), Some(1));
+        assert_eq!(m.scans.borrow().len(), 1);
+
+        let r = batch(&m, 2, r.resume_after.as_ref(), 3).unwrap();
+        assert_eq!((r.scanned, r.rewrapped), (1, 1));
+        assert!(r.end_of_keyset);
+        assert_eq!(r.resume_after, Some(cur(4)));
+        // Row 5 (already above target) was never a candidate or touched.
+        assert_eq!(version_of(&m, 5), Some(3));
+        assert_eq!(m.cas_users.borrow().len(), 4);
+
+        // Empty page keeps the input cursor and reports the end.
+        let r = batch(&m, 2, Some(&cur(4)), 3).unwrap();
+        assert_eq!(r.scanned, 0);
+        assert!(r.end_of_keyset);
+        assert_eq!(r.resume_after, Some(cur(4)));
+    }
+
+    #[test]
+    fn misbehaving_scan_is_rejected_before_any_read_or_write() {
+        let cases: Vec<(Vec<OwnerCursor>, Option<OwnerCursor>)> = vec![
+            (vec![cur(2), cur(1)], None),
+            (vec![cur(1), cur(1)], None),
+            (vec![cur(1), cur(2), cur(3)], None),
+            (vec![cur(2)], Some(cur(2))),
+            (vec![cur(1)], Some(cur(2))),
+            (vec![cur(3), cur(2)], Some(cur(1))),
+        ];
+        for (page, after) in cases {
+            let m = multi(&[(1, 1), (2, 1), (3, 1)]);
+            *m.scan_override.borrow_mut() = Some(page);
+            assert_eq!(
+                batch(&m, 2, after.as_ref(), 2),
+                Err(RotationBatchError::InvalidScan)
+            );
+            assert!(m.reads.borrow().is_empty());
+            assert!(m.cas_users.borrow().is_empty());
+            assert!(m.rows.borrow().values().all(|r| r.kek_version == 1));
+        }
+    }
+
+    #[test]
+    fn scan_failure_is_reported_and_nothing_is_mutated() {
+        let m = Multi {
+            scan_err: true,
+            ..multi(&[(1, 1)])
+        };
+        assert_eq!(batch(&m, 2, None, 5), Err(RotationBatchError::ScanFailed));
+        assert!(m.reads.borrow().is_empty());
+        assert!(m.cas_users.borrow().is_empty());
+        assert_eq!(version_of(&m, 1), Some(1));
+    }
+
+    #[test]
+    fn poison_lost_cas_and_deleted_rows_are_counted_and_skipped_without_retry() {
+        let m = multi(&[(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]);
+        // 2: poison (tampered wrap). 3: relinked between read and CAS.
+        m.rows
+            .borrow_mut()
+            .get_mut(&uid(2))
+            .unwrap()
+            .envelope
+            .dek_wrapped[0] ^= 1;
+        let poisoned = m.rows.borrow().get(&uid(2)).unwrap().clone();
+        let relinked = LinkInput::new("alice_lb", "1b9e2f4a-1c3d-4e5f-8a6b-7c8d9e0f1a2b")
+            .unwrap()
+            .seal(&Keys, 1, &uid(3))
+            .unwrap();
+        m.swap_on_cas.borrow_mut().insert(uid(3), relinked.clone());
+        m.vanish_before_read.borrow_mut().insert(uid(4));
+        let r = batch(&m, 2, None, 10).unwrap();
+        assert_eq!(r.scanned, 5);
+        assert_eq!(
+            (
+                r.rewrapped,
+                r.failed,
+                r.deferred,
+                r.no_link,
+                r.already_current
+            ),
+            (2, 1, 1, 1, 0)
+        );
+        assert!(r.end_of_keyset);
+        assert_eq!(r.resume_after, Some(cur(5)));
+        assert!(same(m.rows.borrow().get(&uid(2)).unwrap(), &poisoned));
+        assert!(same(m.rows.borrow().get(&uid(3)).unwrap(), &relinked));
+        assert!(m.rows.borrow().get(&uid(4)).is_none());
+        // One read per candidate; one CAS for each non-poison, non-vanished row.
+        assert_eq!(m.reads.borrow().len(), 5);
+        assert_eq!(*m.cas_users.borrow(), vec![uid(1), uid(3), uid(5)]);
+    }
+
+    #[test]
+    fn batch_never_downgrades_or_rewrites_current_rows() {
+        let m = multi(&[(1, 2), (2, 3)]);
+        // A store that wrongly lists current rows: reload refuses to downgrade.
+        *m.scan_override.borrow_mut() = Some(vec![cur(1), cur(2)]);
+        let r = batch(&m, 2, None, 5).unwrap();
+        assert_eq!((r.scanned, r.already_current, r.rewrapped), (2, 2, 0));
+        assert!(m.cas_users.borrow().is_empty());
+        assert_eq!((version_of(&m, 1), version_of(&m, 2)), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn unknown_target_key_is_failed_per_row_without_write() {
+        let m = multi(&[(1, 1), (2, 1)]);
+        let r = batch(&m, 9, None, 5).unwrap();
+        assert_eq!((r.scanned, r.failed, r.rewrapped), (2, 2, 0));
+        assert!(m.cas_users.borrow().is_empty());
     }
 }

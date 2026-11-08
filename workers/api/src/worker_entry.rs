@@ -2309,6 +2309,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn listenbrainz_rotation_candidates(
+        &self,
+        below_version: u32,
+        after: Option<&crate::listenbrainz_rotation::OwnerCursor>,
+        limit: u32,
+    ) -> Result<Vec<crate::listenbrainz_rotation::OwnerCursor>, StoreError> {
+        // Reject bad arguments before any connection is opened.
+        crate::listenbrainz_rotation::check_scan_args(below_version, limit)?;
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                crate::listenbrainz_store::rotation_candidates(&client, below_version, after, limit)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {

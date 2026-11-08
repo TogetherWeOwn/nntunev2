@@ -759,6 +759,22 @@ pub trait Store {
             Err(StoreError)
         }
     }
+    /// Bounded keyset scan of owner ids whose ListenBrainz link has
+    /// `kek_version < below_version` (nonzero), ascending by UUID and strictly
+    /// after `after`, at most `limit` (1..=100). Returns ids only: no
+    /// envelopes or usernames. Default refuses (fail closed).
+    fn listenbrainz_rotation_candidates(
+        &self,
+        below_version: u32,
+        after: Option<&crate::listenbrainz_rotation::OwnerCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<crate::listenbrainz_rotation::OwnerCursor>, StoreError>>
+    {
+        async move {
+            let _ = (below_version, after, limit);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,

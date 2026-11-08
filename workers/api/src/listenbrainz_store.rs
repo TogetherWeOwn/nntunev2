@@ -13,6 +13,7 @@ use crate::{
     field_envelope::FieldEnvelope,
     handlers::StoreError,
     listenbrainz::{OutboundClaim, RewrapOutcome, StoredLink, Username},
+    listenbrainz_rotation::{check_scan_args, OwnerCursor, MAX_SCAN_LIMIT},
 };
 
 // Initialization grants nothing and never resets an existing cooldown. Keep
@@ -168,6 +169,50 @@ fn check_shape(user_id: &str, link: &StoredLink) -> Result<(), StoreError> {
         return Err(StoreError);
     }
     Ok(())
+}
+
+/// Keyset page of owner ids whose wrap is older than `below_version`.
+/// Selects only `user_id` (no envelope, username or key material), orders by
+/// byte order of the canonical UUID text (equals UUID order) and uses a strict
+/// `>` cursor, never OFFSET. Arguments are rejected before the query. A row
+/// whose id is not a canonical UUID, or an oversize/unordered result, fails
+/// the whole scan closed rather than being skipped.
+pub(crate) async fn rotation_candidates(
+    client: &Client,
+    below_version: u32,
+    after: Option<&OwnerCursor>,
+    limit: u32,
+) -> Result<Vec<OwnerCursor>, StoreError> {
+    check_scan_args(below_version, limit)?;
+    let below = i32::try_from(below_version).map_err(|_| StoreError)?;
+    let cursor: Option<&str> = after.map(OwnerCursor::as_str);
+    let rows = client
+        .query_typed(
+            "SELECT user_id FROM listenbrainz_links WHERE kek_version < $1 \
+             AND ($2::text IS NULL OR user_id COLLATE \"C\" > $2::text COLLATE \"C\") \
+             ORDER BY user_id COLLATE \"C\" LIMIT $3",
+            &[
+                (&below, Type::INT4),
+                (&cursor, Type::TEXT),
+                (&i64::from(limit), Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > limit.min(MAX_SCAN_LIMIT) as usize {
+        return Err(StoreError);
+    }
+    let mut out: Vec<OwnerCursor> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row.try_get(0).map_err(|_| StoreError)?;
+        let id = OwnerCursor::parse(&id).ok_or(StoreError)?;
+        let previous = out.last().map(OwnerCursor::as_str).or(cursor);
+        if previous.is_some_and(|p| id.as_str() <= p) {
+            return Err(StoreError);
+        }
+        out.push(id);
+    }
+    Ok(out)
 }
 
 pub(crate) async fn replace(
