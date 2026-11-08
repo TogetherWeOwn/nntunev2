@@ -14,7 +14,9 @@ test('demo player emits start on playing, complete on end, and survives a 401', 
 		bodies.push(route.request().postDataJSON() as Body);
 		await route.fulfill({ status, contentType: 'application/json', body: '{}' });
 	});
-	await page.route('**/api/demo/audio**', (route) => route.fulfill({ status: 200, body: '' }));
+	// Media events are doubled below. Keep the media request pending so the
+	// native decoder cannot turn an empty response into an unrelated error.
+	await page.route('**/api/demo/audio**', () => {});
 	await page.addInitScript(() => {
 		HTMLMediaElement.prototype.play = function () {
 			queueMicrotask(() => this.dispatchEvent(new Event('playing')));
@@ -34,13 +36,24 @@ test('demo player emits start on playing, complete on end, and survives a 401', 
 	await expect
 		.poll(() => bodies.some((b) => b.playback_id === first.playback_id && b.event === 'complete'))
 		.toBe(true);
+	// Let natural auto-advance start the second track while telemetry is still
+	// accepted, then select a different track for the refused start.
+	await expect
+		.poll(() => bodies.some((b) => b.track_id === 'second-signal' && b.event === 'start'))
+		.toBe(true);
 	// Playback still works after telemetry is refused.
-	// Ignore anything from natural auto-advance: look only for a NEW refused start.
 	status = 401;
 	const before = bodies.length;
-	await page.getByTestId('queue-select-second-signal').click();
+	const refusedStart = page.waitForResponse((response) => {
+		if (!response.url().endsWith('/v1/plays/events') || response.status() !== 401) return false;
+		const body = response.request().postDataJSON() as Body;
+		return body.track_id === 'third-light' && body.event === 'start';
+	});
+	await page.getByTestId('queue-select-third-light').click();
+	await refusedStart;
 	await expect
-		.poll(() => bodies.slice(before).some((b) => b.track_id === 'second-signal' && b.event === 'start'))
+		.poll(() => bodies.slice(before).some((b) => b.track_id === 'third-light' && b.event === 'start'))
 		.toBe(true);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
 	await expect(page.getByTestId('player-error')).toHaveCount(0);
 });
