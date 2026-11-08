@@ -21552,8 +21552,6 @@ mod tests {
         h.call_full("GET", path, None, Some(cookie.to_string()), Some(ORIGIN))
     }
 
-    const NOT_FOUND_BODY: &str = r#"{"code":"not_found","message":"not found","retryable":false}"#;
-
     #[test]
     fn catalogue_artist_detail_round_trip_and_uniform_404s() {
         let h = harness();

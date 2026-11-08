@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { invalidate } from '$app/navigation';
 	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
+	import { catalogueAuthGeneration } from '#lib/catalogue/auth.svelte.js';
 	import { filterReleases, releaseFilters, type ReleaseFilter } from '#lib/catalogue/catalogue.js';
 	import '#lib/catalogue/catalogue.css';
 	import type { PageData } from './$types';
@@ -8,7 +9,8 @@
 	let { data }: { data: PageData } = $props();
 	let filter = $state<ReleaseFilter>('all');
 	let retrying = $state(false);
-	const detail = $derived(data.value);
+	const authChanged = $derived(data.authGeneration !== catalogueAuthGeneration());
+	const detail = $derived(authChanged ? null : data.value);
 	const releases = $derived(filterReleases(detail?.releases ?? [], filter));
 	$effect(() => { void data.value?.artist.mbid; filter = 'all'; });
 
@@ -56,7 +58,7 @@
 		</section>
 	{:else}
 		<h1>Artist</h1>
-		{#if data.failure === 'signed-out'}
+		{#if authChanged || data.failure === 'signed-out'}
 			<p>Sign in to browse artists available to your account.</p><a class="nt-button" href="/login">Sign in</a>
 		{:else if data.failure === 'not-found'}
 			<p>This artist is not available in your catalogue.</p><a href="/library">Go to your library</a>

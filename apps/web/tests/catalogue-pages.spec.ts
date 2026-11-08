@@ -33,8 +33,10 @@ test('album preserves multi-disc occurrences, unknown durations and real entity 
 	await expect(page.getByRole('table', { name: 'Disc 1' })).toBeVisible();
 	await expect(page.getByRole('table', { name: 'Disc 2' })).toBeVisible();
 	await expect(page.getByRole('cell', { name: 'Unknown', exact: true })).toBeVisible();
-	await expect(page.getByRole('link', { name: 'Open First Light in library' })).toHaveCount(2);
-	await expect(page.getByRole('link', { name: 'Open First Light in library' }).first()).toHaveAttribute('href', `/library?track=${trackId}&t=0`);
+	await expect(page.getByRole('cell', { name: 'First Light', exact: true })).toHaveCount(2);
+	// A valid album occurrence need not be in the library's first 50 rows.
+	// Until a direct occurrence destination exists, never offer a broken link.
+	await expect(page.locator('.catalogue-tracks a')).toHaveCount(0);
 	await expect(page.getByRole('heading', { name: 'Other available editions' })).toBeVisible();
 	await expect(page.getByRole('img', { name: 'Cover for Quiet Rooms' }).first()).toHaveAttribute('data-fallback', 'true');
 	await page.getByRole('link', { name: 'North Window', exact: true }).click();
@@ -100,6 +102,48 @@ for (const width of [320, 1280]) {
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 			await page.screenshot({ path: test.info().outputPath(`${url.startsWith('/album') ? 'album' : 'artist'}-${width}.png`), fullPage: true });
 		}
+	});
+}
+
+for (const entity of ['album', 'artist']) {
+	test(`${entity} clears displayed member data after a delivered cross-tab auth transition`, async ({ page, context }) => {
+		await catalogue(page);
+		await page.goto(`/${entity}/${entity === 'album' ? albumId : artistId}`);
+		await expect(page.getByRole('heading', { level: 1, name: entity === 'album' ? 'Quiet Rooms' : 'North Window' })).toBeVisible();
+		const sibling = await context.newPage();
+		await sibling.goto('/login');
+		await sibling.evaluate(() => localStorage.setItem('nntune.library.auth-transition.v1', crypto.randomUUID()));
+		await expect(page.getByRole('article').getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+		await expect(page.getByRole('heading', { name: 'Quiet Rooms', level: 1 })).toHaveCount(0);
+		await expect(page.getByRole('heading', { name: 'North Window', level: 1 })).toHaveCount(0);
+		await sibling.close();
+	});
+
+	test(`${entity} rejects an old-account response completing after an auth transition`, async ({ page, context }) => {
+		await catalogue(page);
+		const sibling = await context.newPage();
+		await sibling.goto('/login');
+		let releaseResponse!: () => void;
+		let requestStarted!: () => void;
+		const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+		const gate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+		await page.route(entity === 'album' ? '**/v1/releases/*' : '**/v1/artists/*', async (route) => {
+			requestStarted();
+			await gate;
+			await route.fulfill({ contentType: 'application/json', body: JSON.stringify(entity === 'album' ? { release, tracks: [track] } : { artist, releases: [release], truncated: false }) });
+		});
+		const navigation = page.goto(`/${entity}/${entity === 'album' ? albumId : artistId}`);
+		await started;
+		// Deliver synchronously while the loader is in flight. The preceding
+		// test covers real sibling-tab delivery; this case pins response order.
+		await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+			key: 'nntune.library.auth-transition.v1', newValue: 'changed-account'
+		})));
+		releaseResponse();
+		await navigation;
+		await expect(page.getByRole('article').getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+		await expect(page.getByRole('heading', { name: entity === 'album' ? 'Quiet Rooms' : 'North Window', level: 1 })).toHaveCount(0);
+		await sibling.close();
 	});
 }
 

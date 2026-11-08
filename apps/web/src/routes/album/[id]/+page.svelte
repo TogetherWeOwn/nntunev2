@@ -3,13 +3,15 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
+	import { catalogueAuthGeneration } from '#lib/catalogue/auth.svelte.js';
 	import { discTracks, releaseArtwork, releaseDuration, trackDuration } from '#lib/catalogue/catalogue.js';
 	import '#lib/catalogue/catalogue.css';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 	let retrying = $state(false);
-	const detail = $derived(data.value);
+	const authChanged = $derived(data.authGeneration !== catalogueAuthGeneration());
+	const detail = $derived(authChanged ? null : data.value);
 	const release = $derived(detail?.release);
 	const discs = $derived(discTracks(detail?.tracks ?? []));
 	const duration = $derived(releaseDuration(detail?.tracks ?? []));
@@ -54,7 +56,7 @@
 							{#each disc.tracks as track, index (`${track.mbid}:${track.track_no}:${index}`)}
 								<tr>
 									<td>{track.track_no ?? '—'}</td>
-									<td><a href={`/library?track=${track.mbid}&t=0`} aria-label={`Open ${track.title || 'Untitled track'} in library`}>{track.title || 'Untitled track'}</a></td>
+									<td>{track.title || 'Untitled track'}</td>
 									<td>{trackDuration(track.duration_ms)}</td>
 								</tr>
 							{/each}
@@ -76,7 +78,7 @@
 		</section>
 	{:else}
 		<h1>Album</h1>
-		{#if data.failure === 'signed-out'}
+		{#if authChanged || data.failure === 'signed-out'}
 			<p>Sign in to browse releases available to your account.</p><a class="nt-button" href="/login">Sign in</a>
 		{:else if data.failure === 'not-found'}
 			<p>This release is not available in your catalogue.</p><a href="/library">Go to your library</a>
