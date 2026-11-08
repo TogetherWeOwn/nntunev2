@@ -561,8 +561,13 @@ mod tests {
             collection_delete_statement(),
         ] {
             assert!(!sql.contains("::uuid"), "{sql}");
+            // Every statement lowers or projects the stored mbid
+            // explicitly (case-insensitive probe/delete, verbatim list
+            // read, or the save's lowercase bind).
             assert!(
-                sql.contains("lower(mbid)") || sql.contains("mbid, saved_at"),
+                sql.contains("lower(mbid)")
+                    || sql.contains("lower(collection_saves.mbid)")
+                    || sql.contains("mbid, saved_at"),
                 "{sql}"
             );
         }
