@@ -9,6 +9,7 @@ import dataclasses
 import io
 import json
 import re
+import tracemalloc
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -953,6 +954,17 @@ class LimitTests(unittest.TestCase):
                 ae.project(dataclasses.replace(empty_snapshot(), account=account(email="e" * 25)))
             with self.assertRaises(ExportError):
                 ae.project(dataclasses.replace(empty_snapshot(), account=account(id="i" * 25)))
+
+    def test_oversized_text_rejects_without_input_sized_encoding_copy(self):
+        value = "a" * (16 * ae.MAX_TEXT_BYTES)
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(ExportError, "text limit exceeded"):
+                ae._text(value)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * ae.MAX_TEXT_BYTES)
 
     def test_aggregate_input_text_limit(self):
         plain = dict(recording_mbid=None, release_mbid=None, artist_mbids=())

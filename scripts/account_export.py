@@ -275,6 +275,8 @@ def _timestamp(value: datetime) -> str:
 def _text(value: str) -> str:
     if type(value) is not str:
         raise ExportError("expected text")
+    if len(value) > MAX_TEXT_BYTES:
+        raise ExportError("text limit exceeded")
     try:
         if len(value.encode("utf-8")) > MAX_TEXT_BYTES:
             raise ExportError("text limit exceeded")
