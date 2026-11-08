@@ -1,6 +1,9 @@
 //! Disposable PostgreSQL stage/control/publication-CAS tests. Test seeding is not
 //! admission or authenticated control routing; temporary columns do not prove
-//! migration checks. Sequential stale-action cases are not concurrent race proof.
+//! migration checks. Sequential stale-action cases are not concurrent race proof;
+//! settlement_races adds two-connection lock-order coverage on shared scratch rows.
+#[path = "admin_settlement_races.rs"]
+mod settlement_races;
 use super::*;
 use nntune_ingest::admin_checkpoint_store::{self as store, StageOriginal, StoreError};
 

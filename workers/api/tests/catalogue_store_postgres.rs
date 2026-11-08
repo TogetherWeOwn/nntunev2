@@ -14,7 +14,7 @@ const OTHER_RELEASE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 #[path = "support/admin_writer_acceptance.rs"]
 mod admin_writers;
 
-async fn client(populated: bool) -> Client {
+async fn database_client() -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("CI disposable database is required; never silently skip")
         .parse()
@@ -27,8 +27,17 @@ async fn client(populated: bool) -> Client {
     );
     let (client, connection) = config.connect(NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
+    client
+        .batch_execute("SET statement_timeout = '3s'")
+        .await
+        .unwrap();
+    client
+}
+
+async fn client(populated: bool) -> Client {
+    let client = database_client().await;
     client.batch_execute(
-        "SET statement_timeout = '3s'; SET search_path = pg_temp;
+        "SET search_path = pg_temp;
          CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
     ).await.unwrap();
     if populated {
