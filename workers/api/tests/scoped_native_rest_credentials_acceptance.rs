@@ -570,6 +570,7 @@ fn canonical_route(scope: Scope) -> (&'static str, &'static str) {
         Scope::PlaysWrite => ("POST", "/v1/plays"),
         Scope::StreamRead => ("GET", "/v1/stream"),
         Scope::IngestSubmit => ("POST", "/v1/ingest"),
+        Scope::LibraryWrite => ("PUT", "/v1/me/library/albums/m_1"),
     }
 }
 
@@ -581,6 +582,7 @@ fn scope_matrix_scope_a_cannot_reach_scope_b() {
         Scope::PlaysWrite,
         Scope::StreamRead,
         Scope::IngestSubmit,
+        Scope::LibraryWrite,
     ];
     for held in scopes {
         let cred = issued(&[held], 3600, NOW);

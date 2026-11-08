@@ -8943,9 +8943,8 @@ mod tests {
                 kind.as_str().to_string(),
                 mbid.to_string(),
             );
-            let entry = self
-                .collection_saves
-                .borrow_mut()
+            let mut saves = self.collection_saves.borrow_mut();
+            let entry = saves
                 .entry(key)
                 .or_insert(i64::try_from(now).map_err(|_| StoreError)?);
             Ok(Some(*entry))
