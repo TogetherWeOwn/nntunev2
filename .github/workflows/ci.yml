@@ -87,6 +87,10 @@ jobs:
       # TLS-integration proof (covered by the default-feature tests above).
       # Same job, so failures fail rust-test and the ci-ok aggregate.
       - run: cargo test --locked -p nntune-core --no-default-features
+      # Experimental archive metadata uses the exact shared API, without a live
+      # transport. Feature-on coverage must not disappear behind default-off.
+      - run: cargo clippy --locked -p nntune-core --no-default-features --features archive-provider --all-targets -- -D warnings
+      - run: cargo test --locked -p nntune-core --no-default-features --features archive-provider
 
   # Validate fixture shape separately; byte-exact handler comparison runs
   # in the nntune-subsonic tests in rust-test.
@@ -147,6 +151,7 @@ jobs:
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo check --locked -p nntune-core --target wasm32-unknown-unknown --no-default-features --features archive-provider
       - run: cargo check -p nntune-config --target wasm32-unknown-unknown
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).

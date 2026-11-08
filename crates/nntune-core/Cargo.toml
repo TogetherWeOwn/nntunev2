@@ -11,13 +11,15 @@ rust-version = "1.89"
 default = ["native-tls"]
 native-tls = ["velmora/native-tls"]
 worker-transport = ["velmora/worker-transport"]
+# Metadata/fixture development only; no installed archive writer or miss path.
+archive-provider = ["velmora/archive-provider"]
 
 [dependencies]
 # The engine (NNTP, yEnc, NZB, media encryption, par2, transports) lives in
 # TogetherWeOwn/velmora. Pin policy: an immutable git `rev` only (never a
 # branch or tag); a bump is a reviewed PR that moves this rev, the matching
 # nntune-test-nntp rev and every committed lockfile together.
-velmora = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "a0a9694dca3244f4bdd2e890395d3735a198ce90", default-features = false }
+velmora = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "e8fb2adeda386a38d74fc77c7aaa0a05a1b70bf3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"

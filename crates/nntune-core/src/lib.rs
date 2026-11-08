@@ -45,5 +45,9 @@ pub use velmora::{
     transports, yenc, Error, Result,
 };
 
+#[cfg(feature = "archive-provider")]
+pub use velmora::archive;
+#[cfg(feature = "archive-provider")]
+pub mod archive_source;
 pub mod original_source;
 pub mod transcode;
