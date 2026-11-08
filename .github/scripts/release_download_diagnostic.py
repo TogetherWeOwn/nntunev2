@@ -73,7 +73,7 @@ def request(url, output):
     timing = dict(zip(TIMINGS, [int(values[0]), *(float(v) for v in values[1:])]))
     # A proxy CONNECT or interim response may precede the actual response.
     # Split only HTTP delimiters; preserve controls for redirect validation.
-    blocks = [block for block in headers.split(b"\r\n\r\n") if block]
+    blocks = [block for block in headers.split(b"\r\n\r\n") if block] or [b""]
     fields = {}
     for line in blocks[-1].split(b"\r\n")[1:]:
         key, sep, value = line.partition(b":")

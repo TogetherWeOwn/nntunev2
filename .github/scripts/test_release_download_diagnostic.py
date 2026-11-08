@@ -106,6 +106,28 @@ class DownloadDiagnosticTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 32)
         self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
 
+    def test_no_response_preserves_hop_evidence_and_cleanup(self):
+        raw = b"\nNNTUNE_TIMING 000 0.010000 0.000000 0.000000 0.000000 10.001000\n"
+        for rc in (6, 28, 35):
+            with self.subTest(curl_exit=rc):
+                response = subprocess.CompletedProcess([], rc, raw)
+                with tempfile.TemporaryDirectory() as root, io.StringIO() as out:
+                    with patch.object(diagnostic.subprocess, "run", return_value=response) as run:
+                        with redirect_stdout(out):
+                            self.assertFalse(diagnostic.probe(ASSET, root))
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(list(Path(root).iterdir()), [])
+                    records = [json.loads(line) for line in out.getvalue().splitlines()]
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[0], {
+                    "asset": "synthetic", "hop": 0, "host": "github.com",
+                    "curl_exit": rc, "headers": {}, "status": 0,
+                    "dns_s": 0.01, "connect_s": 0.0, "tls_s": 0.0,
+                    "first_byte_s": 0.0, "total_s": 10.001,
+                })
+                self.assertEqual(records[-1]["cleanup"], "passed")
+                self.assertEqual(records[-1]["result"], "failed")
+
     def test_raw_redirect_controls_are_not_normalized_or_requested(self):
         for control in [*range(32), 127]:
             for final in (False, True):
