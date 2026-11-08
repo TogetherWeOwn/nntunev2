@@ -419,9 +419,36 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    // Challenge persistence is shared with native PostgreSQL acceptance;
+    // pin the delegation as well as the statements in those helpers.
+    for (method, call) in [
+        (
+            "insert_challenge",
+            "insert_challenge_on(&client,challenge,user_id,purpose,receipt).await",
+        ),
+        ("challenge_by_id", "challenge_by_id_on(&client,id).await"),
+    ] {
+        let body = function_body(store, &format!("asyncfn{method}("));
+        assert!(
+            body.contains(call),
+            "{method} must await its production persistence helper"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(
+                !body.contains(named),
+                "{method} must not add a named statement"
+            );
+        }
+    }
     let methods = [
-        "insert_challenge",
-        "challenge_by_id",
         "credentials_for_user",
         "magic_by_hash",
         "invite_by_hash",
@@ -432,6 +459,8 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     ]
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
+        "insert_challenge_on",
+        "challenge_by_id_on",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
