@@ -32,6 +32,7 @@ use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod admin_execution;
 pub mod admin_gates;
+pub mod admin_writers;
 pub mod api_error;
 pub mod caller_auth;
 pub mod checkpoint;

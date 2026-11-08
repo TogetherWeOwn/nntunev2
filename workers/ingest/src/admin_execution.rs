@@ -134,6 +134,32 @@ pub async fn run_stage(
     original_key: &str,
     parsed: &Document,
 ) -> Result<StageOutcome, StageError> {
+    validate_original(cp, original_job, original_key)?;
+    if jobs::is_parked(cp.state) {
+        return Ok(StageOutcome::Parked);
+    }
+    if jobs::is_terminal(cp.state) {
+        return Ok(StageOutcome::Settled);
+    }
+    let plan = ProbePlan::new(parsed)?;
+    if !matches!(cp.state, JobState::Queued | JobState::Parsing) && has_archive(parsed) {
+        return Err(StageError::Invalid);
+    }
+    run_planned_stage(runtime, cp, parsed, plan).await
+}
+
+fn has_archive(parsed: &Document) -> bool {
+    parsed
+        .files
+        .iter()
+        .any(|file| file.role == "archive" || matches!(file.container.as_str(), "rar" | "7z"))
+}
+
+fn validate_original(
+    cp: &JobCheckpoint,
+    original_job: &str,
+    original_key: &str,
+) -> Result<(), StageError> {
     if cp.source != JobSource::AdminUpload
         || cp.job_id != original_job
         || cp.idempotency_key != original_key
@@ -148,21 +174,34 @@ pub async fn run_stage(
     {
         return Err(StageError::Invalid);
     }
-    if jobs::is_parked(cp.state) {
-        return Ok(StageOutcome::Parked);
-    }
-    if jobs::is_terminal(cp.state) {
-        return Ok(StageOutcome::Settled);
-    }
-    let plan = ProbePlan::new(parsed)?;
-    if !matches!(cp.state, JobState::Queued | JobState::Parsing)
-        && parsed
-            .files
-            .iter()
-            .any(|file| file.role == "archive" || matches!(file.container.as_str(), "rar" | "7z"))
+    Ok(())
+}
+
+/// Recheck full-original coverage at the storage boundary. The caller still
+/// must compare this checkpoint with durable state inside its transaction;
+/// this pure check is not an execution lease or a publication authorization.
+pub fn validate_publication(
+    cp: &JobCheckpoint,
+    original_job: &str,
+    original_key: &str,
+    parsed: &Document,
+) -> Result<(), StageError> {
+    validate_original(cp, original_job, original_key)?;
+    if !admin_gates::publish_ready(cp)
+        || has_archive(parsed)
+        || !ProbePlan::new(parsed)?.matches(cp)
     {
         return Err(StageError::Invalid);
     }
+    Ok(())
+}
+
+async fn run_planned_stage(
+    runtime: &mut impl StageRuntime,
+    cp: &mut JobCheckpoint,
+    parsed: &Document,
+    plan: ProbePlan<'_>,
+) -> Result<StageOutcome, StageError> {
     let mut next = cp.clone();
     match cp.state {
         JobState::Queued => {

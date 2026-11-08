@@ -11,6 +11,9 @@ const RELEASE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RECORDING: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OTHER_RELEASE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
+#[path = "support/admin_writer_acceptance.rs"]
+mod admin_writers;
+
 async fn client(populated: bool) -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("CI disposable database is required; never silently skip")

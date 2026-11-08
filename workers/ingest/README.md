@@ -16,6 +16,20 @@ durable-original execution and the publication gates. No deployment or
 consumer activation is authorized by closing search intake. The old search
 builders and throttle tests remain compatibility coverage, not a live route.
 
+`admin_writers::write_album` is a storage primitive inside a caller-owned
+PostgreSQL transaction. It rechecks full-original match/probe evidence, locks
+the active content-matching admin job, executes the existing tracks/sources
+and owner-free library statements, and releases a savepoint only after the
+whole album succeeds. Errors/cancellation roll the savepoint back. It selects
+the natural-key-winning track before asking the API/keyring to seal its source;
+replays preserve the entire first source. Ingest receives no keys. Decoded-file
+sizes must come from trusted file inspection, never from STAT's encoded byte
+counts. This primitive neither commits nor marks Done. A live caller still
+needs authenticated dispatch, durable checkpoint comparison and atomic Done
+persistence in the outer transaction, manual-state integration, approved schema
+integration and publication E2E. Its disposable-PostgreSQL tests are not proof
+of those missing boundaries, schema acceptance or consumer enablement.
+
 ## Legacy pipeline reference
 
 User-scoped upload jobs via Queues (no Workflow class yet):
@@ -91,7 +105,7 @@ NZB upload ───────────────────────
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:39`). No ingest route
+  `src/lib.rs:40`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -105,7 +119,7 @@ NZB upload ───────────────────────
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:39`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:40`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -218,7 +232,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:46`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:47`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
