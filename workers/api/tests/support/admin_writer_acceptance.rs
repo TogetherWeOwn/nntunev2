@@ -98,6 +98,13 @@ impl SourceSealer for Sealer {
     }
 }
 
+async fn publication_tables(app: &tokio_postgres::Client) {
+    app.batch_execute(
+        "CREATE TEMP TABLE tracks (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), mbid UUID, release_id UUID NOT NULL, title TEXT NOT NULL, medium_no INTEGER NOT NULL, track_no INTEGER NOT NULL, UNIQUE(release_id,medium_no,track_no));
+         CREATE TEMP TABLE track_sources (track_id UUID PRIMARY KEY REFERENCES tracks(id), source_job_id TEXT REFERENCES ingest_jobs(id), indexer_id UUID, nzb_ref_encrypted BYTEA, nzb_ref_envelope_version SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA, nzb_ref_payload_format SMALLINT)"
+    ).await.unwrap();
+}
+
 async fn fixture() -> (
     tokio_postgres::Client,
     OriginalBody,
@@ -109,10 +116,9 @@ async fn fixture() -> (
     // Isolated tables test the real adapters/SQL, not migration acceptance.
     app.batch_execute(
         "CREATE TEMP TABLE ingest_jobs (id TEXT PRIMARY KEY, source TEXT, status TEXT, content_sha256 TEXT, idempotency_key TEXT, nzb_bytes BIGINT);
-         CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY REFERENCES ingest_jobs(id), content_sha256 TEXT, nzb_bytes BIGINT, nzb_ref_envelope_version SMALLINT, nzb_ref_payload_format SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_encrypted BYTEA, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA);
-         CREATE TEMP TABLE tracks (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), mbid UUID, release_id UUID NOT NULL, title TEXT NOT NULL, medium_no INTEGER NOT NULL, track_no INTEGER NOT NULL, UNIQUE(release_id,medium_no,track_no));
-         CREATE TEMP TABLE track_sources (track_id UUID PRIMARY KEY REFERENCES tracks(id), source_job_id TEXT REFERENCES ingest_jobs(id), indexer_id UUID, nzb_ref_encrypted BYTEA, nzb_ref_envelope_version SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA, nzb_ref_payload_format SMALLINT)"
+         CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY REFERENCES ingest_jobs(id), content_sha256 TEXT, nzb_bytes BIGINT, nzb_ref_envelope_version SMALLINT, nzb_ref_payload_format SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_encrypted BYTEA, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA)"
     ).await.unwrap();
+    publication_tables(&app).await;
     // Reuse only the existing synthetic corpus, never add or log payloads.
     let body = nntune_ingest::fixtures::SMALL_NZB.as_bytes();
     let job = intake::derive_job_id(body);

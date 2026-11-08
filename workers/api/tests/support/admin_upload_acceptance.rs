@@ -1,5 +1,7 @@
 //! Prepared admission branch in disposable PostgreSQL, not ordered migration
 //! acceptance or live dispatch. Reuse the existing synthetic corpus in memory.
+#[path = "admin_lifecycle_acceptance.rs"]
+mod lifecycle;
 use super::*;
 use intake::{AdminIngestAttempt, AdminIngestUploadOutcome, FailureReason};
 use nntune_api::{
