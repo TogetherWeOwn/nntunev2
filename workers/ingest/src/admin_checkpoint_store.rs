@@ -1,12 +1,14 @@
-//! Internal PostgreSQL stage/publication authority. No live dispatch or public
-//! route uses this adapter yet. Ordered schema integration, upload initialization
-//! and manual controls remain separate required integration.
+//! Internal PostgreSQL stage/control/publication authority. No live dispatch or
+//! public route uses this adapter yet. Ordered schema integration, upload
+//! initialization and authenticated control routes remain required integration.
 //! The caller supplies the authenticated original, captures the trusted queue
 //! generation, and applies its existing database/service deadline. No KV fallback.
 
 use crate::{
     admin_checkpoint::{Identity, Snapshot, MAX_CHECKPOINT_BYTES},
-    admin_execution::{validate_publication, validate_stage_transition},
+    admin_execution::{
+        controlled_checkpoint, validate_publication, validate_stage_transition, Control,
+    },
     admin_writers::{write_album, AlbumWrite, FileGeometry, SourceSealer, WriteError},
     jobs::{self, JobCheckpoint, JobState},
     matching::MbRecording,
@@ -136,6 +138,46 @@ pub async fn persist_stage(
     .map_err(|_| StoreError::Invalid)?;
     let successor = expected
         .successor(next.clone(), false, &bound)
+        .map_err(|_| StoreError::Invalid)?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|_| StoreError::Database)?;
+    let (current, current_encoded) = load_on(&tx, original, expected.generation(), true).await?;
+    if current != *expected {
+        return Err(StoreError::Stale);
+    }
+    update_on(&tx, expected, &current_encoded, &successor).await?;
+    tx.commit().await.map_err(|_| StoreError::Database)?;
+    Ok(successor)
+}
+
+/// Commit one explicit, already-authorized admin control. The caller enforces
+/// admin authorization (and archive capability for resume), supplies the original
+/// holder and expected snapshot, and applies its bounded database deadline. This
+/// internal adapter is not an auth boundary, audit sink or live manual endpoint.
+/// Rotate generation even on rejection so all old queue/service results lose.
+/// Enqueue only the committed generation after success; commit errors require
+/// authority reload, not blind replay. This function never sends queue work.
+pub async fn apply_control(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    expected: &Snapshot,
+    control: Control<'_>,
+) -> Result<Snapshot, StoreError> {
+    let bound = identity(original);
+    let encoded = expected.encode().map_err(|_| StoreError::Invalid)?;
+    Snapshot::decode(&encoded, expected.revision(), &bound).map_err(|_| StoreError::Invalid)?;
+    let next = controlled_checkpoint(
+        expected.checkpoint(),
+        control,
+        original.job_id,
+        original.idempotency_key,
+        original.parsed,
+    )
+    .map_err(|_| StoreError::Invalid)?;
+    let successor = expected
+        .successor(next, true, &bound)
         .map_err(|_| StoreError::Invalid)?;
     let tx = client
         .transaction()

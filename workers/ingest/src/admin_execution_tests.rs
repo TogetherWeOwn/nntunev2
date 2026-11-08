@@ -105,6 +105,106 @@ fn at_state(runtime: &mut Runtime, cp: &mut JobCheckpoint, state: JobState) {
     runtime.stored = cp.clone();
 }
 
+#[test]
+fn manual_approval_derives_full_original_plan_and_refuses_invalid_inputs_without_mutation() {
+    let (mut cp, mut parsed, _) = fixture();
+    cp.state = JobState::NeedsReview;
+    let segment = parsed.files[0].segments[0].clone();
+    parsed.files[0]
+        .segments
+        .resize(MAX_PROBE_SEGMENTS + 1, segment);
+    let next = controlled_checkpoint(
+        &cp,
+        Control::ApproveReview { release: RELEASE },
+        &cp.job_id,
+        &cp.idempotency_key,
+        &parsed,
+    )
+    .unwrap();
+    assert_eq!(next.state, JobState::Probing);
+    assert_eq!(next.probe_tally.as_ref().unwrap().total_batches, 2);
+    assert!(next
+        .probe_tally
+        .as_ref()
+        .unwrap()
+        .missing_by_batch
+        .is_empty());
+    let before = cp.clone();
+    for release in ["", "invalid", "11111111-1111-4111-8111-111111111111 "] {
+        assert_eq!(
+            controlled_checkpoint(
+                &cp,
+                Control::ApproveReview { release },
+                &cp.job_id,
+                &cp.idempotency_key,
+                &parsed
+            ),
+            Err(StageError::Invalid)
+        );
+    }
+    assert_eq!(
+        controlled_checkpoint(
+            &cp,
+            Control::Reject,
+            "different_job",
+            &cp.idempotency_key,
+            &parsed
+        ),
+        Err(StageError::Invalid)
+    );
+    parsed.files[0].segments.clear();
+    for action in [
+        Control::ApproveReview { release: RELEASE },
+        Control::RetryReview,
+    ] {
+        assert_eq!(
+            controlled_checkpoint(&cp, action, &cp.job_id, &cp.idempotency_key, &parsed),
+            Err(StageError::Invalid)
+        );
+    }
+    assert_eq!(cp, before);
+}
+
+#[test]
+fn archive_controls_cannot_approve_or_retry_past_parse_and_resume_keeps_original_identity() {
+    for suffix in [".rar", ".7z"] {
+        let (mut cp, _, _) = fixture();
+        let body = crate::fixtures::SMALL_NZB.replace(".flac", suffix);
+        let parsed = nntune_core::nzb::parse(body.as_bytes())
+            .unwrap_or_else(|_| panic!("synthetic parse rejected"));
+        cp.state = JobState::NeedsReview;
+        for action in [
+            Control::ApproveReview { release: RELEASE },
+            Control::RetryReview,
+        ] {
+            assert_eq!(
+                controlled_checkpoint(&cp, action, &cp.job_id, &cp.idempotency_key, &parsed),
+                Err(StageError::Invalid)
+            );
+        }
+        cp.state = JobState::NeedsArchiveRead;
+        let before = cp.clone();
+        let mut resumed = controlled_checkpoint(
+            &cp,
+            Control::ResumeArchive,
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed,
+        )
+        .unwrap();
+        assert_eq!(resumed.state, JobState::Parsing);
+        assert_eq!(
+            (&resumed.job_id, &resumed.user_id, &resumed.idempotency_key),
+            (&cp.job_id, &cp.user_id, &cp.idempotency_key)
+        );
+        assert!(resumed.admin_release_mbid.is_none() && resumed.probe_tally.is_none());
+        // No archive capability is enabled by this helper: unchanged parse parks again.
+        assert!(jobs::complete_admin_parse(&mut resumed, &parsed));
+        assert_eq!(resumed.state, JobState::NeedsArchiveRead);
+        assert_eq!(cp, before);
+    }
+}
+
 #[tokio::test]
 async fn storage_reconstructs_each_stage_and_refuses_skips_and_unrelated_mutations() {
     let (mut cp, parsed, mut runtime) = fixture();

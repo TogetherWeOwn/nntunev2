@@ -1,5 +1,6 @@
-//! Disposable PostgreSQL stage/publication-CAS tests. Test seeding is not an
-//! admission/manual adapter; temporary columns do not prove migration checks.
+//! Disposable PostgreSQL stage/control/publication-CAS tests. Test seeding is not
+//! admission or authenticated control routing; temporary columns do not prove
+//! migration checks. Sequential stale-action cases are not concurrent race proof.
 use super::*;
 use nntune_ingest::admin_checkpoint_store::{self as store, StageOriginal, StoreError};
 
@@ -13,6 +14,7 @@ fn input(original: &OriginalBody) -> StageOriginal<'_> {
 }
 use nntune_ingest::{
     admin_checkpoint::{Identity, Snapshot},
+    admin_execution::Control,
     admin_gates,
     jobs::JobState,
 };
@@ -592,6 +594,290 @@ async fn publication_seal_error_and_cancellation_leave_no_album_or_done() {
     .await
     .unwrap();
     assert_eq!(counts(&app).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn review_controls_rotate_generation_and_clear_previous_match_probe_and_failure_evidence() {
+    for approve in [false, true] {
+        let (mut app, original, writing, _, _) = publication_fixture().await;
+        let mut cp = writing.checkpoint().clone();
+        cp.state = JobState::NeedsReview;
+        cp.attempt = nntune_ingest::jobs::MAX_ATTEMPTS;
+        cp.failure_code = Some("probe_failed".into());
+        cp.failure_reason = Some("retry budget exhausted".into());
+        let parked = writing.successor(cp, false, &identity(&original)).unwrap();
+        seed(&app, &parked).await;
+        let action = if approve {
+            Control::ApproveReview {
+                release: OTHER_RELEASE,
+            }
+        } else {
+            Control::RetryReview
+        };
+        let saved = store::apply_control(&mut app, &input(&original), &parked, action)
+            .await
+            .unwrap();
+        assert_eq!(
+            (saved.revision(), saved.generation(), saved.status()),
+            (7, 7, "running")
+        );
+        let cp = saved.checkpoint();
+        assert_eq!(cp.attempt, 1);
+        assert!(cp.failure_code.is_none() && cp.failure_reason.is_none());
+        assert_eq!(
+            (&cp.job_id, &cp.idempotency_key),
+            (
+                &parked.checkpoint().job_id,
+                &parked.checkpoint().idempotency_key
+            )
+        );
+        if approve {
+            assert_eq!(cp.state, JobState::Probing);
+            assert_eq!(cp.admin_release_mbid.as_deref(), Some(OTHER_RELEASE));
+            let tally = cp.probe_tally.as_ref().unwrap();
+            assert_eq!(tally.total_batches, 1);
+            assert!(tally.missing_by_batch.is_empty());
+            assert!(!admin_gates::publish_ready(cp));
+        } else {
+            assert_eq!(cp.state, JobState::Matching);
+            assert!(cp.admin_release_mbid.is_none() && cp.probe_tally.is_none());
+        }
+        assert_eq!(
+            store::load(&app, &input(&original), 1).await.err(),
+            Some(StoreError::Stale)
+        );
+        assert_eq!(
+            store::apply_control(&mut app, &input(&original), &parked, action)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert!(store::load(&app, &input(&original), 7).await.unwrap() == saved);
+        assert_eq!(counts(&app).await, (0, 0, 0));
+    }
+}
+
+#[tokio::test]
+async fn controls_enforce_existing_states_and_never_restart_terminal_jobs() {
+    let (mut app, original, writing, _, _) = publication_fixture().await;
+    for state in [
+        JobState::Queued,
+        JobState::Parsing,
+        JobState::Matching,
+        JobState::Probing,
+        JobState::Writing,
+        JobState::NeedsReview,
+        JobState::NeedsArchiveRead,
+        JobState::Rejected,
+        JobState::Failed,
+        JobState::Done,
+    ] {
+        let mut cp = writing.checkpoint().clone();
+        cp.state = state;
+        if matches!(
+            state,
+            JobState::Queued | JobState::Parsing | JobState::Matching
+        ) {
+            cp.admin_release_mbid = None;
+            cp.probe_tally = None;
+        }
+        let expected = writing.successor(cp, false, &identity(&original)).unwrap();
+        for (action, allowed, next_state) in [
+            (
+                Control::ApproveReview { release: RELEASE },
+                state == JobState::NeedsReview,
+                JobState::Probing,
+            ),
+            (
+                Control::RetryReview,
+                state == JobState::NeedsReview,
+                JobState::Matching,
+            ),
+            (
+                Control::ResumeArchive,
+                state == JobState::NeedsArchiveRead,
+                JobState::Parsing,
+            ),
+            (
+                Control::Reject,
+                !nntune_ingest::jobs::is_terminal(state),
+                JobState::Rejected,
+            ),
+        ] {
+            seed(&app, &expected).await;
+            let result = store::apply_control(&mut app, &input(&original), &expected, action).await;
+            if allowed {
+                let saved = result.unwrap();
+                assert_eq!(saved.checkpoint().state, next_state);
+                assert_eq!((saved.revision(), saved.generation()), (7, 7));
+                assert!(store::load(&app, &input(&original), 7).await.unwrap() == saved);
+            } else {
+                assert_eq!(result.err(), Some(StoreError::Invalid));
+                assert!(store::load(&app, &input(&original), 1).await.unwrap() == expected);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejection_invalidates_old_publication_and_done_refuses_later_controls() {
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let rejected = store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            rejected.status(),
+            rejected.revision(),
+            rejected.generation()
+        ),
+        ("rejected", 6, 6)
+    );
+    assert!(rejected.checkpoint().admin_release_mbid.is_none());
+    assert!(rejected.checkpoint().probe_tally.is_none());
+    let mut sealer = Sealer::default();
+    assert_eq!(
+        store::publish(
+            &mut app,
+            &input(&original),
+            &writing,
+            &recordings,
+            &geometry,
+            &mut sealer
+        )
+        .await
+        .err(),
+        Some(store::PublicationError::Checkpoint(StoreError::Stale))
+    );
+    assert_eq!(sealer.calls, 0);
+    assert_eq!(counts(&app).await, (0, 0, 0));
+    // A separate fixture proves the opposite settled order, not a concurrent race.
+    let (mut app, original, writing, recordings, geometry) = publication_fixture().await;
+    let done = store::publish(
+        &mut app,
+        &input(&original),
+        &writing,
+        &recordings,
+        &geometry,
+        &mut sealer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+    assert_eq!(
+        store::apply_control(&mut app, &input(&original), &done, Control::Reject)
+            .await
+            .err(),
+        Some(StoreError::Invalid)
+    );
+    assert!(store::load(&app, &input(&original), 1).await.unwrap() == done);
+    assert_eq!(counts(&app).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn control_cas_compares_full_snapshot_revision_generation_and_original_linkage() {
+    let (mut app, original, writing, _, _) = publication_fixture().await;
+    for mode in 0..3 {
+        let current = match mode {
+            0 => {
+                let mut cp = writing.checkpoint().clone();
+                cp.failure_code = Some("write_failed".into());
+                let mut encoded: serde_json::Value =
+                    serde_json::from_str(&writing.encode().unwrap()).unwrap();
+                encoded["checkpoint"] = serde_json::to_value(cp).unwrap();
+                Snapshot::decode(
+                    &encoded.to_string(),
+                    writing.revision(),
+                    &identity(&original),
+                )
+                .unwrap()
+            }
+            1 => writing
+                .successor(writing.checkpoint().clone(), false, &identity(&original))
+                .unwrap(),
+            _ => writing
+                .successor(writing.checkpoint().clone(), true, &identity(&original))
+                .unwrap(),
+        };
+        seed(&app, &current).await;
+        assert_eq!(
+            store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+                .await
+                .err(),
+            Some(StoreError::Stale)
+        );
+        assert!(
+            store::load(&app, &input(&original), current.generation())
+                .await
+                .unwrap()
+                == current
+        );
+    }
+    seed(&app, &writing).await;
+    app.batch_execute("UPDATE ingest_originals SET nzb_bytes = nzb_bytes + 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+    app.batch_execute("UPDATE ingest_originals SET nzb_bytes = nzb_bytes - 1; UPDATE ingest_jobs SET source = 'upload'").await.unwrap();
+    assert_eq!(
+        store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+            .await
+            .err(),
+        Some(StoreError::Stale)
+    );
+}
+
+#[tokio::test]
+async fn control_sql_failure_zero_row_and_overflow_preserve_status_checkpoint_and_generation() {
+    let (mut app, original, writing, _, _) = publication_fixture().await;
+    for mode in 0..2 {
+        let trigger = if mode == 0 {
+            "CREATE FUNCTION pg_temp.refuse_control() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$"
+        } else {
+            "CREATE OR REPLACE FUNCTION pg_temp.refuse_control() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+        };
+        app.batch_execute(trigger).await.unwrap();
+        app.batch_execute("CREATE TRIGGER refuse_control BEFORE UPDATE ON ingest_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_control()").await.unwrap();
+        assert_eq!(
+            store::apply_control(&mut app, &input(&original), &writing, Control::Reject)
+                .await
+                .err(),
+            Some(if mode == 0 {
+                StoreError::Database
+            } else {
+                StoreError::Stale
+            })
+        );
+        assert!(store::load(&app, &input(&original), 1).await.unwrap() == writing);
+        app.batch_execute("DROP TRIGGER refuse_control ON ingest_jobs")
+            .await
+            .unwrap();
+    }
+    app.execute(
+        "UPDATE ingest_jobs SET admin_checkpoint_revision = $1",
+        &[&i64::MAX],
+    )
+    .await
+    .unwrap();
+    let limit = store::load(&app, &input(&original), 1).await.unwrap();
+    assert_eq!(
+        store::apply_control(&mut app, &input(&original), &limit, Control::Reject)
+            .await
+            .err(),
+        Some(StoreError::Invalid)
+    );
+    assert!(store::load(&app, &input(&original), 1).await.unwrap() == limit);
+    assert_eq!(counts(&app).await, (0, 0, 0));
 }
 
 #[tokio::test]

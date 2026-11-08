@@ -196,6 +196,65 @@ pub fn validate_publication(
     Ok(())
 }
 
+/// Explicit controls, never inferred from Queue replay or re-upload. The caller
+/// must enforce existing admin authorization and, for ResumeArchive, the archive
+/// reader prerequisite before invoking the store. This type grants no authority.
+#[derive(Clone, Copy)]
+pub enum Control<'a> {
+    ApproveReview { release: &'a str },
+    RetryReview,
+    ResumeArchive,
+    Reject,
+}
+
+/// Derive a manual successor, not a caller-supplied replacement checkpoint.
+/// Storage must compare the full expected snapshot and rotate its generation
+/// under the same job lock as publication. No service calls occur here.
+pub(crate) fn controlled_checkpoint(
+    expected: &JobCheckpoint,
+    control: Control<'_>,
+    original_job: &str,
+    original_key: &str,
+    parsed: &Document,
+) -> Result<JobCheckpoint, StageError> {
+    validate_original(expected, original_job, original_key)?;
+    if jobs::is_terminal(expected.state) {
+        return Err(StageError::Invalid);
+    }
+    let mut next = expected.clone();
+    let allowed = match control {
+        Control::ApproveReview { release } => {
+            if has_archive(parsed) {
+                return Err(StageError::Invalid);
+            }
+            admin_gates::approve_review(&mut next, release, ProbePlan::new(parsed)?.batches())
+        }
+        Control::RetryReview => {
+            if has_archive(parsed) {
+                return Err(StageError::Invalid);
+            }
+            ProbePlan::new(parsed)?;
+            admin_gates::retry_review(&mut next)
+        }
+        Control::ResumeArchive => {
+            ProbePlan::new(parsed)?;
+            jobs::resume_archive(&mut next)
+        }
+        Control::Reject => {
+            next.state = JobState::Rejected;
+            next.admin_release_mbid = None;
+            next.probe_tally = None;
+            next.failure_code = None;
+            next.failure_reason = None;
+            true
+        }
+    };
+    if !allowed {
+        return Err(StageError::Invalid);
+    }
+    Ok(next)
+}
+
 /// Reconstruct exactly one ordinary stage transition at the storage boundary.
 /// Manual controls, retry-budget changes and publication are separate atomic
 /// operations; none can be smuggled through ordinary stage persistence.
