@@ -62,6 +62,8 @@ the core and require exactly one row before any response.
 | `POST /v1/plays/heartbeat` | renew the current playback lease (cookie session + exact Origin; not a bearer-scoped operation) |
 | `POST /v1/credentials` | mint a native REST credential (session-only, fresh-session step-up; secret rendered once in the 201 body, never stored or listed; rejects zero TTL and scope lists longer than the defined vocabulary with 422 `validation_failed`) |
 | `GET /v1/credentials` | list the caller's native REST credentials (session-only, ordinary session; ids and metadata only, no secrets) |
+| `GET /v1/me/listenbrainz` | caller's ListenBrainz link summary (cookie session only, no step-up; token-free `{linked, username}`) |
+| `DELETE /v1/me/listenbrainz` | unlink the caller's ListenBrainz account (cookie session + fresh-session step-up + exact Origin; idempotent, transactional audit) |
 | `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 | `POST /api/test-accounts` (staging-only seam, no `OPTIONS` arm — see below) | mints a fresh `example.test` account and returns `{"email", "session"}` (the session cookie value) in a 201; same gates and fail-closed 404/401 as `/api/test-codes` |
@@ -105,6 +107,30 @@ Staging deploy rides the `staging-api` lane in
 public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
 Worker secrets and the staging variable values are Operator-wired, and the
 lane skips until they are.
+
+### ListenBrainz account lifecycle checkpoint
+
+`GET /v1/me/listenbrainz` returns `{"linked":true,"username":"…"}` or
+`{"linked":false,"username":null}`. `DELETE` returns the latter only after
+committing row deletion and the scalar-only audit together. Both derive the
+owner exclusively from the verified stored session, never request data. Any
+presented `Authorization` header is refused with 404, even alongside a valid
+cookie; native REST credentials have no account-link scope. Unknown/nested
+path shapes and unsupported methods remain 404.
+
+Status needs neither a fresh session nor token decryption. Unlink requires the
+same fresh-session step-up as credential revocation and exact Origin. A stale
+session receives 401 `reauth_required`; a deleting account receives the typed
+409 `account_deleting`; an absent account receives generic 401. A store/audit
+failure is generic 500, never a successful unlinked projection. Unlink remains
+possible without a provider request or a usable decryption key.
+
+Link/relink routes, provider transport, shared outbound rate enforcement,
+feedback delivery, rotation orchestration, account UI and actual-listen
+submission are not enabled by this checkpoint. The encrypted-link migration
+must follow the normal migration acceptance/apply gate before deployment. See
+[AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails);
+this adds no playback, external data ingestion or cover-art caching.
 
 ### Catalogue mirror availability
 
