@@ -712,8 +712,11 @@ struct CatalogueTestMirror {
 /// The client a store call holds while its statements run. Production
 /// checkouts own their client; test checkouts borrow the injected one
 /// and return it on drop. `Deref`/`DerefMut` keep every caller shape —
-/// `&client`, `&mut client`, `client.transaction()` — identical to
-/// holding an owned `tokio_postgres::Client`.
+/// `client.execute(...)`, `client.transaction()`, `&*client`,
+/// `&mut *client` — identical to holding an owned
+/// `tokio_postgres::Client`. (Explicit `&*`/`&mut *` where a `GenericClient`
+/// bound is in play: `GenericClient` is sealed, so the guard itself
+/// cannot satisfy it.)
 struct ClientCheckout {
     client: Option<tokio_postgres::Client>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -2391,7 +2394,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                insert_credential_on(&client, credential).await
+                insert_credential_on(&*client, credential).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -2411,7 +2414,7 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 complete_registration_on(
-                    &mut client,
+                    &mut *client,
                     challenge,
                     magic,
                     invite,
@@ -2931,7 +2934,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = query_playback_lease_row(&client, user_id).await?;
+                let row = query_playback_lease_row(&*client, user_id).await?;
                 Ok(row)
             },
             TOTAL_TIMEOUT_MS,
@@ -2980,7 +2983,7 @@ impl Store for PgStore {
                     // row (deleted mid-race) reads as retry-now.
                     None => {
                         let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
+                            match query_playback_lease_row(&*client, user_id).await? {
                                 Some(row) => row.retry_after_secs(now),
                                 None => 0,
                             };
@@ -3312,7 +3315,7 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 crate::session_retry_store::rotate_with_retry(
-                    &mut client,
+                    &mut *client,
                     previous,
                     next,
                     retry_hash,
@@ -4829,7 +4832,7 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 admin_set_user_role_on(
-                    &mut client,
+                    &mut *client,
                     actor_user_id,
                     subject_user_id,
                     new_role,
@@ -4876,7 +4879,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                admin_set_app_setting_on(&mut client, actor_user_id, key, new_value, source_ip, now)
+                admin_set_app_setting_on(&mut *client, actor_user_id, key, new_value, source_ip, now)
                     .await
             },
             TOTAL_TIMEOUT_MS,
@@ -4891,7 +4894,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                admin_ingest_upload_on(&mut client, attempt).await
+                admin_ingest_upload_on(&mut *client, attempt).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5006,7 +5009,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                admin_ingest_delete_on(&mut client, actor_user_id, job_id).await
+                admin_ingest_delete_on(&mut *client, actor_user_id, job_id).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5022,7 +5025,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                admin_issue_invite_on(&mut client, actor_user_id, record, source_ip, now).await
+                admin_issue_invite_on(&mut *client, actor_user_id, record, source_ip, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5089,7 +5092,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                admin_revoke_invite_on(&mut client, actor_user_id, invite_id, source_ip, now).await
+                admin_revoke_invite_on(&mut *client, actor_user_id, invite_id, source_ip, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5117,8 +5120,8 @@ impl Store for PgStore {
                 }
                 let client = self.connect().await?;
                 let now_i = i64_of(now)?;
-                delete_expired_rate_limit_slots(&client, now_i).await?;
-                Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+                delete_expired_rate_limit_slots(&*client, now_i).await?;
+                Ok(claim_rate_limit_slot(&*client, &budget, now, now_i)
                     .await?
                     .is_some())
             },
@@ -5179,7 +5182,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                prune_expired_challenges_on(&client, now).await
+                prune_expired_challenges_on(&*client, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5195,7 +5198,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                reap_unverified_users_on(&mut client, now, ttl_secs, protected_user_id).await
+                reap_unverified_users_on(&mut *client, now, ttl_secs, protected_user_id).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5211,7 +5214,7 @@ impl SingleUseStore for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                claim_single_use_on(&client, candidate).await
+                claim_single_use_on(&*client, candidate).await
             },
             TOTAL_TIMEOUT_MS,
         )
