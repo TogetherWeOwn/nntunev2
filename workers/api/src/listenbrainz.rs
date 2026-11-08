@@ -198,6 +198,16 @@ fn context<'a>(scope: &'a str, username: &'a str) -> Context<'a> {
     }
 }
 
+/// Durable wrap-only write result. A lost captured envelope must be
+/// reloaded, never retried as an unconditional replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewrapOutcome {
+    Rewrapped,
+    ClaimLost,
+    AccountDeleting,
+    NoRow,
+}
+
 /// One persisted link row (what the Store reads/writes). Envelope bytes are
 /// opaque; `Debug` never prints them.
 #[derive(Clone)]

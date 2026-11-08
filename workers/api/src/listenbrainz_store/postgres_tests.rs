@@ -12,7 +12,12 @@ const TOKEN_B: &str = "1b9e2f4a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
 struct Keys;
 impl KekSource for Keys {
     fn kek(&self, version: u32) -> Option<&[u8; 32]> {
-        (version == 1).then_some(&[7; 32])
+        match version {
+            1 => Some(&[7; 32]),
+            2 => Some(&[8; 32]),
+            3 => Some(&[9; 32]),
+            _ => None,
+        }
     }
 }
 
@@ -230,4 +235,271 @@ async fn malformed_replacement_cannot_remove_the_current_link() {
     db.execute("DELETE FROM users WHERE id = $1", &[&id])
         .await
         .unwrap();
+}
+
+async fn rewrap_audits(db: &Client) -> i64 {
+    db.query_one(
+        "SELECT count(*) FROM audit_log WHERE action = 'listenbrainz.rewrap'",
+        &[],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+async fn cleanup(db: &Client, id: &str) {
+    db.execute("DELETE FROM users WHERE id = $1", &[&id])
+        .await
+        .unwrap();
+}
+
+/// Row is byte-identical to `expected` (never prints token material).
+async fn assert_row(db: &Client, id: &str, expected: &StoredLink) {
+    let row = read(db, id).await.unwrap().unwrap();
+    assert!(row.username == expected.username);
+    assert_eq!(row.kek_version, expected.kek_version);
+    assert!(row.envelope.dek_wrapped_nonce == expected.envelope.dek_wrapped_nonce);
+    assert!(row.envelope.dek_wrapped == expected.envelope.dek_wrapped);
+    assert!(row.envelope.payload_nonce == expected.envelope.payload_nonce);
+    assert!(row.envelope.ciphertext == expected.envelope.ciphertext);
+}
+
+#[tokio::test]
+async fn rewrap_preserves_payload_and_created_at_and_audits_scalars() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let b = a.rewrap(&Keys, &id, 2).unwrap();
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &a, &b, 2000).await.unwrap(),
+        RewrapOutcome::Rewrapped
+    );
+    assert_row(&db, &id, &b).await;
+    let stored = read(&db, &id).await.unwrap().unwrap();
+    assert_eq!(stored.kek_version, 2);
+    assert!(stored.envelope.payload_nonce == a.envelope.payload_nonce);
+    assert!(stored.envelope.ciphertext == a.envelope.ciphertext);
+    assert!(stored.open(&Keys, &id).unwrap().expose() == TOKEN_A);
+    let created: i64 = db
+        .query_one(
+            "SELECT created_at FROM listenbrainz_links WHERE user_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(created, 1000);
+    let audits = db
+        .query(
+            "SELECT user_id, ok, source_ip, at, details::text FROM audit_log \
+             WHERE action = 'listenbrainz.rewrap'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].get::<_, String>(0), id);
+    assert!(audits[0].get::<_, bool>(1));
+    assert_eq!(
+        audits[0].get::<_, String>(2),
+        crate::vault::sanitize_source_ip(None)
+    );
+    assert_eq!(audits[0].get::<_, i64>(3), 2000);
+    assert_eq!(audits[0].get::<_, String>(4), "{}");
+    // A second claim holding the old capture now loses.
+    let c = a.rewrap(&Keys, &id, 3).unwrap();
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &a, &c, 2001).await.unwrap(),
+        RewrapOutcome::ClaimLost
+    );
+    assert_row(&db, &id, &b).await;
+    // Chained rotation from the fresh capture succeeds.
+    let c = b.rewrap(&Keys, &id, 3).unwrap();
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &b, &c, 2002).await.unwrap(),
+        RewrapOutcome::Rewrapped
+    );
+    assert_eq!(rewrap_audits(&db).await, 2);
+    cleanup(&db, &id).await;
+}
+
+#[tokio::test]
+async fn stale_capture_loses_to_same_version_relink_and_unlink() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let stale = a.rewrap(&Keys, &id, 2).unwrap();
+    // Same username and KEK version, different token.
+    let b = sealed(&id, "alice", TOKEN_B);
+    assert_eq!(b.kek_version, a.kek_version);
+    replace(&mut db, &id, &b, "", 1001).await.unwrap();
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &a, &stale, 2000).await.unwrap(),
+        RewrapOutcome::ClaimLost
+    );
+    assert_row(&db, &id, &b).await;
+    assert_token(&db, &id, TOKEN_B).await;
+    unlink(&mut db, &id, "", 1002).await.unwrap();
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &a, &stale, 2001).await.unwrap(),
+        RewrapOutcome::ClaimLost,
+        "an unlinked account must not be resurrected"
+    );
+    assert!(read(&db, &id).await.unwrap().is_none());
+    assert_eq!(rewrap_audits(&db).await, 0);
+    cleanup(&db, &id).await;
+    assert_eq!(
+        cas_rewrap(&mut db, &id, &a, &stale, 2002).await.unwrap(),
+        RewrapOutcome::NoRow
+    );
+}
+
+#[tokio::test]
+async fn every_captured_field_mismatch_loses_without_writing() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let good = a.rewrap(&Keys, &id, 2).unwrap();
+    type Edit = fn(&mut StoredLink);
+    let edits: [(&str, Edit); 7] = [
+        ("username", |l| {
+            l.username = Username::parse("alice2").unwrap()
+        }),
+        ("username case", |l| {
+            l.username = Username::parse("Alice").unwrap()
+        }),
+        ("wrap nonce", |l| l.envelope.dek_wrapped_nonce[0] ^= 1),
+        ("wrapped dek", |l| l.envelope.dek_wrapped[0] ^= 1),
+        ("payload nonce", |l| l.envelope.payload_nonce[0] ^= 1),
+        ("ciphertext", |l| l.envelope.ciphertext[0] ^= 1),
+        ("version", |l| l.kek_version = 3),
+    ];
+    for (name, edit) in edits {
+        let mut captured = a.clone();
+        edit(&mut captured);
+        // Keep the replacement self-consistent so only the CAS can refuse it.
+        let mut replacement = good.clone();
+        replacement.kek_version = 4;
+        if matches!(
+            name,
+            "username" | "username case" | "payload nonce" | "ciphertext"
+        ) {
+            edit(&mut replacement);
+        }
+        assert_eq!(
+            cas_rewrap(&mut db, &id, &captured, &replacement, 2000)
+                .await
+                .unwrap(),
+            RewrapOutcome::ClaimLost,
+            "{name}"
+        );
+        assert_row(&db, &id, &a).await;
+    }
+    assert_eq!(rewrap_audits(&db).await, 0);
+    cleanup(&db, &id).await;
+}
+
+#[tokio::test]
+async fn invalid_rewrap_inputs_are_refused_before_any_write() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let other = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let good = a.rewrap(&Keys, &id, 2).unwrap();
+    type Edit = fn(&mut StoredLink);
+    let edits: [(&str, Edit); 9] = [
+        ("username", |l| l.username = Username::parse("bob").unwrap()),
+        ("payload nonce", |l| l.envelope.payload_nonce[0] ^= 1),
+        ("ciphertext", |l| l.envelope.ciphertext[0] ^= 1),
+        ("short ciphertext", |l| {
+            l.envelope.ciphertext.pop();
+        }),
+        ("short wrap", |l| {
+            l.envelope.dek_wrapped.pop();
+        }),
+        ("owner", |l| l.user_id = "someone-else".into()),
+        ("same version", |l| l.kek_version = 1),
+        ("zero version", |l| l.kek_version = 0),
+        ("over INT4", |l| l.kek_version = u32::MAX),
+    ];
+    for (name, edit) in edits {
+        let mut replacement = good.clone();
+        edit(&mut replacement);
+        assert!(
+            cas_rewrap(&mut db, &id, &a, &replacement, 2000)
+                .await
+                .is_err(),
+            "{name}"
+        );
+        assert_row(&db, &id, &a).await;
+    }
+    // Captured owner or shape wrong, or caller user mismatch.
+    let mut captured = a.clone();
+    captured.user_id = other.clone();
+    assert!(cas_rewrap(&mut db, &id, &captured, &good, 2000)
+        .await
+        .is_err());
+    let mut captured = a.clone();
+    captured.envelope.ciphertext.pop();
+    assert!(cas_rewrap(&mut db, &id, &captured, &good, 2000)
+        .await
+        .is_err());
+    assert!(cas_rewrap(&mut db, &other, &a, &good, 2000).await.is_err());
+    assert!(cas_rewrap(&mut db, &id, &a, &good, u64::MAX).await.is_err());
+    assert_row(&db, &id, &a).await;
+    assert!(read(&db, &other).await.unwrap().is_none());
+    assert_eq!(rewrap_audits(&db).await, 0);
+    cleanup(&db, &id).await;
+    cleanup(&db, &other).await;
+}
+
+#[tokio::test]
+async fn failed_audit_rolls_back_rewrap() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let b = a.rewrap(&Keys, &id, 2).unwrap();
+    db.batch_execute("ALTER TABLE pg_temp.audit_log ADD CHECK (action <> 'listenbrainz.rewrap')")
+        .await
+        .unwrap();
+    assert!(cas_rewrap(&mut db, &id, &a, &b, 2000).await.is_err());
+    assert_row(&db, &id, &a).await;
+    assert_token(&db, &id, TOKEN_A).await;
+    assert_eq!(rewrap_audits(&db).await, 0);
+    cleanup(&db, &id).await;
+}
+
+#[tokio::test]
+async fn rewrap_respects_owner_lock_and_deletion_fence() {
+    let mut db = client().await;
+    let id = user(&db).await;
+    let a = sealed(&id, "alice", TOKEN_A);
+    replace(&mut db, &id, &a, "", 1000).await.unwrap();
+    let b = a.rewrap(&Keys, &id, 2).unwrap();
+    let mut blocker = client().await;
+    let tx = blocker.transaction().await.unwrap();
+    tx.query_one("SELECT id FROM users WHERE id = $1 FOR UPDATE", &[&id])
+        .await
+        .unwrap();
+    let pending = cas_rewrap(&mut db, &id, &a, &b, 2000);
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut pending)
+            .await
+            .is_err(),
+        "rewrap must wait for the owner lock"
+    );
+    tx.execute("UPDATE users SET deleting_at = now() WHERE id = $1", &[&id])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), RewrapOutcome::AccountDeleting);
+    assert_row(&blocker, &id, &a).await;
+    assert_eq!(rewrap_audits(&blocker).await, 0);
+    cleanup(&blocker, &id).await;
 }

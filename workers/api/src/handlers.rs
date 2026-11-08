@@ -711,6 +711,21 @@ pub trait Store {
             Err(StoreError)
         }
     }
+    /// Wrap-only CAS against the complete captured envelope and username.
+    /// A same-version relink or unlink loses the claim; no credential can be
+    /// resurrected. The owner lock, deletion fence and audit are atomic.
+    fn cas_rewrap_listenbrainz_link(
+        &self,
+        user_id: &str,
+        captured: &crate::listenbrainz::StoredLink,
+        replacement: &crate::listenbrainz::StoredLink,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::listenbrainz::RewrapOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, captured, replacement, now);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,

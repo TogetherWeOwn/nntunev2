@@ -12,7 +12,7 @@ use crate::{
     account_deletion::FencedWriteOutcome,
     field_envelope::FieldEnvelope,
     handlers::StoreError,
-    listenbrainz::{StoredLink, Username},
+    listenbrainz::{RewrapOutcome, StoredLink, Username},
 };
 
 pub(crate) async fn read(client: &Client, user_id: &str) -> Result<Option<StoredLink>, StoreError> {
@@ -176,6 +176,97 @@ async fn mutate(
     transaction.commit().await.map_err(|_| StoreError)?;
     // Unlinking an already-unlinked account is idempotent success.
     Ok(FencedWriteOutcome::Written)
+}
+
+/// Wrap-only compare-and-set. Moves only the DEK wrap and KEK version from
+/// `captured` to `replacement`; the payload is never written. The owner row is
+/// locked first (as in replace/unlink), so a concurrent relink, unlink or
+/// erasure either finishes before this reads the link or waits behind it. The
+/// UPDATE matches the whole captured envelope and username, so a same-version
+/// relink or any other change loses (`ClaimLost`) instead of being overwritten.
+pub(crate) async fn cas_rewrap(
+    client: &mut Client,
+    user_id: &str,
+    captured: &StoredLink,
+    replacement: &StoredLink,
+    now: u64,
+) -> Result<RewrapOutcome, StoreError> {
+    check_shape(user_id, captured)?;
+    check_shape(user_id, replacement)?;
+    if captured.username != replacement.username
+        || captured.envelope.payload_nonce != replacement.envelope.payload_nonce
+        || captured.envelope.ciphertext != replacement.envelope.ciphertext
+        || replacement.kek_version <= captured.kek_version
+    {
+        return Err(StoreError);
+    }
+    let now = i64::try_from(now).map_err(|_| StoreError)?;
+    let old_version = i32::try_from(captured.kek_version).map_err(|_| StoreError)?;
+    let new_version = i32::try_from(replacement.kek_version).map_err(|_| StoreError)?;
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    let owners = transaction
+        .query_typed(
+            "SELECT deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if owners.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(owner) = owners.first() else {
+        return Ok(RewrapOutcome::NoRow);
+    };
+    if owner
+        .try_get::<_, bool>("deleting")
+        .map_err(|_| StoreError)?
+    {
+        return Ok(RewrapOutcome::AccountDeleting);
+    }
+    let updated = transaction
+        .query_typed(
+            "UPDATE listenbrainz_links SET kek_version = $1, dek_wrapped_nonce = $2, \
+             dek_wrapped = $3 WHERE user_id = $4 AND username = $5 AND kek_version = $6 \
+             AND dek_wrapped_nonce = $7 AND dek_wrapped = $8 AND payload_nonce = $9 \
+             AND ciphertext = $10 RETURNING user_id",
+            &[
+                (&new_version, Type::INT4),
+                (
+                    &replacement.envelope.dek_wrapped_nonce.as_slice(),
+                    Type::BYTEA,
+                ),
+                (&replacement.envelope.dek_wrapped, Type::BYTEA),
+                (&user_id, Type::TEXT),
+                (&captured.username.as_str(), Type::TEXT),
+                (&old_version, Type::INT4),
+                (&captured.envelope.dek_wrapped_nonce.as_slice(), Type::BYTEA),
+                (&captured.envelope.dek_wrapped, Type::BYTEA),
+                (&captured.envelope.payload_nonce.as_slice(), Type::BYTEA),
+                (&captured.envelope.ciphertext, Type::BYTEA),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    match updated.len() {
+        0 => return Ok(RewrapOutcome::ClaimLost),
+        1 => {}
+        _ => return Err(StoreError),
+    }
+    // Scalar-only audit: no username, envelope or key version.
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, 'listenbrainz.rewrap', TRUE, $2, $3, NULL, '{}'::jsonb)",
+            &[
+                (&user_id, Type::TEXT),
+                (&crate::vault::sanitize_source_ip(None), Type::TEXT),
+                (&now, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(RewrapOutcome::Rewrapped)
 }
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]

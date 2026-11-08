@@ -2246,6 +2246,30 @@ impl Store for PgStore {
         .await
     }
 
+    async fn cas_rewrap_listenbrainz_link(
+        &self,
+        user_id: &str,
+        captured: &crate::listenbrainz::StoredLink,
+        replacement: &crate::listenbrainz::StoredLink,
+        now: u64,
+    ) -> Result<crate::listenbrainz::RewrapOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::listenbrainz_store::cas_rewrap(
+                    &mut client,
+                    user_id,
+                    captured,
+                    replacement,
+                    now,
+                )
+                .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
