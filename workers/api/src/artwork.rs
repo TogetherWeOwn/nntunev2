@@ -9,7 +9,7 @@
 
 use std::future::Future;
 
-use sha2::{Digest, Sha256};
+use crate::admin_ingest::content_sha256_hex;
 
 pub const MAX_ART_BYTES: usize = 5 << 20;
 const MAX_ART_PIXELS: u64 = 16_000_000;
@@ -133,7 +133,7 @@ pub async fn serve_original(
         .read_object(&key, art.byte_size)
         .await?
         .ok_or(ArtError::NotFound)?;
-    if bytes.len() != art.byte_size || format!("{:x}", Sha256::digest(&bytes)) != art.content_hash {
+    if bytes.len() != art.byte_size || content_sha256_hex(&bytes) != art.content_hash {
         return Err(ArtError::Unavailable);
     }
     Ok(ArtResponse {
@@ -164,7 +164,8 @@ mod tests {
                 allowed: Ok(true),
                 art: Some(OriginalArt {
                     source_kind: "embedded".into(),
-                    content_hash: format!("{:x}", Sha256::digest(PNG)),
+                    content_hash:
+                        "0d11ce2c95b7c8180b42a412fead376f365360f493067c5a9a1fce07e25ee5a1".into(),
                     byte_size: PNG.len(),
                     mime: "image/png".into(),
                     width: 1,
