@@ -255,6 +255,58 @@ pub(crate) fn controlled_checkpoint(
     Ok(next)
 }
 
+/// Returned only after the failure checkpoint commits. The caller schedules the
+/// retry outside the transaction; this is not a durable timer or queue send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceFailureOutcome {
+    Retry { delay_secs: u32 },
+    Parked,
+}
+
+/// Settle only a classified transient match/probe service failure. Invalid input,
+/// persistence errors, stale results and uncertain publication commits must never
+/// spend this budget. No provider detail is accepted or retained. Progress and
+/// generation survive retries; explicit review controls alone reset evidence.
+pub(crate) fn service_failure_checkpoint(
+    expected: &JobCheckpoint,
+    failure: StageError,
+    retry_after_secs: Option<u32>,
+    original_job: &str,
+    original_key: &str,
+    parsed: &Document,
+) -> Result<(JobCheckpoint, ServiceFailureOutcome), StageError> {
+    validate_original(expected, original_job, original_key)?;
+    let plan = ProbePlan::new(parsed)?;
+    if has_archive(parsed) {
+        return Err(StageError::Invalid);
+    }
+    let code = match (expected.state, failure) {
+        (JobState::Matching, StageError::Match) => crate::retry::ERR_MATCH_FAILED,
+        (JobState::Probing, StageError::Probe)
+            if plan.matches(expected) && admin_gates::probe_ready(expected) =>
+        {
+            crate::retry::ERR_PROBE_FAILED
+        }
+        _ => return Err(StageError::Invalid),
+    };
+    let mut next = expected.clone();
+    let outcome = if let Some(delay_secs) = crate::retry::record_redelivery(&mut next) {
+        ServiceFailureOutcome::Retry {
+            delay_secs: retry_after_secs.map_or(delay_secs, |hint| {
+                delay_secs.max(hint.clamp(1, crate::retry::MAX_HINTED_RETRY_DELAY_SECS))
+            }),
+        }
+    } else {
+        // validate_original already bounded attempt, so this is exhaustion,
+        // never a permanent Failed state or a payload-carrying DLQ entry.
+        next.state = JobState::NeedsReview;
+        next.failure_code = Some(code.into());
+        next.failure_reason = Some("retry budget exhausted".into());
+        ServiceFailureOutcome::Parked
+    };
+    Ok((next, outcome))
+}
+
 /// Reconstruct exactly one ordinary stage transition at the storage boundary.
 /// Manual controls, retry-budget changes and publication are separate atomic
 /// operations; none can be smuggled through ordinary stage persistence.

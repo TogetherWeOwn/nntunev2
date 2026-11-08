@@ -8,7 +8,8 @@
 use crate::{
     admin_checkpoint::{Identity, Snapshot, MAX_CHECKPOINT_BYTES},
     admin_execution::{
-        controlled_checkpoint, validate_publication, validate_stage_transition, Control,
+        controlled_checkpoint, service_failure_checkpoint, validate_publication,
+        validate_stage_transition, Control, ServiceFailureOutcome, StageError,
     },
     admin_writers::{write_album, AlbumWrite, FileGeometry, SourceSealer, WriteError},
     jobs::{self, JobCheckpoint, JobState},
@@ -482,6 +483,48 @@ pub async fn persist_stage(
     update_on(&tx, expected, &current_encoded, &successor).await?;
     tx.commit().await.map_err(|_| StoreError::Database)?;
     Ok(successor)
+}
+
+/// Persist a classified transient match/probe failure before scheduling retry.
+/// Derive the next attempt (or review parking) rather than accepting caller state.
+/// Full checkpoint/revision/generation comparison prevents duplicate settlement
+/// and late failures from spending a newer attempt's budget. No raw error detail,
+/// service call, queue send or retry sleep belongs in this transaction. On commit
+/// uncertainty reload authority; never feed a database error back as a service
+/// failure or blindly repeat this write. This installs no live consumer or timer.
+pub async fn persist_service_failure(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    expected: &Snapshot,
+    failure: StageError,
+    retry_after_secs: Option<u32>,
+) -> Result<(Snapshot, ServiceFailureOutcome), StoreError> {
+    let bound = identity(original);
+    let encoded = expected.encode().map_err(|_| StoreError::Invalid)?;
+    Snapshot::decode(&encoded, expected.revision(), &bound).map_err(|_| StoreError::Invalid)?;
+    let (next, outcome) = service_failure_checkpoint(
+        expected.checkpoint(),
+        failure,
+        retry_after_secs,
+        original.job_id,
+        original.idempotency_key,
+        original.parsed,
+    )
+    .map_err(|_| StoreError::Invalid)?;
+    let successor = expected
+        .successor(next, false, &bound)
+        .map_err(|_| StoreError::Invalid)?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|_| StoreError::Database)?;
+    let (current, current_encoded) = load_on(&tx, original, expected.generation(), true).await?;
+    if current != *expected {
+        return Err(StoreError::Stale);
+    }
+    update_on(&tx, expected, &current_encoded, &successor).await?;
+    tx.commit().await.map_err(|_| StoreError::Database)?;
+    Ok((successor, outcome))
 }
 
 /// Commit one explicit admin control with actor revalidation and atomic audit.

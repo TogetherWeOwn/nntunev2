@@ -106,6 +106,198 @@ fn at_state(runtime: &mut Runtime, cp: &mut JobCheckpoint, state: JobState) {
 }
 
 #[test]
+fn service_failures_reuse_bounded_backoff_preserve_probe_progress_and_park_exhaustion() {
+    let (mut cp, mut parsed, _) = fixture();
+    let segment = parsed.files[0].segments[0].clone();
+    parsed.files[0]
+        .segments
+        .resize(MAX_PROBE_SEGMENTS + 1, segment);
+    cp.state = JobState::Matching;
+    assert!(admin_gates::complete_match(&mut cp, Some(RELEASE), 2));
+    cp.probe_tally
+        .as_mut()
+        .unwrap()
+        .missing_by_batch
+        .insert(0, 0);
+    let proof = cp.probe_tally.clone();
+    for (spent, delay) in [(1, 5), (2, 15), (3, 30), (4, 60)] {
+        let (next, outcome) = service_failure_checkpoint(
+            &cp,
+            StageError::Probe,
+            None,
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed,
+        )
+        .unwrap();
+        assert_eq!(outcome, ServiceFailureOutcome::Retry { delay_secs: delay });
+        assert_eq!((next.state, next.attempt), (JobState::Probing, spent + 1));
+        assert_eq!(next.probe_tally, proof);
+        assert_eq!(next.admin_release_mbid.as_deref(), Some(RELEASE));
+        assert!(next.failure_code.is_none() && next.failure_reason.is_none());
+        assert_eq!(
+            validate_stage_transition(&cp, &next, &cp.job_id, &cp.idempotency_key, &parsed),
+            Err(StageError::Invalid)
+        );
+        cp = next;
+    }
+    let (next, outcome) = service_failure_checkpoint(
+        &cp,
+        StageError::Probe,
+        None,
+        &cp.job_id,
+        &cp.idempotency_key,
+        &parsed,
+    )
+    .unwrap();
+    assert_eq!(outcome, ServiceFailureOutcome::Parked);
+    assert_eq!(
+        (next.state, next.attempt),
+        (JobState::NeedsReview, jobs::MAX_ATTEMPTS)
+    );
+    assert_eq!(next.probe_tally, proof);
+    assert_eq!(
+        next.failure_code.as_deref(),
+        Some(crate::retry::ERR_PROBE_FAILED)
+    );
+    assert_eq!(
+        next.failure_reason.as_deref(),
+        Some("retry budget exhausted")
+    );
+    let retried = controlled_checkpoint(
+        &next,
+        Control::RetryReview,
+        &cp.job_id,
+        &cp.idempotency_key,
+        &parsed,
+    )
+    .unwrap();
+    assert_eq!((retried.state, retried.attempt), (JobState::Matching, 1));
+    assert!(retried.probe_tally.is_none() && retried.admin_release_mbid.is_none());
+    assert!(retried.failure_code.is_none() && retried.failure_reason.is_none());
+}
+
+#[test]
+fn service_failure_classification_bounds_hints_and_refuses_non_service_or_wrong_stage_errors() {
+    let (mut cp, mut parsed, _) = fixture();
+    cp.state = JobState::Matching;
+    for (hint, delay) in [(0, 5), (1, 5), (30, 30), (u32::MAX, 300)] {
+        let (next, outcome) = service_failure_checkpoint(
+            &cp,
+            StageError::Match,
+            Some(hint),
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed,
+        )
+        .unwrap();
+        assert_eq!(outcome, ServiceFailureOutcome::Retry { delay_secs: delay });
+        assert_eq!(next.attempt, 2);
+        assert_eq!(cp.attempt, 1);
+    }
+    for error in [
+        StageError::Invalid,
+        StageError::Probe,
+        StageError::Store,
+        StageError::Stale,
+    ] {
+        assert_eq!(
+            service_failure_checkpoint(&cp, error, None, &cp.job_id, &cp.idempotency_key, &parsed)
+                .err(),
+            Some(StageError::Invalid)
+        );
+    }
+    for state in [
+        JobState::Queued,
+        JobState::Parsing,
+        JobState::Searching,
+        JobState::Writing,
+        JobState::NeedsReview,
+        JobState::NeedsArchiveRead,
+        JobState::Done,
+        JobState::Rejected,
+        JobState::Failed,
+    ] {
+        cp.state = state;
+        assert_eq!(
+            service_failure_checkpoint(
+                &cp,
+                StageError::Match,
+                None,
+                &cp.job_id,
+                &cp.idempotency_key,
+                &parsed
+            )
+            .err(),
+            Some(StageError::Invalid)
+        );
+    }
+    cp.state = JobState::Matching;
+    for attempt in [0, jobs::MAX_ATTEMPTS + 1] {
+        cp.attempt = attempt;
+        assert_eq!(
+            service_failure_checkpoint(
+                &cp,
+                StageError::Match,
+                None,
+                &cp.job_id,
+                &cp.idempotency_key,
+                &parsed
+            )
+            .err(),
+            Some(StageError::Invalid)
+        );
+    }
+    cp.attempt = 1;
+    assert!(admin_gates::complete_match(&mut cp, Some(RELEASE), 1));
+    cp.probe_tally
+        .as_mut()
+        .unwrap()
+        .missing_by_batch
+        .insert(0, 0);
+    assert_eq!(
+        service_failure_checkpoint(
+            &cp,
+            StageError::Probe,
+            None,
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed
+        )
+        .err(),
+        Some(StageError::Invalid)
+    );
+    cp.probe_tally.as_mut().unwrap().missing_by_batch.clear();
+    cp.probe_tally.as_mut().unwrap().total_batches = 2;
+    assert_eq!(
+        service_failure_checkpoint(
+            &cp,
+            StageError::Probe,
+            None,
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed
+        )
+        .err(),
+        Some(StageError::Invalid)
+    );
+    cp.state = JobState::Matching;
+    parsed.files[0].role = "archive".into();
+    assert_eq!(
+        service_failure_checkpoint(
+            &cp,
+            StageError::Match,
+            None,
+            &cp.job_id,
+            &cp.idempotency_key,
+            &parsed
+        )
+        .err(),
+        Some(StageError::Invalid)
+    );
+}
+
+#[test]
 fn manual_approval_derives_full_original_plan_and_refuses_invalid_inputs_without_mutation() {
     let (mut cp, mut parsed, _) = fixture();
     cp.state = JobState::NeedsReview;
