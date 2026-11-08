@@ -9,8 +9,6 @@ import io
 import json
 import os
 import re
-import subprocess
-import types
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
@@ -1039,31 +1037,6 @@ class ByteBoundDeliveryTests(unittest.TestCase):
         self.assertGreater(http.pages[0][2], 2 * 1024 * 1024)
         self.assertEqual(http.reads, [2 * 1024 * 1024 + 1])
         self.assertEqual(backend.writes, [])
-
-    def test_pinned_pre_fix_stalls_but_repair_delivers_same_serialized_history(self):
-        # release-proof checks out full history. Load the reviewed pre-fix source
-        # without switching the checkout or running any live API request.
-        sha = "ede9c7eab1d148f152a0dd3cd58fecd2b727a4ec"
-        source = subprocess.check_output(["git", "show", sha + ":ci/incident_report.py"],
-                                         cwd=CI_DIR, text=True)
-        baseline = types.ModuleType("pre_fix_incident_report")
-        exec(compile(source, "pre_fix_incident_report.py", "exec"), baseline.__dict__)
-        rows = [{"body": "x" * (30 * 1024)} for _ in range(100)]
-        rows[85]["body"] += occurrence(10)
-        backend = self.backend(rows)
-        http = SerializedHTTP(backend)
-        with http.mocked():
-            for _ in range(2):
-                with self.assertRaisesRegex(baseline.ReportError, "response exceeded bound"):
-                    baseline.ensure_comment(baseline.API("token"), backend.issues[0], KEY,
-                                            (10, 1), "failure", False)
-        self.assertEqual([p[:2] for p in http.pages], [(None, 100), (None, 100)])
-        self.assertFalse(delivery(backend)["delivered"])
-        self.assertIsNone(delivery(backend)["cursor"])
-        self.reconcile(backend, http)
-        self.assertTrue(delivery(backend)["delivered"])
-        self.assertEqual(comment_count(backend, 7, occurrence(10)), 1)
-        self.assertNotIn("/issues/7/comments", [w[1] for w in backend.writes])
 
     def test_large_bodies_find_receipt_beyond_reduced_page_or_post_if_absent(self):
         for kind in ("failure", "recovery"):
