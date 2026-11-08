@@ -13,7 +13,7 @@
 	 * controls. Status is never set optimistically.
 	 */
 
-	/** The status spinner/label only appears after this delay. */
+	/** The status loading text only appears after this delay. */
 	const LOADING_DELAY_MS = 300;
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -118,14 +118,18 @@
 			phase !== 'linked' ||
 			navigator.onLine === false
 		) {
+			closeConfirm();
 			await focusUnlink();
 			return;
 		}
 		busy = true;
+		statusMessage = 'Unlinking…';
 		unlinkError = null;
 		const outcome = await unlink(client, { afterReauth, signal: lifetime.signal });
 		if (lifetime.signal.aborted) return;
+		closeConfirm();
 		busy = false;
+		statusMessage = '';
 		switch (outcome.kind) {
 			case 'unlinked':
 				username = '';
@@ -161,11 +165,12 @@
 	}
 
 	async function confirmUnlink() {
-		closeConfirm();
+		if (busy) return;
 		await runUnlink(false);
 	}
 
 	function cancelConfirm() {
+		if (busy) return;
 		closeConfirm();
 		void focusUnlink();
 	}
@@ -175,6 +180,7 @@
 		ceremony?.abort();
 		ceremony = null;
 		reauthWorking = false;
+		statusMessage = '';
 		if (reauthDialog?.open) reauthDialog.close();
 		void focusUnlink();
 	}
@@ -182,6 +188,7 @@
 	async function continueWithPasskey() {
 		if (reauthWorking || busy || accountDeleting || phase !== 'linked') return;
 		reauthWorking = true;
+		statusMessage = 'Waiting for your passkey…';
 		reauthError = false;
 		const attempt = new AbortController();
 		ceremony = attempt;
@@ -189,6 +196,7 @@
 		if (lifetime.signal.aborted || ceremony !== attempt) return;
 		ceremony = null;
 		reauthWorking = false;
+		statusMessage = '';
 		if (outcome === 'dismissed') {
 			cancelReauth();
 		} else if (outcome === 'failed') {
@@ -221,12 +229,12 @@
 	}
 </script>
 
-<section aria-labelledby="settings-listenbrainz-heading" aria-busy={busy || reauthWorking}>
+<section aria-labelledby="settings-listenbrainz-heading" aria-busy={phase === 'loading' || busy || reauthWorking}>
 	<h2 id="settings-listenbrainz-heading" tabindex="-1" bind:this={heading}>ListenBrainz</h2>
 
 	{#if phase === 'loading'}
 		{#if showLoading}
-			<p class="lb-muted">Loading…</p>
+			<p class="lb-muted">Loading your ListenBrainz link…</p>
 		{/if}
 	{:else if phase === 'error'}
 		<div class="lb-error-block">
@@ -246,8 +254,7 @@
 			</p>
 		{:else}
 			<p>
-				Link your ListenBrainz account to NNTune. You enter your username and user token; NNTune
-				checks them with ListenBrainz before saving.
+				No ListenBrainz account is linked. Linking an account isn't available in NNTune yet.
 			</p>
 		{/if}
 		<p class="lb-muted">
@@ -267,7 +274,8 @@
 				type="button"
 				class="lb-button lb-button--destructive"
 				bind:this={unlinkButton}
-				disabled={!canWrite}
+				disabled={!online}
+				aria-disabled={busy}
 				onclick={openConfirm}
 			>
 				Unlink
@@ -304,11 +312,12 @@
 		<button
 			type="button"
 			class="lb-button lb-button--ghost lb-button--destructive"
+			aria-disabled={busy}
 			onclick={() => void confirmUnlink()}
 		>
-			Unlink
+			{busy ? 'Unlinking…' : 'Unlink'}
 		</button>
-		<button type="button" class="lb-button lb-button--ghost" bind:this={cancelButton} onclick={cancelConfirm}>
+		<button type="button" class="lb-button lb-button--ghost" bind:this={cancelButton} aria-disabled={busy} onclick={cancelConfirm}>
 			Cancel
 		</button>
 	</div>

@@ -8,11 +8,9 @@ import { expect, test, type Page, type Route } from '@playwright/test';
  * moves, the offline guard at send time, the single post-passkey DELETE
  * retry, and Cancel/Escape never retrying.
  *
- * Pre-PUT gaps documented for UX (not designed here): there is no username
- * field, so focus after unlink goes to the section heading; the unlinked
- * intro keeps the pinned wording that mentions entering a username and
- * token although no form exists yet; there is no spinner component, so the
- * delayed loading state is text only.
+ * Pinned pre-PUT contract: focus after unlink goes to the section heading,
+ * the intro explains that linking is unavailable, and loading/busy states
+ * use text only. No form, token help link, spinner or new kit element.
  */
 
 declare global {
@@ -45,7 +43,7 @@ async function routeApi(
 	page: Page,
 	script: {
 		get?: (n: number) => ReturnType<typeof json> | Promise<ReturnType<typeof json>>;
-		del?: (n: number) => ReturnType<typeof json>;
+		del?: (n: number) => ReturnType<typeof json> | Promise<ReturnType<typeof json>>;
 	}
 ): Promise<Traffic> {
 	const traffic: Traffic = { gets: 0, deletes: 0, reauthStarts: 0, reauthFinishes: 0 };
@@ -56,7 +54,7 @@ async function routeApi(
 			await route.fulfill(await (script.get ?? (() => json(LINKED)))(traffic.gets));
 		} else if (method === 'DELETE') {
 			traffic.deletes += 1;
-			await route.fulfill((script.del ?? (() => json(UNLINKED)))(traffic.deletes));
+			await route.fulfill(await (script.del ?? (() => json(UNLINKED)))(traffic.deletes));
 		} else {
 			// The link route is not dispatched and the UI must never call it.
 			throw new Error(`unexpected ${method} to /v1/me/listenbrainz`);
@@ -153,19 +151,60 @@ test('linked: Cancel on the confirmation sends no DELETE and restores focus; Unl
 	await startUnlink(page);
 	await confirmDialog(page).getByRole('button', { name: 'Unlink' }).click();
 	await expect(section(page).getByText('Linked as')).toHaveCount(0);
-	await expect(section(page).getByText('Link your ListenBrainz account to NNTune.', { exact: false })).toBeVisible();
+	await expect(section(page).getByText("No ListenBrainz account is linked. Linking an account isn't available in NNTune yet.", { exact: true })).toBeVisible();
 	await expect(page.getByText('ListenBrainz unlinked').first()).toBeVisible();
 	await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
 	expect(traffic.deletes).toBe(1);
 	await expect(unlinkButton(page)).toHaveCount(0);
 });
 
+for (const result of ['success', 'failure'] as const) {
+	test(`pending unlink retains focus, refuses repeated actions and settles ${result}`, async ({ page }) => {
+		let settle!: (response: ReturnType<typeof json>) => void;
+		const pending = new Promise<ReturnType<typeof json>>((resolve) => { settle = resolve; });
+		const traffic = await routeApi(page, { del: () => pending });
+		await openLinked(page);
+		await startUnlink(page);
+		await confirmDialog(page).getByRole('button', { name: 'Unlink', exact: true }).click();
+		try {
+			const active = confirmDialog(page).getByRole('button', { name: 'Unlinking…' });
+			await expect(active).toBeFocused();
+			await expect(active).toHaveAttribute('aria-disabled', 'true');
+			await expect(active).not.toHaveAttribute('disabled', '');
+			await expect(section(page).getByRole('status', { includeHidden: true })).toHaveText('Unlinking…');
+			await expect(section(page)).toHaveAttribute('aria-busy', 'true');
+			// DOM activation tests the handler guards even though aria-disabled blocks normal clicks.
+			await active.evaluate((button: HTMLButtonElement) => button.click());
+			await confirmDialog(page).getByRole('button', { name: 'Cancel' }).evaluate((button: HTMLButtonElement) => button.click());
+			await page.keyboard.press('Escape');
+			await expect(confirmDialog(page)).toBeVisible();
+			await expect(active).toBeFocused();
+			expect(traffic.deletes).toBe(1);
+		} finally {
+			settle(result === 'success' ? json(UNLINKED) : json({ code: 'internal_error', message: 'x', retryable: true }, 503));
+		}
+		await expect(confirmDialog(page)).toBeHidden();
+		await expect(section(page)).toHaveAttribute('aria-busy', 'false');
+		if (result === 'success') {
+			const heading = section(page).getByRole('heading', { name: 'ListenBrainz' });
+			await expect(heading).toBeFocused();
+			await expect(heading).toHaveAttribute('tabindex', '-1');
+		} else {
+			await expect(unlinkButton(page)).toBeFocused();
+			await expect(section(page).getByRole('alert')).toHaveText("Couldn't unlink ListenBrainz. Your link is unchanged — try again.");
+		}
+		expect(traffic.deletes).toBe(1);
+	});
+}
+
 test('unlinked status renders the intro and honesty line with no controls', async ({ page }) => {
 	await routeApi(page, { get: () => json(UNLINKED) });
 	await page.goto('/settings');
-	await expect(section(page).getByText('Link your ListenBrainz account to NNTune.', { exact: false })).toBeVisible();
+	await expect(section(page).getByText("No ListenBrainz account is linked. Linking an account isn't available in NNTune yet.", { exact: true })).toBeVisible();
 	await expect(section(page)).toContainText("NNTune doesn't send your listens or feedback");
 	await expect(section(page).getByRole('button')).toHaveCount(0);
+	await expect(section(page).locator('input, form, a')).toHaveCount(0);
+	await expect(section(page)).not.toContainText('Find your user token');
 });
 
 test('status loading text appears only while the read is pending, with no controls', async ({ page }) => {
@@ -176,10 +215,13 @@ test('status loading text appears only while the read is pending, with no contro
 		}
 	});
 	await page.goto('/settings');
-	await expect(section(page).getByText('Loading…')).toBeVisible({ timeout: 1200 });
+	await expect(section(page).getByText('Loading your ListenBrainz link…')).toBeVisible({ timeout: 1200 });
+	await expect(section(page)).toHaveAttribute('aria-busy', 'true');
+	await expect(section(page).getByText('Loading your ListenBrainz link…')).not.toHaveAttribute('role');
+	await expect(section(page).getByRole('status')).toBeEmpty();
 	await expect(section(page).getByRole('button')).toHaveCount(0);
 	await expect(section(page).getByText('Linked as')).toBeVisible();
-	await expect(section(page).getByText('Loading…')).toHaveCount(0);
+	await expect(section(page).getByText('Loading your ListenBrainz link…')).toHaveCount(0);
 });
 
 test('status error shows the generic block and Retry re-runs the read', async ({ page }) => {
@@ -342,6 +384,45 @@ test('unlink failure and account deletion show their exact alerts', async ({ pag
 	await expect(section(page).getByText('Linked as')).toBeVisible();
 	expect(traffic.deletes).toBe(2);
 });
+
+for (const colorScheme of ['light', 'dark'] as const) {
+	for (const width of [1280, 1024, 390, 360]) {
+		test(`mocked status evidence ${colorScheme} ${width}px`, async ({ page }, testInfo) => {
+			await page.setViewportSize({ width, height: 900 });
+			await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+			let response = json(LINKED);
+			let hold = false;
+			let settle!: (response: ReturnType<typeof json>) => void;
+			const pending = new Promise<ReturnType<typeof json>>((resolve) => { settle = resolve; });
+			await routeApi(page, { get: () => hold ? pending : response });
+			const capture = async (state: string) => {
+				await section(page).screenshot({ path: testInfo.outputPath('listenbrainz-evidence', `${state}.png`) });
+				const fits = await section(page).evaluate((element) => element.scrollWidth <= element.clientWidth);
+				expect(fits, `${state} reflows at ${width}px`).toBe(true);
+			};
+			await openLinked(page);
+			await capture('linked');
+			for (const [state, next, text] of [
+				['unlinked', json(UNLINKED), "No ListenBrainz account is linked. Linking an account isn't available in NNTune yet."],
+				['error', json({ code: 'internal_error', message: 'x', retryable: true }, 503), "Couldn't load your ListenBrainz link."],
+				['signed-out', json({ code: 'unauthorized', message: 'x', retryable: false }, 401), 'to see your ListenBrainz link.']
+			] as const) {
+				response = next;
+				await page.reload();
+				await expect(section(page)).toContainText(text);
+				await capture(state);
+			}
+			hold = true;
+			await page.reload();
+			try {
+				await expect(section(page).getByText('Loading your ListenBrainz link…')).toBeVisible();
+				await capture('loading');
+			} finally {
+				settle(json(UNLINKED));
+			}
+		});
+	}
+}
 
 test('linked state and open dialogs have no serious or critical axe violations', async ({ page }) => {
 	await routeApi(page, {});
