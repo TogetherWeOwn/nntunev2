@@ -14,8 +14,8 @@ const track = { mbid: trackId, title: 'First Light', release_mbid: albumId, rele
 	artist_mbid: artistId, artist: release.artist, duration_ms: 90_000, track_no: 1, medium_no: 1, art_url: release.art_url };
 
 async function catalogue(page: Page) {
-	await page.route('**/v1/me/library/albums/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ saved: false, savedAt: null }) }));
-	await page.route('**/v1/me/library/artists/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ followed: false, followedAt: null }) }));
+	await page.route('**/v1/me/library/albums/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ saved: false, saved_at: null }) }));
+	await page.route('**/v1/me/library/artists/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ followed: false, followed_at: null }) }));
 	await page.route('**/v1/releases/*/art', (route) => route.fulfill({ status: 404, body: '' }));
 	await page.route('**/v1/releases/*', (route) => {
 		const id = new URL(route.request().url()).pathname.split('/').pop();

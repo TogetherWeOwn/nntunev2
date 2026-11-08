@@ -9,7 +9,7 @@ function selected(value: unknown, kind: PreferenceKind): boolean | null {
 	if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
 	const row = value as Record<string, unknown>;
 	const enabled = row[kind === 'albums' ? 'saved' : 'followed'];
-	const at = row[kind === 'albums' ? 'savedAt' : 'followedAt'];
+	const at = row[kind === 'albums' ? 'saved_at' : 'followed_at'];
 	if (enabled === false && at === null) return false;
 	if (enabled !== true || typeof at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(at)) return null;
 	const date = new Date(at);

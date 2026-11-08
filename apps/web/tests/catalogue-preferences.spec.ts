@@ -3,8 +3,8 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 // Mocked contract coverage for album save and artist follow toggles. The
 // backend is not delivered when this is written, so these mocks are NOT live
 // acceptance: they pin the browser behaviour against the agreed contract only.
-//   GET|PUT|DELETE /v1/me/library/albums/{mbid}  -> { saved, savedAt }
-//   GET|PUT|DELETE /v1/me/library/artists/{mbid} -> { followed, followedAt }
+//   GET|PUT|DELETE /v1/me/library/albums/{mbid}  -> { saved, saved_at }
+//   GET|PUT|DELETE /v1/me/library/artists/{mbid} -> { followed, followed_at }
 // PUT/DELETE are bodiless and credentialed.
 
 const albumId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -31,14 +31,14 @@ type Entity = {
 	heading: string;
 	segment: 'albums' | 'artists';
 	flag: 'saved' | 'followed';
-	stamp: 'savedAt' | 'followedAt';
+	stamp: 'saved_at' | 'followed_at';
 	off: string;
 	on: string;
 	retry: string;
 };
 const entities: Entity[] = [
-	{ name: 'album', id: albumId, url: `/album/${albumId}`, heading: 'Quiet Rooms', segment: 'albums', flag: 'saved', stamp: 'savedAt', off: 'Save album', on: 'Saved', retry: 'Retry saved status' },
-	{ name: 'artist', id: artistId, url: `/artist/${artistId}`, heading: 'North Window', segment: 'artists', flag: 'followed', stamp: 'followedAt', off: 'Follow', on: 'Following', retry: 'Retry follow status' }
+	{ name: 'album', id: albumId, url: `/album/${albumId}`, heading: 'Quiet Rooms', segment: 'albums', flag: 'saved', stamp: 'saved_at', off: 'Save album', on: 'Saved', retry: 'Retry saved status' },
+	{ name: 'artist', id: artistId, url: `/artist/${artistId}`, heading: 'North Window', segment: 'artists', flag: 'followed', stamp: 'followed_at', off: 'Follow', on: 'Following', retry: 'Retry follow status' }
 ];
 
 type Method = 'GET' | 'PUT' | 'DELETE';
@@ -267,6 +267,7 @@ for (const e of entities) {
 			const bad: Reply[] = [
 				{ raw: '{"unexpected":true}' },
 				{ body: { [e.flag]: 'yes', [e.stamp]: null } },
+				{ body: { [e.flag]: false, [e.name === 'album' ? 'savedAt' : 'followedAt']: null } },
 				{ raw: 'not json' }
 			];
 			for (const reply of bad) {

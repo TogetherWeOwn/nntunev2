@@ -9,7 +9,7 @@ const mbid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const baseUrl = 'https://api.example.test';
 const at = '2026-11-08T00:00:00Z';
 const body = (kind: PreferenceKind, enabled: boolean) => kind === 'albums'
-	? { saved: enabled, savedAt: enabled ? at : null } : { followed: enabled, followedAt: enabled ? at : null };
+	? { saved: enabled, saved_at: enabled ? at : null } : { followed: enabled, followed_at: enabled ? at : null };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 beforeEach(() => { auth.generation = 0; });
 
@@ -26,6 +26,16 @@ for (const kind of ['albums', 'artists'] as const) {
 				expect(fetchFn.mock.calls[index][0]).toBe(`${baseUrl}/v1/me/library/${kind}/${mbid}`);
 				expect(fetchFn.mock.calls[index][1]).toMatchObject({ method, credentials: 'include' });
 				expect(fetchFn.mock.calls[index][1]?.body).toBeUndefined();
+			}
+		});
+
+		it('rejects camelCase timestamps instead of guessing an undocumented wire shape', async () => {
+			const flag = kind === 'albums' ? 'saved' : 'followed';
+			const stamp = kind === 'albums' ? 'savedAt' : 'followedAt';
+			for (const enabled of [false, true]) {
+				const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(json({ [flag]: enabled, [stamp]: enabled ? at : null }));
+				expect(await collectionPreference(new ApiClient({ baseUrl, fetchFn }), kind, mbid))
+					.toEqual({ value: null, failure: 'unavailable' });
 			}
 		});
 
@@ -47,7 +57,7 @@ for (const kind of ['albums', 'artists'] as const) {
 
 		it('refuses wrong shapes, inconsistent timestamps and opposite mutation results', async () => {
 			const flag = kind === 'albums' ? 'saved' : 'followed';
-			const stamp = kind === 'albums' ? 'savedAt' : 'followedAt';
+			const stamp = kind === 'albums' ? 'saved_at' : 'followed_at';
 			for (const value of [null, {}, [], { [flag]: 'true', [stamp]: at }, { [flag]: true, [stamp]: null },
 				{ [flag]: false, [stamp]: at }, { [flag]: true, [stamp]: '2026-02-31T00:00:00Z' },
 				{ [flag]: true, [stamp]: 'yesterday' }, body(kind, false)]) {
