@@ -17408,6 +17408,11 @@ mod tests {
         assert_eq!(body["invites"][0]["revoked_by"], "admin1");
     }
 
+    mod invite_budget_boundary {
+        use super::*;
+        include!("../tests/support/invite_budget_boundary.rs");
+    }
+
     #[test]
     fn invite_redemption_enrolls_once_and_stamps_invited_by() {
         let mut h = harness();
