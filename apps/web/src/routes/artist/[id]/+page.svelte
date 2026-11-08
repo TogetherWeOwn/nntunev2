@@ -1,5 +1,8 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { invalidate } from '$app/navigation';
+	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { createCollectionPreference } from '#lib/catalogue/preference.svelte.js';
 	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
 	import { catalogueAuthGeneration } from '#lib/catalogue/auth.svelte.js';
 	import { filterReleases, releaseFilters, type ReleaseFilter } from '#lib/catalogue/catalogue.js';
@@ -9,6 +12,14 @@
 	let { data }: { data: PageData } = $props();
 	let filter = $state<ReleaseFilter>('all');
 	let retrying = $state(false);
+	const preference = createCollectionPreference('artists', { baseUrl: PUBLIC_API_BASE_URL });
+	$effect(() => {
+		const mbid = detail?.artist.mbid;
+		const generation = data.authGeneration;
+		if (mbid) untrack(() => preference.load(mbid, generation));
+		else preference.clear();
+		return () => preference.clear();
+	});
 	const authChanged = $derived(data.authGeneration !== catalogueAuthGeneration());
 	const detail = $derived(authChanged ? null : data.value);
 	const releases = $derived(filterReleases(detail?.releases ?? [], filter));
@@ -29,6 +40,20 @@
 				<p>Artist{detail.artist.type ? ` · ${detail.artist.type}` : ''}</p>
 				<h1>{detail.artist.name || 'Unnamed artist'}</h1>
 				{#if detail.artist.country}<p>{detail.artist.country}</p>{/if}
+				<button class="nt-button nt-button--ghost" aria-pressed={preference.value ?? undefined} aria-busy={preference.pending}
+					disabled={preference.pending || preference.value === null || preference.failure !== null} onclick={() => preference.toggle()}>
+					{preference.value ? 'Following' : 'Follow'}
+				</button>
+				{#if preference.pending}
+					<p role="status">{preference.value === null ? 'Checking follow status…' : 'Updating follow status…'}</p>
+				{:else if preference.failure === 'signed-out'}
+					<p role="status">Sign in to follow artists.</p><a href="/login">Sign in</a>
+				{:else if preference.failure === 'account-deleting'}
+					<p role="status">Followed artists cannot change while account deletion is scheduled.</p>
+				{:else if preference.failure}
+					<p role="status">{preference.failure === 'not-found' ? 'Follow status is unavailable for this artist.' : "We couldn't confirm follow status. Check it again before making another change."}</p>
+					<button class="nt-button nt-button--ghost" onclick={() => preference.retry()}>Retry follow status</button>
+				{/if}
 			</div>
 		</header>
 		<section aria-labelledby="artist-popular">

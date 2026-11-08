@@ -14,6 +14,8 @@ const track = { mbid: trackId, title: 'First Light', release_mbid: albumId, rele
 	artist_mbid: artistId, artist: release.artist, duration_ms: 90_000, track_no: 1, medium_no: 1, art_url: release.art_url };
 
 async function catalogue(page: Page) {
+	await page.route('**/v1/me/library/albums/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ saved: false, savedAt: null }) }));
+	await page.route('**/v1/me/library/artists/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ followed: false, followedAt: null }) }));
 	await page.route('**/v1/releases/*/art', (route) => route.fulfill({ status: 404, body: '' }));
 	await page.route('**/v1/releases/*', (route) => {
 		const id = new URL(route.request().url()).pathname.split('/').pop();
@@ -46,7 +48,8 @@ test('album preserves multi-disc occurrences, unknown durations and real entity 
 	await expect(page.getByRole('heading', { name: 'North Window', level: 1 })).toBeVisible();
 	await expect(page.getByRole('heading', { name: 'Appears on' })).toBeVisible();
 	await expect(page.getByText('Guest appearances are not available in this mirror response.')).toBeVisible();
-	await expect(page.getByRole('button', { name: /follow|save/i })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Follow', exact: true })).toBeEnabled();
+	await expect(page.getByRole('button', { name: 'Follow', exact: true })).toHaveAttribute('aria-pressed', 'false');
 });
 
 test('artist groups editions, filters release types and resets filters on a new artist', async ({ page }) => {

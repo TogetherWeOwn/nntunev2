@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { invalidate } from '$app/navigation';
+	import { createCollectionPreference } from '#lib/catalogue/preference.svelte.js';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
@@ -11,6 +13,14 @@
 
 	let { data }: { data: PageData } = $props();
 	let retrying = $state(false);
+	const preference = createCollectionPreference('albums', { baseUrl: PUBLIC_API_BASE_URL });
+	$effect(() => {
+		const mbid = release?.mbid;
+		const generation = data.authGeneration;
+		if (mbid) untrack(() => preference.load(mbid, generation));
+		else preference.clear();
+		return () => preference.clear();
+	});
 	const authChanged = $derived(data.authGeneration !== catalogueAuthGeneration());
 	const detail = $derived(authChanged ? null : data.value);
 	const release = $derived(detail?.release);
@@ -41,6 +51,20 @@
 					<a href={`/artist/${release.artist_mbid}`}>{release.artist ?? 'Unknown artist'}</a>
 				{:else}<p>{release.artist ?? 'Unknown artist'}</p>{/if}
 				<p>{detail.tracks.length} available {detail.tracks.length === 1 ? 'track' : 'tracks'} · {duration ?? 'Total duration unknown'}</p>
+				<button class="nt-button nt-button--ghost" aria-pressed={preference.value ?? undefined} aria-busy={preference.pending}
+					disabled={preference.pending || preference.value === null || preference.failure !== null} onclick={() => preference.toggle()}>
+					{preference.value ? 'Saved' : 'Save album'}
+				</button>
+				{#if preference.pending}
+					<p role="status">{preference.value === null ? 'Checking saved status…' : 'Updating saved status…'}</p>
+				{:else if preference.failure === 'signed-out'}
+					<p role="status">Sign in to manage saved albums.</p><a href="/login">Sign in</a>
+				{:else if preference.failure === 'account-deleting'}
+					<p role="status">Saved albums cannot change while account deletion is scheduled.</p>
+				{:else if preference.failure}
+					<p role="status">{preference.failure === 'not-found' ? 'Saved status is unavailable for this release.' : "We couldn't confirm saved status. Check it again before making another change."}</p>
+					<button class="nt-button nt-button--ghost" onclick={() => preference.retry()}>Retry saved status</button>
+				{/if}
 			</div>
 		</header>
 
