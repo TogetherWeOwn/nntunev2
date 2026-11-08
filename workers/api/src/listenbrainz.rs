@@ -354,7 +354,7 @@ fn header<'a>(headers: &'a [(&str, &str)], name: &'a str) -> impl Iterator<Item 
 /// the largest valid value wins (conservative).
 fn max_u64(headers: &[(&str, &str)], name: &str) -> Option<u64> {
     header(headers, name)
-        .filter(|v| !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|v| v.parse::<u64>().ok())
         .max()
 }
@@ -368,7 +368,9 @@ fn max_u64(headers: &[(&str, &str)], name: &str) -> Option<u64> {
 ///   `DEFAULT_EXHAUSTED_WAIT_S` if no usable reset.
 /// - Otherwise: one second, including missing/malformed remaining headers.
 ///
-/// Never shorten a provider cooldown. The transport must reject unsupported
+/// A valid numeric `Retry-After` is a lower bound for every status and
+/// remaining-budget combination. Never shorten a provider cooldown.
+/// The transport must reject unsupported
 /// `Retry-After` HTTP-date values before retrying; this helper handles delta
 /// seconds and the documented ListenBrainz numeric reset headers only.
 /// The adapter must persist and atomically reserve a shared request budget;
@@ -401,6 +403,7 @@ pub fn next_allowed_at(now_s: u64, status: u16, headers: &[(&str, &str)]) -> u64
             .unwrap_or(MIN_REQUEST_INTERVAL_S)
             .max(1)
     };
+    let wait = wait.max(max_u64(headers, "retry-after").unwrap_or(0));
     now_s.saturating_add(wait)
 }
 
@@ -618,6 +621,37 @@ mod tests {
         assert_eq!(
             next_allowed_at(u64::MAX, 429, &[("retry-after", "5")]),
             u64::MAX
+        );
+    }
+
+    #[test]
+    fn retry_after_is_a_floor_even_when_budget_is_exhausted() {
+        for status in [200, 429, 503] {
+            let headers = [
+                ("Retry-After", "120"),
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset-In", "5"),
+            ];
+            assert_eq!(next_allowed_at(1000, status, &headers), 1120);
+        }
+    }
+
+    #[test]
+    fn zero_padded_numeric_headers_keep_their_delay() {
+        assert_eq!(
+            next_allowed_at(1000, 429, &[("Retry-After", "000000000000000000003600")]),
+            4600
+        );
+        assert_eq!(
+            next_allowed_at(
+                1000,
+                200,
+                &[
+                    ("X-RateLimit-Remaining", "0"),
+                    ("X-RateLimit-Reset-In", "000000000000000000003600")
+                ]
+            ),
+            4600
         );
     }
 
