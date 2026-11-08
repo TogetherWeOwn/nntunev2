@@ -207,6 +207,108 @@ fn taste_likes_put_is_canonical_idempotent_and_first_created_at_wins() {
 }
 
 #[test]
+fn taste_like_after_non_love_stamps_the_current_write_time_not_the_old_signal_time() {
+    let h = harness();
+    let cookie = taste_user(&h, "tl-2");
+    taste_library(&h, "tl-2");
+    let now = i64::try_from(NOW).unwrap();
+    // A prior hide, an expired snooze and a live snooze all carry their own
+    // old timestamps; none may leak out as `liked_at`.
+    taste_seed_row(&h, "tl-2", "track", "job-t1", "hide", None, 500);
+    taste_seed_row(&h, "tl-2", "track", "job-t2", "snooze", Some(now - 10), 600);
+    taste_seed_row(
+        &h,
+        "tl-2",
+        "track",
+        TASTE_REC,
+        "snooze",
+        Some(now + 999),
+        700,
+    );
+    for target in ["job-t1", "job-t2", TASTE_REC] {
+        let resp = taste_call(
+            &h,
+            "PUT",
+            &format!("/v1/me/likes/track/{target}"),
+            &cookie,
+            None,
+        );
+        assert_eq!(resp.status, 200, "{target}: {}", resp.body);
+        assert_eq!(taste_json(&resp)["liked_at"], now, "{target}");
+        let stored = taste_row(&h, "tl-2", "track", target).unwrap();
+        assert_eq!((stored.signal.as_str(), stored.created_at), ("love", now));
+        assert_eq!(stored.snooze_until, None);
+    }
+}
+
+#[test]
+fn taste_repeated_love_keeps_created_at_through_both_write_routes() {
+    let h = harness();
+    let cookie = taste_user(&h, "tl-3");
+    taste_library(&h, "tl-3");
+    taste_seed_row(&h, "tl-3", "track", "job-t1", "love", None, 1_000);
+    for _ in 0..2 {
+        let resp = taste_call(&h, "PUT", "/v1/me/likes/track/job-t1", &cookie, None);
+        assert_eq!(taste_json(&resp)["liked_at"], 1_000);
+        let resp = taste_put_signal(&h, &cookie, "track", "job-t1", "love", None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            taste_row(&h, "tl-3", "track", "job-t1").unwrap().created_at,
+            1_000
+        );
+    }
+}
+
+#[test]
+fn taste_fake_store_upsert_created_at_matches_the_production_sql_rule() {
+    use crate::taste::{TargetKind::Track, TasteSignal as S};
+    let h = harness();
+    let cookie = taste_user(&h, "tl-4");
+    taste_library(&h, "tl-4");
+    let put = |signal: S, until: Option<u64>, now: u64| {
+        assert!(block_on(
+            h.store
+                .taste_upsert("tl-4", Track, "job-t1", signal, until, now)
+        )
+        .unwrap());
+        taste_row(&h, "tl-4", "track", "job-t1").unwrap()
+    };
+    // (signal, snooze_until, write time, expected created_at)
+    let steps = [
+        (S::Ban, None, 10, 10),
+        (S::Love, None, 20, 20), // ban -> love: write time
+        (S::Dislike, None, 30, 20),
+        (S::Love, None, 40, 40), // dislike -> love: write time
+        (S::Hide, None, 100, 40),
+        (S::Love, None, 200, 200), // non-love -> love: write time
+        (S::Love, None, 300, 200), // same-love replay: first wins
+        (S::Hide, None, 400, 200), // love -> other keeps the stamp
+        (S::Snooze, Some(450), 410, 200),
+        (S::Love, None, 500, 500), // expired snooze -> love: write time
+        (S::Love, None, 600, 500),
+    ];
+    for (signal, until, now, created) in steps {
+        let row = put(signal, until, now);
+        assert_eq!(
+            (row.created_at, row.updated_at),
+            (created, i64::try_from(now).unwrap())
+        );
+    }
+    // job-t2 was loved at 450, between the initial love (200) and the
+    // converted love (500): job-t1 sorts first only if it was restamped.
+    taste_seed_row(&h, "tl-4", "track", "job-t2", "love", None, 450);
+    let listed = taste_items(&taste_call(&h, "GET", "/v1/me/likes", &cookie, None));
+    assert_eq!(listed[0]["target_id"], "job-t1");
+    assert_eq!(listed[0]["created_at"], 500);
+    assert_eq!(listed[1]["target_id"], "job-t2");
+    assert_eq!(listed[1]["created_at"], 450);
+    // The fake rule above is the production SQL rule.
+    assert!(crate::taste::taste_upsert_statement().contains(
+        "created_at = CASE WHEN EXCLUDED.signal = 'love' AND account_taste.signal <> 'love' THEN EXCLUDED.created_at ELSE account_taste.created_at END"
+    ));
+}
+
+#[test]
 fn taste_unlike_is_idempotent_and_keeps_suppression_signals() {
     let h = harness();
     let cookie = taste_user(&h, "tu-1");

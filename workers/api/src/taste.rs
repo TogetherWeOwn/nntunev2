@@ -221,10 +221,12 @@ pub fn member_target_statement(kind: TargetKind) -> &'static str {
 /// Upsert one taste signal, fenced on the owner's `users` row
 /// `FOR SHARE` like every user-owned writer: a deleting or nonexistent
 /// account writes zero rows (the handler's `account_deleting` probe then
-/// classifies the 409). `created_at` is first-wins — the upsert updates
-/// `signal`, `snooze_until` and `updated_at` only.
+/// classifies the 409). `created_at` is the like time: a same-love replay
+/// keeps the first stamp, while a non-love -> love transition (hide, ban,
+/// dislike, live or expired snooze) restamps it to the write time so the
+/// old signal's timestamp is never exposed as `liked_at`.
 pub fn taste_upsert_statement() -> &'static str {
-    "INSERT INTO public.account_taste (user_id, kind, target_id, signal, snooze_until, created_at, updated_at) SELECT $1, $2, $3, $4, $5, $6, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, kind, target_id) DO UPDATE SET signal = EXCLUDED.signal, snooze_until = EXCLUDED.snooze_until, updated_at = EXCLUDED.updated_at RETURNING 1"
+    "INSERT INTO public.account_taste (user_id, kind, target_id, signal, snooze_until, created_at, updated_at) SELECT $1, $2, $3, $4, $5, $6, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, kind, target_id) DO UPDATE SET signal = EXCLUDED.signal, snooze_until = EXCLUDED.snooze_until, created_at = CASE WHEN EXCLUDED.signal = 'love' AND account_taste.signal <> 'love' THEN EXCLUDED.created_at ELSE account_taste.created_at END, updated_at = EXCLUDED.updated_at RETURNING 1"
 }
 
 /// Read back one stored row after a write (the likes PUT answers with

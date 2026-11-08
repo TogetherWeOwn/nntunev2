@@ -4368,8 +4368,9 @@ where
     else {
         return not_found();
     };
-    // Idempotent upsert: the first `created_at` wins; a re-PUT refreshes
-    // `updated_at` and still answers 200 with the stored row.
+    // Idempotent upsert: a love replay keeps the first `created_at`; a
+    // non-love -> love transition stamps the current write time. A re-PUT
+    // refreshes `updated_at` and still answers 200 with the stored row.
     match ctx
         .store
         .taste_upsert(
@@ -6393,6 +6394,21 @@ where
         Ok(id) => id,
         Err(_) => return unavailable(),
     };
+    // Resolve and persist privacy before touching the incumbent lease. A
+    // failure must not displace it, and no compensating restore may overwrite
+    // a newer concurrent holder. A refused acquire can leave an unused mark
+    // for this server-minted key, but no grant or ledger play can use that key.
+    if let Some(resp) = mark_private_play(
+        ctx,
+        &claims.user_id,
+        &body.session_id,
+        &body.track_id,
+        &play_id,
+    )
+    .await
+    {
+        return resp;
+    }
     let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
     match ctx
         .store
@@ -6407,28 +6423,15 @@ where
         )
         .await
     {
-        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => {
-            if let Some(resp) = mark_private_play(
-                ctx,
-                &claims.user_id,
-                &body.session_id,
-                &body.track_id,
-                &play_id,
-            )
-            .await
-            {
-                return resp;
-            }
-            play_grant_response(
-                secret,
-                &claims.user_id,
-                &body.track_id,
-                &play_id,
-                epoch,
-                ctx.now,
-                lease_expires_at,
-            )
-        }
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+            secret,
+            &claims.user_id,
+            &body.track_id,
+            &play_id,
+            epoch,
+            ctx.now,
+            lease_expires_at,
+        ),
         Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
             // Zero rows back can also mean the deletion fence closed
             // after the up-front check (the marker landed mid-request):
@@ -8235,6 +8238,8 @@ mod tests {
         private_plays: RefCell<std::collections::HashSet<(String, String)>>,
         fail_private_probe: RefCell<bool>,
         fail_private_mark: RefCell<bool>,
+        /// Simulate a concurrent acquisition while the privacy query is in flight.
+        lease_during_private_probe: RefCell<Option<crate::playback::LeaseRow>>,
         taste_write_budget: RefCell<Option<usize>>,
     }
 
@@ -9383,6 +9388,10 @@ mod tests {
             let mut rows = self.taste_rows.borrow_mut();
             match rows.get_mut(&key) {
                 Some(row) => {
+                    // Mirror `taste_upsert_statement`: only non-love -> love restamps.
+                    if signal == crate::taste::TasteSignal::Love && row.signal != "love" {
+                        row.created_at = i64::try_from(now).unwrap_or(i64::MAX);
+                    }
                     row.signal = signal.as_str().to_string();
                     row.snooze_until = snooze_until.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
                     row.updated_at = i64::try_from(now).unwrap_or(i64::MAX);
@@ -9578,6 +9587,11 @@ mod tests {
             session_id: &str,
             now: u64,
         ) -> Result<bool, StoreError> {
+            if let Some(row) = self.lease_during_private_probe.borrow_mut().take() {
+                self.playback_leases
+                    .borrow_mut()
+                    .insert(user_id.to_string(), row);
+            }
             if *self.fail_private_probe.borrow() {
                 return Err(StoreError);
             }
@@ -14203,6 +14217,120 @@ mod tests {
         let holder: serde_json::Value = serde_json::from_str(&holder.body).unwrap();
         assert_eq!(holder["lease"], "active");
         assert_eq!(holder["lease_expires_at"], NOW + 45);
+    }
+
+    #[test]
+    fn play_issue_privacy_failures_preserve_incumbent_and_allow_retry() {
+        for fail_probe in [true, false] {
+            let h = play_harness();
+            let cookie = play_user(&h);
+            let user = "user-plays-1";
+            seed_entitled(&h, user, "plus", 100);
+            let first = play_call(
+                &h,
+                &cookie,
+                serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+            );
+            assert_eq!(first.status, 200, "{}", first.body);
+            let incumbent = h.store.playback_leases.borrow()[user].clone();
+            h.store
+                .private_sessions
+                .borrow_mut()
+                .insert((user.to_string(), "tab-b".to_string()), NOW + 600);
+            *h.store.fail_private_probe.borrow_mut() = fail_probe;
+            *h.store.fail_private_mark.borrow_mut() = !fail_probe;
+            let request = serde_json::json!({
+                "track_id": "track-10", "session_id": "tab-b", "takeover": true,
+            });
+            let failed = play_call(&h, &cookie, request.clone());
+            assert_eq!(failed.status, 503, "{}", failed.body);
+            assert!(taste_json(&failed)["grant"].is_null());
+            assert!(h.store.private_plays.borrow().is_empty());
+            assert_eq!(h.store.playback_leases.borrow()[user], incumbent);
+            let beat = h.call_full(
+                "POST",
+                "/v1/plays/heartbeat",
+                Some(
+                    serde_json::json!({
+                        "session_id": incumbent.session_id,
+                        "play_id": incumbent.play_id,
+                        "lease_epoch": incumbent.epoch,
+                    })
+                    .to_string(),
+                ),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(beat.status, 200, "{}", beat.body);
+            assert_eq!(taste_json(&beat)["lease"], "active");
+            *h.store.fail_private_probe.borrow_mut() = false;
+            *h.store.fail_private_mark.borrow_mut() = false;
+            let retried = play_call(&h, &cookie, request);
+            assert_eq!(retried.status, 200, "{}", retried.body);
+            assert_eq!(taste_json(&retried)["lease_epoch"], incumbent.epoch + 1);
+            let play = taste_json(&retried)["play_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let key = crate::ledger::derive_play_idempotency_key(user, "track-10", &play).unwrap();
+            assert!(h
+                .store
+                .private_plays
+                .borrow()
+                .contains(&(user.to_string(), key)));
+        }
+    }
+
+    #[test]
+    fn play_issue_failed_privacy_probe_never_restores_over_a_concurrent_holder() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let user = "user-plays-1";
+        seed_entitled(&h, user, "plus", 100);
+        assert_eq!(
+            play_call(
+                &h,
+                &cookie,
+                serde_json::json!({
+                    "track_id": "track-9", "session_id": "tab-a",
+                })
+            )
+            .status,
+            200
+        );
+        let newer = crate::playback::LeaseRow {
+            session_id: "tab-c".to_string(),
+            track_id: "track-11".to_string(),
+            play_id: "concurrent-play".to_string(),
+            epoch: 3,
+            expires_at: NOW + 45,
+        };
+        *h.store.lease_during_private_probe.borrow_mut() = Some(newer.clone());
+        *h.store.fail_private_probe.borrow_mut() = true;
+        let failed = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-10", "session_id": "tab-b", "takeover": true,
+            }),
+        );
+        assert_eq!(failed.status, 503, "{}", failed.body);
+        assert_eq!(h.store.playback_leases.borrow()[user], newer);
+        let beat = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": newer.session_id, "play_id": newer.play_id,
+                    "lease_epoch": newer.epoch,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(beat.status, 200, "{}", beat.body);
+        assert_eq!(taste_json(&beat)["lease"], "active");
     }
 
     #[test]

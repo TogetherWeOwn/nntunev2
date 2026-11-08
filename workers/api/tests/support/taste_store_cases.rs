@@ -229,6 +229,44 @@ async fn preference_sql_is_owner_scoped_replay_safe_and_erased_with_account() {
         1
     );
 
+    // created_at is the like time: same-love replay keeps it, any
+    // non-love -> love transition (expired snooze included) restamps it.
+    let other = "transition-target";
+    for (signal, until, now, created) in [
+        ("hide", None, 2000_i64, 2000_i64),
+        ("love", None, 2010, 2010),
+        ("love", None, 2020, 2010),
+        ("snooze", Some(2025_i64), 2030, 2010),
+        ("love", None, 2040, 2040),
+        ("love", None, 2050, 2040),
+    ] {
+        assert_eq!(
+            tx.query(
+                taste_upsert_statement(),
+                &[&a, &"track", &other, &signal, &until, &now]
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        let row = tx
+            .query_one(taste_get_statement(), &[&a, &"track", &other])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>("created_at"), created, "{signal}@{now}");
+        assert_eq!(row.get::<_, i64>("updated_at"), now);
+    }
+    let liked = tx
+        .query(likes_list_statement(), &[&a, &500_i64])
+        .await
+        .unwrap();
+    assert_eq!(liked[0].get::<_, String>("target_id"), other);
+    tx.query(like_delete_statement(), &[&a, &"track", &other])
+        .await
+        .unwrap()
+        .len();
+
     tx.execute(
         "UPDATE public.users SET deleting_at = to_timestamp(1100) WHERE id = $1",
         &[&a],
