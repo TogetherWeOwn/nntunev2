@@ -160,18 +160,11 @@ mod tests {
     use crate::listenbrainz::LinkInput;
     use std::cell::{Cell, RefCell};
     use std::pin::pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
+    use std::task::{Context, Poll, Waker};
 
     /// Fakes complete immediately; a pending future is a test bug.
     fn block_on<F: Future>(f: F) -> F::Output {
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let mut f = pin!(f);
         match f.as_mut().poll(&mut cx) {
             Poll::Ready(v) => v,
