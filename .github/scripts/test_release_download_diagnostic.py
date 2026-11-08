@@ -106,6 +106,72 @@ class DownloadDiagnosticTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 32)
         self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
 
+    def test_raw_redirect_controls_are_not_normalized_or_requested(self):
+        for control in [*range(32), 127]:
+            for final in (False, True):
+                for leading in (False, True):
+                    with self.subTest(control=control, final=final, leading=leading):
+                        location = b"https://github.com/example?DO_NOT_LOG"
+                        byte = bytes([control])
+                        location = byte + location if leading else location + byte
+                        fields = [b"Location: " + location, b"x-cache: MISS"]
+                        if final:
+                            fields.reverse()
+                        raw = (b"HTTP/1.1 302 Found\r\n" + b"\r\n".join(fields)
+                               + b"\r\n\r\n\nNNTUNE_TIMING 302 0.001000 0.002000 "
+                               b"0.003000 0.004000 0.005000\n")
+                        response = subprocess.CompletedProcess([], 0, raw)
+                        with tempfile.TemporaryDirectory() as root, io.StringIO() as out:
+                            with patch.object(diagnostic.subprocess, "run", return_value=response) as run:
+                                with redirect_stdout(out):
+                                    self.assertFalse(diagnostic.probe(ASSET, root))
+                            self.assertEqual(run.call_count, 1)
+                            self.assertEqual(list(Path(root).iterdir()), [])
+                            records = [json.loads(line) for line in out.getvalue().splitlines()]
+                        self.assertEqual(records[-1]["cleanup"], "passed")
+                        self.assertEqual(records[-2]["failure_type"], "ValueError")
+                        self.assertNotIn("DO_NOT_LOG", json.dumps(records))
+
+    def test_raw_valid_redirect_reaches_checksum_and_cleanup(self):
+        signed = "https://release-assets.githubusercontent.com/asset?signature=DO_NOT_LOG"
+        redirect = (b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/2 302\r\n"
+                    + f"Location: {signed}\r\n\r\n".encode())
+        success = b"HTTP/2 200\r\ncontent-length: 36\r\n\r\n"
+        responses = [(302, redirect), (200, success)]
+        calls = []
+
+        def curl(command, **kwargs):
+            calls.append(kwargs["input"])
+            status, headers = responses[len(calls) - 1]
+            output = Path(command[command.index("--output") + 1])
+            output.write_bytes(SYNTHETIC if status == 200 else b"")
+            raw = headers + f"\nNNTUNE_TIMING {status} 0.001000 0.002000 0.003000 0.004000 0.005000\n".encode()
+            return subprocess.CompletedProcess(command, 0, raw)
+
+        with tempfile.TemporaryDirectory() as root, io.StringIO() as out:
+            with patch.object(diagnostic.subprocess, "run", side_effect=curl), redirect_stdout(out):
+                self.assertTrue(diagnostic.probe(ASSET, root))
+            self.assertEqual(list(Path(root).iterdir()), [])
+            records = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(calls, [f'url = "{url}"\n'.encode() for url in (ASSET[1], signed)])
+        self.assertEqual(records[-2]["checksum"], "passed")
+        self.assertEqual(records[-1]["cleanup"], "passed")
+        self.assertNotIn("DO_NOT_LOG", json.dumps(records))
+
+    def test_curl_globbing_is_disabled_for_literal_redirects(self):
+        raw = (b"HTTP/2 504\r\n\r\n\nNNTUNE_TIMING 504 0.001000 0.002000 "
+               b"0.003000 0.004000 0.005000\n")
+        for path in ("{first,second}", "[1-3]"):
+            url = "https://github.com/" + path
+            with self.subTest(path=path):
+                self.assertEqual(diagnostic.host(url), "github.com")
+                with patch.object(diagnostic.subprocess, "run", return_value=subprocess.CompletedProcess([], 22, raw)) as run:
+                    diagnostic.request(url, Path("unused"))
+                command = run.call_args.args[0]
+                self.assertEqual(command[:3], ["curl", "--disable", "--globoff"])
+                self.assertNotIn(url, command)
+                self.assertEqual(run.call_args.kwargs["input"], f'url = "{url}"\n'.encode())
+
     def test_exception_cleanup_and_no_exception_text(self):
         with tempfile.TemporaryDirectory() as root, io.StringIO() as out:
             with patch.object(diagnostic, "request", side_effect=TimeoutError("DO_NOT_LOG")), redirect_stdout(out):

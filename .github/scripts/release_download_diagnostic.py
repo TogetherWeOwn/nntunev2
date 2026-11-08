@@ -53,7 +53,7 @@ def host(url):
 def request(url, output):
     # No -L, retries, auth, cookies, netrc, config files, body logs or verbose
     # tracing. Signed redirect URLs exist only in memory/stdin, never argv/logs.
-    command = ["curl", "--disable", "--silent", "--fail", "--proto", "=https",
+    command = ["curl", "--disable", "--globoff", "--silent", "--fail", "--proto", "=https",
                "--connect-timeout", "10", "--max-time", "30",
                "--max-filesize", str(MAX_BYTES), "--dump-header", "-",
                "--output", str(output), "--write-out",
@@ -72,12 +72,13 @@ def request(url, output):
         raise ValueError("invalid timing metadata")
     timing = dict(zip(TIMINGS, [int(values[0]), *(float(v) for v in values[1:])]))
     # A proxy CONNECT or interim response may precede the actual response.
-    blocks = re.split(rb"\r?\n\r?\n", headers.strip())
+    # Split only HTTP delimiters; preserve controls for redirect validation.
+    blocks = [block for block in headers.split(b"\r\n\r\n") if block]
     fields = {}
-    for line in blocks[-1].splitlines()[1:]:
+    for line in blocks[-1].split(b"\r\n")[1:]:
         key, sep, value = line.partition(b":")
         if sep:
-            fields[key.decode("ascii").lower()] = value.strip().decode("ascii")
+            fields[key.decode("ascii").lower()] = value.strip(b" ").decode("ascii")
     safe = {k: v for k, v in fields.items()
             if k in SAFE_HEADERS and re.fullmatch(SAFE_HEADERS[k], v)}
     return result.returncode, timing, safe, fields.get("location")
