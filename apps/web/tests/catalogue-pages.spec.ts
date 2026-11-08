@@ -59,7 +59,7 @@ test('artist groups editions, filters release types and resets filters on a new 
 	await page.getByText('2 available editions', { exact: true }).click();
 	await expect(page.getByRole('link', { name: /Quiet Rooms · 2025/ })).toHaveAttribute('href', `/album/${editionId}`);
 	await page.getByRole('button', { name: 'Compilations', exact: true }).click();
-	await expect(page.getByRole('article').getByRole('status')).toHaveText('No compilations available in this selection.');
+	await expect(page.getByRole('region', { name: 'Discography', exact: true }).getByRole('status')).toHaveText('No compilations available in this selection.');
 	await expect(page.getByRole('button', { name: 'Compilations', exact: true })).toHaveAttribute('aria-pressed', 'true');
 	await page.getByRole('button', { name: 'All', exact: true }).click();
 	await page.locator('.catalogue-card').click();
@@ -239,5 +239,5 @@ test('a capped artist discography is labelled incomplete', async ({ page }) => {
 	await catalogue(page);
 	await page.route('**/v1/artists/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ artist, releases: [release], truncated: true }) }));
 	await page.goto(`/artist/${artistId}`);
-	await expect(page.getByRole('article').getByRole('status')).toContainText('This discography may be incomplete.');
+	await expect(page.getByRole('region', { name: 'Discography', exact: true }).getByRole('status')).toContainText('This discography may be incomplete.');
 });
