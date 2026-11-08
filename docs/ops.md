@@ -797,7 +797,17 @@ Recurrence reopens the existing keyed issue. Repeat and recovery comments carry
 an occurrence identity: retries reconcile delivery before skipping a recorded
 source, including when a write succeeded but its response was lost. Initial
 issue creation is the opening notification, not an additional repeat comment.
-Keep existing gate keys stable.
+Delivery intent, occurrence and progress cursor are persisted on the issue
+before posting. Comment receipt lookup uses the read-only GraphQL comments
+connection, at most ten pages of 100 comments per reconciliation. Reaching
+that budget saves progress and defers only that gate, rather than failing or
+assuming an unexamined receipt absent. Later scans resume from the cursor,
+even when the source run has left the recent-run window. Existing issues
+without delivery state migrate by scanning from the beginning; subsequent
+occurrences retain the last completed delivery's lower bound. Accumulated
+comment history therefore has no fixed lifetime ceiling. A delivered marker
+prevents duplicate notifications after a lost response or failed final PATCH;
+recovery closes only after delivery is confirmed. Keep existing gate keys stable.
 The existing MB/ingest job names are observed only; reporting does not
 enable those lanes or change their retirement/qualification holds.
 
@@ -844,8 +854,8 @@ is not detected by this observer. Do not claim unattended hold coverage.
 
 Read-only replay of a completed main-branch run:
 `GITHUB_REPOSITORY=TogetherWeOwn/nntunev2 python3 -I ci/incident_report.py --run-id <run-id> --dry-run`
-(with a granted `GITHUB_TOKEN`). Dry runs perform API GETs and print planned
-issue actions without writing. Superseded runs print `superseded` instead
+(with a granted `GITHUB_TOKEN`). Dry runs perform REST GETs and read-only
+GraphQL queries and print planned issue actions without writing. Superseded runs print `superseded` instead
 of replaying stale alerts. Offline API-fixture tests run in the required
 `release-proof` CI job; neither mode touches staging or production.
 

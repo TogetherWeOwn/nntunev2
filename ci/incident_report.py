@@ -55,8 +55,10 @@ class API:
         self.token = token
 
     def request(self, method, path, body=None):
+        url = ("https://api.github.com/graphql" if path == "/graphql" else
+               "https://api.github.com/repos/" + REPO + path)
         req = urllib.request.Request(
-            "https://api.github.com/repos/" + REPO + path, method=method,
+            url, method=method,
             data=None if body is None else json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + self.token,
                      "Accept": "application/vnd.github+json",
@@ -90,6 +92,35 @@ class API:
                 return result
         raise ReportError("GitHub pagination exceeded bound")
 
+    def comment_page(self, number, cursor=None):
+        # Cursor pagination avoids an offset into a growing lifetime history.
+        data = self.request("POST", "/graphql", {
+            "query": """query($number:Int!, $cursor:String) {
+              repository(owner:"TogetherWeOwn", name:"nntunev2") {
+                issue(number:$number) { comments(first:100, after:$cursor) {
+                  edges { cursor node { body } }
+                  pageInfo { endCursor hasNextPage }
+                } }
+              }
+            }""", "variables": {"number": number, "cursor": cursor}})
+        try:
+            if data.get("errors"):
+                raise ValueError
+            connection = data["data"]["repository"]["issue"]["comments"]
+            edges, info = connection["edges"], connection["pageInfo"]
+            end, more = info["endCursor"], info["hasNextPage"]
+            if (not isinstance(edges, list) or len(edges) > 100 or type(more) is not bool
+                    or (end is not None and (not isinstance(end, str) or len(end) > 2048))
+                    or any(not isinstance(e["cursor"], str) or not e["cursor"]
+                           or len(e["cursor"]) > 2048 or not isinstance(e["node"]["body"], str)
+                           for e in edges)
+                    or (edges and end != edges[-1]["cursor"])
+                    or (more and (not edges or end == cursor))):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ReportError("GitHub comment connection malformed") from None
+        return edges, end, more
+
 
 def trusted(run):
     workflow = run.get("path", "").removeprefix(".github/workflows/")
@@ -122,14 +153,95 @@ def source(issue):
     return tuple(map(int, match.groups())) if match else None
 
 
-def ensure_comment(api, number, key, occurrence, kind, body, dry_run):
-    marker = f"<!-- incident-occurrence: {key} {occurrence[0]}:{occurrence[1]} {kind} -->"
-    comments = api.pages(f"/issues/{number}/comments")
-    if any(marker in (comment.get("body") or "") for comment in comments):
-        return False
+DELIVERY = re.compile(r"\n?<!-- incident-delivery: (\{[^\n]*\}) -->")
+
+
+def delivery(issue):
+    match = DELIVERY.search(issue.get("body") or "")
+    if match is None:
+        return None
+    try:
+        state = json.loads(match[1])
+        if (type(state["run_id"]) is not int or state["run_id"] <= 0
+                or type(state["attempt"]) is not int or state["attempt"] <= 0
+                or state["kind"] not in {"failure", "recovery"}
+                or type(state["delivered"]) is not bool
+                or (state["cursor"] is not None and
+                    (not isinstance(state["cursor"], str) or not state["cursor"]
+                     or len(state["cursor"]) > 2048))):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise ReportError("Incident delivery state malformed") from None
+    return state
+
+
+def save_delivery(api, issue, state, dry_run):
+    body = DELIVERY.sub("", issue["body"]).rstrip()
+    body += "\n<!-- incident-delivery: " + json.dumps(state, separators=(",", ":")) + " -->\n"
+    payload = {"body": body, "state": "open"}
+    if state["delivered"] and state["kind"] == "recovery":
+        payload.update(state="closed", state_reason="completed")
     if not dry_run:
-        api.request("POST", f"/issues/{number}/comments", {"body": body + "\n" + marker})
-    return True
+        api.request("PATCH", f"/issues/{issue['number']}", payload)
+        issue.update(payload)
+
+
+def ensure_comment(api, issue, key, occurrence, kind, dry_run):
+    state = delivery(issue)
+    if state is None or (state["run_id"], state["attempt"], state["kind"]) != (*occurrence, kind):
+        # The previous completed delivery's cursor is a safe lower bound: the
+        # serialized writer cannot have posted a newer occurrence before it.
+        state = {"run_id": occurrence[0], "attempt": occurrence[1], "kind": kind,
+                 "cursor": state["cursor"] if state else None, "delivered": False}
+        save_delivery(api, issue, state, dry_run)
+    if state["delivered"]:
+        return True
+    marker = f"<!-- incident-occurrence: {key} {occurrence[0]}:{occurrence[1]} {kind} -->"
+    for _ in range(10):
+        edges, end, more = api.comment_page(issue["number"], state["cursor"])
+        for edge in edges:
+            if marker in edge["node"]["body"]:
+                state.update(cursor=edge["cursor"], delivered=True)
+                save_delivery(api, issue, state, dry_run)
+                return True
+        if edges:
+            state["cursor"] = end
+        if not more:
+            # The durable intent stays pending until POST and the final PATCH
+            # succeed. A lost response is searched from its saved lower bound.
+            if not dry_run:
+                text = DELIVERY.sub("", issue["body"]).replace(
+                    "<!-- incident-notification: failure -->", "").strip()
+                prefix = "Recovered." if kind == "recovery" else "Still failing."
+                api.request("POST", f"/issues/{issue['number']}/comments",
+                            {"body": prefix + "\n\n" + text + "\n" + marker})
+            state["delivered"] = True
+            save_delivery(api, issue, state, dry_run)
+            return True
+    # This invocation spent its bounded lookup budget. Resume next scan from
+    # the durable cursor, not page one; never assume an unexamined receipt absent.
+    save_delivery(api, issue, state, dry_run)
+    return False
+
+
+def reconcile_pending(api, issues, dry_run):
+    actions = []
+    keys = {workflow + ":" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            for workflow, gates in GATES.items() for name in gates}
+    for issue in issues:
+        if "pull_request" in issue:
+            continue
+        key = next((k for k in keys if f"<!-- incident-key: {k} -->" in (issue.get("body") or "")), None)
+        if key is None:
+            continue
+        state = delivery(issue)
+        if state is not None and not state["delivered"]:
+            if source(issue) != (state["run_id"], state["attempt"]):
+                raise ReportError("Incident delivery source mismatch")
+            done = ensure_comment(api, issue, key, (state["run_id"], state["attempt"]),
+                                  state["kind"], dry_run)
+            actions.append(f"{'delivered' if done else 'pending'} #{issue['number']}: {key}")
+    return actions
 
 
 def recent(api, dry_run=False):
@@ -169,7 +281,9 @@ def recent(api, dry_run=False):
         workflow = run["path"].rsplit("/", 1)[-1]
         evidence[workflow][(run["id"], run["run_attempt"])] = api.pages(
             f"/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
-    actions = []
+    # Pending deliveries outlive the moving run window. Drain them even when
+    # no new source run is eligible, and allow unrelated gates to continue.
+    actions = reconcile_pending(api, api.pages("/issues?state=all&labels=incident"), dry_run)
     for run in sorted(runs, key=lambda r: (r["id"], r["run_attempt"])):
         workflow = run["path"].rsplit("/", 1)[-1]
         actions.extend(report(api, run["id"], dry_run, newer_evidence=evidence[workflow]))
@@ -203,7 +317,7 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
     # Retain source ordering even after recovery, so a delayed older failure
     # cannot reopen the same episode. Reuse a closed keyed issue on recurrence.
     issues = api.pages("/issues?state=all&labels=incident")
-    actions = []
+    actions = reconcile_pending(api, issues, dry_run)
     for name, evidence in GATES[workflow].items():
         job = gate_result(jobs, name, evidence)
         if job is None:
@@ -232,16 +346,19 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
                      "promotion target. The dispatch input is not exposed by the runs API; "
                      "consult the linked preflight. No production change is authorized here.\n")
         occurrence = (run_id, attempt)
+        if any(delivery(i) is not None and not delivery(i)["delivered"] for i in matches):
+            actions.append(f"pending: {name}")
+            continue
         if any(source(i) is not None and source(i) > occurrence for i in matches):
             actions.append("superseded")
             continue
         recorded_matches = [i for i in matches if source(i) == occurrence]
         if recorded_matches:
             issue = recorded_matches[0]
-            if conclusion in BAD and "<!-- incident-notification: failure -->" in issue["body"]:
-                delivered = ensure_comment(api, issue["number"], key, occurrence, "failure",
-                                           "Still failing.\n\n" + body, dry_run)
-                actions.append(f"commented #{issue['number']}: {name}" if delivered else "superseded")
+            if (conclusion in BAD and "<!-- incident-notification: failure -->" in issue["body"]
+                    and delivery(issue) is None):
+                delivered = ensure_comment(api, issue, key, occurrence, "failure", dry_run)
+                actions.append(f"commented #{issue['number']}: {name}" if delivered else f"pending: {name}")
             else:
                 actions.append("superseded")
             continue
@@ -249,13 +366,11 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
         if conclusion in BAD:
             if matches:
                 issue = matches[0]
-                actions.append(f"commented #{issue['number']}: {name}")
-                if not dry_run:
-                    api.request("PATCH", f"/issues/{issue['number']}",
-                                {"body": recorded + "<!-- incident-notification: failure -->\n",
-                                 "state": "open"})
-                ensure_comment(api, issue["number"], key, occurrence, "failure",
-                               "Still failing.\n\n" + body, dry_run)
+                previous = DELIVERY.search(issue.get("body") or "")
+                updated = dict(issue, body=recorded + "<!-- incident-notification: failure -->\n" +
+                               (previous[0] if previous else ""))
+                delivered = ensure_comment(api, updated, key, occurrence, "failure", dry_run)
+                actions.append(f"commented #{issue['number']}: {name}" if delivered else f"pending: {name}")
             else:
                 actions.append(f"opened: {name}")
                 if not dry_run:
@@ -271,12 +386,10 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
                 if source(issue) is None:
                     actions.append(f"held #{issue['number']}: unknown source")
                     continue
-                actions.append(f"recovered #{issue['number']}: {name}")
-                ensure_comment(api, issue["number"], key, occurrence, "recovery",
-                               "Recovered.\n\n" + body, dry_run)
-                if not dry_run:
-                    api.request("PATCH", f"/issues/{issue['number']}",
-                                {"body": recorded, "state": "closed", "state_reason": "completed"})
+                previous = DELIVERY.search(issue.get("body") or "")
+                updated = dict(issue, body=recorded + (previous[0] if previous else ""))
+                delivered = ensure_comment(api, updated, key, occurrence, "recovery", dry_run)
+                actions.append(f"recovered #{issue['number']}: {name}" if delivered else f"pending: {name}")
     return actions
 
 

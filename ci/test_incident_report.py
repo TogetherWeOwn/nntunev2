@@ -4,6 +4,7 @@ Run with `python3 ci/test_incident_report.py`.
 """
 
 import importlib.util
+import json
 import os
 import re
 import unittest
@@ -40,6 +41,20 @@ def issue(number, updated="2026-01-01T00:00:00Z", body=MARKER, source=(9, 1), **
     return {"number": number, "body": body, "updated_at": updated, **extra}
 
 
+def graphql_comments(comments, variables):
+    """issue.comments(first:100, after:cursor) over `comments`; cursor "c<index>"."""
+    cursor = variables["cursor"]
+    if cursor is not None and not re.fullmatch(r"c\d+", str(cursor)):
+        raise ir.ReportError("GitHub GET refused (HTTP 400)")
+    start = 0 if cursor is None else int(cursor[1:]) + 1
+    edges = [{"cursor": f"c{start + i}", "node": {"body": row["body"]}}
+             for i, row in enumerate(comments[start:start + 100])]
+    return {"data": {"repository": {"issue": {"comments": {
+        "edges": edges,
+        "pageInfo": {"endCursor": edges[-1]["cursor"] if edges else cursor,
+                     "hasNextPage": start + 100 < len(comments)}}}}}}
+
+
 class FakeAPI(ir.API):
     """Real pagination, canned GETs; records writes."""
 
@@ -54,6 +69,8 @@ class FakeAPI(ir.API):
     def request(self, method, path, body=None):
         if self.fail and self.fail in path:
             raise ir.ReportError("GitHub GET refused (HTTP 500)")
+        if method == "POST" and path == "/graphql":  # a READ: never a recorded write
+            return graphql_comments([], body["variables"])
         if method != "GET":
             self.writes.append((method, path, body))
             return {"number": 1}
@@ -81,7 +98,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(body["labels"], ["incident"])
         api = FakeAPI(jobs=[smoke("failure")], issues=[issue(7), issue(9)])
         self.assertEqual(ir.report(api, 10), [f"commented #7: {SMOKE}"])
-        self.assertEqual([w[1] for w in api.writes], ["/issues/7", "/issues/7/comments"])
+        self.assertEqual([w[1] for w in api.writes],
+                         ["/issues/7", "/issues/7/comments", "/issues/7"])
         self.assertIn("<!-- incident-source: 10:1 -->", api.writes[0][2]["body"])
 
     def test_pull_request_issue_is_not_a_match(self):
@@ -92,8 +110,10 @@ class ReportTests(unittest.TestCase):
         api = FakeAPI(jobs=[smoke("success")], issues=[issue(7)])
         self.assertEqual(ir.report(api, 10), [f"recovered #7: {SMOKE}"])
         self.assertEqual([w[:2] for w in api.writes],
-                         [("POST", "/issues/7/comments"), ("PATCH", "/issues/7")])
-        self.assertEqual(api.writes[1][2]["state"], "closed")
+                         [("PATCH", "/issues/7"), ("POST", "/issues/7/comments"),
+                          ("PATCH", "/issues/7")])
+        self.assertNotEqual(api.writes[0][2]["state"], "closed")
+        self.assertEqual(api.writes[2][2]["state"], "closed")
 
     def test_recovery_uses_failure_source_not_delayed_issue_activity(self):
         for updated in ("2026-01-03T00:00:00Z", "garbage"):
@@ -264,7 +284,7 @@ class StatefulAPI(ir.API):
         self.issues = [dict(i) for i in issues]
         self.comments = {n: [dict(c) for c in rows] for n, rows in (comments or {}).items()}
         self.faults = list(faults)
-        self.writes, self.listings = [], []
+        self.writes, self.listings, self.graphql_calls = [], [], []
 
     def request(self, method, path, body=None):
         fault = next((f for f in self.faults
@@ -279,6 +299,10 @@ class StatefulAPI(ir.API):
         return result
 
     def apply(self, method, path, body=None):
+        if method == "POST" and path == "/graphql":  # a READ: never a recorded write
+            variables = body["variables"]
+            self.graphql_calls.append((variables["number"], variables["cursor"]))
+            return graphql_comments(self.comments.get(variables["number"], []), variables)
         if method != "GET":
             self.writes.append((method, path, body))
             if (m := re.fullmatch(r"/issues/(\d+)/comments", path)):
@@ -291,7 +315,7 @@ class StatefulAPI(ir.API):
             if (m := re.fullmatch(r"/issues/(\d+)", path)):
                 target = next(i for i in self.issues if i["number"] == int(m.group(1)))
                 target["body"] = body["body"]
-                target["state"] = body["state"]
+                target["state"] = body.get("state", target.get("state"))
             return {"number": 1}
         page = int(m.group(1)) if (m := re.search(r"[?&]page=(\d+)", path)) else 1
         window = slice((page - 1) * 100, page * 100)
@@ -324,8 +348,9 @@ class RecentTests(unittest.TestCase):
         api = StatefulAPI(runs=runs, jobs=jobs)
         ir.recent(api)
         self.assertEqual([w[:2] for w in api.writes], [
-            ("POST", "/issues"), ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"),
-            ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
+            ("POST", "/issues"),
+            ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"), ("PATCH", "/issues/100"),
+            ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
         self.assertEqual(self.incident_state(api), [(100, "closed")])
         self.assertEqual(sum(1 for w in api.writes if w[1] == "/issues"), 1)
         self.assertEqual(len(api.listings), len(ir.WORKFLOWS))
@@ -483,8 +508,9 @@ class RecentTests(unittest.TestCase):
         api = StatefulAPI(runs=runs, jobs=jobs)
         ir.recent(api)
         self.assertEqual([w[:2] for w in api.writes], [
-            ("POST", "/issues"), ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"),
-            ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
+            ("POST", "/issues"),
+            ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"), ("PATCH", "/issues/100"),
+            ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
         self.assertEqual(self.incident_state(api), [(100, "closed")])
 
     def test_more_than_ten_newer_history_evidence_rows_raise_before_any_write(self):
@@ -510,6 +536,30 @@ def comment_count(api, number, marker):
     return sum(1 for c in api.comments.get(number, []) if marker in c["body"])
 
 
+def delivery_in(body):
+    match = re.search(r"<!-- incident-delivery: (\{.*?\}) -->", body or "")
+    return json.loads(match.group(1)) if match else None
+
+
+def delivery(api, number=7):
+    return delivery_in(next(i for i in api.issues if i["number"] == number)["body"])
+
+
+def fail_final_patch(api, number, marker, mode):
+    """Fail the first issue PATCH made after the marked comment exists (once)."""
+    real, spent = api.request, []
+
+    def request(method, path, body=None):
+        if (method == "PATCH" and path == f"/issues/{number}" and not spent
+                and comment_count(api, number, marker)):
+            spent.append(1)
+            if mode == "after":
+                real(method, path, body)
+            raise ir.ReportError("GitHub transport failed")
+        return real(method, path, body)
+    api.request = request
+
+
 class CommentDeliveryTests(unittest.TestCase):
     def api(self, conclusion="failure", run_id=10, issues=None, **kw):
         return StatefulAPI(runs=[make_run(run_id)], jobs={(run_id, 1): [smoke(conclusion)]},
@@ -519,10 +569,17 @@ class CommentDeliveryTests(unittest.TestCase):
         api = self.api()
         self.assertEqual(ir.report(api, 10), [f"commented #7: {SMOKE}"])
         self.assertEqual([w[:2] for w in api.writes],
-                         [("PATCH", "/issues/7"), ("POST", "/issues/7/comments")])
+                         [("PATCH", "/issues/7"), ("POST", "/issues/7/comments"),
+                          ("PATCH", "/issues/7")])
         self.assertIn("<!-- incident-source: 10:1 -->", api.writes[0][2]["body"])
         self.assertIn(NOTIFY, api.writes[0][2]["body"])
         self.assertIn(occurrence(10), api.writes[1][2]["body"])
+        intent = delivery_in(api.writes[0][2]["body"])
+        self.assertEqual((intent["run_id"], intent["attempt"], intent["kind"], intent["delivered"]),
+                         (10, 1, "failure", False))
+        final = delivery_in(api.writes[2][2]["body"])
+        self.assertEqual((final["run_id"], final["attempt"], final["kind"], final["delivered"]),
+                         (10, 1, "failure", True))
 
     def test_initial_issue_creation_posts_no_repeat_comment(self):
         api = self.api(issues=[])
@@ -588,17 +645,23 @@ class CommentDeliveryTests(unittest.TestCase):
         api = self.api("success", run_id=11)
         self.assertEqual(ir.report(api, 11), [f"recovered #7: {SMOKE}"])
         self.assertEqual([w[:2] for w in api.writes],
-                         [("POST", "/issues/7/comments"), ("PATCH", "/issues/7")])
-        self.assertIn(occurrence(11, kind="recovery"), api.writes[0][2]["body"])
-        self.assertEqual(api.writes[1][2]["state"], "closed")
+                         [("PATCH", "/issues/7"), ("POST", "/issues/7/comments"),
+                          ("PATCH", "/issues/7")])
+        self.assertNotEqual(api.writes[0][2]["state"], "closed")
+        self.assertIn(occurrence(11, kind="recovery"), api.writes[1][2]["body"])
+        self.assertEqual(api.writes[2][2]["state"], "closed")
+        final = delivery_in(api.writes[2][2]["body"])
+        self.assertEqual((final["run_id"], final["kind"], final["delivered"]),
+                         (11, "recovery", True))
 
     def test_recovery_comment_posted_closing_patch_fails_retry_no_duplicate(self):
-        api = self.api("success", run_id=11, faults=[("PATCH", r"/issues/7", "before")])
+        api = self.api("success", run_id=11)
+        fail_final_patch(api, 7, occurrence(11, kind="recovery"), "before")
         with self.assertRaises(ir.ReportError):
             ir.report(api, 11)
         self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
         self.assertNotEqual(api.issues[0].get("state"), "closed")
-        self.assertEqual(ir.report(api, 11), [f"recovered #7: {SMOKE}"])
+        self.assertIn(f"delivered #7: {KEY}", ir.report(api, 11))
         self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
         self.assertEqual(api.issues[0]["state"], "closed")
 
@@ -621,6 +684,263 @@ class CommentDeliveryTests(unittest.TestCase):
         ir.report(api, 10, dry_run=True)
         self.assertEqual(api.writes, [])
         self.assertEqual(api.comments, {})
+
+
+def notes(count, receipts=()):
+    """`count` ordinary comments; `receipts` maps index -> body replacing a note."""
+    rows = [{"body": f"note {n}"} for n in range(count)]
+    for index, text in dict(receipts).items():
+        rows[index] = {"body": "Delivered.\n" + text}
+    return rows
+
+
+FAILURE = ("failure", 10, "failure")
+RECOVERY = ("success", 11, "recovery")
+
+
+class LargeThreadDeliveryTests(unittest.TestCase):
+    """Issues with >= 1000 comments: bounded pages per run, durable cursor, no loss."""
+
+    def api(self, conclusion, run_id, comments, issues=None, **kw):
+        return StatefulAPI(runs=[make_run(run_id)], jobs={(run_id, 1): [smoke(conclusion)]},
+                           issues=[issue(7)] if issues is None else issues,
+                           comments={7: comments}, **kw)
+
+    def finished(self, api, kind):
+        state = delivery(api)
+        if state is None or not state["delivered"]:
+            return False
+        return kind != "recovery" or api.issues[0]["state"] == "closed"
+
+    def drive(self, api, step, kind, limit, tolerate=False):
+        """Run `step` until delivery completes; each run reads at most 10 pages."""
+        errors = 0
+        for calls in range(1, limit + 1):
+            before = len(api.graphql_calls)
+            try:
+                step()
+            except ir.ReportError:
+                if not tolerate:
+                    raise
+                errors += 1
+            self.assertLessEqual(len(api.graphql_calls) - before, 10)
+            if self.finished(api, kind):
+                return calls, errors
+            if kind == "recovery":
+                self.assertNotEqual(api.issues[0].get("state"), "closed")
+        self.fail("delivery did not complete within the retry budget")
+
+    def test_absent_receipt_progresses_by_bounded_cursor_and_completes(self):
+        for size in (1000, 1001, 2001):
+            for conclusion, run_id, kind in (FAILURE, RECOVERY):
+                with self.subTest(size=size, kind=kind):
+                    api = self.api(conclusion, run_id, notes(size))
+                    marker, cursors = occurrence(run_id, kind=kind), []
+
+                    def step():
+                        ir.report(api, run_id)
+                        state = delivery(api)
+                        if state is not None and not state["delivered"]:
+                            self.assertEqual(comment_count(api, 7, marker), 0)
+                            self.assertEqual((state["run_id"], state["kind"]), (run_id, kind))
+                            cursors.append(int(state["cursor"][1:]))
+                    calls, _ = self.drive(api, step, kind, limit=size // 1000 + 3)
+                    if size > 1000:
+                        self.assertGreater(calls, 1)
+                        self.assertTrue(cursors)
+                    self.assertEqual(cursors, sorted(set(cursors)))  # strictly forward
+                    self.assertEqual(comment_count(api, 7, marker), 1)
+                    self.assertEqual(delivery(api)["cursor"], f"c{size - 1}")
+                    # No lifetime rescan: roughly one pass over the thread in total.
+                    self.assertLessEqual(len(api.graphql_calls), size // 100 + 3)
+                    done = len(api.writes)
+                    ir.report(api, run_id)
+                    self.assertEqual(len(api.writes), done)
+                    self.assertEqual(comment_count(api, 7, marker), 1)
+
+    def test_existing_receipt_after_and_before_1000_is_found_without_reposting(self):
+        for conclusion, run_id, kind in (FAILURE, RECOVERY):
+            for size, index in ((1300, 1150), (2001, 5), (1200, 1000)):
+                with self.subTest(kind=kind, index=index):
+                    marker = occurrence(run_id, kind=kind)
+                    api = self.api(conclusion, run_id, notes(size, {index: marker}))
+                    calls, _ = self.drive(api, lambda: ir.report(api, run_id), kind, limit=4)
+                    if index < 1000:
+                        self.assertEqual(calls, 1)
+                    self.assertNotIn("/issues/7/comments", [w[1] for w in api.writes])
+                    self.assertEqual(comment_count(api, 7, marker), 1)
+                    self.assertEqual(delivery(api)["cursor"], f"c{index}")
+
+    def test_legacy_notification_without_delivery_state_migrates_by_scan(self):
+        legacy = issue(7, source=(10, 1), body=MARKER + "\n" + NOTIFY)
+        marker = occurrence(10)
+        api = self.api("failure", 10, notes(1500, {1200: marker}), issues=[legacy])
+        self.assertIsNone(delivery(api))
+        self.drive(api, lambda: ir.report(api, 10), "failure", limit=4)
+        self.assertNotIn("/issues/7/comments", [w[1] for w in api.writes])
+        self.assertEqual(comment_count(api, 7, marker), 1)
+        # Legacy absent receipt: delivered exactly once after the full scan.
+        legacy = issue(7, source=(10, 1), body=MARKER + "\n" + NOTIFY)
+        api = self.api("failure", 10, notes(1500), issues=[legacy])
+        self.drive(api, lambda: ir.report(api, 10), "failure", limit=4)
+        self.assertEqual(comment_count(api, 7, marker), 1)
+
+    def test_legacy_recovery_receipt_with_unclosed_issue_is_found_and_closes(self):
+        marker = occurrence(11, kind="recovery")
+        api = self.api("success", 11, notes(1200, {1100: marker}))
+        self.drive(api, lambda: ir.report(api, 11), "recovery", limit=4)
+        self.assertNotIn("/issues/7/comments", [w[1] for w in api.writes])
+        self.assertEqual(comment_count(api, 7, marker), 1)
+        self.assertEqual(api.issues[0]["state"], "closed")
+
+    def test_lost_post_response_retry_resumes_and_delivers_once(self):
+        for conclusion, run_id, kind in (FAILURE, RECOVERY):
+            with self.subTest(kind=kind):
+                marker = occurrence(run_id, kind=kind)
+                api = self.api(conclusion, run_id, notes(1500),
+                               faults=[("POST", r"/issues/7/comments", "after")])
+                _, errors = self.drive(api, lambda: ir.report(api, run_id), kind,
+                                       limit=6, tolerate=True)
+                self.assertEqual(errors, 1)
+                self.assertEqual(comment_count(api, 7, marker), 1)
+
+    def test_refused_post_retry_delivers_once(self):
+        api = self.api("failure", 10, notes(1500),
+                       faults=[("POST", r"/issues/7/comments", "before")])
+        _, errors = self.drive(api, lambda: ir.report(api, 10), "failure", limit=6, tolerate=True)
+        self.assertEqual(errors, 1)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+
+    def test_failed_final_patch_retry_does_not_duplicate_or_close_early(self):
+        for conclusion, run_id, kind in (FAILURE, RECOVERY):
+            for mode in ("before", "after"):
+                with self.subTest(kind=kind, mode=mode):
+                    marker = occurrence(run_id, kind=kind)
+                    api = self.api(conclusion, run_id, notes(1500))
+                    fail_final_patch(api, 7, marker, mode)
+                    _, errors = self.drive(api, lambda: ir.report(api, run_id), kind,
+                                           limit=8, tolerate=True)
+                    self.assertEqual(errors, 1)
+                    self.assertEqual(comment_count(api, 7, marker), 1)
+                    posts = sum(1 for w in api.writes if w[1] == "/issues/7/comments")
+                    self.assertEqual(posts, 1)
+
+    def test_pending_delivery_is_reconciled_by_recent_with_no_recent_run(self):
+        for conclusion, run_id, kind in (FAILURE, RECOVERY):
+            with self.subTest(kind=kind):
+                marker = occurrence(run_id, kind=kind)
+                old = recent_run(run_id, 200, updated=180)
+                api = StatefulAPI(runs=[old], jobs={(run_id, 1): [smoke(conclusion)]},
+                                  issues=[issue(7)], comments={7: notes(2501)})
+                ir.report(api, run_id)
+                self.assertFalse(delivery(api)["delivered"])
+                self.assertEqual(comment_count(api, 7, marker), 0)
+                calls, _ = self.drive(api, lambda: ir.recent(api), kind, limit=4)
+                self.assertGreaterEqual(calls, 1)
+                self.assertEqual(comment_count(api, 7, marker), 1)
+
+    def test_pending_report_repeat_resumes_without_restarting(self):
+        api = self.api("failure", 10, notes(2501))
+        ir.report(api, 10)
+        first = int(delivery(api)["cursor"][1:])
+        before = len(api.graphql_calls)
+        ir.report(api, 10)
+        resumed = [c for _, c in api.graphql_calls[before:]]
+        self.assertNotIn(None, resumed)
+        self.assertGreaterEqual(int(resumed[0][1:]), first)
+        self.assertGreater(int(delivery(api)["cursor"][1:]), first)
+
+    def test_deferred_gate_does_not_block_later_gate_in_same_run(self):
+        def job(name):
+            return {"name": name, "conclusion": "failure", "steps": []}
+        run = make_run(10, workflow="deploy.yml", event="push")
+        web, api_key = "deploy.yml:staging-web", "deploy.yml:staging-api"
+        issues = [issue(7, body=f"<!-- incident-key: {web} -->"),
+                  issue(8, body=f"<!-- incident-key: {api_key} -->")]
+        api = StatefulAPI(runs=[run], jobs={(10, 1): [job("staging-web"), job("staging-api")]},
+                          issues=issues, comments={7: notes(2501)})
+        ir.report(api, 10)
+        self.assertFalse(delivery(api, 7)["delivered"])
+        self.assertTrue(delivery(api, 8)["delivered"])
+        self.assertEqual(comment_count(api, 8, f"<!-- incident-occurrence: {api_key} 10:1 failure -->"), 1)
+        self.assertEqual(comment_count(api, 7, f"<!-- incident-occurrence: {web} 10:1 failure -->"), 0)
+        for _ in range(4):
+            ir.report(api, 10)
+        self.assertTrue(delivery(api, 7)["delivered"])
+        self.assertEqual(comment_count(api, 7, f"<!-- incident-occurrence: {web} 10:1 failure -->"), 1)
+        self.assertEqual(comment_count(api, 8, f"<!-- incident-occurrence: {api_key} 10:1 failure -->"), 1)
+
+    def test_deferred_gate_does_not_block_newer_gate_in_recent_scan(self):
+        api_key = "deploy.yml:staging-api"
+        runs = [recent_run(21, 1, workflow="deploy.yml", event="push"), recent_run(20, 2)]
+        issues = [issue(7), issue(8, body=f"<!-- incident-key: {api_key} -->")]
+        jobs = {(20, 1): [smoke("failure")],
+                (21, 1): [{"name": "staging-api", "conclusion": "failure", "steps": []}]}
+        api = StatefulAPI(runs=runs, jobs=jobs, issues=issues, comments={7: notes(2501)})
+        ir.recent(api)
+        self.assertFalse(delivery(api, 7)["delivered"])
+        self.assertTrue(delivery(api, 8)["delivered"])
+        self.assertEqual(comment_count(api, 8, f"<!-- incident-occurrence: {api_key} 21:1 failure -->"), 1)
+        for _ in range(4):
+            ir.recent(api)
+        self.assertTrue(delivery(api, 7)["delivered"])
+        self.assertEqual(comment_count(api, 7, occurrence(20)), 1)
+
+    def test_pending_stale_source_is_never_overwritten_by_older_delivery(self):
+        old = recent_run(10, 200, updated=180)
+        api = StatefulAPI(runs=[old], jobs={(10, 1): [smoke("failure")]},
+                          issues=[issue(7)], comments={7: notes(2501)})
+        ir.report(api, 10)
+        self.assertFalse(delivery(api)["delivered"])
+        # A newer writer takes the issue over (source 11:1, delivered).
+        newer = {"run_id": 11, "attempt": 1, "kind": "failure", "cursor": "c0", "delivered": True}
+        body = (MARKER + "\n<!-- incident-source: 11:1 -->\n" + NOTIFY +
+                "\n<!-- incident-delivery: " + json.dumps(newer) + " -->\n")
+        api.issues[0]["body"] = body
+        done = len(api.writes)
+        ir.recent(api)
+        self.assertEqual(ir.report(api, 10), ["superseded"])
+        self.assertEqual(api.issues[0]["body"], body)
+        self.assertEqual(len(api.writes), done)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 0)
+
+    def test_dry_run_with_large_thread_never_writes(self):
+        for conclusion, run_id, _ in (FAILURE, RECOVERY):
+            api = self.api(conclusion, run_id, notes(2001))
+            self.assertTrue(ir.report(api, run_id, dry_run=True))
+            self.assertEqual(api.writes, [])
+
+    def test_next_occurrence_retains_completed_cursor_instead_of_lifetime_rescan(self):
+        api = self.api("failure", 10, notes(2001))
+        self.drive(api, lambda: ir.report(api, 10), "failure", limit=4)
+        api.runs = [make_run(11)]
+        api.jobs[(11, 1)] = [smoke("success")]
+        before = len(api.graphql_calls)
+        self.assertEqual(ir.report(api, 11), [f"recovered #7: {SMOKE}"])
+        self.assertEqual(api.graphql_calls[before:], [(7, "c2000")])
+        self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
+        self.assertEqual(api.issues[0]["state"], "closed")
+
+    def test_malformed_comment_connections_fail_closed(self):
+        api = self.api("failure", 10, [])
+        for response in ({"errors": [{"message": "private response"}]},
+                         {"data": None},
+                         {"data": {"repository": {"issue": {"comments": {
+                             "edges": [], "pageInfo": {"endCursor": None,
+                                                       "hasNextPage": True}}}}}}):
+            api.request = lambda *args, **kwargs: response
+            with self.assertRaisesRegex(ir.ReportError, "GitHub comment connection malformed"):
+                api.comment_page(7)
+        self.assertEqual(api.writes, [])
+
+    def test_graphql_comment_read_is_not_a_write(self):
+        api = self.api("failure", 10, notes(150))
+        edges, end, more = api.comment_page(7)
+        self.assertEqual((len(edges), end, more), (100, "c99", True))
+        edges, end, more = api.comment_page(7, "c99")
+        self.assertEqual((len(edges), end, more), (50, "c149", False))
+        self.assertEqual(edges[0], {"cursor": "c100", "node": {"body": "note 100"}})
+        self.assertEqual(api.writes, [])
 
 
 class WorkflowWiringTests(unittest.TestCase):
