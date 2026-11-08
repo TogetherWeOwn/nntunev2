@@ -23,7 +23,7 @@ export interface CatalogueHit {
 	kind: SearchKind;
 	artistMbid?: string;
 	artistName?: string;
-	availability: 'available';
+	availability: 'available' | 'unavailable';
 	destination: string | null;
 	occurrences: { id: string; occurrence_key: string }[];
 }
@@ -78,7 +78,7 @@ function cleanText(value: unknown): string | null {
 	return Array.from(text).slice(0, MAX_LABEL_CHARS).join('');
 }
 
-function parseHit(raw: unknown, kind: SearchKind): CatalogueHit | null {
+function parseHit(raw: unknown, kind: SearchKind, includeUnavailable: boolean): CatalogueHit | null {
 	if (!isRecord(raw)) return null;
 	const mbid = raw.mbid;
 	if (typeof mbid !== 'string' || !UUID_RE.test(mbid)) return null;
@@ -88,10 +88,15 @@ function parseHit(raw: unknown, kind: SearchKind): CatalogueHit | null {
 	if (typeof score !== 'number' || !Number.isFinite(score)) return null;
 	// Raw metadata is not the application search contract. Treat missing or
 	// unknown readiness as service failure, not as a successful empty search.
-	if (raw.availability !== 'available' || !Array.isArray(raw.occurrences)) {
+	if (!Array.isArray(raw.occurrences) || (raw.availability !== 'available'
+		&& !(includeUnavailable && raw.availability === 'unavailable'))) {
 		throw new CatalogueSearchError('failed');
 	}
 	const normalizedMbid = mbid.toLowerCase();
+	if (raw.availability === 'unavailable') {
+		if (raw.destination !== null || raw.occurrences.length !== 0) throw new CatalogueSearchError('failed');
+		return { mbid: normalizedMbid, label, score, kind, availability: 'unavailable', destination: null, occurrences: [] };
+	}
 	const expectedDestination = kind === 'artist' ? `/artist/${normalizedMbid}`
 		: kind === 'release' ? `/album/${normalizedMbid}` : null;
 	if (raw.destination !== null && raw.destination !== expectedDestination) {
@@ -122,13 +127,13 @@ function parseHit(raw: unknown, kind: SearchKind): CatalogueHit | null {
 }
 
 /** Throws on a malformed envelope; drops individual malformed hits. */
-function parseResponse(body: unknown, kind: SearchKind): CatalogueHit[] {
+function parseResponse(body: unknown, kind: SearchKind, includeUnavailable: boolean): CatalogueHit[] {
 	if (!isRecord(body) || body.type !== kind || !Array.isArray(body.results)) {
 		throw new CatalogueSearchError('failed');
 	}
 	const hits: CatalogueHit[] = [];
 	for (const raw of body.results.slice(0, CATALOGUE_LIMIT)) {
-		const hit = parseHit(raw, kind);
+		const hit = parseHit(raw, kind, includeUnavailable);
 		if (hit) hits.push(hit);
 	}
 	return hits;
@@ -154,7 +159,8 @@ async function fetchKind(
 	url: string,
 	kind: SearchKind,
 	signal: AbortSignal,
-	fetchFn: typeof fetch
+	fetchFn: typeof fetch,
+	includeUnavailable: boolean
 ): Promise<CatalogueHit[]> {
 	const response = await fetchFn(url, {
 		method: 'GET',
@@ -174,7 +180,12 @@ async function fetchKind(
 		}
 		throw new CatalogueSearchError('failed');
 	}
-	return parseResponse(await readCappedJson(response), kind);
+	return parseResponse(await readCappedJson(response), kind, includeUnavailable);
+}
+
+export interface CatalogueSearchOptions {
+	/** Request only; never evidence of admin authority. The server checks the fresh role. */
+	includeUnavailable?: boolean;
 }
 
 /**
@@ -186,7 +197,8 @@ export async function searchCatalogue(
 	baseUrl: string,
 	query: string,
 	signal: AbortSignal,
-	fetchFn: typeof fetch = fetch
+	fetchFn: typeof fetch = fetch,
+	options: CatalogueSearchOptions = {}
 ): Promise<CatalogueHit[]> {
 	const q = normaliseQuery(query);
 	if (q === null) return [];
@@ -194,6 +206,8 @@ export async function searchCatalogue(
 
 	const base = baseUrl.replace(/\/+$/, '');
 	const encoded = encodeURIComponent(q);
+	const includeUnavailable = options.includeUnavailable === true;
+	const suffix = includeUnavailable ? '&include_unavailable=true' : '';
 	const controller = new AbortController();
 
 	let stop!: (code: CatalogueSearchErrorCode) => void;
@@ -213,10 +227,11 @@ export async function searchCatalogue(
 		const work = Promise.all(
 			CATALOGUE_KINDS.map((kind) =>
 				fetchKind(
-					`${base}/v1/mb/search?q=${encoded}&type=${kind}&limit=${CATALOGUE_LIMIT}&offset=0`,
+					`${base}/v1/mb/search?q=${encoded}&type=${kind}&limit=${CATALOGUE_LIMIT}&offset=0${suffix}`,
 					kind,
 					controller.signal,
-					fetchFn
+					fetchFn,
+					includeUnavailable
 				)
 			)
 		);

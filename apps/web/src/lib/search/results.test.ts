@@ -35,6 +35,12 @@ describe('unified search results', () => {
 	it('never invents entity links when the server could not validate the destination', () => {
 		expect(mergeSearchResults([], [{ ...hit('artist'), destination: null }, { ...hit('release'), destination: null }], 'Coral')).toEqual([]);
 	});
+	it.each(['artist', 'release', 'recording'] as const)('never promotes an unavailable %s into a navigable result', (kind) => {
+		const unavailable: CatalogueHit = { ...hit(kind), availability: 'unavailable', destination: null, occurrences: [] };
+		expect(mergeSearchResults([], [unavailable], 'Coral')).toEqual([]);
+		const items = [{ id: 'local', occurrence_key: 'job:1', title: 'Coral' }];
+		expect(mergeSearchResults(items, [unavailable], 'Coral')).toEqual(mergeSearchResults(items, [], 'Coral'));
+	});
 	it('preserves separate library occurrences of a recording', () => {
 		const results = mergeSearchResults([
 			{ id: 'same', occurrence_key: 'first', title: 'Coral One' },

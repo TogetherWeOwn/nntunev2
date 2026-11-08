@@ -119,6 +119,39 @@ describe('searchCatalogue response validation', () => {
 		await expect(searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn)).rejects.toMatchObject({ code: 'failed' });
 	});
 
+	it('requests unavailable rows only with an explicit opt-in and retains their non-actionable shape', async () => {
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const url = new URL(String(input));
+			const type = url.searchParams.get('type')!;
+			expect(url.searchParams.get('include_unavailable')).toBe('true');
+			return json(envelope(type, [{ mbid: A1, [type === 'artist' ? 'name' : 'title']: 'Unavailable',
+				score: 1, availability: 'unavailable', destination: null, occurrences: [] }]));
+		}) as unknown as typeof fetch;
+		const hits = await searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn, { includeUnavailable: true });
+		expect(hits).toHaveLength(3);
+		expect(hits.every((hit) => hit.availability === 'unavailable' && hit.destination === null && hit.occurrences.length === 0)).toBe(true);
+	});
+
+	it.each([
+		['destination', { availability: 'unavailable', destination: `/artist/${A1}`, occurrences: [] }],
+		['playable occurrence', { availability: 'unavailable', destination: null, occurrences: [{ id: 'one', occurrence_key: 'job:1' }] }],
+		['unknown readiness', { availability: 'unknown', destination: null, occurrences: [] }],
+		['missing readiness', { destination: null, occurrences: [] }]
+	])('rejects %s even when unavailable rows are requested', async (_name, fields) => {
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const type = new URL(String(input)).searchParams.get('type')!;
+			return json({ type, results: type === 'artist' ? [{ mbid: A1, name: 'Alpha', score: 1, ...fields }] : [] });
+		}) as unknown as typeof fetch;
+		await expect(searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn, { includeUnavailable: true }))
+			.rejects.toMatchObject({ code: 'failed' });
+	});
+
+	it.each([401, 403, 404])('does not treat an include-unavailable denial (%s) as successful admin access', async (status) => {
+		const fetchFn = vi.fn(async () => new Response('private denial detail', { status })) as unknown as typeof fetch;
+		await expect(searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn, { includeUnavailable: true }))
+			.rejects.toMatchObject({ code: 'failed', message: 'Catalogue search failed.' });
+	});
+
 	it('accepts only a validated own-origin entity destination', async () => {
 		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
 			const type = new URL(String(input)).searchParams.get('type')!;
