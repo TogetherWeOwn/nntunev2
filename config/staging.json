@@ -1,4 +1,5 @@
 {
+  "archive.write_backend": "nntp",
   "auth.challenge_ttl_secs": 300,
   "auth.invite_redemption_max_attempts": 10,
   "auth.invite_redemption_window_secs": 300,

@@ -24,11 +24,12 @@ Implementation: [src/lib.rs](src/lib.rs).
   Parse rules: numbers and bools tolerate surrounding whitespace; strings are
   kept exact but empty/whitespace-only strings are rejected; bools accept only
   `true`/`false` (case-insensitive).
-  (Sources: `src/lib.rs:56-85` for parsing, `src/lib.rs:262-287` for load;
-  pinned by `defaults_apply_for_unset_keys`,
-  `missing_required_key_without_default_fails`, `invalid_types_rejected`,
-  `unknown_kv_key_rejected` in `src/lib.rs:356-427`, and
-  `empty_and_blank_strings_rejected` in `src/lib.rs:538-575` for the
+  (Sources: `src/lib.rs:56-90` for parsing, `src/lib.rs:277-302` for load;
+  pinned by `defaults_apply_for_unset_keys` in `src/lib.rs:370-381`,
+  `missing_required_key_without_default_fails` in `src/lib.rs:446-458`,
+  `invalid_types_rejected` in `src/lib.rs:460-475`,
+  `unknown_kv_key_rejected` in `src/lib.rs:535-555`, and
+  `empty_and_blank_strings_rejected` in `src/lib.rs:608-645` for the
   empty/whitespace-string rejection matching the CI parity checker.)
 - **Env overlay is scoped and atomic.** `Config::apply_env` consults only keys
   declared `env_overridable`, and only through their documented `env_var`
@@ -37,16 +38,18 @@ Implementation: [src/lib.rs](src/lib.rs).
   atomic: every override is parsed first and the config is only mutated when
   all of them are valid, so a failing overlay leaves previous values
   untouched (fail-closed).
-  (Sources: `src/lib.rs:289-309`; pinned by
-  `env_overlay_only_touches_overridable_keys`,
-  `env_overlay_type_errors_fail_closed`, and
-  `env_overlay_is_atomic_across_vars` in `src/lib.rs:517-536`.)
+  (Sources: `src/lib.rs:304-324`; pinned by
+  `env_overlay_only_touches_overridable_keys` in `src/lib.rs:557-570`,
+  `env_overlay_type_errors_fail_closed` in `src/lib.rs:572-585`, and
+  `env_overlay_is_atomic_across_vars` in `src/lib.rs:587-606`.)
 - **Never secrets.** Secret values are never config keys: Worker secrets and
   rotation live outside KV config entirely. Error text reports key names
-  only, never values, so it is safe for CI logs. This holds by construction
-  — the error variants carry key names only (`src/lib.rs:229-236`); no test
-  asserts the `Display` output.
-  (Sources: `src/lib.rs:11-12` for the rule, `src/lib.rs:226-251` for the
+  only, never values, so it is safe for CI logs. Error variants carry key
+  names only (`src/lib.rs:239-264`); the reserved archive target's diagnostic
+  is pinned by
+  `archive_write_policy_rejects_unsupported_targets_without_echoing_values`
+  in `src/lib.rs:396-409`.
+  (Sources: `src/lib.rs:11-12` for the rule, `src/lib.rs:239-268` for the
   fail-closed error type.)
 - **Schema version bumps with meaning changes.** `SCHEMA_VERSION` is the
   version of `config/schema.json` this accessor implements; bump it together
@@ -56,7 +59,7 @@ Implementation: [src/lib.rs](src/lib.rs).
   `SCHEMA_VERSION`, the accepted version in `validate_schema` in
   `../../.github/scripts/config_parity_check.py:114-119`, its self-test (which
   must then reject the next unsupported version, currently pinned at
-  `../../.github/scripts/test_config_parity_check.py:113` rejecting version
+  `../../.github/scripts/test_config_parity_check.py:117-132` rejecting version
   2), and the `VALID_SCHEMA` fixture in
   `../../.github/scripts/test_config_duplicate_members.py:36` (whose positive
   control `test_valid_distinct_per_environment_values_accepted` in
@@ -69,8 +72,8 @@ Implementation: [src/lib.rs](src/lib.rs).
   stops triggering). Adding a key follows the procedure in the
   [config dir README](../../config/README.md) (schema file, both env
   fixtures, and the `KEYS` table together).
-  (Sources: `src/lib.rs:19-21`, `src/lib.rs:88-91`; pinned by
-  `schema_file_matches_code_table` in `src/lib.rs:615-696`, which also checks
+  (Sources: `src/lib.rs:19-21`, `src/lib.rs:93-104`; pinned by
+  `schema_file_matches_code_table` in `src/lib.rs:685-766`, which also checks
   key set, types, required flags, env-overridability, env vars, and defaults.)
 
 ## Reading values
@@ -78,16 +81,16 @@ Implementation: [src/lib.rs](src/lib.rs).
 Typed getters: `get_u64` / `get_bool` / `get_str`. `None` means the key is
 absent (only possible for non-required keys without a default) or held under
 another type, which cannot happen after `Config::load` validated the set.
-(Sources: `src/lib.rs:311-333`; pinned by
+(Sources: `src/lib.rs:326-348`; pinned by
 `typed_getters_return_none_for_absent_or_other_typed_keys` in
-`src/lib.rs:607-613`. Bool parsing/getter coverage is kept via a synthetic
+`src/lib.rs:677-683`. Bool parsing/getter coverage is kept via a synthetic
 spec while the shipped schema has no bool key — see
-`synthetic_bool_key_parses_and_is_read_by_get_bool` in `src/lib.rs:577-605`;
+`synthetic_bool_key_parses_and_is_read_by_get_bool` in `src/lib.rs:647-675`;
 that spec must not become a production key.)
 
 The shipped staging/prod fixtures load through this same typed path (see
-`shipped_fixtures_load_through_typed_getters` and
-`shipped_fixture_mutations_fail_closed` in `src/lib.rs:721-850`); fixture and
+`shipped_fixtures_load_through_typed_getters` in `src/lib.rs:791-878` and
+`shipped_fixture_mutations_fail_closed` in `src/lib.rs:880-920`); fixture and
 parity rules live in the [config dir README](../../config/README.md).
 
 ## Checks

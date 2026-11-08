@@ -2,6 +2,14 @@
   "schema_version": 1,
   "description": "Versioned schema for the NNTune v2 KV config namespaces (staging/prod). Every key carries its type, default, and env-overridability. Secret values are never declared here: Worker secrets and rotation live outside KV config. Workers read these keys only through the typed accessor (crates/nntune-config); see config/README.md for the adding-a-key procedure.",
   "keys": {
+    "archive.write_backend": {
+      "type": "string",
+      "default": "nntp",
+      "required": false,
+      "env_overridable": true,
+      "env_var": "ARCHIVE_WRITE_BACKEND",
+      "description": "Reserved new-write target policy; only nntp is admissible until shared archive adapters and product consumers are accepted. Does not select legacy readers or change R2 cache bindings."
+    },
     "auth.challenge_ttl_secs": {
       "type": "u64",
       "default": 300,
