@@ -48,6 +48,8 @@ pub enum LinkError {
     InvalidUserId,
     InvalidMbid,
     UnknownKey,
+    /// Rewrap target version is zero or not strictly newer than the row's.
+    InvalidRewrapVersion,
     /// Malformed stored metadata or ciphertext shape.
     Corrupt,
     /// Seal failure, or authentication failure on open (wrong row, user,
@@ -245,6 +247,48 @@ impl StoredLink {
         }
     }
 
+    /// Pure DEK-only rewrap from this row's captured KEK version to a
+    /// strictly newer, positive `target_version`. The payload nonce and
+    /// ciphertext are preserved byte-for-byte; the token is never decrypted.
+    /// Persisting the result is the caller's job: compare-and-set against the
+    /// full captured envelope and username, not just the version (a relink
+    /// can replace the credential without changing its KEK version).
+    pub fn rewrap(
+        &self,
+        keks: &impl KekSource,
+        user_id: &str,
+        target_version: u32,
+    ) -> Result<StoredLink, LinkError> {
+        let scope = scope(user_id)?;
+        if self.user_id != user_id {
+            return Err(LinkError::Crypto);
+        }
+        if target_version == 0 || target_version <= self.kek_version {
+            return Err(LinkError::InvalidRewrapVersion);
+        }
+        let e = &self.envelope;
+        if e.dek_wrapped.len() != 48 || e.ciphertext.len() != 36 + 16 {
+            return Err(LinkError::Corrupt);
+        }
+        let old_kek = keks.kek(self.kek_version).ok_or(LinkError::UnknownKey)?;
+        let new_kek = keks.kek(target_version).ok_or(LinkError::UnknownKey)?;
+        let envelope = field_envelope::rewrap(
+            old_kek,
+            self.kek_version,
+            new_kek,
+            target_version,
+            &context(&scope, self.username.as_str()),
+            e,
+        )
+        .map_err(|_| LinkError::Crypto)?;
+        Ok(StoredLink {
+            user_id: self.user_id.clone(),
+            username: self.username.clone(),
+            kek_version: target_version,
+            envelope,
+        })
+    }
+
     /// Client-safe projection: never the token, envelope or key version.
     pub fn summary(&self) -> LinkSummary {
         LinkSummary {
@@ -417,6 +461,7 @@ mod tests {
             match version {
                 1 => Some(&[7; 32]),
                 2 => Some(&[9; 32]),
+                3 => Some(&[11; 32]),
                 _ => None,
             }
         }
@@ -475,7 +520,7 @@ mod tests {
         let mut other = stored.clone();
         other.kek_version = 2;
         assert_eq!(other.open(&Keys, "u-1").unwrap_err(), LinkError::Crypto);
-        other.kek_version = 3;
+        other.kek_version = 9;
         assert_eq!(other.open(&Keys, "u-1").unwrap_err(), LinkError::UnknownKey);
         assert_eq!(
             link().seal(&Keys, 5, "u-1").unwrap_err(),
@@ -540,6 +585,91 @@ mod tests {
         let summary = serde_json::to_string(&stored.summary()).unwrap();
         assert_eq!(summary, r#"{"linked":true,"username":"alice_lb"}"#);
         assert!(!summary.contains(TOKEN));
+    }
+
+    struct OnlyKey(u32, [u8; 32]);
+    impl KekSource for OnlyKey {
+        fn kek(&self, version: u32) -> Option<&[u8; 32]> {
+            (version == self.0).then_some(&self.1)
+        }
+    }
+
+    #[test]
+    fn rewrap_moves_only_the_wrap_and_version() {
+        let stored = link().seal(&Keys, 1, "u-1").unwrap();
+        let r = stored.rewrap(&Keys, "u-1", 2).unwrap();
+        assert_eq!(r.kek_version, 2);
+        assert_eq!(r.user_id, stored.user_id);
+        assert_eq!(r.username, stored.username);
+        assert_eq!(r.open(&Keys, "u-1").unwrap().expose(), TOKEN);
+        assert_eq!(r.envelope.payload_nonce, stored.envelope.payload_nonce);
+        assert_eq!(r.envelope.ciphertext, stored.envelope.ciphertext);
+        assert_ne!(r.envelope.dek_wrapped, stored.envelope.dek_wrapped);
+        assert_ne!(
+            r.envelope.dek_wrapped_nonce,
+            stored.envelope.dek_wrapped_nonce
+        );
+        // Skipping versions is allowed (strictly newer).
+        let r3 = stored.rewrap(&Keys, "u-1", 3).unwrap();
+        assert_eq!(r3.open(&Keys, "u-1").unwrap().expose(), TOKEN);
+        // Old key alone cannot open the rewrapped row, new key alone can.
+        assert!(r.open(&OnlyKey(1, [7; 32]), "u-1").is_err());
+        assert_eq!(r.open(&OnlyKey(2, [9; 32]), "u-1").unwrap().expose(), TOKEN);
+        // Original row is unchanged and still opens under the old key.
+        assert_eq!(stored.open(&Keys, "u-1").unwrap().expose(), TOKEN);
+        let s = format!("{r:?}");
+        assert!(s.contains("redacted") && !s.contains(TOKEN));
+    }
+
+    #[test]
+    fn rewrap_rejects_bad_versions() {
+        let stored = link().seal(&Keys, 2, "u-1").unwrap();
+        for v in [0, 1, 2] {
+            assert_eq!(
+                stored.rewrap(&Keys, "u-1", v).unwrap_err(),
+                LinkError::InvalidRewrapVersion,
+                "{v}"
+            );
+        }
+        // Unknown target and unknown source fail closed.
+        assert_eq!(
+            stored.rewrap(&Keys, "u-1", 4).unwrap_err(),
+            LinkError::UnknownKey
+        );
+        assert_eq!(
+            stored.rewrap(&OnlyKey(3, [11; 32]), "u-1", 3).unwrap_err(),
+            LinkError::UnknownKey
+        );
+    }
+
+    #[test]
+    fn rewrap_fails_closed_on_wrong_context_or_tamper() {
+        let stored = link().seal(&Keys, 1, "u-1").unwrap();
+        assert!(stored.rewrap(&Keys, "u-2", 2).is_err());
+        let mut moved = stored.clone();
+        moved.user_id = "u-2".into();
+        assert_eq!(
+            moved.rewrap(&Keys, "u-2", 2).unwrap_err(),
+            LinkError::Crypto
+        );
+        let mut renamed = stored.clone();
+        renamed.username = Username::parse("mallory").unwrap();
+        assert_eq!(
+            renamed.rewrap(&Keys, "u-1", 2).unwrap_err(),
+            LinkError::Crypto
+        );
+        let mut c = stored.clone();
+        c.envelope.dek_wrapped[0] ^= 1;
+        assert_eq!(c.rewrap(&Keys, "u-1", 2).unwrap_err(), LinkError::Crypto);
+        let mut c = stored.clone();
+        c.envelope.dek_wrapped_nonce[0] ^= 1;
+        assert_eq!(c.rewrap(&Keys, "u-1", 2).unwrap_err(), LinkError::Crypto);
+        let mut c = stored.clone();
+        c.envelope.dek_wrapped.pop();
+        assert_eq!(c.rewrap(&Keys, "u-1", 2).unwrap_err(), LinkError::Corrupt);
+        let mut c = stored;
+        c.envelope.ciphertext.pop();
+        assert_eq!(c.rewrap(&Keys, "u-1", 2).unwrap_err(), LinkError::Corrupt);
     }
 
     #[test]

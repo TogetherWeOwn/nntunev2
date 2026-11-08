@@ -128,3 +128,53 @@ pub(crate) fn open(
         )
         .map_err(|_| VaultError::Crypto)
 }
+
+/// DEK-only rewrap: unwrap under `old_kek`/`old_version`, wrap again under
+/// `new_kek`/`new_version` with a fresh nonce. The payload nonce and
+/// ciphertext are copied unchanged (payload AAD excludes the KEK version),
+/// so the payload is never decrypted or re-encrypted. Version ordering is
+/// the caller's policy.
+pub(crate) fn rewrap(
+    old_kek: &[u8; 32],
+    old_version: u32,
+    new_kek: &[u8; 32],
+    new_version: u32,
+    context: &Context<'_>,
+    envelope: &FieldEnvelope,
+) -> Result<FieldEnvelope, VaultError> {
+    if envelope.dek_wrapped.len() != 48 {
+        return Err(VaultError::CorruptStoredData);
+    }
+    let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
+    let dek = Zeroizing::new(
+        old_cipher
+            .decrypt(
+                &Nonce::from(envelope.dek_wrapped_nonce),
+                Payload {
+                    msg: &envelope.dek_wrapped,
+                    aad: &context.aad("dek", Some(old_version)),
+                },
+            )
+            .map_err(|_| VaultError::Crypto)?,
+    );
+    if dek.len() != 32 {
+        return Err(VaultError::Crypto);
+    }
+    let new_nonce = crate::random::secure_random_bytes::<12>()?;
+    let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
+    let dek_wrapped = new_cipher
+        .encrypt(
+            &Nonce::from(new_nonce),
+            Payload {
+                msg: &dek,
+                aad: &context.aad("dek", Some(new_version)),
+            },
+        )
+        .map_err(|_| VaultError::Crypto)?;
+    Ok(FieldEnvelope {
+        dek_wrapped_nonce: new_nonce,
+        dek_wrapped,
+        payload_nonce: envelope.payload_nonce,
+        ciphertext: envelope.ciphertext.clone(),
+    })
+}
