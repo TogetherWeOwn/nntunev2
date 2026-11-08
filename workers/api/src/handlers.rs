@@ -1527,6 +1527,16 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ArtistDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
+    /// One artist by MBID with up to the bound + 1 of the artist's MEMBER
+    /// releases (`None` when malformed, unknown, or the caller has no member
+    /// release by the artist: the handler answers a uniform 404).
+    fn catalogue_artist(
+        &self,
+        _user_id: &str,
+        _mbid: &str,
+    ) -> impl Future<Output = Result<Option<crate::catalogue::ArtistDetailDbRow>, StoreError>> {
+        async { Ok(None) }
+    }
     /// Caller-member release collection page (artist-joined).
     fn catalogue_releases(
         &self,
@@ -3969,6 +3979,43 @@ where
                 rows.iter().map(crate::catalogue::track_response).collect();
             catalogue_response(&entries)
         }
+        Err(_) => unavailable(),
+    }
+}
+
+/// `GET /v1/artists/{mbid}`: one artist plus the caller's member releases
+/// by that artist (`{artist, releases, truncated}`). Only single-segment,
+/// well-formed MBIDs reach the store; malformed, unknown and non-member
+/// artists are the same plain 404 (no oracle); store failure is the opaque
+/// 503 envelope.
+async fn catalogue_artist<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    let mbid = match req.path.strip_prefix("/v1/artists/") {
+        Some(rest)
+            if !rest.is_empty()
+                && !rest.contains('/')
+                && crate::catalogue::is_catalogue_mbid(rest) =>
+        {
+            rest
+        }
+        _ => return not_found(),
+    };
+    match ctx.store.catalogue_artist(&user_id, mbid).await {
+        Ok(Some(row)) => catalogue_response(&crate::catalogue::assemble_artist_detail(&row)),
+        Ok(None) => not_found(),
         Err(_) => unavailable(),
     }
 }
@@ -6896,6 +6943,12 @@ fn options_preflight_served(path: &str) -> bool {
             return false;
         }
     }
+    // Artist detail is single-segment too.
+    if let Some(rest) = path.strip_prefix("/v1/artists/") {
+        if rest.is_empty() || rest.contains('/') {
+            return false;
+        }
+    }
     ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
         .iter()
         .any(|method| {
@@ -7072,6 +7125,14 @@ where
         ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
+        // Unserved nested artist paths never reach authentication or stores.
+        ("GET", path)
+            if path
+                .strip_prefix("/v1/artists/")
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
+            catalogue_artist(ctx, req, bearer_user.as_deref()).await
+        }
         // Unserved nested release paths never reach authentication or stores.
         ("GET", path)
             if path
@@ -7391,13 +7452,10 @@ mod tests {
         /// membership read: distinct well-formed release MBIDs from the
         /// fake ledger, sorted for a stable page.
         fn fake_member_releases(&self, user_id: &str) -> Vec<String> {
-            let mut mbids: Vec<String> = self
-                .catalogue_library
-                .borrow()
-                .get(user_id)
-                .cloned()
-                .unwrap_or_default()
+            let ledger = self.catalogue_library.borrow();
+            let mut mbids: Vec<String> = [user_id, "__shared__"]
                 .iter()
+                .flat_map(|owner| ledger.get(*owner).cloned().unwrap_or_default())
                 .filter_map(|row| {
                     row.release_mbid
                         .as_deref()
@@ -8366,6 +8424,47 @@ mod tests {
                 .filter(|row| artist_mbids.contains(&row.mbid))
                 .cloned()
                 .collect())
+        }
+        async fn catalogue_artist(
+            &self,
+            user_id: &str,
+            mbid: &str,
+        ) -> Result<Option<crate::catalogue::ArtistDetailDbRow>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                return Ok(None);
+            };
+            let member = self.fake_member_releases(user_id);
+            let mut releases: Vec<crate::catalogue::ReleaseDbRow> = self
+                .catalogue_releases
+                .borrow()
+                .iter()
+                .filter(|row| member.iter().any(|m| m == &row.mbid))
+                .filter(|row| {
+                    row.artist_mbid
+                        .as_deref()
+                        .and_then(crate::catalogue::enrichment_key)
+                        .as_ref()
+                        == Some(&key)
+                })
+                .cloned()
+                .collect();
+            if releases.is_empty() {
+                return Ok(None);
+            }
+            releases.sort_by(|a, b| {
+                (a.year.is_none(), a.year, &a.mbid).cmp(&(b.year.is_none(), b.year, &b.mbid))
+            });
+            releases.truncate(crate::catalogue::CATALOGUE_ARTIST_RELEASES_MAX + 1);
+            let artist = self
+                .catalogue_artists
+                .borrow()
+                .iter()
+                .find(|row| crate::catalogue::enrichment_key(&row.mbid).as_ref() == Some(&key))
+                .cloned();
+            Ok(artist.map(|artist| crate::catalogue::ArtistDetailDbRow { artist, releases }))
         }
         async fn catalogue_releases(
             &self,
@@ -20945,6 +21044,9 @@ mod tests {
     const CAT_REC_B: &str = "11111111-2222-3333-4444-555555555556";
     const CAT_RELEASE: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const CAT_ARTIST: &str = "ffffffff-1111-2222-3333-444444444444";
+    const CAT_GROUP: &str = "99999999-1111-2222-3333-444444444444";
+    /// Fake-ledger key standing in for NULL-owner (shared) library rows.
+    const CAT_SHARED_OWNER: &str = "__shared__";
 
     fn matched_library_row(job: &str, rec: &str, ord: i64) -> crate::catalogue::LibraryDbRow {
         crate::catalogue::LibraryDbRow {
@@ -21001,6 +21103,7 @@ mod tests {
                 year: Some(1983),
                 artist_mbid: Some(CAT_ARTIST.to_string()),
                 artist_name: Some("Fixture Artist".to_string()),
+                release_group_mbid: Some(CAT_GROUP.to_string()),
             });
         h.store
             .catalogue_tracks
@@ -21155,6 +21258,7 @@ mod tests {
             "/v1/releases",
             "/v1/tracks",
             &format!("/v1/releases/{CAT_RELEASE}"),
+            &format!("/v1/artists/{CAT_ARTIST}"),
         ] {
             let resp = h.call_full("GET", path, None, None, Some(ORIGIN));
             assert_eq!(resp.status, 401, "{path}");
@@ -21404,6 +21508,199 @@ mod tests {
         }
     }
 
+    /// Add one global artist plus one release by it to the fake mirror.
+    fn seed_artist_release(h: &Harness, artist: &str, release: &str, year: Option<i16>) {
+        let known = h
+            .store
+            .catalogue_artists
+            .borrow()
+            .iter()
+            .any(|row| row.mbid == artist);
+        if !known {
+            h.store
+                .catalogue_artists
+                .borrow_mut()
+                .push(crate::catalogue::ArtistDbRow {
+                    mbid: artist.to_string(),
+                    name: format!("Artist {artist}"),
+                    sort_name: format!("Artist {artist}"),
+                    artist_type: None,
+                    country: None,
+                });
+        }
+        h.store
+            .catalogue_releases
+            .borrow_mut()
+            .push(crate::catalogue::ReleaseDbRow {
+                mbid: release.to_string(),
+                title: format!("Release {release}"),
+                release_type: Some("Album".to_string()),
+                year,
+                artist_mbid: Some(artist.to_string()),
+                artist_name: Some(format!("Artist {artist}")),
+                release_group_mbid: None,
+            });
+    }
+
+    fn ledger_row(release: &str, job: &str) -> crate::catalogue::LibraryDbRow {
+        let mut row = matched_library_row(job, CAT_REC_A, 1);
+        row.release_mbid = Some(release.to_string());
+        row
+    }
+
+    fn artist_get(h: &Harness, cookie: &str, path: &str) -> Response {
+        h.call_full("GET", path, None, Some(cookie.to_string()), Some(ORIGIN))
+    }
+
+    const NOT_FOUND_BODY: &str = r#"{"code":"not_found","message":"not found","retryable":false}"#;
+
+    #[test]
+    fn catalogue_artist_detail_round_trip_and_uniform_404s() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_catalogue(&h);
+        seed_library(&h, "u1");
+        let resp = artist_get(&h, &cookie, &format!("/v1/artists/{CAT_ARTIST}"));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let detail: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(detail["artist"]["mbid"], CAT_ARTIST);
+        assert_eq!(detail["artist"]["type"], "Group");
+        assert_eq!(detail["truncated"], false);
+        let releases = detail["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0]["mbid"], CAT_RELEASE);
+        assert_eq!(releases[0]["release_group_mbid"], CAT_GROUP);
+        assert!(
+            !resp.body.contains("http"),
+            "own-origin only: {}",
+            resp.body
+        );
+        // Malformed, nested, empty, unknown, and path-confusable shapes are
+        // one plain 404 with no oracle.
+        for path in [
+            "/v1/artists/not-an-mbid".to_string(),
+            "/v1/artists/".to_string(),
+            format!("/v1/artists/{CAT_ARTIST}/releases"),
+            format!("/v1/artists/{CAT_ARTIST}%2f"),
+            "/v1/artists/22222222-3333-4444-5555-666666666666".to_string(),
+        ] {
+            let resp = artist_get(&h, &cookie, &path);
+            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+            assert_eq!(resp.body, NOT_FOUND_BODY, "{path}");
+        }
+    }
+
+    #[test]
+    fn catalogue_artist_detail_membership_gate_own_shared_and_private() {
+        const OTHER_ARTIST: &str = "eeeeeeee-2222-3333-4444-555555555555";
+        const PRIVATE_RELEASE: &str = "bbbbbbbb-2222-3333-4444-555555555555";
+        const SHARED_RELEASE: &str = "cccccccc-2222-3333-4444-555555555555";
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        seed_catalogue(&h);
+        // The shared artist has a second, private release only u2 owns.
+        seed_artist_release(&h, CAT_ARTIST, PRIVATE_RELEASE, Some(1990));
+        // OTHER_ARTIST is reachable only through a shared (NULL-owner) row.
+        seed_artist_release(&h, OTHER_ARTIST, SHARED_RELEASE, Some(1991));
+        seed_library(&h, "u1");
+        h.store.catalogue_library.borrow_mut().insert(
+            "u2".to_string(),
+            vec![ledger_row(PRIVATE_RELEASE, "job-private")],
+        );
+        h.store.catalogue_library.borrow_mut().insert(
+            CAT_SHARED_OWNER.to_string(),
+            vec![ledger_row(SHARED_RELEASE, "job-shared")],
+        );
+        // u1 sees the artist with only its own release, never u2's private one.
+        let resp = artist_get(&h, &cookie_a, &format!("/v1/artists/{CAT_ARTIST}"));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!resp.body.contains(PRIVATE_RELEASE), "{}", resp.body);
+        let detail: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(detail["releases"].as_array().unwrap().len(), 1);
+        // u2 sees the same artist through its own private release only.
+        let resp = artist_get(&h, &cookie_b, &format!("/v1/artists/{CAT_ARTIST}"));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let detail: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let releases = detail["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0]["mbid"], PRIVATE_RELEASE);
+        assert!(!resp.body.contains(CAT_RELEASE), "{}", resp.body);
+        // Shared rows reveal their artist to every member.
+        for cookie in [&cookie_a, &cookie_b] {
+            let resp = artist_get(&h, cookie, &format!("/v1/artists/{OTHER_ARTIST}"));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            assert!(resp.body.contains(SHARED_RELEASE), "{}", resp.body);
+        }
+        // A caller with no ledger gets the same 404 as an unknown artist,
+        // except for artists reachable through shared rows.
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .remove(CAT_SHARED_OWNER);
+        h.store.catalogue_library.borrow_mut().remove("u2");
+        let resp = artist_get(&h, &cookie_b, &format!("/v1/artists/{CAT_ARTIST}"));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert_eq!(resp.body, NOT_FOUND_BODY);
+        let resp = artist_get(&h, &cookie_a, &format!("/v1/artists/{OTHER_ARTIST}"));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert_eq!(resp.body, NOT_FOUND_BODY);
+    }
+
+    #[test]
+    fn catalogue_artist_detail_reads_artist_beyond_the_list_page_and_truncates() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        // 60 member artists: the target sorts past the 50-row list page.
+        let mut ledger = Vec::new();
+        for n in 0..60 {
+            let artist = format!("00000000-0000-4000-8000-{n:012x}");
+            let release = format!("11111111-0000-4000-8000-{n:012x}");
+            seed_artist_release(&h, &artist, &release, Some(2000));
+            ledger.push(ledger_row(&release, &format!("job-{n}")));
+        }
+        // The target artist also has 51 member releases to force truncation.
+        let target = "00000000-0000-4000-8000-00000000003b";
+        for n in 100..151 {
+            let release = format!("22222222-0000-4000-8000-{n:012x}");
+            seed_artist_release(&h, target, &release, Some(2001));
+            ledger.push(ledger_row(&release, &format!("job-extra-{n}")));
+        }
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("u1".to_string(), ledger);
+        let resp = artist_get(&h, &cookie, &format!("/v1/artists/{target}"));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let detail: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(detail["artist"]["mbid"], target);
+        assert_eq!(detail["releases"].as_array().unwrap().len(), 50);
+        assert_eq!(detail["truncated"], true);
+    }
+
+    #[test]
+    fn catalogue_artist_detail_store_outage_is_opaque_and_track_reads_unchanged() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_catalogue(&h);
+        seed_library(&h, "u1");
+        let tracks_before = artist_get(&h, &cookie, "/v1/tracks");
+        assert_eq!(tracks_before.status, 200, "{}", tracks_before.body);
+        let tracks: Vec<serde_json::Value> = serde_json::from_str(&tracks_before.body).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0]["mbid"], CAT_REC_A);
+        assert!(tracks[0].get("release_group_mbid").is_none());
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        let resp = artist_get(&h, &cookie, &format!("/v1/artists/{CAT_ARTIST}"));
+        assert_eq!(resp.status, 503, "{}", resp.body);
+        assert!(!resp.body.contains(CAT_ARTIST), "{}", resp.body);
+    }
+
     #[test]
     fn catalogue_collections_are_member_scoped() {
         const OTHER_RELEASE: &str = "bbbbbbbb-2222-3333-4444-555555555555";
@@ -21438,6 +21735,7 @@ mod tests {
                 year: Some(1991),
                 artist_mbid: Some(OTHER_ARTIST.to_string()),
                 artist_name: Some("Other Artist".to_string()),
+                release_group_mbid: None,
             });
         h.store
             .catalogue_tracks

@@ -247,3 +247,165 @@ async fn release_membership_hides_nonmembers_before_mirror_state() {
         }
     }
 }
+
+#[tokio::test]
+async fn artist_detail_hides_nonmembers_before_mirror_state() {
+    for configured in [false, true] {
+        let (s, attempts) = store(true, configured).await;
+        // Malformed ids never reach SQL; an empty effective membership
+        // never dials the mirror (the other user's private row is not
+        // membership).
+        assert!(s
+            .catalogue_artist("u1", "malformed")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s
+            .catalogue_artist("fresh", RELEASE)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(attempts.get(), 0);
+    }
+}
+
+const ARTIST_A: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const ARTIST_B: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const ARTIST_C: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const ARTIST_D: &str = "99999999-9999-4999-8999-999999999999";
+const UNOWNED_RELEASE: &str = "11111111-1111-4111-8111-111111111111";
+const SHARED_RELEASE: &str = "22222222-2222-4222-8222-222222222222";
+const GROUP: &str = "33333333-3333-4333-8333-333333333333";
+
+/// Mirror stand-in on its own connection: temp tables with the production
+/// column types, so the real artist SQL and row decoders run unmodified.
+async fn mirror() -> Client {
+    let mirror = client(false).await;
+    mirror
+        .batch_execute(
+            "CREATE TEMP TABLE mb_artist (mbid UUID PRIMARY KEY, name TEXT NOT NULL,
+               sort_name TEXT NOT NULL, type TEXT, country CHAR(2));
+             CREATE TEMP TABLE mb_release (mbid UUID PRIMARY KEY, title TEXT NOT NULL,
+               release_type TEXT, year SMALLINT, artist_mbid UUID, release_group_mbid UUID);",
+        )
+        .await
+        .unwrap();
+    for (artist, name) in [
+        (ARTIST_A, "A"),
+        (ARTIST_B, "B"),
+        (ARTIST_C, "C"),
+        (ARTIST_D, "D"),
+    ] {
+        mirror
+            .execute(
+                "INSERT INTO mb_artist VALUES ($1::text::uuid, $2, $2, 'Group', 'GB')",
+                &[&artist, &name],
+            )
+            .await
+            .unwrap();
+    }
+    for (release, artist, year, group) in [
+        (RELEASE, ARTIST_A, Some(2001_i16), Some(GROUP)),
+        (UNOWNED_RELEASE, ARTIST_A, Some(1990_i16), None),
+        (OTHER_RELEASE, ARTIST_B, Some(1999_i16), None),
+        (SHARED_RELEASE, ARTIST_C, None, None),
+    ] {
+        mirror
+            .execute(
+                "INSERT INTO mb_release VALUES ($1::text::uuid, 'T', 'Album', $3,
+                   $2::text::uuid, $4::text::uuid)",
+                &[&release, &artist, &year, &group],
+            )
+            .await
+            .unwrap();
+    }
+    // 51 member releases for ARTIST_D: the store must read bound + 1.
+    mirror
+        .execute(
+            "INSERT INTO mb_release SELECT ('00000000-0000-4000-8000-' ||
+               lpad(to_hex(g), 12, '0'))::uuid, 'T', 'Album', 2000, $1::text::uuid, NULL
+             FROM generate_series(1, 51) g",
+            &[&ARTIST_D],
+        )
+        .await
+        .unwrap();
+    mirror
+}
+
+async fn artist_store() -> impl Store {
+    let app = client(true).await;
+    app.batch_execute(
+        "INSERT INTO library SELECT 'u1', 'bulk-' || g,
+           '00000000-0000-4000-8000-' || lpad(to_hex(g), 12, '0'), ARRAY[]::text[]
+           FROM generate_series(1, 51) g",
+    )
+    .await
+    .unwrap();
+    app.execute(
+        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[]::text[])",
+        &[&SHARED_RELEASE],
+    )
+    .await
+    .unwrap();
+    catalogue_store_for_postgres_test(app, true, Ok(mirror().await), Rc::new(Cell::new(0)))
+}
+
+#[tokio::test]
+async fn artist_detail_runs_production_sql_with_membership_and_bound() {
+    use nntune_api::catalogue::{assemble_artist_detail, CATALOGUE_ARTIST_RELEASES_MAX};
+    // Own member: only the member release, with the group id; the artist's
+    // unowned release never appears.
+    let row = artist_store()
+        .await
+        .catalogue_artist("u1", &ARTIST_A.to_uppercase())
+        .await
+        .unwrap()
+        .expect("member artist");
+    assert_eq!(row.artist.mbid, ARTIST_A);
+    assert_eq!(row.artist.artist_type.as_deref(), Some("Group"));
+    assert_eq!(row.artist.country.as_deref(), Some("GB"));
+    let ids: Vec<_> = row.releases.iter().map(|r| r.mbid.as_str()).collect();
+    assert_eq!(ids, [RELEASE]);
+    assert_eq!(row.releases[0].release_group_mbid.as_deref(), Some(GROUP));
+    // Another user's private release never reveals its artist.
+    assert!(artist_store()
+        .await
+        .catalogue_artist("u1", ARTIST_B)
+        .await
+        .unwrap()
+        .is_none());
+    // Shared (NULL-owner) rows reveal their artist to a caller with no
+    // ledger of their own, who still cannot see u1's private artist.
+    let shared = artist_store()
+        .await
+        .catalogue_artist("fresh", ARTIST_C)
+        .await
+        .unwrap()
+        .expect("shared artist");
+    assert_eq!(shared.releases.len(), 1);
+    assert_eq!(shared.releases[0].year, None);
+    assert!(artist_store()
+        .await
+        .catalogue_artist("fresh", ARTIST_A)
+        .await
+        .unwrap()
+        .is_none());
+    // Unknown artist with a non-empty membership is the same None.
+    assert!(artist_store()
+        .await
+        .catalogue_artist("u1", "44444444-4444-4444-8444-444444444444")
+        .await
+        .unwrap()
+        .is_none());
+    // Bound + 1 rows read, response bounded and flagged truncated.
+    let big = artist_store()
+        .await
+        .catalogue_artist("u1", ARTIST_D)
+        .await
+        .unwrap()
+        .expect("artist with many releases");
+    assert_eq!(big.releases.len(), CATALOGUE_ARTIST_RELEASES_MAX + 1);
+    let detail = assemble_artist_detail(&big);
+    assert_eq!(detail.releases.len(), CATALOGUE_ARTIST_RELEASES_MAX);
+    assert!(detail.truncated);
+}

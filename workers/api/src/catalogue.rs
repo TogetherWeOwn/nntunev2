@@ -76,6 +76,14 @@
 //!   job row's FULL array (empty by design when unmatched), and
 //!   `release_mbid` mirrors the job row's release. Stream-id resolution
 //!   against these ids lands on a later play-path card.
+//! - `GET /v1/artists/{mbid}` returns `{artist, releases, truncated}`: the
+//!   app-side member release set gates first (empty means 404 with no mirror
+//!   dial), then the mirror reads that artist's MEMBER releases (join is the
+//!   membership probe; at most [`CATALOGUE_ARTIST_RELEASES_MAX`] returned, one
+//!   extra row read to set `truncated`) and the artist row directly, never via
+//!   the first-page artist list. Malformed, unknown and non-member are one 404.
+//!   `ReleaseResponse` also carries nullable `release_group_mbid`
+//!   (mirror migration 0030) so clients can group editions.
 //! - Unknown releases read 404: the detail handler runs the release read
 //!   first (which doubles as the existence probe) and only then the tracks
 //!   read. A malformed `:mbid` never reaches SQL — the handler answers 404
@@ -153,6 +161,9 @@ pub struct ReleaseDbRow {
     pub year: Option<i16>,
     pub artist_mbid: Option<String>,
     pub artist_name: Option<String>,
+    /// `mb_release.release_group_mbid` (migration 0030); `None` when the
+    /// mirror has no group for the release. Lets clients group editions.
+    pub release_group_mbid: Option<String>,
 }
 
 /// One `mb_track` occurrence (joined through to the artist) as the store
@@ -275,6 +286,8 @@ pub struct ReleaseResponse {
     pub artist_mbid: Option<String>,
     pub artist: Option<String>,
     pub art_url: Option<String>,
+    /// Nullable release-group identity for grouping editions client-side.
+    pub release_group_mbid: Option<String>,
 }
 
 /// Caller-visible track occurrence: the canonical `(release, medium, track)`
@@ -348,6 +361,7 @@ pub fn release_response(row: &ReleaseDbRow) -> ReleaseResponse {
         artist_mbid: row.artist_mbid.clone(),
         artist: row.artist_name.clone(),
         art_url: Some(release_art_path(&row.mbid)),
+        release_group_mbid: row.release_group_mbid.clone(),
     }
 }
 
@@ -787,7 +801,8 @@ pub fn artists_list_statement() -> &'static str {
 /// [`CATALOGUE_MAX_PAGE_SIZE`]).
 pub fn releases_list_statement() -> &'static str {
     "SELECT r.mbid::text AS mbid, r.title, r.release_type, r.year, \
-     r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
+     r.artist_mbid::text AS artist_mbid, a.name AS artist_name, \
+     r.release_group_mbid::text AS release_group_mbid \
      FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
      WHERE r.mbid = ANY($1::uuid[]) ORDER BY r.mbid ASC LIMIT $2"
 }
@@ -826,7 +841,8 @@ pub fn tracks_list_statement() -> &'static str {
 /// the detail read's existence probe.
 pub fn release_read_statement() -> &'static str {
     "SELECT r.mbid::text AS mbid, r.title, r.release_type, r.year, \
-     r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
+     r.artist_mbid::text AS artist_mbid, a.name AS artist_name, \
+     r.release_group_mbid::text AS release_group_mbid \
      FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
      WHERE r.mbid = $1::text::uuid"
 }
@@ -846,6 +862,82 @@ pub fn release_tracks_statement() -> &'static str {
      FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid \
      WHERE t.release_mbid = $1::text::uuid AND t.recording_mbid = ANY($2::uuid[]) \
      ORDER BY t.medium_no ASC, t.track_no ASC, rec.mbid ASC LIMIT $3"
+}
+
+/// Maximum releases the artist detail read returns. Same bound as the
+/// collection pages; the store reads one more row to detect truncation.
+pub const CATALOGUE_ARTIST_RELEASES_MAX: usize = CATALOGUE_MAX_PAGE_SIZE;
+
+/// Mirror rows for one artist detail read: the artist plus up to
+/// [`CATALOGUE_ARTIST_RELEASES_MAX`] + 1 of that artist's MEMBER releases
+/// (the extra row is only a truncation probe). Feeds [`assemble_artist_detail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistDetailDbRow {
+    pub artist: ArtistDbRow,
+    pub releases: Vec<ReleaseDbRow>,
+}
+
+/// Caller-visible artist detail: `{artist, releases, truncated}`. Releases
+/// are the caller's member releases of this artist only, in the statement's
+/// stable order (not popularity), bounded at
+/// [`CATALOGUE_ARTIST_RELEASES_MAX`]; `truncated` is true when more member
+/// releases exist than were returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtistDetail {
+    pub artist: ArtistResponse,
+    pub releases: Vec<ReleaseResponse>,
+    pub truncated: bool,
+}
+
+/// Assemble the artist detail. Applies the bound defensively (a store that
+/// returns more than the bound + 1 still cannot grow the response) and
+/// drops any release that names a different artist, so a drifting statement
+/// can never attach another artist's release.
+pub fn assemble_artist_detail(row: &ArtistDetailDbRow) -> ArtistDetail {
+    let mut releases: Vec<ReleaseResponse> = row
+        .releases
+        .iter()
+        .filter(|release| {
+            release
+                .artist_mbid
+                .as_deref()
+                .and_then(enrichment_key)
+                .is_some_and(|mbid| Some(mbid) == enrichment_key(&row.artist.mbid))
+        })
+        .map(release_response)
+        .collect();
+    let truncated = releases.len() > CATALOGUE_ARTIST_RELEASES_MAX;
+    releases.truncate(CATALOGUE_ARTIST_RELEASES_MAX);
+    ArtistDetail {
+        artist: artist_response(&row.artist),
+        releases,
+        truncated,
+    }
+}
+
+/// One artist's MEMBER releases, bounded and stably ordered. Parameters:
+/// artist MBID ($1, `$1::text::uuid`, handler-validated shape), the
+/// caller's well-formed member release MBIDs ($2, `uuid[]`, pre-filtered
+/// through [`enrichment_key`]), row bound ($3,
+/// [`CATALOGUE_ARTIST_RELEASES_MAX`] + 1 so truncation is detectable).
+/// Zero rows means the caller has no member release by this artist (or the
+/// artist is unknown): the store answers `None` and the handler 404s, which
+/// doubles as the membership gate. Order is year (unknown last) then MBID:
+/// stable for fixed data, not popularity.
+pub fn artist_member_releases_statement() -> &'static str {
+    "SELECT r.mbid::text AS mbid, r.title, r.release_type, r.year, \
+     r.artist_mbid::text AS artist_mbid, a.name AS artist_name, \
+     r.release_group_mbid::text AS release_group_mbid \
+     FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
+     WHERE r.artist_mbid = $1::text::uuid AND r.mbid = ANY($2::uuid[]) \
+     ORDER BY r.year ASC NULLS LAST, r.mbid ASC LIMIT $3"
+}
+
+/// One artist by MBID. Parameters: artist MBID ($1, `$1::text::uuid`). Only
+/// run after [`artist_member_releases_statement`] returned a row.
+pub fn artist_read_statement() -> &'static str {
+    "SELECT mbid::text AS mbid, name, sort_name, type, country::text AS country \
+     FROM mb_artist WHERE mbid = $1::text::uuid"
 }
 
 #[cfg(test)]
@@ -1029,6 +1121,7 @@ mod tests {
             year: Some(1983),
             artist_mbid: Some("artist-mbid-here-0000-000000000000".to_string()),
             artist_name: Some("New Order".to_string()),
+            release_group_mbid: Some(GOOD_MBID.to_string()),
         };
         let tracks = vec![ReleaseTrackDbRow {
             recording_mbid: GOOD_MBID.to_string(),
@@ -1603,5 +1696,95 @@ mod tests {
         assert_eq!(rows[0].recording_title.as_deref(), Some("Blue Monday"));
         assert_eq!(rows[0].medium_no, None);
         assert_eq!(rows[0].release_title, None);
+    }
+
+    fn artist_row(mbid: &str) -> ArtistDbRow {
+        ArtistDbRow {
+            mbid: mbid.to_string(),
+            name: "New Order".to_string(),
+            sort_name: "New Order".to_string(),
+            artist_type: Some("Group".to_string()),
+            country: Some("GB".to_string()),
+        }
+    }
+
+    fn artist_release(n: usize, artist: &str) -> ReleaseDbRow {
+        ReleaseDbRow {
+            mbid: format!("aaaaaaaa-bbbb-cccc-dddd-{n:012x}"),
+            title: format!("Release {n}"),
+            release_type: Some("Album".to_string()),
+            year: Some(1980),
+            artist_mbid: Some(artist.to_string()),
+            artist_name: Some("New Order".to_string()),
+            release_group_mbid: None,
+        }
+    }
+
+    #[test]
+    fn artist_detail_wire_shape_and_nullable_group() {
+        let mut with_group = artist_release(1, GOOD_MBID);
+        with_group.release_group_mbid = Some(GOOD_RELEASE.to_string());
+        let detail = assemble_artist_detail(&ArtistDetailDbRow {
+            artist: artist_row(GOOD_MBID),
+            releases: vec![with_group, artist_release(2, GOOD_MBID)],
+        });
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["artist", "releases", "truncated"]
+        );
+        assert_eq!(json["artist"]["type"], "Group");
+        assert_eq!(json["truncated"], false);
+        assert_eq!(json["releases"][0]["release_group_mbid"], GOOD_RELEASE);
+        assert!(json["releases"][1]["release_group_mbid"].is_null());
+    }
+
+    #[test]
+    fn artist_detail_bounds_releases_and_flags_truncation() {
+        let at_bound: Vec<_> = (0..CATALOGUE_ARTIST_RELEASES_MAX)
+            .map(|n| artist_release(n, GOOD_MBID))
+            .collect();
+        let exact = assemble_artist_detail(&ArtistDetailDbRow {
+            artist: artist_row(GOOD_MBID),
+            releases: at_bound.clone(),
+        });
+        assert_eq!(exact.releases.len(), CATALOGUE_ARTIST_RELEASES_MAX);
+        assert!(!exact.truncated);
+        let mut over = at_bound;
+        over.push(artist_release(999, GOOD_MBID));
+        let over = assemble_artist_detail(&ArtistDetailDbRow {
+            artist: artist_row(GOOD_MBID),
+            releases: over,
+        });
+        assert_eq!(over.releases.len(), CATALOGUE_ARTIST_RELEASES_MAX);
+        assert!(over.truncated);
+    }
+
+    #[test]
+    fn artist_detail_drops_other_artists_releases() {
+        let detail = assemble_artist_detail(&ArtistDetailDbRow {
+            artist: artist_row(GOOD_MBID),
+            releases: vec![
+                artist_release(1, GOOD_MBID_UPPER),
+                artist_release(2, GOOD_RELEASE),
+            ],
+        });
+        assert_eq!(detail.releases.len(), 1);
+        assert_eq!(detail.releases[0].title, "Release 1");
+    }
+
+    #[test]
+    fn artist_statements_are_parameterized_member_scoped_and_bounded() {
+        let sql = artist_member_releases_statement();
+        assert!(sql.contains("r.artist_mbid = $1::text::uuid"));
+        assert!(sql.contains("r.mbid = ANY($2::uuid[])"));
+        assert!(sql.contains("LIMIT $3"));
+        assert!(sql.contains("release_group_mbid"));
+        assert!(!sql.contains("caa_url"));
+        assert!(artist_read_statement().contains("$1::text::uuid"));
     }
 }
