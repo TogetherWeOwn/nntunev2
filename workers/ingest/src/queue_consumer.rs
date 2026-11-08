@@ -2057,6 +2057,16 @@ fn retry_raw(raw: &worker::RawMessage, seconds: u32) {
     raw.retry_with_options(&options);
 }
 
+// The live consumer remains legacy-only. Reject unsupported sources and invalid
+// identities before resolving a trace or emitting any consumed-job facts, not
+// merely before KV/provider work inside process_message. Admin wake hints belong
+// to the separately gated SQL path and must never select this KV executor.
+fn decode_legacy_delivery(value: serde_json::Value) -> Result<QueueMsg, ()> {
+    let msg: QueueMsg = serde_json::from_value(value).map_err(|_| ())?;
+    validate_queue_msg(&msg).map_err(|_| ())?;
+    Ok(msg)
+}
+
 async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
     let value = match serde_wasm_bindgen::from_value::<serde_json::Value>(raw.body()) {
         Ok(value) => value,
@@ -2065,7 +2075,7 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
             return;
         }
     };
-    let mut msg = match serde_json::from_value::<QueueMsg>(value) {
+    let mut msg = match decode_legacy_delivery(value) {
         Ok(msg) => msg,
         Err(_) => {
             retry_raw(&raw, UNPERSISTED_RETRY_SECS);
@@ -2152,6 +2162,88 @@ mod tests {
         let mut msg = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         msg.source = JobSource::AdminUpload;
         assert_eq!(validate_queue_msg(&msg), Err("admin dispatch unavailable"));
+    }
+
+    #[test]
+    fn live_legacy_decoder_refuses_admin_hints_and_retired_sources() {
+        let upload = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
+        let hint = serde_json::json!({
+            "schema_version": 1,
+            "job_id": upload.job_id,
+            "idempotency_key": format!("admin:{}", "a".repeat(64)),
+            "generation": 1,
+        });
+        let delivery = crate::admin_checkpoint_store::Delivery::decode(&hint.to_string()).unwrap();
+        // The official sender queues a JSON string. Neither it nor an object
+        // form can fall through to the legacy checkpoint initializer.
+        assert!(
+            decode_legacy_delivery(serde_json::Value::String(delivery.encode().unwrap())).is_err()
+        );
+        assert!(decode_legacy_delivery(hint).is_err());
+
+        for source in [JobSource::AdminUpload, JobSource::IndexerSearch] {
+            for state in [
+                JobState::Queued,
+                JobState::Searching,
+                JobState::Parsing,
+                JobState::Matching,
+                JobState::Probing,
+                JobState::Writing,
+                JobState::NeedsReview,
+                JobState::NeedsArchiveRead,
+                JobState::Rejected,
+                JobState::Done,
+            ] {
+                let mut msg = upload.clone();
+                msg.source = source;
+                msg.state = state;
+                assert!(decode_legacy_delivery(serde_json::to_value(msg).unwrap()).is_err());
+            }
+        }
+        let mut foreign = upload.clone();
+        foreign.user_id = "other_user".into();
+        assert!(decode_legacy_delivery(serde_json::to_value(foreign).unwrap()).is_err());
+    }
+
+    #[test]
+    fn live_legacy_decoder_preserves_supported_upload_wire_compatibility() {
+        let upload = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
+        assert_eq!(
+            decode_legacy_delivery(serde_json::to_value(&upload).unwrap()).unwrap(),
+            upload
+        );
+        let mut older = serde_json::to_value(&upload).unwrap();
+        for field in ["trace_id", "provider_id", "repair_rounds"] {
+            older.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(decode_legacy_delivery(older).unwrap(), upload);
+        let mut traced = upload.clone();
+        traced.trace_id = Some("9f3a1b2c4d5e6f708192a3b4c5d64e6f".into());
+        assert_eq!(
+            decode_legacy_delivery(serde_json::to_value(&traced).unwrap()).unwrap(),
+            traced
+        );
+    }
+
+    #[test]
+    fn raw_delivery_refusal_precedes_trace_logging_and_execution() {
+        let source = include_str!("queue_consumer.rs");
+        let raw = source
+            .split_once("async fn process_raw_message(")
+            .unwrap()
+            .1;
+        let raw = raw.split_once("\n}\n").unwrap().0;
+        let decode = raw.find("decode_legacy_delivery(value)").unwrap();
+        let refusal = raw[decode..].find("return;").unwrap() + decode;
+        for action in [
+            "nntune_logging::resolve_trace_id(",
+            "crate::build_sha_from_env(",
+            "crate::emit(",
+            "process_message(env, &msg)",
+        ] {
+            assert!(refusal < raw.find(action).unwrap());
+        }
+        assert!(raw[decode..refusal].contains("retry_raw(&raw, UNPERSISTED_RETRY_SECS)"));
     }
 
     #[test]

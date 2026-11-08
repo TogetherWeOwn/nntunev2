@@ -42,6 +42,62 @@ fn denied(ctx: &Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns>, req: &Reque
 }
 
 #[test]
+fn prepared_admin_execution_has_no_public_control_or_publication_route() {
+    let h = harness();
+    let admin = seed_admin(&h, "admin1", "admin@example.com");
+    seed_user(&h, "member1", "member@example.com");
+    let member = magic_login(&h, "member@example.com");
+    let uploaded = post_ingest(&h, &admin, &minimal_ingest_nzb());
+    assert_eq!(uploaded.status, 201);
+    let job = admin_ingest::derive_job_id(&minimal_ingest_nzb());
+    let rows = h.store.ingest_jobs.borrow().clone();
+    let audit_count = h.store.audits.borrow().len();
+    let original_count = h.store.ingest_originals.borrow().len();
+    let unknown = not_found();
+
+    // Use the real router and an existing job, not just an unknown identity.
+    // Internal original/control/store helpers must not make these paths live.
+    for action in [
+        "approve",
+        "retry",
+        "resume",
+        "resume_archive",
+        "reject",
+        "reconcile",
+        "redrive",
+        "dispatch",
+        "publish",
+    ] {
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            for cookie in [None, Some(member.clone()), Some(admin.clone())] {
+                let mut req = request(cookie);
+                req.method = method.into();
+                req.path = format!("/v1/admin/ingest/{job}/{action}");
+                let response = block_on(handle(&h.ctx(), &req));
+                assert_eq!(response.status, unknown.status, "{method} {action}");
+                assert_eq!(response.body, unknown.body, "{method} {action}");
+                assert!(response.set_cookie.is_none());
+                assert_eq!(*h.store.ingest_jobs.borrow(), rows);
+                assert_eq!(h.store.ingest_originals.borrow().len(), original_count);
+                assert_eq!(h.store.audits.borrow().len(), audit_count);
+            }
+        }
+    }
+    let read = h.call_full(
+        "GET",
+        &format!("/v1/admin/ingest/{job}"),
+        None,
+        Some(admin),
+        None,
+    );
+    assert_eq!(read.status, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read.body).unwrap()["status"],
+        "accepted"
+    );
+}
+
+#[test]
 fn control_original_authentication_denies_before_repository_access() {
     let h = harness();
     seed_user(&h, "member1", "member@example.com");
