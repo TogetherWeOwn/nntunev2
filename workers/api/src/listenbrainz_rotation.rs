@@ -30,6 +30,10 @@
 
 use std::future::Future;
 
+// Durable run model; source only until a runtime caller is enabled.
+#[allow(dead_code)]
+pub(crate) mod lifecycle;
+
 use crate::{
     handlers::{Store, StoreError},
     listenbrainz::{LinkError, RewrapOutcome, StoredLink},

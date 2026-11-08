@@ -6,7 +6,7 @@
 //! and commit the credential change and scalar-only audit together. Relinking
 //! deletes then inserts; there is no second credential copy or UPSERT.
 
-use tokio_postgres::{types::Type, Client, Row};
+use tokio_postgres::{types::Type, Client, GenericClient, Row};
 
 use crate::{
     account_deletion::FencedWriteOutcome,
@@ -15,6 +15,27 @@ use crate::{
     listenbrainz::{OutboundClaim, RewrapOutcome, StoredLink, Username},
     listenbrainz_rotation::{check_scan_args, OwnerCursor, MAX_SCAN_LIMIT},
 };
+
+// Durable rotation-run ledger transactions; source only until a runtime
+// caller is enabled.
+#[allow(dead_code)]
+pub(crate) mod rotation_runs;
+
+/// Why a transaction-capable helper failed. `Sql` means a statement errored
+/// (inside a transaction the whole transaction is then aborted and a caller
+/// must not continue); `Data` means a row or argument was rejected locally
+/// with the transaction still usable. Neither carries detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepError {
+    Sql,
+    Data,
+}
+
+impl From<StepError> for StoreError {
+    fn from(_: StepError) -> Self {
+        StoreError
+    }
+}
 
 // Initialization grants nothing and never resets an existing cooldown. Keep
 // it separate so absent-row uniqueness waits finish before sampling the clock.
@@ -125,6 +146,14 @@ pub(crate) async fn defer_outbound(client: &Client, wait_s: u64) -> Result<(), S
 }
 
 pub(crate) async fn read(client: &Client, user_id: &str) -> Result<Option<StoredLink>, StoreError> {
+    Ok(read_in(client, user_id).await?)
+}
+
+/// [`read`] on any client or open transaction.
+pub(crate) async fn read_in(
+    client: &impl GenericClient,
+    user_id: &str,
+) -> Result<Option<StoredLink>, StepError> {
     let rows = client
         .query_typed(
             "SELECT user_id, username, kek_version, dek_wrapped_nonce, dek_wrapped, \
@@ -132,11 +161,13 @@ pub(crate) async fn read(client: &Client, user_id: &str) -> Result<Option<Stored
             &[(&user_id, Type::TEXT)],
         )
         .await
-        .map_err(|_| StoreError)?;
+        .map_err(|_| StepError::Sql)?;
     if rows.len() > 1 {
-        return Err(StoreError);
+        return Err(StepError::Data);
     }
-    rows.first().map(decode).transpose()
+    rows.first()
+        .map(|row| decode(row).map_err(|_| StepError::Data))
+        .transpose()
 }
 
 fn decode(row: &Row) -> Result<StoredLink, StoreError> {
@@ -183,8 +214,18 @@ pub(crate) async fn rotation_candidates(
     after: Option<&OwnerCursor>,
     limit: u32,
 ) -> Result<Vec<OwnerCursor>, StoreError> {
-    check_scan_args(below_version, limit)?;
-    let below = i32::try_from(below_version).map_err(|_| StoreError)?;
+    Ok(rotation_candidates_in(client, below_version, after, limit).await?)
+}
+
+/// [`rotation_candidates`] on any client or open transaction.
+pub(crate) async fn rotation_candidates_in(
+    client: &impl GenericClient,
+    below_version: u32,
+    after: Option<&OwnerCursor>,
+    limit: u32,
+) -> Result<Vec<OwnerCursor>, StepError> {
+    check_scan_args(below_version, limit).map_err(|_| StepError::Data)?;
+    let below = i32::try_from(below_version).map_err(|_| StepError::Data)?;
     let cursor: Option<&str> = after.map(OwnerCursor::as_str);
     let rows = client
         .query_typed(
@@ -198,17 +239,17 @@ pub(crate) async fn rotation_candidates(
             ],
         )
         .await
-        .map_err(|_| StoreError)?;
+        .map_err(|_| StepError::Sql)?;
     if rows.len() > limit.min(MAX_SCAN_LIMIT) as usize {
-        return Err(StoreError);
+        return Err(StepError::Data);
     }
     let mut out: Vec<OwnerCursor> = Vec::with_capacity(rows.len());
     for row in &rows {
-        let id: String = row.try_get(0).map_err(|_| StoreError)?;
-        let id = OwnerCursor::parse(&id).ok_or(StoreError)?;
+        let id: String = row.try_get(0).map_err(|_| StepError::Data)?;
+        let id = OwnerCursor::parse(&id).ok_or(StepError::Data)?;
         let previous = out.last().map(OwnerCursor::as_str).or(cursor);
         if previous.is_some_and(|p| id.as_str() <= p) {
-            return Err(StoreError);
+            return Err(StepError::Data);
         }
         out.push(id);
     }
@@ -344,6 +385,19 @@ pub(crate) async fn cas_rewrap(
     replacement: &StoredLink,
     now: u64,
 ) -> Result<RewrapOutcome, StoreError> {
+    // Validate before opening a transaction.
+    check_rewrap_args(user_id, captured, replacement)?;
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    let outcome = cas_rewrap_in(&transaction, user_id, captured, replacement, now).await?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(outcome)
+}
+
+fn check_rewrap_args(
+    user_id: &str,
+    captured: &StoredLink,
+    replacement: &StoredLink,
+) -> Result<(), StoreError> {
     check_shape(user_id, captured)?;
     check_shape(user_id, replacement)?;
     if captured.username != replacement.username
@@ -353,26 +407,39 @@ pub(crate) async fn cas_rewrap(
     {
         return Err(StoreError);
     }
-    let now = i64::try_from(now).map_err(|_| StoreError)?;
-    let old_version = i32::try_from(captured.kek_version).map_err(|_| StoreError)?;
-    let new_version = i32::try_from(replacement.kek_version).map_err(|_| StoreError)?;
-    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// The CAS body on an already-open transaction. It never begins, commits or
+/// rolls back: the caller owns the transaction. A non-`Rewrapped` outcome
+/// wrote nothing. On `Err(StepError::Sql)` the transaction is aborted.
+pub(crate) async fn cas_rewrap_in(
+    transaction: &impl GenericClient,
+    user_id: &str,
+    captured: &StoredLink,
+    replacement: &StoredLink,
+    now: u64,
+) -> Result<RewrapOutcome, StepError> {
+    check_rewrap_args(user_id, captured, replacement).map_err(|_| StepError::Data)?;
+    let now = i64::try_from(now).map_err(|_| StepError::Data)?;
+    let old_version = i32::try_from(captured.kek_version).map_err(|_| StepError::Data)?;
+    let new_version = i32::try_from(replacement.kek_version).map_err(|_| StepError::Data)?;
     let owners = transaction
         .query_typed(
             "SELECT deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
             &[(&user_id, Type::TEXT)],
         )
         .await
-        .map_err(|_| StoreError)?;
+        .map_err(|_| StepError::Sql)?;
     if owners.len() > 1 {
-        return Err(StoreError);
+        return Err(StepError::Data);
     }
     let Some(owner) = owners.first() else {
         return Ok(RewrapOutcome::NoRow);
     };
     if owner
         .try_get::<_, bool>("deleting")
-        .map_err(|_| StoreError)?
+        .map_err(|_| StepError::Data)?
     {
         return Ok(RewrapOutcome::AccountDeleting);
     }
@@ -399,11 +466,12 @@ pub(crate) async fn cas_rewrap(
             ],
         )
         .await
-        .map_err(|_| StoreError)?;
+        .map_err(|_| StepError::Sql)?;
     match updated.len() {
         0 => return Ok(RewrapOutcome::ClaimLost),
         1 => {}
-        _ => return Err(StoreError),
+        // Multi-row write is not a per-row data issue: abort the transaction.
+        _ => return Err(StepError::Sql),
     }
     // Scalar-only audit: no username, envelope or key version.
     transaction
@@ -417,8 +485,7 @@ pub(crate) async fn cas_rewrap(
             ],
         )
         .await
-        .map_err(|_| StoreError)?;
-    transaction.commit().await.map_err(|_| StoreError)?;
+        .map_err(|_| StepError::Sql)?;
     Ok(RewrapOutcome::Rewrapped)
 }
 
