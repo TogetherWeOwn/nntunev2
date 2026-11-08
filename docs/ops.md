@@ -797,7 +797,11 @@ builds are not part of this procedure: use the
 [Actions verification contract](../CONTRIBUTING.md#verification-github-actions-first).
 
 The staging lanes prepare tools and build before any Cloudflare credential
-step. Each captures the release build log and runs `worker_tools.py
+step. Before worker-build's own metadata lookup, they run `cargo metadata
+--locked --format-version 1` and reject lockfile changes after each build.
+This preflight matters because worker-build's initial metadata lookup does
+not receive its forwarded build flags. Each captures the release build log
+and runs `worker_tools.py
 check-build <log>` to require all three resolved overrides and an empty
 worker-build download cache. A failed build or verification prevents upload.
 Wrangler then uploads the existing bundle with `--no-build`. Existing

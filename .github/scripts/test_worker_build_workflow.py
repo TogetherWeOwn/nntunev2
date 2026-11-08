@@ -45,6 +45,10 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertIn(f"working-directory: workers/{worker}", items[build])
                 self.assertIn("set -euo pipefail", items[build])
                 self.assertIn(BUILD + ' 2>&1 | tee', items[build])
+                self.assertLess(items[build].index('cargo metadata --locked --format-version 1'),
+                                items[build].index(BUILD))
+                self.assertGreater(items[build].index('git diff --exit-code -- Cargo.lock'),
+                                   items[build].index(BUILD))
                 self.assertIn('worker_tools.py check-build "$RUNNER_TEMP/worker-', items[build])
                 self.assertIn("command: deploy --no-build --env staging --var BUILD_SHA:", items[upload])
                 self.assertIn(f'command = "{BUILD}"', section)
@@ -67,6 +71,8 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("python3 -I .github/scripts/test_worker_build_workflow.py", section)
         self.assertIn("for worker in api mb ingest; do", section)
         self.assertIn(BUILD, section)
+        self.assertLess(section.index('cargo metadata --locked --format-version 1'), section.index(BUILD))
+        self.assertGreater(section.index('git diff --exit-code -- Cargo.lock'), section.index(BUILD))
         self.assertIn("worker_tools.py check-build", section)
         self.assertIn("set -euo pipefail", section)
         self.assertIn("worker-release-builds", job(text, "ci-ok"))

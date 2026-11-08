@@ -230,6 +230,9 @@ class CheckBuild(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_check(self.lines + ["[INFO]: Downloading Esbuild@0.28.2..."])
 
+    def test_cargo_registry_download_is_not_tool_download(self):
+        self.run_check(self.lines + [" Downloading crates ...", "  Downloaded serde v1.0.228"])
+
     def test_cache_dirt(self):
         (self.cache / "worker-build").mkdir()
         self.run_check()  # an empty directory is fine

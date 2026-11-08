@@ -218,7 +218,8 @@ def check_build(log_path: str, env=os.environ) -> None:
     # The styled prefix is "[INFO]"; strip any ANSI colour and CR so a coloured or
     # CRLF-captured log still matches. Paths are printed raw, unquoted.
     text = ANSI.sub("", Path(log_path).read_text(errors="replace")).replace("\r", "")
-    if "falling back to internal" in text or "Downloading " in text:
+    tool_download = any(f"Downloading {name}@" in text for _, name in OVERRIDES)
+    if "falling back to internal" in text or tool_download:
         raise ValueError("worker-build fell back or attempted a tool download")
     for var, full_name in OVERRIDES:
         path = env.get(var)
