@@ -125,18 +125,31 @@ session receives 401 `reauth_required`; a deleting account receives the typed
 failure is generic 500, never a successful unlinked projection. Unlink remains
 possible without a provider request or a usable decryption key.
 
-The store exposes an atomic fleet-wide outbound claim and monotonic cooldown
-write, using database time in milliseconds and one credential-free singleton
-row. A claim spends at least one second of budget; concurrent callers cannot
-split it by user, token or isolate. Cooldowns never shorten an existing floor,
-and oversized waits saturate to deny rather than wrapping. Store failures and
-denials forbid sending. These are storage primitives, not an enabled transport
-or serialization of in-flight responses; response ordering and cooldown-write
-failure handling still need integration before any provider request is enabled.
+The private outbound coordinator reserves a fleet-wide busy generation before
+polling transport and atomically persists the cooldown before releasing it or
+returning a response. Database time is sampled after row locking. There is no
+lease expiry, automatic recovery or retry: cancellation/unknown database commit
+can strand the budget. Known cooldowns never shorten an existing floor; oversized
+or unknown waits saturate to deny. In particular a missing response head may hide
+an accepted request with a longer cooldown, so it quarantines admission rather
+than using the finite fallback for a received 429 with absent headers. A retained
+head survives body failure/deadline. Persistence failure never reports success.
 
-Link/relink routes, provider transport, live outbound rate enforcement, feedback
-delivery, rotation orchestration, account UI and actual-listen submission are
-not enabled by this checkpoint. The encrypted-link migration
+Dispatch is not operationally ready. Before enabling it, establish supported
+positive fleet sender-exclusion/HTTP-settlement evidence (including paused old
+Workers and unknown database outcomes) and an authoritative lost-response
+cooldown bound or a usable evidence-based recovery path. Abort, elapsed time,
+a new deployment or a generation bump is not that proof. Saturation contains
+uncertainty; it does not demonstrate bounded availability. A recovery design must
+close admission durably, prove drain, reconcile primary database state, retire
+only the captured generation with an atomic scalar audit receipt, and reopen
+separately without shortening any floor. No repair endpoint, recovery actor,
+maintenance latch or speculative replacement service is enabled here.
+
+Link/relink routes, provider calls, feedback delivery, fleet rotation execution
+and actual-listen submission remain disabled. The private per-user rotation
+helper only reads, rewraps and conditionally writes one captured envelope; no
+credential rotation has been executed. The encrypted-link migration
 must follow the normal migration acceptance/apply gate before deployment. See
 [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails);
 this adds no playback, external data ingestion or cover-art caching.

@@ -56,9 +56,11 @@ pub(crate) struct Exchange {
 
 impl Exchange {
     pub fn cooldown_s(&self) -> u64 {
-        self.head
-            .map(|head| head.cooldown_s)
-            .unwrap_or(listenbrainz::DEFAULT_429_WAIT_S)
+        // A missing head can hide a provider-accepted request and any length
+        // of Retry-After. Neither a deadline nor abort proves non-delivery or
+        // a finite upper bound. Quarantine until evidence-based recovery;
+        // this sentinel is containment, not operational readiness.
+        self.head.map(|head| head.cooldown_s).unwrap_or(u64::MAX)
     }
 }
 

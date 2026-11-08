@@ -262,7 +262,7 @@ fn failure_after_head_keeps_the_head() {
 }
 
 #[test]
-fn pre_header_deadline_uses_the_fallback_cooldown() {
+fn pre_header_deadline_quarantines_the_unknown_cooldown() {
     let cell = Cell::new(None);
     let exchange = block_on(timed_exchange(
         &cell,
@@ -271,11 +271,11 @@ fn pre_header_deadline_uses_the_fallback_cooldown() {
     ));
     assert_eq!(bytes(&exchange.body), Err(WireError::Unavailable));
     assert!(exchange.head.is_none());
-    assert_eq!(exchange.cooldown_s(), listenbrainz::DEFAULT_429_WAIT_S);
+    assert_eq!(exchange.cooldown_s(), u64::MAX);
 }
 
 #[test]
-fn pre_header_failure_uses_the_fallback_cooldown() {
+fn pre_header_failure_quarantines_the_unknown_cooldown() {
     let cell = Cell::new(None);
     let exchange = block_on(timed_exchange(
         &cell,
@@ -283,7 +283,7 @@ fn pre_header_failure_uses_the_fallback_cooldown() {
         60_000,
     ));
     assert!(exchange.head.is_none());
-    assert_eq!(exchange.cooldown_s(), listenbrainz::DEFAULT_429_WAIT_S);
+    assert_eq!(exchange.cooldown_s(), u64::MAX);
 }
 
 struct DropFlag(Rc<Cell<usize>>);

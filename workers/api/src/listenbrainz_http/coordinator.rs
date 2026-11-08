@@ -53,7 +53,6 @@ mod tests {
 
     use super::super::transport::ResponseHead;
     use super::*;
-    use crate::listenbrainz::DEFAULT_429_WAIT_S;
     use zeroize::Zeroizing;
 
     fn reply(head: Option<ResponseHead>, body: Result<Vec<u8>, WireError>) -> Exchange {
@@ -149,12 +148,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_head_persists_conservative_transport_failure_delay() {
+    async fn absent_head_persists_unknown_cooldown_quarantine() {
         let result = coordinate(
             async { Ok(Some(OutboundClaim(1))) },
             async { reply(None, Err(WireError::Unavailable)) },
             |_, wait| async move {
-                assert_eq!(wait, DEFAULT_429_WAIT_S);
+                assert_eq!(wait, u64::MAX);
                 Ok(())
             },
         )
