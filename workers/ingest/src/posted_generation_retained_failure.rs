@@ -1,7 +1,8 @@
 //! Selected retained-generation conclusion. Negative reads alone are never a
 //! failure verdict. The existing repair-first policy consumes durable current
 //! round evidence; the decision and its immutable evidence snapshot commit
-//! together. This does not implement the retained repair collector or rollout.
+//! together. The bounded retained repair collector supplies observations; neither
+//! the collector nor this conclusion enables a production rollout.
 
 use super::super::failure::repair_failure_is_conclusive;
 use super::*;
@@ -30,8 +31,8 @@ pub enum RetainedFailureOutcome {
 ///
 /// Preserve custody, references, selection, operations, budgets and R2. This is
 /// policy failure, NOT physical loss or replacement/cleanup authorization. The
-/// retained repair collector, compatible rollout/drain and multi-generation
-/// admission are separate unfinished operations; no caller boolean replaces them.
+/// compatible rollout/drain and multi-generation admission remain separate
+/// unfinished operations; no caller boolean replaces durable repair observations.
 /// Retry the original permit after CommitUnknown: a receipt never starts work.
 pub async fn conclude_retained_failure(
     client: &mut Client,
@@ -94,26 +95,7 @@ pub async fn conclude_retained_failure(
     }
     // A pre-promotion candidate round, historical selection or recreated
     // reference cannot be relabelled as a retained repair round.
-    let origin = tx
-        .query_opt(
-            "SELECT health_revision FROM posted_file_retained_observations \
-             WHERE generation_id = $1 AND round = $2::bigint - 1 AND health_revision < $3 \
-             AND reference_kind = $4 AND reference_owner = $5 AND reference_token = $6 \
-             AND prepared_registry_revision = $7 AND recorded_registry_revision = $7 \
-             AND prepared_selection = $1 AND recorded_selection = $1",
-            &[
-                &permit.generation,
-                &permit.round,
-                &permit.revision,
-                &permit.reference_kind.db_value(),
-                &permit.reference_owner,
-                &permit.reference_token,
-                &permit.registry_revision,
-            ],
-        )
-        .await
-        .map_err(database_error)?;
-    let Some(origin) = origin else {
+    let Some(origin) = negative_origin(&tx, permit).await? else {
         return Ok(RetainedFailureOutcome::InsufficientEvidence);
     };
     let custody = bundle.custody()?;
@@ -171,7 +153,7 @@ pub async fn conclude_retained_failure(
                        FROM posted_file_content_checks c WHERE c.generation_id = $1 AND c.round = $3))",
         &[
             &permit.generation, &permit.revision, &permit.round, &permit.round_token,
-            &origin.get::<_, i64>("health_revision"), &permit.attempt.job_id,
+            &origin, &permit.attempt.job_id,
             &permit.attempt.attempt, &permit.attempt.token, &permit.reference_kind.db_value(),
             &permit.reference_owner, &permit.reference_token, &permit.registry_revision,
             &outcome.get::<_, i64>("revision"), &outcome.get::<_, i64>("round"),
@@ -181,8 +163,39 @@ pub async fn conclude_retained_failure(
     if inserted != 1 {
         return Err(StoreError::Inconsistent);
     }
+    // Final health/receipt statements can themselves wait on relation locks.
+    // Expiry rolls the complete conclusion and its snapshot back together.
+    if !lock_attempt(&tx, &permit.attempt).await? {
+        return Ok(RetainedFailureOutcome::StaleOrDiverged);
+    }
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(RetainedFailureOutcome::Applied)
+}
+
+pub(super) async fn negative_origin(
+    tx: &Transaction<'_>,
+    permit: &RetainedCheckPermit,
+) -> Result<Option<i64>, StoreError> {
+    Ok(tx
+        .query_opt(
+            "SELECT health_revision FROM posted_file_retained_observations \
+         WHERE generation_id = $1 AND round = $2::bigint - 1 AND health_revision < $3 \
+         AND reference_kind = $4 AND reference_owner = $5 AND reference_token = $6 \
+         AND prepared_registry_revision = $7 AND recorded_registry_revision = $7 \
+         AND prepared_selection = $1 AND recorded_selection = $1",
+            &[
+                &permit.generation,
+                &permit.round,
+                &permit.revision,
+                &permit.reference_kind.db_value(),
+                &permit.reference_owner,
+                &permit.reference_token,
+                &permit.registry_revision,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row.get("health_revision")))
 }
 
 async fn matching_receipt(

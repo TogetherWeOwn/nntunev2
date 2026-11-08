@@ -72,10 +72,11 @@ pub use rechecks::{
 #[path = "posted_generation_retained.rs"]
 mod retained;
 pub use retained::{
-    conclude_retained_failure, drive_retained_content_read, invalidate_retained_check,
-    prepare_retained_check, prepare_retained_content_check, record_retained_content_check,
+    conclude_retained_failure, drive_retained_content_read, drive_retained_repair,
+    invalidate_retained_check, prepare_retained_check, prepare_retained_content_check,
+    record_retained_content_check, recover_retained_repair, start_retained_repair,
     RetainedCheckPermit, RetainedContentPermit, RetainedCustody, RetainedFailureOutcome,
-    RetainedInvalidation, RetainedReferenceKind,
+    RetainedInvalidation, RetainedReferenceKind, RetainedRepairStep,
 };
 
 const LEASE_SECONDS: i64 = 300;

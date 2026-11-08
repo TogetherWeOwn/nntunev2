@@ -27,6 +27,8 @@ mod content;
 mod failure;
 #[path = "posted_generation_retained_provenance.rs"]
 mod provenance;
+#[path = "posted_generation_retained_repair.rs"]
+mod repair;
 
 type Prepared = Option<(RetainedCheckPermit, RetainedCustody)>;
 

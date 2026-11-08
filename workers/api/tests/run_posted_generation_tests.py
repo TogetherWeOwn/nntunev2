@@ -20,6 +20,15 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_retained::repair::postgres_retained_repair_start_is_idempotent_refuses_without_origin_and_never_resets_progress",
+    "posted_generation_retained::repair::postgres_retained_repair_all_missing_answered_reposts_hit_cap_then_five_passes_conclude_failure",
+    "posted_generation_retained::repair::postgres_retained_repair_transport_and_refused_posts_never_spend_or_conclude_failure",
+    "posted_generation_retained::repair::postgres_retained_repair_presence_complete_is_not_publication_or_failure_authority",
+    "posted_generation_retained::repair::postgres_retained_repair_bounded_cursor_restarts_and_read_only_recovery_retires_old_callbacks",
+    "posted_generation_retained::repair::postgres_retained_repair_selection_aba_and_reference_recreation_block_everything",
+    "posted_generation_retained::repair::postgres_retained_repair_health_mutation_during_stat_or_post_stales_callback_and_keeps_state",
+    "posted_generation_retained::repair::postgres_retained_repair_expiry_behind_final_health_update_rolls_back_evidence",
+    "posted_generation_retained::repair::postgres_retained_repair_cancelled_callbacks_record_no_answer_and_keep_the_fence",
     "posted_generation_retained::failure::postgres_retained_failure_snapshots_repair_evidence_and_preserves_custody_on_exact_replay",
     "posted_generation_retained::failure::postgres_retained_failure_unknown_partial_transport_and_pre_repair_evidence_never_conclude",
     "posted_generation_retained::failure::postgres_retained_failure_intact_content_vetoes_absence_and_mismatched_content_refuses",

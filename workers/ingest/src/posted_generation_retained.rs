@@ -18,6 +18,12 @@ use super::*;
 mod failure;
 pub use failure::{conclude_retained_failure, RetainedFailureOutcome};
 
+#[path = "posted_generation_retained_repair.rs"]
+mod repair;
+pub use repair::{
+    drive_retained_repair, recover_retained_repair, start_retained_repair, RetainedRepairStep,
+};
+
 #[path = "posted_generation_retained_content.rs"]
 mod content_reads;
 pub use content_reads::{
