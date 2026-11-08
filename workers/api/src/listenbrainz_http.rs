@@ -1,16 +1,20 @@
-//! ListenBrainz wire contract, with no network implementation or user route.
+//! ListenBrainz wire contract and an unwired bounded Worker fetch primitive.
+//! No link/feedback provider call is enabled by a user route.
 //!
 //! Protocol references: the public ListenBrainz API `core.html`,
 //! `recordings.html` and `feedback-json.html` documentation. Tokens travel
-//! only in Authorization, never in a URL or JSON body. A future transport
-//! must disable redirects, bound response collection before allocation,
-//! enforce a total deadline, and call `Store::claim_listenbrainz_outbound`
-//! before sending. It must persist the parsed relative cooldown through
-//! `Store::defer_listenbrainz_outbound` before returning an upstream outcome.
-//! Both use one database-clock budget for the whole fleet, never a token or
-//! isolate-local key. Admission errors/denials forbid sending; persistence
-//! errors forbid success. These storage primitives do not serialize in-flight
-//! responses or enable transport. Never log request headers or upstream bodies.
+//! only in Authorization, never in a URL or JSON body. The bounded fetch
+//! primitive disables redirects and enforces one headers/body deadline. Its
+//! caller must serialize the fleet-wide claim/send/cooldown cycle, call
+//! `Store::claim_listenbrainz_outbound` before sending and persist the parsed
+//! relative cooldown through `Store::defer_listenbrainz_outbound` before
+//! returning ANY upstream outcome. Both use one database-clock budget for the
+//! whole fleet, never a token or isolate-local key. Admission errors/denials
+//! forbid sending; persistence errors forbid success. Interval claims alone
+//! do not serialize in-flight responses. Never log headers or upstream bodies.
+
+#[allow(dead_code)] // Unwired until shared in-flight coordination lands.
+pub(crate) mod transport;
 
 use serde::Deserialize;
 use zeroize::Zeroizing;
