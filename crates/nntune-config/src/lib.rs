@@ -79,6 +79,11 @@ impl KeySpec {
                 if raw.trim().is_empty() {
                     return Err(invalid());
                 }
+                // Reserve new-write selection without enabling an undelivered
+                // adapter. This never selects a reader for an existing object.
+                if self.name == "archive.write_backend" && raw != "nntp" {
+                    return Err(ConfigError::InvalidValue(self.name));
+                }
                 Ok(Value::Str(raw.to_string()))
             }
         }
@@ -89,6 +94,14 @@ impl KeySpec {
 /// updating the schema file, both env fixtures, and this table together
 /// (see `config/README.md`); the schema cross-check test enforces it.
 pub static KEYS: &[KeySpec] = &[
+    KeySpec {
+        name: "archive.write_backend",
+        ty: ConfigType::Str,
+        default: Some("nntp"),
+        required: false,
+        env_overridable: true,
+        env_var: Some("ARCHIVE_WRITE_BACKEND"),
+    },
     KeySpec {
         name: "auth.challenge_ttl_secs",
         ty: ConfigType::U64,
@@ -233,6 +246,7 @@ pub enum ConfigError {
         expected: ConfigType,
     },
     UnknownKey(String),
+    InvalidValue(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -246,6 +260,7 @@ impl fmt::Display for ConfigError {
                 )
             }
             ConfigError::UnknownKey(key) => write!(f, "undeclared config key: {key}"),
+            ConfigError::InvalidValue(key) => write!(f, "unsupported config value for key: {key}"),
         }
     }
 }
@@ -363,6 +378,61 @@ mod tests {
         assert_eq!(config.get_u64("mb.search_limit"), Some(25));
         assert_eq!(config.get_u64("ingest.payload_ttl_secs"), Some(2592000));
         assert_eq!(config.get_str("auth.rp_id"), Some("staging.nntune.com"));
+    }
+
+    #[test]
+    fn archive_write_policy_defaults_to_nntp_without_enabling_s3() {
+        let mut config = Config::load(&identity()).expect("old key set loads");
+        assert_eq!(config.get_str("archive.write_backend"), Some("nntp"));
+        config
+            .apply_env(&kv(&[("ARCHIVE_WRITE_BACKEND", "nntp")]))
+            .expect("explicit NNTP policy loads");
+        assert_eq!(config.get_str("archive.write_backend"), Some("nntp"));
+        let mut raw = identity();
+        raw.insert("archive.write_backend".into(), "nntp".into());
+        assert_eq!(Config::load(&raw), Ok(config));
+    }
+
+    #[test]
+    fn archive_write_policy_rejects_unsupported_targets_without_echoing_values() {
+        for value in ["s3", "r2", "NNTP", " nntp ", "synthetic-private-value"] {
+            let mut raw = identity();
+            raw.insert("archive.write_backend".into(), value.into());
+            let error = Config::load(&raw).expect_err("target is not enabled");
+            assert_eq!(error, ConfigError::InvalidValue("archive.write_backend"));
+            assert_eq!(
+                error.to_string(),
+                "unsupported config value for key: archive.write_backend"
+            );
+            assert!(!format!("{error:?}").contains(value));
+        }
+    }
+
+    #[test]
+    fn archive_write_policy_cannot_be_enabled_by_environment_overlay() {
+        let mut config = Config::load(&identity()).expect("identity loads");
+        let before = config.clone();
+        let env = kv(&[("ARCHIVE_WRITE_BACKEND", "s3"), ("RP_ID", "changed.test")]);
+        assert_eq!(
+            config.apply_env(&env),
+            Err(ConfigError::InvalidValue("archive.write_backend"))
+        );
+        assert_eq!(config, before, "failed overlay must not change other keys");
+    }
+
+    #[test]
+    fn archive_write_policy_rejects_blank_targets() {
+        for value in ["", " ", "\t\n"] {
+            let mut raw = identity();
+            raw.insert("archive.write_backend".into(), value.into());
+            assert_eq!(
+                Config::load(&raw),
+                Err(ConfigError::InvalidType {
+                    key: "archive.write_backend",
+                    expected: ConfigType::Str,
+                })
+            );
+        }
     }
 
     #[test]

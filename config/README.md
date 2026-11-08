@@ -31,6 +31,23 @@ makes drift fail CI.
   keys declared `env_overridable`, and only through their documented
   `env_var` name. Everything else in the environment is ignored.
 
+## Archive write policy preparation
+
+`archive.write_backend` defaults to `nntp` when omitted, including for existing
+KV key sets. The accessor currently accepts only the exact value `nntp`;
+`s3`, `r2`, unknown targets and whitespace-padded targets fail closed. Its
+`ARCHIVE_WRITE_BACKEND` overlay is validated before any environment values are
+applied. Errors name the key, never the supplied value.
+
+This reserves a product new-write policy, not an archive-provider interface or
+an activation switch. No current ingest or playback caller is rerouted by this
+key. S3 stays disabled until the shared adapter, immutable backend/account/
+locator/version/encryption metadata and real product consumers are accepted.
+Existing objects must be read using their recorded identity, never the current
+write target. R2 remains the common temporary cache, never a substitute archive
+target when S3 is unconfigured. This change performs no provider activation,
+credential lookup, migration or media transfer.
+
 ## Adding a key
 
 1. Add the key to `schema.json` with its `type`, `default` (or `null` for
@@ -39,7 +56,8 @@ makes drift fail CI.
 2. Add the same key to `staging.json` and `prod.json` (same type; values may
    differ), and mirror it in the `KEYS` table in
    `crates/nntune-config/src/lib.rs`.
-3. Run the gates locally before pushing:
+3. Push a draft PR to run these gates in GitHub Actions (local execution is
+   limited to focused reproduction of one failing test or crate):
    - `python3 .github/scripts/config_parity_check.py --schema config/schema.json --staging config/staging.json --prod config/prod.json`
    - `python3 .github/scripts/test_config_parity_check.py`
    - `python3 .github/scripts/test_config_duplicate_members.py`
