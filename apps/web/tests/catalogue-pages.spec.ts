@@ -34,9 +34,11 @@ test('album preserves multi-disc occurrences, unknown durations and real entity 
 	await expect(page.getByRole('table', { name: 'Disc 2' })).toBeVisible();
 	await expect(page.getByRole('cell', { name: 'Unknown', exact: true })).toBeVisible();
 	await expect(page.getByRole('cell', { name: 'First Light', exact: true })).toHaveCount(2);
-	// A valid album occurrence need not be in the library's first 50 rows.
-	// Until a direct occurrence destination exists, never offer a broken link.
-	await expect(page.locator('.catalogue-tracks a')).toHaveCount(0);
+	// Each destination carries release and exact medium/position, not a first-page library lookup.
+	await expect(page.getByRole('table', { name: 'Disc 1' }).getByRole('link', { name: 'First Light' }))
+		.toHaveAttribute('href', `/track/${trackId}?release=${albumId}&medium=1&position=1`);
+	await expect(page.getByRole('table', { name: 'Disc 2' }).getByRole('link', { name: 'First Light' }))
+		.toHaveAttribute('href', `/track/${trackId}?release=${albumId}&medium=2&position=1`);
 	await expect(page.getByRole('heading', { name: 'Other available editions' })).toBeVisible();
 	await expect(page.getByRole('img', { name: 'Cover for Quiet Rooms' }).first()).toHaveAttribute('data-fallback', 'true');
 	await page.getByRole('link', { name: 'North Window', exact: true }).click();
@@ -87,20 +89,24 @@ for (const width of [320, 1280]) {
 	test(`catalogue pages remain keyboard accessible without overflow at ${width}px`, async ({ page }) => {
 		await page.setViewportSize({ width, height: 900 });
 		await catalogue(page);
-		for (const url of [`/album/${albumId}`, `/artist/${artistId}`]) {
+		for (const [entity, url, title] of [
+			['album', `/album/${albumId}`, 'Quiet Rooms'],
+			['artist', `/artist/${artistId}`, 'North Window'],
+			['track', `/track/${trackId}?release=${albumId}&medium=1&position=1`, 'First Light']
+		]) {
 			await page.goto(url);
-			await expect(page.getByRole('heading', { level: 1, name: url.startsWith('/album') ? 'Quiet Rooms' : 'North Window' })).toBeVisible();
-			const action = url.startsWith('/album') ? page.getByRole('link', { name: 'North Window', exact: true }) : page.getByRole('button', { name: 'Albums', exact: true });
+			await expect(page.getByRole('heading', { level: 1, name: title })).toBeVisible();
+			const action = entity === 'artist' ? page.getByRole('button', { name: 'Albums', exact: true }) : page.getByRole('link', { name: 'North Window', exact: true });
 			await action.focus();
 			await expect(action).toBeFocused();
-			if (url.startsWith('/artist')) {
+			if (entity === 'artist') {
 				await page.keyboard.press('Enter');
 				await expect(action).toHaveAttribute('aria-pressed', 'true');
 			}
 			const results = await new AxeBuilder({ page }).include('.catalogue-page').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze();
 			expect(results.violations.filter((item) => item.impact === 'serious' || item.impact === 'critical')).toEqual([]);
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-			await page.screenshot({ path: test.info().outputPath(`${url.startsWith('/album') ? 'album' : 'artist'}-${width}.png`), fullPage: true });
+			await page.screenshot({ path: test.info().outputPath(`${entity}-${width}.png`), fullPage: true });
 		}
 	});
 }
@@ -146,6 +152,85 @@ for (const entity of ['album', 'artist']) {
 		await sibling.close();
 	});
 }
+
+test('track destinations resolve the exact disc without reading a library page', async ({ page }) => {
+	await catalogue(page);
+	const libraryRequests: string[] = [];
+	page.on('request', (request) => {
+		if (/\/v1\/library(?:\?|$)/.test(request.url())) libraryRequests.push(request.url());
+	});
+	await page.goto(`/album/${albumId}`);
+	const link = page.getByRole('table', { name: 'Disc 2' }).getByRole('link', { name: 'First Light' });
+	await link.focus();
+	await page.keyboard.press('Enter');
+	await expect(page).toHaveURL(`/track/${trackId}?release=${albumId}&medium=2&position=1`);
+	await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toBeVisible();
+	await expect(page.getByText('Disc 2 · Track 1', { exact: true })).toBeVisible();
+	await expect(page.getByText('Track · Unknown', { exact: true })).toBeVisible();
+	await expect(page.getByRole('button', { name: /play/i })).toHaveCount(0);
+	await page.getByRole('article', { name: 'Track' }).getByRole('link', { name: 'Quiet Rooms', exact: true }).click();
+	await expect(page).toHaveURL(`/album/${albumId}`);
+	expect(libraryRequests).toEqual([]);
+});
+
+test('track rejects invalid and absent occurrence identities without a misleading destination', async ({ page }) => {
+	await catalogue(page);
+	for (const query of ['medium=1&position=1', `release=${albumId}&medium=1&position=1&position=2`, `release=${albumId}&medium=3&position=1`]) {
+		await page.goto(`/track/${trackId}?${query}`);
+		await expect(page.getByText('This recording occurrence is not available in your catalogue.')).toBeVisible();
+		await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toHaveCount(0);
+	}
+	await page.route('**/v1/releases/*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ release, tracks: [track, track] }) }));
+	await page.goto(`/album/${albumId}`);
+	await expect(page.getByRole('heading', { level: 1, name: 'Quiet Rooms' })).toBeVisible();
+	await expect(page.locator('.catalogue-tracks a')).toHaveCount(0);
+});
+
+test('track preserves signed-out, absent and retryable failures', async ({ page }) => {
+	let status = 401;
+	await page.route('**/v1/**', (route) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify({ code: 'unavailable', message: 'diagnostic', retryable: false }) }));
+	await page.goto(`/track/${trackId}?release=${albumId}&medium=1&position=1`);
+	await expect(page.getByRole('article', { name: 'Track' }).getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+	status = 404;
+	await page.reload();
+	await expect(page.getByText('This recording occurrence is not available in your catalogue.')).toBeVisible();
+	status = 503;
+	await page.reload();
+	await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+	await catalogue(page);
+	await page.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toBeVisible();
+});
+
+test('track clears account data and fences an old response across auth transitions', async ({ page }) => {
+	await catalogue(page);
+	const url = `/track/${trackId}?release=${albumId}&medium=1&position=1`;
+	await page.goto(url);
+	await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toBeVisible();
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+		key: 'nntune.library.auth-transition.v1', newValue: 'next-account'
+	})));
+	await expect(page.getByRole('article', { name: 'Track' }).getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+	await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toHaveCount(0);
+	let releaseResponse!: () => void;
+	let requestStarted!: () => void;
+	const gate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+	await page.route('**/v1/releases/*', async (route) => {
+		requestStarted();
+		await gate;
+		await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ release, tracks: [track] }) });
+	});
+	const navigation = page.reload();
+	await started;
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+		key: 'nntune.library.auth-transition.v1', newValue: 'third-account'
+	})));
+	releaseResponse();
+	await navigation;
+	await expect(page.getByRole('article', { name: 'Track' }).getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+	await expect(page.getByRole('heading', { level: 1, name: 'First Light' })).toHaveCount(0);
+});
 
 test('a capped artist discography is labelled incomplete', async ({ page }) => {
 	await catalogue(page);

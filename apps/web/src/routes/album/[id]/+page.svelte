@@ -5,6 +5,7 @@
 	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
 	import { catalogueAuthGeneration } from '#lib/catalogue/auth.svelte.js';
 	import { discTracks, releaseArtwork, releaseDuration, trackDuration } from '#lib/catalogue/catalogue.js';
+	import { releaseOccurrenceLinks } from '#lib/catalogue/occurrence.js';
 	import '#lib/catalogue/catalogue.css';
 	import type { PageData } from './$types';
 
@@ -14,6 +15,7 @@
 	const detail = $derived(authChanged ? null : data.value);
 	const release = $derived(detail?.release);
 	const discs = $derived(discTracks(detail?.tracks ?? []));
+	const trackLinks = $derived(releaseOccurrenceLinks(detail?.tracks ?? []));
 	const duration = $derived(releaseDuration(detail?.tracks ?? []));
 	const others = $derived(data.artist?.releases.filter((item) => item.mbid !== release?.mbid) ?? []);
 	const versions = $derived(release?.release_group_mbid
@@ -56,7 +58,7 @@
 							{#each disc.tracks as track, index (`${track.mbid}:${track.track_no}:${index}`)}
 								<tr>
 									<td>{track.track_no ?? '—'}</td>
-									<td>{track.title || 'Untitled track'}</td>
+									<td>{#if trackLinks.has(track)}<a href={trackLinks.get(track)}>{track.title || 'Untitled track'}</a>{:else}{track.title || 'Untitled track'}{/if}</td>
 									<td>{trackDuration(track.duration_ms)}</td>
 								</tr>
 							{/each}
