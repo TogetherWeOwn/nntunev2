@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { beforeNavigate, goto } from '$app/navigation';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { browserStorage, invalidateLibraryCache, LIBRARY_AUTH_TRANSITION_KEY, type LibraryItem } from '#lib/library/cache.js';
@@ -26,14 +26,19 @@
 	let staleAt = $state<string | null>(null);
 	let catalogueLoading = $state(false);
 	let catalogueError = $state(false);
+	let catalogueBlocked = $state(false);
 	let retry = $state(0);
 	let request: AbortController | null = null;
 	let navigationTimer: ReturnType<typeof setTimeout> | undefined;
-	let resultRoot: HTMLDivElement | undefined;
+	beforeNavigate(() => clearTimeout(navigationTimer));
+	let resultRoot = $state<HTMLDivElement>();
 	let input: HTMLInputElement | undefined;
 
 	function resetAtAuthBoundary(): void {
 		request?.abort();
+		catalogueLoading = false;
+		catalogueError = false;
+		catalogueBlocked = true;
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		recents = [];
 		recentsReady = false;
@@ -50,9 +55,12 @@
 			requiresSignIn = state.requiresSignIn;
 			libraryError = !!state.loadError || state.libraryUnavailable;
 			staleAt = state.staleAt;
-			if (!state.loading && !state.requiresSignIn && !state.loadError && !state.libraryUnavailable && !recentsReady) {
-				recents = loadRecentFinds(browserStorage('session'), browserStorage('local'));
-				recentsReady = true;
+			if (!state.loading && !state.requiresSignIn && !state.loadError && !state.libraryUnavailable) {
+				catalogueBlocked = false;
+				if (!recentsReady) {
+					recents = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+					recentsReady = true;
+				}
 			}
 		}
 	});
@@ -87,7 +95,7 @@
 		void retry;
 		hits = [];
 		catalogueError = false;
-		if (requiresSignIn || [...value].length < 2 || [...value].length > 100) {
+		if (requiresSignIn || catalogueBlocked || [...value].length < 2 || [...value].length > 100) {
 			catalogueLoading = false;
 			return;
 		}
@@ -117,7 +125,7 @@
 		saveRecentFinds(browserStorage('session'), browserStorage('local'), recents);
 	}
 	function navigate(value: string, replaceState = false): void {
-		void goto(searchHref(value, category), { replaceState, keepFocus: replaceState, noScroll: replaceState });
+		void goto(searchHref(value, category), { replace: replaceState, reset: !replaceState });
 	}
 	function onInput(): void {
 		clearTimeout(navigationTimer);
@@ -205,11 +213,11 @@
 			<p>No {category === 'all' ? 'music' : labels[category].toLowerCase()} found for “{effectiveQuery}”. Try another spelling or search all music.</p>
 			<a href={searchHref(effectiveQuery)}>All results</a> · <a href="/search">Clear search</a>
 		{/if}
-		<div bind:this={resultRoot} onkeydown={resultKeydown} role="group" aria-label="Search results">
+		<div bind:this={resultRoot} role="group" aria-label="Search results">
 			{#if !compact && category === 'all' && visible.length > 0}
 				<section class="top-result" aria-label="Top result">
 					<h2>Top result</h2>
-					<a data-search-result href={visible[0].href} onclick={() => remember(effectiveQuery)}>{visible[0].label}</a>
+					<a data-search-result onkeydown={resultKeydown} href={visible[0].href} onclick={() => remember(effectiveQuery)}>{visible[0].label}</a>
 					{#if visible[0].inLibrary}<p>In your library</p>{/if}
 				</section>
 			{/if}
@@ -220,7 +228,7 @@
 						<h2>{compact ? 'Top hits' : labels[group]}</h2>
 						<ul class="search-results">
 							{#each rows as result (result.key)}
-								<li><a data-search-result href={result.href} onclick={() => { remember(effectiveQuery); onselect?.(); }}>{result.label}{result.artist ? ` — ${result.artist}` : ''}</a>
+								<li><a data-search-result onkeydown={resultKeydown} href={result.href} onclick={() => { remember(effectiveQuery); onselect?.(); }}>{result.label}{result.artist ? ` — ${result.artist}` : ''}</a>
 									{#if result.inLibrary}<span class="availability">In your library</span>{/if}</li>
 							{/each}
 						</ul>

@@ -1,6 +1,7 @@
 import { libraryItemKey, type LibraryItem } from '#lib/library/cache.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { buildShareQuery } from '#lib/player/shareTimestamp.js';
 import type { CatalogueHit } from './catalogue.js';
 
 export const SEARCH_CATEGORIES = ['all', 'tracks', 'artists', 'albums', 'playlists', 'videos'] as const;
@@ -20,6 +21,10 @@ export function searchCategory(value: string | null | undefined): SearchCategory
 
 export function searchHref(query: string, category: SearchCategory = 'all'): string {
 	const trimmed = query.trim();
+	// URL parsers normalize both literal and percent-encoded dot segments.
+	if (trimmed === '.' || trimmed === '..') {
+		return `/search?${new URLSearchParams({ q: trimmed, type: category })}`;
+	}
 	return trimmed ? `/search/${encodeURIComponent(trimmed)}/${category}` : '/search';
 }
 
@@ -34,8 +39,8 @@ export function mergeSearchResults(
 		key: `library:${libraryItemKey(item)}`,
 		category: 'tracks',
 		label: displayTitle(item),
-		artist: displayArtist(item),
-		href: `/library?track=${encodeURIComponent(item.id)}`,
+		artist: displayArtist(item) ?? undefined,
+		href: `/library?${buildShareQuery(item.id, 0)}`,
 		inLibrary: true
 	}));
 	const recordingIds = new Set(items.flatMap((item) =>
@@ -50,7 +55,7 @@ export function mergeSearchResults(
 			for (const item of items.filter((row) => Array.isArray(row.recording_mbids) && row.recording_mbids.includes(hit.mbid))) {
 				if (results.some((result) => result.key === `library:${libraryItemKey(item)}`)) continue;
 				results.push({ key: `library:${libraryItemKey(item)}`, category: 'tracks', label: displayTitle(item),
-					artist: displayArtist(item), href: `/library?track=${encodeURIComponent(item.id)}`, inLibrary: true });
+					artist: displayArtist(item) ?? undefined, href: `/library?${buildShareQuery(item.id, 0)}`, inLibrary: true });
 			}
 		} else {
 			const category = hit.kind === 'artist' ? 'artists' : 'albums';

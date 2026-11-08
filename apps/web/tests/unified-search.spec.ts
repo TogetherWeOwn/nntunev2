@@ -30,7 +30,7 @@ test('unifies library and catalogue matches, hides unindexed recordings and uses
 	const main = page.locator('main');
 	await expect(main.getByRole('link', { name: 'Coral Artist', exact: true })).toHaveAttribute('href', `/artist/${artistId}`);
 	await expect(main.getByRole('link', { name: 'Coral Album — Reef Band', exact: true })).toHaveAttribute('href', `/album/${albumId}`);
-	await expect(main.getByRole('link', { name: 'Coral Song — Reef Band', exact: true })).toHaveAttribute('href', '/library?track=coral');
+	await expect(main.getByRole('link', { name: 'Coral Song — Reef Band', exact: true })).toHaveAttribute('href', '/library?track=coral&t=0');
 	await expect(main.getByText('Unindexed Recording')).toHaveCount(0);
 	await main.getByRole('link', { name: 'Albums', exact: true }).click();
 	await expect(page).toHaveURL(/\/search\/Coral\/albums$/);
@@ -48,6 +48,16 @@ test('keeps library matches usable when catalogue fails and exposes a retry', as
 	await expect(page.getByText('Catalogue search is unavailable. Showing library matches only.')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Retry catalogue', exact: true })).toBeVisible();
 	await expect(page.locator('main').getByRole('link', { name: 'Coral Song — Reef Band', exact: true })).toBeVisible();
+});
+
+test('settles catalogue loading after a library access refusal', async ({ page }) => {
+	await fixtures(page);
+	await page.route('**/api/library', (route) => route.fulfill({ status: 403, json: {} }));
+	await page.route('**/v1/mb/search?**', (route) => route.abort());
+	await page.goto('/search?q=Coral');
+	await expect(page.getByText('Your library is not available. Catalogue results may be incomplete.')).toBeVisible();
+	await expect(page.getByText('Searching the catalogue…', { exact: true })).toHaveCount(0);
+	await expect(page.getByText('No music found for “Coral”.', { exact: false })).toBeVisible();
 });
 
 test('records explicit searches locally with remove and clear controls, then clears at an auth boundary', async ({ page }) => {
@@ -85,6 +95,19 @@ test('opens quick search on demand, supports keyboard hits, and restores focus o
 	await page.keyboard.press('Escape');
 	await expect(dialog).toHaveCount(0);
 	await expect(opener).toBeFocused();
+});
+
+test('does not let a pending shell search override a different destination', async ({ page }) => {
+	await fixtures(page);
+	await page.goto('/settings');
+	await hydrated(page);
+	await page.clock.install();
+	await page.clock.pauseAt(new Date());
+	await page.locator('[data-testid="shell-topbar"]').getByRole('searchbox', { name: 'Search', exact: true }).fill('Coral');
+	await page.locator('[data-testid="shell-rail"]').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await page.clock.runFor(500);
+	await expect(page).toHaveURL(/\/home$/);
 });
 
 test('debounces shell typing while retaining keyboard focus', async ({ page }) => {

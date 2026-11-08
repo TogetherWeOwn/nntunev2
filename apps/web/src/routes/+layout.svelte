@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, beforeNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
@@ -309,12 +309,13 @@
 	// Preserve focus in the shell while the search route updates its results.
 	let searchText = $state('');
 	let shellSearchTimer: ReturnType<typeof setTimeout> | undefined;
+	beforeNavigate(() => clearTimeout(shellSearchTimer));
 	function onShellSearchInput(): void {
 		clearTimeout(shellSearchTimer);
 		const query = searchText.trim();
 		shellSearchTimer = setTimeout(() => {
 			void goto(query ? `/search?q=${encodeURIComponent(query)}` : '/search', {
-				replaceState: page.url.pathname.startsWith('/search'), keepFocus: true, noScroll: true
+				replace: page.url.pathname.startsWith('/search'), reset: false
 			});
 		}, 200);
 	}

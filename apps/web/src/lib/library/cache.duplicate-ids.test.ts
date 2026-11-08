@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
+import { mergeSearchResults } from '../search/results.js';
 import {
 	decodeSnapshot,
 	loadSnapshot,
@@ -39,13 +40,19 @@ function snapshotWith(items: unknown[]): string {
 describe('catalogue occurrence identity', () => {
 	it.each([
 		['home', '{#each preview as item (libraryItemKey(item))}'],
-		['search', '{#each results as item (libraryItemKey(item))}'],
 		['library/liked', '{#each liked as item (libraryItemKey(item))}'],
 		['library', '{#each tracks as track (libraryItemKey(track))}'],
 		['library', '{#each favoriteTracks as track, index (libraryItemKey(track))}']
 	])('wires the shared occurrence key into the %s list', (route, each) => {
 		const source = readFileSync(new URL(`../../routes/${route}/+page.svelte`, import.meta.url), 'utf8');
 		expect(source).toContain(each);
+	});
+	it('wires shared occurrence identity through the extracted search panel', () => {
+		const rows = [item('a', { occurrence_key: 'first' }), item('a', { occurrence_key: 'second' })];
+		const results = mergeSearchResults(rows, [], 'Track');
+		expect(results.map((result) => result.key)).toEqual(rows.map((row) => `library:${libraryItemKey(row)}`));
+		const panel = readFileSync(new URL('../search/SearchPanel.svelte', import.meta.url), 'utf8');
+		expect(panel).toContain('{#each rows as result (result.key)}');
 	});
 	it('preserves repeated recordings within and across jobs without changing stream ids', () => {
 		const rows = [
