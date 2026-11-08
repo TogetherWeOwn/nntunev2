@@ -214,11 +214,40 @@ test('going offline while the confirmation is open refuses the DELETE', async ({
 	await expect(confirmDialog(page)).toBeHidden();
 	await expect(section(page).getByText("You're offline. Connect to change ListenBrainz.")).toBeVisible();
 	await expect(unlinkButton(page)).toBeDisabled();
+	await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
 	await expect(section(page).getByText('Linked as')).toBeVisible();
 	expect(traffic.deletes).toBe(0);
 
 	await context.setOffline(false);
 	await expect(unlinkButton(page)).toBeEnabled();
+});
+
+for (const how of ['Cancel button', 'Escape'] as const) {
+	test(`offline confirmation ${how} restores focus to an available section target`, async ({ page, context }) => {
+		const traffic = await routeApi(page, {});
+		await openLinked(page);
+		await startUnlink(page);
+		await context.setOffline(true);
+		await expect(unlinkButton(page)).toBeDisabled();
+		if (how === 'Escape') await page.keyboard.press('Escape');
+		else await confirmDialog(page).getByRole('button', { name: 'Cancel' }).click();
+		await expect(confirmDialog(page)).toBeHidden();
+		await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
+		expect(traffic.deletes).toBe(0);
+	});
+}
+
+test('DELETE generic 401 moves focus out of the removed unlink control', async ({ page }) => {
+	const traffic = await routeApi(page, {
+		del: () => json({ code: 'unauthorized', message: 'x', retryable: false }, 401)
+	});
+	await openLinked(page);
+	await startUnlink(page);
+	await confirmDialog(page).getByRole('button', { name: 'Unlink' }).click();
+	await expect(section(page).getByRole('link', { name: 'Sign in' })).toBeVisible();
+	await expect(unlinkButton(page)).toHaveCount(0);
+	await expect(section(page).getByRole('heading', { name: 'ListenBrainz' })).toBeFocused();
+	expect(traffic.deletes).toBe(1);
 });
 
 test('offline at load disables Unlink with the reason', async ({ page, context }) => {

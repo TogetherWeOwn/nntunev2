@@ -99,7 +99,10 @@
 
 	async function focusUnlink() {
 		await tick();
-		unlinkButton?.focus();
+		// An offline transition disables the invoker while a dialog is open.
+		// Disabled buttons cannot receive focus after that dialog closes.
+		if (unlinkButton?.isConnected && !unlinkButton.disabled) unlinkButton.focus();
+		else heading?.focus();
 	}
 
 	/** Apply one DELETE result. `afterReauth` marks the single allowed retry. */
@@ -144,6 +147,7 @@
 				break;
 			case 'signed_out':
 				phase = 'signed_out';
+				await focusHeading();
 				break;
 			case 'account_deleting':
 				accountDeleting = true;
