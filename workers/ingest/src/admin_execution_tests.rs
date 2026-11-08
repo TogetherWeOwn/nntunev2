@@ -106,6 +106,95 @@ fn at_state(runtime: &mut Runtime, cp: &mut JobCheckpoint, state: JobState) {
 }
 
 #[tokio::test]
+async fn storage_reconstructs_each_stage_and_refuses_skips_and_unrelated_mutations() {
+    let (mut cp, parsed, mut runtime) = fixture();
+    for _ in 0..4 {
+        let expected = cp.clone();
+        step(&mut runtime, &mut cp, &parsed).await.unwrap();
+        let validate = |next: &JobCheckpoint| {
+            validate_stage_transition(
+                &expected,
+                next,
+                &expected.job_id,
+                &expected.idempotency_key,
+                &parsed,
+            )
+        };
+        assert_eq!(validate(&cp), Ok(()));
+        assert_eq!(validate(&expected), Err(StageError::Invalid));
+        let mut bad = cp.clone();
+        bad.attempt += 1;
+        assert_eq!(validate(&bad), Err(StageError::Invalid));
+        bad = cp.clone();
+        bad.failure_code = Some("probe_failed".into());
+        assert_eq!(validate(&bad), Err(StageError::Invalid));
+        for state in [JobState::Done, JobState::Rejected, JobState::Searching] {
+            bad = cp.clone();
+            bad.state = state;
+            assert_eq!(validate(&bad), Err(StageError::Invalid));
+        }
+    }
+    let mut done = cp.clone();
+    jobs::advance_checkpoint(&mut done, false);
+    assert_eq!(done.state, JobState::Done);
+    assert_eq!(
+        validate_stage_transition(&cp, &done, &cp.job_id, &cp.idempotency_key, &parsed),
+        Err(StageError::Invalid)
+    );
+}
+
+#[tokio::test]
+async fn storage_rechecks_probe_batch_order_geometry_and_unchanged_evidence() {
+    let (mut cp, mut parsed, mut runtime) = fixture();
+    let mut template = parsed.files[0].segments[0].clone();
+    let seed = template.message_id.clone();
+    parsed.files.truncate(1);
+    parsed.files[0].segments.clear();
+    for index in 0..(MAX_PROBE_SEGMENTS + 1) {
+        template.message_id = format!("{index}{seed}");
+        parsed.files[0].segments.push(template.clone());
+    }
+    at_state(&mut runtime, &mut cp, JobState::Matching);
+    step(&mut runtime, &mut cp, &parsed).await.unwrap();
+    let first = cp.clone();
+    step(&mut runtime, &mut cp, &parsed).await.unwrap();
+    let second = cp.clone();
+    let validate = |expected: &JobCheckpoint, next: &JobCheckpoint| {
+        validate_stage_transition(
+            expected,
+            next,
+            &expected.job_id,
+            &expected.idempotency_key,
+            &parsed,
+        )
+    };
+    assert_eq!(validate(&first, &second), Ok(()));
+    let mut bad = second.clone();
+    let tally = bad.probe_tally.as_mut().unwrap();
+    tally.missing_by_batch.remove(&0);
+    tally.missing_by_batch.insert(1, 0);
+    assert_eq!(validate(&first, &bad), Err(StageError::Invalid));
+    step(&mut runtime, &mut cp, &parsed).await.unwrap();
+    assert_eq!(validate(&second, &cp), Ok(()));
+    bad = cp.clone();
+    bad.probe_tally
+        .as_mut()
+        .unwrap()
+        .missing_by_batch
+        .insert(1, 2);
+    bad.state = JobState::NeedsReview;
+    assert_eq!(validate(&second, &bad), Err(StageError::Invalid));
+    bad = cp.clone();
+    bad.probe_tally
+        .as_mut()
+        .unwrap()
+        .missing_by_batch
+        .insert(0, 1);
+    assert_eq!(validate(&second, &bad), Err(StageError::Invalid));
+    assert_eq!(validate(&first, &cp), Err(StageError::Invalid));
+}
+
+#[tokio::test]
 async fn every_stage_persists_before_the_next_service_and_stops_before_publication() {
     let (mut cp, parsed, mut runtime) = fixture();
     for expected in [

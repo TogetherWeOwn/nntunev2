@@ -196,6 +196,77 @@ pub fn validate_publication(
     Ok(())
 }
 
+/// Reconstruct exactly one ordinary stage transition at the storage boundary.
+/// Manual controls, retry-budget changes and publication are separate atomic
+/// operations; none can be smuggled through ordinary stage persistence.
+/// Match/probe results remain the trusted runtime's inputs, but their retained
+/// geometry, ordering and every unchanged checkpoint field are checked here.
+pub fn validate_stage_transition(
+    expected: &JobCheckpoint,
+    next: &JobCheckpoint,
+    original_job: &str,
+    original_key: &str,
+    parsed: &Document,
+) -> Result<(), StageError> {
+    validate_original(expected, original_job, original_key)?;
+    let plan = ProbePlan::new(parsed)?;
+    if !matches!(expected.state, JobState::Queued | JobState::Parsing) && has_archive(parsed) {
+        return Err(StageError::Invalid);
+    }
+    let mut computed = expected.clone();
+    match expected.state {
+        JobState::Queued => {
+            jobs::advance_checkpoint(&mut computed, false);
+        }
+        JobState::Parsing => {
+            if !jobs::complete_admin_parse(&mut computed, parsed) {
+                return Err(StageError::Invalid);
+            }
+        }
+        JobState::Matching => {
+            if !admin_gates::complete_match(
+                &mut computed,
+                next.admin_release_mbid.as_deref(),
+                plan.batches(),
+            ) {
+                return Err(StageError::Invalid);
+            }
+        }
+        JobState::Probing => {
+            if !plan.matches(expected) {
+                return Err(StageError::Invalid);
+            }
+            if admin_gates::probe_ready(expected) {
+                let tally = computed.probe_tally.as_mut().ok_or(StageError::Invalid)?;
+                let index = (0..plan.batches())
+                    .find(|i| !tally.missing_by_batch.contains_key(i))
+                    .ok_or(StageError::Invalid)?;
+                let missing = next
+                    .probe_tally
+                    .as_ref()
+                    .and_then(|t| t.missing_by_batch.get(&index))
+                    .copied()
+                    .filter(|n| {
+                        *n as usize
+                            <= plan
+                                .segments
+                                .len()
+                                .saturating_sub(index * MAX_PROBE_SEGMENTS)
+                                .min(MAX_PROBE_SEGMENTS)
+                    })
+                    .ok_or(StageError::Invalid)?;
+                tally.missing_by_batch.insert(index, missing);
+            }
+            admin_gates::advance_probe(&mut computed);
+        }
+        _ => return Err(StageError::Invalid),
+    }
+    if computed != *next {
+        return Err(StageError::Invalid);
+    }
+    Ok(())
+}
+
 async fn run_planned_stage(
     runtime: &mut impl StageRuntime,
     cp: &mut JobCheckpoint,

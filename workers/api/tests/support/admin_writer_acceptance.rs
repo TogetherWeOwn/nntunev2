@@ -1,6 +1,9 @@
 //! Real statement execution in disposable PostgreSQL. The checkpoint runtime
 //! is fake; these tests do not establish live dispatch, durable checkpoint CAS,
 //! production schema acceptance or atomic Done/publication integration.
+#[path = "admin_checkpoint_acceptance.rs"]
+mod checkpoint_acceptance;
+
 use super::{client, OTHER_RELEASE, RECORDING, RELEASE};
 use nntune_api::{
     admin_ingest as intake,
