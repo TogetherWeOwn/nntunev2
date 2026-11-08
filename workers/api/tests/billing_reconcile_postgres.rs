@@ -6,6 +6,7 @@
 //! the Worker's positional parameter types, never a copy of its SQL.
 #![cfg(feature = "postgres-tests")]
 
+use nntune_api::billing::{resolve_effective_plan, SubscriptionView};
 use nntune_api::billing_reconcile::{
     insert_paid_invoice_history_statement, reconcile_live_select_statement,
     reconcile_lock_statement, reconcile_subscription, store_reconciled_subscription_statement,
@@ -212,58 +213,60 @@ impl Fx {
     }
 
     /// The Worker's transaction: per-user lock, positional typed write,
-    /// then history. Panics on any statement error, so a unique-index
-    /// conflict surfaces as a failure.
-    async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
-        let tx = self.db.transaction().await.unwrap();
-        tx.query_typed(reconcile_lock_statement(), &[(&user, Type::TEXT)])
-            .await
-            .unwrap();
-        let stmt = tx
-            .prepare_typed(
-                store_reconciled_subscription_statement(),
-                &[
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::BOOL,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::BOOL,
-                ],
-            )
-            .await
-            .unwrap();
-        let r = &outcome.row;
-        let params: [&(dyn ToSql + Sync); 15] = [
-            &user,
-            &r.stripe_subscription_id,
-            &r.stripe_customer_id,
-            &r.stripe_item_id,
-            &r.stripe_price_id,
-            &r.plan_id,
-            &r.status,
-            &r.current_period_end_unix,
-            &r.cancel_at_period_end,
-            &r.paid_through_unix,
-            &r.paid_invoice_id,
-            &r.grace_until_unix,
-            &outcome.read_anchor,
-            &outcome.read_plan,
-            &outcome.stale_snapshot,
-        ];
-        tx.execute(&stmt, &params).await.unwrap();
-        for h in &outcome.history {
-            tx.execute(
-                &tx.prepare_typed(
+    /// then history. A failing statement rolls the whole transaction back
+    /// and is returned, so tests can assert the exact SQLSTATE.
+    async fn try_put(
+        &mut self,
+        user: &str,
+        outcome: &ReconcileOutcome,
+    ) -> Result<(), tokio_postgres::Error> {
+        let tx = self.db.transaction().await?;
+        let written: Result<(), tokio_postgres::Error> = async {
+            tx.query_typed(reconcile_lock_statement(), &[(&user, Type::TEXT)])
+                .await?;
+            let stmt = tx
+                .prepare_typed(
+                    store_reconciled_subscription_statement(),
+                    &[
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::INT8,
+                        Type::BOOL,
+                        Type::INT8,
+                        Type::TEXT,
+                        Type::INT8,
+                        Type::TEXT,
+                        Type::TEXT,
+                        Type::BOOL,
+                    ],
+                )
+                .await?;
+            let r = &outcome.row;
+            let params: [&(dyn ToSql + Sync); 15] = [
+                &user,
+                &r.stripe_subscription_id,
+                &r.stripe_customer_id,
+                &r.stripe_item_id,
+                &r.stripe_price_id,
+                &r.plan_id,
+                &r.status,
+                &r.current_period_end_unix,
+                &r.cancel_at_period_end,
+                &r.paid_through_unix,
+                &r.paid_invoice_id,
+                &r.grace_until_unix,
+                &outcome.read_anchor,
+                &outcome.read_plan,
+                &outcome.stale_snapshot,
+            ];
+            tx.execute(&stmt, &params).await?;
+            let history = tx
+                .prepare_typed(
                     insert_paid_invoice_history_statement(),
                     &[
                         Type::TEXT,
@@ -277,24 +280,41 @@ impl Fx {
                         Type::INT8,
                     ],
                 )
-                .await
-                .unwrap(),
-                &[
-                    &user,
-                    &h.stripe_invoice_id,
-                    &h.stripe_subscription_id,
-                    &h.plan_id,
-                    &h.period_start_unix,
-                    &h.period_end_unix,
-                    &h.amount_cents,
-                    &h.currency,
-                    &h.paid_at_unix,
-                ],
-            )
-            .await
-            .unwrap();
+                .await?;
+            for h in &outcome.history {
+                tx.execute(
+                    &history,
+                    &[
+                        &user,
+                        &h.stripe_invoice_id,
+                        &h.stripe_subscription_id,
+                        &h.plan_id,
+                        &h.period_start_unix,
+                        &h.period_end_unix,
+                        &h.amount_cents,
+                        &h.currency,
+                        &h.paid_at_unix,
+                    ],
+                )
+                .await?;
+            }
+            Ok(())
         }
-        tx.commit().await.unwrap();
+        .await;
+        match written {
+            Ok(()) => tx.commit().await,
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// `try_put` for writes that must succeed.
+    async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
+        self.try_put(user, outcome)
+            .await
+            .expect("reconcile write must commit");
     }
 
     /// Stored active subscription `sub` with invoices 1 and 2 folded
@@ -755,7 +775,7 @@ async fn terminal_subscription_is_not_resurrected_beside_a_live_one() {
 }
 
 #[tokio::test]
-async fn insertion_skips_only_while_another_subscription_holds_the_slot() {
+async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
     let mut fx = Fx::new().await;
     let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
     let outside = [
@@ -781,16 +801,26 @@ async fn insertion_skips_only_while_another_subscription_holds_the_slot() {
                 &invoices(&newcomer, 1),
             ),
         );
-        fx.put(&user, &outcome).await;
         let held = live.contains(status);
-        assert_eq!(
-            fx.snap(&newcomer).await.is_some(),
-            !held,
-            "holder status {status}"
-        );
-        assert_eq!(fx.rows(&user).await, if held { 1 } else { 2 });
-        // History converges either way.
-        assert_eq!(fx.history_rows(&newcomer).await, 1);
+        let result = fx.try_put(&user, &outcome).await;
+        if held {
+            // A competing live holder surfaces as a retryable unique
+            // violation; the transaction (history included) rolls back.
+            let error = result.expect_err(status);
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+                "holder status {status}"
+            );
+            assert!(fx.snap(&newcomer).await.is_none(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 1);
+            assert_eq!(fx.history_rows(&newcomer).await, 0, "holder {status}");
+        } else {
+            result.expect(status);
+            assert!(fx.snap(&newcomer).await.is_some(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 2);
+            assert_eq!(fx.history_rows(&newcomer).await, 1);
+        }
     }
 
     // Another user's live slot never blocks this user.
@@ -810,4 +840,92 @@ async fn insertion_skips_only_while_another_subscription_holds_the_slot() {
     );
     fx.put("free_user", &outcome).await;
     assert!(fx.snap("sub_free").await.is_some());
+}
+
+#[tokio::test]
+async fn equal_end_plan_switch_converges_in_both_commit_orders() {
+    let mut finals = Vec::new();
+    for held_first in [true, false] {
+        let mut fx = Fx::new().await;
+        let seed = fx.seed_active("u1", "sub_a").await;
+        // Both passes read the same seed: Plus, end E, anchor I1.
+        let held = fx
+            .fold(
+                "u1",
+                &remote(
+                    "sub_a",
+                    "paused",
+                    PRICE_PLUS,
+                    false,
+                    T + 2 * P + 1,
+                    &invoices("sub_a", 2),
+                ),
+            )
+            .await;
+        // Newer snapshot: I1 plus a same-end Pro invoice paid later.
+        let mut pro = invoice("sub_a", 2);
+        pro.id = "inv_sub_a_pro".into();
+        pro.status_transitions = Some(InvoiceStatusTransitions {
+            paid_at: Some(T + P + 10),
+        });
+        pro.lines.as_mut().unwrap().data[0].price = Some(PRICE_PRO.into());
+        let mut newer_invoices = invoices("sub_a", 2);
+        newer_invoices.push(pro);
+        let active = fx
+            .fold(
+                "u1",
+                &remote(
+                    "sub_a",
+                    "active",
+                    PRICE_PRO,
+                    true,
+                    T + 3 * P,
+                    &newer_invoices,
+                ),
+            )
+            .await;
+        assert_eq!(held.read_anchor, seed.anchor);
+        assert_eq!(held.read_plan.as_deref(), Some("plus"));
+        assert_eq!(active.read_anchor, seed.anchor);
+        assert_eq!(active.row.plan_id, "pro");
+        assert_eq!(active.row.paid_invoice_id.as_deref(), Some("inv_sub_a_pro"));
+        assert!(!held.stale_snapshot && !active.stale_snapshot);
+        if held_first {
+            fx.put("u1", &held).await;
+            fx.put("u1", &active).await;
+        } else {
+            fx.put("u1", &active).await;
+            // Same end, but the stored plan/anchor moved since this read.
+            fx.put("u1", &held).await;
+        }
+        let snap = fx.snap("sub_a").await.unwrap();
+        assert_eq!(snap.plan, "pro");
+        assert_eq!(snap.anchor.as_deref(), Some("inv_sub_a_pro"));
+        assert_eq!(snap.price, PRICE_PRO);
+        assert_eq!(snap.status, "active");
+        assert!(snap.cancel);
+        assert_eq!(snap.period_end, Some(T + 3 * P));
+        assert_eq!(snap.paid_through, Some(T + 2 * P));
+        assert_eq!(snap.grace, None);
+        // Exact paid cutoff: entitled strictly before the end, and with a
+        // scheduled cancellation closed at the end.
+        let view = |now| {
+            resolve_effective_plan(
+                Some(SubscriptionView {
+                    plan_id: &snap.plan,
+                    status: &snap.status,
+                    cancel_at_period_end: snap.cancel,
+                    paid_through_at_unix: snap.paid_through,
+                    grace_until_unix: snap.grace,
+                    current_period_end_unix: snap.period_end,
+                }),
+                now,
+            )
+        };
+        let end = T + 2 * P;
+        assert!(view(end - 1).entitled);
+        assert!(!view(end).entitled);
+        finals.push(snap);
+    }
+    assert_eq!(finals[0], finals[1], "commit order must not matter");
 }

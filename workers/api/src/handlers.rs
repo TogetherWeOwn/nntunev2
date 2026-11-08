@@ -7298,6 +7298,9 @@ mod tests {
         /// reconcile input loads whole.
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        /// All subscription keys, including terminal rows no longer projected
+        /// by the per-user map, distinguish an upsert update from an insert.
+        billing_subscription_ids: RefCell<HashSet<String>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
         /// Land a replacement at input load, after the remote retrieve.
         replacement_on_reconcile_load:
@@ -8669,14 +8672,25 @@ mod tests {
             // different live slot skip the subscription write entirely;
             // history still converges on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
-            let skip = outcome.stale_snapshot
-                || rows.get(user_id).is_some_and(|existing| {
-                    existing.stripe_subscription_id != outcome.row.stripe_subscription_id
-                        && matches!(
-                            existing.status.as_str(),
-                            "incomplete" | "active" | "past_due" | "unpaid" | "paused"
-                        )
-                });
+            let different_live = rows.get(user_id).is_some_and(|existing| {
+                existing.stripe_subscription_id != outcome.row.stripe_subscription_id
+                    && matches!(
+                        existing.status.as_str(),
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+            });
+            if !outcome.stale_snapshot
+                && different_live
+                && !self
+                    .billing_subscription_ids
+                    .borrow()
+                    .contains(&outcome.row.stripe_subscription_id)
+            {
+                // A new paid subscription must fail/retry on the unique slot,
+                // not silently acknowledge a checkout without storing its row.
+                return Err(StoreError);
+            }
+            let skip = outcome.stale_snapshot || different_live;
             if !skip {
                 let merged = match rows.get(user_id) {
                     Some(existing)
@@ -8709,8 +8723,11 @@ mod tests {
                                 (Some(end), Some(previous)) => {
                                     end < previous
                                         || (end == previous
-                                            && outcome.row.paid_invoice_id.is_none()
-                                            && existing.paid_invoice_id.is_some())
+                                            && ((outcome.row.paid_invoice_id.is_none()
+                                                && existing.paid_invoice_id.is_some())
+                                                || outcome.read_plan.as_deref()
+                                                    != Some(existing.plan_id.as_str())
+                                                || outcome.read_anchor != existing.paid_invoice_id))
                                 }
                                 _ => false,
                             };
@@ -8733,6 +8750,9 @@ mod tests {
                     }
                     _ => outcome.row.clone(),
                 };
+                self.billing_subscription_ids
+                    .borrow_mut()
+                    .insert(merged.stripe_subscription_id.clone());
                 rows.insert(user_id.to_string(), merged);
             }
             let mut history = self.invoice_history.borrow_mut();
@@ -11124,6 +11144,17 @@ mod tests {
                     .billing_customers
                     .borrow_mut()
                     .insert("u1".into(), "cus_test_1".into());
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(
+                        PLAN_PLUS,
+                        "canceled",
+                        Some(BILLING_NOW - 200),
+                        Some("in_prior"),
+                        None,
+                    ),
+                ))
+                .expect("A was canceled before replacement");
                 let mut replacement = stored_seed(
                     PLAN_PRO,
                     "active",
@@ -11240,36 +11271,15 @@ mod tests {
     #[test]
     fn billing_late_held_fold_preserves_recovery_cancellation_and_bindings() {
         let old_end = BILLING_NOW;
-        let new_end = BILLING_NOW + BILLING_PERIOD;
-        let input = fold_input(PLAN_PLUS, "active", Some(old_end), None, Some("in_seed"));
-        let mut held_sub = test_subscription("sub_test_1", "cus_test_1", "paused", PRICE_PLUS);
-        held_sub.current_period_end = Some(old_end);
-        let held = crate::billing_reconcile::reconcile_subscription(
-            &input,
-            &crate::billing_reconcile::RemoteSubscription {
-                subscription: held_sub,
-                invoices: vec![test_invoice(
-                    "in_seed",
-                    "cus_test_1",
-                    "sub_test_1",
-                    PRICE_PLUS,
-                    old_end - BILLING_PERIOD,
-                    old_end,
-                    BILLING_NOW - 100,
-                )],
-            },
-            BILLING_NOW,
-        );
-        let mut recovered_sub = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO);
-        recovered_sub.current_period_end = Some(new_end);
-        recovered_sub.cancel_at_period_end = true;
-        recovered_sub.items.as_mut().expect("item").data[0].id = "si_recovered".into();
-        let recovered = crate::billing_reconcile::reconcile_subscription(
-            &input,
-            &crate::billing_reconcile::RemoteSubscription {
-                subscription: recovered_sub,
-                invoices: vec![
-                    test_invoice(
+        for new_end in [old_end, old_end + BILLING_PERIOD] {
+            let input = fold_input(PLAN_PLUS, "active", Some(old_end), None, Some("in_seed"));
+            let mut held_sub = test_subscription("sub_test_1", "cus_test_1", "paused", PRICE_PLUS);
+            held_sub.current_period_end = Some(old_end);
+            let held = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: held_sub,
+                    invoices: vec![test_invoice(
                         "in_seed",
                         "cus_test_1",
                         "sub_test_1",
@@ -11277,42 +11287,152 @@ mod tests {
                         old_end - BILLING_PERIOD,
                         old_end,
                         BILLING_NOW - 100,
-                    ),
-                    test_invoice(
-                        "in_recovered",
-                        "cus_test_1",
-                        "sub_test_1",
-                        PRICE_PRO,
-                        old_end,
-                        new_end,
-                        BILLING_NOW,
-                    ),
-                ],
-            },
-            BILLING_NOW,
-        );
-        assert!(
-            !held.stale_snapshot,
-            "fresh at fold time, stale only at commit"
-        );
-        for held_first in [false, true] {
-            let h = stripe_harness();
-            seed_billing_user(&h, "u1");
-            block_on(h.store.store_reconcile_outcome(
-                "u1",
-                &stored_seed(PLAN_PLUS, "active", Some(old_end), Some("in_seed"), None),
-            ))
-            .expect("seed");
-            let passes = if held_first {
-                [&held, &recovered]
-            } else {
-                [&recovered, &held]
-            };
-            for pass in passes {
-                block_on(h.store.store_reconcile_outcome("u1", pass)).expect("commit");
+                    )],
+                },
+                BILLING_NOW,
+            );
+            let mut recovered_sub =
+                test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO);
+            recovered_sub.current_period_end = Some(new_end);
+            recovered_sub.cancel_at_period_end = true;
+            recovered_sub.items.as_mut().expect("item").data[0].id = "si_recovered".into();
+            let recovered = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: recovered_sub,
+                    invoices: vec![
+                        test_invoice(
+                            "in_seed",
+                            "cus_test_1",
+                            "sub_test_1",
+                            PRICE_PLUS,
+                            old_end - BILLING_PERIOD,
+                            old_end,
+                            BILLING_NOW - 100,
+                        ),
+                        test_invoice(
+                            "in_recovered",
+                            "cus_test_1",
+                            "sub_test_1",
+                            PRICE_PRO,
+                            old_end,
+                            new_end,
+                            BILLING_NOW,
+                        ),
+                    ],
+                },
+                BILLING_NOW,
+            );
+            assert!(
+                !held.stale_snapshot,
+                "fresh at fold time, stale only at commit"
+            );
+            for held_first in [false, true] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(PLAN_PLUS, "active", Some(old_end), Some("in_seed"), None),
+                ))
+                .expect("seed");
+                let passes = if held_first {
+                    [&held, &recovered]
+                } else {
+                    [&recovered, &held]
+                };
+                for pass in passes {
+                    block_on(h.store.store_reconcile_outcome("u1", pass)).expect("commit");
+                }
+                assert_eq!(h.store.billing_rows.borrow()["u1"], recovered.row);
+                let row = h.store.billing_rows.borrow();
+                let row = &row["u1"];
+                for (now, entitled) in [(new_end - 1, true), (new_end, false)] {
+                    assert_eq!(
+                        crate::billing::resolve_effective_plan(
+                            Some(crate::billing::SubscriptionView {
+                                plan_id: &row.plan_id,
+                                status: &row.status,
+                                cancel_at_period_end: row.cancel_at_period_end,
+                                paid_through_at_unix: row.paid_through_unix,
+                                grace_until_unix: row.grace_until_unix,
+                                current_period_end_unix: row.current_period_end_unix,
+                            }),
+                            now
+                        )
+                        .entitled,
+                        entitled
+                    );
+                }
             }
-            assert_eq!(h.store.billing_rows.borrow()["u1"], recovered.row);
         }
+    }
+
+    #[test]
+    fn billing_new_paid_subscription_slot_conflict_remains_retryable() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let mut holder = stored_seed(PLAN_PLUS, "active", None, None, None);
+        holder.row.stripe_subscription_id = "sub_holder".into();
+        block_on(h.store.store_reconcile_outcome("u1", &holder)).expect("holder");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("operation");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".into(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".into(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW,
+            ),
+        );
+        let body = checkout_completed_body("evt_slot_conflict", "cs_test_1", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert!(!h
+            .store
+            .webhook_events
+            .borrow()
+            .contains("evt_slot_conflict"));
+        assert_eq!(h.store.checkout_ops.borrow()["op_test_1"].state, "pending");
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(h.store.billing_rows.borrow()["u1"], holder.row);
+        holder.row.status = "canceled".into();
+        block_on(h.store.store_reconcile_outcome("u1", &holder)).expect("release slot");
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(
+            h.store.checkout_ops.borrow()["op_test_1"].state,
+            "succeeded"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"].stripe_subscription_id,
+            "sub_test_1"
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }
 
     #[test]
