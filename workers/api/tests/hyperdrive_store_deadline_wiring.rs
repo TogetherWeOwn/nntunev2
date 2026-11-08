@@ -226,7 +226,7 @@ fn total_budget_encloses_dial_handshake_and_statement_setup_without_reset() {
         "DIAL_TIMEOUT_MS",
         ".connect_raw(socket,worker::postgres_tls::PassthroughTls)",
         "client.batch_execute(",
-        "Ok(client)",
+        "Ok(ClientCheckout{",
     ] {
         assert!(
             operation.contains(stage),
@@ -238,7 +238,8 @@ fn total_budget_encloses_dial_handshake_and_statement_setup_without_reset() {
         operation.find(".connect_raw(").unwrap() < operation.find("client.batch_execute(").unwrap()
     );
     assert!(
-        operation.find("client.batch_execute(").unwrap() < operation.find("Ok(client)").unwrap()
+        operation.find("client.batch_execute(").unwrap()
+            < operation.find("Ok(ClientCheckout{").unwrap()
     );
 }
 
