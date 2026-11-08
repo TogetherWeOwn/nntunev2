@@ -741,6 +741,19 @@ pub fn session_retry_store_for_postgres_test(
     }
 }
 
+/// Inject only connection acquisition; the billing reconcile pass still
+/// runs the real PgStore transaction, lock, loads, writes and deadline.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn billing_store_for_postgres_test(client: tokio_postgres::Client) -> impl Store {
+    PgStore {
+        env: None,
+        trace_id: "postgres-billing-test".into(),
+        mirror_binding: MirrorBinding::Configured,
+        test_client: std::cell::RefCell::new(Some(client)),
+        test_mirror: None,
+    }
+}
+
 /// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
 /// code only, never the message/detail (which can carry host/role strings).
 /// `tokio_postgres::Error` extracts the real code; test stubs return fixed
@@ -918,6 +931,190 @@ impl PgStore {
             );
         }
         connected
+    }
+
+    /// Narrow server-side caps before each statement and provider read to
+    /// the shared budget's remaining time. Numeric formatting only: SET
+    /// takes no parameters, and no caller text enters this statement.
+    async fn set_local_timeouts(
+        transaction: &impl GenericClient,
+        ms: u64,
+    ) -> Result<(), tokio_postgres::Error> {
+        let ms = ms.max(1);
+        transaction
+            .batch_execute(&format!(
+                "SET LOCAL statement_timeout = {ms}; \
+             SET LOCAL idle_in_transaction_session_timeout = {ms}"
+            ))
+            .await
+    }
+
+    /// The reconcile decision-input reads on a caller-supplied connection
+    /// or transaction (the production decoders and SQL, shared by the
+    /// standalone checkout read and the locked reconcile pass).
+    async fn load_reconcile_input_on(
+        client: &impl GenericClient,
+        user_id: &str,
+        failed: &dyn Fn() -> StoreError,
+        remaining_ms: Option<&dyn Fn() -> u64>,
+    ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+        if let Some(remaining) = remaining_ms {
+            Self::set_local_timeouts(client, remaining())
+                .await
+                .map_err(|_| failed())?;
+        }
+        let account_rows = client
+            .query_typed(
+                crate::billing_reconcile::reconcile_account_select_statement(),
+                &[(&user_id, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| failed())?;
+        if account_rows.len() > 1 {
+            return Err(StoreError);
+        }
+        let stripe_customer_id = account_rows
+            .first()
+            .map(|row| {
+                row.try_get::<_, Option<String>>("stripe_customer_id")
+                    .map_err(|_| StoreError)
+            })
+            .transpose()?
+            .flatten();
+        if let Some(remaining) = remaining_ms {
+            Self::set_local_timeouts(client, remaining())
+                .await
+                .map_err(|_| failed())?;
+        }
+        let live_rows = client
+            .query_typed(
+                crate::billing_reconcile::reconcile_live_select_statement(),
+                &[(&user_id, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| failed())?;
+        if live_rows.len() > 1 {
+            return Err(StoreError);
+        }
+        let live = live_rows
+            .first()
+            .map(|row| {
+                Ok::<_, StoreError>(crate::billing_reconcile::LiveRow {
+                    stripe_subscription_id: row
+                        .try_get("stripe_subscription_id")
+                        .map_err(|_| StoreError)?,
+                    stripe_customer_id: row
+                        .try_get("stripe_customer_id")
+                        .map_err(|_| StoreError)?,
+                    stripe_item_id: row
+                        .try_get("stripe_subscription_item_id")
+                        .map_err(|_| StoreError)?,
+                    stripe_price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
+                    plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                    status: row.try_get("status").map_err(|_| StoreError)?,
+                    paid_through_unix: row
+                        .try_get::<_, Option<i64>>("paid_through_unix")
+                        .map_err(|_| StoreError)?,
+                    paid_invoice_id: row
+                        .try_get::<_, Option<String>>("paid_invoice_id")
+                        .map_err(|_| StoreError)?,
+                    grace_until_unix: row
+                        .try_get::<_, Option<i64>>("grace_until_unix")
+                        .map_err(|_| StoreError)?,
+                })
+            })
+            .transpose()?;
+        if let Some(remaining) = remaining_ms {
+            Self::set_local_timeouts(client, remaining())
+                .await
+                .map_err(|_| failed())?;
+        }
+        let binding_rows = client
+            .query_typed(
+                crate::billing_reconcile::price_bindings_select_statement(),
+                &[],
+            )
+            .await
+            .map_err(|_| failed())?;
+        let bindings = binding_rows
+            .iter()
+            .map(|row| {
+                Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
+                    price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
+                    plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                    selectable: row.try_get("selectable").map_err(|_| StoreError)?,
+                    livemode: row.try_get("livemode").map_err(|_| StoreError)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::billing_reconcile::ReconcileInput {
+            stripe_customer_id,
+            live,
+            bindings,
+        })
+    }
+
+    /// The subscription upsert plus paid-invoice history inserts on a
+    /// caller-supplied transaction that already holds the per-user advisory
+    /// lock: coverage advances monotonically while history inserts converge
+    /// on the invoice id, so duplicates and out-of-order replays land the
+    /// same stored state.
+    async fn write_reconcile_outcome_on(
+        client: &impl GenericClient,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+        failed: &dyn Fn() -> StoreError,
+        remaining_ms: &dyn Fn() -> u64,
+    ) -> Result<(), StoreError> {
+        Self::set_local_timeouts(client, remaining_ms())
+            .await
+            .map_err(|_| failed())?;
+        let row = &outcome.row;
+        client
+            .query_typed(
+                crate::billing_reconcile::store_reconciled_subscription_statement(),
+                &[
+                    (&user_id, Type::TEXT),
+                    (&row.stripe_subscription_id, Type::TEXT),
+                    (&row.stripe_customer_id, Type::TEXT),
+                    (&row.stripe_item_id, Type::TEXT),
+                    (&row.stripe_price_id, Type::TEXT),
+                    (&row.plan_id, Type::TEXT),
+                    (&row.status, Type::TEXT),
+                    (&row.current_period_end_unix, Type::INT8),
+                    (&row.cancel_at_period_end, Type::BOOL),
+                    (&row.paid_through_unix, Type::INT8),
+                    (&row.paid_invoice_id, Type::TEXT),
+                    (&row.grace_until_unix, Type::INT8),
+                    (&outcome.read_anchor, Type::TEXT),
+                    (&outcome.read_plan, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| failed())?;
+        for history in &outcome.history {
+            Self::set_local_timeouts(client, remaining_ms())
+                .await
+                .map_err(|_| failed())?;
+            client
+                .query_typed(
+                    crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                    &[
+                        (&user_id, Type::TEXT),
+                        (&history.stripe_invoice_id, Type::TEXT),
+                        (&history.stripe_subscription_id, Type::TEXT),
+                        (&history.plan_id, Type::TEXT),
+                        (&history.period_start_unix, Type::INT8),
+                        (&history.period_end_unix, Type::INT8),
+                        (&history.amount_cents, Type::INT8),
+                        (&history.currency, Type::TEXT),
+                        (&history.paid_at_unix, Type::INT8),
+                    ],
+                )
+                .await
+                .map_err(|_| failed())?;
+        }
+        Ok(())
     }
 
     /// Map one `billing_operations` row to its single-flight shape: the
@@ -4034,87 +4231,7 @@ impl Store for PgStore {
                 let failed =
                     || self.statement_failed("api.db.statement_failed.load_reconcile_input");
                 let client = self.connect().await?;
-                let account_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_account_select_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                if account_rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                let stripe_customer_id = account_rows
-                    .first()
-                    .map(|row| {
-                        row.try_get::<_, Option<String>>("stripe_customer_id")
-                            .map_err(|_| StoreError)
-                    })
-                    .transpose()?
-                    .flatten();
-                let live_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_live_select_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                if live_rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                let live = live_rows
-                    .first()
-                    .map(|row| {
-                        Ok::<_, StoreError>(crate::billing_reconcile::LiveRow {
-                            stripe_subscription_id: row
-                                .try_get("stripe_subscription_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_customer_id: row
-                                .try_get("stripe_customer_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_item_id: row
-                                .try_get("stripe_subscription_item_id")
-                                .map_err(|_| StoreError)?,
-                            stripe_price_id: row
-                                .try_get("stripe_price_id")
-                                .map_err(|_| StoreError)?,
-                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
-                            status: row.try_get("status").map_err(|_| StoreError)?,
-                            paid_through_unix: row
-                                .try_get::<_, Option<i64>>("paid_through_unix")
-                                .map_err(|_| StoreError)?,
-                            paid_invoice_id: row
-                                .try_get::<_, Option<String>>("paid_invoice_id")
-                                .map_err(|_| StoreError)?,
-                            grace_until_unix: row
-                                .try_get::<_, Option<i64>>("grace_until_unix")
-                                .map_err(|_| StoreError)?,
-                        })
-                    })
-                    .transpose()?;
-                let binding_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::price_bindings_select_statement(),
-                        &[],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                let bindings = binding_rows
-                    .iter()
-                    .map(|row| {
-                        Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
-                            price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
-                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
-                            selectable: row.try_get("selectable").map_err(|_| StoreError)?,
-                            livemode: row.try_get("livemode").map_err(|_| StoreError)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(crate::billing_reconcile::ReconcileInput {
-                    stripe_customer_id,
-                    live,
-                    bindings,
-                })
+                Self::load_reconcile_input_on(&client, user_id, &failed, None).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4151,21 +4268,52 @@ impl Store for PgStore {
         .await
     }
 
-    async fn store_reconcile_outcome(
+    async fn reconcile_billing_subscription(
         &self,
         user_id: &str,
-        outcome: &crate::billing_reconcile::ReconcileOutcome,
-    ) -> Result<(), StoreError> {
+        subscription_id: &str,
+        stripe: &dyn crate::stripe::StripeTransport,
+        now_unix: i64,
+    ) -> Result<crate::billing_reconcile::ReconcileOutcome, StoreError> {
+        // One shared 15s budget for the whole pass. The outer race covers
+        // connect, BEGIN, lock, local loads, every provider page, the fold,
+        // the writes and COMMIT; nothing below re-arms it. The start is
+        // sampled before the race so the `SET LOCAL` windows below are the
+        // time actually left, not a fresh `TOTAL_TIMEOUT_MS`.
+        let started = now_millis();
+        let remaining_ms = move || {
+            TOTAL_TIMEOUT_MS
+                .saturating_sub(now_millis().saturating_sub(started))
+                .max(1)
+        };
         Self::bounded(
             async {
-                let failed =
-                    || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+                let failed = || {
+                    self.statement_failed("api.db.statement_failed.reconcile_billing_subscription")
+                };
                 let mut client = self.connect().await?;
-                let transaction = client.transaction().await.map_err(|_| failed())?;
-                // One transaction under the per-user advisory lock: coverage
-                // advances monotonically while history inserts converge on
-                // the invoice id — duplicates and out-of-order replays land
-                // the same stored state.
+                // Explicit READ COMMITTED: the per-user advisory lock, not
+                // snapshot isolation, orders competing passes, and the
+                // statements after the lock must see rows committed by the
+                // pass that held it before us. `transaction` borrows
+                // `client` and drops first on every exit.
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| failed())?;
+                // Server-side backstops bounded by the time left: a hung
+                // statement, or a backend left idle in transaction while
+                // the provider fetch runs (or after this future is
+                // dropped), is cancelled/terminated by Postgres, which
+                // rolls back and releases the advisory lock.
+                Self::set_local_timeouts(&transaction, remaining_ms())
+                    .await
+                    .map_err(|_| failed())?;
+                // Lock BEFORE any decision input or provider retrieval, so
+                // the fold's view of local state cannot be overtaken by a
+                // competing pass between read and write.
                 transaction
                     .query_typed(
                         crate::billing_reconcile::reconcile_lock_statement(),
@@ -4173,50 +4321,35 @@ impl Store for PgStore {
                     )
                     .await
                     .map_err(|_| failed())?;
-                let row = &outcome.row;
-                transaction
-                    .query_typed(
-                        crate::billing_reconcile::store_reconciled_subscription_statement(),
-                        &[
-                            (&user_id, Type::TEXT),
-                            (&row.stripe_subscription_id, Type::TEXT),
-                            (&row.stripe_customer_id, Type::TEXT),
-                            (&row.stripe_item_id, Type::TEXT),
-                            (&row.stripe_price_id, Type::TEXT),
-                            (&row.plan_id, Type::TEXT),
-                            (&row.status, Type::TEXT),
-                            (&row.current_period_end_unix, Type::INT8),
-                            (&row.cancel_at_period_end, Type::BOOL),
-                            (&row.paid_through_unix, Type::INT8),
-                            (&row.paid_invoice_id, Type::TEXT),
-                            (&row.grace_until_unix, Type::INT8),
-                            (&outcome.read_anchor, Type::TEXT),
-                            (&outcome.read_plan, Type::TEXT),
-                        ],
-                    )
+                let input = Self::load_reconcile_input_on(
+                    &transaction,
+                    user_id,
+                    &failed,
+                    Some(&remaining_ms),
+                )
+                .await?;
+                // Lock wait and local reads consumed part of the same budget.
+                // Narrow the idle backstop before yielding to provider I/O.
+                Self::set_local_timeouts(&transaction, remaining_ms())
                     .await
                     .map_err(|_| failed())?;
-                for history in &outcome.history {
-                    transaction
-                        .query_typed(
-                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
-                            &[
-                                (&user_id, Type::TEXT),
-                                (&history.stripe_invoice_id, Type::TEXT),
-                                (&history.stripe_subscription_id, Type::TEXT),
-                                (&history.plan_id, Type::TEXT),
-                                (&history.period_start_unix, Type::INT8),
-                                (&history.period_end_unix, Type::INT8),
-                                (&history.amount_cents, Type::INT8),
-                                (&history.currency, Type::TEXT),
-                                (&history.paid_at_unix, Type::INT8),
-                            ],
-                        )
-                        .await
-                        .map_err(|_| failed())?;
-                }
+                let remote =
+                    crate::handlers::retrieve_billing_observation(stripe, subscription_id).await?;
+                let outcome =
+                    crate::billing_reconcile::reconcile_subscription(&input, &remote, now_unix);
+                Self::write_reconcile_outcome_on(
+                    &transaction,
+                    user_id,
+                    &outcome,
+                    &failed,
+                    &remaining_ms,
+                )
+                .await?;
+                Self::set_local_timeouts(&transaction, remaining_ms())
+                    .await
+                    .map_err(|_| failed())?;
                 transaction.commit().await.map_err(|_| failed())?;
-                Ok(())
+                Ok(outcome)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5978,7 +6111,7 @@ mod tests {
         "api.db.statement_failed.release_webhook_event",
         "api.db.statement_failed.load_reconcile_input",
         "api.db.statement_failed.user_for_stripe_customer",
-        "api.db.statement_failed.store_reconcile_outcome",
+        "api.db.statement_failed.reconcile_billing_subscription",
         "api.db.statement_failed.open_checkout_operation",
         "api.db.statement_failed.create_checkout_operation",
         "api.db.statement_failed.checkout_operation_by_id",

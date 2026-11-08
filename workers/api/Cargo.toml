@@ -71,6 +71,10 @@ required-features = ["postgres-tests"]
 name = "catalogue_store_postgres"
 required-features = ["postgres-tests"]
 
+[[test]]
+name = "billing_observation_postgres"
+required-features = ["postgres-tests"]
+
 [dev-dependencies]
 # Cross-seam persisted source conformance uses the real pure producer.
 nntune-ingest = { version = "0.1.0", path = "../ingest" }

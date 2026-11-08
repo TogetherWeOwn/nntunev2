@@ -1281,10 +1281,23 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<String>, StoreError>> {
         async move { Ok(None) }
     }
-    /// Persist one reconcile pass: the subscription row upsert plus the
-    /// idempotent history inserts, as a single transaction under the
-    /// per-user advisory lock. Default `Err` (fail closed): unconfirmed
-    /// state is never half-written.
+    /// Acquire the per-user transaction lock before reading local inputs or
+    /// retrieving authoritative provider state; fold and commit on that same
+    /// connection. The whole unit, including lock wait and provider pages,
+    /// shares the existing total attempt budget. No prefetched outcome enters
+    /// this seam. Default `Err` leaves unprovisioned stores fail closed.
+    fn reconcile_billing_subscription(
+        &self,
+        _user_id: &str,
+        _subscription_id: &str,
+        _stripe: &dyn crate::stripe::StripeTransport,
+        _now_unix: i64,
+    ) -> impl Future<Output = Result<crate::billing_reconcile::ReconcileOutcome, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    // Pure fake-store projection tests retain an unguarded write helper. It
+    // does not exist in the production Store contract.
+    #[cfg(test)]
     fn store_reconcile_outcome(
         &self,
         _user_id: &str,
@@ -5899,18 +5912,32 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let subscription = ctx
-        .stripe
+    ctx.store
+        .reconcile_billing_subscription(
+            user_id,
+            subscription_id,
+            ctx.stripe,
+            billing_now_i64(ctx.now),
+        )
+        .await
+        .map_err(|_| ())
+}
+
+/// Read a complete observation only from inside the Store's ordered unit.
+/// The transaction owner bounds this entire future, not each individual page.
+/// A supplied subscription id is a retrieval target, never a snapshot.
+pub(crate) async fn retrieve_billing_observation(
+    stripe: &dyn crate::stripe::StripeTransport,
+    subscription_id: &str,
+) -> Result<crate::billing_reconcile::RemoteSubscription, StoreError> {
+    let subscription = stripe
         .retrieve_subscription(subscription_id.to_string())
         .await
-        .map_err(|_| ())?;
-    let input = ctx
-        .store
-        .load_reconcile_input(user_id)
-        .await
-        .map_err(|_| ())?;
-    let listed = ctx
-        .stripe
+        .map_err(|_| StoreError)?;
+    if subscription.id != subscription_id {
+        return Err(StoreError);
+    }
+    let listed = stripe
         .list_invoices(crate::stripe::ListInvoices {
             customer_id: subscription.customer.clone(),
             subscription_id: Some(subscription.id.clone()),
@@ -5921,7 +5948,7 @@ where
             starting_after: None,
         })
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| StoreError)?;
     let mut invoices = Vec::with_capacity(listed.len());
     for mut invoice in listed {
         loop {
@@ -5938,11 +5965,26 @@ where
                 .as_ref()
                 .and_then(|lines| lines.data.last())
                 .map(|line| line.id.clone());
-            let page = ctx
-                .stripe
+            if cursor.as_ref().is_some_and(|id| id.is_empty()) {
+                return Err(StoreError);
+            }
+            let page = stripe
                 .list_invoice_lines(invoice.id.clone(), cursor, 100)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| StoreError)?;
+            // An empty or nonadvancing continuation is not an exhausted
+            // invoice. Reject it rather than accepting a partial observation
+            // or looping until the shared transaction budget expires.
+            if page.data.is_empty()
+                || page.data.iter().any(|line| {
+                    line.id.is_empty()
+                        || invoice.lines.as_ref().is_some_and(|lines| {
+                            lines.data.iter().any(|previous| previous.id == line.id)
+                        })
+                })
+            {
+                return Err(StoreError);
+            }
             match invoice.lines.as_mut() {
                 Some(lines) => {
                     lines.data.extend(page.data);
@@ -5958,19 +6000,10 @@ where
         }
         invoices.push(invoice);
     }
-    let outcome = crate::billing_reconcile::reconcile_subscription(
-        &input,
-        &crate::billing_reconcile::RemoteSubscription {
-            subscription,
-            invoices,
-        },
-        billing_now_i64(ctx.now),
-    );
-    ctx.store
-        .store_reconcile_outcome(user_id, &outcome)
-        .await
-        .map_err(|_| ())?;
-    Ok(outcome)
+    Ok(crate::billing_reconcile::RemoteSubscription {
+        subscription,
+        invoices,
+    })
 }
 
 /// Reconcile one completed Checkout Session (the webhook's handoff):
@@ -8633,6 +8666,23 @@ mod tests {
                 .iter()
                 .find(|(_, customer)| customer.as_str() == customer_id)
                 .map(|(user, _)| user.clone()))
+        }
+        async fn reconcile_billing_subscription(
+            &self,
+            user_id: &str,
+            subscription_id: &str,
+            stripe: &dyn crate::stripe::StripeTransport,
+            now_unix: i64,
+        ) -> Result<crate::billing_reconcile::ReconcileOutcome, StoreError> {
+            // Handler fixtures project the fold synchronously. Ordering and
+            // rollback are exercised separately through the production adapter
+            // against disposable PostgreSQL, not asserted by this fake.
+            let input = self.load_reconcile_input(user_id).await?;
+            let remote = retrieve_billing_observation(stripe, subscription_id).await?;
+            let outcome =
+                crate::billing_reconcile::reconcile_subscription(&input, &remote, now_unix);
+            self.store_reconcile_outcome(user_id, &outcome).await?;
+            Ok(outcome)
         }
         async fn store_reconcile_outcome(
             &self,
@@ -12880,6 +12930,90 @@ mod tests {
         ));
         assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
         assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_incomplete_line_observation_releases_webhook_for_retry() {
+        for repeated_page in [false, true] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            let mut invoice = test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            );
+            let lines = invoice.lines.as_mut().expect("fixture lines");
+            lines.has_more = true;
+            h.stripe.line_pages.borrow_mut().insert(
+                invoice.id.clone(),
+                if repeated_page {
+                    lines.data.clone()
+                } else {
+                    Vec::new()
+                },
+            );
+            h.stripe
+                .invoices
+                .borrow_mut()
+                .insert(invoice.id.clone(), invoice);
+            h.stripe.subscriptions.borrow_mut().insert(
+                "sub_test_1".into(),
+                test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            );
+            h.stripe.sessions.borrow_mut().insert(
+                "cs_test_1".into(),
+                test_session(
+                    "cs_test_1",
+                    "complete",
+                    "paid",
+                    Some("cus_test_1"),
+                    Some("sub_test_1"),
+                    Some("op_test_1"),
+                ),
+            );
+            block_on(h.store.create_checkout_operation(
+                "op_test_1",
+                "u1",
+                PRICE_PLUS,
+                Some("cus_test_1"),
+            ))
+            .expect("operation");
+            let body = checkout_completed_body("evt_incomplete", "cs_test_1", false);
+            let response = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+            assert_eq!(response.status, 500);
+            assert!(!h.store.webhook_events.borrow().contains("evt_incomplete"));
+            assert!(h.store.billing_rows.borrow().is_empty());
+            assert!(h.store.invoice_history.borrow().is_empty());
+
+            h.stripe
+                .invoices
+                .borrow_mut()
+                .get_mut("in_test_1")
+                .expect("invoice")
+                .lines
+                .as_mut()
+                .expect("lines")
+                .has_more = false;
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn billing_retrieval_rejects_a_different_subscription_target() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_unrelated", "cus_test_1", "active", PRICE_PLUS),
+        );
+        assert!(block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).is_err());
+        assert!(h.store.billing_rows.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
     }
 
     #[test]

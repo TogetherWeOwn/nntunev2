@@ -157,9 +157,29 @@ renewal observes `past_due` with no new invoice, and that observation still
 sets the renewal grace). The stale fold carries its evidence end into the
 write (not the stored end), so the predicate still fires when the
 stale-reading pass commits second — falling back to the stored end, anchor
-cleared, when its snapshot holds no item-plan money at all. Equal-money
-status order across fresh passes is unknowable, so those still fold verbatim
-and converge on the next hourly reconcile. When an equal paid end carries a
+cleared, when its snapshot holds no item-plan money at all.
+
+All reconciliation consumers acquire the per-user PostgreSQL transaction advisory
+lock **before** loading decision inputs or retrieving authoritative subscription
+state. READ COMMITTED reads, complete invoice/line retrieval, the pure fold,
+subscription/history writes and commit use that one pinned transaction. One
+15,000 ms whole-attempt budget includes connection acquisition, lock wait, all
+provider pages and commit; failure never accepts a partial observation. Local
+statement and idle-transaction timeouts bound database work, and cancellation
+drops the transaction and queues rollback. A separately prefetched subscription
+or outcome cannot enter the production write contract.
+
+This orders our observations, not remote mutations. Later serialized cancellation
+flags apply verbatim in either direction, including legitimate uncancellation;
+no timestamp, permanent OR or first-writer priority provides remote authority.
+The provider may return stale data or change between subscription and invoice
+reads: remote atomicity, linearizability and eventual consistency are not solved.
+Unknown-price validation still precedes anchor containment, even with a fresh
+exhausted invoice listing missing the old anchor. Such observations retain only
+confirmed coverage/deadlines, grant no new caps, disable purchases and alert;
+serialization does not turn them into stale successes.
+
+When an equal paid end carries a
 new plan (a plan switch landing exactly on the old period end), the fold
 relabels to the subscription item's current plan with unchanged coverage,
 anchored on the new evidence — but only onto equally-or-more-recently paid
