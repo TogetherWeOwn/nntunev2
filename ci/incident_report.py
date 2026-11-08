@@ -122,12 +122,22 @@ def source(issue):
     return tuple(map(int, match.groups())) if match else None
 
 
+def ensure_comment(api, number, key, occurrence, kind, body, dry_run):
+    marker = f"<!-- incident-occurrence: {key} {occurrence[0]}:{occurrence[1]} {kind} -->"
+    comments = api.pages(f"/issues/{number}/comments")
+    if any(marker in (comment.get("body") or "") for comment in comments):
+        return False
+    if not dry_run:
+        api.request("POST", f"/issues/{number}/comments", {"body": body + "\n" + marker})
+    return True
+
+
 def recent(api, dry_run=False):
     # Overlap scans for delayed schedules; source markers make replay idempotent.
     # Read the whole bounded snapshot before writes, then process in source order
     # so even a transient failure followed by recovery leaves an incident trail.
     cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
-    runs = []
+    runs, history = [], {}
     for workflow in WORKFLOWS:
         rows = api.request("GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
         if not isinstance(rows, list) or len(rows) > 100:
@@ -135,19 +145,38 @@ def recent(api, dry_run=False):
         if len(rows) == 100 and datetime.strptime(
                 rows[-1]["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff:
             raise ReportError("Gate history window saturated")
-        for run in rows:
-            if trusted(run) and datetime.strptime(
+        history[workflow] = [r for r in rows if trusted(r)]
+        for run in history[workflow]:
+            if datetime.strptime(
                     run["updated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff:
                 runs.append(run)
     if len(runs) > 10:
         raise ReportError("Recent gate history exceeds bound")
+    candidates = {(r["id"], r["run_attempt"]) for r in runs}
+    outside = []
+    for workflow, rows in history.items():
+        selected = [(r["id"], r["run_attempt"]) for r in runs
+                    if r["path"].rsplit("/", 1)[-1] == workflow]
+        outside.extend(r for r in rows if selected
+                       and (r["id"], r["run_attempt"]) > min(selected)
+                       and (r["id"], r["run_attempt"]) not in candidates)
+    if len(outside) > 10:
+        raise ReportError("Gate history replay exceeds bound")
+    # Healthy gates need not have an issue. Consult newer out-of-window sources
+    # before any writes, but keep ordered transitions among this scan's candidates.
+    evidence = {workflow: {} for workflow in WORKFLOWS}
+    for run in outside:
+        workflow = run["path"].rsplit("/", 1)[-1]
+        evidence[workflow][(run["id"], run["run_attempt"])] = api.pages(
+            f"/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
     actions = []
     for run in sorted(runs, key=lambda r: (r["id"], r["run_attempt"])):
-        actions.extend(report(api, run["id"], dry_run, ordered=True))
+        workflow = run["path"].rsplit("/", 1)[-1]
+        actions.extend(report(api, run["id"], dry_run, newer_evidence=evidence[workflow]))
     return actions
 
 
-def report(api, run_id, dry_run=False, ordered=False):
+def report(api, run_id, dry_run=False, newer_evidence=None):
     run = api.request("GET", f"/actions/runs/{run_id}")
     if not trusted(run):
         raise ReportError("Untrusted or incomplete gate run")
@@ -157,17 +186,20 @@ def report(api, run_id, dry_run=False, ordered=False):
     # in the workflow, then ignore superseded runs, including newer attempts.
     # Runs are newest-created first: a newer run, if any, is in this page.
     # Do not walk all history (a busy repository can exceed the search bound).
-    latest = [] if ordered else api.request(
-        "GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
-    newer = [r for r in latest if trusted(r) and (r["id"], r["run_attempt"]) > (run_id, attempt)]
-    if len(newer) > 10:
-        raise ReportError("Gate history replay exceeds bound")
+    if newer_evidence is None:
+        latest = api.request(
+            "GET", f"/actions/workflows/{workflow}/runs?branch=main&per_page=100")["workflow_runs"]
+        newer = [r for r in latest if trusted(r) and (r["id"], r["run_attempt"]) > (run_id, attempt)]
+        if len(newer) > 10:
+            raise ReportError("Gate history replay exceeds bound")
+        newer_evidence = {(r["id"], r["run_attempt"]): api.pages(
+            f"/actions/runs/{r['id']}/attempts/{r['run_attempt']}/jobs", "jobs") for r in newer}
     current = api.request("GET", f"/actions/runs/{run_id}")
     if current["run_attempt"] != attempt or current["status"] != "completed":
         return ["superseded"]
     jobs = api.pages(f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
-    newer_jobs = [api.pages(f"/actions/runs/{r['id']}/attempts/{r['run_attempt']}/jobs", "jobs")
-                  for r in newer]
+    newer_jobs = [rows for occurrence, rows in newer_evidence.items()
+                  if occurrence > (run_id, attempt)]
     # Retain source ordering even after recovery, so a delayed older failure
     # cannot reopen the same episode. Reuse a closed keyed issue on recurrence.
     issues = api.pages("/issues?state=all&labels=incident")
@@ -200,8 +232,18 @@ def report(api, run_id, dry_run=False, ordered=False):
                      "promotion target. The dispatch input is not exposed by the runs API; "
                      "consult the linked preflight. No production change is authorized here.\n")
         occurrence = (run_id, attempt)
-        if any(source(i) is not None and source(i) >= occurrence for i in matches):
+        if any(source(i) is not None and source(i) > occurrence for i in matches):
             actions.append("superseded")
+            continue
+        recorded_matches = [i for i in matches if source(i) == occurrence]
+        if recorded_matches:
+            issue = recorded_matches[0]
+            if conclusion in BAD and "<!-- incident-notification: failure -->" in issue["body"]:
+                delivered = ensure_comment(api, issue["number"], key, occurrence, "failure",
+                                           "Still failing.\n\n" + body, dry_run)
+                actions.append(f"commented #{issue['number']}: {name}" if delivered else "superseded")
+            else:
+                actions.append("superseded")
             continue
         recorded = body + f"\n{marker}\n<!-- incident-source: {run_id}:{attempt} -->\n"
         if conclusion in BAD:
@@ -210,9 +252,10 @@ def report(api, run_id, dry_run=False, ordered=False):
                 actions.append(f"commented #{issue['number']}: {name}")
                 if not dry_run:
                     api.request("PATCH", f"/issues/{issue['number']}",
-                                {"body": recorded, "state": "open"})
-                    api.request("POST", f"/issues/{issue['number']}/comments",
-                                {"body": "Still failing.\n\n" + body})
+                                {"body": recorded + "<!-- incident-notification: failure -->\n",
+                                 "state": "open"})
+                ensure_comment(api, issue["number"], key, occurrence, "failure",
+                               "Still failing.\n\n" + body, dry_run)
             else:
                 actions.append(f"opened: {name}")
                 if not dry_run:
@@ -229,9 +272,9 @@ def report(api, run_id, dry_run=False, ordered=False):
                     actions.append(f"held #{issue['number']}: unknown source")
                     continue
                 actions.append(f"recovered #{issue['number']}: {name}")
+                ensure_comment(api, issue["number"], key, occurrence, "recovery",
+                               "Recovered.\n\n" + body, dry_run)
                 if not dry_run:
-                    api.request("POST", f"/issues/{issue['number']}/comments",
-                                {"body": "Recovered.\n\n" + body})
                     api.request("PATCH", f"/issues/{issue['number']}",
                                 {"body": recorded, "state": "closed", "state_reason": "completed"})
     return actions

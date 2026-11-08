@@ -793,7 +793,11 @@ an incident. Ordering is per gate: a newer run that skips the gate cannot
 erase its earlier failure or recovery. Each keyed issue records its last
 source run/attempt, including after closure; issue activity time is not a
 proxy for failure time. Older evidence cannot close/reopen a newer episode.
-Recurrence reopens the existing keyed issue. Keep existing gate keys stable.
+Recurrence reopens the existing keyed issue. Repeat and recovery comments carry
+an occurrence identity: retries reconcile delivery before skipping a recorded
+source, including when a write succeeded but its response was lost. Initial
+issue creation is the opening notification, not an additional repeat comment.
+Keep existing gate keys stable.
 The existing MB/ingest job names are observed only; reporting does not
 enable those lanes or change their retirement/qualification holds.
 
@@ -817,10 +821,17 @@ and introduces no always-on staging/preview runtime or new credential.
 Each scan considers the latest 100 created runs per workflow and selects
 trusted completed runs updated within the last hour, at most ten total.
 The snapshot is collected before writing, then processed oldest source first
-so a short failure followed by recovery still leaves an incident trail.
-Repeated scans do not repeat the same source occurrence. A saturated recent
-history window or more than ten candidates fails before writes, rather than
-silently truncating. Inspect reporting failures promptly: Actions schedules
+so observed failures followed by recovery leave an incident trail. The runs
+listing exposes the latest attempt, not every attempt: a failure rerun green
+between scans can be missed; exhaustive attempt delivery is not claimed.
+Newer completed sources outside that one-hour candidate window still supply
+per-gate supersession evidence from the same history snapshot, even with no
+prior incident or after closure. Skipped/unevidenced gates do not supersede.
+At most ten such additional sources are read before any writes; exceeding
+that evidence bound fails the scan. Repeated scans reconcile missing delivery
+without repeating a delivered occurrence. A saturated recent history window
+or more than ten candidates also fails before writes, rather than silently
+truncating. Inspect reporting failures promptly: Actions schedules
 can be delayed, and an outage beyond one hour or a rerun older than the latest
 100 created runs requires deliberate run-ID replay after checking newer
 evidence. The scan is bounded catch-up, not durable all-history delivery.

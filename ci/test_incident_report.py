@@ -64,6 +64,8 @@ class FakeAPI(ir.API):
             return self.run if self.run_gets == 1 else self.current
         if "/jobs" in path:
             return {"jobs": self.jobs[window]}
+        if re.search(r"/issues/\d+/comments", path):
+            return []
         if path.startswith("/actions/workflows/"):
             return {"workflow_runs": self.runs[window]}
         return self.issues[window]
@@ -248,18 +250,40 @@ def ago(minutes):
 
 
 class StatefulAPI(ir.API):
-    """Runs, jobs and issues live in memory; writes mutate them."""
+    """Runs, jobs, issues and comments live in memory; writes mutate them.
 
-    def __init__(self, runs=(), jobs=None, issues=()):
+    `faults` is a list of (method, path regex, mode), each consumed once:
+    "before" refuses without effect; "after" applies the write, then raises
+    as if the response were lost.
+    """
+
+    def __init__(self, runs=(), jobs=None, issues=(), comments=None, faults=()):
         super().__init__("token")
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.issues = [dict(i) for i in issues]
+        self.comments = {n: [dict(c) for c in rows] for n, rows in (comments or {}).items()}
+        self.faults = list(faults)
         self.writes, self.listings = [], []
 
     def request(self, method, path, body=None):
+        fault = next((f for f in self.faults
+                      if f[0] == method and re.fullmatch(f[1], path)), None)
+        if fault:
+            self.faults.remove(fault)
+            if fault[2] == "before":
+                raise ir.ReportError(f"GitHub {method} refused (HTTP 403)")
+        result = self.apply(method, path, body)
+        if fault:
+            raise ir.ReportError("GitHub transport failed")
+        return result
+
+    def apply(self, method, path, body=None):
         if method != "GET":
             self.writes.append((method, path, body))
+            if (m := re.fullmatch(r"/issues/(\d+)/comments", path)):
+                self.comments.setdefault(int(m.group(1)), []).append({"body": body["body"]})
+                return {"id": 1}
             if path == "/issues":
                 self.issues.append({"number": 100 + len(self.issues), "state": "open",
                                     "body": body["body"], "updated_at": ago(0)})
@@ -279,6 +303,8 @@ class StatefulAPI(ir.API):
             return {"workflow_runs": rows[window]}
         if (m := re.search(r"/actions/runs/(\d+)/attempts/(\d+)/jobs", path)):
             return {"jobs": self.jobs.get((int(m.group(1)), int(m.group(2))), [])[window]}
+        if (m := re.search(r"/issues/(\d+)/comments", path)):
+            return self.comments.get(int(m.group(1)), [])[window]
         return self.issues[window]
 
 
@@ -363,7 +389,7 @@ class RecentTests(unittest.TestCase):
 
     def test_full_page_with_history_older_than_window_is_allowed(self):
         rows = [recent_run(1000 + n, 180 + n, updated=170) for n in range(99)]
-        api = StatefulAPI(runs=[recent_run(70)] + rows, jobs={(70, 1): [smoke("failure")]})
+        api = StatefulAPI(runs=[recent_run(2000)] + rows, jobs={(2000, 1): [smoke("failure")]})
         self.assertEqual(len(api.runs), 100)
         ir.recent(api)
         self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
@@ -386,23 +412,216 @@ class RecentTests(unittest.TestCase):
             ir.recent(api)
         self.assertEqual(api.writes, [])
 
-    def test_ordered_report_skips_latest_lookup_entirely(self):
+    def test_supplied_newer_evidence_snapshot_skips_latest_lookup_entirely(self):
         runs = [recent_run(92), recent_run(91)]
         api = StatefulAPI(runs=runs, jobs={(91, 1): [smoke("failure")]})
-        self.assertEqual(ir.report(api, 91, ordered=True), [f"opened: {SMOKE}"])
+        self.assertEqual(ir.report(api, 91, newer_evidence={}), [f"opened: {SMOKE}"])
         self.assertEqual(api.listings, [])
 
-    def test_ordered_report_still_checks_recorded_source_and_trust(self):
+    def test_supplied_newer_evidence_is_used_to_supersede(self):
+        runs = [recent_run(92), recent_run(91)]
+        api = StatefulAPI(runs=runs, jobs={(91, 1): [smoke("failure")]})
+        evidence = {(92, 1): [smoke("success")]}
+        self.assertEqual(ir.report(api, 91, newer_evidence=evidence), ["superseded"])
+        self.assertEqual(api.listings, [])
+        self.assertEqual(api.writes, [])
+
+    def test_supplied_newer_evidence_still_checks_recorded_source_and_trust(self):
         run = recent_run(80)
         api = StatefulAPI(runs=[run], jobs={(80, 1): [smoke("failure")]},
                           issues=[issue(7, source=(81, 1), state="open")])
-        self.assertEqual(ir.report(api, 80, ordered=True), ["superseded"])
+        self.assertEqual(ir.report(api, 80, newer_evidence={}), ["superseded"])
         self.assertEqual(api.writes, [])
         bad = StatefulAPI(runs=[recent_run(82, head_branch="x")],
                           jobs={(82, 1): [smoke("failure")]})
         with self.assertRaises(ir.ReportError):
-            ir.report(bad, 82, ordered=True)
+            ir.report(bad, 82, newer_evidence={})
         self.assertEqual(bad.writes, [])
+
+    def test_newer_success_outside_window_supersedes_older_delayed_failure(self):
+        outside = recent_run(71, 130, updated=120)
+        for issues in ([], [issue(7, state="closed")], [issue(7, state="open")]):
+            api = StatefulAPI(runs=[recent_run(70), outside], issues=issues,
+                              jobs={(70, 1): [smoke("failure")], (71, 1): [smoke("success")]})
+            ir.recent(api)
+            self.assertEqual(api.writes, [], issues)
+            self.assertEqual([i.get("state") for i in api.issues],
+                             [i.get("state") for i in issues])
+
+    def test_latest_attempt_failure_versus_newer_old_success_run(self):
+        # GitHub lists one row per run, carrying its latest attempt.
+        failed = recent_run(102, 150, updated=2, run_attempt=2)
+        newer = recent_run(103, 140, updated=120)
+        jobs = {(102, 2): [smoke("failure")], (103, 1): [smoke("success")]}
+        for issues in ([], [issue(7, source=(101, 1), state="closed")]):
+            api = StatefulAPI(runs=[newer, failed], jobs=jobs, issues=issues)
+            ir.recent(api)
+            self.assertEqual(api.writes, [], issues)
+            self.assertEqual([i.get("state") for i in api.issues],
+                             [i.get("state") for i in issues])
+
+    def test_newer_rerun_success_outside_window_supersedes_older_attempt_failure(self):
+        rerun = make_run(72, attempt=2, created_at=ago(150), updated_at=ago(120))
+        api = StatefulAPI(runs=[recent_run(72), rerun],
+                          jobs={(72, 1): [smoke("failure")], (72, 2): [smoke("success")]})
+        ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+    def test_skipped_or_unevidenced_newer_success_outside_window_does_not_suppress(self):
+        for newer in (smoke("skipped"), smoke("success", step="skipped"),
+                      {**smoke("success"), "steps": []}):
+            api = StatefulAPI(runs=[recent_run(70), recent_run(71, 130, updated=120)],
+                              jobs={(70, 1): [smoke("failure")], (71, 1): [newer]})
+            ir.recent(api)
+            self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
+
+    def test_newer_evidence_outside_window_does_not_break_trail_inside_window(self):
+        runs = [recent_run(23, 1), recent_run(22, 2), recent_run(21, 3),
+                recent_run(10, 150, updated=140)]
+        jobs = {(21, 1): [smoke("failure")], (22, 1): [smoke("failure")],
+                (23, 1): [smoke("success")], (10, 1): [smoke("success")]}
+        api = StatefulAPI(runs=runs, jobs=jobs)
+        ir.recent(api)
+        self.assertEqual([w[:2] for w in api.writes], [
+            ("POST", "/issues"), ("PATCH", "/issues/100"), ("POST", "/issues/100/comments"),
+            ("POST", "/issues/100/comments"), ("PATCH", "/issues/100")])
+        self.assertEqual(self.incident_state(api), [(100, "closed")])
+
+    def test_more_than_ten_newer_history_evidence_rows_raise_before_any_write(self):
+        rows = [make_run(100 + n, created_at=ago(150 + n), updated_at=ago(120))
+                for n in range(11)]
+        jobs = {(r["id"], 1): [smoke("success")] for r in rows}
+        jobs[(70, 1)] = [smoke("failure")]
+        api = StatefulAPI(runs=[recent_run(70)] + rows, jobs=jobs)
+        with self.assertRaises(ir.ReportError):
+            ir.recent(api)
+        self.assertEqual(api.writes, [])
+
+
+KEY = "e2e-staging.yml:synthetic-smoke-health"
+NOTIFY = "<!-- incident-notification: failure -->"
+
+
+def occurrence(run_id, attempt=1, kind="failure"):
+    return f"<!-- incident-occurrence: {KEY} {run_id}:{attempt} {kind} -->"
+
+
+def comment_count(api, number, marker):
+    return sum(1 for c in api.comments.get(number, []) if marker in c["body"])
+
+
+class CommentDeliveryTests(unittest.TestCase):
+    def api(self, conclusion="failure", run_id=10, issues=None, **kw):
+        return StatefulAPI(runs=[make_run(run_id)], jobs={(run_id, 1): [smoke(conclusion)]},
+                           issues=[issue(7)] if issues is None else issues, **kw)
+
+    def test_repeat_patches_notification_marker_then_posts_marked_comment(self):
+        api = self.api()
+        self.assertEqual(ir.report(api, 10), [f"commented #7: {SMOKE}"])
+        self.assertEqual([w[:2] for w in api.writes],
+                         [("PATCH", "/issues/7"), ("POST", "/issues/7/comments")])
+        self.assertIn("<!-- incident-source: 10:1 -->", api.writes[0][2]["body"])
+        self.assertIn(NOTIFY, api.writes[0][2]["body"])
+        self.assertIn(occurrence(10), api.writes[1][2]["body"])
+
+    def test_initial_issue_creation_posts_no_repeat_comment(self):
+        api = self.api(issues=[])
+        self.assertEqual(ir.report(api, 10), [f"opened: {SMOKE}"])
+        self.assertEqual([w[:2] for w in api.writes], [("POST", "/issues")])
+        self.assertEqual(api.comments, {})
+
+    def test_existing_marked_comment_is_not_posted_again(self):
+        api = self.api(comments={7: [{"body": "Still failing.\n" + occurrence(10)}]})
+        ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+        self.assertNotIn("/issues/7/comments", [w[1] for w in api.writes])
+
+    def test_marker_on_later_comment_page_is_found(self):
+        filler = [{"body": f"note {n}"} for n in range(100)]
+        api = self.api(comments={7: filler + [{"body": occurrence(10)}]})
+        ir.report(api, 10)
+        self.assertNotIn("/issues/7/comments", [w[1] for w in api.writes])
+
+    def test_other_occurrence_or_kind_marker_does_not_suppress(self):
+        others = [{"body": occurrence(9)}, {"body": occurrence(10, kind="recovery")},
+                  {"body": occurrence(10, 2)}]
+        api = self.api(comments={7: others})
+        ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+
+    def test_equal_source_repeat_with_notification_marker_reconciles_missing_comment(self):
+        stale = issue(7, source=(10, 1), body=MARKER + "\n" + NOTIFY)
+        api = self.api(issues=[stale])
+        ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+        done = len(api.writes)
+        ir.report(api, 10)
+        self.assertEqual(len(api.writes), done)
+
+    def test_equal_source_without_notification_marker_stays_superseded(self):
+        api = self.api(issues=[issue(7, source=(10, 1))])
+        self.assertEqual(ir.report(api, 10), ["superseded"])
+        self.assertEqual(api.writes, [])
+
+    def test_patch_ok_then_comment_refused_retry_delivers_exactly_once(self):
+        api = self.api(faults=[("POST", r"/issues/7/comments", "before")])
+        with self.assertRaises(ir.ReportError):
+            ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 0)
+        self.assertIn(NOTIFY, api.issues[0]["body"])
+        ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+        done = len(api.writes)
+        ir.report(api, 10)
+        self.assertEqual(len(api.writes), done)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+
+    def test_comment_posted_but_response_lost_retry_posts_once(self):
+        api = self.api(faults=[("POST", r"/issues/7/comments", "after")])
+        with self.assertRaises(ir.ReportError):
+            ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+        ir.report(api, 10)
+        self.assertEqual(comment_count(api, 7, occurrence(10)), 1)
+
+    def test_recovery_ensures_marked_comment_before_closing_patch(self):
+        api = self.api("success", run_id=11)
+        self.assertEqual(ir.report(api, 11), [f"recovered #7: {SMOKE}"])
+        self.assertEqual([w[:2] for w in api.writes],
+                         [("POST", "/issues/7/comments"), ("PATCH", "/issues/7")])
+        self.assertIn(occurrence(11, kind="recovery"), api.writes[0][2]["body"])
+        self.assertEqual(api.writes[1][2]["state"], "closed")
+
+    def test_recovery_comment_posted_closing_patch_fails_retry_no_duplicate(self):
+        api = self.api("success", run_id=11, faults=[("PATCH", r"/issues/7", "before")])
+        with self.assertRaises(ir.ReportError):
+            ir.report(api, 11)
+        self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
+        self.assertNotEqual(api.issues[0].get("state"), "closed")
+        self.assertEqual(ir.report(api, 11), [f"recovered #7: {SMOKE}"])
+        self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
+        self.assertEqual(api.issues[0]["state"], "closed")
+
+    def test_recovery_comment_response_lost_retry_posts_once_and_closes(self):
+        api = self.api("success", run_id=11, faults=[("POST", r"/issues/7/comments", "after")])
+        with self.assertRaises(ir.ReportError):
+            ir.report(api, 11)
+        ir.report(api, 11)
+        self.assertEqual(comment_count(api, 7, occurrence(11, kind="recovery")), 1)
+        self.assertEqual(api.issues[0]["state"], "closed")
+
+    def test_dry_run_never_writes_comments_or_patches(self):
+        for conclusion, run_id in (("failure", 10), ("success", 11)):
+            api = self.api(conclusion, run_id=run_id)
+            self.assertTrue(ir.report(api, run_id, dry_run=True))
+            self.assertEqual(api.writes, [])
+            self.assertEqual(api.comments, {})
+        stale = issue(7, source=(10, 1), body=MARKER + "\n" + NOTIFY)
+        api = self.api(issues=[stale])
+        ir.report(api, 10, dry_run=True)
+        self.assertEqual(api.writes, [])
+        self.assertEqual(api.comments, {})
+
 
 class WorkflowWiringTests(unittest.TestCase):
     def setUp(self):
