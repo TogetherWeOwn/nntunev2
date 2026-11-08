@@ -2,7 +2,7 @@
 """Credential-free dry-run of the staging Worker upload path.
 
 Run AFTER the real api/mb/ingest release builds exist
-(workers/<name>/build/worker). For each Worker it:
+(workers/<name>/build). For each Worker it:
 
 1. extracts the exact "Generate staging wrangler.toml" run script and the
    exact upload command from .github/workflows/deploy.yml,
@@ -157,9 +157,11 @@ def fixture(base, worker, label):
     """Copy manifest and the real prebuilt bundle into a fresh tree."""
     tree = base / label
     wdir = tree / "workers" / worker
-    src = ROOT / "workers" / worker / "build" / "worker"
-    check((src / "shim.mjs").is_file(), f"{src}/shim.mjs missing: run the real {worker} release build first")
-    shutil.copytree(src, wdir / "build" / "worker")
+    src = ROOT / "workers" / worker / "build"
+    check((src / "worker/shim.mjs").is_file(), f"{src}/worker/shim.mjs missing: run the real {worker} release build first")
+    # The entry shim imports ../index.js, whose JS/Wasm dependencies live
+    # beside worker/. Preserve the whole build output, not just the shim.
+    shutil.copytree(src, wdir / "build")
     (tree / ".github/scripts").mkdir(parents=True)
     shutil.copy(ROOT / MANIFEST, tree / MANIFEST)
     return tree, wdir

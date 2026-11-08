@@ -1,9 +1,16 @@
 """Regression tests for canonical Worker build and upload sequencing."""
 
+import importlib.util
 from pathlib import Path
 import re
+import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
+
+SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
+UPLOAD = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(UPLOAD)
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = "worker-build --release -- --locked"
@@ -21,6 +28,29 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_upload_fixture_preserves_complete_build_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            build = source / "workers/api/build"
+            (build / "worker").mkdir(parents=True)
+            files = {
+                "worker/shim.mjs": b"export * from '../index.js';\n",
+                "index.js": b"import wasm from './index_bg.wasm';\n",
+                "index_bg.wasm": b"\x00asm\x01\x00\x00\x00",
+            }
+            for name, content in files.items():
+                (build / name).write_bytes(content)
+            manifest = source / UPLOAD.MANIFEST
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("worker = []\n")
+            with patch.object(UPLOAD, "ROOT", source):
+                tree, wdir = UPLOAD.fixture(base, "api", "fixture")
+            self.assertEqual(wdir, tree / "workers/api")
+            self.assertEqual((tree / UPLOAD.MANIFEST).read_bytes(), manifest.read_bytes())
+            for name, content in files.items():
+                self.assertEqual((wdir / "build" / name).read_bytes(), content)
+
     def test_staging_prepares_and_builds_before_upload(self):
         text = (ROOT / ".github/workflows/deploy.yml").read_text()
         self.assertNotIn("cargo install", text)
