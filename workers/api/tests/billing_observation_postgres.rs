@@ -1369,6 +1369,33 @@ async fn wrong_customer_mode_and_subscription_never_advance_coverage() {
             Some(E2)
         );
 
+        // Ambiguous items remain a validation failure even when the fresh
+        // exhausted listing omits the stored anchor.
+        let acct = fx.account("ambiguous", true).await;
+        acct.seed_active(&fx).await;
+        let mut remote = acct.remote("past_due", false, vec![acct.invoice("2", E1, E2)]);
+        remote
+            .sub
+            .items
+            .as_mut()
+            .unwrap()
+            .data
+            .push(SubscriptionItem {
+                id: "si_ambiguous_second".into(),
+                price: Some(PRICE_PRO.into()),
+            });
+        let fake = Rc::new(Fake::new("ambiguous", &log, &truth(remote)));
+        let outcome = solo(&fx, &acct, &fake)
+            .await
+            .expect("fail closed, not rescued by anchor");
+        assert_eq!(outcome.fail_closed, Some(FailClosedReason::AmbiguousItems));
+        assert!(outcome.disable_new_purchases());
+        assert_eq!(
+            stored(&fx.db, &acct.user).await.unwrap().paid_through,
+            Some(E1)
+        );
+        assert!(history(&fx.db, &acct.user).await.is_empty());
+
         // Invoices bound to another subscription or customer, or unpaid,
         // are skipped: no coverage, no history.
         let acct = fx.account("foreigninv", true).await;
@@ -1394,6 +1421,115 @@ async fn wrong_customer_mode_and_subscription_never_advance_coverage() {
         let rows = history(&fx.db, &acct.user).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, acct.inv_id("1"));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn equal_end_plan_switch_and_switch_back_keep_history_idempotent() {
+    run(60, async {
+        let fx = Fixture::new().await;
+        let acct = fx.account("switch", true).await;
+        acct.seed_active(&fx).await;
+        let log = new_log();
+        let mut pro_invoice = acct.invoice("2", T0, E1);
+        pro_invoice.lines.as_mut().unwrap().data[0].price = Some(PRICE_PRO.into());
+        pro_invoice.status_transitions.as_mut().unwrap().paid_at = Some(E1 + 60);
+        let mut remote = acct.remote(
+            "active",
+            false,
+            vec![acct.invoice("1", T0, E1), pro_invoice],
+        );
+        remote.sub.items.as_mut().unwrap().data[0].price = Some(PRICE_PRO.into());
+        let t = truth(remote);
+        let switched = reconcile_once(&fx, &acct, &log, &t, "pro").await;
+        assert!(switched.fail_closed.is_none());
+        let row = stored(&fx.db, &acct.user).await.unwrap();
+        assert_eq!(
+            (row.plan.as_str(), row.paid_through, row.anchor),
+            ("pro", Some(E1), Some(acct.inv_id("2")))
+        );
+        let mut back = acct.invoice("3", T0, E1);
+        back.status_transitions.as_mut().unwrap().paid_at = Some(E1 + 120);
+        t.borrow_mut().invoices.push(back);
+        t.borrow_mut().sub.items.as_mut().unwrap().data[0].price = Some(PRICE_PLUS.into());
+        reconcile_once(&fx, &acct, &log, &t, "plus").await;
+        reconcile_once(&fx, &acct, &log, &t, "replay").await;
+        let row = stored(&fx.db, &acct.user).await.unwrap();
+        assert_eq!(
+            (row.plan.as_str(), row.paid_through, row.anchor),
+            ("plus", Some(E1), Some(acct.inv_id("3")))
+        );
+        let rows = history(&fx.db, &acct.user).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            ["plus", "pro", "plus"]
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn archived_target_proof_is_not_replaced_by_the_live_slot() {
+    run(60, async {
+        let fx = Fixture::new().await;
+        let archived = fx.account("archived", true).await;
+        fx.seed(&archived, Seed { status: "canceled", ..Seed::active(E1, Some(archived.inv_id("1"))) }).await;
+        let mut replacement = archived.clone();
+        replacement.sub = "sub_replacement".into();
+        replacement.item = "si_replacement".into();
+        replacement.tag = "replacement".into();
+        fx.seed(&replacement, Seed::active(E2, Some(replacement.inv_id("2")))).await;
+        let log = new_log();
+        let t = truth(archived.remote("canceled", false, vec![archived.invoice("1", T0, E1)]));
+        reconcile_once(&fx, &archived, &log, &t, "archived").await;
+        let rows = fx.db.query(
+            "SELECT stripe_subscription_id, status, EXTRACT(EPOCH FROM paid_through_at)::bigint, paid_invoice_id FROM subscriptions WHERE user_id = $1 ORDER BY stripe_subscription_id",
+            &[&archived.user],
+        ).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let sub: String = row.get(0);
+            let status: String = row.get(1);
+            let end: Option<i64> = row.get(2);
+            let anchor: Option<String> = row.get(3);
+            if sub == archived.sub {
+                assert_eq!((status.as_str(), end, anchor), ("canceled", Some(E1), Some(archived.inv_id("1"))));
+            } else {
+                assert_eq!(sub, replacement.sub);
+                assert_eq!((status.as_str(), end, anchor), ("active", Some(E2), Some(replacement.inv_id("2"))));
+            }
+        }
+        wait_unlocked(&fx.db, &archived.user, "archived target unit releases user lock").await;
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_anchor_cannot_reactivate_a_non_live_target() {
+    run(60, async {
+        let fx = Fixture::new().await;
+        let acct = fx.account("nonlive", true).await;
+        fx.seed(
+            &acct,
+            Seed {
+                status: "canceled",
+                ..Seed::active(E1, Some(acct.inv_id("1")))
+            },
+        )
+        .await;
+        let before = stored(&fx.db, &acct.user).await.unwrap();
+        let log = new_log();
+        let t = truth(acct.remote("active", true, Vec::new()));
+        reconcile_once(&fx, &acct, &log, &t, "stale_nonlive").await;
+        assert_eq!(stored(&fx.db, &acct.user).await.unwrap(), before);
+        assert!(history(&fx.db, &acct.user).await.is_empty());
+        *t.borrow_mut() = acct.remote("active", false, vec![acct.invoice("1", T0, E1)]);
+        reconcile_once(&fx, &acct, &log, &t, "fresh_recovery").await;
+        let row = stored(&fx.db, &acct.user).await.unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.paid_through, Some(E1));
+        assert_eq!(row.anchor, Some(acct.inv_id("1")));
     })
     .await;
 }
@@ -1542,10 +1678,16 @@ async fn lock_is_held_through_complete_invoice_line_pagination() {
         );
         remote.more_lines.insert(
             id.clone(),
-            vec![InvoiceLines {
-                data: vec![line(&format!("{id}-plus"), Some(PRICE_PLUS), 800, E1, E2)],
-                has_more: false,
-            }],
+            vec![
+                InvoiceLines {
+                    data: vec![line(&format!("{id}-second-oneoff"), None, 200, E1, E2)],
+                    has_more: true,
+                },
+                InvoiceLines {
+                    data: vec![line(&format!("{id}-plus"), Some(PRICE_PLUS), 800, E1, E2)],
+                    has_more: false,
+                },
+            ],
         );
         let t = truth(remote);
         let first = Rc::new(
@@ -1659,6 +1801,46 @@ async fn commit_failure_never_returns_success_or_partial_history() {
         let retry = Rc::new(Fake::new("retrycommit", &log, &t));
         solo(&fx, &acct, &retry).await.expect("retry rereads and commits");
         assert_eq!(history(&fx.db, &acct.user).await.len(), 2);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_during_commit_rolls_back_before_releasing_the_lock() {
+    run(60, async {
+        let fx = Fixture::new().await;
+        let acct = fx.account("cancelcommit", true).await;
+        acct.seed_active(&fx).await;
+        let before = stored(&fx.db, &acct.user).await.unwrap();
+        let blocker = fx.client().await;
+        // Two-key advisory locks occupy a different key space from the
+        // production one-key lock, so the gate cannot collide with it.
+        blocker.query("SELECT pg_advisory_lock(46059, hashtext($1))", &[&acct.user]).await.unwrap();
+        fx.db.batch_execute(
+            "CREATE FUNCTION gate_billing_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(46059, hashtext(NEW.user_id)); RETURN NEW; END $$;
+             CREATE CONSTRAINT TRIGGER gate_billing_commit AFTER INSERT OR UPDATE ON subscriptions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION gate_billing_commit()"
+        ).await.unwrap();
+        let log = new_log();
+        let t = truth(acct.renewed());
+        let fake = Rc::new(Fake::new("commitcancel", &log, &t));
+        let pass = start(&fx, &acct, &fake).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = fx.db.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND objsubid = 2 AND NOT granted)", &[&pass.pid]
+                ).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("COMMIT reached its deferred gate");
+        let query: String = fx.db.query_one("SELECT query FROM pg_stat_activity WHERE pid = $1", &[&pass.pid]).await.unwrap().get(0);
+        assert_eq!(query, "COMMIT");
+        pass.task.abort();
+        assert!(pass.task.await.expect_err("caller cancelled during COMMIT").is_cancelled());
+        blocker.query("SELECT pg_advisory_unlock(46059, hashtext($1))", &[&acct.user]).await.unwrap();
+        wait_unlocked(&fx.db, &acct.user, "commit cancellation settles and releases lock").await;
+        assert_eq!(stored(&fx.db, &acct.user).await.unwrap(), before,
+            "a cancelled unit must not persist writes after its caller exits");
+        assert!(history(&fx.db, &acct.user).await.is_empty());
     }).await;
 }
 

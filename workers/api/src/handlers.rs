@@ -20194,7 +20194,7 @@ mod tests {
         // stripped next so prose mentioning a scope cannot satisfy its pin.
         let source = include_str!("handlers.rs");
         let production = source
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests {")
             .expect("test module must exist")
             .0;
         let code = strip_line_comments(production);

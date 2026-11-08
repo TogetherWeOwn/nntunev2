@@ -165,9 +165,13 @@ state. READ COMMITTED reads, complete invoice/line retrieval, the pure fold,
 subscription/history writes and commit use that one pinned transaction. One
 15,000 ms whole-attempt budget includes connection acquisition, lock wait, all
 provider pages and commit; failure never accepts a partial observation. Local
-statement and idle-transaction timeouts bound database work, and cancellation
-drops the transaction and queues rollback. A separately prefetched subscription
-or outcome cannot enter the production write contract.
+statement and idle-transaction timeouts bound database work. Before COMMIT,
+cancellation drops the transaction and queues rollback. An in-flight COMMIT can
+have an indeterminate outcome: dropping its future cannot reverse work already
+accepted by PostgreSQL. Commit-phase cancellation/settlement is an outstanding
+acceptance prerequisite, not a rollback guarantee or permission to ship. A
+separately prefetched subscription or outcome cannot enter the production write
+contract.
 
 This orders our observations, not remote mutations. Later serialized cancellation
 flags apply verbatim in either direction, including legitimate uncancellation;
