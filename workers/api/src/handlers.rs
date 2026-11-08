@@ -3752,6 +3752,52 @@ where
     catalogue_library_entries(ctx, &user_id).await
 }
 
+/// `GET /v1/mb/search`: application-owned MusicBrainz search.
+///
+/// Order: identity (session cookie or gate-authorized `library:read`
+/// bearer; 401 otherwise), strict query validation (400), then, only for
+/// `include_unavailable=true`, the existing fresh-DB-role admin gate
+/// (every non-admin, bearer included, gets the concealed plain 404), then
+/// the provider. No qualified authoritative provider exists yet, so the
+/// runtime provider always fails and the answer is the opaque 503 the web
+/// client turns into library-only search. Raw backend metadata is never
+/// returned and no empty success is fabricated.
+async fn mb_search_route<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    let (bare, raw_query) = match req.path.split_once('?') {
+        Some((bare, query)) => (bare, query),
+        None => (req.path.as_str(), ""),
+    };
+    if bare != "/v1/mb/search" {
+        return not_found();
+    }
+    let query = match crate::mb_search::parse_query(raw_query) {
+        Ok(query) => query,
+        Err(_) => return validation_failed("invalid search query"),
+    };
+    if query.include_unavailable && ctx.authenticate_admin(req, false).await.is_err() {
+        return not_found();
+    }
+    let request = crate::mb_search::MbSearchRequest { user_id, query };
+    match crate::mb_search::run(&crate::mb_search::UnavailableProvider, &request).await {
+        Ok(body) => json_response(200, body),
+        Err(_) => unavailable(),
+    }
+}
+
 /// `GET /api/library`: the legacy alias serving the same entries as
 /// `GET /v1/library` (the documented M1 shape — bare array or `{ items }`
 /// with string-`id` rows). Outside the bearer scope map, so this handler
@@ -6846,6 +6892,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/artists"
             | "/v1/releases"
             | "/v1/tracks"
+            | "/v1/mb/search"
     )
 }
 
@@ -7072,6 +7119,11 @@ where
         ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
+        // Application-owned MusicBrainz search. The entry reattaches the
+        // raw query to the path for exactly this route.
+        ("GET", path) if path == "/v1/mb/search" || path.starts_with("/v1/mb/search?") => {
+            mb_search_route(ctx, req, bearer_user.as_deref()).await
+        }
         // Unserved nested release paths never reach authentication or stores.
         ("GET", path)
             if path
@@ -21064,6 +21116,157 @@ mod tests {
         assert_eq!(items[2]["id"], "job-2");
         assert_eq!(items[2]["recording_mbids"], serde_json::json!([]));
         assert!(items[2].get("release_mbid").is_none_or(|v| v.is_null()));
+    }
+
+    const MB_SEARCH_OK: &str = "/v1/mb/search?q=daft+punk&type=artist";
+
+    fn mb_search_bearer(h: &Harness, cookie: &str, scope: &str) -> String {
+        let minted = mint_call(
+            h,
+            cookie,
+            serde_json::json!({"scopes": [scope], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        mint_secret(&serde_json::from_str(&minted.body).unwrap())
+    }
+
+    #[test]
+    fn mb_search_requires_authentication_before_anything_else() {
+        let h = harness();
+        for path in [
+            MB_SEARCH_OK,
+            "/v1/mb/search",
+            "/v1/mb/search?q=x&type=bogus",
+        ] {
+            let resp = h.call_full("GET", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 401, "{path}: {}", resp.body);
+        }
+        // Even the admin-only flag cannot be probed anonymously.
+        let resp = h.call_full(
+            "GET",
+            "/v1/mb/search?q=x&type=artist&include_unavailable=true",
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+    }
+
+    #[test]
+    fn mb_search_fails_closed_503_without_a_qualified_provider() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for kind in ["artist", "release", "recording"] {
+            let path = format!("/v1/mb/search?q=daft%20punk&type={kind}&limit=5&offset=10");
+            let resp = h.call_full("GET", &path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, 503, "{kind}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["code"], "service_unavailable");
+            assert!(body.get("results").is_none(), "no fabricated results");
+            assert!(!resp.body.contains("daft"), "query is never echoed");
+        }
+    }
+
+    #[test]
+    fn mb_search_rejects_invalid_queries_with_one_generic_400() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let long = format!("/v1/mb/search?q={}&type=artist", "a".repeat(201));
+        for path in [
+            "/v1/mb/search",
+            "/v1/mb/search?q=x",
+            "/v1/mb/search?type=artist",
+            "/v1/mb/search?q=&type=artist",
+            "/v1/mb/search?q=x&type=track",
+            "/v1/mb/search?q=x&type=artist&limit=0",
+            "/v1/mb/search?q=x&type=artist&limit=51",
+            "/v1/mb/search?q=x&type=artist&offset=1001",
+            "/v1/mb/search?q=x&type=artist&include_unavailable=yes",
+            "/v1/mb/search?q=x&type=artist&backend=raw",
+            "/v1/mb/search?q=x&q=y&type=artist",
+            long.as_str(),
+        ] {
+            let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, 400, "{path}: {}", resp.body);
+        }
+    }
+
+    #[test]
+    fn mb_search_include_unavailable_is_admin_only_and_concealed() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let admin = seed_admin(&h, "admin1", "admin@example.com");
+        let path = "/v1/mb/search?q=x&type=recording&include_unavailable=true";
+        // Non-admin: the plain 404, the same an unknown path gives.
+        let denied = h.call_full("GET", path, None, Some(member.clone()), Some(ORIGIN));
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(denied.body, not_found().body);
+        // `include_unavailable=false` is not an admin request.
+        let plain = h.call_full(
+            "GET",
+            "/v1/mb/search?q=x&type=recording&include_unavailable=false",
+            None,
+            Some(member.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(plain.status, 503, "{}", plain.body);
+        // Admin passes the gate and reaches the (unavailable) provider.
+        let ok = h.call_full("GET", path, None, Some(admin.clone()), Some(ORIGIN));
+        assert_eq!(ok.status, 503, "{}", ok.body);
+        // A bearer can never be admin, even a library:read key minted by
+        // an admin.
+        let secret = mb_search_bearer(&h, &admin, "library:read");
+        let bearer = h.call_bearer("GET", path, Some(format!("Bearer {secret}")));
+        assert_eq!(bearer.status, 404, "{}", bearer.body);
+        // Role is read fresh: demotion takes effect on the same session.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), "member".to_string());
+        let demoted = h.call_full("GET", path, None, Some(admin), Some(ORIGIN));
+        assert_eq!(demoted.status, 404, "{}", demoted.body);
+    }
+
+    #[test]
+    fn mb_search_bearer_scope_and_route_shape() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let library = mb_search_bearer(&h, &cookie, "library:read");
+        let stream = mb_search_bearer(&h, &cookie, "stream:read");
+        let ok = h.call_bearer("GET", MB_SEARCH_OK, Some(format!("Bearer {library}")));
+        assert_eq!(ok.status, 503, "{}", ok.body);
+        let wrong = h.call_bearer("GET", MB_SEARCH_OK, Some(format!("Bearer {stream}")));
+        assert_eq!(wrong.status, 403, "{}", wrong.body);
+        let bogus = h.call_bearer(
+            "GET",
+            MB_SEARCH_OK,
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+        );
+        assert_eq!(bogus.status, 404, "{}", bogus.body);
+        // Only GET is mapped; HEAD, POST and nested paths stay denied.
+        for (method, path) in [
+            ("HEAD", "/v1/mb/search"),
+            ("POST", "/v1/mb/search"),
+            ("GET", "/v1/mb/search/extra"),
+            ("GET", "/v1/mb/search/?q=x&type=artist"),
+            ("GET", "/v1/mb/searchx?q=x&type=artist"),
+        ] {
+            assert_eq!(
+                crate::native_rest::scope_for_operation(method, path),
+                crate::native_rest::RouteDecision::Deny,
+                "{method} {path}"
+            );
+            let resp = h.call_full(method, path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, 404, "{method} {path}: {}", resp.body);
+        }
+        assert_eq!(
+            crate::native_rest::scope_for_operation("GET", MB_SEARCH_OK),
+            crate::native_rest::RouteDecision::Bearer(crate::native_rest::Scope::LibraryRead)
+        );
     }
 
     #[test]

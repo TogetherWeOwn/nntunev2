@@ -145,6 +145,29 @@ This follows [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGE
 CC0 core only, no NC enrichment, no new art caching, and no YouTube playback or
 clean-room UI changes. The M1 contract remains additive and unchanged.
 
+### Application search boundary (provider unavailable)
+
+`GET /v1/mb/search?q=...&type=artist|release|recording&limit=12&offset=0`
+requires a cookie session or `library:read` bearer. It validates bounded query
+parameters and reserves `include_unavailable=true` for a cookie session whose
+admin role is read fresh from the database; other callers receive a concealed
+404 for that flag. There is no browser-to-private-worker route or new binding.
+
+Today every valid authorized search returns opaque 503 `service_unavailable`:
+**no qualified authoritative provider is connected**. The web client keeps library
+matches and offers an explicit catalogue retry. This is source preparation, not a
+working catalogue backend, snapshot adoption or staging latency qualification.
+
+The transport-free provider contract in `src/mb_search.rs` requires own/shared
+membership and media readiness **before pagination**. Available recording hits
+carry authorized library `id` plus separate `occurrence_key`; artist/release hits
+carry only server-validated real destinations (or null). Raw MBIDs, album-wide
+recording arrays and metadata scores never prove playable media. The structural
+validator cannot itself prove live membership/readiness; the future provider must
+supply that evidence. Unavailable admin rows have no destination or occurrences.
+No raw unfiltered totals, supplementary data, art caching or playback changes are
+introduced. The guardrails linked above continue to apply.
+
 ### Session refresh retries without a stale-cookie grace period
 
 An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:

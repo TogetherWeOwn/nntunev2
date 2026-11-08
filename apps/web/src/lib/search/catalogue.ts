@@ -23,6 +23,9 @@ export interface CatalogueHit {
 	kind: SearchKind;
 	artistMbid?: string;
 	artistName?: string;
+	availability: 'available';
+	destination: string | null;
+	occurrences: { id: string; occurrence_key: string }[];
 }
 
 export type CatalogueSearchErrorCode = 'aborted' | 'timeout' | 'failed';
@@ -83,7 +86,30 @@ function parseHit(raw: unknown, kind: SearchKind): CatalogueHit | null {
 	if (label === null) return null;
 	const score = raw.score;
 	if (typeof score !== 'number' || !Number.isFinite(score)) return null;
-	const hit: CatalogueHit = { mbid: mbid.toLowerCase(), label, score, kind };
+	// Raw metadata is not the application search contract. Treat missing or
+	// unknown readiness as service failure, not as a successful empty search.
+	if (raw.availability !== 'available' || !Array.isArray(raw.occurrences)) {
+		throw new CatalogueSearchError('failed');
+	}
+	const normalizedMbid = mbid.toLowerCase();
+	const expectedDestination = kind === 'artist' ? `/artist/${normalizedMbid}`
+		: kind === 'release' ? `/album/${normalizedMbid}` : null;
+	if (raw.destination !== null && raw.destination !== expectedDestination) {
+		throw new CatalogueSearchError('failed');
+	}
+	if (raw.occurrences.length > 50) throw new CatalogueSearchError('failed');
+	const occurrences = raw.occurrences.map((value: unknown) => {
+		if (!isRecord(value) || cleanText(value.id) !== value.id || cleanText(value.occurrence_key) !== value.occurrence_key
+			|| typeof value.id !== 'string' || typeof value.occurrence_key !== 'string') {
+			throw new CatalogueSearchError('failed');
+		}
+		return { id: value.id, occurrence_key: value.occurrence_key };
+	});
+	if ((kind === 'recording' && occurrences.length === 0) || (kind !== 'recording' && occurrences.length > 0)) {
+		throw new CatalogueSearchError('failed');
+	}
+	const hit: CatalogueHit = { mbid: normalizedMbid, label, score, kind,
+		availability: 'available', destination: raw.destination as string | null, occurrences };
 	if (kind !== 'artist') {
 		const artistMbid = raw.artist_mbid;
 		const artistName = cleanText(raw.artist_name);

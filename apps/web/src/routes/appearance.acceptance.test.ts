@@ -2,7 +2,7 @@ import { createRawSnippet } from 'svelte';
 import { render } from 'svelte/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('$app/navigation', () => ({ afterNavigate: () => {} }));
+vi.mock('$app/navigation', () => ({ afterNavigate: () => {}, beforeNavigate: () => {} }));
 // Direct SSR rendering has no Kit request context. Supply page state at that
 // boundary while keeping the actual root layout and its children under test.
 vi.mock('$app/state', () => ({

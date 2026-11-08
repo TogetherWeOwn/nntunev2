@@ -17,7 +17,10 @@ function json(body: unknown, init: ResponseInit = {}): Response {
 }
 
 function envelope(type: string, results: unknown[]) {
-	return { q: 'x', type, limit: 12, offset: 0, results };
+	return { q: 'x', type, limit: 12, offset: 0, results: results.map((result) =>
+		typeof result === 'object' && result !== null && !Array.isArray(result)
+			? { availability: 'available', destination: null, occurrences: [], ...result } : result
+	) };
 }
 
 function okFetch(): typeof fetch {
@@ -30,7 +33,8 @@ function okFetch(): typeof fetch {
 					{ mbid: R1, title: 'Rel', score: 95, artist_mbid: A1, artist_name: 'Alpha' }
 				])
 			);
-		return json(envelope(type, [{ mbid: T1, title: 'Rec', score: 80, artist_mbid: null, artist_name: null }]));
+		return json(envelope(type, [{ mbid: T1, title: 'Rec', score: 80, artist_mbid: null, artist_name: null,
+			occurrences: [{ id: T1, occurrence_key: 'job:1' }] }]));
 	}) as unknown as typeof fetch;
 }
 
@@ -100,6 +104,28 @@ describe('searchCatalogue query validation', () => {
 });
 
 describe('searchCatalogue response validation', () => {
+	it.each([
+		['legacy raw metadata', {}],
+		['unknown readiness', { availability: 'unknown', destination: null, occurrences: [] }],
+		['unavailable default response', { availability: 'unavailable', destination: null, occurrences: [] }],
+		['foreign destination', { availability: 'available', destination: 'https://other.test/', occurrences: [] }],
+		['unvalidated entity destination', { availability: 'available', destination: `/artist/${A2}`, occurrences: [] }],
+		['missing occurrence identity', { availability: 'available', destination: null, occurrences: [{ id: 'one' }] }]
+	])('fails to library-only fallback for %s', async (_name, fields) => {
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const type = new URL(String(input)).searchParams.get('type')!;
+			return json({ type, results: type === 'artist' ? [{ mbid: A1, name: 'Alpha', score: 1, ...fields }] : [] });
+		}) as unknown as typeof fetch;
+		await expect(searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn)).rejects.toMatchObject({ code: 'failed' });
+	});
+
+	it('accepts only a validated own-origin entity destination', async () => {
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const type = new URL(String(input)).searchParams.get('type')!;
+			return json(envelope(type, type === 'artist' ? [{ mbid: A1, name: 'Alpha', score: 1, destination: `/artist/${A1}` }] : []));
+		}) as unknown as typeof fetch;
+		expect(await searchCatalogue(BASE, 'alpha', new AbortController().signal, fetchFn)).toMatchObject([{ destination: `/artist/${A1}` }]);
+	});
 	function withArtist(results: unknown[]): typeof fetch {
 		return vi.fn(async (input: RequestInfo | URL) => {
 			const type = new URL(String(input)).searchParams.get('type')!;
@@ -122,7 +148,7 @@ describe('searchCatalogue response validation', () => {
 				{ mbid: A1, name: 'Good', score: 5 }
 			])
 		);
-		expect(hits).toEqual([{ mbid: A1, label: 'Good', score: 5, kind: 'artist' }]);
+		expect(hits).toEqual([{ mbid: A1, label: 'Good', score: 5, kind: 'artist', availability: 'available', destination: null, occurrences: [] }]);
 	});
 
 	it('drops an invalid artist link on a release but keeps the hit', async () => {

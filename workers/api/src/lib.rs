@@ -28,6 +28,7 @@ pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
 mod magic_redemption;
+pub mod mb_search;
 pub mod meter_sink;
 pub mod native_rest;
 pub mod original_source;
