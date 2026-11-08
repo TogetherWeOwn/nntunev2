@@ -338,6 +338,20 @@ pub fn reconcile_subscription(
     };
 
     let status = sub.status.as_str();
+    let previous = local.live.as_ref();
+    if is_terminal_status(status) || is_held_status(status) {
+        if let Some(kept) = previous.filter(|row| {
+            row.stripe_subscription_id == sub.id
+                && row.paid_invoice_id.as_ref().is_some_and(|anchor| {
+                    !remote.invoices.iter().any(|invoice| &invoice.id == anchor)
+                })
+        }) {
+            // The exhausted listing proves staleness even without folding
+            // money. Do not re-pin an equal-end anchor: the write must still
+            // recognize this evidence after another pass changes status/grace.
+            return stale_snapshot(sub, remote_customer, kept, None, Vec::new());
+        }
+    }
     // Every non-stale branch below re-pins the stored anchor when it keeps
     // the stored coverage: the write guard reads an anchor-less equal-end
     // write against an anchored stored row as stale evidence, and only the
@@ -454,7 +468,7 @@ pub fn reconcile_subscription(
             .as_ref()
             .map(|lines| lines.data.as_slice())
             .unwrap_or(&[]);
-        let mut span_start: Option<i64> = None;
+        let mut spans = std::collections::BTreeMap::<String, (i64, i64)>::new();
         let mut span_end: Option<i64> = None;
         let mut span_plan: Option<String> = None;
         let mut item_end: Option<i64> = None;
@@ -467,33 +481,27 @@ pub fn reconcile_subscription(
             ) else {
                 continue;
             };
-            // The history row spans the selected plan's OWN lines only: a
-            // takeover by a different plan restarts the span at that line,
-            // while further lines of the already-selected plan extend it.
-            // Otherwise a mid-cycle upgrade invoice (earlier-plan days plus
-            // new-plan days on one invoice) would attribute the earlier
-            // plan's service period to the later plan.
+            // Accumulate each plan independently so an intervening plan
+            // cannot discard the eventual winner's earlier service days.
+            // Strictly greater preserves ties: the first latest-ending
+            // line still selects the plan, not the map's iteration order.
+            let span = spans
+                .entry(qualified.plan.clone())
+                .or_insert((qualified.start, qualified.end));
+            span.0 = span.0.min(qualified.start);
+            span.1 = span.1.max(qualified.end);
             if span_end.is_none_or(|end| qualified.end > end) {
                 span_end = Some(qualified.end);
-                let same_plan = span_plan.as_deref() == Some(qualified.plan.as_str());
-                span_start = Some(if same_plan {
-                    span_start.map_or(qualified.start, |start: i64| start.min(qualified.start))
-                } else {
-                    qualified.start
-                });
                 span_plan = Some(qualified.plan.clone());
-            } else if span_plan.as_deref() == Some(qualified.plan.as_str()) {
-                span_start = Some(
-                    span_start.map_or(qualified.start, |start: i64| start.min(qualified.start)),
-                );
             }
             if qualified.plan == item_plan {
                 item_end = Some(item_end.map_or(qualified.end, |end: i64| end.max(qualified.end)));
             }
         }
-        let (Some(start), Some(end), Some(plan)) = (span_start, span_end, span_plan) else {
+        let Some(plan) = span_plan else {
             continue;
         };
+        let (start, end) = spans[&plan];
         history.push(PaidInvoiceRow {
             stripe_invoice_id: invoice.id.clone(),
             stripe_subscription_id: sub.id.clone(),
@@ -537,8 +545,8 @@ pub fn reconcile_subscription(
     // snapshot with no item-plan money at all is NOT stale on that basis
     // alone: a first failed renewal observes `past_due` with no new
     // invoice, and that observation must set the grace below. Terminal and
-    // held paths branch before any money comparison, so only the advancing
-    // statuses can take this arm. The invoice listing is followed to
+    // held paths use the same anchor-containment check above, without a
+    // money comparison or history fold. The invoice listing is followed to
     // exhaustion by the caller, so a fresh snapshot always contains the
     // stored anchor; a missing one proves the read predates that commit.
     //
@@ -552,26 +560,7 @@ pub fn reconcile_subscription(
     };
     if stale {
         let kept = previous.expect("stale requires stored coverage");
-        return ReconcileOutcome {
-            row: ReconciledRow {
-                stripe_subscription_id: sub.id.clone(),
-                stripe_customer_id: remote_customer,
-                stripe_item_id: kept.stripe_item_id.clone(),
-                stripe_price_id: kept.stripe_price_id.clone(),
-                plan_id: kept.plan_id.clone(),
-                status: kept.status.clone(),
-                current_period_end_unix: sub.current_period_end,
-                cancel_at_period_end: sub.cancel_at_period_end,
-                paid_through_unix: new_end.or(previous_end),
-                paid_invoice_id: None,
-                grace_until_unix: kept.grace_until_unix,
-            },
-            history,
-            fail_closed: None,
-            read_plan: Some(kept.plan_id.clone()),
-            read_anchor: stored_anchor,
-            stale_snapshot: true,
-        };
+        return stale_snapshot(sub, remote_customer, kept, new_end, history);
     }
     // Monotonic coverage: duplicates and older invoices never regress a
     // later confirmed plan/period. New money (a strictly greater item-plan
@@ -667,6 +656,37 @@ pub fn reconcile_subscription(
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: stored_anchor,
         stale_snapshot: false,
+    }
+}
+
+/// Retain the read row while carrying stale evidence through the write:
+/// no anchor, and the evidence end (or the stored end when none was folded).
+fn stale_snapshot(
+    sub: &Subscription,
+    customer: String,
+    kept: &LiveRow,
+    evidence_end: Option<i64>,
+    history: Vec<PaidInvoiceRow>,
+) -> ReconcileOutcome {
+    ReconcileOutcome {
+        row: ReconciledRow {
+            stripe_subscription_id: sub.id.clone(),
+            stripe_customer_id: customer,
+            stripe_item_id: kept.stripe_item_id.clone(),
+            stripe_price_id: kept.stripe_price_id.clone(),
+            plan_id: kept.plan_id.clone(),
+            status: kept.status.clone(),
+            current_period_end_unix: sub.current_period_end,
+            cancel_at_period_end: sub.cancel_at_period_end,
+            paid_through_unix: evidence_end.or(kept.paid_through_unix),
+            paid_invoice_id: None,
+            grace_until_unix: kept.grace_until_unix,
+        },
+        history,
+        fail_closed: None,
+        read_plan: Some(kept.plan_id.clone()),
+        read_anchor: kept.paid_invoice_id.clone(),
+        stale_snapshot: true,
     }
 }
 
@@ -1635,6 +1655,58 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_plan_history_is_permutation_invariant_and_preserves_ties() {
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for plus_end in [15, 30] {
+            let line = |id, price, start, end| {
+                paid_invoice(id, price, NOW + start, NOW + end, NOW)
+                    .lines
+                    .expect("lines")
+                    .data
+                    .remove(0)
+            };
+            let lines = [
+                line("pro_early", PRICE_PRO, 1, 10),
+                line("plus", PRICE_PLUS, 0, plus_end),
+                line("pro_late", PRICE_PRO, 10, 30),
+            ];
+            for order in permutations {
+                let mut invoice = paid_invoice("in_interleaved", PRICE_PRO, NOW, NOW + 30, NOW);
+                invoice.lines.as_mut().expect("lines").data =
+                    order.map(|i| lines[i].clone()).to_vec();
+                let remote = RemoteSubscription {
+                    subscription: subscription("active", PRICE_PRO),
+                    invoices: vec![invoice],
+                };
+                let outcome = reconcile_subscription(&fresh(), &remote, NOW);
+                assert_eq!(outcome.fail_closed, None);
+                assert_eq!(outcome.history.len(), 1);
+                // Equal latest ends keep the first line reaching that end,
+                // not the first plan encountered or map iteration order.
+                let plus_wins = plus_end == 30
+                    && order.iter().position(|&i| i == 1) < order.iter().position(|&i| i == 2);
+                let row = &outcome.history[0];
+                assert_eq!(row.plan_id, if plus_wins { "plus" } else { "pro-5x" });
+                assert_eq!(row.period_start_unix, NOW + if plus_wins { 0 } else { 1 });
+                assert_eq!(row.period_end_unix, NOW + 30);
+                assert_eq!(row.stripe_invoice_id, "in_interleaved");
+                assert_eq!((row.amount_cents, row.currency.as_str()), (800, "usd"));
+                assert_eq!(row.paid_at_unix, NOW);
+                assert_eq!(outcome.row.plan_id, "pro-5x", "coverage uses the item plan");
+                assert_eq!(outcome.row.paid_through_unix, Some(NOW + 30));
+                assert_eq!(reconcile_subscription(&fresh(), &remote, NOW), outcome);
+            }
+        }
+    }
+
+    #[test]
     fn same_plan_multiline_invoice_history_spans_all_its_lines() {
         // The scoping above must not drop same-plan days: two pro lines
         // arriving latest-end-last still span their full range.
@@ -1871,6 +1943,91 @@ mod tests {
             assert_eq!(outcome.row.plan_id, "plus", "history retained");
             assert_eq!(outcome.row.paid_through_unix, Some(NOW + 100));
             assert_eq!(outcome.row.grace_until_unix, None, "terminal clears grace");
+        }
+    }
+
+    #[test]
+    fn fresh_held_and_terminal_snapshots_keep_verbatim_status() {
+        let end = NOW + 100;
+        let grace = end + RENEWAL_GRACE_SECS;
+        for status in [
+            "incomplete",
+            "unpaid",
+            "paused",
+            "canceled",
+            "incomplete_expired",
+        ] {
+            for has_anchor in [false, true] {
+                let mut input = local("plus", Some(end), Some(grace));
+                let mut remote = RemoteSubscription {
+                    subscription: subscription(status, PRICE_PRO),
+                    invoices: vec![],
+                };
+                if has_anchor {
+                    input.live.as_mut().expect("live").paid_invoice_id =
+                        Some("in_seed".to_string());
+                    // Freshness depends on containment, not whether the
+                    // current item's plan has money as late as stored coverage.
+                    remote
+                        .invoices
+                        .push(paid_invoice("in_seed", PRICE_PLUS, NOW, end, NOW));
+                }
+                let outcome = reconcile_subscription(&input, &remote, NOW);
+                assert_eq!(outcome.fail_closed, None);
+                assert_eq!(outcome.row.status, status);
+                assert_eq!(outcome.row.plan_id, "plus");
+                assert_eq!(outcome.row.paid_through_unix, Some(end));
+                assert_eq!(
+                    outcome.row.paid_invoice_id.as_deref(),
+                    has_anchor.then_some("in_seed")
+                );
+                assert_eq!(
+                    outcome.row.grace_until_unix,
+                    if is_terminal_status(status) {
+                        None
+                    } else {
+                        Some(grace)
+                    }
+                );
+                assert_eq!(outcome.row.stripe_price_id, PRICE_PRO);
+                assert!(outcome.history.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_replay_does_not_use_replacement_subscription_anchor() {
+        // A delayed completed Checkout for the old subscription can be
+        // retrieved after its replacement owns the user's live slot. That
+        // replacement's invoice cannot prove the old subscription stale.
+        let mut input = anchored("plus", NOW + 100, "in_replacement");
+        input.live.as_mut().expect("live").stripe_subscription_id = "sub_replacement".to_string();
+        for status in ["canceled", "incomplete_expired"] {
+            for empty in [false, true] {
+                let remote = RemoteSubscription {
+                    subscription: subscription(status, PRICE_PLUS),
+                    invoices: if empty {
+                        vec![]
+                    } else {
+                        vec![paid_invoice(
+                            "in_old",
+                            PRICE_PLUS,
+                            NOW - 100,
+                            NOW,
+                            NOW - 100,
+                        )]
+                    },
+                };
+                let outcome = reconcile_subscription(&input, &remote, NOW);
+                assert_eq!(outcome.fail_closed, None);
+                assert_eq!(outcome.row.stripe_subscription_id, "sub_123");
+                assert_eq!(
+                    outcome.row.status, status,
+                    "old subscription must not become active"
+                );
+                assert_eq!(outcome.row.grace_until_unix, None);
+                assert!(outcome.history.is_empty());
+            }
         }
     }
 

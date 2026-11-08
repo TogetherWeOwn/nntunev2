@@ -11583,6 +11583,192 @@ mod tests {
     }
 
     #[test]
+    fn billing_stale_held_and_terminal_commit_orders_keep_fresh_status_and_grace() {
+        // Both passes fold the same stored row. Only the fresh snapshot
+        // contains its anchor; equal coverage must not hide stale evidence
+        // when the held/terminal pass commits after a status/grace change.
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let grace = end + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        for status in [
+            "incomplete",
+            "unpaid",
+            "paused",
+            "canceled",
+            "incomplete_expired",
+        ] {
+            for (before, after) in [("active", "past_due"), ("past_due", "active")] {
+                for empty in [false, true] {
+                    for stale_first in [false, true] {
+                        let h = stripe_harness();
+                        seed_billing_user(&h, "u1");
+                        let initial_grace = (before == "past_due").then_some(grace);
+                        block_on(h.store.store_reconcile_outcome(
+                            "u1",
+                            &stored_seed(
+                                PLAN_PLUS,
+                                before,
+                                Some(end),
+                                Some("in_seed"),
+                                initial_grace,
+                            ),
+                        ))
+                        .expect("seed stores");
+                        let input = fold_input(
+                            PLAN_PLUS,
+                            before,
+                            Some(end),
+                            initial_grace,
+                            Some("in_seed"),
+                        );
+                        let invoice = |id, invoice_end| {
+                            test_invoice(
+                                id,
+                                "cus_test_1",
+                                "sub_test_1",
+                                PRICE_PLUS,
+                                BILLING_NOW - BILLING_PERIOD,
+                                invoice_end,
+                                BILLING_NOW,
+                            )
+                        };
+                        let stale = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    status,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: if empty {
+                                    vec![]
+                                } else {
+                                    vec![invoice("in_old", BILLING_NOW)]
+                                },
+                            },
+                            BILLING_NOW,
+                        );
+                        assert_eq!(stale.fail_closed, None);
+                        assert_eq!(stale.row.status, before);
+                        assert_eq!(stale.row.grace_until_unix, initial_grace);
+                        assert_eq!(stale.row.paid_through_unix, Some(end));
+                        assert_eq!(
+                            stale.row.paid_invoice_id, None,
+                            "stale evidence, never a re-pin"
+                        );
+                        assert_eq!(stale.read_anchor.as_deref(), Some("in_seed"));
+                        assert!(
+                            stale.history.is_empty(),
+                            "held/terminal paths do not backfill history"
+                        );
+                        let fresh = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    after,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: vec![invoice("in_seed", end)],
+                            },
+                            BILLING_NOW,
+                        );
+                        let commits = if stale_first {
+                            [&stale, &fresh]
+                        } else {
+                            [&fresh, &stale]
+                        };
+                        for outcome in commits {
+                            block_on(h.store.store_reconcile_outcome("u1", outcome))
+                                .expect("pass stores");
+                        }
+                        let row = h.store.billing_rows.borrow()["u1"].clone();
+                        assert_eq!(
+                            row.status, after,
+                            "{status}, empty={empty}, stale_first={stale_first}"
+                        );
+                        assert_eq!(row.grace_until_unix, (after == "past_due").then_some(grace));
+                        assert_eq!(row.plan_id, PLAN_PLUS);
+                        assert_eq!(row.paid_through_unix, Some(end));
+                        assert_eq!(row.paid_invoice_id.as_deref(), Some("in_seed"));
+                        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn billing_permuted_invoice_history_replays_idempotently() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let line = |price, start, end| {
+            test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                price,
+                BILLING_NOW + start,
+                BILLING_NOW + end,
+                BILLING_NOW,
+            )
+            .lines
+            .expect("lines")
+            .data
+            .remove(0)
+        };
+        let lines = [
+            line(PRICE_PRO, 1, 10),
+            line(PRICE_PLUS, 0, 15),
+            line(PRICE_PRO, 10, 30),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut invoice = test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + 1,
+                BILLING_NOW + 30,
+                BILLING_NOW,
+            );
+            invoice.lines.as_mut().expect("lines").data = order.map(|i| lines[i].clone()).to_vec();
+            let input = block_on(h.store.load_reconcile_input("u1")).expect("input loads");
+            let outcome = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "active",
+                        PRICE_PRO,
+                    ),
+                    invoices: vec![invoice],
+                },
+                BILLING_NOW,
+            );
+            assert_eq!(outcome.history.len(), 1);
+            assert_eq!(outcome.history[0].period_start_unix, BILLING_NOW + 1);
+            block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("replay stores");
+            let history = h.store.invoice_history.borrow();
+            assert_eq!(
+                history.len(),
+                1,
+                "all permutations retain the same invoice identity"
+            );
+            assert_eq!(history["in_mix"], outcome.history[0]);
+        }
+    }
+
+    #[test]
     fn billing_relabel_first_keep_second_keeps_new_plan() {
         // Relabel-then-keep commit order, built from REAL fold outcomes:
         // keep pass K folds the pre-switch snapshot (plus/E/`in_plus`) and
