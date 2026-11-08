@@ -289,7 +289,8 @@ async fn rejection_holds_job_lock_and_concurrent_publication_loses_without_seali
     assert!(matches!(reloaded, Err(StoreError::Stale)));
     assert_eq!(rejected.checkpoint().state, JobState::Rejected);
     assert_eq!(rejected.revision(), writing.revision() + 1);
-    assert_eq!(rejected.generation(), writing.generation() + 1);
+    assert_eq!(rejected.generation(), rejected.revision());
+    assert!(rejected.generation() > writing.generation());
     assert_eq!(authority.0, "rejected");
     assert_eq!(authority.1, rejected.revision());
     let decoded =
