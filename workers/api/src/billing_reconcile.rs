@@ -206,6 +206,9 @@ pub struct ReconcileOutcome {
     pub read_plan: Option<String>,
     /// See `read_plan`: the stored anchor at fold time.
     pub read_anchor: Option<String>,
+    /// The fold proved this snapshot stale. The store skips the subscription
+    /// write regardless of evidence end; invoice history still converges.
+    pub stale_snapshot: bool,
 }
 
 impl ReconcileOutcome {
@@ -365,6 +368,7 @@ pub fn reconcile_subscription(
             fail_closed: None,
             read_plan: previous.map(|row| row.plan_id.clone()),
             read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
+            stale_snapshot: false,
         };
     }
     if is_held_status(status) {
@@ -391,6 +395,7 @@ pub fn reconcile_subscription(
             fail_closed: None,
             read_plan: previous.map(|row| row.plan_id.clone()),
             read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
+            stale_snapshot: false,
         };
     }
     if !is_advancing_status(status) {
@@ -508,7 +513,13 @@ pub fn reconcile_subscription(
         }
     }
 
-    let previous = local.live.as_ref();
+    // The subscription was retrieved before the live row was loaded. A
+    // replacement may now own the slot; its coverage/anchor/bindings cannot
+    // order or fill any field of this subscription's advancing outcome.
+    let previous = local
+        .live
+        .as_ref()
+        .filter(|row| row.stripe_subscription_id == sub.id);
     let previous_end = previous.and_then(|row| row.paid_through_unix);
     let stored_anchor = previous.and_then(|row| row.paid_invoice_id.clone());
     // Staleness is anchor containment, not an end comparison: a snapshot
@@ -531,19 +542,10 @@ pub fn reconcile_subscription(
     // exhaustion by the caller, so a fresh snapshot always contains the
     // stored anchor; a missing one proves the read predates that commit.
     //
-    // The row carries the stale *evidence* end (`new_end`), not the
-    // stored end: the write guard keys its staleness predicate off
-    // `EXCLUDED.paid_through_at`, so a stale-reading pass that commits
-    // second still compares strictly older and keeps the stored
-    // status/grace instead of overwriting them with older verbatim
-    // fields. A stale pass whose snapshot holds no item-plan money at
-    // all emits no evidence end — and the guard only fires on non-NULL
-    // evidence — so it falls back to the stored end: with the anchor
-    // cleared that is exactly the anchor-less equal-end shape the guard
-    // already reads as stale against an anchored stored row (a shape
-    // only this branch emits). Coverage itself stays monotonic in the
-    // write (the guard keeps the greatest confirmed end), and the
-    // retained plan/anchor are kept with it there.
+    // Keep the evidence shape for callers, but carry the proof explicitly:
+    // an evidence end can be greater than stored coverage, or absent. It
+    // cannot order mutable subscription fields. `stale_snapshot` suppresses
+    // the subscription write entirely; confirmed history still converges.
     let stale = match stored_anchor {
         Some(ref anchor) => !remote.invoices.iter().any(|inv| &inv.id == anchor),
         None => matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev),
@@ -568,6 +570,7 @@ pub fn reconcile_subscription(
             fail_closed: None,
             read_plan: Some(kept.plan_id.clone()),
             read_anchor: stored_anchor,
+            stale_snapshot: true,
         };
     }
     // Monotonic coverage: duplicates and older invoices never regress a
@@ -663,6 +666,7 @@ pub fn reconcile_subscription(
         fail_closed: None,
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: stored_anchor,
+        stale_snapshot: false,
     }
 }
 
@@ -715,6 +719,7 @@ fn fail_closed(
         fail_closed: Some(reason),
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
+        stale_snapshot: false,
     }
 }
 
@@ -984,8 +989,13 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// even when the stale-reading pass commits second — falling back to
 /// the stored end when its snapshot holds no item-plan money at all, so
 /// the anchor-less equal-end shape still presents non-NULL evidence).
-/// Item bindings, period end and cancel still update verbatim.
-/// Full staleness predicate (mirrored in both CASEs): EXCLUDED money is
+/// Customer/item/price bindings, period end and cancellation use the same
+/// commit-time guard as status/grace. A fold-proven stale snapshot (`$15`)
+/// never writes the subscription, including with greater or NULL evidence.
+/// A different subscription holding the user's live slot also suppresses
+/// this write: retrieval can predate cancellation and replacement. These
+/// checks run after the per-user lock; history is still inserted separately.
+/// Full staleness predicate (mirrored in the mutable-field CASEs): EXCLUDED money is
 /// non-NULL, stored money is non-NULL, and EXCLUDED ends strictly before
 /// stored — or EXCLUDED ties stored while carrying no anchor against an
 /// anchored stored row. The fold only emits that anchor-less equal-end
@@ -1005,9 +1015,10 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
 /// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL ·
 /// $13 read paid_invoice_id-or-NULL (the stored anchor at fold time) ·
-/// $14 read plan_id-or-NULL (the stored plan at fold time).
+/// $14 read plan_id-or-NULL (the stored plan at fold time) ·
+/// $15 stale_snapshot (the fold proved the remote snapshot stale).
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) SELECT $1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint) WHERE NOT $15::boolean AND NOT EXISTS (SELECT 1 FROM subscriptions AS live WHERE live.user_id = $1 AND live.stripe_subscription_id <> $2 AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.stripe_customer_id ELSE EXCLUDED.stripe_customer_id END, stripe_subscription_item_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.stripe_subscription_item_id ELSE EXCLUDED.stripe_subscription_item_id END, stripe_price_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.stripe_price_id ELSE EXCLUDED.stripe_price_id END, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.current_period_end ELSE EXCLUDED.current_period_end END, cancel_at_period_end = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.cancel_at_period_end ELSE EXCLUDED.cancel_at_period_end END, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·

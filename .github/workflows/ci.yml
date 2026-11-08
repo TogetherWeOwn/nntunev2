@@ -640,6 +640,7 @@ jobs:
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:

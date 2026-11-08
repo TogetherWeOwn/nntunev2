@@ -7299,6 +7299,9 @@ mod tests {
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
+        /// Land a replacement at input load, after the remote retrieve.
+        replacement_on_reconcile_load:
+            RefCell<Option<(crate::billing_reconcile::ReconciledRow, Arc<Mutex<bool>>)>>,
         /// Claimed webhook event ids (first claim wins, mirroring
         /// `billing_webhook_events`).
         webhook_events: RefCell<HashSet<String>>,
@@ -8593,6 +8596,15 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            if let Some((row, retrieved)) = self.replacement_on_reconcile_load.borrow_mut().take() {
+                assert!(
+                    *retrieved.lock().expect("retrieve pin"),
+                    "retrieve A precedes load B"
+                );
+                self.billing_rows
+                    .borrow_mut()
+                    .insert(user_id.to_string(), row);
+            }
             let live = self.billing_rows.borrow().get(user_id).map(|row| {
                 crate::billing_reconcile::LiveRow {
                     stripe_subscription_id: row.stripe_subscription_id.clone(),
@@ -8652,23 +8664,31 @@ mod tests {
             // relabel, or an older relabel committing after a newer one,
             // keeps the stored ones instead of reversing the newer
             // plan/anchor. An anchor-less tie keeps the stored ones too.
-            // The same staleness predicate guards
-            // `status` and `grace_until`: strictly older money — or the
-            // anchor-less equal-end shape only the stale fold emits — keeps
-            // the stored verbatim fields instead of writing stale ones over
-            // a fresher pass. Bindings still update verbatim; history still
-            // converges on the invoice id.
+            // The same commit-time staleness predicate guards all mutable
+            // fields. Explicit fold-proven stale evidence and writes to a
+            // different live slot skip the subscription write entirely;
+            // history still converges on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
-            let merged = match rows.get(user_id) {
-                Some(existing)
-                    if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
-                {
-                    let advances = outcome.row.paid_through_unix.is_some_and(|end| {
-                        existing
-                            .paid_through_unix
-                            .is_none_or(|previous| end > previous)
-                    });
-                    let relabels = !advances
+            let skip = outcome.stale_snapshot
+                || rows.get(user_id).is_some_and(|existing| {
+                    existing.stripe_subscription_id != outcome.row.stripe_subscription_id
+                        && matches!(
+                            existing.status.as_str(),
+                            "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                        )
+                });
+            if !skip {
+                let merged = match rows.get(user_id) {
+                    Some(existing)
+                        if existing.stripe_subscription_id
+                            == outcome.row.stripe_subscription_id =>
+                    {
+                        let advances = outcome.row.paid_through_unix.is_some_and(|end| {
+                            existing
+                                .paid_through_unix
+                                .is_none_or(|previous| end > previous)
+                        });
+                        let relabels = !advances
                         && outcome.row.paid_invoice_id.is_some()
                         && matches!(
                             (outcome.row.paid_through_unix, existing.paid_through_unix),
@@ -8684,30 +8704,37 @@ mod tests {
                         // keep never relabels either.
                         && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
                         && existing.paid_invoice_id == outcome.read_anchor;
-                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
-                        (Some(end), Some(previous)) => {
-                            end < previous
-                                || (end == previous
-                                    && outcome.row.paid_invoice_id.is_none()
-                                    && existing.paid_invoice_id.is_some())
+                        let stale =
+                            match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                                (Some(end), Some(previous)) => {
+                                    end < previous
+                                        || (end == previous
+                                            && outcome.row.paid_invoice_id.is_none()
+                                            && existing.paid_invoice_id.is_some())
+                                }
+                                _ => false,
+                            };
+                        let mut row = outcome.row.clone();
+                        if !advances && !relabels {
+                            row.paid_through_unix = existing.paid_through_unix;
+                            row.plan_id = existing.plan_id.clone();
+                            row.paid_invoice_id = existing.paid_invoice_id.clone();
                         }
-                        _ => false,
-                    };
-                    let mut row = outcome.row.clone();
-                    if !advances && !relabels {
-                        row.paid_through_unix = existing.paid_through_unix;
-                        row.plan_id = existing.plan_id.clone();
-                        row.paid_invoice_id = existing.paid_invoice_id.clone();
+                        if stale {
+                            row.status = existing.status.clone();
+                            row.grace_until_unix = existing.grace_until_unix;
+                            row.stripe_customer_id = existing.stripe_customer_id.clone();
+                            row.stripe_item_id = existing.stripe_item_id.clone();
+                            row.stripe_price_id = existing.stripe_price_id.clone();
+                            row.current_period_end_unix = existing.current_period_end_unix;
+                            row.cancel_at_period_end = existing.cancel_at_period_end;
+                        }
+                        row
                     }
-                    if stale {
-                        row.status = existing.status.clone();
-                        row.grace_until_unix = existing.grace_until_unix;
-                    }
-                    row
-                }
-                _ => outcome.row.clone(),
-            };
-            rows.insert(user_id.to_string(), merged);
+                    _ => outcome.row.clone(),
+                };
+                rows.insert(user_id.to_string(), merged);
+            }
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
                 history
@@ -9195,6 +9222,7 @@ mod tests {
     struct FakeStripe {
         sessions: RefCell<HashMap<String, crate::stripe::CheckoutSession>>,
         subscriptions: RefCell<HashMap<String, crate::stripe::Subscription>>,
+        subscription_retrieved: Arc<Mutex<bool>>,
         invoices: RefCell<HashMap<String, crate::stripe::Invoice>>,
         /// Remainder line pages per invoice: `list_invoice_lines` answers
         /// the next page from here, so tests pin the full-read follow-up
@@ -9389,6 +9417,7 @@ mod tests {
                 if self.fail("retrieve_subscription") {
                     return self.err();
                 }
+                *self.subscription_retrieved.lock().expect("retrieve pin") = true;
                 self.subscriptions
                     .borrow()
                     .get(&subscription_id)
@@ -10980,6 +11009,7 @@ mod tests {
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            stale_snapshot: false,
             // Inserts (no stored row yet), so the guard never reads this.
             read_plan: None,
             read_anchor: None,
@@ -10989,6 +11019,7 @@ mod tests {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            stale_snapshot: false,
             // Read the fresh row: strictly-older money, so the stale arm
             // fires on the ends regardless.
             read_plan: Some(PLAN_PLUS.to_string()),
@@ -11075,10 +11106,212 @@ mod tests {
             },
             history: vec![],
             fail_closed: None,
+            stale_snapshot: false,
             // Seeds commit as inserts (no stored row yet), so the
             // equal-end adopt arm never reads this.
             read_plan: None,
             read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_retrieve_old_subscription_then_load_replacement_never_borrows_state() {
+        for status in ["active", "past_due"] {
+            for evidence in [None, Some(-100), Some(100), Some(200)] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                h.store
+                    .billing_customers
+                    .borrow_mut()
+                    .insert("u1".into(), "cus_test_1".into());
+                let mut replacement = stored_seed(
+                    PLAN_PRO,
+                    "active",
+                    Some(BILLING_NOW + 100),
+                    Some("in_replacement"),
+                    None,
+                )
+                .row;
+                replacement.stripe_subscription_id = "sub_replacement".into();
+                replacement.stripe_item_id = "si_replacement".into();
+                replacement.stripe_price_id = PRICE_PRO.into();
+                replacement.cancel_at_period_end = true;
+                *h.store.replacement_on_reconcile_load.borrow_mut() = Some((
+                    replacement.clone(),
+                    Arc::clone(&h.stripe.subscription_retrieved),
+                ));
+                let sub = test_subscription("sub_test_1", "cus_test_1", status, PRICE_PLUS);
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .insert(sub.id.clone(), sub.clone());
+                let invoices: Vec<_> = evidence
+                    .into_iter()
+                    .map(|offset| {
+                        test_invoice(
+                            "in_old",
+                            "cus_test_1",
+                            "sub_test_1",
+                            PRICE_PLUS,
+                            BILLING_NOW - BILLING_PERIOD,
+                            BILLING_NOW + offset,
+                            BILLING_NOW - 100,
+                        )
+                    })
+                    .collect();
+                for invoice in &invoices {
+                    h.stripe
+                        .invoices
+                        .borrow_mut()
+                        .insert(invoice.id.clone(), invoice.clone());
+                }
+                // Same remote snapshot without a same-subscription live row:
+                // B must have no influence on any field of A's outcome.
+                let expected = crate::billing_reconcile::reconcile_subscription(
+                    &crate::billing_reconcile::ReconcileInput {
+                        stripe_customer_id: Some("cus_test_1".into()),
+                        live: None,
+                        bindings: test_bindings(),
+                    },
+                    &crate::billing_reconcile::RemoteSubscription {
+                        subscription: sub,
+                        invoices,
+                    },
+                    BILLING_NOW,
+                );
+                let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("late A safely reconciles");
+                assert_eq!(outcome, expected, "replacement is not A's previous state");
+                assert_eq!(h.store.billing_rows.borrow()["u1"], replacement);
+                assert_eq!(
+                    h.store.invoice_history.borrow().len(),
+                    usize::from(evidence.is_some())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn billing_explicit_stale_fold_never_changes_stored_fields() {
+        let end = BILLING_NOW + BILLING_PERIOD;
+        for evidence in [None, Some(end - 100), Some(end), Some(end + 100)] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            let mut seed = stored_seed(PLAN_PRO, "active", Some(end), Some("in_seed"), None);
+            seed.row.cancel_at_period_end = true;
+            block_on(h.store.store_reconcile_outcome("u1", &seed)).expect("seed");
+            let invoices = evidence
+                .into_iter()
+                .map(|e| {
+                    test_invoice(
+                        "in_old",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW - BILLING_PERIOD,
+                        e,
+                        BILLING_NOW - 100,
+                    )
+                })
+                .collect();
+            let stale = crate::billing_reconcile::reconcile_subscription(
+                &fold_input(PLAN_PRO, "active", Some(end), None, Some("in_seed")),
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "past_due",
+                        PRICE_PLUS,
+                    ),
+                    invoices,
+                },
+                BILLING_NOW,
+            );
+            assert!(stale.stale_snapshot);
+            block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale");
+            assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+            assert_eq!(
+                h.store.invoice_history.borrow().len(),
+                usize::from(evidence.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn billing_late_held_fold_preserves_recovery_cancellation_and_bindings() {
+        let old_end = BILLING_NOW;
+        let new_end = BILLING_NOW + BILLING_PERIOD;
+        let input = fold_input(PLAN_PLUS, "active", Some(old_end), None, Some("in_seed"));
+        let mut held_sub = test_subscription("sub_test_1", "cus_test_1", "paused", PRICE_PLUS);
+        held_sub.current_period_end = Some(old_end);
+        let held = crate::billing_reconcile::reconcile_subscription(
+            &input,
+            &crate::billing_reconcile::RemoteSubscription {
+                subscription: held_sub,
+                invoices: vec![test_invoice(
+                    "in_seed",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    old_end - BILLING_PERIOD,
+                    old_end,
+                    BILLING_NOW - 100,
+                )],
+            },
+            BILLING_NOW,
+        );
+        let mut recovered_sub = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO);
+        recovered_sub.current_period_end = Some(new_end);
+        recovered_sub.cancel_at_period_end = true;
+        recovered_sub.items.as_mut().expect("item").data[0].id = "si_recovered".into();
+        let recovered = crate::billing_reconcile::reconcile_subscription(
+            &input,
+            &crate::billing_reconcile::RemoteSubscription {
+                subscription: recovered_sub,
+                invoices: vec![
+                    test_invoice(
+                        "in_seed",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        old_end - BILLING_PERIOD,
+                        old_end,
+                        BILLING_NOW - 100,
+                    ),
+                    test_invoice(
+                        "in_recovered",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PRO,
+                        old_end,
+                        new_end,
+                        BILLING_NOW,
+                    ),
+                ],
+            },
+            BILLING_NOW,
+        );
+        assert!(
+            !held.stale_snapshot,
+            "fresh at fold time, stale only at commit"
+        );
+        for held_first in [false, true] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            block_on(h.store.store_reconcile_outcome(
+                "u1",
+                &stored_seed(PLAN_PLUS, "active", Some(old_end), Some("in_seed"), None),
+            ))
+            .expect("seed");
+            let passes = if held_first {
+                [&held, &recovered]
+            } else {
+                [&recovered, &held]
+            };
+            for pass in passes {
+                block_on(h.store.store_reconcile_outcome("u1", pass)).expect("commit");
+            }
+            assert_eq!(h.store.billing_rows.borrow()["u1"], recovered.row);
         }
     }
 
