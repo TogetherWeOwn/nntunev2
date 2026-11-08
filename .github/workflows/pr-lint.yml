@@ -107,6 +107,7 @@ jobs:
   # Existing registered dispatch entry point; never run downloads on PR/push.
   # This evidence cannot replace any required scan, policy audit or ci-ok.
   release-download-diagnostic:
+    name: Pinned release download diagnostic
     if: github.event_name == 'workflow_dispatch' && inputs.release_download_diagnostic
     runs-on: ubuntu-latest
     timeout-minutes: 12

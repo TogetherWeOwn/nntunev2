@@ -198,6 +198,7 @@ class DownloadDiagnosticTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", workflow)
         self.assertIn("persist-credentials: false", workflow)
         job = workflow.split("  release-download-diagnostic:", 1)[1]
+        self.assertIn("name: Pinned release download diagnostic", job)
         self.assertNotIn("secrets.", job)
         self.assertNotIn("write", job)
         self.assertIn("contents: read", job)
