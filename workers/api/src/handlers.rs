@@ -8705,11 +8705,18 @@ mod tests {
             }
             let skip = outcome.stale_snapshot || different_live;
             if !skip {
-                let merged = match rows.get(user_id) {
-                    Some(existing)
-                        if existing.stripe_subscription_id
-                            == outcome.row.stripe_subscription_id =>
-                    {
+                let existing = rows
+                    .get(user_id)
+                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.billing_nonlive_rows
+                            .borrow()
+                            .get(&outcome.row.stripe_subscription_id)
+                            .cloned()
+                    });
+                let merged = match existing.as_ref() {
+                    Some(existing) => {
                         let advances = outcome.row.paid_through_unix.is_some_and(|end| {
                             existing
                                 .paid_through_unix
@@ -8767,15 +8774,35 @@ mod tests {
                             row.stripe_price_id = existing.stripe_price_id.clone();
                             row.current_period_end_unix = existing.current_period_end_unix;
                             row.cancel_at_period_end = existing.cancel_at_period_end;
+                        } else if recovers_trial
+                            && outcome.row.paid_through_unix.is_some()
+                            && outcome.row.paid_through_unix == existing.paid_through_unix
+                            && row.status == "past_due"
+                        {
+                            row.grace_until_unix = existing.grace_until_unix.or_else(|| {
+                                existing.paid_through_unix.map(|end| {
+                                    end.saturating_add(crate::billing_reconcile::RENEWAL_GRACE_SECS)
+                                })
+                            });
                         }
                         row
                     }
                     _ => outcome.row.clone(),
                 };
+                let subscription_id = merged.stripe_subscription_id.clone();
                 self.billing_subscription_ids
                     .borrow_mut()
-                    .insert(merged.stripe_subscription_id.clone());
-                rows.insert(user_id.to_string(), merged);
+                    .insert(subscription_id.clone());
+                self.billing_nonlive_rows
+                    .borrow_mut()
+                    .remove(&subscription_id);
+                if let Some(previous) = rows.insert(user_id.to_string(), merged) {
+                    if previous.stripe_subscription_id != subscription_id {
+                        self.billing_nonlive_rows
+                            .borrow_mut()
+                            .insert(previous.stripe_subscription_id.clone(), previous);
+                    }
+                }
             }
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
@@ -11246,10 +11273,27 @@ mod tests {
 
     #[test]
     fn billing_duplicate_checkout_recovers_nonlive_equal_end_state() {
-        for status in ["active", "past_due"] {
+        for (status, existing_grace) in [
+            ("active", false),
+            ("active", true),
+            ("past_due", false),
+            ("past_due", true),
+        ] {
             let h = stripe_harness();
             seed_billing_user(&h, "u1");
             let body = deliver_first_period(&h, "evt_recovery");
+            if existing_grace {
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .get_mut("sub_test_1")
+                    .unwrap()
+                    .status = "past_due".into();
+                webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+                assert!(h.store.billing_rows.borrow()["u1"]
+                    .grace_until_unix
+                    .is_some());
+            }
             // An existing paid subscription can enter an unsupported state.
             // Re-delivery follows the real caller and preserves its paid proof.
             h.stripe
@@ -11278,7 +11322,7 @@ mod tests {
                 .insert(recovered.id.clone(), recovered.clone());
             let input = block_on(h.store.load_reconcile_input("u1")).unwrap();
             assert!(input.live.is_none());
-            let expected = crate::billing_reconcile::reconcile_subscription(
+            let mut expected = crate::billing_reconcile::reconcile_subscription(
                 &input,
                 &crate::billing_reconcile::RemoteSubscription {
                     subscription: recovered,
@@ -11293,7 +11337,10 @@ mod tests {
             assert_eq!(expected.row.paid_invoice_id, held.paid_invoice_id);
             assert_eq!(
                 expected.row.grace_until_unix, None,
-                "the fold treats observed money without a live row as recovery"
+                "the no-read fold cannot see the retained paid end"
+            );
+            expected.row.grace_until_unix = (status == "past_due").then_some(
+                BILLING_NOW + BILLING_PERIOD + crate::billing_reconcile::RENEWAL_GRACE_SECS,
             );
             webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
             assert_eq!(h.store.billing_rows.borrow()["u1"], expected.row);
@@ -11418,6 +11465,28 @@ mod tests {
         assert_eq!(
             live_for(&h, "u1").unwrap().stripe_subscription_id,
             "sub_holder"
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        holder.read_plan = Some(holder.row.plan_id.clone());
+        holder.read_anchor = holder.row.paid_invoice_id.clone();
+        holder.row.status = "canceled".into();
+        block_on(h.store.store_reconcile_outcome("u1", &holder)).unwrap();
+        assert!(live_for(&h, "u1").is_none());
+        block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("replay after release");
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"],
+            terminal.row,
+            "retained paid proof survives a no-live replay"
+        );
+        assert!(!h
+            .store
+            .billing_nonlive_rows
+            .borrow()
+            .contains_key("sub_test_1"));
+        assert_eq!(
+            h.store.billing_nonlive_rows.borrow()["sub_holder"],
+            holder.row
         );
         assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }

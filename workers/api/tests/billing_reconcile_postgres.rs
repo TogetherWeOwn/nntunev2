@@ -935,17 +935,22 @@ async fn trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence(
     // `trialing` is fail-closed and sits outside the live select, so the
     // recovery pass folds with no live row: read_plan/read_anchor are NULL
     // while the stored row still holds the same paid end and anchor.
-    for status in ["active", "past_due"] {
+    for (status, existing_grace) in [
+        ("active", false),
+        ("active", true),
+        ("past_due", false),
+        ("past_due", true),
+    ] {
         let mut fx = Fx::new().await;
         let seed = fx.seed_active("u1", "sub_a").await;
-        if status == "past_due" {
+        if existing_grace {
             // Stored grace comes from a first failed renewal on the paid end.
             let due = fx
                 .fold(
                     "u1",
                     &remote(
                         "sub_a",
-                        status,
+                        "past_due",
                         PRICE_PLUS,
                         false,
                         T + 2 * P,
@@ -1011,7 +1016,30 @@ async fn trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence(
         assert_eq!(snap.customer, seed.customer, "{status}");
         assert_eq!(snap.period_end, Some(T + 3 * P), "{status}");
         assert!(snap.cancel, "{status}");
-        assert_eq!(snap.grace, back.row.grace_until_unix, "{status}");
+        let expected_grace = (status == "past_due").then_some(T + 2 * P + GRACE);
+        assert_eq!(
+            snap.grace, expected_grace,
+            "{status}, prior grace={existing_grace}"
+        );
+        if status == "past_due" {
+            for (now, entitled) in [(T + 2 * P + 1, true), (T + 2 * P + GRACE, false)] {
+                assert_eq!(
+                    resolve_effective_plan(
+                        Some(SubscriptionView {
+                            plan_id: &snap.plan,
+                            status: &snap.status,
+                            cancel_at_period_end: snap.cancel,
+                            paid_through_at_unix: snap.paid_through,
+                            grace_until_unix: snap.grace,
+                            current_period_end_unix: snap.period_end,
+                        }),
+                        now
+                    )
+                    .entitled,
+                    entitled
+                );
+            }
+        }
         assert_eq!(snap.plan, "plus");
         assert_eq!(snap.paid_through, seed.paid_through);
         assert_eq!(snap.anchor, seed.anchor);
@@ -1122,17 +1150,19 @@ async fn new_terminal_row_beside_a_live_one_commits_without_disturbing_it() {
 
     // Terminal A is not a live-slot holder: the row and its confirmed
     // history are accepted and B keeps the slot unchanged.
-    let mut terminal_a = fold_with(
-        None,
-        &remote(
-            "sub_a",
-            "canceled",
-            PRICE_PLUS,
-            false,
-            T + P,
-            &invoices("sub_a", 1),
-        ),
-    );
+    let mut terminal_a = fx
+        .fold(
+            "u1",
+            &remote(
+                "sub_a",
+                "canceled",
+                PRICE_PLUS,
+                false,
+                T + P,
+                &invoices("sub_a", 1),
+            ),
+        )
+        .await;
     terminal_a.history = fold_with(
         None,
         &remote(
@@ -1177,4 +1207,41 @@ async fn new_terminal_row_beside_a_live_one_commits_without_disturbing_it() {
     assert_eq!(fx.history_rows("sub_c").await, 0);
     assert_eq!(fx.snap("sub_b").await.unwrap(), live_b);
     assert_eq!(fx.rows("u1").await, 2);
+
+    let retained_a = fx.snap("sub_a").await.unwrap();
+    assert!(retained_a.paid_through.is_some());
+    let release = fx
+        .fold(
+            "u1",
+            &remote(
+                "sub_b",
+                "canceled",
+                PRICE_PLUS,
+                false,
+                T + 2 * P,
+                &invoices("sub_b", 2),
+            ),
+        )
+        .await;
+    fx.put("u1", &release).await;
+    assert!(fx.live("u1").await.is_none());
+    let replay = fx
+        .fold(
+            "u1",
+            &remote(
+                "sub_a",
+                "canceled",
+                PRICE_PLUS,
+                false,
+                T + P,
+                &invoices("sub_a", 1),
+            ),
+        )
+        .await;
+    assert!(replay.row.paid_through_unix.is_none());
+    fx.put("u1", &replay).await;
+    assert_eq!(fx.snap("sub_a").await.unwrap(), retained_a);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.put("u1", &live_c).await;
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_c");
 }
