@@ -784,6 +784,37 @@ impl From<StoreError> for PublicationError {
     }
 }
 
+/// Publish only Writing authority reloaded for this captured delivery. Current
+/// parked/terminal work is a no-op; an invalidated generation is stale, never
+/// adopted from a latest-generation read. Premature deliveries cannot seal.
+///
+/// The caller has authenticated/opened the original and obtained trusted mirror
+/// recordings and decoded geometry outside a transaction. This function does not
+/// inspect provider files or authorize publication from queue input alone. The
+/// canonical publication transaction rechecks the whole snapshot under its lock,
+/// so a control/stage change after this read still refuses before sealing.
+/// Apply the caller's deadline to the entire operation. A database/COMMIT error
+/// remains uncertain and requires authority reload, not assumed success. No live
+/// consumer, broker acknowledgment or recovery scanner is installed here.
+pub async fn publish_delivery(
+    client: &mut Client,
+    original: &StageOriginal<'_>,
+    delivery: &Delivery,
+    recordings: &[MbRecording],
+    geometry: &[FileGeometry],
+    sealer: &mut impl SourceSealer,
+) -> Result<Option<Snapshot>, PublicationError> {
+    let Some(expected) = load_delivery(client, original, delivery).await? else {
+        return Ok(None);
+    };
+    if expected.checkpoint().state != JobState::Writing {
+        return Err(StoreError::Invalid.into());
+    }
+    publish(client, original, &expected, recordings, geometry, sealer)
+        .await
+        .map(Some)
+}
+
 /// Commit album rows and Done in one outer transaction, never merely release
 /// the album savepoint. The caller has already authenticated the original and
 /// obtained CC0 mirror recordings and trusted decoded-file geometry; no network

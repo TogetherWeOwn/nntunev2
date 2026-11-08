@@ -140,29 +140,55 @@ async fn drain(
     panic!("continuation failed to stop within the fixture stage bound")
 }
 
+fn publication_inputs() -> ([MbRecording; 1], [FileGeometry; 1]) {
+    // Same fake mirror/inspection contract as the existing writer fixture. These
+    // values do not establish trusted inspection of a real decoded provider file.
+    (
+        [MbRecording {
+            mbid: RECORDING.into(),
+            title: "Catalogue title".into(),
+            track_no: Some(1),
+            medium_no: Some(1),
+        }],
+        [FileGeometry {
+            file_ordinal: 0,
+            decoded_bytes: 64,
+            range_hint: None,
+        }],
+    )
+}
+
 async fn publish(
     app: &mut tokio_postgres::Client,
     original: &OriginalBody,
     writing: &Snapshot,
     sealer: &mut Sealer,
 ) -> Result<Snapshot, checkpoints::PublicationError> {
-    // Same fake mirror/inspection contract as the existing writer fixture. These
-    // values do not establish trusted inspection of a real decoded provider file.
+    let (recordings, geometry) = publication_inputs();
     checkpoints::publish(
         app,
         &input(original),
         writing,
-        &[MbRecording {
-            mbid: RECORDING.into(),
-            title: "Catalogue title".into(),
-            track_no: Some(1),
-            medium_no: Some(1),
-        }],
-        &[FileGeometry {
-            file_ordinal: 0,
-            decoded_bytes: 64,
-            range_hint: None,
-        }],
+        &recordings,
+        &geometry,
+        sealer,
+    )
+    .await
+}
+
+async fn publish_delivery(
+    app: &mut tokio_postgres::Client,
+    original: &OriginalBody,
+    delivery: &Delivery,
+    sealer: &mut Sealer,
+) -> Result<Option<Snapshot>, checkpoints::PublicationError> {
+    let (recordings, geometry) = publication_inputs();
+    checkpoints::publish_delivery(
+        app,
+        &input(original),
+        delivery,
+        &recordings,
+        &geometry,
         sealer,
     )
     .await
@@ -290,6 +316,157 @@ async fn fresh_upload_without_match_parks_then_manual_approval_requires_probe_be
         .unwrap()
         .get(0);
     assert_eq!(operation, "approve");
+}
+
+#[tokio::test]
+async fn delivery_publication_reloads_writing_and_terminal_replay_is_a_noop() {
+    let (mut app, original, mut queue) = admitted().await;
+    let delivery = Delivery::decode(queue.pending.front().unwrap()).unwrap();
+    let writing = drain(&mut app, &original, &mut Services::default(), &mut queue).await;
+    assert_eq!(writing.checkpoint().state, JobState::Writing);
+    let mut sealer = Sealer::default();
+    let done = publish_delivery(&mut app, &original, &delivery, &mut sealer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.checkpoint().state, JobState::Done);
+    assert_eq!(done.revision(), writing.revision() + 1);
+    assert_eq!(done.generation(), delivery.generation());
+    assert_eq!(sealer.calls, 1);
+    assert_eq!(super::super::counts(&app).await, (1, 1, 1));
+    let before = authority(&app).await;
+    assert!(
+        publish_delivery(&mut app, &original, &delivery, &mut sealer)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(authority(&app).await, before);
+    assert_eq!(super::super::counts(&app).await, (1, 1, 1));
+    assert_eq!(sealer.calls, 1);
+}
+
+#[tokio::test]
+async fn delivery_publication_refuses_premature_and_parked_authority_before_sealing() {
+    let (mut app, original, queue) = admitted().await;
+    let delivery = Delivery::decode(queue.pending.front().unwrap()).unwrap();
+    let mut services = Services::default();
+    let mut sealer = Sealer::default();
+    for state in [
+        JobState::Queued,
+        JobState::Parsing,
+        JobState::Matching,
+        JobState::Probing,
+    ] {
+        let saved = checkpoints::load(&app, &input(&original), delivery.generation())
+            .await
+            .unwrap();
+        assert_eq!(saved.checkpoint().state, state);
+        let before = authority(&app).await;
+        assert!(matches!(
+            publish_delivery(&mut app, &original, &delivery, &mut sealer).await,
+            Err(checkpoints::PublicationError::Checkpoint(
+                checkpoints::StoreError::Invalid
+            ))
+        ));
+        assert_eq!(authority(&app).await, before);
+        assert_eq!(sealer.calls, 0);
+        assert_eq!(super::super::counts(&app).await, (0, 0, 0));
+        checkpoints::run_delivery_stage(&mut app, &input(&original), &delivery, &mut services)
+            .await
+            .unwrap();
+    }
+    // A clean gate is not sufficient if the mirror/inspection inputs are absent.
+    let before = authority(&app).await;
+    assert!(checkpoints::publish_delivery(
+        &mut app,
+        &input(&original),
+        &delivery,
+        &[],
+        &[],
+        &mut sealer
+    )
+    .await
+    .is_err());
+    assert_eq!(authority(&app).await, before);
+    assert_eq!(sealer.calls, 0);
+    assert_eq!(super::super::counts(&app).await, (0, 0, 0));
+
+    let (mut app, original, mut queue) = admitted().await;
+    let delivery = Delivery::decode(queue.pending.front().unwrap()).unwrap();
+    let mut services = Services {
+        no_match: true,
+        ..Default::default()
+    };
+    let review = drain(&mut app, &original, &mut services, &mut queue).await;
+    assert_eq!(review.checkpoint().state, JobState::NeedsReview);
+    let before = authority(&app).await;
+    assert!(
+        publish_delivery(&mut app, &original, &delivery, &mut sealer)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(authority(&app).await, before);
+    assert_eq!(sealer.calls, 0);
+    assert_eq!(super::super::counts(&app).await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn delivery_publication_refuses_wrong_identity_generation_and_manual_invalidation() {
+    let (mut app, original, mut queue) = admitted().await;
+    let delivery = Delivery::decode(queue.pending.front().unwrap()).unwrap();
+    let writing = drain(&mut app, &original, &mut Services::default(), &mut queue).await;
+    let mut sealer = Sealer::default();
+    let before = authority(&app).await;
+    for field in ["job_id", "idempotency_key", "generation"] {
+        let mut wire: serde_json::Value =
+            serde_json::from_str(&delivery.encode().unwrap()).unwrap();
+        match field {
+            "generation" => wire[field] = (delivery.generation() + 1).into(),
+            _ => {
+                let mut value = wire[field].as_str().unwrap().to_owned();
+                let last = value.pop().unwrap();
+                value.push(if last == 'a' { 'b' } else { 'a' });
+                wire[field] = value.into();
+            }
+        }
+        let wrong = Delivery::decode(&wire.to_string()).unwrap();
+        assert!(matches!(
+            publish_delivery(&mut app, &original, &wrong, &mut sealer).await,
+            Err(checkpoints::PublicationError::Checkpoint(
+                checkpoints::StoreError::Invalid | checkpoints::StoreError::Stale
+            ))
+        ));
+        assert_eq!(authority(&app).await, before);
+        assert_eq!(sealer.calls, 0);
+    }
+    let rejected = checkpoints::apply_control(
+        &mut app,
+        ControlActor {
+            user_id: "stage_user",
+            source_ip: None,
+            now: 2,
+        },
+        &input(&original),
+        &writing,
+        Control::Reject,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejected.checkpoint().state, JobState::Rejected);
+    assert!(rejected.generation() > delivery.generation());
+    let before = authority(&app).await;
+    assert!(matches!(
+        publish_delivery(&mut app, &original, &delivery, &mut sealer).await,
+        Err(checkpoints::PublicationError::Checkpoint(
+            checkpoints::StoreError::Stale
+        ))
+    ));
+    assert_eq!(authority(&app).await, before);
+    assert_eq!(super::super::counts(&app).await, (0, 0, 0));
+    assert_eq!(sealer.calls, 0);
+    assert_eq!(counts(&app).await, (1, 1, 2));
 }
 
 #[tokio::test]
