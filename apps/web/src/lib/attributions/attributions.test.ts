@@ -59,6 +59,17 @@ describe('attribution inventory v1', () => {
 		}
 	);
 
+	it.each([
+		{ kind: ['package'] },
+		{ kind: { toString: () => 'package' } }
+	])('rejects coerced package kinds without package metadata: %j', ({ kind }) => {
+		const value = clone();
+		value.entries[0].kind = kind;
+		value.entries[0].status = 'planned';
+		delete value.entries[0].package;
+		expect(validateAttributionInventory(value)).toContain('entries[0].kind is unknown');
+	});
+
 	it('rejects empty fields, unknown states, malformed package records and duplicate IDs', () => {
 		for (const [field, bad] of [
 			['name', '  '], ['notice', false], ['status', 'enabled'], ['kind', 'vendor'],

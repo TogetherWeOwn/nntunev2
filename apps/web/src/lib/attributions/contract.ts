@@ -55,7 +55,7 @@ export function validateAttributionInventory(value: unknown): string[] {
 			if (ids.has(entry.id)) errors.push(`${path}.id is duplicated`);
 			ids.add(entry.id);
 		}
-		if (!['package', 'font', 'icons', 'data', 'artwork'].includes(String(entry.kind))) {
+		if (typeof entry.kind !== 'string' || !['package', 'font', 'icons', 'data', 'artwork'].includes(entry.kind)) {
 			errors.push(`${path}.kind is unknown`);
 		}
 		if (entry.status !== 'active' && entry.status !== 'planned') {
