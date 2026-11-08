@@ -53,10 +53,27 @@ cold miss still returns `502 upstream_unavailable`. Both-backend ingest,
 commit/abort/restart, real hit/miss/range restore and publication receipts remain
 undelivered. No migration or provider activation is authorized.
 
+## Invocation control boundary (not installed)
+
+The corrected shared checkpoint requires both `Control::check` and the
+`Control::cancelled(target, action)` future. A future invocation adapter must
+bind trusted current authority, cancellation and deadline wake sources for the
+exact target/action, registering before rechecking policy. A pending future that
+never wakes, or checks only when socket I/O progresses, is not a live control.
+This metadata module does not implement `Control` or invoke a provider.
+
+The shared NNTP client adapter interrupts pending POST/BODY/STAT and invalidates
+and attempts shutdown without QUIT. That attempt is not physical-close proof:
+the existing product broker must retain the lease until closure/settlement is
+proved. A post-ack readback failure remains uncertain, not absence or rollback.
+Final commit/reconcile proof must still authorize Write even if old-object Read
+remains allowed. These are integration requirements, not consumer cancellation,
+restart or pool-settlement receipts delivered by the metadata tests.
+
 ## Dependency and verification limits
 
 This draft uses immutable shared checkpoint
-`e8fb2adeda386a38d74fc77c7aaa0a05a1b70bf3` from
+`40dba9a8cedb27748fa22e8a1d63cb2132067efd` from
 [Velmora PR #19](https://github.com/TogetherWeOwn/velmora/pull/19), not an accepted
 production pin. The source bump also includes the previously merged bounded
 repair-cleanup fix. The shared API, full dependency delta, NNTune consumer and
