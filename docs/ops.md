@@ -784,7 +784,10 @@ lane. Complete every box on the exact head being promoted.
 
 `gate-incidents.yml` scans completed main-branch `deploy`, `e2e-staging`
 and `deploy-production` runs every ten minutes (or on manual dispatch from
-`main`), without the privileged `workflow_run` trigger. Its separate
+`main`), without the privileged `workflow_run` trigger. Existing `deploy`
+runs triggered by either `push` or `workflow_dispatch` are included; schedule
+is not a supported event for that workflow. All sources must be completed,
+same-repository main-branch runs with a valid SHA. Its separate
 issue-writer job opens one
 `incident` issue per workflow/job key, comments on repeats and closes it
 with a recovery comment after a successful job with its required evidence
@@ -799,15 +802,30 @@ source, including when a write succeeded but its response was lost. Initial
 issue creation is the opening notification, not an additional repeat comment.
 Delivery intent, occurrence and progress cursor are persisted on the issue
 before posting. Comment receipt lookup uses the read-only GraphQL comments
-connection, at most ten pages of 100 comments per reconciliation. Reaching
-that budget saves progress and defers only that gate, rather than failing or
-assuming an unexamined receipt absent. Later scans resume from the cursor,
-even when the source run has left the recent-run window. Existing issues
-without delivery state migrate by scanning from the beginning; subsequent
-occurrences retain the last completed delivery's lower bound. Accumulated
-comment history therefore has no fixed lifetime ceiling. A delivered marker
-prevents duplicate notifications after a lost response or failed final PATCH;
-recovery closes only after delivery is confirmed. Keep existing gate keys stable.
+connection, with at most ten requests per reconciliation, **including failed
+oversize reads**. Pages start at at most 100 complete bodies; the hard HTTP
+response limit remains 2,097,152 bytes (the reader requests one extra byte to
+detect overflow). A byte-saturated read halves the page size, down to one,
+without moving the cursor. Bodies and receipt markers are never truncated.
+The reduced size and last examined cursor are saved on budget exhaustion and
+reused on later invocations; old state without a size starts at 100. A single
+comment response still exceeding the byte limit leaves delivery pending and
+prints a fixed diagnostic requiring manual investigation. It never marks
+delivery successful or prevents unrelated gates from being processed. Other
+API errors, including refusals, still fail the reporting job.
+
+Reaching the request budget saves progress and defers only that gate, rather
+than assuming an unexamined receipt absent. Later scans resume the persisted
+intent even when its source run has left the recent-run window. **Newer
+transitions deferred behind it are not queued.** After the old intent drains,
+a missed newer transition can require deliberate run-ID replay after checking
+newer evidence; repeated scans are not an all-occurrence delivery guarantee.
+Existing issues without delivery state migrate by scanning from the beginning;
+subsequent occurrences retain the last completed delivery's lower bound.
+Accumulated comment history has no fixed lifetime count ceiling, subject to
+these byte, request and catch-up limits. A delivered marker prevents duplicate
+notifications after a lost response or failed final PATCH; recovery closes only
+after delivery is confirmed. Keep existing gate keys stable.
 The existing MB/ingest job names are observed only; reporting does not
 enable those lanes or change their retirement/qualification holds.
 
@@ -822,7 +840,13 @@ Reporting success is neither staging qualification nor production approval.
 The observer needs only `contents: read`, `actions: read` and job-scoped
 `issues: write` with the existing workflow token. The `incident` label must
 exist. API failures fail the reporting job; inspect the observer's Actions
-run if an expected incident is absent. The existing incident intake owns
+run if an expected incident is absent. The inherited all-state labelled-issue
+listing is bounded to ten REST pages of 100 rows: it succeeds only below
+1,000 listed rows, and **exactly 1,000 also refuses**, because no shorter final
+page established completeness. Listed pull requests count toward this ceiling,
+even though they are excluded from incident matching. Saturation prevents
+pending reconciliation as well as new delivery; this observer does not claim
+population-scale or all-history coverage. The existing incident intake owns
 routing issues to an accountable responder; an issue alone is not a hold
 owner. The Actions-only reporting schedule performs API reads and issue
 writes; it never starts staging resources, alarms, probes or keep-alive,

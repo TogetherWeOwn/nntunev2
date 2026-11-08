@@ -15,8 +15,9 @@ import urllib.error
 import urllib.request
 
 REPO = "TogetherWeOwn/nntunev2"
-WORKFLOWS = {"deploy.yml": "push", "e2e-staging.yml": None,
-             "deploy-production.yml": "workflow_dispatch"}
+WORKFLOWS = {"deploy.yml": {"push", "workflow_dispatch"},
+             "e2e-staging.yml": {"push", "schedule", "workflow_dispatch"},
+             "deploy-production.yml": {"workflow_dispatch"}}
 BAD = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 # The successful evidence step prevents skipped/unconfigured jobs from closing
 # an incident. Keys are job names from the reviewed default-branch workflows.
@@ -43,6 +44,10 @@ GATES = {
 
 class ReportError(Exception):
     """Fixed-vocabulary errors only; never expose remote response bodies."""
+
+
+class ResponseTooLarge(ReportError):
+    """Only this transport failure permits a smaller comment read."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -73,7 +78,7 @@ class API:
         except (OSError, ValueError):
             raise ReportError("GitHub transport failed") from None
         if len(raw) > 2 * 1024 * 1024:
-            raise ReportError("GitHub response exceeded bound")
+            raise ResponseTooLarge("GitHub response exceeded bound")
         try:
             return json.loads(raw) if raw else None
         except (ValueError, RecursionError):
@@ -92,24 +97,24 @@ class API:
                 return result
         raise ReportError("GitHub pagination exceeded bound")
 
-    def comment_page(self, number, cursor=None):
+    def comment_page(self, number, cursor=None, page_size=100):
         # Cursor pagination avoids an offset into a growing lifetime history.
         data = self.request("POST", "/graphql", {
-            "query": """query($number:Int!, $cursor:String) {
+            "query": """query($number:Int!, $cursor:String, $size:Int!) {
               repository(owner:"TogetherWeOwn", name:"nntunev2") {
-                issue(number:$number) { comments(first:100, after:$cursor) {
+                issue(number:$number) { comments(first:$size, after:$cursor) {
                   edges { cursor node { body } }
                   pageInfo { endCursor hasNextPage }
                 } }
               }
-            }""", "variables": {"number": number, "cursor": cursor}})
+            }""", "variables": {"number": number, "cursor": cursor, "size": page_size}})
         try:
             if data.get("errors"):
                 raise ValueError
             connection = data["data"]["repository"]["issue"]["comments"]
             edges, info = connection["edges"], connection["pageInfo"]
             end, more = info["endCursor"], info["hasNextPage"]
-            if (not isinstance(edges, list) or len(edges) > 100 or type(more) is not bool
+            if (not isinstance(edges, list) or len(edges) > page_size or type(more) is not bool
                     or (end is not None and (not isinstance(end, str) or len(end) > 2048))
                     or any(not isinstance(e["cursor"], str) or not e["cursor"]
                            or len(e["cursor"]) > 2048 or not isinstance(e["node"]["body"], str)
@@ -127,8 +132,7 @@ def trusted(run):
     return (workflow in WORKFLOWS and run.get("head_branch") == "main"
             and run.get("head_repository", {}).get("full_name") == REPO
             and run.get("status") == "completed"
-            and run.get("event") in {"push", "schedule", "workflow_dispatch"}
-            and (WORKFLOWS[workflow] is None or run["event"] == WORKFLOWS[workflow])
+            and run.get("event") in WORKFLOWS[workflow]
             and re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", "")) is not None)
 
 
@@ -166,6 +170,8 @@ def delivery(issue):
                 or type(state["attempt"]) is not int or state["attempt"] <= 0
                 or state["kind"] not in {"failure", "recovery"}
                 or type(state["delivered"]) is not bool
+                or type(state.get("page_size", 100)) is not int
+                or not 1 <= state.get("page_size", 100) <= 100
                 or (state["cursor"] is not None and
                     (not isinstance(state["cursor"], str) or not state["cursor"]
                      or len(state["cursor"]) > 2048))):
@@ -192,13 +198,26 @@ def ensure_comment(api, issue, key, occurrence, kind, dry_run):
         # The previous completed delivery's cursor is a safe lower bound: the
         # serialized writer cannot have posted a newer occurrence before it.
         state = {"run_id": occurrence[0], "attempt": occurrence[1], "kind": kind,
-                 "cursor": state["cursor"] if state else None, "delivered": False}
+                 "cursor": state["cursor"] if state else None,
+                 "page_size": state.get("page_size", 100) if state else 100,
+                 "delivered": False}
         save_delivery(api, issue, state, dry_run)
     if state["delivered"]:
         return True
     marker = f"<!-- incident-occurrence: {key} {occurrence[0]}:{occurrence[1]} {kind} -->"
     for _ in range(10):
-        edges, end, more = api.comment_page(issue["number"], state["cursor"])
+        # Failed reads count too. Never enlarge the transport or request budget,
+        # advance past unexamined bodies, or mistake an oversized page for absence.
+        size = state.get("page_size", 100)
+        try:
+            edges, end, more = api.comment_page(issue["number"], state["cursor"], size)
+        except ResponseTooLarge:
+            state["page_size"] = max(1, size // 2)
+            if size == 1:
+                print(f"Incident #{issue['number']}: single comment response exceeded bound; "
+                      "delivery pending, manual investigation required", file=sys.stderr)
+                break
+            continue
         for edge in edges:
             if marker in edge["node"]["body"]:
                 state.update(cursor=edge["cursor"], delivered=True)

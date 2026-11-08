@@ -3,11 +3,16 @@
 Run with `python3 ci/test_incident_report.py`.
 """
 
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import os
 import re
+import subprocess
+import types
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 CI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,17 +47,18 @@ def issue(number, updated="2026-01-01T00:00:00Z", body=MARKER, source=(9, 1), **
 
 
 def graphql_comments(comments, variables):
-    """issue.comments(first:100, after:cursor) over `comments`; cursor "c<index>"."""
+    """issue.comments(first:size, after:cursor) over `comments`; cursor "c<index>"."""
+    size = variables.get("size", 100)
     cursor = variables["cursor"]
     if cursor is not None and not re.fullmatch(r"c\d+", str(cursor)):
         raise ir.ReportError("GitHub GET refused (HTTP 400)")
     start = 0 if cursor is None else int(cursor[1:]) + 1
     edges = [{"cursor": f"c{start + i}", "node": {"body": row["body"]}}
-             for i, row in enumerate(comments[start:start + 100])]
+             for i, row in enumerate(comments[start:start + size])]
     return {"data": {"repository": {"issue": {"comments": {
         "edges": edges,
         "pageInfo": {"endCursor": edges[-1]["cursor"] if edges else cursor,
-                     "hasNextPage": start + 100 < len(comments)}}}}}}
+                     "hasNextPage": start + size < len(comments)}}}}}}
 
 
 class FakeAPI(ir.API):
@@ -262,6 +268,35 @@ class ReportTests(unittest.TestCase):
                       jobs=[job])
         self.assertEqual(ir.report(api, 10), ["opened: production-preflight"])
         self.assertIn("No production change is authorized", api.writes[0][2]["body"])
+
+    def test_manual_deploy_dispatch_is_trusted_only_for_same_repo_main_completed(self):
+        gate = {"name": "gate", "conclusion": "failure", "steps": []}
+        run = make_run(workflow="deploy.yml", event="workflow_dispatch")
+        api = FakeAPI(run=run, jobs=[gate])
+        self.assertEqual(ir.report(api, 10), ["opened: gate"])
+        self.assertEqual(api.writes[0][:2], ("POST", "/issues"))
+        bad = [{"event": "schedule"}, {"event": "pull_request"}, {"event": "workflow_run"},
+               {"head_repository": {"full_name": "evil/fork"}}, {"head_branch": "feature"},
+               {"status": "in_progress"}, {"head_sha": "abc"}]
+        for over in bad:
+            api = FakeAPI(run=make_run(workflow="deploy.yml",
+                                       **{"event": "workflow_dispatch", **over}),
+                          jobs=[gate])
+            with self.assertRaises(ir.ReportError, msg=over):
+                ir.report(api, 10)
+            self.assertEqual(api.writes, [], over)
+
+    def test_manual_deploy_dispatch_skipped_or_unevidenced_gate_does_not_recover(self):
+        run = make_run(workflow="deploy.yml", event="workflow_dispatch")
+        key = "<!-- incident-key: deploy.yml:gate -->"
+        gate = {"name": "gate", "conclusion": "success", "steps": [],
+                "started_at": "2026-01-02T00:00:00Z"}
+        skipped = {"name": "staging-web", "conclusion": "success", "steps": [
+            {"name": "Deploy to staging", "conclusion": "skipped"}]}
+        for jobs in ([gate], [gate, skipped], [{**gate, "conclusion": "skipped"}]):
+            api = FakeAPI(run=run, jobs=jobs, issues=[issue(7, body=key)])
+            self.assertEqual(ir.report(api, 10), [])
+            self.assertEqual(api.writes, [])
 
 
 def ago(minutes):
@@ -941,6 +976,215 @@ class LargeThreadDeliveryTests(unittest.TestCase):
         self.assertEqual((len(edges), end, more), (50, "c149", False))
         self.assertEqual(edges[0], {"cursor": "c100", "node": {"body": "note 100"}})
         self.assertEqual(api.writes, [])
+
+
+class SerializedHTTP:
+    """Mock HTTP only: real API.request serializes, reads bytes and decodes JSON."""
+
+    def __init__(self, backend, ensure_ascii=True):
+        self.backend, self.ensure_ascii = backend, ensure_ascii
+        self.pages, self.reads = [], []
+
+    def open(self, req, timeout):
+        path = req.full_url.removeprefix("https://api.github.com")
+        path = path.removeprefix("/repos/" + ir.REPO)
+        body = json.loads(req.data) if req.data else None
+        try:
+            result = self.backend.request(req.method, path, body)
+        except ir.ReportError as exc:
+            if "HTTP 403" in str(exc):
+                raise ir.urllib.error.HTTPError(req.full_url, 403, "refused", {}, None)
+            raise OSError("lost response") from None
+        raw = json.dumps(result, ensure_ascii=self.ensure_ascii).encode("utf-8")
+        if path == "/graphql":
+            v = body["variables"]
+            self.pages.append((v["cursor"], v.get("size", 100), len(raw)))
+        reads = self.reads
+
+        class Response(io.BytesIO):
+            def read(self, size=-1):
+                reads.append(size)
+                return super().read(size)
+        return Response(raw)
+
+    def mocked(self):
+        return patch.object(ir.urllib.request, "build_opener", return_value=self)
+
+
+class ByteBoundDeliveryTests(unittest.TestCase):
+    def backend(self, rows, kind="failure", **kw):
+        run_id = 10 if kind == "failure" else 11
+        return StatefulAPI(runs=[make_run(run_id)], issues=[issue(7)],
+                           jobs={(run_id, 1): [smoke("failure" if kind == "failure"
+                                                    else "success")]},
+                           comments={7: rows}, **kw)
+
+    def reconcile(self, backend, http, kind="failure", limit=12):
+        api = ir.API("token")
+        with http.mocked():
+            for _ in range(limit):
+                start = len(http.pages)
+                ir.ensure_comment(api, backend.issues[0], KEY,
+                                  (10 if kind == "failure" else 11, 1), kind, False)
+                self.assertLessEqual(len(http.pages) - start, 10)
+                if delivery(backend)["delivered"]:
+                    return
+        self.fail("bounded reconciliation did not complete")
+
+    def test_original_hundred_large_bodies_exceed_actual_transport_bound(self):
+        backend = self.backend([{"body": "x" * (30 * 1024)}] * 100)
+        http = SerializedHTTP(backend)
+        with http.mocked(), self.assertRaisesRegex(ir.ReportError, "response exceeded bound"):
+            ir.API("token").comment_page(7)
+        self.assertGreater(http.pages[0][2], 2 * 1024 * 1024)
+        self.assertEqual(http.reads, [2 * 1024 * 1024 + 1])
+        self.assertEqual(backend.writes, [])
+
+    def test_pinned_pre_fix_stalls_but_repair_delivers_same_serialized_history(self):
+        # release-proof checks out full history. Load the reviewed pre-fix source
+        # without switching the checkout or running any live API request.
+        sha = "ede9c7eab1d148f152a0dd3cd58fecd2b727a4ec"
+        source = subprocess.check_output(["git", "show", sha + ":ci/incident_report.py"],
+                                         cwd=CI_DIR, text=True)
+        baseline = types.ModuleType("pre_fix_incident_report")
+        exec(compile(source, "pre_fix_incident_report.py", "exec"), baseline.__dict__)
+        rows = [{"body": "x" * (30 * 1024)} for _ in range(100)]
+        rows[85]["body"] += occurrence(10)
+        backend = self.backend(rows)
+        http = SerializedHTTP(backend)
+        with http.mocked():
+            for _ in range(2):
+                with self.assertRaisesRegex(baseline.ReportError, "response exceeded bound"):
+                    baseline.ensure_comment(baseline.API("token"), backend.issues[0], KEY,
+                                            (10, 1), "failure", False)
+        self.assertEqual([p[:2] for p in http.pages], [(None, 100), (None, 100)])
+        self.assertFalse(delivery(backend)["delivered"])
+        self.assertIsNone(delivery(backend)["cursor"])
+        self.reconcile(backend, http)
+        self.assertTrue(delivery(backend)["delivered"])
+        self.assertEqual(comment_count(backend, 7, occurrence(10)), 1)
+        self.assertNotIn("/issues/7/comments", [w[1] for w in backend.writes])
+
+    def test_large_bodies_find_receipt_beyond_reduced_page_or_post_if_absent(self):
+        for kind in ("failure", "recovery"):
+            marker = occurrence(10 if kind == "failure" else 11, kind=kind)
+            for present in (True, False):
+                with self.subTest(kind=kind, present=present):
+                    rows = [{"body": "x" * (30 * 1024)} for _ in range(100)]
+                    if present:
+                        rows[85]["body"] += marker
+                    backend = self.backend(rows, kind)
+                    http = SerializedHTTP(backend)
+                    self.reconcile(backend, http, kind)
+                    self.assertEqual([p[1] for p in http.pages[:2]], [100, 50])
+                    self.assertEqual(comment_count(backend, 7, marker), 1)
+                    self.assertEqual(sum(w[1] == "/issues/7/comments" for w in backend.writes),
+                                     0 if present else 1)
+                    if kind == "recovery":
+                        self.assertEqual(backend.issues[0]["state"], "closed")
+                    before = len(backend.writes)
+                    self.reconcile(backend, http, kind)
+                    self.assertEqual(len(backend.writes), before)
+
+    def test_escaped_and_utf8_bytes_adapt_and_resume_saved_progress(self):
+        # Equal character counts have different encoded sizes; do not estimate
+        # response bytes from len(body) or truncate receipt-bearing bodies.
+        for ascii_json in (True, False):
+            rows = [{"body": ('"\\\né\U0001f600' * (6 * 1024))} for _ in range(300)]
+            backend = self.backend(rows)
+            http = SerializedHTTP(backend, ensure_ascii=ascii_json)
+            api = ir.API("token")
+            with http.mocked():
+                self.assertFalse(ir.ensure_comment(api, backend.issues[0], KEY,
+                                                   (10, 1), "failure", False))
+            first = delivery(backend)
+            self.assertFalse(first["delivered"])
+            self.assertIsNotNone(first["cursor"])
+            self.assertLess(first["page_size"], 50)
+            self.assertEqual(len(http.pages), 10)  # retries consume the same budget
+            start = len(http.pages)
+            self.reconcile(backend, http)
+            self.assertEqual(http.pages[start][:2], (first["cursor"], first["page_size"]))
+            self.assertEqual(comment_count(backend, 7, occurrence(10)), 1)
+            self.assertTrue(all(n == 2 * 1024 * 1024 + 1 for n in http.reads))
+
+    def test_adapted_lookup_survives_post_and_final_patch_faults(self):
+        for kind in ("failure", "recovery"):
+            for fault in ("post-before", "post-after", "patch-before", "patch-after"):
+                with self.subTest(kind=kind, fault=fault):
+                    rows = [{"body": "x" * (30 * 1024)}] * 100
+                    kw = ({"faults": [("POST", r"/issues/7/comments", fault.split("-")[1])]}
+                          if fault.startswith("post") else {})
+                    backend = self.backend(rows, kind, **kw)
+                    marker = occurrence(10 if kind == "failure" else 11, kind=kind)
+                    if fault.startswith("patch"):
+                        fail_final_patch(backend, 7, marker, fault.split("-")[1])
+                    http = SerializedHTTP(backend)
+                    with self.assertRaises(ir.ReportError):
+                        self.reconcile(backend, http, kind)
+                    if kind == "recovery" and fault != "patch-after":
+                        self.assertNotEqual(backend.issues[0].get("state"), "closed")
+                    self.reconcile(backend, http, kind)
+                    self.assertEqual(comment_count(backend, 7, marker), 1)
+
+    def test_single_oversize_stays_pending_and_later_gate_continues(self):
+        backend = self.backend([{"body": "x" * (2 * 1024 * 1024 + 1)}])
+        backend.runs = [make_run(10, workflow="deploy.yml", event="workflow_dispatch")]
+        backend.jobs[(10, 1)] = [{"name": n, "conclusion": "failure", "steps": []}
+                                 for n in ("staging-web", "staging-api")]
+        backend.issues[0]["body"] = backend.issues[0]["body"].replace(
+            KEY, "deploy.yml:staging-web")
+        http, diagnostics = SerializedHTTP(backend), io.StringIO()
+        with http.mocked(), redirect_stderr(diagnostics):
+            actions = ir.report(ir.API("token"), 10)
+        self.assertIn("pending: staging-web", actions)
+        self.assertIn("opened: staging-api", actions)
+        self.assertEqual(delivery(backend)["page_size"], 1)
+        self.assertFalse(delivery(backend)["delivered"])
+        self.assertIsNone(delivery(backend)["cursor"])
+        self.assertEqual([p[1] for p in http.pages], [100, 50, 25, 12, 6, 3, 1])
+        self.assertIn("manual investigation required", diagnostics.getvalue())
+        self.assertEqual(backend.comments[7][0]["body"], "x" * (2 * 1024 * 1024 + 1))
+        self.assertNotIn("/issues/7/comments", [w[1] for w in backend.writes])
+        # Existing pending intent also resumes without starving unrelated gates.
+        with http.mocked(), redirect_stderr(diagnostics):
+            ir.report(ir.API("token"), 10)
+        self.assertFalse(delivery(backend)["delivered"])
+        self.assertEqual(sum(w[1] == "/issues" for w in backend.writes), 1)
+
+    def test_legacy_cursor_adapts_without_rescanning_and_dry_run_never_writes(self):
+        legacy = {"run_id": 10, "attempt": 1, "kind": "failure",
+                  "cursor": "c49", "delivered": False}
+        for dry in (True, False):
+            backend = self.backend([{"body": "x" * (30 * 1024)}] * 150)
+            backend.issues[0]["body"] += "\n<!-- incident-delivery: " + json.dumps(legacy) + " -->"
+            http = SerializedHTTP(backend)
+            with http.mocked():
+                self.assertTrue(ir.ensure_comment(ir.API("token"), backend.issues[0], KEY,
+                                                  (10, 1), "failure", dry))
+            self.assertEqual(http.pages[0][:2], ("c49", 100))
+            self.assertTrue(all(p[0] is not None for p in http.pages))
+            if dry:
+                self.assertEqual(backend.writes, [])
+                self.assertEqual(delivery(backend), legacy)
+            else:
+                self.assertEqual(delivery(backend)["page_size"], 50)
+
+    def test_api_refusals_are_not_adaptive_success(self):
+        backend = self.backend([], faults=[("POST", r"/graphql", "before")])
+        http = SerializedHTTP(backend)
+        with http.mocked(), self.assertRaisesRegex(ir.ReportError, "HTTP 403"):
+            ir.ensure_comment(ir.API("token"), backend.issues[0], KEY, (10, 1), "failure", False)
+        self.assertFalse(delivery(backend)["delivered"])
+        self.assertNotIn("/issues/7/comments", [w[1] for w in backend.writes])
+
+    def test_invalid_persisted_page_sizes_refuse(self):
+        for size in (0, 101, True, "50", None):
+            state = {"run_id": 10, "attempt": 1, "kind": "failure", "cursor": None,
+                     "delivered": False, "page_size": size}
+            row = issue(7, body=MARKER + "\n<!-- incident-delivery: " + json.dumps(state) + " -->")
+            with self.assertRaisesRegex(ir.ReportError, "delivery state malformed"):
+                ir.delivery(row)
 
 
 class WorkflowWiringTests(unittest.TestCase):
