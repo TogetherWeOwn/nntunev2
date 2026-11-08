@@ -90,7 +90,7 @@ pub struct MbSearchQuery {
 }
 
 /// Why a query string was refused. The handler maps every variant to one
-/// generic 400, so the variant never reaches a caller.
+/// generic 422 validation envelope, so the variant never reaches a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryError {
     TooLong,

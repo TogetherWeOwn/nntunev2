@@ -21169,7 +21169,7 @@ mod tests {
     }
 
     #[test]
-    fn mb_search_rejects_invalid_queries_with_one_generic_400() {
+    fn mb_search_rejects_invalid_queries_with_one_generic_422() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
@@ -21189,13 +21189,22 @@ mod tests {
             long.as_str(),
         ] {
             let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
-            assert_eq!(resp.status, 400, "{path}: {}", resp.body);
+            assert_eq!(resp.status, 422, "{path}: {}", resp.body);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&resp.body).unwrap(),
+                serde_json::json!({
+                    "code": "validation_failed",
+                    "message": "invalid search query",
+                    "retryable": false,
+                }),
+                "{path}"
+            );
         }
     }
 
     #[test]
     fn mb_search_include_unavailable_is_admin_only_and_concealed() {
-        let h = harness();
+        let h = peppered_harness();
         seed_user(&h, "member1", "member@example.com");
         let member = magic_login(&h, "member@example.com");
         let admin = seed_admin(&h, "admin1", "admin@example.com");
@@ -21232,7 +21241,7 @@ mod tests {
 
     #[test]
     fn mb_search_bearer_scope_and_route_shape() {
-        let h = harness();
+        let h = peppered_harness();
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
         let library = mb_search_bearer(&h, &cookie, "library:read");
