@@ -153,6 +153,15 @@ async fn fixture() -> (
     cp.user_id.clear();
     cp.job_id = original.job_id().into();
     cp.idempotency_key = original.idempotency_key().into();
+    let mut snapshot = nntune_ingest::admin_checkpoint::Snapshot::initial(
+        cp.clone(),
+        &nntune_ingest::admin_checkpoint::Identity {
+            job_id: original.job_id(),
+            user_id: "",
+            idempotency_key: original.idempotency_key(),
+        },
+    )
+    .unwrap();
     let mut runtime = Runtime(cp.clone());
     for _ in 0..4 {
         run_stage(
@@ -164,7 +173,21 @@ async fn fixture() -> (
         )
         .await
         .unwrap();
+        let identity = nntune_ingest::admin_checkpoint::Identity {
+            job_id: original.job_id(),
+            user_id: "",
+            idempotency_key: original.idempotency_key(),
+        };
+        snapshot = snapshot.successor(cp.clone(), false, &identity).unwrap();
+        let restored = nntune_ingest::admin_checkpoint::Snapshot::decode(
+            &snapshot.encode().unwrap(),
+            snapshot.revision(),
+            &identity,
+        )
+        .unwrap();
+        assert!(restored == snapshot);
     }
+    assert_eq!((snapshot.revision(), snapshot.generation()), (5, 1));
     let recordings = vec![MbRecording {
         mbid: RECORDING.into(),
         title: "Catalogue title".into(),
@@ -203,7 +226,7 @@ async fn counts(app: &tokio_postgres::Client) -> (i64, i64, i64) {
 
 struct StoredSource {
     metadata: SourceMetadata,
-    envelope: nntune_api::field_envelope::FieldEnvelope,
+    envelope: nntune_api::original_source::FieldEnvelope,
 }
 impl SourceRepository for StoredSource {
     fn metadata(&mut self, _: &str) -> Result<[Option<SourceMetadata>; 2], SourceServiceError> {
@@ -212,7 +235,7 @@ impl SourceRepository for StoredSource {
     fn envelope(
         &mut self,
         _: &SourceMetadata,
-    ) -> Result<Option<nntune_api::field_envelope::FieldEnvelope>, SourceServiceError> {
+    ) -> Result<Option<nntune_api::original_source::FieldEnvelope>, SourceServiceError> {
         Ok(Some(self.envelope.clone()))
     }
 }
@@ -279,7 +302,7 @@ async fn real_writers_use_job_fence_winning_track_and_real_keyring_seal_without_
         .await
         .unwrap();
     let nonce = |name| -> [u8; 12] { r.get::<_, Vec<u8>>(name).try_into().unwrap() };
-    let envelope = nntune_api::field_envelope::FieldEnvelope {
+    let envelope = nntune_api::original_source::FieldEnvelope {
         dek_wrapped_nonce: nonce("nzb_ref_dek_wrapped_nonce"),
         dek_wrapped: r.get("nzb_ref_dek_wrapped"),
         payload_nonce: nonce("nzb_ref_payload_nonce"),

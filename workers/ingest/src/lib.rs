@@ -30,6 +30,7 @@ use futures_util::StreamExt;
 use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod admin_checkpoint;
 pub mod admin_execution;
 pub mod admin_gates;
 pub mod admin_writers;
