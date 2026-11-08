@@ -50,10 +50,14 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertGreater(items[build].index('git diff --exit-code -- Cargo.lock'),
                                    items[build].index(BUILD))
                 self.assertIn('worker_tools.py check-build "$RUNNER_TEMP/worker-', items[build])
-                self.assertIn("command: deploy --no-build --env staging --var BUILD_SHA:", items[upload])
-                self.assertIn(f'command = "{BUILD}"', section)
+                self.assertIn("command: deploy --env staging --var BUILD_SHA:", items[upload])
+                generate = next(s for s in items if "name: Generate staging wrangler.toml" in s)
+                self.assertNotIn("[build]", generate)
+                self.assertNotIn("[env.staging.build]", generate)
+                self.assertNotIn("worker-build", generate)
+                self.assertNotIn("--no-build", items[upload])
 
-    def test_committed_configs_match_generated_build_command(self):
+    def test_committed_configs_keep_the_local_build_command(self):
         for path in ("workers/api/wrangler.toml.example", "workers/mb/wrangler.toml",
                      "workers/ingest/wrangler.toml"):
             with self.subTest(path=path):
@@ -76,6 +80,10 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("worker_tools.py check-build", section)
         self.assertIn("set -euo pipefail", section)
         self.assertIn("worker-release-builds", job(text, "ci-ok"))
+        self.assertIn("pnpm install --frozen-lockfile --ignore-scripts", section)
+        self.assertIn("--config.minimumReleaseAge=4320", section)
+        self.assertIn("check_worker_upload.py --wrangler", section)
+        self.assertLess(section.index(BUILD), section.index("check_worker_upload.py --wrangler"))
 
 
 if __name__ == "__main__":

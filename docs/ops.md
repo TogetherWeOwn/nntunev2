@@ -807,16 +807,26 @@ not receive its forwarded build flags. Each captures the release build log
 and runs `worker_tools.py
 check-build <log>` to require all three resolved overrides and an empty
 worker-build download cache. A failed build or verification prevents upload.
-Wrangler then uploads the existing bundle with `--no-build`. Existing
-configuration, Hyperdrive, schema, ingest-enable and deployment outcome gates
-remain in force. Production workflow and secret scope are unchanged.
+The generated upload configs omit `[build]` entirely, so the supported
+`deploy --env staging --var BUILD_SHA:<sha>` command consumes the prebuilt
+entry point without running another custom build. The committed local
+configs retain their installed-binary build command. Existing configuration,
+Hyperdrive, schema, ingest-enable and deployment outcome gates remain in
+force. Production workflow and secret scope are unchanged.
 
 The required `worker-release-builds` CI job exercises the same tool
 preparation and all three ordinary release builds without deployment
 credentials. Its negative tests cover changed archives, missing overrides,
-fallbacks, cache contents and workflow/config agreement. Retain its
-exact-head Actions job link and build-log artifact with review evidence;
-a skipped staging lane is not deployment evidence.
+fallbacks, cache contents and workflow/config agreement. After building,
+`check_worker_upload.py` runs the actual config generators and pinned
+Wrangler upload argv with `--dry-run`, including both API mirror states.
+Poisoned build tools refuse any second build; a restored custom-build
+negative control must invoke that refusal. No live deployment is performed.
+The CLI reuses the web lockfile, with lifecycle scripts disabled and a
+three-day resolution age policy; existing lock entries are not a
+retrospective publication audit. No lifecycle-script exemption is granted.
+Retain the exact-head Actions job link and build-log artifact with review
+evidence; a skipped staging lane is not deployment evidence.
 
 ## Staging promotion checklist
 

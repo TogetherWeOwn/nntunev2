@@ -288,8 +288,7 @@ jobs:
           main = "build/worker/shim.mjs"
           compatibility_date = "2026-10-01"
 
-          [build]
-          command = "worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-api-staging"
@@ -391,7 +390,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           workingDirectory: workers/api
-          command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
       # Always report the executed step outcomes, including safe config skips
       # and failures. A green job alone is not evidence of a deployed Worker.
       - name: Record API deployment outcome
@@ -549,8 +548,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-mb-staging"
@@ -593,7 +591,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           workingDirectory: workers/mb
-          command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
       # Always report the executed step outcomes, including safe config skips
       # and failures. A green job alone is not evidence of a deployed Worker.
       - name: Record mb deployment outcome
@@ -795,8 +793,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-ingest-staging"
@@ -881,7 +878,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           workingDirectory: workers/ingest
-          command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
       # Always report the executed step outcomes, including safe config skips
       # and failures. A green job alone is not evidence of a deployed Worker.
       - name: Record ingest deployment outcome

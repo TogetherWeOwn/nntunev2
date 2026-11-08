@@ -1614,11 +1614,13 @@ ${MB_INVENTORY}`);
     const result = generateConfig();
     expect(result.status, result.output).toBe(0);
     expect(result.toml).toBeDefined();
-    expect(parseToml(result.toml!)).toMatchObject({
+    const config = parseToml(result.toml!);
+    expect(config).not.toHaveProperty('build.command');
+    expect(config).not.toHaveProperty('env.staging.build.command');
+    expect(config).toMatchObject({
       name: 'nntune-api',
       main: 'build/worker/shim.mjs',
       compatibility_date: '2026-10-01',
-      build: { command: 'worker-build --release -- --locked' },
       env: {
         staging: {
           name: 'nntune-api-staging',
@@ -1655,7 +1657,7 @@ ${MB_INVENTORY}`);
     expect(step).toContain("if: steps.config.outputs.configured == 'true'");
     expect(step).toContain('workingDirectory: workers/api');
     expect(step?.match(/^          command: (.+)$/m)?.[1]).toBe(
-      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
     );
   });
 
@@ -1771,7 +1773,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
 
   const assertDeployBody = (body: string) => {
     expect(body.match(/wrangler-action/g) ?? []).toHaveLength(4);
-    expect(body.match(/deploy(?: --no-build)? --env/g) ?? []).toHaveLength(4);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(4);
     // Exact command pin: staging-web deploys to staging and staging-api
     // deploys the api Worker to staging with the public BUILD_SHA var —
     // no `preview` lane exists. A bare `command: deploy` (no --env)
@@ -1786,9 +1788,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
     ).toEqual([
       'deploy --env staging',
-      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
-      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
-      'deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
     ]);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
@@ -1888,7 +1890,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(condition, 'staging-api must carry a job-level if').toBeDefined();
     expect(condition).toContain("github.event_name == 'push'");
     expect(condition).toContain("needs.gate.outputs.enabled == 'true'");
-    expect(section).toContain('command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
     expect(section).toContain('check_hyperdrive_cache.sh');
     expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
     expect(section, 'api lane must bind the staging GitHub environment').toContain(
@@ -1994,7 +1996,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       codeLines(section),
       'real deploys must not pass --allow-skip',
     ).not.toContain('--allow-skip');
-    expect(section).toContain('command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
     expect(section).toContain(
       'HYPERDRIVE_ID_MB must equal the mb MB_DB staging inventory id',
     );
@@ -2033,7 +2035,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     );
     expect(section).toContain('group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}');
     expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
-    expect(section).toContain('command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
     expect(section).toContain(
       'HYPERDRIVE_ID_STAGING must equal the ingest LIBRARY_DB staging inventory id',
     );
@@ -2271,13 +2273,13 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // Mb lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
     const noMbBuildShaMutant = jobsBody.replace(
-      'workingDirectory: workers/mb\n          command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
-      'workingDirectory: workers/mb\n          command: deploy --no-build --env staging',
+      'workingDirectory: workers/mb\n          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'workingDirectory: workers/mb\n          command: deploy --env staging',
     );
     // Ingest lane without the public BUILD_SHA var.
     const noIngestBuildShaMutant = jobsBody.replace(
-      'workingDirectory: workers/ingest\n          command: deploy --no-build --env staging --var BUILD_SHA:${{ github.sha }}',
-      'workingDirectory: workers/ingest\n          command: deploy --no-build --env staging',
+      'workingDirectory: workers/ingest\n          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'workingDirectory: workers/ingest\n          command: deploy --env staging',
     );
     // Mb lane sharing staging-web's group: a push's own lanes cancel each
     // other, leaving web and mb at different SHAs.
