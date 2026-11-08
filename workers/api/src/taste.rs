@@ -267,6 +267,14 @@ pub fn history_list_statement() -> &'static str {
     "SELECT idempotency_key, track_id, recorded_at, stream_seconds::bigint AS stream_seconds FROM public.stream_play_ledger WHERE user_id = $1 AND idempotency_key LIKE 'play:%' AND bytes_served > 0 AND idempotency_key NOT IN (SELECT play_key FROM public.private_plays WHERE user_id = $1) ORDER BY recorded_at DESC, id DESC LIMIT $2"
 }
 
+/// Serialize privacy toggles and NEW-play issuance, including when no session
+/// row exists. Hold until commit; probe privacy in a subsequent READ COMMITTED
+/// statement so a toggle that committed while acquiring this lock is visible.
+/// The user lock also fences account deletion. Continuations do not reclassify.
+pub fn private_issuance_fence_statement() -> &'static str {
+    "SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR UPDATE"
+}
+
 /// Upsert one private session with its server-side TTL, fenced like
 /// every user-owned writer. A refresh replaces `expires_at`.
 pub fn private_session_upsert_statement() -> &'static str {

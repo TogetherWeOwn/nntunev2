@@ -912,8 +912,11 @@ pub trait Store {
     /// no row exists, the stored lease has expired at `now`, the same
     /// client session re-acquires, or `takeover` is set; the epoch
     /// increments in the store, never from a caller value. Otherwise
-    /// `Held` with the live lease's remaining TTL. Default `Err` fails
-    /// closed like [`Store::live_subscription`].
+    /// `Held` with the live lease's remaining TTL. Privacy classification and
+    /// the private-play mark MUST commit atomically with acquisition, serialized
+    /// with private-session enable/disable even when no session row exists.
+    /// Any probe/mark/write error leaves the incumbent unchanged. Continuation
+    /// touch never reclassifies. Default `Err` fails closed.
     fn acquire_playback_lease(
         &self,
         user_id: &str,
@@ -6148,57 +6151,6 @@ fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Respon
     }
 }
 
-/// Private-session mark at grant issuance (migration 0037): when an
-/// unexpired `private_sessions` row names this `(user_id, session_id)`,
-/// persist the `private_plays` mark for the play about to be granted
-/// — before the grant leaves the server, so the play is suppressed
-/// from history/taste exposure from first use while billing still
-/// meters it. `None` = clear to issue; `Some(response)` = the caller
-/// answers it instead. Fail-closed on the mark, never on the probe
-/// alone: a session probe error cannot silently skip a mark (the
-/// answer is 503, not a grant for an unmarked private play), and a
-/// fenced mark answers through `account_deleting` like every fenced
-/// write. Marks are idempotent on `(user_id, play_key)` — a
-/// continuation re-mark is a no-op. `derive_play_idempotency_key` is
-/// infallible here: the handler already ran the same probe before any
-/// lease write.
-async fn mark_private_play<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    user_id: &str,
-    session_id: &str,
-    track_id: &str,
-    play_id: &str,
-) -> Option<Response>
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    match ctx
-        .store
-        .private_session_active(user_id, session_id, ctx.now)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(_) => return Some(unavailable()),
-    }
-    let Ok(play_key) = crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
-    else {
-        return Some(internal());
-    };
-    match ctx
-        .store
-        .private_play_mark(user_id, &play_key, ctx.now)
-        .await
-    {
-        Ok(true) => None,
-        Ok(false) => Some(fenced_write_response(ctx, user_id).await),
-        Err(_) => Some(unavailable()),
-    }
-}
-
 /// Mint the grant for an already-acquired lease hold and render the
 /// issuance body. The minter re-checks the identity field rule, so an
 /// unmeterable identity still cannot mint even though the handler
@@ -6394,21 +6346,9 @@ where
         Ok(id) => id,
         Err(_) => return unavailable(),
     };
-    // Resolve and persist privacy before touching the incumbent lease. A
-    // failure must not displace it, and no compensating restore may overwrite
-    // a newer concurrent holder. A refused acquire can leave an unused mark
-    // for this server-minted key, but no grant or ledger play can use that key.
-    if let Some(resp) = mark_private_play(
-        ctx,
-        &claims.user_id,
-        &body.session_id,
-        &body.track_id,
-        &play_id,
-    )
-    .await
-    {
-        return resp;
-    }
+    // The store serializes the privacy decision and lease acquisition with
+    // private-session toggles, and commits the mark and lease atomically.
+    // Failure leaves the incumbent untouched; no compensating restore.
     let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
     match ctx
         .store
@@ -6446,7 +6386,7 @@ where
                 ))
             }
         }
-        Err(_) => internal(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -8235,6 +8175,7 @@ mod tests {
         /// `(user_id, play_key)`.
         taste_rows: RefCell<HashMap<(String, String, String), crate::taste::TasteDbRow>>,
         private_sessions: RefCell<HashMap<(String, String), u64>>,
+        private_session_before_acquire: RefCell<Option<(String, String, u64)>>,
         private_plays: RefCell<std::collections::HashSet<(String, String)>>,
         fail_private_probe: RefCell<bool>,
         fail_private_mark: RefCell<bool>,
@@ -8639,6 +8580,24 @@ mod tests {
                         .get(user_id)
                         .map_or(0, |row| row.retry_after_secs(now)),
                 });
+            }
+            if let Some((owner, session, until)) = self.private_session_before_acquire.borrow_mut().take() {
+                self.private_sessions.borrow_mut().insert((owner, session), until);
+            }
+            let private = self.private_session_active(user_id, session_id, now).await?;
+            if let Some(existing) = self.playback_leases.borrow().get(user_id) {
+                if existing.is_live(now) && existing.session_id != session_id && !takeover {
+                    return Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: existing.retry_after_secs(now),
+                    });
+                }
+            }
+            if private {
+                let key = crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
+                    .map_err(|_| StoreError)?;
+                if !self.private_play_mark(user_id, &key, now).await? {
+                    return Err(StoreError);
+                }
             }
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get(user_id) {
@@ -14217,6 +14176,31 @@ mod tests {
         let holder: serde_json::Value = serde_json::from_str(&holder.body).unwrap();
         assert_eq!(holder["lease"], "active");
         assert_eq!(holder["lease_expires_at"], NOW + 45);
+    }
+
+    #[test]
+    fn play_issue_observes_activation_at_acquisition_and_keeps_next_play_private() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let user = "user-plays-1";
+        seed_entitled(&h, user, "plus", 100);
+        assert!(h.store.private_sessions.borrow().is_empty());
+        // Activation completes after the handler's preflight but before the
+        // atomic store boundary. Both this acquisition and the next are private.
+        *h.store.private_session_before_acquire.borrow_mut() = Some((
+            user.to_string(), "tab-a".to_string(), NOW + 600,
+        ));
+        for track in ["track-9", "track-10"] {
+            let issued = play_call(&h, &cookie, serde_json::json!({
+                "track_id": track, "session_id": "tab-a",
+            }));
+            assert_eq!(issued.status, 200, "{}", issued.body);
+            let play = taste_json(&issued)["play_id"].as_str().unwrap().to_string();
+            let key = crate::ledger::derive_play_idempotency_key(user, track, &play).unwrap();
+            assert!(h.store.private_plays.borrow().contains(&(user.to_string(), key)));
+        }
+        assert_eq!(h.store.playback_leases.borrow()[user].epoch, 2);
+        assert_eq!(h.store.private_plays.borrow().len(), 2);
     }
 
     #[test]
