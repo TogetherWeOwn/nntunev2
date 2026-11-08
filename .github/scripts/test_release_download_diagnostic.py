@@ -72,7 +72,8 @@ class DownloadDiagnosticTests(unittest.TestCase):
     def test_unapproved_redirect_is_not_requested(self):
         for location in ["http://github.com/no", "https://evil.example/a",
                          "https://user:pass@github.com/a", "https://github.com:444/a",
-                         'https://github.com/"bad', "https://github.com/\ninvalid"]:
+                         'https://github.com/"bad', "https://github.com/\ninvalid",
+                         "https://github.com/\rinvalid", "https://github.com/\tinvalid"]:
             with self.subTest(location=location):
                 passed, _, calls = self.run_probe([(0, 302, {}, location, b"")])
                 self.assertFalse(passed)

@@ -103,8 +103,9 @@ def probe(asset, temp_root):
                 if rc:
                     break
                 if timing["status"] in (301, 302, 303, 307, 308):
-                    if not location:
-                        raise ValueError("missing redirect")
+                    # urljoin strips some control characters: validate raw input first.
+                    if not location or any(ord(c) < 33 or ord(c) > 126 or c in '\\"' for c in location):
+                        raise ValueError("invalid redirect")
                     url = urljoin(url, location)
                     host(url)
                     payload.unlink(missing_ok=True)
