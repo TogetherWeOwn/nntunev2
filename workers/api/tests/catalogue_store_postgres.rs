@@ -58,7 +58,7 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 }
 
 #[tokio::test]
-async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs() {
+async fn admin_original_adapter_bounds_reads_without_mutating_status() {
     use nntune_api::admin_original::{OriginalRepository, PostgresOriginalRepository};
     let app = client(false).await;
     app.batch_execute(
@@ -85,9 +85,9 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
     assert_eq!(rows.len(), 1);
     let selected = rows.pop().unwrap();
     assert!(repo.envelope(&selected).await.unwrap().is_some());
-    assert!(repo.mark_running(&selected).await.unwrap());
+    assert!(repo.confirm_current(&selected).await.unwrap());
     assert!(
-        repo.mark_running(&selected).await.unwrap(),
+        repo.confirm_current(&selected).await.unwrap(),
         "replay converges"
     );
     let status: String = app
@@ -95,15 +95,29 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
         .await
         .unwrap()
         .get(0);
-    assert_eq!(status, "running");
+    assert_eq!(status, "queued");
+    for status in ["running", "needs_review", "needs_archive_read"] {
+        app.execute("UPDATE ingest_jobs SET status = $1", &[&status])
+            .await
+            .unwrap();
+        assert_eq!(repo.metadata(&job).await.unwrap().len(), 1);
+        assert!(repo.envelope(&selected).await.unwrap().is_some());
+        assert!(repo.confirm_current(&selected).await.unwrap());
+        let stored: String = app
+            .query_one("SELECT status FROM ingest_jobs", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stored, status);
+    }
 
     // Rotation or a corrupt byte shape after metadata selection refuses the
-    // byte load and the running projection.
+    // byte load and the final read-only confirmation.
     app.execute("UPDATE ingest_originals SET nzb_ref_kek_version = 8", &[])
         .await
         .unwrap();
     assert!(repo.envelope(&selected).await.unwrap().is_none());
-    assert!(!repo.mark_running(&selected).await.unwrap());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
     app.execute(
         "UPDATE ingest_originals SET nzb_ref_kek_version = 7, nzb_ref_encrypted = $1",
         &[&vec![0u8; 18]],
@@ -111,26 +125,20 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
     .await
     .unwrap();
     assert!(repo.envelope(&selected).await.unwrap().is_none());
-    assert!(!repo.mark_running(&selected).await.unwrap());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
     app.execute(
         "UPDATE ingest_originals SET nzb_ref_encrypted = $1",
         &[&vec![0u8; 17]],
     )
     .await
     .unwrap();
-    for status in [
-        "done",
-        "failed",
-        "needs_review",
-        "needs_archive_read",
-        "rejected",
-    ] {
+    for status in ["done", "failed", "rejected", "unknown"] {
         app.execute("UPDATE ingest_jobs SET status = $1", &[&status])
             .await
             .unwrap();
         assert!(repo.metadata(&job).await.unwrap().is_empty());
         assert!(repo.envelope(&selected).await.unwrap().is_none());
-        assert!(!repo.mark_running(&selected).await.unwrap());
+        assert!(!repo.confirm_current(&selected).await.unwrap());
     }
     app.execute(
         "UPDATE ingest_jobs SET status = 'queued', source = 'pipeline'",
@@ -140,7 +148,7 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
     .unwrap();
     assert!(repo.metadata(&job).await.unwrap().is_empty());
     assert!(repo.envelope(&selected).await.unwrap().is_none());
-    assert!(!repo.mark_running(&selected).await.unwrap());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
     app.execute(
         "UPDATE ingest_jobs SET source = 'admin', content_sha256 = $1",
         &[&"b".repeat(64)],
@@ -149,7 +157,7 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
     .unwrap();
     assert!(repo.metadata(&job).await.unwrap().is_empty());
     assert!(repo.envelope(&selected).await.unwrap().is_none());
-    assert!(!repo.mark_running(&selected).await.unwrap());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
 }
 
 #[tokio::test]

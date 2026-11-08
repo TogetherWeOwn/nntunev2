@@ -165,6 +165,11 @@ async fn fixture() -> (
         },
     )
     .unwrap();
+    // This writer-primitive fixture deliberately fakes checkpoint persistence.
+    // The original reader no longer changes job status; only this test seeds it.
+    app.batch_execute("UPDATE ingest_jobs SET status = 'running'")
+        .await
+        .unwrap();
     let mut runtime = Runtime(cp.clone());
     for _ in 0..4 {
         run_stage(

@@ -64,18 +64,19 @@ impl OriginalMetadata {
 }
 
 pub fn original_metadata_sql() -> &'static str {
-    "SELECT o.job_id, o.content_sha256, o.nzb_bytes, o.nzb_ref_envelope_version, o.nzb_ref_payload_format, o.nzb_ref_kek_version, octet_length(o.nzb_ref_encrypted) AS ciphertext_len, octet_length(o.nzb_ref_dek_wrapped_nonce) AS wrap_nonce_len, octet_length(o.nzb_ref_dek_wrapped) AS wrapped_dek_len, octet_length(o.nzb_ref_payload_nonce) AS payload_nonce_len FROM ingest_originals o JOIN ingest_jobs j ON j.id = o.job_id WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running') AND j.content_sha256 = o.content_sha256 AND j.idempotency_key = 'admin:' || o.content_sha256 AND j.nzb_bytes = o.nzb_bytes AND octet_length(o.content_sha256) = 64 LIMIT 2"
+    "SELECT o.job_id, o.content_sha256, o.nzb_bytes, o.nzb_ref_envelope_version, o.nzb_ref_payload_format, o.nzb_ref_kek_version, octet_length(o.nzb_ref_encrypted) AS ciphertext_len, octet_length(o.nzb_ref_dek_wrapped_nonce) AS wrap_nonce_len, octet_length(o.nzb_ref_dek_wrapped) AS wrapped_dek_len, octet_length(o.nzb_ref_payload_nonce) AS payload_nonce_len FROM ingest_originals o JOIN ingest_jobs j ON j.id = o.job_id WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running', 'needs_review', 'needs_archive_read') AND j.content_sha256 = o.content_sha256 AND j.idempotency_key = 'admin:' || o.content_sha256 AND j.nzb_bytes = o.nzb_bytes AND octet_length(o.content_sha256) = 64 LIMIT 2"
 }
 
 /// Bind job, content hash, stored KEK version, and plaintext byte count. The
-/// predicates are repeated at byte loading and running persistence: deletion,
+/// predicates are repeated at byte loading and the final read: deletion,
 /// settlement or rotation between operations fails closed, not onto a new row.
+/// Parked originals are readable for authorized controls, never auto-restarted.
 pub fn original_envelope_sql() -> &'static str {
-    "SELECT o.nzb_ref_dek_wrapped_nonce, o.nzb_ref_dek_wrapped, o.nzb_ref_payload_nonce, o.nzb_ref_encrypted FROM ingest_originals o JOIN ingest_jobs j ON j.id = o.job_id WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running') AND j.content_sha256 = $2 AND j.idempotency_key = 'admin:' || $2 AND j.nzb_bytes = $4 AND o.content_sha256 = $2 AND o.nzb_ref_kek_version = $3 AND o.nzb_bytes = $4 AND o.nzb_ref_envelope_version = 2 AND o.nzb_ref_payload_format = 1 AND octet_length(o.nzb_ref_encrypted) = $4 + 16 AND octet_length(o.nzb_ref_encrypted) BETWEEN 17 AND 8388624 AND octet_length(o.nzb_ref_dek_wrapped_nonce) = 12 AND octet_length(o.nzb_ref_dek_wrapped) = 48 AND octet_length(o.nzb_ref_payload_nonce) = 12 LIMIT 1"
+    "SELECT o.nzb_ref_dek_wrapped_nonce, o.nzb_ref_dek_wrapped, o.nzb_ref_payload_nonce, o.nzb_ref_encrypted FROM ingest_originals o JOIN ingest_jobs j ON j.id = o.job_id WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running', 'needs_review', 'needs_archive_read') AND j.content_sha256 = $2 AND j.idempotency_key = 'admin:' || $2 AND j.nzb_bytes = $4 AND o.content_sha256 = $2 AND o.nzb_ref_kek_version = $3 AND o.nzb_bytes = $4 AND o.nzb_ref_envelope_version = 2 AND o.nzb_ref_payload_format = 1 AND octet_length(o.nzb_ref_encrypted) = $4 + 16 AND octet_length(o.nzb_ref_encrypted) BETWEEN 17 AND 8388624 AND octet_length(o.nzb_ref_dek_wrapped_nonce) = 12 AND octet_length(o.nzb_ref_dek_wrapped) = 48 AND octet_length(o.nzb_ref_payload_nonce) = 12 LIMIT 1"
 }
 
-pub fn mark_running_sql() -> &'static str {
-    "UPDATE ingest_jobs j SET status = 'running' WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running') AND j.content_sha256 = $2 AND j.idempotency_key = 'admin:' || $2 AND j.nzb_bytes = $4 AND EXISTS (SELECT 1 FROM ingest_originals o WHERE o.job_id = j.id AND o.content_sha256 = $2 AND o.nzb_ref_kek_version = $3 AND o.nzb_bytes = $4 AND o.nzb_ref_envelope_version = 2 AND o.nzb_ref_payload_format = 1 AND octet_length(o.nzb_ref_encrypted) = $4 + 16 AND octet_length(o.nzb_ref_encrypted) BETWEEN 17 AND 8388624 AND octet_length(o.nzb_ref_dek_wrapped_nonce) = 12 AND octet_length(o.nzb_ref_dek_wrapped) = 48 AND octet_length(o.nzb_ref_payload_nonce) = 12)"
+pub fn confirm_current_sql() -> &'static str {
+    "SELECT j.id FROM ingest_jobs j WHERE j.id = $1 AND j.source = 'admin' AND j.status IN ('queued', 'running', 'needs_review', 'needs_archive_read') AND j.content_sha256 = $2 AND j.idempotency_key = 'admin:' || $2 AND j.nzb_bytes = $4 AND EXISTS (SELECT 1 FROM ingest_originals o WHERE o.job_id = j.id AND o.content_sha256 = $2 AND o.nzb_ref_kek_version = $3 AND o.nzb_bytes = $4 AND o.nzb_ref_envelope_version = 2 AND o.nzb_ref_payload_format = 1 AND octet_length(o.nzb_ref_encrypted) = $4 + 16 AND octet_length(o.nzb_ref_encrypted) BETWEEN 17 AND 8388624 AND octet_length(o.nzb_ref_dek_wrapped_nonce) = 12 AND octet_length(o.nzb_ref_dek_wrapped) = 48 AND octet_length(o.nzb_ref_payload_nonce) = 12)"
 }
 
 /// Implemented by an authenticated internal execution authority, never by a
@@ -93,9 +94,10 @@ pub trait OriginalRepository {
         &mut self,
         selected: &OriginalMetadata,
     ) -> impl Future<Output = Result<Option<intake::IngestOriginalEnvelope>, OriginalError>>;
-    /// Returns true only when exactly one active, identity-matching admin row
-    /// was updated. This is a status projection, not an exclusive job lease.
-    fn mark_running(
+    /// Read-only recheck of the selected identity, envelope shape and readable
+    /// state. This grants neither execution authority nor a lease. The caller
+    /// must load the captured-generation checkpoint and persist through its CAS.
+    fn confirm_current(
         &mut self,
         selected: &OriginalMetadata,
     ) -> impl Future<Output = Result<bool, OriginalError>>;
@@ -195,9 +197,10 @@ pub async fn read_original(
         job_id: selected.job_id.clone(),
         idempotency_key: intake::idempotency_key(&selected.content_sha256),
     };
-    // Construct the holder before awaiting persistence so its parsed strings
-    // are also cleared if the row is lost, storage fails or the future drops.
-    if !repository.mark_running(&selected).await? {
+    // Construct the holder before the final read so its parsed strings are also
+    // cleared if the row is lost, storage fails or the future drops. Reading a
+    // queued/parked original must not change status outside checkpoint authority.
+    if !repository.confirm_current(&selected).await? {
         return Err(OriginalError::Missing);
     }
     Ok(original)
@@ -280,14 +283,14 @@ impl OriginalRepository for PostgresOriginalRepository<'_> {
         }))
     }
 
-    async fn mark_running(&mut self, s: &OriginalMetadata) -> Result<bool, OriginalError> {
+    async fn confirm_current(&mut self, s: &OriginalMetadata) -> Result<bool, OriginalError> {
         self.client
-            .execute(
-                mark_running_sql(),
+            .query(
+                confirm_current_sql(),
                 &[&s.job_id, &s.content_sha256, &s.kek_version, &s.nzb_bytes],
             )
             .await
-            .map(|n| n == 1)
+            .map(|rows| rows.len() == 1)
             .map_err(|_| OriginalError::Store)
     }
 }

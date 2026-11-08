@@ -116,6 +116,186 @@ impl StageRuntime for DatabaseRuntime<'_> {
 }
 
 #[tokio::test]
+async fn original_reads_preserve_fenced_state_and_do_not_reconcile_legacy_authority() {
+    let (app, original, initial) = seeded().await;
+    for state in [
+        JobState::Queued,
+        JobState::Parsing,
+        JobState::NeedsReview,
+        JobState::NeedsArchiveRead,
+    ] {
+        let mut cp = initial.checkpoint().clone();
+        cp.state = state;
+        let expected = initial.successor(cp, true, &identity(&original)).unwrap();
+        seed(&app, &expected).await;
+        for _ in 0..2 {
+            let reopened = read_original(
+                &Authority,
+                &mut PostgresOriginalRepository { client: &app },
+                &Keys,
+                original.job_id(),
+            )
+            .await
+            .unwrap();
+            assert!(reopened.as_bytes() == original.as_bytes());
+            assert!(
+                store::load(&app, &input(&reopened), expected.generation())
+                    .await
+                    .unwrap()
+                    == expected
+            );
+            assert_eq!(
+                store::load(&app, &input(&reopened), initial.generation())
+                    .await
+                    .err(),
+                Some(StoreError::Stale)
+            );
+        }
+    }
+    // Reading/decrypting cannot repair a null or malformed old checkpoint or
+    // manufacture execution authority. Reconciliation is a separate control.
+    for encoded in [None, Some("{}"), Some("null")] {
+        app.execute("UPDATE ingest_jobs SET status = 'queued', admin_checkpoint = $1::text::jsonb, admin_checkpoint_revision = 0", &[&encoded]).await.unwrap();
+        let reopened = read_original(
+            &Authority,
+            &mut PostgresOriginalRepository { client: &app },
+            &Keys,
+            original.job_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store::load(&app, &input(&reopened), 1).await.err(),
+            Some(StoreError::Invalid)
+        );
+        let row = app
+            .query_one(
+                "SELECT status, admin_checkpoint::text, admin_checkpoint_revision FROM ingest_jobs",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "queued");
+        assert_eq!(row.get::<_, Option<String>>(1).as_deref(), encoded);
+        assert_eq!(row.get::<_, i64>(2), 0);
+    }
+}
+
+#[tokio::test]
+async fn legacy_user_terminal_sql_cannot_mutate_or_converge_admin_authority() {
+    use nntune_ingest::ingest_jobs::{
+        classify_transition_zero_rows, select_ingest_job_status_sql, transition_ingest_job_sql,
+        TransitionOutcome,
+    };
+    let (app, original, initial, _, _) = publication_fixture().await;
+    app.batch_execute("CREATE TEMP TABLE users (id TEXT PRIMARY KEY, deleting_at BIGINT); INSERT INTO users VALUES ('uploader', NULL); ALTER TABLE ingest_jobs ADD COLUMN user_id TEXT; UPDATE ingest_jobs SET user_id = 'uploader'").await.unwrap();
+    for state in [
+        JobState::Queued,
+        JobState::Parsing,
+        JobState::NeedsReview,
+        JobState::NeedsArchiveRead,
+        JobState::Rejected,
+        JobState::Done,
+        JobState::Failed,
+    ] {
+        let mut cp = initial.checkpoint().clone();
+        cp.state = state;
+        if matches!(state, JobState::Queued | JobState::Parsing) {
+            cp.admin_release_mbid = None;
+            cp.probe_tally = None;
+        }
+        let expected = initial.successor(cp, true, &identity(&original)).unwrap();
+        seed(&app, &expected).await;
+        for terminal in ["done", "failed"] {
+            assert_eq!(
+                app.execute(
+                    transition_ingest_job_sql(),
+                    &[&original.job_id(), &"uploader", &terminal]
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            let rows = app
+                .query(
+                    select_ingest_job_status_sql(),
+                    &[&original.job_id(), &"uploader"],
+                )
+                .await
+                .unwrap();
+            assert!(rows.is_empty());
+            assert_eq!(
+                classify_transition_zero_rows(None),
+                TransitionOutcome::MissingOrFenced
+            );
+            assert!(
+                store::load(&app, &input(&original), expected.generation())
+                    .await
+                    .unwrap()
+                    == expected
+            );
+        }
+    }
+    // Non-admin terminal writes still honor the existing owner/deletion fence.
+    app.batch_execute("UPDATE ingest_jobs SET source = 'pipeline', status = 'queued'")
+        .await
+        .unwrap();
+    assert_eq!(
+        app.execute(
+            transition_ingest_job_sql(),
+            &[&original.job_id(), &"other", &"done"]
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    app.batch_execute("UPDATE users SET deleting_at = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        app.execute(
+            transition_ingest_job_sql(),
+            &[&original.job_id(), &"uploader", &"done"]
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    app.batch_execute("UPDATE users SET deleting_at = NULL")
+        .await
+        .unwrap();
+    assert_eq!(
+        app.execute(
+            transition_ingest_job_sql(),
+            &[&original.job_id(), &"uploader", &"done"]
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        app.execute(
+            transition_ingest_job_sql(),
+            &[&original.job_id(), &"uploader", &"failed"]
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let row = app
+        .query_one(
+            select_ingest_job_status_sql(),
+            &[&original.job_id(), &"uploader"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        classify_transition_zero_rows(Some(row.get::<_, &str>(0))),
+        TransitionOutcome::Converged
+    );
+}
+
+#[tokio::test]
 async fn real_stage_store_runs_to_writing_and_refuses_publication_and_duplicate_results() {
     let (mut app, original, snapshot) = seeded().await;
     let mut cp = snapshot.checkpoint().clone();

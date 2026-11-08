@@ -27,7 +27,7 @@ impl OriginalAuthorization for Authorization {
 struct Repository {
     rows: Vec<OriginalMetadata>,
     envelope: Option<intake::IngestOriginalEnvelope>,
-    running: bool,
+    current: bool,
     events: Vec<&'static str>,
 }
 impl OriginalRepository for Repository {
@@ -42,9 +42,9 @@ impl OriginalRepository for Repository {
         self.events.push("envelope");
         Ok(self.envelope.clone())
     }
-    async fn mark_running(&mut self, _: &OriginalMetadata) -> Result<bool, OriginalError> {
-        self.events.push("running");
-        Ok(self.running)
+    async fn confirm_current(&mut self, _: &OriginalMetadata) -> Result<bool, OriginalError> {
+        self.events.push("confirm");
+        Ok(self.current)
     }
 }
 fn fixture() -> (Vec<u8>, String, Repository, Keys) {
@@ -75,7 +75,7 @@ fn fixture_for(body: Vec<u8>) -> (Vec<u8>, String, Repository, Keys) {
         Repository {
             rows: vec![row],
             envelope: Some(envelope),
-            running: true,
+            current: true,
             events: vec![],
         },
         Keys {
@@ -86,7 +86,7 @@ fn fixture_for(body: Vec<u8>) -> (Vec<u8>, String, Repository, Keys) {
 }
 
 #[tokio::test]
-async fn opens_only_after_authorization_and_persists_running_before_return() {
+async fn opens_only_after_authorization_and_read_only_recheck() {
     let (body, job, mut repo, keys) = fixture();
     for _ in 0..2 {
         let opened = read_original(&Authorization(true), &mut repo, &keys, &job)
@@ -96,7 +96,7 @@ async fn opens_only_after_authorization_and_persists_running_before_return() {
     }
     assert_eq!(
         repo.events,
-        ["metadata", "envelope", "running", "metadata", "envelope", "running"]
+        ["metadata", "envelope", "confirm", "metadata", "envelope", "confirm"]
     );
     assert_eq!(*keys.requested.borrow(), [7, 7]);
 }
@@ -175,7 +175,7 @@ async fn stored_key_is_pinned_with_no_fallback() {
 }
 
 #[tokio::test]
-async fn corrupt_swapped_or_missing_envelopes_never_mark_running() {
+async fn corrupt_swapped_or_missing_envelopes_never_confirm_current() {
     for mutation in 0..5 {
         let (_, job, mut repo, keys) = fixture();
         match mutation {
@@ -200,7 +200,7 @@ async fn corrupt_swapped_or_missing_envelopes_never_mark_running() {
 }
 
 #[tokio::test]
-async fn authenticated_but_false_content_identity_is_rejected_before_running() {
+async fn authenticated_but_false_content_identity_is_rejected_before_recheck() {
     let (body, job, mut repo, keys) = fixture();
     let false_hash = "c".repeat(64);
     repo.envelope =
@@ -216,12 +216,12 @@ async fn authenticated_but_false_content_identity_is_rejected_before_running() {
 #[tokio::test]
 async fn lost_active_row_discards_plaintext_instead_of_executing() {
     let (_, job, mut repo, keys) = fixture();
-    repo.running = false;
+    repo.current = false;
     assert!(matches!(
         read_original(&Authorization(true), &mut repo, &keys, &job).await,
         Err(OriginalError::Missing)
     ));
-    assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+    assert_eq!(repo.events, ["metadata", "envelope", "confirm"]);
 }
 
 #[tokio::test]
@@ -255,7 +255,7 @@ async fn authenticated_original_drives_the_existing_admin_parse_transition() {
                 .sum::<u64>(),
             counts.segment_count
         );
-        assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+        assert_eq!(repo.events, ["metadata", "envelope", "confirm"]);
         assert_eq!(opened.job_id(), job);
         assert_eq!(
             opened.idempotency_key(),
@@ -306,11 +306,11 @@ async fn execution_parse_uses_admin_body_limit_not_the_legacy_upload_limit() {
         .unwrap();
     let counts = intake::classify_upload(&body).unwrap();
     assert_eq!(opened.parsed().files.len() as u64, counts.file_count);
-    assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+    assert_eq!(repo.events, ["metadata", "envelope", "confirm"]);
 }
 
 #[tokio::test]
-async fn authenticated_invalid_document_never_returns_a_parse_or_marks_running() {
+async fn authenticated_invalid_document_never_returns_a_parse_or_confirms() {
     let (body, _, _, _) = fixture();
     // Authenticated identity and envelope are valid, but the retained input
     // has been truncated. Do not expose the parser's payload-bearing error.
@@ -327,10 +327,12 @@ fn sql_pins_active_admin_identity_and_bounds_bytes_before_loading() {
     for sql in [
         original_metadata_sql(),
         original_envelope_sql(),
-        mark_running_sql(),
+        confirm_current_sql(),
     ] {
         assert!(sql.contains("j.source = 'admin'"));
-        assert!(sql.contains("j.status IN ('queued', 'running')"));
+        assert!(
+            sql.contains("j.status IN ('queued', 'running', 'needs_review', 'needs_archive_read')")
+        );
         assert!(sql.contains("j.id = $1"));
         assert!(sql.contains("j.idempotency_key = 'admin:' ||"));
         assert!(sql.contains("j.content_sha256 ="));
@@ -341,5 +343,14 @@ fn sql_pins_active_admin_identity_and_bounds_bytes_before_loading() {
     assert!(sql.contains("o.nzb_ref_kek_version = $3"));
     assert!(sql.contains("o.nzb_bytes = $4"));
     assert!(sql.contains("LIMIT 1"));
-    assert!(!mark_running_sql().contains("SET status = $"));
+    for sql in [
+        original_metadata_sql(),
+        original_envelope_sql(),
+        confirm_current_sql(),
+    ] {
+        assert!(sql.starts_with("SELECT "));
+        assert!(!sql.contains("UPDATE "));
+        assert!(!sql.contains("SET status"));
+        assert!(!sql.contains("FOR UPDATE"));
+    }
 }

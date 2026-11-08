@@ -80,7 +80,7 @@ async fn authenticated_retained_original_runs_persisted_parse_match_probe_withou
         let original = read_original(&Authorization(true), &mut repo, &keys, &job)
             .await
             .unwrap();
-        assert_eq!(repo.events, ["metadata", "envelope", "running"]);
+        assert_eq!(repo.events, ["metadata", "envelope", "confirm"]);
         let mut cp = checkpoint(&original);
         let mut runtime = Runtime {
             stored: cp.clone(),
