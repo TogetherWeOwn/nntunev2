@@ -4929,10 +4929,10 @@ fn admin_ingest_failure(status: u16, code: &str, reason: &str, job_id: Option<&s
 /// pre-existing row (list/get views never carry it).
 fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> serde_json::Value {
     match admin_ingest::view_status(&job.db_status) {
-        Some("accepted") => {
+        Some(status) if status != "failed" => {
             let mut view = serde_json::json!({
                 "job_id": job.job_id,
-                "status": "accepted",
+                "status": status,
                 "accepted_at": job.accepted_at,
                 "nzb_bytes": job.nzb_bytes,
                 "file_count": job.file_count,
@@ -5010,6 +5010,9 @@ where
                 // A fresh rejection answers the reason's own status;
                 // a replay converges on the stored failed row (200).
                 Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    if admin_ingest::view_status(&job.db_status).is_none() {
+                        return internal();
+                    }
                     let status = if deduplicated {
                         200
                     } else {
@@ -5063,6 +5066,9 @@ where
                 // Fresh acceptance is 201; a replay converges on the
                 // stored row (200 with `deduplicated: true`).
                 Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    if admin_ingest::view_status(&job.db_status).is_none() {
+                        return internal();
+                    }
                     let status = if deduplicated { 200 } else { 201 };
                     let view = admin_ingest_view(&job, Some(deduplicated));
                     json_response(status, view)
@@ -5146,15 +5152,9 @@ where
     let Some(status) = admin_ingest::parse_status_filter(status_raw) else {
         return validation_failed("unknown status");
     };
-    // The store filters on the ledger status; the view names it
-    // `accepted` while the row stays `queued` for the future dispatch
-    // slice (the source discriminator keeps the pipeline off it).
-    let db_status = match status {
-        None => None,
-        Some("accepted") => Some("queued"),
-        Some("failed") => Some("failed"),
-        Some(_) => return internal(),
-    };
+    // Filter on the ledger projection, not its public alias. In particular,
+    // published selects only done, never a running or parked job.
+    let db_status = status.and_then(admin_ingest::db_status);
     let (limit, offset) = admin_ingest::parse_list_window(limit_raw, offset_raw);
     match ctx.store.admin_ingest_list(db_status, limit, offset).await {
         Ok(jobs) => {
@@ -16661,6 +16661,103 @@ mod tests {
         assert_eq!(body["reason"], "not_nzb");
         for marker in ["poster@example", "mid-", "@example.invalid"] {
             assert!(!get_failed.body.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn admin_ingest_execution_views_and_filters_remain_redacted_on_replay() {
+        let h = harness();
+        let cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let upload = minimal_ingest_nzb();
+        let accepted = post_ingest(&h, &cookie, &upload);
+        assert_eq!(accepted.status, 201);
+        let accepted: serde_json::Value = serde_json::from_str(&accepted.body).unwrap();
+        let id = accepted["job_id"].as_str().unwrap();
+        let mut expected = accepted.clone();
+        expected.as_object_mut().unwrap().remove("deduplicated");
+        for (stored, view) in [
+            ("running", "running"),
+            ("needs_review", "needs_review"),
+            ("needs_archive_read", "needs_archive_read"),
+            ("rejected", "rejected"),
+            ("done", "published"),
+        ] {
+            h.store
+                .ingest_jobs
+                .borrow_mut()
+                .get_mut(id)
+                .unwrap()
+                .db_status = stored.into();
+            let audits = h.store.audits.borrow().len();
+            expected["status"] = view.into();
+            let get = h.call_full(
+                "GET",
+                &format!("/v1/admin/ingest/{id}"),
+                None,
+                Some(cookie.clone()),
+                None,
+            );
+            assert_eq!(get.status, 200, "{stored}");
+            let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+            assert_eq!(body, expected);
+            for filter in [None, Some(view), Some("accepted")] {
+                let path = filter
+                    .map(|s| format!("/v1/admin/ingest?status={s}"))
+                    .unwrap_or_else(|| "/v1/admin/ingest".into());
+                let list = h.call_full("GET", &path, None, Some(cookie.clone()), None);
+                assert_eq!(list.status, 200, "{stored}");
+                let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+                let want = if filter == Some("accepted") {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([expected.clone()])
+                };
+                assert_eq!(body["jobs"], want);
+            }
+            assert_eq!(h.store.audits.borrow().len(), audits);
+            let replay = post_ingest(&h, &cookie, &upload);
+            assert_eq!(replay.status, 200, "{stored}");
+            let mut body: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+            assert_eq!(
+                body.as_object_mut().unwrap().remove("deduplicated"),
+                Some(true.into())
+            );
+            assert_eq!(body, expected);
+            assert_eq!(h.store.ingest_jobs.borrow()[id].db_status, stored);
+            assert_eq!(h.store.ingest_originals.borrow().len(), 1);
+        }
+
+        // Unknown stored vocabulary still fails closed rather than appearing
+        // published or being silently omitted from the list.
+        h.store
+            .ingest_jobs
+            .borrow_mut()
+            .get_mut(id)
+            .unwrap()
+            .db_status = "matching".into();
+        for path in [
+            "/v1/admin/ingest".to_string(),
+            format!("/v1/admin/ingest/{id}"),
+        ] {
+            assert_eq!(
+                h.call_full("GET", &path, None, Some(cookie.clone()), None)
+                    .status,
+                500
+            );
+        }
+        assert_eq!(post_ingest(&h, &cookie, &upload).status, 500);
+        for filter in ["queued", "done", "matching", "probing"] {
+            assert_eq!(
+                h.call_full(
+                    "GET",
+                    &format!("/v1/admin/ingest?status={filter}"),
+                    None,
+                    Some(cookie.clone()),
+                    None
+                )
+                .status,
+                422
+            );
         }
     }
 

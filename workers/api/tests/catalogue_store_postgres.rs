@@ -150,6 +150,51 @@ async fn admin_original_adapter_bounds_reads_and_persists_only_active_admin_jobs
 }
 
 #[tokio::test]
+async fn admin_execution_statuses_survive_real_store_reads_and_filters() {
+    use nntune_api::admin_ingest::{db_status, view_status};
+    for status in [
+        "queued",
+        "running",
+        "needs_review",
+        "needs_archive_read",
+        "rejected",
+        "done",
+    ] {
+        for filter in [None, Some(status), Some("failed")] {
+            let app = client(false).await;
+            // Test only the production store's status projection here. Actual
+            // parked-state schema acceptance requires the separately gated
+            // forward migration; these isolated tables make no apply claim.
+            app.batch_execute(
+                "CREATE TEMP TABLE ingest_jobs (id TEXT PRIMARY KEY, source TEXT, status TEXT, accepted_at BIGINT, nzb_bytes BIGINT, file_count INTEGER, segment_count INTEGER, failure_reason TEXT, user_id TEXT);
+                 CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY);
+                 INSERT INTO ingest_originals VALUES ('admin-job')",
+            ).await.unwrap();
+            app.execute(
+                "INSERT INTO ingest_jobs VALUES ('admin-job', 'admin', $1, 1, 1, 1, 1, NULL, 'uploader'),
+                 ('pipeline-job', 'pipeline', $1, 1, 1, 1, 1, NULL, 'uploader')",
+                &[&status],
+            ).await.unwrap();
+            let attempts = Rc::new(Cell::new(0));
+            let store = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts);
+            let rows = store.admin_ingest_list(filter, 50, 0).await.unwrap();
+            if filter == Some("failed") {
+                assert!(rows.is_empty());
+            } else {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].job_id, "admin-job");
+                assert_eq!(rows[0].db_status, status);
+                assert!(rows[0].has_original);
+                assert_eq!(
+                    db_status(view_status(&rows[0].db_status).unwrap()),
+                    Some(status)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn library_continuation_binds_every_key_and_preserves_owner_scope() {
     use nntune_api::catalogue::LibraryCursor;
     for caller in ["u1", "fresh"] {
