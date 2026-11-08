@@ -23108,11 +23108,11 @@ mod tests {
             let del = collection_del(&h, &item, &cookie);
             assert_eq!(del.status, 500, "DELETE {collection}: {}", del.body);
             // The row itself is untouched (the fake fence refused it).
-            assert!(h
-                .store
-                .collection_saves
-                .borrow()
-                .contains_key(&("u1".to_string(), kind.to_string(), mbid.to_string())));
+            assert!(h.store.collection_saves.borrow().contains_key(&(
+                "u1".to_string(),
+                kind.to_string(),
+                mbid.to_string()
+            )));
 
             // PUT against a refused (zero-row) save with a failing
             // probe: the fallback classification errs, never a 404.
