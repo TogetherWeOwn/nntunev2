@@ -309,6 +309,121 @@ async fn owner_lock_timeout_aborts_batch_without_partial_progress() {
 }
 
 #[tokio::test]
+async fn deferred_commit_statement_timeout_rolls_back_wrap_audit_and_checkpoint() {
+    let mut f = Fixture::new().await;
+    f.link("a").await;
+    open(&mut f.db, "run", "stage", 2, &Keys).await.unwrap();
+    // This fires only at COMMIT, after every wrap, audit and checkpoint write.
+    // The production SET LOCAL statement timeout must interrupt it there too.
+    f.db.batch_execute(
+        "CREATE FUNCTION stall_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_sleep(60);
+             RETURN NEW;
+         END $$;
+         CREATE CONSTRAINT TRIGGER stall_commit AFTER UPDATE
+             ON listenbrainz_rotation_runs DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION stall_commit()",
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1001),
+    )
+    .await
+    .expect("COMMIT must settle under its statement timeout, not the 30s deadline");
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "must reach the injected COMMIT stall, not fail early"
+    );
+    // Settle the driver before taking any error as evidence of rollback.
+    f.db.simple_query("SELECT 1").await.unwrap();
+    let mut observer = f.other().await;
+    let saved = reconcile(&mut observer, "run", "stage", 2).await.unwrap();
+    assert_eq!((saved.checkpoint_seq, saved.scanned), (0, 0));
+    assert!(saved.owner_cursor.is_none());
+    assert!(!saved.finished);
+    assert_eq!(read(&observer, "a").await.unwrap().unwrap().kek_version, 1);
+    assert_eq!(f.audits().await, 0);
+    f.db.batch_execute("DROP TRIGGER stall_commit ON listenbrainz_rotation_runs")
+        .await
+        .unwrap();
+    let resumed = batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1002)
+        .await
+        .unwrap();
+    assert_eq!((resumed.checkpoint_seq, resumed.rewrapped), (1, 1));
+    assert_eq!(f.audits().await, 1);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn whole_operation_deadline_rolls_back_cumulative_work_before_resume() {
+    let mut f = Fixture::new().await;
+    for n in 0..100 {
+        f.link(&format!("owner_{n:03}")).await;
+    }
+    open(&mut f.db, "run", "stage", 2, &Keys).await.unwrap();
+    // Each statement stays well below the 5s ceiling, and the transaction is
+    // never idle. Only the actual 30s whole-operation deadline bounds the page.
+    f.db.batch_execute(
+        "CREATE FUNCTION slow_rewrap() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_sleep(0.6);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER slow_rewrap BEFORE UPDATE ON listenbrainz_links
+             FOR EACH ROW EXECUTE FUNCTION slow_rewrap()",
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(45),
+        batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1001),
+    )
+    .await
+    .expect("the real operation deadline must bound cumulative statement work");
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() >= Duration::from_secs(29),
+        "a per-statement or setup failure must not pass as the whole deadline"
+    );
+    // Dropping the timed-out future queues ROLLBACK behind the in-flight query.
+    // This barrier, not elapsed time, establishes that the driver has settled.
+    tokio::time::timeout(Duration::from_secs(10), f.db.simple_query("SELECT 1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut observer = f.other().await;
+    let saved = reconcile(&mut observer, "run", "stage", 2).await.unwrap();
+    assert_eq!((saved.checkpoint_seq, saved.scanned), (0, 0));
+    assert!(saved.owner_cursor.is_none());
+    assert!(!saved.finished);
+    let old: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM listenbrainz_links WHERE kek_version = 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(old, 100);
+    assert_eq!(f.audits().await, 0);
+    f.db.batch_execute("DROP TRIGGER slow_rewrap ON listenbrainz_links")
+        .await
+        .unwrap();
+    let resumed = batch(&mut f.db, "run", "stage", 2, 0, 100, &Keys, 1002)
+        .await
+        .unwrap();
+    assert_eq!((resumed.checkpoint_seq, resumed.rewrapped), (1, 100));
+    assert_eq!(f.audits().await, 100);
+    f.cleanup().await;
+}
+
+#[tokio::test]
 async fn checkpoint_failure_rolls_back_prior_wraps_and_audits() {
     let mut f = Fixture::new().await;
     f.link("a").await;
