@@ -106,10 +106,44 @@ def install_crate(name: str, pin: dict, dl, root: Path, tool_root: Path, run=sub
         f"https://static.crates.io/crates/{name}/{name}-{version}.crate", 20_000_000
     ), pin["sha256"])
     (source_dir / "source.crate").write_bytes(archive)
-    # Cargo re-checks registry packages and uses the shipped lock. Never run
-    # anything from the download directory.
-    run(["cargo", "install", name, "--version", f"={version}", "--locked",
+    source = unpack_crate(archive, source_dir, f"{name}-{version}")
+    package = tomllib.loads((source / "Cargo.toml").read_text())["package"]
+    if package.get("name") != name or package.get("version") != version:
+        raise ValueError("crate manifest disagrees with selected tool")
+    if not (source / "Cargo.lock").is_file():
+        raise ValueError("selected tool must ship Cargo.lock")
+    # Install the verified source, keeping the process cwd outside downloaded files.
+    run(["cargo", "install", "--path", str(source), "--locked",
          "--root", str(tool_root)], cwd=ROOT, check=True)
+
+
+def unpack_crate(archive: bytes, destination: Path, directory: str) -> Path:
+    """Write bounded regular files below the expected crate root; never follow links."""
+    seen = set()
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        for count, member in enumerate(bundle, 1):
+            parts = member.name.rstrip("/").split("/")
+            if (count > 10_000 or parts[0] != directory
+                    or any(part in ("", ".", "..") or "\\" in part for part in parts)
+                    or member.name in seen or not (member.isdir() or member.isfile())):
+                raise ValueError("unexpected crate archive member")
+            seen.add(member.name)
+            target = destination.joinpath(*parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            total += member.size
+            if member.size < 0 or member.size > 20_000_000 or total > 100_000_000:
+                raise ValueError("crate contents exceed size limit")
+            handle = bundle.extractfile(member)
+            if handle is None:
+                raise ValueError("unexpected crate archive member")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                output.write(handle.read())
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
+    return destination / directory
 
 
 def read_member(archive: bytes, member_name: str, limit: int) -> bytes:

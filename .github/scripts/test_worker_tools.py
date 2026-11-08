@@ -101,8 +101,80 @@ class Checksums(unittest.TestCase):
         with self.assertRaises(ValueError):
             wt.verified_integrity(data, good.replace("sha512", "sha1"))
 
+    def crate_archive(self, extra=(), lock=True, version="1.0.0"):
+        files = [
+            ("tool-x-1.0.0/Cargo.toml",
+             f'[package]\nname = "tool-x"\nversion = "{version}"\n'.encode(), tarfile.REGTYPE),
+            ("tool-x-1.0.0/src/main.rs", b"fn main() {}", tarfile.REGTYPE),
+        ]
+        if lock:
+            files.append(("tool-x-1.0.0/Cargo.lock", b"version = 4\n", tarfile.REGTYPE))
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
+            for name, data, kind in [*files, *extra]:
+                info = tarfile.TarInfo(name)
+                info.type = kind
+                info.size = len(data) if kind == tarfile.REGTYPE else 0
+                if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                    info.linkname = "Cargo.toml"
+                bundle.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+        return buffer.getvalue()
+
+    def install_archive(self, archive, root, run):
+        pin = {"version": "1.0.0", "sha256": hashlib.sha256(archive).hexdigest()}
+        index = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}).encode()
+        downloads = []
+
+        def dl(url, limit):
+            downloads.append(url)
+            return index if "index.crates.io" in url else archive
+
+        wt.install_crate("tool-x", pin, dl, root, root / "installed", run=run)
+        return downloads
+
+    def test_cargo_installs_verified_source_with_shipped_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = []
+
+            def run(cmd, **kwargs):
+                calls.append(cmd)
+                source = Path(cmd[cmd.index("--path") + 1])
+                self.assertEqual(source, root / "tool-x/tool-x-1.0.0")
+                self.assertEqual((source / "src/main.rs").read_bytes(), b"fn main() {}")
+                self.assertEqual((source / "Cargo.lock").read_bytes(), b"version = 4\n")
+                self.assertEqual(kwargs, {"cwd": wt.ROOT, "check": True})
+                self.assertEqual(cmd, ["cargo", "install", "--path", str(source), "--locked",
+                                       "--root", str(root / "installed")])
+
+            downloads = self.install_archive(self.crate_archive(), root, run)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(downloads), 2)
+
+    def test_crate_rejects_unsafe_members_before_cargo(self):
+        for name, kind in (
+            ("../escape", tarfile.REGTYPE),
+            ("/absolute", tarfile.REGTYPE),
+            ("tool-x-1.0.0/../escape", tarfile.REGTYPE),
+            ("other-1.0.0/file", tarfile.REGTYPE),
+            ("tool-x-1.0.0/link", tarfile.SYMTYPE),
+            ("tool-x-1.0.0/link", tarfile.LNKTYPE),
+            ("tool-x-1.0.0/pipe", tarfile.FIFOTYPE),
+            ("tool-x-1.0.0/Cargo.toml", tarfile.REGTYPE),
+        ):
+            with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(ValueError):
+                    self.install_archive(self.crate_archive([(name, b"x", kind)]), Path(tmp),
+                                         lambda *a, **k: self.fail("must not build"))
+
+    def test_crate_requires_matching_identity_and_lock(self):
+        for archive in (self.crate_archive(lock=False), self.crate_archive(version="2.0.0")):
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+                self.install_archive(archive, Path(tmp),
+                                     lambda *a, **k: self.fail("must not build"))
+
     def test_crate_tamper_and_index_mismatch(self):
-        crate = b"crate"
+        crate = self.crate_archive()
         pin = {"version": "1.0.0", "sha256": hashlib.sha256(crate).hexdigest()}
         index = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}).encode()
 
@@ -114,7 +186,9 @@ class Checksums(unittest.TestCase):
             wt.install_crate("tool-x", pin, make(crate, index), Path(tmp), Path(tmp) / "i",
                              run=lambda cmd, **k: ran.append(cmd))
         self.assertIn("--locked", ran[0])
-        self.assertIn("=1.0.0", ran[0])
+        self.assertIn("--path", ran[0])
+        self.assertNotIn("--version", ran[0])
+        self.assertNotIn("tool-x", ran[0])
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             wt.install_crate("tool-x", pin, make(b"tampered", index), Path(tmp), Path(tmp) / "i",
                              run=lambda *a, **k: self.fail("must not build"))

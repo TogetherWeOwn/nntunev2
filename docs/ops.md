@@ -780,10 +780,13 @@ Notes, all referencing (not changing) owning-lane state:
 The api, mb and ingest release builds share the exact tool versions in
 `.github/worker-toolchain.json`. The Actions-only helper
 `.github/scripts/worker_tools.py install` prepares worker-build and
-wasm-bindgen-cli with exact-version, locked Cargo installs, checks their
-crate archives against the manifest, and prepares checksum-verified esbuild
-and wasm-opt executables. Each download has a fresh directory; only the
-selected regular executable is read from each binary archive. No npm
+wasm-bindgen-cli by checking their exact-version crate archives against the
+manifest, unpacking bounded regular files into fresh directories and using
+`cargo install --path` with each shipped lockfile and `--locked`. Package
+identity must match the selection. Cargo runs from the repository, not the
+download directory. The helper also prepares checksum-verified esbuild and
+wasm-opt executables; only the selected regular executable is read from
+each binary archive. No npm
 package scripts are run. Cargo has no stable native release-age filter or
 blanket build-script/proc-macro refusal; exact pins, registry/archive checks
 and credential-free Actions builds do not eliminate that residual trust.
