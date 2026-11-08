@@ -216,9 +216,11 @@ async fn account_deletion_cascades_save_rows() {
 #[tokio::test]
 async fn artist_membership_requires_mirror_row_and_member_release() {
     let s = store(client().await).await;
-    // ARTIST owns u1's member release AND u2's non-member release.
+    // ARTIST owns u1's member release AND `other`'s private release;
+    // u2 has no member release belonging to ARTIST, so the probe
+    // correctly answers false for it.
     assert!(s.collection_artist_member("u1", ARTIST).await.unwrap());
-    assert!(s.collection_artist_member("u2", ARTIST).await.unwrap());
+    assert!(!s.collection_artist_member("u2", ARTIST).await.unwrap());
     // OTHER_ARTIST owns only the shared release: member for every caller.
     assert!(s
         .collection_artist_member("u1", OTHER_ARTIST)

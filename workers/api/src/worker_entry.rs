@@ -690,15 +690,62 @@ struct PgStore {
     trace_id: String,
     mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-    test_client: Option<tokio_postgres::Client>,
+    test_client: Option<PgTestSlot>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
 
+/// Shared slot one injected test client lives in. `Client` is not
+/// `Clone`, so repeated store calls in one test instead CHECK the client
+/// out of its slot: the [`ClientCheckout`] guard below returns it when
+/// the call ends, keeping the single seeded connection (and its
+/// per-connection temp tables) shared across every call a test makes.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+type PgTestSlot = std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::Client>>>;
+
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
-    client: Result<tokio_postgres::Client, StoreError>,
+    client: Result<PgTestSlot, StoreError>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+/// The client a store call holds while its statements run. Production
+/// checkouts own their client; test checkouts borrow the injected one
+/// and return it on drop. `Deref`/`DerefMut` keep every caller shape —
+/// `&client`, `&mut client`, `client.transaction()` — identical to
+/// holding an owned `tokio_postgres::Client`.
+struct ClientCheckout {
+    client: Option<tokio_postgres::Client>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    return_to: Option<PgTestSlot>,
+}
+
+impl std::ops::Deref for ClientCheckout {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("live checkout")
+    }
+}
+
+impl std::ops::DerefMut for ClientCheckout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("live checkout")
+    }
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl Drop for ClientCheckout {
+    fn drop(&mut self) {
+        if let (Some(slot), Some(client)) = (&self.return_to, self.client.take()) {
+            let mut guard = slot.borrow_mut();
+            // Returning into an occupied slot is a test-harness misuse
+            // (a client cannot be in two places); drop it rather than
+            // silently sharing one connection across live checkouts.
+            if guard.is_none() {
+                *guard = Some(client);
+            }
+        }
+    }
 }
 
 /// Inject connection acquisition only; execute the production catalogue SQL,
@@ -718,9 +765,9 @@ pub fn catalogue_store_for_postgres_test(
         } else {
             MirrorBinding::Unconfigured
         },
-        test_client: Some(app),
+        test_client: Some(std::rc::Rc::new(std::cell::RefCell::new(Some(app)))),
         test_mirror: Some(CatalogueTestMirror {
-            client: mirror,
+            client: mirror.map(|c| std::rc::Rc::new(std::cell::RefCell::new(Some(c)))),
             attempts,
         }),
     }
@@ -736,7 +783,7 @@ pub fn session_retry_store_for_postgres_test(
         env: None,
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
-        test_client: Some(client),
+        test_client: Some(std::rc::Rc::new(std::cell::RefCell::new(Some(client)))),
         test_mirror: None,
     }
 }
@@ -772,13 +819,18 @@ impl PgStore {
         with_deadline(operation, timeout_ms, StoreError).await
     }
 
-    async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
-        // The injected client is cloned, not taken: tokio_postgres shares
-        // the one connection (and its per-connection temp tables) across
-        // clones, so repeated store calls in one test keep their state.
+    async fn connect(&self) -> Result<ClientCheckout, StoreError> {
+        // The injected client is checked out, not cloned: `Client` is not
+        // `Clone`, so the guard below borrows the slot's one connection
+        // (keeping its per-connection temp tables) and returns it on
+        // drop. A second live checkout of the same slot fails closed.
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = &self.test_client {
-            return Ok(client.clone());
+        if let Some(slot) = &self.test_client {
+            let client = slot.borrow_mut().take().ok_or(StoreError)?;
+            return Ok(ClientCheckout {
+                client: Some(client),
+                return_to: Some(slot.clone()),
+            });
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -830,7 +882,11 @@ impl PgStore {
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
                     .map_err(|_| StoreError)?;
-                Ok(client)
+                Ok(ClientCheckout {
+                    client: Some(client),
+                    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                    return_to: None,
+                })
             },
             TOTAL_TIMEOUT_MS,
             StoreError,
@@ -859,13 +915,19 @@ impl PgStore {
     /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
     /// are the `mirror_*` literals so an incident names the cluster that
     /// refused; empty app results never need a mirror connection.
-    async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
+    async fn connect_mirror(&self) -> Result<ClientCheckout, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(mirror) = &self.test_mirror {
             mirror.attempts.set(mirror.attempts.get() + 1);
-            // Same clone-not-take rationale as `connect`: repeated mirror
-            // probes share the injected connection.
-            return mirror.client.clone();
+            // Same checkout-not-clone rationale as `connect`: repeated
+            // mirror probes share the injected connection through the
+            // slot, never through a `Client: Clone` bound.
+            let slot = mirror.client.as_ref().map_err(|_| StoreError)?;
+            let client = slot.borrow_mut().take().ok_or(StoreError)?;
+            return Ok(ClientCheckout {
+                client: Some(client),
+                return_to: Some(slot.clone()),
+            });
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -908,7 +970,11 @@ impl PgStore {
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
                     .map_err(|_| StoreError)?;
-                Ok(client)
+                Ok(ClientCheckout {
+                    client: Some(client),
+                    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                    return_to: None,
+                })
             },
             TOTAL_TIMEOUT_MS,
             StoreError,
@@ -4084,8 +4150,11 @@ impl Store for PgStore {
         .await
     }
 
-    /// Fenced idempotent removal: `execute` reports the affected-row
-    /// count the handler splits (idempotent no-op vs. fence-refused).
+    /// Fenced idempotent removal: `RETURNING` rows report the
+    /// affected-row count the handler splits (idempotent no-op vs.
+    /// fence-refused) through the same unnamed path as the other
+    /// statements — `execute` would prepare a named statement that a
+    /// pooled backend cannot keep.
     async fn collection_remove(
         &self,
         user_id: &str,
@@ -4095,13 +4164,22 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                client
-                    .execute(
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
                         crate::collection::collection_delete_statement(),
-                        &[&user_id, &kind.as_str(), &mbid],
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                        ],
                     )
                     .await
-                    .map_err(|_| self.statement_failed("api.db.statement_failed.collection_remove"))
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_remove")
+                    })?;
+                Ok(rows.len() as u64)
             },
             TOTAL_TIMEOUT_MS,
         )

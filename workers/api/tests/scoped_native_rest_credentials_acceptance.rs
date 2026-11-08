@@ -570,7 +570,12 @@ fn canonical_route(scope: Scope) -> (&'static str, &'static str) {
         Scope::PlaysWrite => ("POST", "/v1/plays"),
         Scope::StreamRead => ("GET", "/v1/stream"),
         Scope::IngestSubmit => ("POST", "/v1/ingest"),
-        Scope::LibraryWrite => ("PUT", "/v1/me/library/albums/m_1"),
+        // The item segment must satisfy the MBID shape gate: a malformed
+        // segment classifies Deny, never a scope answer.
+        Scope::LibraryWrite => (
+            "PUT",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
+        ),
     }
 }
 
@@ -686,41 +691,53 @@ fn route_map_is_exhaustive_and_default_deny() {
         ),
         // Collection saves: reads ride library:read; saves/removals need
         // the appended library:write scope; the bare root serves nothing.
+        // Positive item paths use well-formed MBIDs — the shape gate
+        // denies malformed segments before they reach any scope answer.
         ("GET", "/v1/me/library/albums", Bearer(Scope::LibraryRead)),
         ("GET", "/v1/me/library/artists", Bearer(Scope::LibraryRead)),
         (
             "GET",
-            "/v1/me/library/albums/m_1",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryRead),
         ),
         (
             "GET",
-            "/v1/me/library/artists/m_1",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryRead),
         ),
         (
             "PUT",
-            "/v1/me/library/albums/m_1",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryWrite),
         ),
         (
             "DELETE",
-            "/v1/me/library/albums/m_1",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryWrite),
         ),
         (
             "PUT",
-            "/v1/me/library/artists/m_1",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryWrite),
         ),
         (
             "DELETE",
-            "/v1/me/library/artists/m_1",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
             Bearer(Scope::LibraryWrite),
         ),
         ("GET", "/v1/me/library", Deny),
         ("PUT", "/v1/me/library/albums", Deny),
-        ("GET", "/v1/me/library/albums/m_1/x", Deny),
+        (
+            "GET",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab/x",
+            Deny,
+        ),
+        // Malformed single segments deny at the gate on every method —
+        // never a scope answer for a path dispatch would 404 anyway.
+        ("GET", "/v1/me/library/albums/m_1", Deny),
+        ("HEAD", "/v1/me/library/artists/m_1", Deny),
+        ("PUT", "/v1/me/library/albums/m_1", Deny),
+        ("DELETE", "/v1/me/library/artists/m_1", Deny),
         // Play events → plays:write; playback → stream:read; ingest → submit.
         ("POST", "/v1/plays", Bearer(Scope::PlaysWrite)),
         ("GET", "/v1/stream", Bearer(Scope::StreamRead)),

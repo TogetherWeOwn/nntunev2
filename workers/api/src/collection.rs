@@ -327,12 +327,17 @@ pub fn collection_save_statement() -> &'static str {
 /// normalized — `lower(mbid)` keeps removal case-insensitive like the
 /// state probe, so an uppercase-stored legacy value is still removable).
 /// 0..1 affected rows: removing an unsaved MBID is the same success and
-/// never an error.
+/// never an error. `RETURNING mbid` lets the Worker count the removed
+/// rows through the same unnamed typed path every other collection
+/// statement uses (named prepared execution cannot survive a pooled
+/// backend reset — see the TWO-539 `query_typed` notes at each call
+/// site).
 pub fn collection_delete_statement() -> &'static str {
     "DELETE FROM collection_saves \
      USING (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
      WHERE collection_saves.user_id = $1 AND collection_saves.kind = $2 \
-     AND lower(collection_saves.mbid) = $3"
+     AND lower(collection_saves.mbid) = $3 \
+     RETURNING mbid"
 }
 
 /// Mirror artist-existence probe for target validation and (joined by
@@ -594,6 +599,12 @@ mod tests {
             "{save}"
         );
         assert!(save.contains("RETURNING saved_at"), "{save}");
+        // Removal reports its 0..1 affected rows through `RETURNING` so
+        // the Worker can run it on the same unnamed typed path as the
+        // other statements (named prepared execution cannot survive a
+        // pooled backend reset).
+        let delete = collection_delete_statement();
+        assert!(delete.contains("RETURNING mbid"), "{delete}");
         // Mirror probes bind only normalized arrays and stay bounded.
         for sql in [artists_by_mbid_statement(), releases_by_mbid_statement()] {
             assert!(sql.contains("ANY($1::uuid[])"), "{sql}");

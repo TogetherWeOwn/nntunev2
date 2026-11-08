@@ -4354,8 +4354,13 @@ where
                     // Zero rows: the deletion fence closed after the
                     // up-front check (the marker landed mid-request) or
                     // the user row is gone. Re-read the fence state to
-                    // split the typed 409 from a vanished-account write.
-                    let deleting = matches!(ctx.store.account_deleting(&user_id).await, Ok(true));
+                    // split the typed 409 from a vanished-account write;
+                    // a FAILED probe answers the outage, never a
+                    // fabricated 404 the caller would take as state.
+                    let deleting = match ctx.store.account_deleting(&user_id).await {
+                        Ok(deleting) => deleting,
+                        Err(_) => return internal(),
+                    };
                     match crate::collection::collection_write_outcome(false, deleting) {
                         crate::collection::CollectionWriteOutcome::AccountDeleting => {
                             account_deleting_response()
@@ -4381,11 +4386,15 @@ where
                     // a closed fence answers the typed 409, anything else
                     // is the idempotent success (removal never re-runs
                     // target validation, so a lapsed member stays
-                    // removable).
-                    if affected == 0
-                        && matches!(ctx.store.account_deleting(&user_id).await, Ok(true))
-                    {
-                        return account_deleting_response();
+                    // removable). A FAILED probe answers the outage: the
+                    // write may have refused, so a fabricated unsaved
+                    // state would lie about the row it just left behind.
+                    if affected == 0 {
+                        match ctx.store.account_deleting(&user_id).await {
+                            Ok(true) => return account_deleting_response(),
+                            Ok(false) => {}
+                            Err(_) => return internal(),
+                        }
                     }
                     match kind {
                         crate::collection::SaveKind::Album => {
@@ -7810,6 +7819,10 @@ mod tests {
         /// fails like a production outage (the handler must answer
         /// retryable reads / opaque writes, never invented state).
         fail_collection: RefCell<bool>,
+        /// Fail only the `account_deleting` probe: the handler must
+        /// never fabricate saved/unsaved state or a 404 when the fence
+        /// classification itself erred.
+        fail_deleting_probe: RefCell<bool>,
     }
 
     impl FakeStore {
@@ -9038,6 +9051,9 @@ mod tests {
                 .collect())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_deleting_probe.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
@@ -23065,5 +23081,64 @@ mod tests {
             let idx = i64::from_str_radix(&mbid[..8], 16).unwrap();
             assert!(idx <= 49, "first page holds the newest 50");
         }
+    }
+
+    #[test]
+    fn collection_zero_row_writes_never_fabricate_on_a_failed_probe() {
+        // The marker lands mid-request (seeded after the up-front check):
+        // the fenced write affects zero rows, then the fence re-read
+        // fails. Neither method may guess — DELETE must not report an
+        // unsaved state for a row it may still hold, PUT must not 404 a
+        // refusal it could not classify. Both answer the opaque 500.
+        for (collection, kind, mbid) in [
+            ("albums", "album", COL_ALBUM),
+            ("artists", "artist", COL_ARTIST),
+        ] {
+            let h = collection_seeded();
+            let cookie = magic_login(&h, "a@example.com");
+            let item = format!("/v1/me/library/{collection}/{mbid}");
+
+            let saved = collection_put(&h, &item, &cookie);
+            assert_eq!(saved.status, 200, "seed save {collection}");
+            // Arm the mid-request fence + failing probe, then remove:
+            // the fake's own fence check zero-rows the write, and the
+            // post-write probe errs.
+            h.store.deleting_users.borrow_mut().insert("u1".to_string());
+            *h.store.fail_deleting_probe.borrow_mut() = true;
+            let del = collection_del(&h, &item, &cookie);
+            assert_eq!(del.status, 500, "DELETE {collection}: {}", del.body);
+            // The row itself is untouched (the fake fence refused it).
+            assert!(h
+                .store
+                .collection_saves
+                .borrow()
+                .contains_key(&("u1".to_string(), kind.to_string(), mbid.to_string())));
+
+            // PUT against a refused (zero-row) save with a failing
+            // probe: the fallback classification errs, never a 404.
+            let put = collection_put(&h, &item, &cookie);
+            assert_eq!(put.status, 500, "PUT {collection}: {}", put.body);
+        }
+    }
+
+    #[test]
+    fn collection_zero_row_delete_still_splits_the_live_409() {
+        // Same zero-row shape with a WORKING probe: the closed fence
+        // still answers the typed 409, and a live account keeps the
+        // idempotent unsaved success.
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        assert_eq!(collection_put(&h, &item, &cookie).status, 200);
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 409, "{}", del.body);
+        let body: serde_json::Value = serde_json::from_str(&del.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 200, "never-saved removal stays idempotent");
     }
 }

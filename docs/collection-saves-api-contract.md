@@ -126,8 +126,9 @@ Uniform, non-distinguishing failures:
 
 `public.collection_saves (user_id, kind, mbid, saved_at)`, primary key
 `(user_id, kind, mbid)`, `kind ∈ {'album','artist'}`, `mbid` TEXT (stored
-verbatim after the Rust-side shape gate; no `::uuid` cast anywhere on the
-app side), `saved_at` BIGINT unix seconds. `user_id` references
+as the gate-normalized lowercase MBID — probes compare with
+`lower(mbid)`; no `::uuid` cast anywhere on the app side), `saved_at`
+BIGINT unix seconds. `user_id` references
 `public.users(id) ON DELETE CASCADE` (account deletion and the
 unverified-user reap remove all preference rows — matching the
 `listenbrainz_links`/`listen_events` preference precedent). Secondary
