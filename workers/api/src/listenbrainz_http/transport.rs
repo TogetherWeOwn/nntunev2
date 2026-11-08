@@ -1,7 +1,6 @@
-//! Bounded Worker fetch primitive. Deliberately not wired to a user route:
-//! the caller must serialize the fleet-wide claim/send/cooldown cycle, and
-//! persist `Exchange::cooldown_s` even when the body or transport fails.
-//! Merely calling the existing interval claim is NOT sufficient serialization.
+//! Private bounded Worker fetch primitive. The coordinator owns durable
+//! fleet-wide claim/send/finish ordering, including body/transport failures.
+//! Deliberately not wired to a user route.
 
 use std::{cell::Cell, future::Future};
 
@@ -129,7 +128,7 @@ fn redirect_policy() -> RequestRedirect {
 /// Only fixed `ApiRequest` endpoints are representable. Redirects are returned
 /// as unavailable, never followed, including same-origin redirects. No retry,
 /// cache API, logging, inherited browser headers or configurable URL is used.
-pub(crate) async fn exchange(request: ApiRequest) -> Exchange {
+pub(super) async fn exchange(request: ApiRequest) -> Exchange {
     let head = Cell::new(None);
     let operation = async {
         let headers = Headers::new();

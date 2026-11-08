@@ -671,11 +671,26 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
-    /// Fleet-shared outbound admission, using database time. Every provider
-    /// request must claim first; false or error means do not send. No token,
-    /// account or caller-chosen key can split the global budget.
-    fn claim_listenbrainz_outbound(&self) -> impl Future<Output = Result<bool, StoreError>> {
+    /// Fleet-shared outbound admission, using database time. None or error
+    /// means do not send. A claim excludes all other sends until its matching
+    /// completion persists the cooldown; it never expires automatically.
+    fn claim_listenbrainz_outbound(
+        &self,
+    ) -> impl Future<Output = Result<Option<crate::listenbrainz::OutboundClaim>, StoreError>> {
         async { Err(StoreError) }
+    }
+    /// Atomically persist cooldown and release only this in-flight generation.
+    /// No release without durable cooldown. Errors/uncertain commits never
+    /// authorize success or automatic retry. Default refuses, like admission.
+    fn finish_listenbrainz_outbound(
+        &self,
+        claim: crate::listenbrainz::OutboundClaim,
+        wait_s: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (claim, wait_s);
+            Err(StoreError)
+        }
     }
     /// Persist the parsed relative provider cooldown before returning an
     /// upstream outcome. Concurrent/older replies cannot shorten the floor.

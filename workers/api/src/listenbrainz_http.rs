@@ -5,16 +5,18 @@
 //! `recordings.html` and `feedback-json.html` documentation. Tokens travel
 //! only in Authorization, never in a URL or JSON body. The bounded fetch
 //! primitive disables redirects and enforces one headers/body deadline. Its
-//! caller must serialize the fleet-wide claim/send/cooldown cycle, call
-//! `Store::claim_listenbrainz_outbound` before sending and persist the parsed
-//! relative cooldown through `Store::defer_listenbrainz_outbound` before
-//! returning ANY upstream outcome. Both use one database-clock budget for the
-//! whole fleet, never a token or isolate-local key. Admission errors/denials
-//! forbid sending; persistence errors forbid success. Interval claims alone
-//! do not serialize in-flight responses. Never log headers or upstream bodies.
+//! coordinator reserves a durable fleet-wide generation before sending and
+//! atomically persists the relative cooldown before releasing it or returning
+//! ANY upstream outcome. Admission errors/denials forbid sending; persistence
+//! errors forbid success. Cancellation or an uncertain write can strand the
+//! budget busy: no expiring lease or automatic recovery authorizes another send.
+//! User dispatch remains unwired pending recovery/integration review. Never log
+//! headers or upstream bodies.
 
-#[allow(dead_code)] // Unwired until shared in-flight coordination lands.
-pub(crate) mod transport;
+#[allow(dead_code)] // User dispatch remains unwired.
+pub(crate) mod coordinator;
+#[allow(dead_code)]
+mod transport;
 
 use serde::Deserialize;
 use zeroize::Zeroizing;

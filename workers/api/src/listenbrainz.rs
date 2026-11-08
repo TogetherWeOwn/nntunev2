@@ -20,7 +20,8 @@
 //! - The token is opened only server-side immediately before an upstream
 //!   call, never returned to a client and never logged. Clients only ever
 //!   see [`LinkSummary`].
-//! - Honour [`next_allowed_at`] per user/token before every upstream call.
+//! - Serialize every upstream call through the fleet-shared durable claim and
+//!   persist its cooldown before releasing the claim; never use a per-user budget.
 //! - `hide` stays local: [`feedback_for`] yields no upstream feedback for it.
 
 use serde::Serialize;
@@ -30,6 +31,12 @@ use crate::{
     field_envelope::{self, Context, FieldEnvelope},
     rotation::KekSource,
 };
+
+/// One durable fleet-wide send generation. Not Clone: completion consumes it.
+/// No automatic expiry/refund: cancellation or uncertain persistence can leave
+/// the budget busy. Recovery requires proving the old sender is quiescent before a
+/// separately authorized repair; a time-based lease cannot establish that.
+pub struct OutboundClaim(pub(crate) i64);
 
 /// Dedicated table the envelope context binds to.
 pub const LINK_TABLE: &str = "listenbrainz_links";

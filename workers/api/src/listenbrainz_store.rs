@@ -12,7 +12,7 @@ use crate::{
     account_deletion::FencedWriteOutcome,
     field_envelope::FieldEnvelope,
     handlers::StoreError,
-    listenbrainz::{RewrapOutcome, StoredLink, Username},
+    listenbrainz::{OutboundClaim, RewrapOutcome, StoredLink, Username},
 };
 
 // Initialization grants nothing and never resets an existing cooldown. Keep
@@ -29,36 +29,68 @@ async fn initialize_outbound(client: &Client) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Atomically spend the one fleet-wide outbound slot. Materialized dependencies
-/// force the clock sample AFTER row locking, so a queued winner still spends a
-/// fresh interval. Rounding up plus strict expiry avoids sub-millisecond bursts.
-/// A failed/denied claim is never permission to send. No refund after an
-/// uncertain send. Both statements may run on pooled connections independently;
-/// only the locked statement decides admission and holds the lock until write.
-pub(crate) async fn claim_outbound(client: &Client) -> Result<bool, StoreError> {
+/// Atomically spend the fleet-wide slot AND reserve its full response cycle.
+/// Materialized dependencies sample the clock after locking. A busy claim has
+/// no automatic expiry: even a delayed sender excludes later requests until
+/// cooldown persistence succeeds. Pooled connections need no session affinity.
+pub(crate) async fn claim_outbound(client: &Client) -> Result<Option<OutboundClaim>, StoreError> {
     initialize_outbound(client).await?;
     let interval_ms = i64::try_from(crate::listenbrainz::MIN_REQUEST_INTERVAL_S * 1000)
         .map_err(|_| StoreError)?;
     let rows = client
         .query_typed(
             "WITH locked AS MATERIALIZED \
-             (SELECT singleton, next_allowed_at_ms FROM listenbrainz_outbound_rate \
-              WHERE singleton = TRUE FOR UPDATE), \
+             (SELECT singleton, next_allowed_at_ms, in_flight, generation \
+              FROM listenbrainz_outbound_rate WHERE singleton = TRUE FOR UPDATE), \
              clock AS MATERIALIZED \
-             (SELECT singleton, next_allowed_at_ms, \
-              ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms FROM locked) \
-             UPDATE listenbrainz_outbound_rate AS budget SET next_allowed_at_ms = clock.ms + $1 \
+             (SELECT *, ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms \
+              FROM locked) \
+             UPDATE listenbrainz_outbound_rate AS budget SET \
+             next_allowed_at_ms = clock.ms + $1, in_flight = TRUE, generation = clock.generation + 1 \
              FROM clock WHERE budget.singleton = clock.singleton \
-             AND clock.next_allowed_at_ms < clock.ms RETURNING budget.singleton",
+             AND NOT clock.in_flight AND clock.generation < 9223372036854775807 \
+             AND clock.next_allowed_at_ms < clock.ms RETURNING budget.generation",
             &[(&interval_ms, Type::INT8)],
         )
         .await
         .map_err(|_| StoreError)?;
-    match rows.len() {
-        0 => Ok(false),
-        1 => Ok(true),
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(Some(OutboundClaim(row.try_get(0).map_err(|_| StoreError)?))),
         _ => Err(StoreError),
     }
+}
+
+/// Only the matching busy generation may atomically persist the cooldown and
+/// release the sender. SQL failure rolls back BOTH changes; a timeout with an
+/// unknown commit result never authorizes a retry or success. No initialization
+/// here: an absent row is a lost claim, not a fresh budget. Saturate to deny.
+pub(crate) async fn finish_outbound(
+    client: &Client,
+    claim: OutboundClaim,
+    wait_s: u64,
+) -> Result<(), StoreError> {
+    let wait_ms = wait_s.saturating_mul(1000).min(i64::MAX as u64) as i64;
+    let rows = client
+        .query_typed(
+            "WITH locked AS MATERIALIZED \
+             (SELECT singleton, next_allowed_at_ms, in_flight, generation \
+              FROM listenbrainz_outbound_rate WHERE singleton = TRUE FOR UPDATE), \
+             clock AS MATERIALIZED \
+             (SELECT *, ceil(extract(epoch FROM clock_timestamp()) * 1000) AS ms FROM locked) \
+             UPDATE listenbrainz_outbound_rate AS budget SET next_allowed_at_ms = \
+             GREATEST(clock.next_allowed_at_ms, \
+              LEAST(clock.ms + $1::numeric, 9223372036854775807)::bigint), in_flight = FALSE \
+             FROM clock WHERE budget.singleton = clock.singleton \
+             AND clock.in_flight AND clock.generation = $2 RETURNING budget.singleton",
+            &[(&wait_ms, Type::INT8), (&claim.0, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() != 1 {
+        return Err(StoreError);
+    }
+    Ok(())
 }
 
 /// Persist a relative provider cooldown using the database's clock, never

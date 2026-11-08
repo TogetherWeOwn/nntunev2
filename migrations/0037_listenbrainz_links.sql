@@ -16,5 +16,7 @@ CREATE TABLE IF NOT EXISTS public.listenbrainz_links (
 -- No credentials, user identifiers or response metadata are stored here.
 CREATE TABLE IF NOT EXISTS public.listenbrainz_outbound_rate (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    next_allowed_at_ms BIGINT NOT NULL CHECK (next_allowed_at_ms >= 0)
+    next_allowed_at_ms BIGINT NOT NULL CHECK (next_allowed_at_ms >= 0),
+    in_flight BOOLEAN NOT NULL DEFAULT FALSE,
+    generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0)
 );
