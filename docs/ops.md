@@ -1142,6 +1142,44 @@ Evidence records contain names, version identifiers, commit SHAs, and run
 or health-check URLs only. Do not record account IDs, tokens, credentials,
 database URLs, environment values, or personal login identities in them.
 
+## Genre mirror refresh intent (disabled)
+
+The additive CC0 genre projection is prepared by
+[`containers/genre-mirror/materialize.py`](../containers/genre-mirror/materialize.py),
+using the existing offline extractor and a reviewed Product-owned root config.
+See its [input, provenance and resource contract](../containers/genre-mirror/README.md).
+Follow AGENTS.md **“Clean-room, YouTube and MetaBrainz guardrails”**: no
+MusicBrainz supplementary genre/tag data, NC replication packets or MLHD+.
+
+Intended cadence, **not enabled here**: twice weekly alongside the existing
+CC0 mirror dump refresh. Bind the extract, artist mirror and playable cohort to
+the same snapshot; validate all digests/config/references and inspect unresolved,
+capped, cyclic and broad-multi diagnostics before atomic publication. Retain
+config hash, taxonomy version, extract identity and the previous validated
+materialization for diagnosis/rebuild. Invalid preparation leaves the previous
+snapshot in place; an apply error rolls back the whole refresh. Rollback is a
+separately authorized replay of a compatible previous snapshot, never a destructive
+schema rollback or an assumed restore.
+
+The intended schema remains a non-executable design pending the actual complete
+ordered predecessor source; this preparation adds no migration or alternate DDL.
+Reconcile existing reservations and the manifest prefix before numbered schema
+integration and disposable Actions replay/rollback tests. No database behavior
+or apply evidence is claimed here. An authorized apply window must verify importer ownership and
+least-privilege reader SELECT, namespace/target identity, actual tracking receipts
+and same-build compatibility under the normal migration/release gates. The
+prepared `refresh.sql` is inert output, not permission to execute it. No live
+migration, database read/write, scheduler, workflow trigger, credential or runtime
+service is created. Existing mirror URL allowlists are unchanged.
+
+Manual/file-tag values are represented for precedence only; ingestion remains
+unauthorized. The offline coverage adapter measures its supplied Wikidata/cohort
+snapshot, not existing manual database rows. Later full coverage must export the
+manual-wins `artist_genre_root` view for the same actual playable cohort. Neither
+fixtures nor the popularity proxy establish the >=80% actual-artist gate. Until
+that later measurement and review, keep genre UI inactive and curated shelves as
+the below-gate degradation; no play weighting without actual plays.
+
 ## Operator runbook: enabling staging-mb / staging-ingest
 
 Operator-owned actions only. No secrets in the repo or the workflow: Worker
