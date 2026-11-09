@@ -25,7 +25,8 @@ NNTune is intended for invite-only listening from a shared, curated catalogue.
 The listening model is FLAC first, then an official YouTube video embed where
 a suitable video is available; otherwise the track is unavailable. Unavailable
 tracks are hidden by default. YouTube remains a visible video feature, never
-an audio-only or background-playback source, and watching it is not paywalled.
+an audio-only or background-playback source, and it is never sold, upsold or
+gated as a separate paid extra.
 
 The initial scope is one concurrent stream per user and private playlists.
 The staging subscription journey uses payment test mode; it does not activate
