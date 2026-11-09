@@ -551,7 +551,7 @@ class MaterializeTests(unittest.TestCase):
             item("Q111", "synthetic sibling anchor", {"P279": [("Q100", "normal")]}),
         ]
         fixture = self.fresh("ranked-fixture")
-        fixture.write_text(json.dumps(entities), "utf-8")
+        fixture.write_text("[\n" + ",\n".join(json.dumps(entity) for entity in entities) + "\n]\n", "utf-8")
         extract = self.fresh("ranked-extract")
         done = run_py(EXTRACT, "--input", fixture, "--output", extract, "--dump-version", "synthetic-v1")
         self.assertEqual(done.returncode, 0, done.stderr)
