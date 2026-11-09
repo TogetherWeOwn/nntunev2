@@ -16,7 +16,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Media loading stays pending locally. Only the native transport boundary is
  * mocked; queue/history/session persistence and the Svelte page remain real.
- * All backend/telemetry/external requests are rejected and asserted absent.
+ * All backend/external requests are rejected and asserted absent. The one
+ * intentional exception is the private listen-lifecycle POST /v1/plays/events
+ * that real `playing` events send: only that exact local request is answered
+ * (401, so the sender stays quiet). Mocked lifecycle requests are excluded
+ * from the no-backend assertion; everything else is still rejected and asserted.
  * Synthetic media events are not evidence of real streams, audio output, OS
  * media controls, or OS IME. This suite adds no operational API or CLI.
  *
@@ -98,6 +102,9 @@ async function open(page: Page, options: {
 		if (url.origin !== localOrigin) {
 			calls.push(`external ${request.method()} ${url.pathname}`);
 			await route.abort();
+		} else if (request.method() === 'POST' && url.pathname === '/v1/plays/events' && url.search === '') {
+			// Intentional listen lifecycle from real playing events; nothing else is allowed through.
+			await route.fulfill({ status: 401, contentType: 'application/json', body: '{}' });
 		} else if (request.method() !== 'GET' || ['xhr', 'fetch'].includes(request.resourceType())) {
 			calls.push(`${request.method()} ${url.pathname}`);
 			await route.abort();
@@ -183,7 +190,7 @@ async function open(page: Page, options: {
 }
 const backendCalls = new WeakMap<Page, string[]>();
 test.afterEach(async ({ page }) => {
-	expect(backendCalls.get(page) ?? [], 'no backend, telemetry or external requests').toEqual([]);
+	expect(backendCalls.get(page) ?? [], 'no backend or external requests besides the mocked listen lifecycle POST').toEqual([]);
 });
 
 async function transport(page: Page) {

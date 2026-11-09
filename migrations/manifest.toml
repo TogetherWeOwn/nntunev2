@@ -177,3 +177,8 @@ sha256 = "fcca71547ad14366c7ba7d37920fba476fa6237b40ee8986ecee3d19f604efc0"
 file = "0036_library_shared_owner.sql"
 target = "app"
 sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
+
+[[migration]]
+file = "0037_listen_history.sql"
+target = "app"
+sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"

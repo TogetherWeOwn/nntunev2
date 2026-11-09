@@ -2853,6 +2853,115 @@ impl Store for PgStore {
         .await
     }
 
+    async fn record_listen_event(
+        &self,
+        user_id: &str,
+        event: &crate::listen_history::ListenEventBody,
+        now: u64,
+    ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+        use crate::listen_history::WriteOutcome;
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::listen_history::INSERT_SQL,
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&event.playback_id, Type::TEXT),
+                            (&event.track_id, Type::TEXT),
+                            (&event.event.as_str(), Type::TEXT),
+                            (&event.event.phase(), Type::INT2),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_write"))?;
+                if rows.len() == 1 {
+                    return Ok(WriteOutcome::Written);
+                }
+                let fence = client
+                    .query_opt(
+                        crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
+                        &[&user_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                match fence {
+                    Some(row) if row.try_get::<_, bool>("deleting").map_err(|_| StoreError)? => {
+                        Ok(WriteOutcome::AccountDeleting)
+                    }
+                    Some(_) => Ok(WriteOutcome::Conflict),
+                    None => Err(StoreError),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn export_listen_events(
+        &self,
+        user_id: &str,
+        before_id: Option<i64>,
+    ) -> Result<Vec<crate::listen_history::ListenRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let limit = (crate::listen_history::EXPORT_PAGE_SIZE + 1) as i64;
+                let rows = client
+                    .query_typed(
+                        crate::listen_history::EXPORT_SQL,
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&before_id, Type::INT8),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_export"))?;
+                rows.iter()
+                    .map(|row| {
+                        let event: String = row.try_get("event").map_err(|_| StoreError)?;
+                        let event = match event.as_str() {
+                            "start" => crate::listen_history::ListenEvent::Start,
+                            "complete" => crate::listen_history::ListenEvent::Complete,
+                            "skip" => crate::listen_history::ListenEvent::Skip,
+                            _ => return Err(StoreError),
+                        };
+                        Ok(crate::listen_history::ListenRow {
+                            id: row
+                                .try_get::<_, i64>("id")
+                                .map_err(|_| StoreError)?
+                                .to_string(),
+                            playback_id: row.try_get("playback_id").map_err(|_| StoreError)?,
+                            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+                            event,
+                            recorded_at: row.try_get("recorded_at").map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn delete_listen_events(&self, user_id: &str) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(crate::listen_history::DELETE_SQL, &[&user_id])
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_delete"))?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn playback_lease(
         &self,
         user_id: &str,

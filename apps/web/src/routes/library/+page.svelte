@@ -13,6 +13,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+	import { listenEvents } from '#lib/player/listenEventsAction.js';
 	import {
 		clearFavoritesAtAuthBoundary,
 		loadFavorites,
@@ -2577,6 +2578,7 @@
 						data-testid="audio-player"
 						controls
 						src={streamUrl}
+						use:listenEvents={() => currentTrack?.id}
 						onplay={handlePlay}
 						onplaying={handlePlay}
 						onpause={handlePause}

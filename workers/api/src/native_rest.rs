@@ -558,7 +558,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/playlists" {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/plays" {
+            if path == "/v1/plays" || path == crate::listen_history::EVENTS_PATH {
                 return Bearer(Scope::PlaysWrite);
             }
             if path == "/v1/ingest" || path.starts_with("/v1/ingest/") {

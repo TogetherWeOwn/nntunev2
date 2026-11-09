@@ -42,7 +42,8 @@ for f in "${migrations[@]}"; do
 done
 for f in "${tests[@]}"; do
   echo "test:    ${f#"$root"/}"
-  psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
+  psql_run -v listen_history_insert_sql="$(<"$root/workers/api/src/listen_history_insert.sql")" \
+    -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
     -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" -f "$f"
 done
 echo "migration tests passed"
