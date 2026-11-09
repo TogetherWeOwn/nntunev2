@@ -28,13 +28,13 @@ extract, actual library export, live query or refresh job is commissioned.
 Inputs must be immutable during the operation. It is trusted offline filesystem
 tooling, not a concurrent multi-user filesystem security boundary.
 
-`schema.sql` is **candidate mirror DDL**, deliberately outside `migrations/`.
-It is not a numbered migration, manifest entry, reservation or an apply command.
-Existing reservations and ordered prefix integration must be reconciled before
-promoting these bytes through the normal migration manifest/review/apply gates.
-Never copy predecessor migrations, skip slots or run the candidate against a
-live database to evade those gates. Actions alone applies it in a disposable
-fixture database; this is schema behavior evidence, not staging apply evidence.
+DDL remains a **non-executable design**, outside this source tree, until the
+actual integration source contains the complete immutable predecessor history.
+This source does not install a schema, append a migration/manifest entry or
+prove database behavior. Existing reservations and ordered prefix integration
+must be reconciled before adding the genuine migration and its disposable
+Actions replay/rollback tests through the normal review/apply gates. Never copy
+predecessor migrations, skip slots or use an alternate schema to evade them.
 
 ### Input contracts and bounds
 
@@ -66,8 +66,10 @@ fixture database; this is schema behavior evidence, not staging apply evidence.
 The extractor's **normal + preferred statement-membership** semantics remain
 unchanged; rank is not present in interchange v1 and cannot be reconstructed.
 This source preparation must not be described as truthy/best-rank extraction.
-Any Product best-rank requirement needs explicit contract reconciliation before
-complete integration is claimed. P31 is never traversed.
+Product v1 accepts this union for P279 and P136/P434 admission, excluding
+deprecated/non-value claims and ignoring qualifiers/references. Both normal and
+preferred rows remain when they coexist; a future best-rank requirement needs
+a new producer contract, never consumer inference. P31 is never traversed.
 
 ### Cohort and coverage adapter
 
@@ -92,8 +94,13 @@ real measurement. Coverage JSON contains only mirrored artists' resolved roots.
 `coverage.json` conforms to the existing [coverage v1 contract](../../docs/genre-root-coverage.md).
 That contract accepts hyphens, not underscores. The adapter maps canonical
 `hip_hop` to transport `hip-hop` (likewise other underscore IDs), validates
-collision-free slugs and records the complete map in provenance. It never
-renames a Product ID or changes the calculator. `dataset_kind` is a caller
+collision-free slugs across all active **and retired** reserved IDs, and rejects
+invalid/unmapped membership references before filtering artists. Only active
+roots enter the resolved set; null memberships stay null. The separate manifest
+records adapter `nntune.genre-coverage-adapter.v1` and the full forward/reverse
+map, bound to config/taxonomy, validated producer manifest, cohort identity and
+coverage input/report digests. No metadata is added to the strict v1 payload.
+It never renames a Product ID or changes the calculator. `dataset_kind` is a caller
 assertion, not attestation; `real_data_gate` remains `not_evaluated` even for
 `actual-export`. Fixtures/popularity never establish >=80% actual-playable-artist
 coverage. Later real measurement needs complete same-snapshot actual N-ingest
@@ -103,9 +110,12 @@ play weighting needs actual play data and is not implemented here.
 ## Outputs and refresh integrity
 
 A new output directory holds `refresh.sql`, `genre_rollup.jsonl`, diagnostics,
-coverage input, the original extract manifest and a final `manifest.json` marker.
-The marker binds config bytes, taxonomy version, extract manifest, cohort and
-output digests, without timestamps or host paths. Numeric QID order then root
+coverage input, `coverage-report.json` from the existing calculator, the original
+extract manifest and a final `manifest.json` provenance sidecar/completion marker.
+The marker binds config bytes, taxonomy version, the complete validated producer
+manifest (schema/version, extractor-source SHA, source/licence/dump, input SHA and
+row digests), cohort and output digests, without timestamps or host paths. Hashes
+prove consistency, not origin authenticity. Numeric QID order then root
 sort order is deterministic. Same inputs produce identical bytes. Existing
 directories/symlinks refuse unchanged; a failed run removes only its own newly
 created directory. Consumers refuse partial directories lacking the marker.
@@ -123,8 +133,10 @@ ancestry becomes unresolved, never a fallback to lower-priority assignments.
 Generated `coverage.json` measures the supplied Wikidata snapshot only, **not**
 pre-existing manual/file-tag database rows. A later full database export must
 read `artist_genre_root` for those; do not call this offline file an after-all-legs
-real-data measurement. Re-applying a fixture produces the same logical state;
-failures roll back the whole refresh. No grants or automatic runtime are added.
+real-data measurement. Numbered integration must verify identical logical state
+on fixture replay and whole-refresh rollback on failure against the actual
+schema. Those database behaviors are intended, not proved by this schema-free
+preparation. No grants or automatic runtime are added.
 
 `GET /v1/genres` is an authenticated empty read stub, not a live mirror read or
 a coverage assertion. It follows W9 session-or-bearer `library:read`, bare-array,
@@ -134,9 +146,9 @@ per-genre detail, UI or changes to `/api/library`/the M1 journey are introduced.
 ## Verification
 
 GitHub Actions `mb-import-etl` runs resolver and materialization tests; the
-existing disposable Postgres `mb-import` job tests candidate schema replay,
-fixture refresh replay, manual precedence and rollback. API tests run in the
-existing Rust jobs. Full suites/CI gates run only on Actions, not locally;
+database replay/rollback harness must be integrated with the actual ordered
+migration before DB-backed integration is complete; it is not wired to a
+candidate schema here. API tests run in the existing Rust jobs. Full suites/CI gates run only on Actions, not locally;
 focused reproduction follows [CONTRIBUTING.md](../../CONTRIBUTING.md#verification-github-actions-first).
 No schema test uses staging or production.
 

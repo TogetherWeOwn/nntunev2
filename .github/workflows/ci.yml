@@ -961,12 +961,6 @@ jobs:
           # These pre-convention migrations carry no search_path header, so pin
           # the session exactly like workers/api/tests/run_migration_tests.sh.
           PGOPTIONS: '-c search_path=public,pg_catalog'
-      - name: Test genre candidate schema and atomic fixture refresh in disposable Postgres
-        run: |
-          createdb --host=localhost --username=postgres genre_ci
-          python3 -I containers/genre-mirror/tests/test_schema.py
-        env:
-          GENRE_TEST_DATABASE_URL: host=localhost port=5432 user=postgres dbname=genre_ci
       - name: Run import integration suite in the shipped image
         run: >-
           docker run --rm --network host

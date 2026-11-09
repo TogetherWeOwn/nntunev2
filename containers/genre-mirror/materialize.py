@@ -14,7 +14,10 @@ import uuid
 
 # Isolated-mode CLI imports only this trusted source sibling, never the input directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rollup import resolve
+from rollup import ROOT_ID_RE, resolve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from genre_root_coverage import calculate
 
 MAX_BYTES = 32 * 1024**2
 MAX_ROWS = 50_000
@@ -83,7 +86,7 @@ def load_extract(directory):
     raw_manifest = read_bounded(directory / "manifest.json", 1024**2)
     manifest = decode(raw_manifest)
     shape(manifest, ("schema", "extractor_version", "extractor_sha256", "source", "input", "language", "limits", "counts", "outputs"))
-    if manifest["schema"] != "nntune.genre-extract.v1" or type(manifest["extractor_version"]) is not int or manifest["extractor_version"] != 1:
+    if manifest["schema"] != "nntune.genre-extract.v1" or manifest["extractor_version"] != "1":
         raise ValueError("unsupported extract version")
     shape(manifest["source"], ("name", "license", "dump_version"))
     if (manifest["source"]["name"] != "wikidata" or manifest["source"]["license"] != "CC0-1.0"
@@ -170,14 +173,39 @@ def coverage_payload(cohort, roots, artist_roots):
     playable = {mbid(x) for x in cohort["playable_artist_mbids"]}
     if not playable <= artists:
         raise ValueError("playable artists absent from artist mirror export")
-    # Coverage v1 uses hyphen slugs. This transport map never renames canonical IDs.
-    mapping = {r["root_id"]: r["root_id"].replace("_", "-") for r in roots if not r.get("retired", False)}
-    if len(set(mapping.values())) != len(mapping) or any(not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", x) for x in mapping.values()):
-        raise ValueError("root transport collision or invalid coverage slug")
+    # Reserve transport IDs for retired roots too; never rename canonical IDs.
+    if type(roots) is not list:
+        raise ValueError("invalid coverage roots")
+    mapping, active, slugs = {}, set(), set()
+    for root in roots:
+        if type(root) is not dict:
+            raise ValueError("invalid coverage root")
+        canonical = root.get("root_id")
+        retired = root.get("retired", False)
+        if (type(canonical) is not str or not ROOT_ID_RE.fullmatch(canonical)
+                or canonical in mapping or type(retired) is not bool):
+            raise ValueError("invalid or duplicate canonical root")
+        slug = canonical.replace("_", "-")
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", slug) or slug in slugs:
+            raise ValueError("root transport collision or invalid coverage slug")
+        mapping[canonical] = slug
+        slugs.add(slug)
+        if not retired:
+            active.add(canonical)
+    if type(artist_roots) is not list:
+        raise ValueError("invalid coverage memberships")
+    memberships = []
+    for row in artist_roots:
+        shape(row, ("artist_mbid", "root_id"))
+        artist = mbid(row["artist_mbid"])
+        root = row["root_id"]
+        if root is not None and (type(root) is not str or root not in active):
+            raise ValueError("unmapped or retired coverage root reference")
+        if artist in artists:
+            memberships.append({"artist_mbid": artist, "root_id": None if root is None else mapping[root]})
     return ({"schema_version": 1, "dataset_kind": cohort["dataset_kind"],
-             "playable_artist_mbids": sorted(playable), "resolved_root_ids": sorted(mapping.values()),
-             "memberships": [{"artist_mbid": row["artist_mbid"], "root_id": mapping[row["root_id"]]}
-                             for row in artist_roots if row["artist_mbid"] in artists]}, mapping, artists)
+             "playable_artist_mbids": sorted(playable), "resolved_root_ids": sorted(mapping[r] for r in active),
+             "memberships": memberships}, mapping, artists)
 
 
 def literal(value):
@@ -224,10 +252,14 @@ def materialize(extract, config_path, cohort_path, output):
     identity = {"schema": "nntune.genre-mirror.v1", "extract_manifest_sha256": extract_id,
                 "config_sha256": digest(config_raw), "taxonomy_version": config["taxonomy_version"],
                 "cohort_sha256": digest(cohort_raw), "dataset_kind": cohort["dataset_kind"],
-                "source": manifest["source"], "real_data_gate": "not_evaluated",
+                "source": manifest["source"], "producer": manifest, "real_data_gate": "not_evaluated",
                 "coverage_root_id_map": mapping,
+                "coverage_adapter": {"schema": "nntune.genre-coverage-adapter.v1",
+                                     "canonical_to_coverage": mapping,
+                                     "coverage_to_canonical": {v: k for k, v in mapping.items()}},
                 "unmatched_artist_mbids": sorted({r["artist_mbid"] for r in memberships} - artists)}
-    payloads = {"coverage.json": encode(coverage), "diagnostics.json": encode(result["diagnostics"]),
+    payloads = {"coverage.json": encode(coverage), "coverage-report.json": encode(calculate(coverage)),
+                "diagnostics.json": encode(result["diagnostics"]),
                 "genre_rollup.jsonl": b"".join(encode(r) for r in result["genre_rollup"]),
                 "refresh.sql": refresh_sql(tables["genres.jsonl"], memberships, result, config, identity),
                 "extract-manifest.json": encode(manifest)}

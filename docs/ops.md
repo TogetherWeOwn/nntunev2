@@ -1161,9 +1161,11 @@ snapshot in place; an apply error rolls back the whole refresh. Rollback is a
 separately authorized replay of a compatible previous snapshot, never a destructive
 schema rollback or an assumed restore.
 
-`schema.sql` is candidate source, not a numbered/applied migration. Reconcile
-existing migration reservations and the ordered manifest prefix before schema
-integration. An authorized apply window must verify importer ownership and
+The intended schema remains a non-executable design pending the actual complete
+ordered predecessor source; this preparation adds no migration or alternate DDL.
+Reconcile existing reservations and the manifest prefix before numbered schema
+integration and disposable Actions replay/rollback tests. No database behavior
+or apply evidence is claimed here. An authorized apply window must verify importer ownership and
 least-privilege reader SELECT, namespace/target identity, actual tracking receipts
 and same-build compatibility under the normal migration/release gates. The
 prepared `refresh.sql` is inert output, not permission to execute it. No live

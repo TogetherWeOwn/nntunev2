@@ -5,6 +5,7 @@ names and the cohort below are invented. Nothing here touches a database.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ MIRROR = HERE.parent
 MATERIALIZE = MIRROR / "materialize.py"
 EXTRACT = MIRROR.parent / "genre-extract" / "extract.py"
 FIXTURE = MIRROR.parent / "genre-extract" / "tests" / "fixtures" / "synthetic.json"
+SCRIPTS = MIRROR.parents[1] / "scripts"
 TIMEOUT = 120
 REFUSAL = "genre-mirror: refused invalid, incomplete or over-budget input/output\n"
 
@@ -27,7 +29,23 @@ A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 B = "22222222-2222-4222-8222-222222222222"
 C = "66666666-6666-4666-8666-666666666666"
 D = "55555555-5555-4555-8555-555555555555"
+E = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 REASON = "it's a \\ test ünï ☃"
+
+
+# Trusted in-repo modules only (stdlib-only Python); the CLI tests below stay black-box.
+sys.path.insert(0, str(MIRROR))
+import materialize  # noqa: E402
+
+
+def _load_calculator():
+    spec = importlib.util.spec_from_file_location("genre_root_coverage_under_test", SCRIPTS / "genre_root_coverage.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+COVERAGE = _load_calculator()
 
 
 def config():
@@ -135,8 +153,9 @@ class MaterializeTests(unittest.TestCase):
     def test_outputs_checksums_and_provenance(self):
         out = self.ok()
         files = tree(out)
-        self.assertEqual(set(files), {"coverage.json", "diagnostics.json", "genre_rollup.jsonl", "refresh.sql",
-                                      "extract-manifest.json", "manifest.json"})
+        self.assertEqual(set(files), {"coverage.json", "coverage-report.json", "diagnostics.json",
+                                      "genre_rollup.jsonl", "refresh.sql", "extract-manifest.json",
+                                      "manifest.json"})
         manifest = json.loads(files["manifest.json"])
         self.assertEqual(manifest["schema"], "nntune.genre-mirror.v1")
         self.assertEqual(manifest["extract_manifest_sha256"], sha((self.extract / "manifest.json").read_bytes()))
@@ -149,6 +168,13 @@ class MaterializeTests(unittest.TestCase):
         self.assertEqual(set(manifest["outputs"]), set(files) - {"manifest.json"})
         for name, receipt in manifest["outputs"].items():
             self.assertEqual(receipt, {"sha256": sha(files[name]), "bytes": len(files[name])}, name)
+        # Provenance binds the validated, complete original extractor manifest.
+        self.assertEqual(manifest["producer"], json.loads((self.extract / "manifest.json").read_text("utf-8")))
+        # Coverage input and report digests are bound and the report is the strict calculator's output.
+        coverage = json.loads(files["coverage.json"])
+        self.assertEqual(files["coverage-report.json"], materialize.encode(COVERAGE.calculate(coverage)))
+        self.assertEqual(manifest["outputs"]["coverage.json"]["sha256"], sha(files["coverage.json"]))
+        self.assertEqual(manifest["outputs"]["coverage-report.json"]["sha256"], sha(files["coverage-report.json"]))
 
     def test_byte_deterministic_across_directories(self):
         first, second = self.ok(), self.ok()
@@ -185,7 +211,15 @@ class MaterializeTests(unittest.TestCase):
         })
         manifest = json.loads((out / "manifest.json").read_text("utf-8"))
         self.assertEqual(manifest["coverage_root_id_map"],
-                         {"test_branch": "test-branch", "test_loop": "test-loop", "test_root": "test-root"})
+                         {"test_branch": "test-branch", "test_loop": "test-loop", "test_old": "test-old",
+                          "test_root": "test-root"})
+        self.assertEqual(manifest["coverage_adapter"], {
+            "schema": "nntune.genre-coverage-adapter.v1",
+            "canonical_to_coverage": manifest["coverage_root_id_map"],
+            "coverage_to_canonical": {"test-branch": "test_branch", "test-loop": "test_loop",
+                                      "test-old": "test_old", "test-root": "test_root"},
+        })
+        self.assertNotIn("test-old", coverage["resolved_root_ids"])  # retired: mapped, never resolved
         self.assertEqual(manifest["unmatched_artist_mbids"], [])
 
     def test_unmatched_artists_filtered_from_coverage_only(self):
@@ -259,7 +293,9 @@ class MaterializeTests(unittest.TestCase):
             "row count": rows_plus_one,
             "missing manifest": lambda d: (d / "manifest.json").unlink(),
             "missing data file": lambda d: (d / "genre_parents.jsonl").unlink(),
-            "unknown version": edit_manifest(["extractor_version"], 2),
+            "unknown version": edit_manifest(["extractor_version"], "2"),
+            "integer version": edit_manifest(["extractor_version"], 1),
+            "integer unknown version": edit_manifest(["extractor_version"], 2),
             "boolean version": edit_manifest(["extractor_version"], True),
             "invalid input identity": edit_manifest(["input", "sha256"], "bad"),
             "invalid limit count": edit_manifest(["limits", "max_depth"], True),
@@ -313,6 +349,9 @@ class MaterializeTests(unittest.TestCase):
             "absent active anchors": bad_config(lambda c: c["roots"][0].update(anchors=["Q107"])),
             "hyphenated canonical root id": bad_config(lambda c: c["roots"].append(
                 {"root_id": "test-root", "display_name": "x", "sort_order": 9, "anchors": ["Q101"]})),
+            "hyphenated retired root vs underscore id": bad_config(lambda c: c["roots"].append(
+                {"root_id": "test-root", "display_name": "x", "sort_order": 9, "anchors": ["Q900011"],
+                 "retired": True})),
             "playable not in artists": bad_cohort(cohort(artists=(A,), playable=(A, C))),
             "bad dataset kind": bad_cohort(dict(good, dataset_kind="production")),
             "bad cohort schema": bad_cohort(dict(good, schema="other")),
@@ -358,6 +397,184 @@ class MaterializeTests(unittest.TestCase):
         (extract / "genres.jsonl").rename(extract / "real.jsonl")
         (extract / "genres.jsonl").symlink_to(extract / "real.jsonl")
         self.assertFalse(self.refused(extract=extract).exists())
+
+    # ---- coverage adapter: direct payload contract -------------------------------------------
+
+    @staticmethod
+    def roots(*ids, retired=()):
+        return [dict(root_id=i, display_name=i, sort_order=n, anchors=["Q1"], **({"retired": True} if i in retired else {}))
+                for n, i in enumerate(ids, 1)]
+
+    def payload(self, roots, memberships, artists=(A, B), playable=(A,)):
+        return materialize.coverage_payload(cohort(artists=artists, playable=playable), roots, memberships)
+
+    def test_payload_underscore_and_simple_ids(self):
+        coverage, mapping, artists = self.payload(
+            self.roots("rock", "a_b_c", "r2d2", "x" * 32),
+            [{"artist_mbid": A, "root_id": "a_b_c"}, {"artist_mbid": B, "root_id": "rock"}])
+        self.assertEqual(mapping, {"rock": "rock", "a_b_c": "a-b-c", "r2d2": "r2d2", "x" * 32: "x" * 32})
+        self.assertEqual(coverage["resolved_root_ids"], sorted(mapping.values()))
+        self.assertEqual(coverage["memberships"], [{"artist_mbid": A, "root_id": "a-b-c"},
+                                                   {"artist_mbid": B, "root_id": "rock"}])
+        self.assertEqual(artists, {A, B})
+        COVERAGE.calculate(coverage)  # strict v1 acceptance
+
+    def test_payload_retired_mapped_but_not_resolved(self):
+        coverage, mapping, _ = self.payload(self.roots("keep", "gone_one", retired={"gone_one"}),
+                                            [{"artist_mbid": A, "root_id": "keep"}])
+        self.assertEqual(mapping, {"keep": "keep", "gone_one": "gone-one"})
+        self.assertEqual({v: k for k, v in mapping.items()}, {"keep": "keep", "gone-one": "gone_one"})
+        self.assertEqual(coverage["resolved_root_ids"], ["keep"])
+
+    def test_payload_invalid_duplicate_and_unmapped_roots_refused(self):
+        for label, roots in {
+            "duplicate": self.roots("dup", "dup"),
+            "duplicate across retired": self.roots("dup", "dup", retired={"dup"}),
+            "uppercase": self.roots("Bad"),
+            "hyphen": self.roots("a-b"),
+            "empty": self.roots(""),
+            "too long": self.roots("x" * 33),
+            "slug starts with digit": self.roots("1abc"),
+            "slug starts with underscore": self.roots("_abc"),
+            "hyphen vs underscore": self.roots("test_root", "test-root"),
+            "hyphen vs retired underscore": self.roots("test-root", "test_root", retired={"test_root"}),
+        }.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.payload(roots, [])
+        roots = self.roots("keep", "gone", retired={"gone"})
+        for label, row in {
+            "unmapped": {"artist_mbid": A, "root_id": "nope"},
+            "unmapped on nonmirror artist": {"artist_mbid": C, "root_id": "nope"},
+            "invalid grammar on nonmirror artist": {"artist_mbid": C, "root_id": "Bad-Id"},
+            "slug form is not canonical": {"artist_mbid": A, "root_id": "ke-ep"},
+            "retired membership": {"artist_mbid": A, "root_id": "gone"},
+            "retired membership on nonmirror artist": {"artist_mbid": C, "root_id": "gone"},
+        }.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.payload(roots, [row])
+
+    def test_payload_null_memberships_preserved_and_mbids_normalized(self):
+        coverage, _, artists = self.payload(
+            self.roots("keep"),
+            [{"artist_mbid": A, "root_id": None}, {"artist_mbid": B.upper(), "root_id": "keep"},
+             {"artist_mbid": C, "root_id": "keep"}, {"artist_mbid": C, "root_id": None}])
+        self.assertEqual(coverage["memberships"], [{"artist_mbid": A, "root_id": None},
+                                                   {"artist_mbid": B, "root_id": "keep"}])
+        self.assertEqual(artists, {A, B})
+        self.assertEqual(COVERAGE.calculate(coverage)["artists_with_resolved_root"], 0)
+
+    def test_payload_dataset_kind_and_cohort_dedup(self):
+        value = cohort(artists=(A, A.upper(), B), playable=(A, A.upper()))
+        value["dataset_kind"] = "actual-export"
+        coverage, _, artists = materialize.coverage_payload(
+            value, self.roots("keep"), [{"artist_mbid": A, "root_id": "keep"}, {"artist_mbid": A.upper(), "root_id": "keep"}])
+        self.assertEqual(coverage["dataset_kind"], "actual-export")
+        self.assertEqual(coverage["playable_artist_mbids"], [A])
+        self.assertEqual(artists, {A, B})
+        for bad in (dict(value, dataset_kind="production"), dict(value, extra=1),
+                    cohort(artists=(A,), playable=(A, B))):
+            with self.assertRaises(ValueError):
+                materialize.coverage_payload(bad, self.roots("keep"), [])
+
+    def test_calculator_rejects_extra_keys_in_adapter_output(self):
+        coverage, _, _ = self.payload(self.roots("keep"), [{"artist_mbid": A, "root_id": "keep"}])
+        self.assertEqual(COVERAGE.calculate(coverage)["artists_with_resolved_root"], 1)
+        bad_member = dict(coverage, memberships=[dict(coverage["memberships"][0], extra=1)])
+        for label, bad in {"top": dict(coverage, extra=1), "membership": bad_member,
+                           "missing": {k: v for k, v in coverage.items() if k != "memberships"}}.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                COVERAGE.calculate(bad)
+
+    # ---- coverage adapter: CLI outputs -------------------------------------------------------
+
+    def test_coverage_report_and_provenance_deterministic(self):
+        first, second = self.ok(), self.ok()
+        report = json.loads((first / "coverage-report.json").read_text("utf-8"))
+        self.assertEqual((first / "coverage-report.json").read_bytes(), (second / "coverage-report.json").read_bytes())
+        self.assertEqual(report["metric"], "unique-playable-artist-count")
+        self.assertEqual((report["playable_artists"], report["artists_with_resolved_root"]), (2, 2))
+        self.assertEqual(report["unknown_root_ids_for_playable_artists"], [])
+        manifests = [json.loads((d / "manifest.json").read_text("utf-8")) for d in (first, second)]
+        self.assertEqual(manifests[0], manifests[1])
+        outputs = manifests[0]["outputs"]
+        self.assertEqual(outputs["coverage.json"]["sha256"], sha((first / "coverage.json").read_bytes()))
+        self.assertEqual(outputs["coverage-report.json"]["sha256"], sha((first / "coverage-report.json").read_bytes()))
+        # Changing the coverage input changes the bound digests.
+        path = self.root / "cohort-one.json"
+        write_json(path, cohort(artists=(A,), playable=(A,)))
+        other = json.loads((self.ok(cohort_path=path) / "manifest.json").read_text("utf-8"))
+        self.assertNotEqual(other["outputs"]["coverage.json"], outputs["coverage.json"])
+        self.assertNotEqual(other["outputs"]["coverage-report.json"], outputs["coverage-report.json"])
+        self.assertNotEqual(other["cohort_sha256"], manifests[0]["cohort_sha256"])
+
+    def test_unique_count_unchanged_by_duplicates_and_multiple_roots(self):
+        path = self.root / "cohort-dups.json"
+        write_json(path, cohort(artists=(A, A.upper(), B, C, D, C), playable=(A, C, C.upper(), A)))
+        out = self.ok(cohort_path=path)
+        report = json.loads((out / "coverage-report.json").read_text("utf-8"))
+        coverage = json.loads((out / "coverage.json").read_text("utf-8"))
+        # A holds two roots (test-root and test-branch) yet counts once.
+        self.assertGreater(sum(m["artist_mbid"] == A for m in coverage["memberships"]), 1)
+        self.assertEqual((report["playable_artists"], report["artists_with_resolved_root"],
+                          report["uncovered_artists"]), (2, 2, 0))
+
+    def test_actual_export_label_kept_but_real_data_gate_never_evaluated(self):
+        path = self.root / "cohort-actual.json"
+        write_json(path, dict(cohort(), dataset_kind="actual-export"))
+        out = self.ok(cohort_path=path)
+        manifest = json.loads((out / "manifest.json").read_text("utf-8"))
+        report = json.loads((out / "coverage-report.json").read_text("utf-8"))
+        self.assertEqual(manifest["dataset_kind"], "actual-export")
+        self.assertEqual(json.loads((out / "coverage.json").read_text("utf-8"))["dataset_kind"], "actual-export")
+        self.assertEqual(report["dataset_kind"], "actual-export")
+        self.assertEqual(manifest["real_data_gate"], "not_evaluated")
+        self.assertEqual(report["real_data_gate"], "not_evaluated")
+
+    # ---- rank union regression ---------------------------------------------------------------
+
+    def test_rank_union_preserves_both_roots_end_to_end(self):
+        def item(qid, name, claims):
+            def stmt(prop, target, rank):
+                return {"mainsnak": {"snaktype": "value", "property": prop, "datatype": "wikibase-item",
+                                     "datavalue": {"type": "wikibase-entityid",
+                                                   "value": {"entity-type": "item", "id": target}}},
+                        "type": "statement", "rank": rank}
+            return {"type": "item", "id": qid, "labels": {"en": {"language": "en", "value": name}},
+                    "claims": {prop: [stmt(prop, t, r) for t, r in values] for prop, values in claims.items()}}
+
+        entities = json.loads(FIXTURE.read_text("utf-8"))
+        for entity in entities:
+            if entity["id"] == "Q1":  # same artist: normal P136 values plus one preferred value
+                entity["claims"]["P136"].append(item("Q1", "x", {"P136": [("Q110", "preferred")]})["claims"]["P136"][0])
+        entities += [
+            item("Q110", "synthetic ranked genre", {"P279": [("Q102", "normal"), ("Q111", "preferred")]}),
+            item("Q111", "synthetic sibling anchor", {"P279": [("Q100", "normal")]}),
+        ]
+        fixture = self.fresh("ranked-fixture")
+        fixture.write_text(json.dumps(entities), "utf-8")
+        extract = self.fresh("ranked-extract")
+        done = run_py(EXTRACT, "--input", fixture, "--output", extract, "--dump-version", "synthetic-v1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        parents = {(r["genre_qid"], r["parent_qid"]) for r in read_rows(extract, "genre_parents.jsonl")}
+        self.assertLessEqual({("Q110", "Q102"), ("Q110", "Q111")}, parents)
+        self.assertIn({"artist_mbid": A, "genre_qid": "Q110"}, read_rows(extract, "artist_genres.jsonl"))
+
+        cfg = config()
+        cfg["roots"].append({"root_id": "test_sibling", "display_name": "Test Sibling", "sort_order": 5,
+                             "anchors": ["Q111"]})
+        cfg_path = self.fresh("config.json")
+        write_json(cfg_path, cfg)
+        out = self.ok(extract=extract, config_path=cfg_path)
+        by_genre = {}
+        for r in read_rows(out, "genre_rollup.jsonl"):
+            by_genre.setdefault(r["genre_qid"], set()).add(r["root_id"])
+        self.assertEqual(by_genre["Q110"], {"test_branch", "test_sibling"})
+        coverage = json.loads((out / "coverage.json").read_text("utf-8"))
+        roots_for_a = {m["root_id"] for m in coverage["memberships"] if m["artist_mbid"] == A}
+        self.assertLessEqual({"test-branch", "test-sibling"}, roots_for_a)
+        self.assertIn("test-sibling", coverage["resolved_root_ids"])
+        manifest = json.loads((out / "manifest.json").read_text("utf-8"))
+        self.assertEqual(manifest["producer"], json.loads((extract / "manifest.json").read_text("utf-8")))
 
 
 if __name__ == "__main__":
