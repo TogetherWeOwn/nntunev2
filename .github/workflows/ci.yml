@@ -317,6 +317,8 @@ jobs:
         run: python3 .github/scripts/test_ci_fixture_secrets.py
       - name: Test workflow and offline account-export boundaries
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 scripts/test_account_export.py
+      - name: Test offline playable-artist root coverage (synthetic only)
+        run: python3 scripts/test_genre_root_coverage.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
