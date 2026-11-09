@@ -38,6 +38,8 @@ claim authenticity or make arbitrary supplied data CC0.
 - Default `--format json-array`: `[` and `]` each on a separate line, exactly
   one complete entity per intervening line, standard comma separation. `[]` is
   also accepted. This is the line-oriented dump layout, not arbitrary pretty JSON.
+  Only JSON whitespace (space, tab, CR and LF) may surround records/delimiters;
+  other whitespace outside strings is rejected in both input formats.
 - `--format jsonl`: one complete object per line, without array/comma framing.
   Empty input is a valid empty projection only in this mode.
 - Invalid UTF-8/JSON, duplicate JSON keys, non-finite numbers, bad framing,
@@ -114,6 +116,10 @@ Defaults (all flags explicit in the manifest):
 | `--max-db-bytes` | 1 GiB | SQLite 4096-byte pages, rounded down; min 64 KiB, max 1 TiB |
 | `--max-output-bytes` | 1 GiB | combined row files plus manifest, before writing |
 | `--max-depth` | 128 edges | shortest distance from membership nodes; range 0–10000 |
+
+Line/input byte limits must be positive and less than the platform's `sys.maxsize`
+so the bounded read's extra overflow-detection byte is representable; larger values
+are refused as sanitized argument errors before creating output or scratch.
 
 One input pass, memory proportional to one bounded JSON entity plus Python JSON
 object overhead (not a hard RSS guarantee), 8 MiB SQLite page cache, at most 64 MiB

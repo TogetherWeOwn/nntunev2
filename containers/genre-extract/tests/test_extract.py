@@ -205,6 +205,38 @@ class FailureTests(ExtractCase):
         self.fails(self.write_input(as_array(lines)[:-2]))  # missing closing delimiter
         self.fails(self.write_input(as_array(lines[:-1]).replace(b"\n]", b",\n]")))  # dangling comma
 
+    def test_forbidden_json_whitespace_refused(self):
+        record = '{"type":"item","id":"Q1"}'
+        for whitespace in map(chr, (0x0B, 0x0C, 0x85, 0xA0, 0x2003)):
+            for token in ("[", "]", "[]", record):
+                for before in (True, False):
+                    padded = whitespace + token if before else token + whitespace
+                    if token == "[":
+                        data = padded + "\n" + record + "\n]\n"
+                    elif token == "]":
+                        data = "[\n" + record + "\n" + padded + "\n"
+                    elif token == "[]":
+                        data = padded + "\n"
+                    else:
+                        data = "[\n" + padded + "\n]\n"
+                    with self.subTest(whitespace=repr(whitespace), token=token, before=before):
+                        self.fails(self.write_input(data.encode()))
+            for before in (True, False):
+                padded = whitespace + record if before else record + whitespace
+                with self.subTest(whitespace=repr(whitespace), format="jsonl", before=before):
+                    self.fails(self.write_input((padded + "\n").encode()), "--format", "jsonl")
+
+    def test_oversized_read_limits_are_sanitized(self):
+        path = self.write_input(b"[]\n")
+        for limit in (sys.maxsize, sys.maxsize + 1):
+            with self.subTest(limit=limit):
+                proc = self.fails(path, "--max-line-bytes", str(limit),
+                                  "--max-input-bytes", str(limit))
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr,
+                                 b"genre-extract: refused (invalid command-line arguments)\n")
+
     def test_truncated_compressed(self):
         data = gzip.compress(as_array(entity_lines()), mtime=0)
         self.fails(self.write_input(data[: len(data) // 2], "t.json.gz"))
@@ -353,6 +385,19 @@ class EdgeTests(ExtractCase):
                 for rf in ROW_FILES:
                     self.assertEqual(read_bytes(os.path.join(out, rf)), b"")
                 self.assertEqual(self.manifest(out)["outputs"][ROW_FILES[0]]["rows"], 0)
+
+    def test_legal_json_whitespace(self):
+        record = '{"type":"item","id":"Q1"}'
+        whitespace = " \t\r"
+        padded = whitespace + record + whitespace
+        for data, extra in ((whitespace + "[" + whitespace + "\n" + padded + "\n"
+                             + whitespace + "]" + whitespace + "\n", ()),
+                            (padded + "\n", ("--format", "jsonl")),
+                            (whitespace + "[]" + whitespace + "\n", ())):
+            with self.subTest(data=data, extra=extra):
+                out = self.ok(self.write_input(data.encode()), *extra)
+                self.assertEqual(self.manifest(out)["counts"]["entities"],
+                                 0 if "[]" in data else 1)
 
     def test_finite_numbers_in_unused_fields(self):
         line = '{"type":"item","id":"Q1","unused":[1e308,-1e308,1.5,1e-400]}'

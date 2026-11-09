@@ -76,7 +76,7 @@ def entities(stream, args, identity: dict, counts: dict):
         if len(raw) > args.max_line_bytes:
             raise Refused("max-line-bytes exceeded")
         digest.update(raw)
-        line = raw.decode("utf-8").strip()
+        line = raw.decode("utf-8").strip(" \t\r\n")
         if not line:
             raise Refused(f"blank input record at line {line_number}")
         if state == "start":
@@ -309,6 +309,7 @@ def main() -> int:
     parser.add_argument("--max-depth", type=int, default=128)
     args = parser.parse_args()
     if (min(args.max_line_bytes, args.max_input_bytes, args.max_entities, args.max_output_bytes) < 1
+            or max(args.max_line_bytes, args.max_input_bytes) >= sys.maxsize
             or args.max_db_bytes < 65536 or args.max_db_bytes > 1024**4
             or args.max_depth < 0 or args.max_depth > 10000):
         parser.error("positive limits required; DB 64 KiB..1 TiB; depth 0..10000")
