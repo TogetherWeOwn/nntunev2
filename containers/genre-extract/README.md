@@ -99,6 +99,8 @@ An abrupt kill/power loss can leave partial directories: quarantine them, do not
 resume or ingest them. Use a new destination to retry. Do not mutate input/output
 paths concurrently; this is trusted offline filesystem tooling, not a multi-user
 filesystem security boundary. Error messages do not echo dump text or local paths.
+Argument errors, including unknown options and invalid values, exit 2 with a fixed
+sanitized diagnostic; `--help` still describes the available options.
 
 ## Resource contract
 
@@ -114,9 +116,12 @@ Defaults (all flags explicit in the manifest):
 | `--max-depth` | 128 edges | shortest distance from membership nodes; range 0–10000 |
 
 One input pass, memory proportional to one bounded JSON entity plus Python JSON
-object overhead (not a hard RSS guarantee), 8 MiB SQLite page cache, 64 MiB hard
-SQLite heap limit. Scratch stores all item labels and P279 edges, not only output
-nodes. SQLite sorting/temp data stay in its bounded heap; journaling is disabled
+object overhead (not a hard RSS guarantee), 8 MiB SQLite page cache, at most 64 MiB
+hard SQLite heap limit. Admission sets and queries `PRAGMA hard_heap_limit` before
+creating tables, selecting memory temp storage or loading input; an unavailable,
+nonpositive or above-budget effective limit refuses extraction. An existing lower
+positive SQLite limit is retained. Scratch stores all item labels and P279 edges,
+not only output nodes. SQLite sorting/temp data stay in its bounded heap; journaling is disabled
 for this disposable scratch only. There are no shell/external sort processes.
 Scratch file bytes <= DB budget; output bytes <= output budget, excluding source,
 filesystem metadata and interpreter overhead. Scratch lives in a temporary sibling

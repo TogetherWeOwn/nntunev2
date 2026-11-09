@@ -8,6 +8,7 @@ import bz2
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -29,6 +30,11 @@ class Refused(ValueError):
     """A diagnostic that contains no untrusted values or local paths."""
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, "genre-extract: refused (invalid command-line arguments)\n")
+
+
 def encode(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -44,6 +50,13 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
 
 def invalid_constant(value: str) -> None:
     raise Refused("non-finite JSON number")
+
+
+def finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise Refused("non-finite JSON number")
+    return number
 
 
 def entities(stream, args, identity: dict, counts: dict):
@@ -89,7 +102,8 @@ def entities(stream, args, identity: dict, counts: dict):
                 line = line[:-1]
             seen = True
         try:
-            entity = json.loads(line, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+            entity = json.loads(line, object_pairs_hook=unique_object,
+                                parse_constant=invalid_constant, parse_float=finite_float)
         except (ValueError, RecursionError) as exc:
             raise Refused(f"invalid JSON record at line {line_number}") from exc
         counts["entities"] += 1
@@ -221,11 +235,14 @@ def extract(args) -> None:
         with tempfile.TemporaryDirectory(prefix=".genre-extract-", dir=args.output.parent) as scratch:
             db = sqlite3.connect(Path(scratch) / "projection.sqlite3")
             try:
+                db.execute("PRAGMA hard_heap_limit=67108864")
+                limit = db.execute("PRAGMA hard_heap_limit").fetchone()
+                if not limit or type(limit[0]) is not int or not 0 < limit[0] <= 67108864:
+                    raise Refused("SQLite hard heap limit unavailable")
                 db.executescript(f"""
                     PRAGMA page_size=4096;
                     PRAGMA max_page_count={args.max_db_bytes // 4096};
                     PRAGMA cache_size=-8192;
-                    PRAGMA hard_heap_limit=67108864;
                     PRAGMA journal_mode=OFF;
                     PRAGMA synchronous=OFF;
                     PRAGMA temp_store=MEMORY;
@@ -278,7 +295,7 @@ def extract(args) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dump-version", required=True)

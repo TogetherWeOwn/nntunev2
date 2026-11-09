@@ -1,14 +1,18 @@
-"""Black-box tests for containers/genre-extract/extract.py (stdlib only)."""
+"""CLI and heap-admission tests for containers/genre-extract/extract.py (stdlib only)."""
 
 import bz2
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXTRACT = os.path.join(os.path.dirname(HERE), "extract.py")
@@ -244,12 +248,54 @@ class FailureTests(ExtractCase):
                 self.fails(path, *extra)
 
     def test_duplicate_keys_and_nonfinite(self):
-        lines = entity_lines()
         for bad in ('{"type":"item","id":"Q1","id":"Q1"}',
                     '{"type":"item","id":"Q1","x":NaN}',
-                    '{"type":"item","id":"Q1","x":Infinity}'):
+                    '{"type":"item","id":"Q1","x":Infinity}',
+                    '{"type":"item","id":"Q1","x":-Infinity}'):
             with self.subTest(bad=bad):
-                self.fails(self.write_input(as_array(lines + [bad])))
+                self.fails(self.write_input(as_array([bad])))
+
+    def test_overflowed_numbers_refused(self):
+        for number in ("1e400", "-1e400"):
+            with self.subTest(number=number):
+                line = '{"type":"item","id":"Q1","unused":{"numbers":[%s]}}' % number
+                proc = self.fails(self.write_input(as_array([line])))
+                self.assertIn(b"invalid JSON record", proc.stderr)
+
+    def test_argument_errors_are_sanitized(self):
+        path = self.golden_input()
+        supplied = os.path.join(self.tmp, "private-argument")
+        for extra in (("--max-line-bytes", supplied), ("--format", supplied),
+                      ("--unknown=" + supplied,), ("--language", supplied),
+                      ("--dump-version", supplied), ("--max-depth", "-1")):
+            with self.subTest(extra=extra):
+                proc = self.fails(path, *extra)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr,
+                                 b"genre-extract: refused (invalid command-line arguments)\n")
+
+    def test_ineffective_sqlite_heap_limit_refused(self):
+        spec = importlib.util.spec_from_file_location("genre_extract", EXTRACT)
+        extract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(extract)
+        path = self.golden_input()
+        for result in (None, (), (0,), (-1,), (67108865,), ("67108864",), (None,)):
+            with self.subTest(result=result):
+                out = os.path.join(self.tmp, "out-heap")
+                args = SimpleNamespace(input=Path(path), output=Path(out))
+                db = mock.Mock()
+                db.execute.return_value.fetchone.return_value = result
+                with mock.patch.object(extract.sqlite3, "connect", return_value=db), \
+                        mock.patch.object(extract, "load") as load:
+                    with self.assertRaisesRegex(extract.Refused, "SQLite hard heap limit unavailable"):
+                        extract.extract(args)
+                self.assertIn(mock.call("PRAGMA hard_heap_limit"), db.execute.call_args_list)
+                db.executescript.assert_not_called()
+                load.assert_not_called()
+                db.close.assert_called_once()
+                self.assertFalse(os.path.exists(out), "output published on failure")
+                self.assertFalse(any(x.startswith(".genre-extract-") for x in os.listdir(self.tmp)))
 
     def test_bad_labels_and_utf8(self):
         for text in ("a\\u0001b", "a\\ud800b", "   "):
@@ -307,6 +353,11 @@ class EdgeTests(ExtractCase):
                 for rf in ROW_FILES:
                     self.assertEqual(read_bytes(os.path.join(out, rf)), b"")
                 self.assertEqual(self.manifest(out)["outputs"][ROW_FILES[0]]["rows"], 0)
+
+    def test_finite_numbers_in_unused_fields(self):
+        line = '{"type":"item","id":"Q1","unused":[1e308,-1e308,1.5,1e-400]}'
+        out = self.ok(self.write_input(as_array([line])))
+        self.assertEqual(self.manifest(out)["counts"]["entities"], 1)
 
     def test_invalid_numeric_id_claim_skipped(self):
         ents = [json.loads(x) for x in entity_lines()]
