@@ -1268,13 +1268,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1300,13 +1300,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1332,13 +1332,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1388,13 +1388,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1482,13 +1482,13 @@ jobs:
         with:
           persist-credentials: false
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1584,13 +1584,13 @@ jobs:
             (cd "workers/$worker" && git diff --exit-code -- Cargo.lock)
           done
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
