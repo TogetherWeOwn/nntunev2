@@ -1,0 +1,27 @@
+{
+  "taxonomy_version": 1,
+  "traversal_barriers": ["Q373342", "Q115484611", "Q188451", "Q1583807"],
+  "limits": {"max_depth": 32, "max_nodes": 10000, "broad_multi_threshold": 3},
+  "roots": [
+    {"root_id": "pop", "display_name": "Pop", "sort_order": 1, "anchors": ["Q37073"]},
+    {"root_id": "rock", "display_name": "Rock", "sort_order": 2, "anchors": ["Q11399"]},
+    {"root_id": "metal", "display_name": "Metal", "sort_order": 3, "anchors": ["Q12326776"]},
+    {"root_id": "hip_hop", "display_name": "Hip-hop & rap", "sort_order": 4, "anchors": ["Q11401"]},
+    {"root_id": "rnb_soul", "display_name": "R&B & soul", "sort_order": 5, "anchors": ["Q45981"]},
+    {"root_id": "funk", "display_name": "Funk", "sort_order": 6, "anchors": ["Q164444"]},
+    {"root_id": "electronic", "display_name": "Electronic", "sort_order": 7, "anchors": ["Q9778"]},
+    {"root_id": "jazz", "display_name": "Jazz", "sort_order": 8, "anchors": ["Q8341"]},
+    {"root_id": "blues", "display_name": "Blues", "sort_order": 9, "anchors": ["Q9759"]},
+    {"root_id": "country", "display_name": "Country", "sort_order": 10, "anchors": ["Q83440"]},
+    {"root_id": "folk", "display_name": "Folk", "sort_order": 11, "anchors": ["Q43343"]},
+    {"root_id": "classical", "display_name": "Classical", "sort_order": 12, "anchors": ["Q9730"]},
+    {"root_id": "reggae", "display_name": "Reggae", "sort_order": 13, "anchors": ["Q9794"]},
+    {"root_id": "latin", "display_name": "Latin", "sort_order": 14, "anchors": ["Q18345375"]},
+    {"root_id": "asian_pop", "display_name": "Asian pop", "sort_order": 15, "anchors": ["Q10730335"]},
+    {"root_id": "world", "display_name": "World & regional", "sort_order": 16, "anchors": ["Q205049"]}
+  ],
+  "overrides": [
+    {"genre_qid": "Q186472", "action": "add", "roots": ["folk"], "reason": "folk rock: P279 is rock only; product wants it under Folk too"},
+    {"genre_qid": "Q193207", "action": "add", "roots": ["electronic"], "reason": "ambient music: P279 is popular music (barrier) so it reaches no root"}
+  ]
+}

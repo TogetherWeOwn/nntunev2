@@ -1527,6 +1527,13 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ArtistDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
+    /// Genre root page. Stub default: empty until a real-data acceptance
+    /// lands a store implementation; never fabricates rows.
+    fn catalogue_genres(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::catalogue::GenreDbRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
     /// Caller-member release collection page (artist-joined).
     fn catalogue_releases(
         &self,
@@ -3859,6 +3866,38 @@ where
         Ok(rows) => {
             let entries: Vec<crate::catalogue::ArtistResponse> =
                 rows.iter().map(crate::catalogue::artist_response).collect();
+            catalogue_response(&entries)
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+/// `GET /v1/genres`: read stub serving a bare array of genre roots, capped
+/// at the first page ([`crate::catalogue::CATALOGUE_MAX_PAGE_SIZE`]). Empty
+/// until a real-data acceptance backs the store read. Authentication posture
+/// matches [`catalogue_artists`]: anonymous callers answer 401 before any
+/// store read; store failure is the opaque 503.
+async fn catalogue_genres<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
+        return resp;
+    }
+    match ctx.store.catalogue_genres().await {
+        Ok(rows) => {
+            let entries: Vec<crate::catalogue::GenreResponse> = rows
+                .iter()
+                .take(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                .map(crate::catalogue::genre_response)
+                .collect();
             catalogue_response(&entries)
         }
         Err(_) => unavailable(),
@@ -6844,6 +6883,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/library"
             | "/api/library"
             | "/v1/artists"
+            | "/v1/genres"
             | "/v1/releases"
             | "/v1/tracks"
     )
@@ -7070,6 +7110,7 @@ where
         // call falls back to the session cookie.
         ("GET", "/api/library") => catalogue_library_alias(ctx, req).await,
         ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
+        ("GET", "/v1/genres") => catalogue_genres(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
         // Unserved nested release paths never reach authentication or stores.
@@ -7375,6 +7416,7 @@ mod tests {
         /// ordering itself are pinned by the SQL regression test, not here.
         catalogue_library: RefCell<HashMap<String, Vec<crate::catalogue::LibraryDbRow>>>,
         catalogue_artists: RefCell<Vec<crate::catalogue::ArtistDbRow>>,
+        catalogue_genres: RefCell<Vec<crate::catalogue::GenreDbRow>>,
         catalogue_releases: RefCell<Vec<crate::catalogue::ReleaseDbRow>>,
         catalogue_tracks: RefCell<Vec<crate::catalogue::TrackDbRow>>,
         catalogue_release_tracks:
@@ -8366,6 +8408,12 @@ mod tests {
                 .filter(|row| artist_mbids.contains(&row.mbid))
                 .cloned()
                 .collect())
+        }
+        async fn catalogue_genres(&self) -> Result<Vec<crate::catalogue::GenreDbRow>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.catalogue_genres.borrow().clone())
         }
         async fn catalogue_releases(
             &self,
@@ -21387,6 +21435,98 @@ mod tests {
             Some(format!("Bearer {stream_secret}")),
         );
         assert_eq!(forbidden.status, 403, "{}", forbidden.body);
+    }
+
+    fn genre_row(n: usize) -> crate::catalogue::GenreDbRow {
+        crate::catalogue::GenreDbRow {
+            root_id: format!("root_{n}"),
+            display_name: format!("Genre {n}"),
+        }
+    }
+
+    #[test]
+    fn catalogue_genres_requires_authentication() {
+        let h = harness();
+        h.store.catalogue_genres.borrow_mut().push(genre_row(1));
+        let resp = h.call_full("GET", "/v1/genres", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert_eq!(resp.body, r#"{"error":"check your email and try again"}"#);
+    }
+
+    #[test]
+    fn catalogue_genres_stub_is_an_empty_bare_array() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = h.call_full("GET", "/v1/genres", None, Some(cookie), Some(ORIGIN));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(resp.body, "[]");
+    }
+
+    #[test]
+    fn catalogue_genres_maps_rows_and_bounds_the_first_page() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        h.store.catalogue_genres.borrow_mut().push(genre_row(0));
+        let resp = h.call_full(
+            "GET",
+            "/v1/genres",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let items: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            items,
+            serde_json::json!([{"root_id": "root_0", "display_name": "Genre 0"}])
+        );
+        for n in 1..60 {
+            h.store.catalogue_genres.borrow_mut().push(genre_row(n));
+        }
+        let resp = h.call_full("GET", "/v1/genres", None, Some(cookie), Some(ORIGIN));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(items.len(), crate::catalogue::CATALOGUE_MAX_PAGE_SIZE);
+        assert_eq!(items[0]["root_id"], "root_0");
+    }
+
+    #[test]
+    fn catalogue_genres_bearer_scope_and_opaque_store_error() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let ok = h.call_bearer("GET", "/v1/genres", Some(format!("Bearer {secret}")));
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert_eq!(ok.body, "[]");
+        let stream_minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["stream:read"], "ttl_secs": 3600}),
+        );
+        let stream_secret = mint_secret(&serde_json::from_str(&stream_minted.body).unwrap());
+        let forbidden = h.call_bearer("GET", "/v1/genres", Some(format!("Bearer {stream_secret}")));
+        assert_eq!(forbidden.status, 403, "{}", forbidden.body);
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        let outage = h.call_bearer("GET", "/v1/genres", Some(format!("Bearer {secret}")));
+        assert_eq!(outage.status, 503, "{}", outage.body);
+        let error: serde_json::Value = serde_json::from_str(&outage.body).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "code": "service_unavailable",
+                "message": "service unavailable",
+                "retryable": true,
+            })
+        );
     }
 
     #[test]

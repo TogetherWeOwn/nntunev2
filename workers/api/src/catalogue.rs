@@ -143,6 +143,15 @@ pub struct ArtistDbRow {
     pub country: Option<String>,
 }
 
+/// One genre root as the store returns it. The `GET /v1/genres` stub never
+/// fabricates rows: the default store read is empty until a real-data
+/// acceptance lands a CC0 projection behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenreDbRow {
+    pub root_id: String,
+    pub display_name: String,
+}
+
 /// One `mb_release` row (joined to its artist) as the store returns it.
 /// Feeds [`release_response`] and [`assemble_release_detail`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +272,13 @@ pub struct ArtistResponse {
     pub country: Option<String>,
 }
 
+/// Caller-visible genre root (`GET /v1/genres`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenreResponse {
+    pub root_id: String,
+    pub display_name: String,
+}
+
 /// Caller-visible release. `artist` is the display name (`artist_mbid` the
 /// identity); `art_url` is the reserved own-origin path, always `Some`
 /// here because the MBID comes from the mirror itself.
@@ -334,6 +350,14 @@ pub fn artist_response(row: &ArtistDbRow) -> ArtistResponse {
         sort_name: row.sort_name.clone(),
         artist_type: row.artist_type.clone(),
         country: row.country.clone(),
+    }
+}
+
+/// Map one genre row to its response. Total: every column has a field.
+pub fn genre_response(row: &GenreDbRow) -> GenreResponse {
+    GenreResponse {
+        root_id: row.root_id.clone(),
+        display_name: row.display_name.clone(),
     }
 }
 
@@ -901,6 +925,18 @@ mod tests {
             assert!(json["occurrence_key"].as_str().is_some());
         }
         assert_eq!(library_entry(&first), library_entry(&first));
+    }
+
+    #[test]
+    fn genre_response_maps_root_id_and_display_name() {
+        let row = GenreDbRow {
+            root_id: "root_1".to_string(),
+            display_name: "Fixture Genre".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(genre_response(&row)).unwrap(),
+            serde_json::json!({"root_id": "root_1", "display_name": "Fixture Genre"})
+        );
     }
 
     #[test]
