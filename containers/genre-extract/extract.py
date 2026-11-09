@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unicodedata
 import uuid
+import zlib
 
 VERSION = "1"
 SCHEMA = "nntune.genre-extract.v1"
@@ -300,7 +301,7 @@ def main() -> int:
         parser.error("dump-version must be a bounded version identifier, not a path or URL")
     try:
         extract(args)
-    except (OSError, ValueError, sqlite3.Error, EOFError, RecursionError, MemoryError) as exc:
+    except (OSError, ValueError, sqlite3.Error, EOFError, RecursionError, MemoryError, zlib.error) as exc:
         # Only our own fixed diagnostics may be shown, never parser/SQL/path details.
         reason = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         print(f"genre-extract: refused ({reason})", file=sys.stderr)

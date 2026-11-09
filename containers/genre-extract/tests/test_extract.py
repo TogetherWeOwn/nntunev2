@@ -207,6 +207,14 @@ class FailureTests(ExtractCase):
         data = bz2.compress(as_array(entity_lines()))
         self.fails(self.write_input(data[: len(data) // 2], "t.json.bz2"))
 
+    def test_corrupt_deflate_is_sanitized(self):
+        path = self.write_input(bytes.fromhex("1f8b0800000000000003070000000000000000"), "bad.json.gz")
+        proc = self.fails(path)
+        self.assertIn(b"genre-extract: refused", proc.stderr)
+        self.assertNotIn(b"Traceback", proc.stderr)
+        self.assertNotIn(self.tmp.encode(), proc.stderr)
+        self.assertNotIn(EXTRACT.encode(), proc.stderr)
+
     def test_duplicate_entity_ids(self):
         lines = entity_lines()
         self.fails(self.write_input(as_array(lines + [lines[0]])))
