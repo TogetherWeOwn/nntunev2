@@ -67,7 +67,7 @@ BEGIN
     -- Statement 2: terminal transition queued -> done matches one row.
     UPDATE ingest_jobs SET status = 'done'
     FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE ingest_jobs.id = 'job_01ingestjobs0001' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+    WHERE ingest_jobs.id = 'job_01ingestjobs0001' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     IF updated_count <> 1 THEN
         RAISE EXCEPTION 'terminal transition did not match the queued row';
@@ -77,13 +77,13 @@ BEGIN
     -- finds the terminal status (classify: Converged).
     UPDATE ingest_jobs SET status = 'done'
     FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE ingest_jobs.id = 'job_01ingestjobs0001' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+    WHERE ingest_jobs.id = 'job_01ingestjobs0001' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     IF updated_count <> 0 THEN
         RAISE EXCEPTION 'terminal transition rewrote an already-terminal row';
     END IF;
     SELECT status INTO job_status FROM ingest_jobs
-    WHERE id = 'job_01ingestjobs0001' AND user_id = 'user-ij-1';
+    WHERE id = 'job_01ingestjobs0001' AND user_id = 'user-ij-1' AND source <> 'admin';
     IF NOT FOUND OR job_status <> 'done' THEN
         RAISE EXCEPTION 'ingest_jobs status re-select missed the settled row';
     END IF;
@@ -96,10 +96,32 @@ BEGIN
             1700000000, 'running');
     UPDATE ingest_jobs SET status = 'failed'
     FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE ingest_jobs.id = 'job_01ingestjobs0002' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+    WHERE ingest_jobs.id = 'job_01ingestjobs0002' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     IF updated_count <> 1 THEN
         RAISE EXCEPTION 'terminal transition did not match the running row';
+    END IF;
+
+    -- The uploader's open user fence cannot settle an admin job outside the
+    -- checkpoint/publication authority, or misclassify it as converged later.
+    INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status,
+                             source, content_sha256, nzb_bytes, file_count, segment_count)
+    VALUES ('adm_' || repeat('a',43), 'user-ij-1', 'admin:' || repeat('a',64),
+            1700000000, 'queued', 'admin', repeat('a',64), 1, 1, 1);
+    UPDATE ingest_jobs SET status = 'done'
+    FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE ingest_jobs.id = 'adm_' || repeat('a',43) AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
+    GET DIAGNOSTICS updated_count = ROW_COUNT;
+    IF updated_count <> 0 OR (SELECT status FROM ingest_jobs WHERE source = 'admin' AND id = 'adm_' || repeat('a',43)) <> 'queued' THEN
+        RAISE EXCEPTION 'private terminal write changed admin authority';
+    END IF;
+    -- Simulate an already-settled admin outcome; the private convergence read
+    -- must still not return it, even with the correct uploader identity.
+    UPDATE ingest_jobs SET status = 'done' WHERE id = 'adm_' || repeat('a',43);
+    SELECT status INTO job_status FROM ingest_jobs
+    WHERE id = 'adm_' || repeat('a',43) AND user_id = 'user-ij-1' AND source <> 'admin';
+    IF FOUND THEN
+        RAISE EXCEPTION 'private convergence read adopted admin outcome';
     END IF;
 
     -- Unknown statuses are rejected by the CHECK backstop even if a
@@ -114,7 +136,7 @@ BEGIN
     BEGIN
         UPDATE ingest_jobs SET status = 'started'
         FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-        WHERE ingest_jobs.id = 'job_01ingestjobs0006' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+        WHERE ingest_jobs.id = 'job_01ingestjobs0006' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
         RAISE EXCEPTION 'CHECK accepted an unknown ingest status on transition';
     EXCEPTION WHEN check_violation THEN
         NULL;
@@ -140,13 +162,13 @@ BEGIN
             1700000000, 'queued');
     UPDATE ingest_jobs SET status = 'done'
     FROM (SELECT id FROM users WHERE id = 'user-ij-2' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE ingest_jobs.id = 'job_01ingestjobs0004' AND ingest_jobs.user_id = 'user-ij-2' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+    WHERE ingest_jobs.id = 'job_01ingestjobs0004' AND ingest_jobs.user_id = 'user-ij-2' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     IF updated_count <> 0 THEN
         RAISE EXCEPTION 'fenced transition matched a row behind the deletion marker';
     END IF;
     SELECT status INTO job_status FROM ingest_jobs
-    WHERE id = 'job_01ingestjobs0004' AND user_id = 'user-ij-2';
+    WHERE id = 'job_01ingestjobs0004' AND user_id = 'user-ij-2' AND source <> 'admin';
     IF NOT FOUND OR job_status <> 'queued' THEN
         RAISE EXCEPTION 'fenced row did not stay queued for classification';
     END IF;
@@ -158,7 +180,7 @@ BEGIN
     -- predicate passes), so the zero rows isolate the owner binding.
     UPDATE ingest_jobs SET status = 'failed'
     FROM (SELECT id FROM users WHERE id = 'user-ij-3' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE ingest_jobs.id = 'job_01ingestjobs0004' AND ingest_jobs.user_id = 'user-ij-3' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+    WHERE ingest_jobs.id = 'job_01ingestjobs0004' AND ingest_jobs.user_id = 'user-ij-3' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running');
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     IF updated_count <> 0 THEN
         RAISE EXCEPTION 'cross-user transition matched another user''s job';

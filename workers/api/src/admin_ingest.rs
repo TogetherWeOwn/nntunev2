@@ -147,6 +147,18 @@ pub struct ValidatedNzb {
 /// `Ok` carries counts; `Err` carries the fixed reason (never parser
 /// detail). Empty and over-cap bodies fail before the parser runs.
 pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
+    let document = parse_upload(body)?;
+    Ok(ValidatedNzb {
+        file_count: document.files.len() as u64,
+        segment_count: document.files.iter().map(|f| f.segments.len() as u64).sum(),
+        declared_bytes: document.encoded_bytes.max(0) as u64,
+    })
+}
+
+/// Internal execution uses exactly the intake parser and caps, without a
+/// second parse under the legacy user-upload limits. Parser content stays
+/// in memory: only `classify_upload`'s counts may enter an intake response.
+pub(crate) fn parse_upload(body: &[u8]) -> Result<nntune_core::nzb::Document, FailureReason> {
     if body.is_empty() {
         return Err(FailureReason::Empty);
     }
@@ -181,7 +193,6 @@ pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
         },
         _ => FailureReason::Malformed,
     })?;
-    let file_count = document.files.len() as u64;
     let mut segment_count: u64 = 0;
     for file in &document.files {
         segment_count = segment_count.saturating_add(file.segments.len() as u64);
@@ -189,11 +200,7 @@ pub fn classify_upload(body: &[u8]) -> Result<ValidatedNzb, FailureReason> {
     if segment_count > ADMIN_MAX_TOTAL_SEGMENTS as u64 {
         return Err(FailureReason::TooManySegments);
     }
-    Ok(ValidatedNzb {
-        file_count,
-        segment_count,
-        declared_bytes: document.encoded_bytes.max(0) as u64,
-    })
+    Ok(document)
 }
 
 /// Content identity: lowercase hex SHA-256 of the raw upload bytes.
@@ -474,14 +481,33 @@ pub enum AdminIngestDeleteOutcome {
     ActorNotAdmin,
 }
 
-/// View status for an admin job row: the ledger stores `queued` for an
-/// accepted upload (a later slice wires dispatch; the source
-/// discriminator keeps the pipeline consumer off admin rows) and
-/// `failed` for a rejected one. Anything else is a store bug, never a
-/// client answer.
+/// Redacted view of the existing job machine's ledger projection. `done`
+/// means published, never merely parsed or matched. Intake failures keep
+/// their original `failed` view; an explicit admin rejection is distinct.
+/// Unknown stored states are a store bug, never a client answer.
 pub fn view_status(db_status: &str) -> Option<&'static str> {
     match db_status {
         "queued" => Some("accepted"),
+        "running" => Some("running"),
+        "needs_review" => Some("needs_review"),
+        "needs_archive_read" => Some("needs_archive_read"),
+        "rejected" => Some("rejected"),
+        "done" => Some("published"),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
+/// Inverse of `view_status`, shared by list filtering and its tests. Raw
+/// machine stages are not public filters and cannot select another source.
+pub fn db_status(view: &str) -> Option<&'static str> {
+    match view {
+        "accepted" => Some("queued"),
+        "running" => Some("running"),
+        "needs_review" => Some("needs_review"),
+        "needs_archive_read" => Some("needs_archive_read"),
+        "rejected" => Some("rejected"),
+        "published" => Some("done"),
         "failed" => Some("failed"),
         _ => None,
     }
@@ -493,9 +519,7 @@ pub fn view_status(db_status: &str) -> Option<&'static str> {
 pub fn parse_status_filter(raw: Option<&str>) -> Option<Option<&'static str>> {
     match raw {
         None => Some(None),
-        Some("accepted") => Some(Some("accepted")),
-        Some("failed") => Some(Some("failed")),
-        Some(_) => None,
+        Some(raw) => db_status(raw).and_then(view_status).map(Some),
     }
 }
 
@@ -521,7 +545,7 @@ pub fn parse_list_window(limit_raw: Option<&str>, offset_raw: Option<&str>) -> (
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Minimal valid NZB: one file, two contiguous segments. Test
@@ -621,7 +645,46 @@ mod tests {
         assert_eq!(parse_status_filter(Some("queued")), None);
         assert_eq!(view_status("queued"), Some("accepted"));
         assert_eq!(view_status("failed"), Some("failed"));
-        assert_eq!(view_status("done"), None);
+        assert_eq!(view_status("done"), Some("published"));
+    }
+
+    #[test]
+    fn execution_statuses_round_trip_without_exposing_machine_stages() {
+        for (stored, view) in [
+            ("queued", "accepted"),
+            ("running", "running"),
+            ("needs_review", "needs_review"),
+            ("needs_archive_read", "needs_archive_read"),
+            ("rejected", "rejected"),
+            ("done", "published"),
+            ("failed", "failed"),
+        ] {
+            assert_eq!(view_status(stored), Some(view));
+            assert_eq!(db_status(view), Some(stored));
+            assert_eq!(parse_status_filter(Some(view)), Some(Some(view)));
+        }
+        for raw in [
+            "",
+            "queued",
+            "done",
+            "matching",
+            "probing",
+            "RUNNING",
+            "rejected ",
+        ] {
+            assert_eq!(db_status(raw), None);
+            assert_eq!(parse_status_filter(Some(raw)), None);
+        }
+        for raw in [
+            "",
+            "accepted",
+            "published",
+            "matching",
+            "probing",
+            "RUNNING",
+        ] {
+            assert_eq!(view_status(raw), None);
+        }
     }
 
     #[test]

@@ -7,8 +7,10 @@ use nntune_core::original_source::{
 };
 use zeroize::Zeroizing;
 
+pub use crate::field_envelope::FieldEnvelope;
+
 use crate::{
-    field_envelope::{self, Context, FieldEnvelope},
+    field_envelope::{self, Context},
     rotation::KekSource,
 };
 

@@ -1100,6 +1100,7 @@ fn catalogue_library_page_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<crate::catalogue::LibraryPageRow, StoreError> {
     Ok(crate::catalogue::LibraryPageRow {
+        idempotency_key: row.try_get("idempotency_key").map_err(|_| StoreError)?,
         job_id: row.try_get("job_id").map_err(|_| StoreError)?,
         release_mbid: row.try_get("release_mbid").map_err(|_| StoreError)?,
         recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
@@ -1723,6 +1724,34 @@ async fn admin_ingest_upload_on(
     client: &mut tokio_postgres::Client,
     attempt: &AdminIngestAttempt,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
+    // Keep live admission on the pre-schema path until ordered schema
+    // integration. No column detection or fallback can enable execution.
+    admin_ingest_upload_with_authority_on(client, attempt, None).await
+}
+
+type AdminCheckpointConstructor = fn(&str, &str) -> Result<String, StoreError>;
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub async fn admin_ingest_upload_for_postgres_test(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+    initialize_checkpoint: Option<AdminCheckpointConstructor>,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
+    admin_ingest_upload_with_authority_on(client, attempt, initialize_checkpoint).await
+}
+
+/// The checkpoint-enabled branch is prepared for ordered schema integration,
+/// not selected by the live caller yet. Only a fresh accepted insert initializes;
+/// duplicates return above it without reading or resetting checkpoint authority.
+/// The internal coordinator must supply the ingest-owned strict fresh-checkpoint
+/// constructor. API owns the transaction, not the pipeline wire format, and must
+/// not link another Worker's runtime merely to construct this evidence. Refusal
+/// aborts the transaction; absence explicitly selects the pre-schema path.
+async fn admin_ingest_upload_with_authority_on(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+    initialize_checkpoint: Option<AdminCheckpointConstructor>,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     transaction
         .query_typed(
@@ -1845,6 +1874,27 @@ async fn admin_ingest_upload_on(
             deduplicated: true,
         });
     }
+    let checkpoint = if let Some(initialize) = initialize_checkpoint {
+        match (&attempt.failure, &attempt.original) {
+            (None, Some(envelope)) => {
+                let bytes = usize::try_from(attempt.nzb_bytes).map_err(|_| StoreError)?;
+                if bytes == 0
+                    || bytes > admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+                    || envelope.ciphertext.len() != bytes.checked_add(16).ok_or(StoreError)?
+                    || envelope.dek_wrapped.len() != 48
+                    || attempt.kek_version == 0
+                    || attempt.idempotency_key != format!("admin:{}", attempt.content_sha256_hex)
+                {
+                    return Err(StoreError);
+                }
+                Some(initialize(&attempt.job_id, &attempt.idempotency_key)?)
+            }
+            (Some(_), None) => None,
+            _ => return Err(StoreError),
+        }
+    } else {
+        None
+    };
     let db_status = if attempt.failure.is_some() {
         "failed"
     } else {
@@ -1908,6 +1958,21 @@ async fn admin_ingest_upload_on(
             )
             .await
             .map_err(|_| StoreError)?;
+    }
+    if let Some(encoded) = &checkpoint {
+        let initialized = transaction
+            .query_typed(
+                "UPDATE ingest_jobs SET admin_checkpoint = $2::text::jsonb, \
+                 admin_checkpoint_revision = 1 \
+                 WHERE id = $1 AND source = 'admin' AND status = 'queued' \
+                 AND admin_checkpoint IS NULL AND admin_checkpoint_revision = 0 RETURNING id",
+                &[(&attempt.job_id, Type::TEXT), (encoded, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if initialized.len() != 1 {
+            return Err(StoreError);
+        }
     }
     if let Some(reason) = failure_reason.as_deref() {
         transaction
@@ -3561,18 +3626,31 @@ impl Store for PgStore {
     async fn catalogue_library(
         &self,
         user_id: &str,
+        after: Option<&crate::catalogue::LibraryCursor>,
     ) -> Result<Vec<crate::catalogue::LibraryDbRow>, StoreError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
-                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE)
+                // One lookahead row determines whether a continuation exists.
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE + 1)
                     .map_err(|_| StoreError)?;
+                let matched_last = after.map(|cursor| cursor.matched_last);
+                let job_id = after.map(|cursor| cursor.job_id.as_str());
+                let recording_ord = after.map(|cursor| cursor.recording_ord);
+                let idempotency_key = after.map(|cursor| cursor.idempotency_key.as_str());
                 let page = client
                     .query_typed(
                         crate::catalogue::library_page_statement(),
-                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&limit, Type::INT8),
+                            (&matched_last, Type::BOOL),
+                            (&job_id, Type::TEXT),
+                            (&recording_ord, Type::INT8),
+                            (&idempotency_key, Type::TEXT),
+                        ],
                     )
                     .await
                     .map_err(|_| {
@@ -5817,13 +5895,14 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // The runtime path strips the query string everywhere; the admin
-    // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
+    // Preserve list filters and Library keyset continuations for exactly
+    // these GET collections. Every other route keeps the bare runtime path.
     let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+    let handler_path = if req.method() == Method::Get
+        && matches!(
+            bare_path.as_str(),
+            "/v1/admin/ingest" | "/v1/library" | "/api/library"
+        ) {
         match req.url().ok().and_then(|url| {
             url.query()
                 .filter(|query| !query.is_empty())

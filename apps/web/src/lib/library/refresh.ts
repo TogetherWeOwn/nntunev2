@@ -83,6 +83,14 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 		let timeoutFired = false;
+		let retainedBytes = 0;
+
+		function countBytes(bytes: number): void {
+			retainedBytes += bytes;
+			if (retainedBytes > LIBRARY_BODY_MAX_BYTES) {
+				throw new Error('library response exceeds the byte cap');
+			}
+		}
 
 		function cancelResponse(resp: Response | null | undefined): void {
 			if (!resp) return;
@@ -125,9 +133,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// timeout so the refresher falls back to unreachable/snapshot.
 				if (typeof resp.arrayBuffer === 'function') {
 					const buffer = await resp.arrayBuffer();
-					if (buffer.byteLength > LIBRARY_BODY_MAX_BYTES) {
-						throw new Error('library request timed out');
-					}
+					countBytes(buffer.byteLength);
 					return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer)));
 				}
 				// Runtimes (and injected test fetches) without `arrayBuffer`
@@ -136,9 +142,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// byte-counted streamed and arrayBuffer paths.
 				const data = await resp.json();
 				const serialized = JSON.stringify(data) ?? '';
-				if (new TextEncoder().encode(serialized).length > LIBRARY_BODY_MAX_BYTES) {
-					throw new Error('library request timed out');
-				}
+				countBytes(new TextEncoder().encode(serialized).length);
 				return data;
 			}
 			const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
@@ -151,7 +155,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					if (done) break;
 					if (value) {
 						totalLength += value.length;
-						if (totalLength > LIBRARY_BODY_MAX_BYTES) {
+						retainedBytes += value.length;
+						if (retainedBytes > LIBRARY_BODY_MAX_BYTES) {
 							// Stop at the cap: cancel the reader so the
 							// producer stops and the trailing bytes are never
 							// retained, then reject through the same failure
@@ -204,70 +209,97 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		});
 
 		try {
-			const fetchPromise = fetchFn('/api/library', {
-				credentials: 'include',
-				signal: controller.signal
-			});
-			// A response that materializes after its race was already lost
-			// (timeout won, or a newer generation aborted us) holds an open
-			// stream the winner never reads. Release it instead of abandoning
-			// it. Injected fetches deliberately ignore the abort signal, so
-			// the signal alone cannot release a late-arriving body.
-			void fetchPromise.then(
-				(lateResponse) => {
-					if (
-						timeoutFired ||
-						generation !== requestGeneration ||
-						controller.signal.aborted
-					) {
-						cancelResponse(lateResponse);
-					}
-				},
-				() => {}
-			);
-			const response = await Promise.race([fetchPromise, timeout, aborted]);
-			if (generation !== requestGeneration || controller.signal.aborted) {
-				cancelResponse(response);
-				return;
-			}
-			activeResponse = response;
-			if (!response.ok) {
-				// Refusal bodies are never read. Detach before best-effort cleanup
-				// so abort/disposal cannot cancel them again; never await cleanup.
+			const collected: LibraryItem[] = [];
+			const seenCursors = new Set<string>();
+			let cursor: string | null = null;
+			do {
+				const path: string = cursor
+					? `/api/library?cursor=${encodeURIComponent(cursor)}`
+					: '/api/library';
+				const fetchPromise = fetchFn(path, {
+					credentials: 'include',
+					signal: controller.signal
+				});
+				// A response that materializes after its race was already lost
+				// (timeout won, or a newer generation aborted us) holds an open
+				// stream the winner never reads. Release it instead of abandoning
+				// it. Injected fetches deliberately ignore the abort signal, so
+				// the signal alone cannot release a late-arriving body.
+				void fetchPromise.then(
+					(lateResponse) => {
+						if (
+							timeoutFired ||
+							generation !== requestGeneration ||
+							controller.signal.aborted
+						) {
+							cancelResponse(lateResponse);
+						}
+					},
+					() => {}
+				);
+				const response = await Promise.race([fetchPromise, timeout, aborted]);
+				if (generation !== requestGeneration || controller.signal.aborted) {
+					cancelResponse(response);
+					return;
+				}
+				activeResponse = response;
+				if (!response.ok) {
+					// Refusal bodies are never read. Detach before best-effort cleanup
+					// so abort/disposal cannot cancel them again; never await cleanup.
+					activeResponse = null;
+					cancelResponse(response);
+				}
+				if (response.status === 404) {
+					// The list endpoint has not landed yet. Do not treat a 404 as
+					// session verification or expose a previously saved snapshot.
+					authenticatedThisLoad = false;
+					inMemorySnapshot = null;
+					state.items = [];
+					state.staleAt = null;
+					state.libraryUnavailable = true;
+					return;
+				}
+				if (response.status === 401 || response.status === 403) {
+					authenticatedThisLoad = false;
+					inMemorySnapshot = null;
+					deps.invalidateLibraryCache();
+					state.items = [];
+					state.staleAt = null;
+					state.requiresSignIn = response.status === 401;
+					state.loadError = state.requiresSignIn
+						? 'You are signed out or do not have access to this library.'
+						: 'You do not have access to this library.';
+					return;
+				}
+				if (!response.ok) throw new Error(`library request failed (${response.status})`);
+				const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
+				if (generation !== requestGeneration || controller.signal.aborted) {
+					cancelResponse(response);
+					return;
+				}
 				activeResponse = null;
-				cancelResponse(response);
-			}
-			if (response.status === 404) {
-				// The list endpoint has not landed yet. Do not treat a 404 as
-				// session verification or expose a previously saved snapshot.
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				state.items = [];
-				state.staleAt = null;
-				state.libraryUnavailable = true;
-				return;
-			}
-			if (response.status === 401 || response.status === 403) {
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				deps.invalidateLibraryCache();
-				state.items = [];
-				state.staleAt = null;
-				state.requiresSignIn = response.status === 401;
-				state.loadError = state.requiresSignIn
-					? 'You are signed out or do not have access to this library.'
-					: 'You do not have access to this library.';
-				return;
-			}
-			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
-			if (generation !== requestGeneration || controller.signal.aborted) {
-				cancelResponse(response);
-				return;
-			}
-			activeResponse = null;
-			const fresh = toLibraryItems(payload);
-			if (fresh === null) throw new Error('library response has an invalid shape');
+				const page = toLibraryItems(payload);
+				if (page === null) throw new Error('library response has an invalid shape');
+				collected.push(...page);
+				const next =
+					payload && typeof payload === 'object' && 'next_cursor' in payload
+						? payload.next_cursor
+						: null;
+				if (
+					next !== null &&
+					(typeof next !== 'string' ||
+						!/^[A-Za-z0-9_-]{1,8192}$/.test(next) ||
+						seenCursors.has(next) ||
+						page.length === 0)
+				) {
+					throw new Error('library continuation is invalid');
+				}
+				cursor = next;
+				if (cursor) seenCursors.add(cursor);
+			} while (cursor !== null);
+			// Commit only a complete traversal. A failed/refused continuation must
+			// never replace a previously verified snapshot with a partial page.
+			const fresh = toLibraryItems(collected)!;
 			authenticatedThisLoad = true;
 			state.items = fresh;
 			state.staleAt = null;

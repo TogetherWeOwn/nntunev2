@@ -190,6 +190,7 @@ pub struct ReleaseTrackDbRow {
 /// [`assemble_library_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryPageRow {
+    pub idempotency_key: String,
     pub job_id: String,
     pub release_mbid: Option<String>,
     pub recording_mbids: Vec<String>,
@@ -236,6 +237,7 @@ pub struct LibraryReleaseHit {
 /// Feeds [`library_entry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryDbRow {
+    pub idempotency_key: String,
     pub job_id: String,
     pub release_mbid: Option<String>,
     pub recording_mbids: Vec<String>,
@@ -248,6 +250,57 @@ pub struct LibraryDbRow {
     pub release_title: Option<String>,
     pub artist_mbid: Option<String>,
     pub artist_name: Option<String>,
+}
+
+/// Versioned keyset position, not an authorization grant. Every continuation
+/// still binds the authenticated caller's own-or-shared SQL predicate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryCursor {
+    version: u8,
+    pub matched_last: bool,
+    pub job_id: String,
+    pub recording_ord: i64,
+    pub idempotency_key: String,
+}
+
+impl LibraryCursor {
+    pub fn from_row(row: &LibraryDbRow) -> Self {
+        Self {
+            version: 1,
+            matched_last: row.release_mbid.is_none(),
+            job_id: row.job_id.clone(),
+            recording_ord: row.recording_ord,
+            idempotency_key: row.idempotency_key.clone(),
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        crate::b64::encode(&serde_json::to_vec(self).expect("serializable library cursor"))
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        if value.len() > 8192 {
+            return None;
+        }
+        let cursor: Self = serde_json::from_slice(&crate::b64::decode(value).ok()?).ok()?;
+        (cursor.version == 1
+            && cursor.recording_ord >= 0
+            && !cursor.job_id.is_empty()
+            && !cursor.idempotency_key.is_empty()
+            && !cursor.job_id.contains('\0')
+            && !cursor.idempotency_key.contains('\0'))
+        .then_some(cursor)
+    }
+
+    /// Bytewise text order matches the page SQL's explicit C collation.
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        self.matched_last
+            .cmp(&other.matched_last)
+            .then_with(|| other.job_id.cmp(&self.job_id))
+            .then_with(|| self.recording_ord.cmp(&other.recording_ord))
+            .then_with(|| self.idempotency_key.cmp(&other.idempotency_key))
+    }
 }
 
 /// Caller-visible artist. Mirrors the mirror worker's `Artist` shape
@@ -300,7 +353,7 @@ pub struct TrackResponse {
 /// unmatched rows; `title`/`artist`/`release` are `None` exactly when the
 /// mirror has nothing (unmatched ingest, or a match the mirror does not
 /// carry). `art_url` is `Some` only for well-formed release MBIDs.
-/// `occurrence_key` identifies the job/array position for rendering and cache
+/// `occurrence_key` identifies the ledger-key/array position for rendering and cache
 /// deduplication; the legacy playback `id` is deliberately unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LibraryEntry {
@@ -379,7 +432,11 @@ pub fn library_entry(row: &LibraryDbRow) -> LibraryEntry {
             .recording_mbid
             .clone()
             .unwrap_or_else(|| row.job_id.clone()),
-        occurrence_key: format!("{}:{}", row.job_id, row.recording_ord),
+        occurrence_key: format!(
+            "{}:{}",
+            crate::b64::encode(row.idempotency_key.as_bytes()),
+            row.recording_ord
+        ),
         recording_mbids: row.recording_mbids.clone(),
         release_mbid: row.release_mbid.clone(),
         title: row.recording_title.clone(),
@@ -516,6 +573,7 @@ pub fn assemble_library_rows(
                 _ => None,
             };
             LibraryDbRow {
+                idempotency_key: row.idempotency_key.clone(),
                 job_id: row.job_id.clone(),
                 release_mbid: row.release_mbid.clone(),
                 recording_mbids: row.recording_mbids.clone(),
@@ -538,8 +596,9 @@ pub fn assemble_library_rows(
 /// `library` table is app-target, migration 0035): this statement names no
 /// mirror relation, because the mirror lives on its own cluster (ADR 0002
 /// §1) and a join across databases cannot run on either connection.
-/// Parameters: owner user id ($1), row bound ($2,
-/// [`CATALOGUE_MAX_PAGE_SIZE`]).
+/// Parameters: owner user id ($1), row bound ($2, page size plus one
+/// lookahead), and optional cursor fields ($3 matched-last, $4 job id,
+/// $5 recording ordinal, $6 idempotency key). A NULL $3 starts the listing.
 ///
 /// - The `LATERAL` subselect unnests the job's `recording_mbids` with
 ///   ordinality (album order). There is deliberately no `text::uuid` cast:
@@ -860,6 +919,7 @@ mod tests {
 
     fn library_row() -> LibraryDbRow {
         LibraryDbRow {
+            idempotency_key: "key-1".to_string(),
             job_id: "job-1".to_string(),
             release_mbid: Some(GOOD_RELEASE.to_string()),
             recording_mbids: vec![GOOD_MBID.to_string()],
@@ -881,7 +941,8 @@ mod tests {
         let mut repeated = first.clone();
         repeated.recording_ord = 2;
         let mut other_job = first.clone();
-        other_job.job_id = "job-2".to_string();
+        // A second ledger row may share the same job/ordinal positions.
+        other_job.idempotency_key = "key-2".to_string();
         let entries: Vec<_> = [&first, &repeated, &other_job]
             .into_iter()
             .map(library_entry)
@@ -891,7 +952,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.occurrence_key.as_str())
                 .collect::<Vec<_>>(),
-            vec!["job-1:1", "job-1:2", "job-2:1"]
+            vec!["a2V5LTE:1", "a2V5LTE:2", "a2V5LTI:1"]
         );
         for entry in entries {
             let json = serde_json::to_value(entry).unwrap();
@@ -960,6 +1021,7 @@ mod tests {
     #[test]
     fn library_entry_unmatched_falls_back_to_job_id() {
         let row = LibraryDbRow {
+            idempotency_key: "key-9".to_string(),
             job_id: "job-9".to_string(),
             release_mbid: None,
             recording_mbids: Vec::new(),
@@ -1078,6 +1140,38 @@ mod tests {
     }
 
     #[test]
+    fn library_cursor_is_versioned_bounded_and_uses_the_unique_tie_breaker() {
+        let row = library_row();
+        let cursor = LibraryCursor::from_row(&row);
+        assert_eq!(
+            LibraryCursor::decode(&cursor.encode()),
+            Some(cursor.clone())
+        );
+        let mut next = cursor.clone();
+        next.idempotency_key.push('z');
+        assert!(cursor.compare(&next).is_lt());
+        next = cursor.clone();
+        next.recording_ord += 1;
+        assert!(cursor.compare(&next).is_lt());
+        next = cursor.clone();
+        next.job_id = "job-0".into();
+        assert!(cursor.compare(&next).is_lt());
+        next = cursor.clone();
+        next.matched_last = true;
+        assert!(cursor.compare(&next).is_lt());
+        for field in ["version", "recording_ord"] {
+            let mut value = serde_json::to_value(&cursor).unwrap();
+            value[field] = serde_json::json!(-1);
+            assert!(LibraryCursor::decode(&crate::b64::encode(
+                &serde_json::to_vec(&value).unwrap()
+            ))
+            .is_none());
+        }
+        assert!(LibraryCursor::decode("invalid!").is_none());
+        assert!(LibraryCursor::decode(&"a".repeat(8193)).is_none());
+    }
+
+    #[test]
     fn statements_bind_limits_and_guard_every_mirror_join() {
         // Every list ends in a bound LIMIT: unbounded mirror scans can
         // never reach a response. The member lists bind their membership
@@ -1179,7 +1273,7 @@ mod tests {
         assert!(statement.contains("(l.release_mbid IS NULL) AS matched_last"));
         assert_eq!(statement.matches("l.idempotency_key").count(), 2);
         assert!(statement.ends_with(
-            "ORDER BY matched_last ASC, job_id DESC, recording_ord ASC, idempotency_key ASC LIMIT $2"
+            "ORDER BY matched_last ASC, job_id COLLATE \"C\" DESC, recording_ord ASC, idempotency_key COLLATE \"C\" ASC LIMIT $2"
         ));
         // Unnest preserves album order with ordinality.
         assert!(statement.contains("WITH ORDINALITY"));
@@ -1400,6 +1494,7 @@ mod tests {
 
     fn page_row(job: &str, release: Option<&str>, rec: Option<&str>, ord: i64) -> LibraryPageRow {
         LibraryPageRow {
+            idempotency_key: format!("key-{job}"),
             job_id: job.to_string(),
             release_mbid: release.map(str::to_string),
             recording_mbids: rec.map(|m| vec![m.to_string()]).unwrap_or_default(),

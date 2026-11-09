@@ -241,19 +241,36 @@ pub fn validate_library_write(write: &LibraryWrite) -> Result<(), &'static str> 
     if write.user_id.is_empty() || write.user_id.len() > 128 {
         return Err("user id must be 1..=128 chars");
     }
+    if !valid_ingest_key(&write.idempotency_key) {
+        return Err("idempotency key must be an ingest key");
+    }
     validate_shared_library_write(&shared_upsert_params(write))
 }
 
-/// Same key/MBID bounds as the legacy writer, without an owner requirement.
+fn valid_ingest_key(key: &str) -> bool {
+    key.len() <= 640
+        && key.starts_with("ingest:")
+        && key.bytes().filter(|b| *b == b':').count() >= 2
+}
+
+/// Exact content key used by authenticated admin originals. The private
+/// writer deliberately does not accept these owner-free identities.
+pub fn valid_admin_key(key: &str) -> bool {
+    key.strip_prefix("admin:").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Shared writes accept the legacy ingest key or an exact admin content key.
 pub fn validate_shared_library_write(write: &SharedUpsertParams<'_>) -> Result<(), &'static str> {
     if !validate_job_id(write.job_id) {
         return Err("job id must be 1..=64 url-safe chars");
     }
-    if write.idempotency_key.len() > 640
-        || !write.idempotency_key.starts_with("ingest:")
-        || write.idempotency_key.bytes().filter(|b| *b == b':').count() < 2
-    {
-        return Err("idempotency key must be an ingest key");
+    if !valid_ingest_key(write.idempotency_key) && !valid_admin_key(write.idempotency_key) {
+        return Err("idempotency key must be an ingest or admin key");
     }
     if let Some(mbid) = write.release_mbid {
         if !validate_mbid(mbid) {
@@ -340,6 +357,24 @@ mod tests {
         assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_ok());
         w.job_id.clear();
         assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_err());
+    }
+
+    #[test]
+    fn admin_content_keys_are_shared_only_and_exact() {
+        let mut w = write();
+        w.idempotency_key = format!("admin:{}", "a".repeat(64));
+        assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_ok());
+        assert!(validate_library_write(&w).is_err());
+        for key in [
+            "admin:".to_owned(),
+            format!("admin:{}", "a".repeat(63)),
+            format!("admin:{}", "a".repeat(65)),
+            format!("admin:{}", "A".repeat(64)),
+            format!("admin:{}:upload", "a".repeat(64)),
+        ] {
+            w.idempotency_key = key;
+            assert!(validate_shared_library_write(&shared_upsert_params(&w)).is_err());
+        }
     }
 
     #[test]

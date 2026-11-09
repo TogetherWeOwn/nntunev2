@@ -1516,6 +1516,7 @@ pub trait Store {
     fn catalogue_library(
         &self,
         _user_id: &str,
+        _after: Option<&crate::catalogue::LibraryCursor>,
     ) -> impl Future<Output = Result<Vec<crate::catalogue::LibraryDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
@@ -3731,9 +3732,9 @@ fn catalogue_response<T: serde::Serialize>(entries: &T) -> Response {
 }
 
 /// `GET /v1/library` and the legacy `GET /api/library` alias: the caller's
-/// joined ingest ledger as a bare array (the documented `/api/library`
-/// shape the M1 journey pins — bare array or `{ items }` with string-`id`
-/// rows). Store failure is the generic 500.
+/// joined ingest ledger as `{ items, next_cursor }` with string-`id` rows.
+/// A continuation is opaque, versioned and still caller-scoped; store
+/// failure is the generic 500.
 async fn catalogue_library<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -3749,7 +3750,7 @@ where
         Ok(user) => user,
         Err(resp) => return resp,
     };
-    catalogue_library_entries(ctx, &user_id).await
+    catalogue_library_entries(ctx, &user_id, req).await
 }
 
 /// `GET /api/library`: the legacy alias serving the same entries as
@@ -3779,25 +3780,70 @@ where
             Err(resp) => return resp,
         }
     };
-    catalogue_library_entries(ctx, &user_id).await
+    catalogue_library_entries(ctx, &user_id, req).await
 }
 
 /// Shared store read plus serialization for the two library routes: the
 /// caller arrives authenticated, this only assembles the entries.
-async fn catalogue_library_entries<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, user_id: &str) -> Response
+async fn catalogue_library_entries<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    req: &Request,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    match ctx.store.catalogue_library(user_id).await {
-        Ok(rows) => {
-            let entries: Vec<crate::catalogue::LibraryEntry> =
+    let after = match library_cursor_query(&req.path) {
+        Ok(after) => after,
+        Err(()) => return invalid_request(),
+    };
+    match ctx.store.catalogue_library(user_id, after.as_ref()).await {
+        Ok(mut rows) => {
+            let more = rows.len() > crate::catalogue::CATALOGUE_MAX_PAGE_SIZE;
+            rows.truncate(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE);
+            let next_cursor = if more {
+                rows.last()
+                    .map(|row| crate::catalogue::LibraryCursor::from_row(row).encode())
+            } else {
+                None
+            };
+            let items: Vec<crate::catalogue::LibraryEntry> =
                 rows.iter().map(crate::catalogue::library_entry).collect();
-            catalogue_response(&entries)
+            json_response(
+                200,
+                serde_json::json!({ "items": items, "next_cursor": next_cursor }),
+            )
         }
         Err(_) => internal(),
+    }
+}
+
+fn library_cursor_query(path: &str) -> Result<Option<crate::catalogue::LibraryCursor>, ()> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Ok(None);
+    };
+    if query.len() > 8192 {
+        return Err(());
+    }
+    let mut after = None;
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if name != "cursor" || after.is_some() {
+            return Err(());
+        }
+        after = Some(crate::catalogue::LibraryCursor::decode(&value).ok_or(())?);
+    }
+    Ok(after)
+}
+
+/// Only the library collections accept cursor queries. Other route matching
+/// and credential handling retain their existing path rules.
+pub(crate) fn library_route_path(path: &str) -> &str {
+    match path.split_once('?') {
+        Some((bare @ ("/v1/library" | "/api/library"), _)) => bare,
+        _ => path,
     }
 }
 
@@ -4883,10 +4929,10 @@ fn admin_ingest_failure(status: u16, code: &str, reason: &str, job_id: Option<&s
 /// pre-existing row (list/get views never carry it).
 fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> serde_json::Value {
     match admin_ingest::view_status(&job.db_status) {
-        Some("accepted") => {
+        Some(status) if status != "failed" => {
             let mut view = serde_json::json!({
                 "job_id": job.job_id,
-                "status": "accepted",
+                "status": status,
                 "accepted_at": job.accepted_at,
                 "nzb_bytes": job.nzb_bytes,
                 "file_count": job.file_count,
@@ -4917,6 +4963,91 @@ fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> 
             view
         }
     }
+}
+
+/// Session-bound original for an explicit control or null reconciliation. No
+/// Debug/Serialize, session token, key material or public constructor. Opening
+/// this holder changes no job state and grants no execution lease. The mutation
+/// adapter must still recheck actor role/deletion and the whole saved authority.
+pub struct AdminControlOriginal {
+    original: crate::admin_original::OriginalBody,
+    actor_user_id: String,
+    source_ip: Option<std::net::IpAddr>,
+    now: i64,
+}
+
+impl AdminControlOriginal {
+    pub fn original(&self) -> &crate::admin_original::OriginalBody {
+        &self.original
+    }
+
+    pub fn actor_user_id(&self) -> &str {
+        &self.actor_user_id
+    }
+
+    pub fn source_ip(&self) -> Option<std::net::IpAddr> {
+        self.source_ip
+    }
+
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+}
+
+struct ControlOriginalAuthorization<'a>(&'a str);
+
+impl crate::admin_original::OriginalAuthorization for ControlOriginalAuthorization<'_> {
+    fn authorize(&self, job_id: &str) -> Result<(), crate::admin_original::OriginalError> {
+        if job_id == self.0 {
+            Ok(())
+        } else {
+            Err(crate::admin_original::OriginalError::Denied)
+        }
+    }
+}
+
+/// Internal preparation only: no public route dispatches here yet. Apply the
+/// caller's database deadline to this entire operation. The existing admin
+/// mutation guard checks cookie signature, current session row, Origin, current
+/// role and freshness BEFORE touching the original repository or keyring. Native
+/// credentials (even alongside a cookie) cannot enter this path. Archive resume
+/// additionally needs its existing capability gate at the eventual caller.
+pub async fn read_admin_control_original<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    job_id: &str,
+    repository: &mut impl crate::admin_original::OriginalRepository,
+) -> Result<AdminControlOriginal, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = ctx.authenticate_admin(req, true).await?;
+    match ctx.store.account_deleting(&claims.user_id).await {
+        Ok(false) => {}
+        Ok(true) => return Err(account_deleting_response()),
+        Err(_) => return Err(internal()),
+    }
+    let now = i64::try_from(ctx.now).map_err(|_| internal())?;
+    let original = crate::admin_original::read_original(
+        &ControlOriginalAuthorization(job_id),
+        repository,
+        ctx.cfg,
+        job_id,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::admin_original::OriginalError::Missing => not_found(),
+        _ => internal(),
+    })?;
+    Ok(AdminControlOriginal {
+        original,
+        actor_user_id: claims.user_id,
+        source_ip: ctx.source_ip.parse().ok(),
+        now,
+    })
 }
 
 /// `POST /v1/admin/ingest` — accept one raw NZB upload. The guard runs
@@ -4964,6 +5095,9 @@ where
                 // A fresh rejection answers the reason's own status;
                 // a replay converges on the stored failed row (200).
                 Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    if admin_ingest::view_status(&job.db_status).is_none() {
+                        return internal();
+                    }
                     let status = if deduplicated {
                         200
                     } else {
@@ -5017,6 +5151,9 @@ where
                 // Fresh acceptance is 201; a replay converges on the
                 // stored row (200 with `deduplicated: true`).
                 Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    if admin_ingest::view_status(&job.db_status).is_none() {
+                        return internal();
+                    }
                     let status = if deduplicated { 200 } else { 201 };
                     let view = admin_ingest_view(&job, Some(deduplicated));
                     json_response(status, view)
@@ -5100,15 +5237,9 @@ where
     let Some(status) = admin_ingest::parse_status_filter(status_raw) else {
         return validation_failed("unknown status");
     };
-    // The store filters on the ledger status; the view names it
-    // `accepted` while the row stays `queued` for the future dispatch
-    // slice (the source discriminator keeps the pipeline off it).
-    let db_status = match status {
-        None => None,
-        Some("accepted") => Some("queued"),
-        Some("failed") => Some("failed"),
-        Some(_) => return internal(),
-    };
+    // Filter on the ledger projection, not its public alias. In particular,
+    // published selects only done, never a running or parked job.
+    let db_status = status.and_then(admin_ingest::db_status);
     let (limit, offset) = admin_ingest::parse_list_window(limit_raw, offset_raw);
     match ctx.store.admin_ingest_list(db_status, limit, offset).await {
         Ok(jobs) => {
@@ -7012,7 +7143,7 @@ where
             }
         }
     }
-    match (req.method.as_str(), req.path.as_str()) {
+    match (req.method.as_str(), library_route_path(&req.path)) {
         ("GET", "/healthz") => json_response(
             200,
             serde_json::json!({"ok": true, "build_sha": ctx.cfg.build_sha}),
@@ -7289,6 +7420,7 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
+        fail_account_deleting_lookup: RefCell<bool>,
         /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
@@ -8333,16 +8465,24 @@ mod tests {
         async fn catalogue_library(
             &self,
             user_id: &str,
+            after: Option<&crate::catalogue::LibraryCursor>,
         ) -> Result<Vec<crate::catalogue::LibraryDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
             }
-            Ok(self
+            use crate::catalogue::LibraryCursor;
+            let mut rows = self
                 .catalogue_library
                 .borrow()
                 .get(user_id)
                 .cloned()
-                .unwrap_or_default())
+                .unwrap_or_default();
+            rows.sort_by(|a, b| LibraryCursor::from_row(a).compare(&LibraryCursor::from_row(b)));
+            rows.retain(|row| {
+                after.is_none_or(|cursor| LibraryCursor::from_row(row).compare(cursor).is_gt())
+            });
+            rows.truncate(crate::catalogue::CATALOGUE_MAX_PAGE_SIZE + 1);
+            Ok(rows)
         }
         async fn catalogue_artists(
             &self,
@@ -8450,6 +8590,9 @@ mod tests {
                 .unwrap_or_default())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_account_deleting_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
@@ -16209,6 +16352,10 @@ mod tests {
         serde_json::from_str(audit.details.as_ref().expect("details")).unwrap()
     }
 
+    mod control_original {
+        include!("admin_control_original_tests.rs");
+    }
+
     #[test]
     fn admin_ingest_guard_collapses_to_byte_identical_404() {
         let h = harness();
@@ -16793,6 +16940,103 @@ mod tests {
         assert_eq!(body["reason"], "not_nzb");
         for marker in ["poster@example", "mid-", "@example.invalid"] {
             assert!(!get_failed.body.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn admin_ingest_execution_views_and_filters_remain_redacted_on_replay() {
+        let h = harness();
+        let cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let upload = minimal_ingest_nzb();
+        let accepted = post_ingest(&h, &cookie, &upload);
+        assert_eq!(accepted.status, 201);
+        let accepted: serde_json::Value = serde_json::from_str(&accepted.body).unwrap();
+        let id = accepted["job_id"].as_str().unwrap();
+        let mut expected = accepted.clone();
+        expected.as_object_mut().unwrap().remove("deduplicated");
+        for (stored, view) in [
+            ("running", "running"),
+            ("needs_review", "needs_review"),
+            ("needs_archive_read", "needs_archive_read"),
+            ("rejected", "rejected"),
+            ("done", "published"),
+        ] {
+            h.store
+                .ingest_jobs
+                .borrow_mut()
+                .get_mut(id)
+                .unwrap()
+                .db_status = stored.into();
+            let audits = h.store.audits.borrow().len();
+            expected["status"] = view.into();
+            let get = h.call_full(
+                "GET",
+                &format!("/v1/admin/ingest/{id}"),
+                None,
+                Some(cookie.clone()),
+                None,
+            );
+            assert_eq!(get.status, 200, "{stored}");
+            let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+            assert_eq!(body, expected);
+            for filter in [None, Some(view), Some("accepted")] {
+                let path = filter
+                    .map(|s| format!("/v1/admin/ingest?status={s}"))
+                    .unwrap_or_else(|| "/v1/admin/ingest".into());
+                let list = h.call_full("GET", &path, None, Some(cookie.clone()), None);
+                assert_eq!(list.status, 200, "{stored}");
+                let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+                let want = if filter == Some("accepted") {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([expected.clone()])
+                };
+                assert_eq!(body["jobs"], want);
+            }
+            assert_eq!(h.store.audits.borrow().len(), audits);
+            let replay = post_ingest(&h, &cookie, &upload);
+            assert_eq!(replay.status, 200, "{stored}");
+            let mut body: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+            assert_eq!(
+                body.as_object_mut().unwrap().remove("deduplicated"),
+                Some(true.into())
+            );
+            assert_eq!(body, expected);
+            assert_eq!(h.store.ingest_jobs.borrow()[id].db_status, stored);
+            assert_eq!(h.store.ingest_originals.borrow().len(), 1);
+        }
+
+        // Unknown stored vocabulary still fails closed rather than appearing
+        // published or being silently omitted from the list.
+        h.store
+            .ingest_jobs
+            .borrow_mut()
+            .get_mut(id)
+            .unwrap()
+            .db_status = "matching".into();
+        for path in [
+            "/v1/admin/ingest".to_string(),
+            format!("/v1/admin/ingest/{id}"),
+        ] {
+            assert_eq!(
+                h.call_full("GET", &path, None, Some(cookie.clone()), None)
+                    .status,
+                500
+            );
+        }
+        assert_eq!(post_ingest(&h, &cookie, &upload).status, 500);
+        for filter in ["queued", "done", "matching", "probing"] {
+            assert_eq!(
+                h.call_full(
+                    "GET",
+                    &format!("/v1/admin/ingest?status={filter}"),
+                    None,
+                    Some(cookie.clone()),
+                    None
+                )
+                .status,
+                422
+            );
         }
     }
 
@@ -21134,6 +21378,7 @@ mod tests {
 
     fn matched_library_row(job: &str, rec: &str, ord: i64) -> crate::catalogue::LibraryDbRow {
         crate::catalogue::LibraryDbRow {
+            idempotency_key: format!("key-{job}"),
             job_id: job.to_string(),
             release_mbid: Some(CAT_RELEASE.to_string()),
             recording_mbids: vec![CAT_REC_A.to_string(), CAT_REC_B.to_string()],
@@ -21151,6 +21396,7 @@ mod tests {
 
     fn unmatched_library_row(job: &str) -> crate::catalogue::LibraryDbRow {
         crate::catalogue::LibraryDbRow {
+            idempotency_key: format!("key-{job}"),
             job_id: job.to_string(),
             release_mbid: None,
             recording_mbids: Vec::new(),
@@ -21225,6 +21471,11 @@ mod tests {
         );
     }
 
+    fn catalogue_items(body: &str) -> Vec<serde_json::Value> {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        serde_json::from_value(value.get("items").unwrap_or(&value).clone()).unwrap()
+    }
+
     #[test]
     fn catalogue_library_serves_m1_row_for_session_caller() {
         let h = harness();
@@ -21233,7 +21484,7 @@ mod tests {
         seed_library(&h, "u1");
         let resp = h.call_full("GET", "/v1/library", None, Some(cookie), Some(ORIGIN));
         assert_eq!(resp.status, 200, "{}", resp.body);
-        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+        let items = catalogue_items(&resp.body);
         assert_eq!(items.len(), 3);
         // M1 row: string id, non-empty recording_mbids, release_mbid, plus
         // the rich enrichment the web library renders.
@@ -21253,6 +21504,71 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_library_cursor_walks_both_routes_and_rejects_invalid_input() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        h.store.catalogue_library.borrow_mut().insert(
+            "u1".into(),
+            (0..53)
+                .map(|i| matched_library_row(&format!("job-{i:03}"), CAT_REC_A, 1))
+                .collect(),
+        );
+        let first = h.call_full(
+            "GET",
+            "/v1/library",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(first.status, 200);
+        let value: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(value["items"].as_array().unwrap().len(), 50);
+        let cursor = value["next_cursor"].as_str().unwrap();
+        let mut seen: Vec<String> = catalogue_items(&first.body)
+            .iter()
+            .map(|item| item["occurrence_key"].as_str().unwrap().to_owned())
+            .collect();
+        let mut bodies = Vec::new();
+        for root in ["/v1/library", "/api/library"] {
+            let path = format!("{root}?cursor={cursor}");
+            let second = h.call_full("GET", &path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(second.status, 200, "{}", second.body);
+            let page: serde_json::Value = serde_json::from_str(&second.body).unwrap();
+            assert_eq!(page["items"].as_array().unwrap().len(), 3);
+            assert!(page["next_cursor"].is_null());
+            bodies.push(second.body);
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        seen.extend(
+            catalogue_items(&bodies[0])
+                .iter()
+                .map(|item| item["occurrence_key"].as_str().unwrap().to_owned()),
+        );
+        assert_eq!(seen.len(), 53);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 53);
+        for query in [
+            "cursor=invalid",
+            "cursor=",
+            "other=value",
+            &format!("cursor={cursor}&cursor={cursor}"),
+        ] {
+            let path = format!("/api/library?{query}");
+            assert_eq!(
+                h.call_full("GET", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                400
+            );
+            assert_eq!(
+                h.call_full("GET", &path, None, None, Some(ORIGIN)).status,
+                401
+            );
+        }
+    }
+
+    #[test]
     fn catalogue_library_alias_preserves_unenriched_app_fields() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -21260,6 +21576,7 @@ mod tests {
         let page: Vec<_> = [1, 2]
             .into_iter()
             .map(|ord| crate::catalogue::LibraryPageRow {
+                idempotency_key: "key-1".into(),
                 job_id: "job-1".into(),
                 release_mbid: Some(CAT_RELEASE.into()),
                 recording_mbids: vec![CAT_REC_A.into(), CAT_REC_A.into()],
@@ -21282,7 +21599,7 @@ mod tests {
         assert_eq!(v1.status, 200);
         assert_eq!(alias.status, 200);
         assert_eq!(v1.body, alias.body);
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&v1.body).unwrap();
+        let rows = catalogue_items(&v1.body);
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0]["occurrence_key"], rows[1]["occurrence_key"]);
         for row in rows {
@@ -21371,9 +21688,18 @@ mod tests {
         // `catalogue_library_alias_session_transports` below.)
         let resp = h.call_bearer("GET", "/v1/library", Some(format!("Bearer {secret}")));
         assert_eq!(resp.status, 200, "{}", resp.body);
-        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+        let items = catalogue_items(&resp.body);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0]["id"], CAT_REC_A);
+        let cursor =
+            crate::catalogue::LibraryCursor::from_row(&matched_library_row("job-1", CAT_REC_A, 1))
+                .encode();
+        let paged_path = format!("/v1/library?cursor={cursor}");
+        let paged = h.call_bearer("GET", &paged_path, Some(format!("Bearer {secret}")));
+        assert_eq!(paged.status, 200, "{}", paged.body);
+        assert_eq!(catalogue_items(&paged.body).len(), 2);
+        let invalid = h.call_bearer("GET", &paged_path, Some("Bearer invalid".into()));
+        assert_eq!(invalid.status, 404);
         // Wrong scope stays the names-only 403 (the gate owns it).
         let stream_minted = mint_call(
             &h,
@@ -21381,11 +21707,7 @@ mod tests {
             serde_json::json!({"scopes": ["stream:read"], "ttl_secs": 3600}),
         );
         let stream_secret = mint_secret(&serde_json::from_str(&stream_minted.body).unwrap());
-        let forbidden = h.call_bearer(
-            "GET",
-            "/v1/library",
-            Some(format!("Bearer {stream_secret}")),
-        );
+        let forbidden = h.call_bearer("GET", &paged_path, Some(format!("Bearer {stream_secret}")));
         assert_eq!(forbidden.status, 403, "{}", forbidden.body);
     }
 
@@ -21420,7 +21742,7 @@ mod tests {
             via_bearer.body, via_cookie.body,
             "alias must serve one shape on both session transports"
         );
-        let items: Vec<serde_json::Value> = serde_json::from_str(&via_bearer.body).unwrap();
+        let items = catalogue_items(&via_bearer.body);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0]["id"], CAT_REC_A);
         // A native-REST credential is not a session: 401 even when the
@@ -21458,7 +21780,7 @@ mod tests {
         seed_library(&h, "u1");
         let resp = h.call_full("GET", "/v1/library", None, Some(cookie_b), Some(ORIGIN));
         assert_eq!(resp.status, 200, "{}", resp.body);
-        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+        let items = catalogue_items(&resp.body);
         assert!(
             items.is_empty(),
             "u1 rows must never reach u2: {}",
@@ -21659,7 +21981,7 @@ mod tests {
         for path in ["/v1/artists", "/v1/releases", "/v1/tracks"] {
             let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
             assert_eq!(resp.status, 200, "{path}: {}", resp.body);
-            let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+            let items = catalogue_items(&resp.body);
             assert_eq!(items.len(), 1, "{path}: {}", resp.body);
             assert!(
                 !resp.body.contains(OTHER_RELEASE) && !resp.body.contains(OTHER_ARTIST),

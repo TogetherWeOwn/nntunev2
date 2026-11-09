@@ -51,8 +51,10 @@ pub fn upsert_ingest_job_sql() -> &'static str {
 /// `$n` parameter order for [`transition_ingest_job_sql`].
 pub const INGEST_JOB_TRANSITION_PARAM_ORDER: [&str; 3] = ["id", "user_id", "status"];
 
-/// Terminal transition: `queued`/`running` to `done`/`failed`
-/// ([`validate_transition_status`]; the schema `CHECK` backstops it).
+/// Private-pipeline terminal transition: `queued`/`running` to `done`/`failed`
+/// ([`validate_transition_status`]; the schema `CHECK` backstops it). Admin rows
+/// never use this user fence, even when the uploader matches. Their checkpoint,
+/// status and publication settle together through admin checkpoint authority.
 /// The `IN ('queued', 'running')` predicate makes a converged replay
 /// match 0 rows instead of rewriting a terminal status; the caller
 /// separates that from a fenced or missing row with
@@ -61,13 +63,13 @@ pub const INGEST_JOB_TRANSITION_PARAM_ORDER: [&str; 3] = ["id", "user_id", "stat
 /// (owner) so a job id presented under the wrong user matches nothing
 /// and fails closed through that same classification.
 pub fn transition_ingest_job_sql() -> &'static str {
-    "UPDATE ingest_jobs SET status = $3 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE ingest_jobs.id = $1 AND ingest_jobs.user_id = $2 AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running')"
+    "UPDATE ingest_jobs SET status = $3 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE ingest_jobs.id = $1 AND ingest_jobs.user_id = $2 AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running')"
 }
 
 /// Fetch the job status after a zero-row [`transition_ingest_job_sql`]
 /// write. Parameters: `id` ($1), `user_id` ($2).
 pub fn select_ingest_job_status_sql() -> &'static str {
-    "SELECT status FROM ingest_jobs WHERE id = $1 AND user_id = $2"
+    "SELECT status FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND source <> 'admin'"
 }
 
 /// Outcome of one terminal [`transition_ingest_job_sql`] write.
@@ -175,7 +177,7 @@ mod tests {
             transition_ingest_job_sql(),
             "UPDATE ingest_jobs SET status = $3 \
              FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
-             WHERE ingest_jobs.id = $1 AND ingest_jobs.user_id = $2 AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running')"
+             WHERE ingest_jobs.id = $1 AND ingest_jobs.user_id = $2 AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.source <> 'admin' AND ingest_jobs.status IN ('queued', 'running')"
         );
         assert_eq!(
             INGEST_JOB_TRANSITION_PARAM_ORDER,
@@ -190,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             select_ingest_job_status_sql(),
-            "SELECT status FROM ingest_jobs WHERE id = $1 AND user_id = $2"
+            "SELECT status FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND source <> 'admin'"
         );
     }
 

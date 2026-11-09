@@ -686,7 +686,15 @@ mod surface_acceptance {
         for path in ["/v1/library", "/v1/artists", "/v1/releases", "/v1/tracks"] {
             let served = request(&h, "GET", path, None, Some(&cookie));
             assert_eq!(served.status, 200, "GET {path}: session serves");
-            assert_eq!(served.body, "[]", "GET {path}: fixture store holds no rows");
+            let empty = if path == "/v1/library" {
+                r#"{"items":[],"next_cursor":null}"#
+            } else {
+                "[]"
+            };
+            assert_eq!(
+                served.body, empty,
+                "GET {path}: fixture store holds no rows"
+            );
             let anon = request(&h, "GET", path, None, None);
             assert_eq!(anon.status, 401, "GET {path}: anonymous 401s");
         }
@@ -778,7 +786,10 @@ mod surface_acceptance {
             via_bearer.body, via_cookie.body,
             "GET {ALIAS}: one shape on both session transports"
         );
-        assert_eq!(via_bearer.body, "[]", "fixture store holds no rows");
+        assert_eq!(
+            via_bearer.body, r#"{"items":[],"next_cursor":null}"#,
+            "fixture store holds no rows"
+        );
         let anon = request(&h, "GET", ALIAS, None, None);
         assert_eq!(anon.status, 401, "GET {ALIAS}: anonymous 401s");
     }

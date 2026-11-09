@@ -11,7 +11,10 @@ const RELEASE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RECORDING: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OTHER_RELEASE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
-async fn client(populated: bool) -> Client {
+#[path = "support/admin_writer_acceptance.rs"]
+mod admin_writers;
+
+async fn database_client() -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("CI disposable database is required; never silently skip")
         .parse()
@@ -24,8 +27,17 @@ async fn client(populated: bool) -> Client {
     );
     let (client, connection) = config.connect(NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
+    client
+        .batch_execute("SET statement_timeout = '3s'")
+        .await
+        .unwrap();
+    client
+}
+
+async fn client(populated: bool) -> Client {
+    let client = database_client().await;
     client.batch_execute(
-        "SET statement_timeout = '3s'; SET search_path = pg_temp;
+        "SET search_path = pg_temp;
          CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
     ).await.unwrap();
     if populated {
@@ -33,8 +45,8 @@ async fn client(populated: bool) -> Client {
         // degradation. The other user's row must never become membership.
         client
             .execute(
-                "INSERT INTO library VALUES ('u1','job-1',$1,ARRAY[$2,$2,'stored-invalid']),
-             ('u1','job-0',NULL,ARRAY[]::text[]), ('other','private',$3,ARRAY[$2])",
+                "INSERT INTO library VALUES ('u1','job-1',$1,ARRAY[$2,$2,'stored-invalid'],'key-1'),
+             ('u1','job-0',NULL,ARRAY[]::text[],'key-0'), ('other','private',$3,ARRAY[$2],'key-private')",
                 &[&RELEASE, &RECORDING, &OTHER_RELEASE],
             )
             .await
@@ -52,6 +64,201 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
         attempts.clone(),
     );
     (store, attempts)
+}
+
+#[tokio::test]
+async fn admin_original_adapter_bounds_reads_without_mutating_status() {
+    use nntune_api::admin_original::{OriginalRepository, PostgresOriginalRepository};
+    let app = client(false).await;
+    app.batch_execute(
+        "CREATE TEMP TABLE ingest_jobs (id TEXT PRIMARY KEY, source TEXT, status TEXT, content_sha256 TEXT, idempotency_key TEXT, nzb_bytes BIGINT);
+         CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY, content_sha256 TEXT, nzb_bytes BIGINT, nzb_ref_envelope_version SMALLINT, nzb_ref_payload_format SMALLINT, nzb_ref_kek_version INTEGER, nzb_ref_encrypted BYTEA, nzb_ref_dek_wrapped_nonce BYTEA, nzb_ref_dek_wrapped BYTEA, nzb_ref_payload_nonce BYTEA)",
+    ).await.unwrap();
+    let job = format!("adm_{}", "a".repeat(43));
+    let hash = "a".repeat(64);
+    app.execute(
+        "INSERT INTO ingest_jobs VALUES ($1, 'admin', 'queued', $2, 'admin:' || $2, 1);
+        ",
+        &[&job, &hash],
+    )
+    .await
+    .unwrap();
+    app.execute(
+        "INSERT INTO ingest_originals VALUES ($1, $2, 1, 2, 1, 7, $3, $4, $5, $4)",
+        &[&job, &hash, &vec![0u8; 17], &vec![0u8; 12], &vec![0u8; 48]],
+    )
+    .await
+    .unwrap();
+    let mut repo = PostgresOriginalRepository { client: &app };
+    let mut rows = repo.metadata(&job).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let selected = rows.pop().unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_some());
+    assert!(repo.confirm_current(&selected).await.unwrap());
+    assert!(
+        repo.confirm_current(&selected).await.unwrap(),
+        "replay converges"
+    );
+    let status: String = app
+        .query_one("SELECT status FROM ingest_jobs WHERE id = $1", &[&job])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "queued");
+    for status in ["running", "needs_review", "needs_archive_read"] {
+        app.execute("UPDATE ingest_jobs SET status = $1", &[&status])
+            .await
+            .unwrap();
+        assert_eq!(repo.metadata(&job).await.unwrap().len(), 1);
+        assert!(repo.envelope(&selected).await.unwrap().is_some());
+        assert!(repo.confirm_current(&selected).await.unwrap());
+        let stored: String = app
+            .query_one("SELECT status FROM ingest_jobs", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stored, status);
+    }
+
+    // Rotation or a corrupt byte shape after metadata selection refuses the
+    // byte load and the final read-only confirmation.
+    app.execute("UPDATE ingest_originals SET nzb_ref_kek_version = 8", &[])
+        .await
+        .unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_originals SET nzb_ref_kek_version = 7, nzb_ref_encrypted = $1",
+        &[&vec![0u8; 18]],
+    )
+    .await
+    .unwrap();
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_originals SET nzb_ref_encrypted = $1",
+        &[&vec![0u8; 17]],
+    )
+    .await
+    .unwrap();
+    for status in ["done", "failed", "rejected", "unknown"] {
+        app.execute("UPDATE ingest_jobs SET status = $1", &[&status])
+            .await
+            .unwrap();
+        assert!(repo.metadata(&job).await.unwrap().is_empty());
+        assert!(repo.envelope(&selected).await.unwrap().is_none());
+        assert!(!repo.confirm_current(&selected).await.unwrap());
+    }
+    app.execute(
+        "UPDATE ingest_jobs SET status = 'queued', source = 'pipeline'",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(repo.metadata(&job).await.unwrap().is_empty());
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
+    app.execute(
+        "UPDATE ingest_jobs SET source = 'admin', content_sha256 = $1",
+        &[&"b".repeat(64)],
+    )
+    .await
+    .unwrap();
+    assert!(repo.metadata(&job).await.unwrap().is_empty());
+    assert!(repo.envelope(&selected).await.unwrap().is_none());
+    assert!(!repo.confirm_current(&selected).await.unwrap());
+}
+
+#[tokio::test]
+async fn admin_execution_statuses_survive_real_store_reads_and_filters() {
+    use nntune_api::admin_ingest::{db_status, view_status};
+    for status in [
+        "queued",
+        "running",
+        "needs_review",
+        "needs_archive_read",
+        "rejected",
+        "done",
+    ] {
+        for filter in [None, Some(status), Some("failed")] {
+            let app = client(false).await;
+            // Test only the production store's status projection here. Actual
+            // parked-state schema acceptance requires the separately gated
+            // forward migration; these isolated tables make no apply claim.
+            app.batch_execute(
+                "CREATE TEMP TABLE ingest_jobs (id TEXT PRIMARY KEY, source TEXT, status TEXT, accepted_at BIGINT, nzb_bytes BIGINT, file_count INTEGER, segment_count INTEGER, failure_reason TEXT, user_id TEXT);
+                 CREATE TEMP TABLE ingest_originals (job_id TEXT PRIMARY KEY);
+                 INSERT INTO ingest_originals VALUES ('admin-job')",
+            ).await.unwrap();
+            app.execute(
+                "INSERT INTO ingest_jobs VALUES ('admin-job', 'admin', $1, 1, 1, 1, 1, NULL, 'uploader'),
+                 ('pipeline-job', 'pipeline', $1, 1, 1, 1, 1, NULL, 'uploader')",
+                &[&status],
+            ).await.unwrap();
+            let attempts = Rc::new(Cell::new(0));
+            let store = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts);
+            let rows = store.admin_ingest_list(filter, 50, 0).await.unwrap();
+            if filter == Some("failed") {
+                assert!(rows.is_empty());
+            } else {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].job_id, "admin-job");
+                assert_eq!(rows[0].db_status, status);
+                assert!(rows[0].has_original);
+                assert_eq!(
+                    db_status(view_status(&rows[0].db_status).unwrap()),
+                    Some(status)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn library_continuation_binds_every_key_and_preserves_owner_scope() {
+    use nntune_api::catalogue::LibraryCursor;
+    for caller in ["u1", "fresh"] {
+        let attempts = Rc::new(Cell::new(0));
+        let mut after = None;
+        let mut seen = std::collections::HashSet::new();
+        for turn in 0..3 {
+            // PgStore acquires a connection per request; the test seam lends
+            // its injected connection once. Seed the same isolated snapshot
+            // on each request rather than reusing an exhausted store seam.
+            let app = client(false).await;
+            app.execute(
+                "INSERT INTO library SELECT NULL, 'same-job', $1, ARRAY[$2], 'shared-' || lpad(g::text, 3, '0')
+                 FROM generate_series(1,55) g",
+                &[&RELEASE, &RECORDING],
+            ).await.unwrap();
+            app.execute(
+                "INSERT INTO library VALUES ('u1','same-job',$1,ARRAY[$2],'own'),
+                 ('other','same-job',$1,ARRAY[$2],'other')",
+                &[&RELEASE, &RECORDING],
+            )
+            .await
+            .unwrap();
+            let s =
+                catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
+            let mut rows = s.catalogue_library(caller, after.as_ref()).await.unwrap();
+            if turn == 0 {
+                assert_eq!(rows.len(), 51, "one lookahead row");
+            }
+            let more = rows.len() > 50;
+            rows.truncate(50);
+            for row in &rows {
+                assert!(seen.insert(row.idempotency_key.clone()));
+            }
+            if !more {
+                break;
+            }
+            after = rows.last().map(LibraryCursor::from_row);
+        }
+        assert_eq!(seen.len(), if caller == "u1" { 56 } else { 55 });
+        assert_eq!(seen.contains("own"), caller == "u1");
+        assert!(!seen.contains("other"));
+        assert_eq!(attempts.get(), 0);
+    }
 }
 
 #[tokio::test]
@@ -99,7 +306,17 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
             assert_eq!(!recordings.is_empty(), is_member);
         }
         let page = app
-            .query(library_page_statement(), &[&caller, &50_i64])
+            .query(
+                library_page_statement(),
+                &[
+                    &caller,
+                    &50_i64,
+                    &None::<bool>,
+                    &None::<String>,
+                    &None::<i64>,
+                    &None::<String>,
+                ],
+            )
             .await
             .unwrap();
         assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
@@ -110,7 +327,7 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
 #[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
-    let rows = store.catalogue_library("u1").await.unwrap();
+    let rows = store.catalogue_library("u1", None).await.unwrap();
     let page: Vec<_> = [
         Some(RECORDING),
         Some(RECORDING),
@@ -120,6 +337,12 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     .into_iter()
     .enumerate()
     .map(|(i, recording)| LibraryPageRow {
+        idempotency_key: if recording.is_some() {
+            "key-1"
+        } else {
+            "key-0"
+        }
+        .into(),
         job_id: if recording.is_some() {
             "job-1"
         } else {
@@ -148,7 +371,7 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
 async fn empty_app_membership_never_connects_in_either_mode() {
     for configured in [false, true] {
         let (s, attempts) = store(false, configured).await;
-        assert!(s.catalogue_library("u1").await.unwrap().is_empty());
+        assert!(s.catalogue_library("u1", None).await.unwrap().is_empty());
         assert_eq!(attempts.get(), 0);
         let (s, attempts) = store(false, configured).await;
         assert!(s.catalogue_artists("u1").await.unwrap().is_empty());
@@ -215,7 +438,7 @@ async fn nonempty_entities_fail_without_dialing_an_absent_binding() {
 #[tokio::test]
 async fn configured_library_connect_and_statement_failures_never_degrade() {
     let (s, attempts) = store(true, true).await;
-    assert!(s.catalogue_library("u1").await.is_err());
+    assert!(s.catalogue_library("u1", None).await.is_err());
     assert_eq!(attempts.get(), 1);
     // A connected mirror without its required tables must propagate the real
     // statement failure, not serve the same null-enriched rows as absence.
@@ -226,7 +449,7 @@ async fn configured_library_connect_and_statement_failures_never_degrade() {
         Ok(client(false).await),
         attempts.clone(),
     );
-    assert!(s.catalogue_library("u1").await.is_err());
+    assert!(s.catalogue_library("u1", None).await.is_err());
     assert_eq!(attempts.get(), 1);
 }
 

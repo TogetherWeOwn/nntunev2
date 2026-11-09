@@ -2,8 +2,8 @@
 //!
 //! Routes (all JSON):
 //! - `GET /healthz` — unauthenticated Worker health check; no bindings.
-//! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
-//!   (`indexer_ref` vault handle; raw keys are never accepted here).
+//! - `POST /v1/ingest/search` — retired intake; authenticated 404 without
+//!   reading the request body or admitting any work.
 //! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps and parsed
 //!   with the bounded `nntune-core` parser before enqueue.
 //! - `GET /v1/ingest/jobs/:id` — job checkpoint status (idempotent resume).
@@ -20,16 +20,21 @@
 //! validates messages and checkpoints and executes the upload
 //! parse + pool-probe + verify steps, the repair step (through the
 //! `REPAIR_CONTAINER` service binding, fed by verify's staged inputs)
-//! and match/write, but its search boundary is not executable yet, so the
-//! staging deploy lane must stay operator-disabled until TWO-1660 closes
-//! search intake (the `[[queues.consumers]]` stanza in `wrangler.toml` is
-//! live config and the consumer goes live on deploy).
+//! and match/write. Search admission and search-sourced queue execution
+//! are closed. Admin execution/publication remains fail-closed pending
+//! durable-original dispatch and publish gates; this change authorizes
+//! no deploy or consumer activation.
 //! See `README.md`.
 
 use futures_util::StreamExt;
 use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod admin_checkpoint;
+pub mod admin_checkpoint_store;
+pub mod admin_execution;
+pub mod admin_gates;
+pub mod admin_writers;
 pub mod api_error;
 pub mod caller_auth;
 pub mod checkpoint;
@@ -64,14 +69,12 @@ use jobs::{validate_job_id, JobSource};
 use metering::{
     emit_meter, MeterOutcome, MeterSink, MeterWriteError, METER_DATASET, METER_DATASET_BINDING,
 };
-use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use nzb_intake::{estimate_nzb, IntakeRejection};
-use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
+use queue::{NzbUploadRequest, QueueMsg};
 
-/// Largest accepted `POST /v1/ingest/search` body: the request is a query plus
-/// a short category list, never content. Enforced while streaming
-/// ([`read_capped_text`]): at most `cap` bytes are ever buffered, whether or
-/// not the caller sent `Content-Length`.
+/// Historical search-body cap retained for compatibility tests only.
+/// The retired route refuses after caller authentication and never reads
+/// a body. This constant no longer describes an executable admission path.
 pub const MAX_SEARCH_BODY_BYTES: usize = 16 * 1024;
 /// Largest accepted `POST /v1/ingest/nzb` JSON body. The decoded NZB is capped
 /// at [`MAX_NZB_BYTES`], but JSON escaping can inflate hostile input ~6x on
@@ -262,147 +265,6 @@ fn caller_auth_decision(
     })
 }
 
-// --- Search abuse guard (roadmap R6) -------------------------------------------
-
-thread_local! {
-    /// Per-isolate search buckets. Scope is deliberately honest: this
-    /// bounds bursts per isolate, complementing the durable per-plan
-    /// metering downstream (see `rate_limit::SearchThrottleStore`).
-    static SEARCH_THROTTLE: std::cell::RefCell<rate_limit::SearchThrottleStore> =
-        std::cell::RefCell::new(rate_limit::SearchThrottleStore::new());
-}
-
-/// Canonical source-IP scope for the search throttle: only a clean IP
-/// literal from the Cloudflare-set header survives, else `unknown` (all
-/// unidentified callers share one bucket — fail-closed, never a fresh
-/// budget per forged header). IPv6 is keyed by its /64 (IPv4-mapped by the
-/// embedded IPv4), mirroring the API worker's `rate_limit_ip_key`, so
-/// rotation inside one prefix cannot mint fresh budgets. The value keys
-/// buckets in memory only; it is never logged.
-fn search_source_ip(raw: Option<String>) -> String {
-    use std::net::IpAddr;
-    match raw {
-        Some(value) => match value.trim().parse::<IpAddr>() {
-            Ok(IpAddr::V4(v4)) => v4.to_string(),
-            Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-                Some(v4) => v4.to_string(),
-                None => {
-                    let segments = v6.segments();
-                    std::net::Ipv6Addr::new(
-                        segments[0],
-                        segments[1],
-                        segments[2],
-                        segments[3],
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                    .to_string()
-                }
-            },
-            Err(_) => "unknown".to_string(),
-        },
-        None => "unknown".to_string(),
-    }
-}
-
-/// The [vars] names `SearchRateLimitConfig::from_vars` reads. One
-/// const list so the glue test can pin every name against its field.
-const SEARCH_RATE_LIMIT_VAR_NAMES: [&str; 2] =
-    ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"];
-
-/// Cloudflare-set connecting-IP header. One const so the glue test
-/// pins the exact name the route reads.
-const CONNECTING_IP_HEADER: &str = "cf-connecting-ip";
-
-/// Search throttle tunables from a [vars] lookup; `from_vars` fails
-/// safe to the documented defaults on anything missing or invalid.
-/// Pure over the lookup closure (mirrors the api worker's
-/// `rate_limits_from_lookup`) so a renamed key fails a native test.
-fn search_throttle_vars_from_lookup(
-    get: impl Fn(&str) -> Option<String>,
-) -> std::collections::HashMap<String, String> {
-    SEARCH_RATE_LIMIT_VAR_NAMES
-        .iter()
-        .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
-        .collect()
-}
-
-/// Read the connecting IP through a header lookup: asks for exactly
-/// [`CONNECTING_IP_HEADER`], so a renamed header fails a native test
-/// instead of silently collapsing every caller into `unknown`.
-fn search_connecting_ip(get_header: impl Fn(&str) -> Option<String>) -> Option<String> {
-    get_header(CONNECTING_IP_HEADER)
-}
-
-/// The search route's throttle decision, extracted over plain inputs
-/// (connecting-IP header value, [vars], account, now) so native tests
-/// drive the exact function the route calls — `Request`/`Env` need
-/// wasm-bindgen and cannot be built in a unit test.
-fn search_attempt_decision(
-    store: &mut rate_limit::SearchThrottleStore,
-    connecting_ip: Option<String>,
-    vars: &std::collections::HashMap<String, String>,
-    user_id: &str,
-    now_s: u64,
-) -> rate_limit::SearchDecision {
-    let ip = search_source_ip(connecting_ip);
-    let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
-    let cfg = rate_limit::SearchRateLimitConfig::from_vars(vars);
-    store.check(&key, &cfg, now_s)
-}
-
-/// The full route glue over plain lookups: header name, [vars]
-/// names and the store decision composed exactly as the route runs
-/// them. A native test drives THIS fn end to end, so neutering any
-/// link (unconditional Allow, renamed var, renamed header) fails.
-fn check_search_attempt_in(
-    store: &mut rate_limit::SearchThrottleStore,
-    get_header: impl Fn(&str) -> Option<String>,
-    get_var: impl Fn(&str) -> Option<String>,
-    user_id: &str,
-    now_s: u64,
-) -> rate_limit::SearchDecision {
-    let connecting_ip = search_connecting_ip(get_header);
-    let vars = search_throttle_vars_from_lookup(get_var);
-    search_attempt_decision(store, connecting_ip, &vars, user_id, now_s)
-}
-
-/// Run the dual (per-IP + per-account) search gate for one attempt.
-/// Thin wasm wrapper: supplies the `Request`/`Env` lookups and the
-/// per-isolate store to [`check_search_attempt_in`].
-fn check_search_attempt(req: &Request, env: &Env, user_id: &str) -> rate_limit::SearchDecision {
-    let now_s = worker::Date::now().as_millis() / 1000;
-    SEARCH_THROTTLE.with(|store| {
-        check_search_attempt_in(
-            &mut store.borrow_mut(),
-            |name| req.headers().get(name).ok().flatten(),
-            |name| env.var(name).ok().map(|v| v.to_string()),
-            user_id,
-            now_s,
-        )
-    })
-}
-
-/// 429 for a throttled search: the standard `rate_limited` envelope as a
-/// generic zero-arg body (no query, key or caller identity can leak into
-/// it) plus `Retry-After`.
-fn search_rate_limited_response(retry_after_secs: u64) -> Result<Response> {
-    let headers = headers_json().unwrap_or_default();
-    headers.append(
-        rate_limit::RETRY_AFTER_HEADER,
-        &rate_limit::search_retry_after_header(retry_after_secs),
-    )?;
-    Response::from_body(worker::ResponseBody::Body(
-        rate_limit::search_rate_limited_body().into_bytes(),
-    ))
-    .map(|r| {
-        r.with_status(rate_limit::SEARCH_RATE_LIMIT_STATUS)
-            .with_headers(headers)
-    })
-}
-
 /// Declared `Content-Length`, if the caller sent one.
 fn content_length(req: &Request) -> Option<usize> {
     req.headers()
@@ -463,35 +325,6 @@ async fn read_capped_text(req: &mut Request, cap: usize) -> core::result::Result
         push_chunk(&mut buf, &chunk, cap).map_err(ApiError::payload_too_large)?;
     }
     String::from_utf8(buf).map_err(|_| ApiError::invalid_request("request body must be UTF-8"))
-}
-
-/// Parse a search body: malformed JSON is a client error (400), never a 500.
-/// (Without this, `Router::run` turns the handler `Err` into a 500 plus a
-/// noisy `console_error!` for every client typo.)
-fn parse_search(text: &str) -> core::result::Result<SearchRequest, &'static str> {
-    serde_json::from_str(text).map_err(|_| "body must be SearchRequest JSON")
-}
-
-/// Validate a parsed search request: bounds the query, the vault handle, the
-/// page window, and the category list before anything is built or enqueued.
-fn check_search(req: &SearchRequest) -> core::result::Result<(), &'static str> {
-    let q = req.query.trim();
-    if q.is_empty() || q.chars().count() > 200 {
-        return Err("query must be 1..=200 chars");
-    }
-    if !validate_indexer_ref(&req.indexer_ref) {
-        return Err("indexer_ref must be a vault handle");
-    }
-    if req.limit == 0 || req.limit > MAX_LIMIT {
-        return Err("limit must be 1..=100");
-    }
-    if req.page > MAX_PAGE {
-        return Err("page out of range");
-    }
-    if req.categories.len() > MAX_CATEGORIES {
-        return Err("too many categories (max 16)");
-    }
-    Ok(())
 }
 
 fn parse_upload(text: &str) -> core::result::Result<NzbUploadRequest, &'static str> {
@@ -557,6 +390,9 @@ fn intake_rejection_response(rejection: &IntakeRejection) -> Result<Response> {
 /// missing or failing binding returns false and the route answers 503 (see
 /// [`queued_envelope`]), so the job is retried instead of silently lost.
 async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
+    if queue_consumer::validate_queue_msg(msg).is_err() {
+        return false;
+    }
     match env.queue(dispatch::INGEST_QUEUE_BINDING) {
         Ok(queue) => match queue.send(msg.clone()).await {
             Ok(()) => true,
@@ -590,7 +426,7 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
 fn meter_entry_stage(source: JobSource) -> &'static str {
     match source {
         JobSource::IndexerSearch => "search",
-        JobSource::NzbUpload => "parse",
+        JobSource::NzbUpload | JobSource::AdminUpload => "parse",
     }
 }
 
@@ -1350,75 +1186,15 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace
     }
 }
 
-/// Validate a search body and enqueue it; the Queue consumer runs the
-/// search → parse → probe → verify → match → write workflow. The resolved
-/// trace travels in every log line, in the `x-trace-id` response header, and
-/// in the queued message for the consumer.
+/// Retired indexer intake. Authenticate as before, then refuse without
+/// reading the body or touching payloads, checkpoints, throttles, meters or
+/// the admission ledger. Catalogue search is a separate read-only feature.
 async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
-    let caller = match authenticate_caller(req, &ctx.env, trace_id) {
-        Ok(caller) => caller,
+    match authenticate_caller(req, &ctx.env, trace_id) {
+        Ok(_) => {}
         Err(refused) => return refused,
-    };
-    let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
-        Ok(text) => text,
-        Err(err) => return json_error(err),
-    };
-    let parsed = match parse_search(&text) {
-        Ok(parsed) => parsed,
-        Err(message) => return json_error(ApiError::invalid_request(message)),
-    };
-    if let Err(message) = check_search(&parsed) {
-        return json_error(ApiError::invalid_request(message));
     }
-    if let Err(message) = caller_auth::bind_body_user(&caller, parsed.user_id.as_deref()) {
-        return json_error(ApiError::invalid_request(message));
-    }
-    // Abuse guard before any dispatch is built or metered (roadmap R6):
-    // per-IP AND per-account token buckets; a denied attempt consumes
-    // nothing and answers the generic 429 + Retry-After.
-    if let rate_limit::SearchDecision::Deny { retry_after_secs } =
-        check_search_attempt(req, &ctx.env, &caller.user_id)
-    {
-        return search_rate_limited_response(retry_after_secs);
-    }
-    let q = parsed.query.trim().to_string();
-    let mut msg = match dispatch::build_search_dispatch(
-        &caller.user_id,
-        &q,
-        &parsed.indexer_ref,
-        &parsed.categories,
-        parsed.limit,
-        parsed.page,
-    ) {
-        Ok(msg) => msg,
-        Err(message) => return json_error(ApiError::invalid_request(message)),
-    };
-    msg.trace_id = Some(trace_id.to_string());
-    // Build identity rides every line (mirrors the api worker): the deploy
-    // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
-    let build_sha = build_sha_from_env(&ctx.env);
-    // Operational facts only: opaque job ID plus the query length. The query
-    // text, user handle, and indexer handle never enter a log line.
-    emit(
-        Level::Info,
-        trace_id,
-        "ingest.search.received",
-        serde_json::json!({"job_id": msg.job_id, "q_len": q.len(), "build_sha": build_sha}),
-    );
-    // Durable idempotent admission: the (job_id, stage) ledger owns the
-    // enqueue + meter outbox, fail-closed. A 503 here means nothing was
-    // accepted with its meter; the client retry converges on one `Ok`
-    // meter event for one accepted job.
-    let mut ledger = PgAdmissionLedger::from_env(&ctx.env, trace_id);
-    return admit_metered_job(
-        &ctx.env,
-        &mut ledger,
-        &msg,
-        meter_entry_stage(msg.source),
-        "indexer_search",
-        serde_json::json!({}),
-    )
-    .await;
+    json_error(ApiError::not_found("not found"))
 }
 
 /// Validate an NZB upload and enqueue it; the consumer parses with
@@ -1573,6 +1349,137 @@ fn owned_checkpoint<E>(
 
 #[cfg(test)]
 mod tests {
+    use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
+    use crate::queue::{validate_indexer_ref, SearchRequest};
+
+    // --- Search abuse guard (roadmap R6) -------------------------------------------
+
+    /// Canonical source-IP scope for the search throttle: only a clean IP
+    /// literal from the Cloudflare-set header survives, else `unknown` (all
+    /// unidentified callers share one bucket — fail-closed, never a fresh
+    /// budget per forged header). IPv6 is keyed by its /64 (IPv4-mapped by the
+    /// embedded IPv4), mirroring the API worker's `rate_limit_ip_key`, so
+    /// rotation inside one prefix cannot mint fresh budgets. The value keys
+    /// buckets in memory only; it is never logged.
+    fn search_source_ip(raw: Option<String>) -> String {
+        use std::net::IpAddr;
+        match raw {
+            Some(value) => match value.trim().parse::<IpAddr>() {
+                Ok(IpAddr::V4(v4)) => v4.to_string(),
+                Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+                    Some(v4) => v4.to_string(),
+                    None => {
+                        let segments = v6.segments();
+                        std::net::Ipv6Addr::new(
+                            segments[0],
+                            segments[1],
+                            segments[2],
+                            segments[3],
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        .to_string()
+                    }
+                },
+                Err(_) => "unknown".to_string(),
+            },
+            None => "unknown".to_string(),
+        }
+    }
+
+    /// The [vars] names `SearchRateLimitConfig::from_vars` reads. One
+    /// const list so the glue test can pin every name against its field.
+    const SEARCH_RATE_LIMIT_VAR_NAMES: [&str; 2] =
+        ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"];
+
+    /// Cloudflare-set connecting-IP header. One const so the glue test
+    /// pins the exact name the route reads.
+    const CONNECTING_IP_HEADER: &str = "cf-connecting-ip";
+
+    /// Search throttle tunables from a [vars] lookup; `from_vars` fails
+    /// safe to the documented defaults on anything missing or invalid.
+    /// Pure over the lookup closure (mirrors the api worker's
+    /// `rate_limits_from_lookup`) so a renamed key fails a native test.
+    fn search_throttle_vars_from_lookup(
+        get: impl Fn(&str) -> Option<String>,
+    ) -> std::collections::HashMap<String, String> {
+        SEARCH_RATE_LIMIT_VAR_NAMES
+            .iter()
+            .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
+            .collect()
+    }
+
+    /// Read the connecting IP through a header lookup: asks for exactly
+    /// [`CONNECTING_IP_HEADER`], so a renamed header fails a native test
+    /// instead of silently collapsing every caller into `unknown`.
+    fn search_connecting_ip(get_header: impl Fn(&str) -> Option<String>) -> Option<String> {
+        get_header(CONNECTING_IP_HEADER)
+    }
+
+    /// The search route's throttle decision, extracted over plain inputs
+    /// (connecting-IP header value, [vars], account, now) so native tests
+    /// drive the exact function the route calls — `Request`/`Env` need
+    /// wasm-bindgen and cannot be built in a unit test.
+    fn search_attempt_decision(
+        store: &mut rate_limit::SearchThrottleStore,
+        connecting_ip: Option<String>,
+        vars: &std::collections::HashMap<String, String>,
+        user_id: &str,
+        now_s: u64,
+    ) -> rate_limit::SearchDecision {
+        let ip = search_source_ip(connecting_ip);
+        let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
+        let cfg = rate_limit::SearchRateLimitConfig::from_vars(vars);
+        store.check(&key, &cfg, now_s)
+    }
+
+    /// The full route glue over plain lookups: header name, [vars]
+    /// names and the store decision composed exactly as the route runs
+    /// them. A native test drives THIS fn end to end, so neutering any
+    /// link (unconditional Allow, renamed var, renamed header) fails.
+    fn check_search_attempt_in(
+        store: &mut rate_limit::SearchThrottleStore,
+        get_header: impl Fn(&str) -> Option<String>,
+        get_var: impl Fn(&str) -> Option<String>,
+        user_id: &str,
+        now_s: u64,
+    ) -> rate_limit::SearchDecision {
+        let connecting_ip = search_connecting_ip(get_header);
+        let vars = search_throttle_vars_from_lookup(get_var);
+        search_attempt_decision(store, connecting_ip, &vars, user_id, now_s)
+    }
+
+    /// Parse a search body: malformed JSON is a client error (400), never a 500.
+    /// (Without this, `Router::run` turns the handler `Err` into a 500 plus a
+    /// noisy `console_error!` for every client typo.)
+    fn parse_search(text: &str) -> core::result::Result<SearchRequest, &'static str> {
+        serde_json::from_str(text).map_err(|_| "body must be SearchRequest JSON")
+    }
+
+    /// Validate a parsed search request: bounds the query, the vault handle, the
+    /// page window, and the category list before anything is built or enqueued.
+    fn check_search(req: &SearchRequest) -> core::result::Result<(), &'static str> {
+        let q = req.query.trim();
+        if q.is_empty() || q.chars().count() > 200 {
+            return Err("query must be 1..=200 chars");
+        }
+        if !validate_indexer_ref(&req.indexer_ref) {
+            return Err("indexer_ref must be a vault handle");
+        }
+        if req.limit == 0 || req.limit > MAX_LIMIT {
+            return Err("limit must be 1..=100");
+        }
+        if req.page > MAX_PAGE {
+            return Err("page out of range");
+        }
+        if req.categories.len() > MAX_CATEGORIES {
+            return Err("too many categories (max 16)");
+        }
+        Ok(())
+    }
+
     use super::*;
     use crate::nzb_intake::{MAX_FILES, MAX_NZB_BYTES};
 
@@ -1815,62 +1722,27 @@ mod tests {
     }
 
     #[test]
-    fn search_route_denial_short_circuits_before_dispatch() {
-        // The route itself needs wasm-bindgen, so pin its shape in
-        // source: the throttle denial must return before any dispatch
-        // is built. Slice ONLY the route body out of the pre-test
-        // source — searching the whole file could match this test's
-        // own literals. (The glue BEHIND the call is pinned
-        // behaviorally by `search_gate_glue_enforces_configured_cap_end_to_end`.)
-        let source = include_str!("lib.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("test module must exist")
-            .0;
-        let route = production
-            .split_once("async fn search(req: &mut Request")
-            .expect("search route must exist")
-            .1
-            .split_once("\nasync fn ")
-            .expect("a following route must bound the body")
-            .0;
-        let gate = route
-            .find("check_search_attempt(req, &ctx.env, &caller.user_id)")
-            .expect("search route must run the throttle gate");
-        let denied = route
-            .find("return search_rate_limited_response(retry_after_secs);")
-            .expect("throttle denial must return the 429 response");
-        let dispatch = route
-            .find("build_search_dispatch(")
-            .expect("search route must build a dispatch");
-        assert!(gate < denied && denied < dispatch);
-        // The wasm wrapper must delegate to the behaviorally-pinned
-        // glue over the per-isolate store: replacing its body with an
-        // unconditional Allow removes this call from its pre-test
-        // body slice and fails here.
-        let wrapper = production
-            .split_once("fn check_search_attempt(req: &Request")
-            .expect("check_search_attempt wrapper must exist")
-            .1
-            .split_once("\nfn ")
-            .expect("a following fn must bound the wrapper body")
-            .0;
-        assert!(
-            wrapper.contains("check_search_attempt_in("),
-            "check_search_attempt must run the pinned glue"
+    fn retired_search_route_refuses_without_reading_or_admitting() {
+        // Worker Request/Env need wasm-bindgen. Pin the complete production
+        // route, not a substring that could leave an admission path behind.
+        let route = production_route("async fn search(req: &mut Request");
+        let route = route.split_once("\n\n///").unwrap().0;
+        assert_eq!(
+            route.trim(),
+            r#", ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
+    match authenticate_caller(req, &ctx.env, trace_id) {
+        Ok(_) => {}
+        Err(refused) => return refused,
+    }
+    json_error(ApiError::not_found("not found"))
+}"#
         );
-        assert!(
-            wrapper.contains("SEARCH_THROTTLE.with("),
-            "check_search_attempt must use the per-isolate store"
+        let error = ApiError::not_found("not found");
+        assert_eq!(
+            (error.status, error.code, error.retryable),
+            (404, "not_found", false)
         );
-        // An early `return …::Allow` ABOVE the glue call would leave
-        // both substrings in place, so forbid a direct Allow in the
-        // wrapper outright: the only decision it may produce is the
-        // glue's.
-        assert!(
-            !wrapper.contains("SearchDecision::Allow"),
-            "check_search_attempt must not short-circuit the glue with Allow"
-        );
+        assert_eq!(error.message, "not found");
     }
 
     const AUTH_SECRET: &str = "test-secret-test-secret-test-secret!";
@@ -1926,7 +1798,7 @@ mod tests {
         // the job id is looked at (status), hence before any queue, KV,
         // throttle, ledger or meter call.
         for (signature, first_effect) in [
-            ("async fn search(req: &mut Request", "read_capped_text("),
+            ("async fn search(req: &mut Request", "ApiError::not_found("),
             ("async fn upload_nzb(req: &mut Request", "read_capped_text("),
             ("async fn job_status(req: &Request", "ctx.param(\"id\")"),
         ] {
@@ -1952,27 +1824,13 @@ mod tests {
         // A body naming another user is refused before any dispatch; an
         // absent or matching one is accepted, and dispatch keys on the
         // authenticated caller only.
-        for (signature, dispatch) in [
-            (
-                "async fn search(req: &mut Request",
-                "build_search_dispatch(",
-            ),
-            (
-                "async fn upload_nzb(req: &mut Request",
-                "build_upload_dispatch(",
-            ),
-        ] {
-            let route = production_route(signature);
-            let bind = route
-                .find("caller_auth::bind_body_user(&caller, parsed.user_id.as_deref())")
-                .unwrap_or_else(|| panic!("{signature} must bind the body user"));
-            let built = route.find(dispatch).unwrap();
-            assert!(bind < built, "{signature}");
-            assert!(
-                !route.contains("&parsed.user_id"),
-                "{signature} trusts the body"
-            );
-        }
+        let route = production_route("async fn upload_nzb(req: &mut Request");
+        let bind = route
+            .find("caller_auth::bind_body_user(&caller, parsed.user_id.as_deref())")
+            .expect("upload must bind the body user");
+        let built = route.find("build_upload_dispatch(").unwrap();
+        assert!(bind < built);
+        assert!(!route.contains("&parsed.user_id"), "upload trusts the body");
         let me = caller("user_01");
         let spoofed = parse_search(
             &search_body("q", "vault_idx_01-ab", &[], 10, 0)
@@ -3280,7 +3138,7 @@ mod build_sha_tests {
         // `build_sha_from_env` needs a wasm Env, so pin the call sites in
         // source the way the throttle-gate test pins the route shape: slice
         // the pre-test source so this test's own literals cannot satisfy it.
-        // All four fetch lines plus the queue-consumer line must carry the
+        // Active fetch lines plus the queue-consumer line must carry the
         // normalized key — never a missing key or a raw var.
         let source = include_str!("lib.rs");
         let production = source
@@ -3295,8 +3153,11 @@ mod build_sha_tests {
             production.contains("nntune_logging::parse_build_sha"),
             "the reader must normalize through the shared validator"
         );
+        assert!(
+            !production.contains("ingest.search.received"),
+            "retired search admission must not emit an accepted-work event"
+        );
         for event in [
-            "ingest.search.received",
             "ingest.payload.store_failed",
             "ingest.upload.received",
             "ingest.job.status_checked",
@@ -3306,14 +3167,14 @@ mod build_sha_tests {
         }
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // The four fetch lines plus the migrated operational emits carry
+        // Active fetch lines plus the migrated operational emits carry
         // the key, so a dropped key at any one of them drops the count
-        // below eighteen. The detached library-db failure line owns its
+        // below seventeen. The detached library-db failure line owns its
         // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            18,
-            "all eighteen keyed lines must carry the build_sha key"
+            17,
+            "all seventeen keyed lines must carry the build_sha key"
         );
         assert_eq!(
             production
