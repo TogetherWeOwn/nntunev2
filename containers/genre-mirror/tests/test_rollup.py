@@ -111,6 +111,15 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(roots_of(res, 14), ["ma", "mb"])
         self.assertIn({"genre_qid": q(14), "flag": "cycle_detected"}, res["diagnostics"])
 
+    def test_multi_anchor_projected_nesting_cycle_keeps_roots(self):
+        cfg = make_config(roots=[root("a", 1, 1, 2), root("b", 2, 3, 4), root("c", 3, 5, 6)])
+        genres = gen(1, 2, 3, 4, 5, 6, 7)
+        parents = edges((1, 3), (4, 5), (6, 2), (7, 1), (7, 4), (7, 6))
+        res = run(genres, parents, [mem("artist", 7)], cfg)
+        self.assertEqual(roots_of(res, 7), ["a", "b", "c"])
+        self.assertEqual(len(res["artist_roots"]), 3)
+        self.assertEqual(diag_of(res, 7), [], "acyclic ancestry must not be flagged as a genre cycle")
+
     def test_real_cycle_flagged_diamond_not(self):
         genres = gen(1, 2, 3, 4, 30, 31, 32, 33, 34)
         # diamond: 30 -> 31,32 -> 33 -> 1
@@ -250,6 +259,10 @@ class OverrideTests(unittest.TestCase):
         self.assertIn({"genre_qid": q(21), "flag": "override_target_missing"}, res["diagnostics"])
         self.assertIn({"genre_qid": q(22), "flag": "override_target_missing"}, res["diagnostics"])
         self.assertNotIn(q(22), [r["genre_qid"] for r in res["genre_rollup"]])
+        self.assertEqual(roots_of(res, 21), [], "missing override target must be inert")
+        cfg["overrides"][0] = self.ov(21, "replace", ["folk"])
+        res = run(genres, [], config=cfg)
+        self.assertEqual(roots_of(res, 21), [], "missing replace target must also be inert")
 
     def test_retired_root_not_emitted_and_reserved(self):
         cfg = make_config(roots=make_config()["roots"] + [root("old", 9, 10, retired=True)])

@@ -300,6 +300,21 @@ def resolve(genres, parents, memberships, config):
             if b in reaches_root[n] and n not in reaches_root[b]:
                 narrower_than[n].add(b)
 
+    # Multiple anchors can project an acyclic genre graph into a cyclic root
+    # relation. Such roots cannot strictly subsume one another: removing all
+    # members would turn reached roots into an invented coverage gap.
+    nesting_reach = {}
+    for rid in root_anchors:
+        visited, pending = set(), list(narrower_than[rid])
+        while pending:
+            other = pending.pop()
+            if other not in visited:
+                visited.add(other)
+                pending.extend(narrower_than[other])
+        nesting_reach[rid] = visited
+    narrower_than = {n: {b for b in broader if n not in nesting_reach[b]}
+                     for n, broader in narrower_than.items()}
+
     overrides = {}
     for ov in config["overrides"]:
         overrides.setdefault(ov["genre_qid"], {})[ov["action"]] = set(
@@ -309,7 +324,8 @@ def resolve(genres, parents, memberships, config):
     final = {}
     diagnostics = []
     for qid in sorted(universe, key=_qkey):
-        acts = overrides.get(qid, {})
+        # A disappeared/merged override target is inert, never invented from config.
+        acts = overrides.get(qid, {}) if qid in present else {}
         visited, capped, cycle = ((frozenset(), False, False)
                                   if "exclude" in acts or "replace" in acts else graph.reach(qid))
         flags = set()
