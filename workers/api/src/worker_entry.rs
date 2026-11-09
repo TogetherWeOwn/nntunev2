@@ -955,6 +955,7 @@ impl PgStore {
     async fn load_reconcile_input_on(
         client: &impl GenericClient,
         user_id: &str,
+        target_subscription_id: Option<&str>,
         failed: &dyn Fn() -> StoreError,
         remaining_ms: Option<&dyn Fn() -> u64>,
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
@@ -986,13 +987,25 @@ impl PgStore {
                 .await
                 .map_err(|_| failed())?;
         }
-        let live_rows = client
-            .query_typed(
-                crate::billing_reconcile::reconcile_live_select_statement(),
-                &[(&user_id, Type::TEXT)],
-            )
-            .await
-            .map_err(|_| failed())?;
+        let live_rows = match target_subscription_id {
+            Some(subscription_id) => {
+                client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_target_select_statement(),
+                        &[(&user_id, Type::TEXT), (&subscription_id, Type::TEXT)],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+            }
+        }
+        .map_err(|_| failed())?;
         if live_rows.len() > 1 {
             return Err(StoreError);
         }
@@ -1070,7 +1083,7 @@ impl PgStore {
             .await
             .map_err(|_| failed())?;
         let row = &outcome.row;
-        client
+        let written = client
             .query_typed(
                 crate::billing_reconcile::store_reconciled_subscription_statement(),
                 &[
@@ -1088,10 +1101,14 @@ impl PgStore {
                     (&row.grace_until_unix, Type::INT8),
                     (&outcome.read_anchor, Type::TEXT),
                     (&outcome.read_plan, Type::TEXT),
+                    (&outcome.stale_snapshot, Type::BOOL),
                 ],
             )
             .await
             .map_err(|_| failed())?;
+        if crate::billing_reconcile::reconcile_write_requires_retry(outcome, !written.is_empty()) {
+            return Err(StoreError);
+        }
         for history in &outcome.history {
             Self::set_local_timeouts(client, remaining_ms())
                 .await
@@ -4225,13 +4242,21 @@ impl Store for PgStore {
     async fn load_reconcile_input(
         &self,
         user_id: &str,
+        target_subscription_id: Option<&str>,
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
         Self::bounded(
             async {
                 let failed =
                     || self.statement_failed("api.db.statement_failed.load_reconcile_input");
                 let client = self.connect().await?;
-                Self::load_reconcile_input_on(&client, user_id, &failed, None).await
+                Self::load_reconcile_input_on(
+                    &client,
+                    user_id,
+                    target_subscription_id,
+                    &failed,
+                    None,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4304,11 +4329,10 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 let applied = async {
-                    // Server-side backstops bounded by the time left: a hung
-                    // statement, or a backend left idle in transaction while
-                    // the provider fetch runs (or after this future is
-                    // dropped), is cancelled/terminated by Postgres, which
-                    // rolls back and releases the advisory lock.
+                    // Decreasing server-side backstops for statements and
+                    // provider waits. These request server cancellation or
+                    // termination, not proof of cleanup by the caller deadline
+                    // under transport/platform failure.
                     Self::set_local_timeouts(&transaction, remaining_ms())
                         .await
                         .map_err(|_| failed())?;
@@ -4325,6 +4349,7 @@ impl Store for PgStore {
                     let input = Self::load_reconcile_input_on(
                         &transaction,
                         user_id,
+                        Some(subscription_id),
                         &failed,
                         Some(&remaining_ms),
                     )
@@ -4355,13 +4380,17 @@ impl Store for PgStore {
                 .await;
                 match applied {
                     Ok(outcome) => {
+                        // Only acknowledged COMMIT returns success. Once it is
+                        // submitted, cancellation cannot reverse a durable
+                        // commit; acknowledgement loss is indeterminate and
+                        // retryable through fresh locked reconciliation.
                         transaction.commit().await.map_err(|_| failed())?;
                         Ok(outcome)
                     }
                     Err(error) => {
-                        // Ordinary errors finish rollback before returning.
-                        // Cancellation/expiry instead drops the transaction,
-                        // whose driver queues rollback before client teardown.
+                        // Before COMMIT, ordinary errors await rollback.
+                        // Cancellation/expiry instead drops the transaction and
+                        // requests rollback; it does not acknowledge cleanup.
                         transaction.rollback().await.map_err(|_| failed())?;
                         Err(error)
                     }

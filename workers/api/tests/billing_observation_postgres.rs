@@ -30,9 +30,12 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_postgres::{Client, Config, NoTls};
 
@@ -741,7 +744,12 @@ async fn start(fx: &Fixture, acct: &Acct, fake: &Rc<Fake>) -> Pass {
 }
 
 async fn start_after(fx: &Fixture, acct: &Acct, fake: &Rc<Fake>, admission: Option<Gate>) -> Pass {
-    let client = fx.client().await;
+    start_on(fx.client().await, acct, fake, admission).await
+}
+
+/// As `start_after`, on a caller-supplied connection; the production Store
+/// is still what runs.
+async fn start_on(client: Client, acct: &Acct, fake: &Rc<Fake>, admission: Option<Gate>) -> Pass {
     let pid: i32 = client
         .query_one("SELECT pg_backend_pid()", &[])
         .await
@@ -1804,44 +1812,297 @@ async fn commit_failure_never_returns_success_or_partial_history() {
     }).await;
 }
 
+/// Install the deterministic deferred-trigger gate. The returned blocker
+/// connection holds it; releasing it lets the server finish a blocked COMMIT.
+async fn install_commit_gate(fx: &Fixture, acct: &Acct) -> Client {
+    let blocker = fx.client().await;
+    // Two-key advisory locks occupy a different key space from the
+    // production one-key lock, so the gate cannot collide with it.
+    blocker
+        .query(
+            "SELECT pg_advisory_lock(46059, hashtext($1))",
+            &[&acct.user],
+        )
+        .await
+        .unwrap();
+    fx.db.batch_execute(
+        "CREATE FUNCTION gate_billing_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(46059, hashtext(NEW.user_id)); RETURN NEW; END $$;
+         CREATE CONSTRAINT TRIGGER gate_billing_commit AFTER INSERT OR UPDATE ON subscriptions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION gate_billing_commit()"
+    ).await.unwrap();
+    blocker
+}
+
+/// Prove from server state that backend `pid` is executing the actual
+/// `COMMIT`, blocked inside the deferred gate.
+async fn await_commit_gate(fx: &Fixture, pid: i32) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = fx.db.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND objsubid = 2 AND NOT granted)", &[&pid]
+            ).await.unwrap().get(0);
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("COMMIT reached its deferred gate");
+    let query: String = fx
+        .db
+        .query_one("SELECT query FROM pg_stat_activity WHERE pid = $1", &[&pid])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(query, "COMMIT");
+}
+
+/// Gate installed, then one pass proven blocked in its actual COMMIT.
+async fn pass_blocked_in_commit(fx: &Fixture, acct: &Acct, fake: &Rc<Fake>) -> (Client, Pass) {
+    let blocker = install_commit_gate(fx, acct).await;
+    let pass = start(fx, acct, fake).await;
+    await_commit_gate(fx, pass.pid).await;
+    (blocker, pass)
+}
+
+/// Test-only transport: delegates everything to the TCP stream, except that
+/// while `withhold` is set reads stay Pending, so server bytes (the COMMIT
+/// acknowledgement) sit unread in the kernel. Never unblocked: the test ends
+/// it by aborting the connection driver, which drops the transport.
+struct Withholding {
+    inner: TcpStream,
+    withhold: Arc<AtomicBool>,
+}
+
+impl AsyncRead for Withholding {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.withhold.load(Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Withholding {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A client over a `Withholding` transport to the same (already
+/// loopback-validated) disposable server, schema set, with its connection
+/// driver handle retained so the test can drop the transport.
+async fn withholding_client(fx: &Fixture) -> (Client, JoinHandle<()>, Arc<AtomicBool>) {
+    let port = fx.config.get_ports().first().copied().unwrap_or(5432);
+    let stream = match fx.config.get_hostaddrs().first() {
+        Some(addr) => TcpStream::connect((*addr, port)).await,
+        None => match fx.config.get_hosts().first() {
+            Some(tokio_postgres::config::Host::Tcp(host)) => {
+                TcpStream::connect((host.as_str(), port)).await
+            }
+            _ => panic!("disposable test database must use a local TCP host"),
+        },
+    }
+    .expect("connect loopback PostgreSQL");
+    let withhold = Arc::new(AtomicBool::new(false));
+    let (client, connection) = fx
+        .config
+        .connect_raw(
+            Withholding {
+                inner: stream,
+                withhold: withhold.clone(),
+            },
+            NoTls,
+        )
+        .await
+        .expect("handshake over test transport");
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("SET search_path TO {}", fx.schema))
+        .await
+        .unwrap();
+    (client, driver, withhold)
+}
+
+/// The two states a settled COMMIT may leave, always atomically: the seeded
+/// row with no history (rolled back), or the renewed row with both history
+/// rows (committed). Returns whether it committed.
+async fn assert_atomic_settlement(fx: &Fixture, acct: &Acct, before: &Stored) -> bool {
+    let after = stored(&fx.db, &acct.user).await.unwrap();
+    let rows = history(&fx.db, &acct.user).await;
+    if rows.is_empty() {
+        assert_eq!(
+            &after, before,
+            "rolled back: subscription row must be untouched"
+        );
+        false
+    } else {
+        assert_eq!(rows.len(), 2, "committed: complete history, never partial");
+        assert_eq!(
+            after.paid_through,
+            Some(E2),
+            "committed: subscription agrees with history"
+        );
+        assert_eq!(after.anchor, Some(acct.inv_id("2")));
+        true
+    }
+}
+
+/// Retry through the production store with a fresh provider read. It must
+/// observe exactly the settled state, converge, and leave one history row per
+/// invoice under the same per-user lock.
+async fn assert_retry_converges(fx: &Fixture, acct: &Acct, log: &Log, settled: Option<Stored>) {
+    let t = truth(acct.renewed());
+    let retry = Rc::new(Fake::new("retry", log, &t).observe(fx, acct));
+    solo(fx, acct, &retry)
+        .await
+        .expect("retry through the production store");
+    assert_eq!(
+        retry.seen(),
+        settled,
+        "retry loaded the settled state under the lock"
+    );
+    assert!(retry.calls() > 0, "retry made a fresh provider read");
+    let after = stored(&fx.db, &acct.user).await.unwrap();
+    assert_eq!(after.paid_through, Some(E2));
+    assert_eq!(
+        history(&fx.db, &acct.user).await.len(),
+        2,
+        "history is idempotent"
+    );
+    wait_unlocked(&fx.db, &acct.user, "retry released the same user lock").await;
+}
+
+// Accepted contract: cancellation before COMMIT requests rollback; once COMMIT
+// is submitted the server may settle it committed or rolled back, only an
+// acknowledged COMMIT is success, and a lost acknowledgement is indeterminate
+// and retryable. There is no universal backend cleanup deadline; the bounded
+// waits here belong to this disposable scenario, not to a platform guarantee.
 #[tokio::test(flavor = "current_thread")]
-async fn cancellation_during_commit_rolls_back_before_releasing_the_lock() {
+async fn cancellation_during_commit_settles_atomically_and_retries_converge() {
     run(60, async {
         let fx = Fixture::new().await;
         let acct = fx.account("cancelcommit", true).await;
         acct.seed_active(&fx).await;
         let before = stored(&fx.db, &acct.user).await.unwrap();
-        let blocker = fx.client().await;
-        // Two-key advisory locks occupy a different key space from the
-        // production one-key lock, so the gate cannot collide with it.
-        blocker.query("SELECT pg_advisory_lock(46059, hashtext($1))", &[&acct.user]).await.unwrap();
-        fx.db.batch_execute(
-            "CREATE FUNCTION gate_billing_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(46059, hashtext(NEW.user_id)); RETURN NEW; END $$;
-             CREATE CONSTRAINT TRIGGER gate_billing_commit AFTER INSERT OR UPDATE ON subscriptions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION gate_billing_commit()"
-        ).await.unwrap();
         let log = new_log();
         let t = truth(acct.renewed());
         let fake = Rc::new(Fake::new("commitcancel", &log, &t));
-        let pass = start(&fx, &acct, &fake).await;
+        let (blocker, pass) = pass_blocked_in_commit(&fx, &acct, &fake).await;
+        pass.task.abort();
+        // The aborted caller never observes success.
+        assert!(pass
+            .task
+            .await
+            .expect_err("caller cancelled during COMMIT")
+            .is_cancelled());
+        blocker
+            .query(
+                "SELECT pg_advisory_unlock(46059, hashtext($1))",
+                &[&acct.user],
+            )
+            .await
+            .unwrap();
+        wait_unlocked(
+            &fx.db,
+            &acct.user,
+            "settled COMMIT releases the lock in this scenario",
+        )
+        .await;
+        // The server may have finished the submitted COMMIT either way; the
+        // subscription row and history must agree atomically.
+        let committed = assert_atomic_settlement(&fx, &acct, &before).await;
+        fx.db
+            .batch_execute("DROP TRIGGER gate_billing_commit ON subscriptions")
+            .await
+            .unwrap();
+        let settled = stored(&fx.db, &acct.user).await;
+        assert_eq!(settled.as_ref() == Some(&before), !committed);
+        assert_retry_converges(&fx, &acct, &log, settled).await;
+    })
+    .await;
+}
+
+// Deterministic lost acknowledgement: the server's reads of the client are
+// not withheld, the client's reads of the server are. The COMMIT is released
+// at the deferred gate and becomes durable while its acknowledgement stays
+// unread; dropping the transport then fails the caller although the commit
+// landed. The caller must see an error (never success), the row and history
+// must agree as committed, and a fresh retry must converge idempotently.
+#[tokio::test(flavor = "current_thread")]
+async fn lost_commit_acknowledgement_after_durable_commit_is_retryable() {
+    run(60, async {
+        let fx = Fixture::new().await;
+        let acct = fx.account("lostack", true).await;
+        acct.seed_active(&fx).await;
+        let before = stored(&fx.db, &acct.user).await.unwrap();
+        let log = new_log();
+        let t = truth(acct.renewed());
+        let fake = Rc::new(Fake::new("lostack", &log, &t));
+        let blocker = install_commit_gate(&fx, &acct).await;
+        let (client, driver, withhold) = withholding_client(&fx).await;
+        let pass = start_on(client, &acct, &fake, None).await;
+        await_commit_gate(&fx, pass.pid).await;
+        // Withhold acknowledgement reads BEFORE the gate is released.
+        withhold.store(true, Ordering::SeqCst);
+        blocker
+            .query(
+                "SELECT pg_advisory_unlock(46059, hashtext($1))",
+                &[&acct.user],
+            )
+            .await
+            .unwrap();
+        // Durable on the server, observed from another connection, with the
+        // production lock gone.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let waiting: bool = fx.db.query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND objsubid = 2 AND NOT granted)", &[&pass.pid]
-                ).await.unwrap().get(0);
-                if waiting { break; }
+                let row = stored(&fx.db, &acct.user).await;
+                if row.as_ref().is_some_and(|r| r.paid_through == Some(E2))
+                    && locks(&fx.db, &acct.user).await.is_empty()
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("COMMIT reached its deferred gate");
-        let query: String = fx.db.query_one("SELECT query FROM pg_stat_activity WHERE pid = $1", &[&pass.pid]).await.unwrap().get(0);
-        assert_eq!(query, "COMMIT");
-        pass.task.abort();
-        assert!(pass.task.await.expect_err("caller cancelled during COMMIT").is_cancelled());
-        blocker.query("SELECT pg_advisory_unlock(46059, hashtext($1))", &[&acct.user]).await.unwrap();
-        wait_unlocked(&fx.db, &acct.user, "commit cancellation settles and releases lock").await;
-        assert_eq!(stored(&fx.db, &acct.user).await.unwrap(), before,
-            "a cancelled unit must not persist writes after its caller exits");
-        assert!(history(&fx.db, &acct.user).await.is_empty());
-    }).await;
+        })
+        .await
+        .expect("COMMIT became durable and released the lock");
+        assert!(
+            !pass.task.is_finished(),
+            "acknowledgement is withheld: the caller has no result yet"
+        );
+        // Drop the transport: the pending COMMIT can only fail.
+        driver.abort();
+        assert!(driver.await.expect_err("driver aborted").is_cancelled());
+        assert!(
+            pass.done().await.is_err(),
+            "no success without an acknowledged COMMIT"
+        );
+        wait_unlocked(&fx.db, &acct.user, "lock stays released").await;
+        assert!(
+            assert_atomic_settlement(&fx, &acct, &before).await,
+            "the unacknowledged COMMIT was durable"
+        );
+        fx.db
+            .batch_execute("DROP TRIGGER gate_billing_commit ON subscriptions")
+            .await
+            .unwrap();
+        let settled = stored(&fx.db, &acct.user).await;
+        assert_retry_converges(&fx, &acct, &log, settled).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

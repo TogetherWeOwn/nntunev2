@@ -144,20 +144,19 @@ their original deadlines; an unknown price grants no new or higher paid caps.
 
 A reconcile pass folding an older remote snapshot must not regress a fresher
 stored pass: coverage (`paid_through_at`, and the `plan_id`/`paid_invoice_id`
-tied to it) advances monotonically, and the same staleness predicate — the new
-evidence ends strictly before the stored paid end, or ties it while carrying
-no anchor against an anchored stored row — guards stored `status` and
-`grace_until` instead of writing stale verbatim fields over a fresher pass.
-Staleness is anchor containment, not an end comparison: a snapshot that does
-not contain the invoice anchoring the stored coverage folded an older remote
-state, however its item-plan money compares (a snapshot with no stored anchor
-to check against falls back to the end comparison, and a snapshot with no
-item-plan money at all is not stale on that basis alone — a first failed
-renewal observes `past_due` with no new invoice, and that observation still
-sets the renewal grace). The stale fold carries its evidence end into the
-write (not the stored end), so the predicate still fires when the
-stale-reading pass commits second — falling back to the stored end, anchor
-cleared, when its snapshot holds no item-plan money at all.
+tied to it) advances monotonically. Reconciliation reads the exact target
+subscription, including archived rows, rather than borrowing another
+subscription's live-slot proof. Purchase decisions still use the live slot.
+After identity and price validation, anchor containment detects stale evidence:
+a snapshot missing the stored coverage invoice is stale regardless of its
+item-plan money (without a stored anchor, the fold falls back to comparing paid
+ends). No item-plan money alone does not establish staleness: a first failed
+renewal can observe `past_due` without a new invoice and still set renewal
+grace. A fold-proven stale observation explicitly suppresses subscription
+writes, including mutable fields, even with greater or absent evidence ends;
+confirmed invoice history remains idempotent. Missing target provenance or a
+changed terminal plan/anchor context returns retryable failure, not an
+acknowledgement of an unapplied observation.
 
 All reconciliation consumers acquire the per-user PostgreSQL transaction advisory
 lock **before** loading decision inputs or retrieving authoritative subscription
@@ -165,11 +164,26 @@ state. READ COMMITTED reads, complete invoice/line retrieval, the pure fold,
 subscription/history writes and commit use that one pinned transaction. One
 15,000 ms whole-attempt budget includes connection acquisition, lock wait, all
 provider pages and commit; failure never accepts a partial observation. Local
-statement and idle-transaction timeouts bound database work. Before COMMIT,
-cancellation drops the transaction and queues rollback. An in-flight COMMIT can
-have an indeterminate outcome: dropping its future cannot reverse work already
-accepted by PostgreSQL. Commit-phase cancellation/settlement is an outstanding
-acceptance prerequisite, not a rollback guarantee or permission to ship. A
+statement and idle-transaction timeouts bound database work, with decreasing
+server-side caps inside the caller deadline. Cancellation before COMMIT requests
+rollback (a request, not proof). Once COMMIT is submitted, PostgreSQL may settle
+it either atomically committed or rolled back; dropping the caller's future
+cannot choose between them. Only an acknowledged COMMIT is success. A lost
+acknowledgement is indeterminate and retryable: the retry re-reads under the
+same per-user lock and fresh provider data, and the idempotent history
+(one row per invoice) converges either outcome. There is no universal backend
+cleanup deadline under transport or platform failure. The disposable-PostgreSQL
+tests require, for that scenario only, that an aborted caller never
+sees success, subscription and history agree atomically, the lock is
+eventually released and a retry converges; their bounded watchdogs are test
+guards, not a platform guarantee. A deterministic lost-acknowledgement test
+withholds the client's reads of the server over a test-only transport, releases
+the deferred COMMIT, observes the durable renewed row and released lock from
+another connection, then drops the transport: the caller errors, row and
+history agree as committed, and a fresh retry converges. Supported
+Worker/Hyperdrive fault, connection-lifetime, cleanup and resource evidence is
+still unproved and
+remains a shipping gate; this decision refines the source contract only. A
 separately prefetched subscription or outcome cannot enter the production write
 contract.
 
