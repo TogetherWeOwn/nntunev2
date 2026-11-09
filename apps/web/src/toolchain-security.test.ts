@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import lock from '../pnpm-lock.yaml?raw';
+import policy from '../pnpm-workspace.yaml?raw';
+import manifest from '../package.json';
+
+describe('dependency install policy', () => {
+	it('delays new resolutions by three days and refuses install scripts', () => {
+		expect(policy).toMatch(/^minimumReleaseAge: 4320$/m);
+		expect(policy).toMatch(/^ignoreScripts: true$/m);
+	});
+
+	it('explicitly generates SvelteKit files before commands that need them', () => {
+		for (const command of ['dev', 'build', 'check', 'test'] as const) {
+			expect(manifest.scripts[command]).toMatch(/^svelte-kit sync && /);
+		}
+	});
+});
 
 /**
  * Wrangler -> Miniflare pulls undici in transitively, so no manifest pins it.
