@@ -85,10 +85,15 @@ fingerprint. Picture blocks are skipped, not validated or staged. The caller's
 32 MiB whole-job prefix budget, other formats, selection binding, grouping and
 image validation/staging remain unwired; this helper adds no fetch or cache.
 
-This is non-behavioural preparation: no production caller freezes a manifest yet.
-The freeze guard is checkpoint-local; KV has no compare-and-swap. Production
-integration must establish serialized durable first acceptance across concurrent
-deliveries before mirror lookup, not assume that the in-memory guard provides it.
+This is unmounted preparation: no production caller freezes a manifest yet.
+The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
+bounded immutable manifest field to retained originals. `audio_manifest_store`
+provides a single owner/deletion-fenced PostgreSQL update that serializes on the
+original row and returns the first stored winner, even when a later delivery
+proposes different tags. It checks both job and original digests, validates the
+winner again, bounds its database wait and never falls back to the candidate on
+failure. Legacy originals stay NULL. Integration must consume this winner before
+mirror lookup and KV persistence; the in-memory guard alone is insufficient.
 Tag/fingerprint extraction, the specified grouping/dedup algorithm, persisted
 classifications and trusted mirror snapshots, original-selector resolution,
 normalized SQL publication, retention cleanup and lifetime source sealing remain
@@ -111,7 +116,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:39`). No ingest route
+  `src/lib.rs:40`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -125,7 +130,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:39`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:40`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -238,7 +243,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:46`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:47`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

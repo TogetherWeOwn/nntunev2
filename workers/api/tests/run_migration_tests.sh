@@ -43,6 +43,7 @@ done
 for f in "${tests[@]}"; do
   echo "test:    ${f#"$root"/}"
   psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
-    -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" -f "$f"
+    -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" \
+    -v audio_manifest_store_sql="$(<"$root/workers/ingest/src/audio_manifest_store.sql")" -f "$f"
 done
 echo "migration tests passed"

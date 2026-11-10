@@ -187,3 +187,8 @@ sha256 = "e0d05ff850b376f07af53020c97d9128cc0ea915a029cf9009f5f16d6823fa1f"
 file = "0038_ingest_acceptance_order.sql"
 target = "app"
 sha256 = "f9d18a1c324f54c8110b88fb7f23fbdfeadc6485fe2d064eb8c563d1220b6187"
+
+[[migration]]
+file = "0039_ingest_audio_manifest.sql"
+target = "app"
+sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
