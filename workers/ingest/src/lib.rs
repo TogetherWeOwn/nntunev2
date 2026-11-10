@@ -33,6 +33,7 @@ use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 pub mod api_error;
 pub mod audio_manifest;
 pub mod audio_manifest_store;
+pub mod audio_selection;
 pub mod audio_tags;
 pub mod caller_auth;
 pub mod checkpoint;
