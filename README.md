@@ -2,6 +2,9 @@
 
 Serverless music streaming on Cloudflare, from a shared curated catalogue.
 
+Read the [roadmap](ROADMAP.md) for product direction, boundaries and conditional
+future intentions. It is not a feature-availability or delivery-status tracker.
+
 ## Vision
 
 Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,

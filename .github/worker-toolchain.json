@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "scope": "all ordinary api, mb and ingest release builds; one canonical manifest",
+  "worker-build": {
+    "version": "0.8.7",
+    "sha256": "1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222"
+  },
+  "wasm-bindgen-cli": {
+    "version": "0.2.129",
+    "sha256": "5fd044ed178958a277eeaf21f3d384287b0f4428d38c019141df01da9c03168c"
+  },
+  "binaryen": {
+    "version": "version_132",
+    "asset": "binaryen-version_132-x86_64-linux.tar.gz",
+    "sha256": "195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572"
+  },
+  "runtime": {
+    "wrangler": "4.153.0",
+    "miniflare": "5.20261023.0-beta",
+    "workerd": "1.20261023.1",
+    "esbuild": "0.28.2"
+  },
+  "esbuild-npm": {
+    "package": "@esbuild/linux-x64",
+    "integrity": "sha512-4xTZr1FUmSoQW4XIWmit3tzQrUTZM+N3P0XV8xROKYF50XfI7xeO90+1bZvNwxIufQ9hDQVRJH5YhgPVF8A/HQ==",
+    "version-from": "runtime.esbuild"
+  }
+}

@@ -315,8 +315,10 @@ jobs:
         run: python3 .github/scripts/test_ci_public_pr_security.py
       - name: Structural-test the CC0 fixture secret wiring
         run: python3 .github/scripts/test_ci_fixture_secrets.py
-      - name: Test workflow setup and shell data boundaries
-        run: python3 .github/scripts/test_workflow_policy_hardening.py
+      - name: Test workflow and offline account-export boundaries
+        run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 scripts/test_account_export.py
+      - name: Test offline playable-artist root coverage (synthetic only)
+        run: python3 scripts/test_genre_root_coverage.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -448,6 +450,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_renamed_from.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
           python3 .github/scripts/test_migrations_rename_check.py
+          python3 .github/scripts/test_migration_snapshot.py
           python3 .github/scripts/test_apply_migration.py
           python3 .github/scripts/test_schema_migrations_backfill.py
           python3 .github/scripts/test_migrations_gate_root_validity.py
@@ -557,6 +560,8 @@ jobs:
         run: bash containers/mb-import/tests/test_runtime_user.sh --self-test
       - name: Run mb-import stream-extract and disk-bounded ETL tests
         run: python3 containers/mb-import/tests/test_stream_extract.py
+      - name: Run offline CC0 genre-extract contract tests
+        run: python3 -I containers/genre-extract/tests/test_extract.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
@@ -644,6 +649,7 @@ jobs:
           printf '%s\n' "$inventory"
           test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 10
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
@@ -925,7 +931,7 @@ jobs:
         # image (containers/mb-import/Dockerfile:3) so the integration
         # suite never tests against a newer Postgres than the image
         # ships; re-pin both deliberately.
-        image: postgres:18-bookworm@sha256:5c4783a8cc3f0074912164f94dfa1be4e043438f0f707cf968d7af9a0d31a2c8
+        image: postgres:18-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
@@ -1046,6 +1052,8 @@ jobs:
         run: python3 ci/test_staging_admission.py
       - name: Unit-test the receipt archive bounds
         run: python3 ci/test_read_promotion_receipt.py
+      - name: Unit-test gate incident reporting (offline API fixtures)
+        run: python3 -I ci/test_incident_report.py
       - name: Promotion proof scripts parse clean
         run: |
           node --check ci/release-promotion-proof.cjs
@@ -1270,13 +1278,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1302,13 +1310,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1334,13 +1342,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1390,13 +1398,13 @@ jobs:
       # it once in-job. Each attempt recreates its bootstrap dir and exports
       # PATH/PNPM_HOME only on success; a second failure fails the job.
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1484,13 +1492,13 @@ jobs:
         with:
           persist-credentials: false
       - id: pnpm-setup
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         continue-on-error: true
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: Retry pnpm bootstrap once
         if: steps.pnpm-setup.outcome == 'failure'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1556,11 +1564,73 @@ jobs:
       - name: Run health-alert acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
 
+  worker-release-builds:
+    name: worker release builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test canonical tool preparation and workflow boundaries
+        run: |
+          python3 -I .github/scripts/test_worker_tools.py
+          python3 -I .github/scripts/test_worker_build_workflow.py
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - name: Prepare canonical Worker tools
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build ordinary Worker release bundles
+        run: |
+          set -euo pipefail
+          for worker in api mb ingest; do
+            (cd "workers/$worker" && cargo metadata --locked --format-version 1 > /dev/null)
+            (cd "workers/$worker" && worker-build --release -- --locked) 2>&1 | tee "$RUNNER_TEMP/worker-$worker.log"
+            python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-$worker.log"
+            (cd "workers/$worker" && git diff --exit-code -- Cargo.lock)
+          done
+      - id: pnpm-setup
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # Reuse the existing locked Wrangler dependency. No root prepare or
+      # dependency install scripts are needed for upload-only dry-runs.
+      - name: Install locked upload CLI without lifecycle scripts
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Dry-run generated staging upload configs without rebuilding
+        run: |
+          set -euo pipefail
+          mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
+          test "${#wranglers[@]}" -eq 1
+          python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      - name: Upload Worker build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: worker-release-builds-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-*.log
+          retention-days: 7
+          if-no-files-found: warn
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

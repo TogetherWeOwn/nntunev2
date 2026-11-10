@@ -244,7 +244,7 @@ jobs:
           # Deploy the validated dispatch SHA, never a newer main head.
           ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -352,7 +352,7 @@ jobs:
       # stays above; only versions promote/rollback runs here.
       - name: Gradual promotion 5-50-100 with automatic rollback
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        uses: TogetherWeOwn/.github/actions/gradual-promote@d427f7212f478ea3823a605edb394b0722e152b5 # v0.6.0
         with:
           worker-name: ${{ env.PRODUCTION_WORKER_NAME }}
           version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
