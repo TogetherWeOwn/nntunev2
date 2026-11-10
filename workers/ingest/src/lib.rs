@@ -35,6 +35,7 @@ pub mod audio_grouping;
 pub mod audio_manifest;
 pub mod audio_manifest_store;
 pub mod audio_positions;
+pub mod audio_scratch;
 pub mod audio_selection;
 pub mod audio_tags;
 pub mod caller_auth;

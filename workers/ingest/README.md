@@ -90,9 +90,24 @@ unknown roles refuse the whole plan instead of silently dropping possible audio.
 Its streaming extraction caps retained bytes at 8 MiB per file / 32 MiB per job,
 shrinks requests to the remaining budget, stops polling at the prefix cap, and
 retains budget-exhausted/malformed selections with empty hints. Transport errors
-and oversized/chunk-flooding adapters refuse the whole candidate. Runtime scratch
-binding, range enforcement, cancellation and I/O deadlines remain adapter work;
-no runtime reader is installed. These helpers add no fetch or cache.
+and oversized/chunk-flooding adapters refuse the whole candidate.
+
+`audio_scratch.rs` supplies an unmounted direct-file runtime reader. It rechecks
+original digest, job/round and exact original-index/name-derived scratch keys,
+and requires healthy assembled records with valid hashes and bounded sizes.
+Missing/damaged inputs refuse the candidate; spooled files explicitly refuse
+until their reader is implemented. Each single ranged R2 GET binds its body to
+that same response's verification metadata, total size and exact prefix range;
+there is no HEAD/GET race or whole-object buffer. A caller-supplied total deadline
+covers headers and every body poll across all files, with deadline-first polling
+and no per-chunk rearm. Premature EOF, transport errors, range/metadata drift,
+oversize chunks and chunk floods refuse the whole candidate. The reader stops at
+the requested length and drops the cancelling body on success, refusal or timeout.
+The runtime adapter uses workers-rs ByteStream's cancel-on-drop stream; native
+fake-stream tests exercise drop behavior, not a deployed R2 cancellation claim.
+The 30-second deadline constant is available for the future producer; no live
+caller constructs this reader or arms that timer yet. These helpers add no route,
+cache, manifest freeze or membership.
 
 `audio_grouping.rs` assembles a structurally validated manifest candidate only
 when extraction exactly covers that plan in order. Release-MBID hints take
@@ -164,7 +179,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:43`). No ingest route
+  `src/lib.rs:45`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -178,7 +193,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:43`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:45`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -291,7 +306,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:50`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:51`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

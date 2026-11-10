@@ -30,11 +30,16 @@ pub enum SelectionError {
 
 /// No Debug: even a private selector is not public job-status information.
 pub struct DirectAudioSelection {
+    original_content_sha256: String,
     audio_ordinal: u32,
     selector: AudioSelector,
 }
 
 impl DirectAudioSelection {
+    pub fn original_content_sha256(&self) -> &str {
+        &self.original_content_sha256
+    }
+
     pub fn audio_ordinal(&self) -> u32 {
         self.audio_ordinal
     }
@@ -72,6 +77,7 @@ impl AudioSelectionPlan {
             }
             match (file.role.as_str(), file.container.as_str()) {
                 ("content", "flac") => selections.push(DirectAudioSelection {
+                    original_content_sha256: expected_hash.to_owned(),
                     audio_ordinal: (selections.len() + 1) as u32,
                     selector: AudioSelector {
                         nzb_file_ordinal: index,
