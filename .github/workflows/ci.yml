@@ -641,11 +641,13 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Meter-metadata boundary runs below against independently migrated
+      # app/mirror stores (their own env vars); it must not run here on the
+      # single shared database, where the split-store env vars are absent.
       - name: Exercise production session retry adapter under PostgreSQL contention
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
-          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test meter_meta_store_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
