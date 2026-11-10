@@ -41,6 +41,7 @@ pub mod audio_manifest_store;
 pub mod audio_mirror_evidence;
 pub mod audio_positions;
 pub mod audio_producer;
+pub mod audio_publication;
 pub mod audio_scratch;
 pub mod audio_selection;
 pub mod audio_tags;
