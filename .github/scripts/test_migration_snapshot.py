@@ -307,9 +307,30 @@ class Collect(GitCase):
         (_, evidence), _ = self.collect(a, files(1), b, b, files(2), b)
         self.assertEqual(evidence["attempt"], 2)
 
+    def test_observed_rewinds_and_sibling_transitions_are_not_retried_away(self):
+        (self.root / "next.txt").write_text("another advance\n")
+        newest = self.commit("second advance")
+        self.git("checkout", "-qb", "sibling", self.base)
+        (self.root / "sibling.txt").write_text("independent descendant\n")
+        sibling = self.commit("sibling advance")
+        b1 = meta(base=self.moved, head=self.head, count=1)
+        b2 = meta(base=newest, head=self.head, count=1)
+        for opening, closing in ((b2, b1),
+                                 (b1, meta(base=sibling, head=self.head, count=1))):
+            with self.subTest(closing=closing["base"]["sha"]):
+                script = self.fails("not a descendant", opening, files(1), closing,
+                                    closing, files(1), closing)
+                self.assertEqual(len(script.paths), 3)
+        # A count mismatch alone can retry, but cannot erase the prior B2 sample.
+        changed_count = copy.deepcopy(b2)
+        changed_count["changed_files"] = 2
+        script = self.fails("not a descendant", b2, files(1), changed_count,
+                            b1, files(1), b1)
+        self.assertEqual(len(script.paths), 4)
+
     def test_retry_exhaustion_after_three_attempts(self):
         before = meta(base=self.base, head=self.head, count=1)
-        moved = meta(base=self.moved, head=self.head, count=1)
+        moved = meta(base=self.base, head=self.head, count=2)
         script = self.fails("changed during all bounded attempts",
                             *([before, files(1), moved] * snapshot.MAX_ATTEMPTS))
         self.assertEqual(len(script.paths), 3 * snapshot.MAX_ATTEMPTS)

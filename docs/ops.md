@@ -479,8 +479,10 @@ file-list attempt, including every page and non-migration record. Both
 samples must agree on PR number, repository IDs/names, refs, commits and
 file count. An observed head change or retarget fails; it never adopts a
 live head. A recorded effective base B1 may equal the event base B0 or be
-its Git-verified descendant in the same repository/ref. B1 need not be an
-ancestor of H. Its immutable object must be available in the full data
+its Git-verified descendant in the same repository/ref. Every observed base
+must also equal or descend from the preceding observation across brackets
+and attempts; an observed rewind or divergent transition is a hard failure.
+B1 need not be an ancestor of H. Its immutable object must be available in the full data
 checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
 fetch or trust-pin substitution. Missing/incompatible trusted B0 code also
 still fails; advancing the evidence base cannot recover absent executables.

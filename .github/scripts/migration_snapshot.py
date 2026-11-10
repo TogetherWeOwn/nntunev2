@@ -79,7 +79,7 @@ def check_base(root, base, head, effective, budget):
     # An inaccessible object/ancestry fails, rather than fetching a mutable ref.
     history = GitHistory(root, effective, head, budget=budget)
     if history.git("merge-base", base, effective).decode().strip() != base:
-        raise HistoryError("effective base is not a descendant of event base")
+        raise HistoryError("effective base is not a descendant of event base/previous observation")
 
 
 def request(path, budget):
@@ -136,12 +136,13 @@ def collect(root, expected, budget):
 
 def collect_attempts(root, expected, budget, collection_deadline):
     endpoint = f"repos/{expected['base']['repo']['full_name']}/pulls/{expected['number']}"
+    observed_base = expected["base"]["sha"]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         budget.remaining(COLLECTION_TIMEOUT)
         before = project_metadata(request(endpoint, budget))
         check_identity(before, expected)
-        check_base(root, expected["base"]["sha"], expected["head"]["sha"],
-                   before["base"]["sha"], budget)
+        check_base(root, observed_base, expected["head"]["sha"], before["base"]["sha"], budget)
+        observed_base = before["base"]["sha"]
         pages = []
         for page in range(1, MAX_FILES // 100 + 1):
             if time.monotonic() >= collection_deadline:
@@ -158,8 +159,8 @@ def collect_attempts(root, expected, budget, collection_deadline):
             raise HistoryError("API pagination reached truncation bound")
         after = project_metadata(request(endpoint, budget))
         check_identity(after, expected)
-        check_base(root, expected["base"]["sha"], expected["head"]["sha"],
-                   after["base"]["sha"], budget)
+        check_base(root, observed_base, expected["head"]["sha"], after["base"]["sha"], budget)
+        observed_base = after["base"]["sha"]
         # Structural defects are hard failures even during a moving bracket.
         # Validate against this attempt's declared initial count before retrying.
         api_coverage(compact(pages), compact(before), before["base"]["sha"], expected["head"]["sha"])
