@@ -3,12 +3,15 @@
 Run with `python3 ci/test_incident_report.py`.
 """
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import json
 import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
@@ -1186,11 +1189,19 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("schedule:", on)
         self.assertRegex(on, r"cron: ['\"]?7,17,27,37,47,57 \* \* \* \*['\"]?")
         self.assertIn("workflow_dispatch:", on)
-        self.assertNotRegex(on, r"workflow_dispatch:\s*\n\s+inputs:")
+        self.assertRegex(on, r"workflow_dispatch:\s*\n\s+inputs:")
+        self.assertIn("default: recent", on)
+        self.assertIn("- run-id-dry-run", on)
         for banned in ("workflow_run", "pull_request_target"):
             self.assertNotIn(banned, code)
         self.assertIn("python3 -I ci/incident_report.py --recent", code)
-        self.assertNotIn("--run-id", code)
+        self.assertIn('--run-id "$INCIDENT_RUN_ID" --dry-run', code)
+        self.assertIn("if: github.ref == 'refs/heads/main'", code)
+        for binding in ("INCIDENT_EVENT: ${{ github.event_name }}",
+                        "INCIDENT_MODE: ${{ inputs.mode }}",
+                        "INCIDENT_RUN_ID: ${{ inputs.run_id }}"):
+            self.assertIn(binding, code)
+        self.assertNotIn("${{", code.split("        run: |\n", 1)[1])
         jobs = code.split("\njobs:\n")[1]
         self.assertRegex(jobs, r"(?m)^  report:")
         for scope in ("contents: read", "actions: read", "issues: write"):
@@ -1201,6 +1212,104 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", self.wf)
         self.assertIn("queue: max", self.wf)
         self.assertIn("python3 -I ci/test_incident_report.py", self.ci)
+
+
+class DispatchTests(unittest.TestCase):
+    def select(self, mode="", run_id="", event="workflow_dispatch", exit_code=0):
+        with open(os.path.join(os.path.dirname(CI_DIR),
+                               ".github/workflows/gate-incidents.yml")) as f:
+            script = textwrap.dedent(f.read().split("        run: |\n", 1)[1])
+        # Execute the shipped selector, not a Python copy of its validation.
+        # The stub records inert argv; no reporter, token or network is used.
+        with tempfile.TemporaryDirectory() as tools:
+            stub = os.path.join(tools, "python3")
+            with open(stub, "w") as f:
+                f.write('#!/bin/sh\nprintf "%s\\n" "$@"\nexit "$STUB_EXIT"\n')
+            os.chmod(stub, 0o700)
+            return subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
+                                  env={"PATH": tools + os.pathsep + os.defpath,
+                                       "INCIDENT_EVENT": event, "INCIDENT_MODE": mode,
+                                       "INCIDENT_RUN_ID": run_id, "STUB_EXIT": str(exit_code)},
+                                  capture_output=True, text=True, timeout=5)
+
+    def test_schedule_and_default_dispatch_keep_recent_lane(self):
+        for event in ("schedule", "workflow_dispatch"):
+            for mode in ("", "recent"):
+                with self.subTest(event=event, mode=mode):
+                    result = self.select(mode=mode, event=event)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(),
+                                     ["-I", "ci/incident_report.py", "--recent"])
+
+    def test_target_is_always_dry_run_and_preserves_the_exact_id(self):
+        for run_id in ("1", "42789138872", "9" * 20):
+            result = self.select("run-id-dry-run", run_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             ["-I", "ci/incident_report.py", "--run-id", run_id, "--dry-run"])
+
+    def test_invalid_or_ambiguous_inputs_never_invoke_reporter(self):
+        bad_ids = ("", "0", "01", "-1", "+1", "1.0", " 1", "1 ", "1\n2", "1\n",
+                   "１", "١", "9" * 21, "--recent", '1; printf injected', '$(printf injected)')
+        cases = [("run-id-dry-run", value, "workflow_dispatch") for value in bad_ids]
+        cases += [(mode, "1", "workflow_dispatch") for mode in ("", "recent", "write", "true")]
+        cases += [("write", "", "workflow_dispatch"), ("--recent", "", "workflow_dispatch"),
+                  ("run-id-dry-run", "1", "schedule"), ("recent", "1", "schedule"),
+                  ("run-id-dry-run", "1", "push"), ("recent", "", "pull_request")]
+        for mode, run_id, event in cases:
+            with self.subTest(mode=mode, run_id=run_id, event=event):
+                result = self.select(mode, run_id, event)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+
+    def test_reporter_failure_is_not_masked(self):
+        for mode, run_id in (("recent", ""), ("run-id-dry-run", "10")):
+            self.assertEqual(self.select(mode, run_id, exit_code=23).returncode, 23)
+
+    def dry_run(self, backend):
+        selected = self.select("run-id-dry-run", "10")
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        argv = selected.stdout.splitlines()[2:]
+        output = io.StringIO()
+        http = SerializedHTTP(backend)
+        with http.mocked(), redirect_stdout(output), patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": ir.REPO, "GITHUB_TOKEN": "synthetic-token"}, clear=True), \
+                patch("sys.argv", ["incident_report.py", *argv]):
+            ir.main()
+        self.assertEqual(backend.writes, [])  # Includes issue POST/PATCH/DELETE.
+        return output.getvalue()
+
+    def test_dispatch_cli_reports_all_gates_and_pending_delivery_without_writes(self):
+        pending = {"run_id": 9, "attempt": 1, "kind": "recovery",
+                   "cursor": None, "delivered": False}
+        issues = [issue(7, state="open", body=MARKER + "\n<!-- incident-delivery: " +
+                        json.dumps(pending) + " -->"),
+                  issue(8, state="open", body="<!-- incident-key: deploy.yml:staging-api -->")]
+        run = make_run(workflow="deploy.yml", event="push")
+        jobs = [{"name": "staging-web", "conclusion": "failure", "steps": []},
+                {"name": "staging-api", "conclusion": "success", "steps": [
+                    {"name": "Deploy api to staging", "conclusion": "success"}]}]
+        backend = StatefulAPI(runs=[run], jobs={(10, 1): jobs}, issues=issues)
+        before = json.dumps((backend.issues, backend.comments), sort_keys=True)
+        output = self.dry_run(backend)
+        self.assertEqual(output.splitlines(), [f"DRY RUN: delivered #7: {KEY}",
+                         "DRY RUN: opened: staging-web", "DRY RUN: recovered #8: staging-api"])
+        self.assertEqual(json.dumps((backend.issues, backend.comments), sort_keys=True), before)
+        self.assertTrue(backend.graphql_calls)  # Read-only GraphQL queries still run.
+
+    def test_dispatch_cli_retains_hold_supersession_and_refusals(self):
+        run = make_run()
+        backend = StatefulAPI(runs=[run], jobs={(10, 1): [smoke("success")]},
+                              issues=[issue(7, state="open", source=None)])
+        self.assertEqual(self.dry_run(backend), "DRY RUN: held #7: unknown source\n")
+        backend = StatefulAPI(runs=[make_run(11), run],
+                              jobs={(10, 1): [smoke("success")], (11, 1): [smoke("failure")]})
+        self.assertEqual(self.dry_run(backend), "DRY RUN: superseded\n")
+        backend = StatefulAPI(runs=[make_run(head_branch="feature")])
+        with self.assertRaisesRegex(ir.ReportError, "Untrusted or incomplete gate run"):
+            self.dry_run(backend)
+        self.assertEqual(backend.writes, [])
 
 
 if __name__ == "__main__":
