@@ -1224,8 +1224,9 @@ pub enum PromotionOutcome {
 /// Atomically publish a usable candidate as the registry selection:
 /// operation `pending` → `promoted`, registry selection moves from the
 /// pinned predecessor to this generation, the in-flight reference becomes
-/// serving, and a predecessor serving reference becomes rollback
-/// (legacy pins are kept). Custody, evidence and history are preserved;
+/// serving, and a predecessor serving incarnation is retired for a
+/// fresh-token rollback incarnation (legacy pins are kept). Custody,
+/// evidence and history are preserved;
 /// the predecessor health revision is re-checked under lock so a drifted
 /// replacement basis refuses. Lock order matches admission: owning
 /// job/attempt, registry, operation/health, predecessor health,
@@ -1413,10 +1414,21 @@ pub async fn promote_candidate(
     .await
     .map_err(database_error)?;
     // A predecessor serving reference becomes rollback; legacy pins stay.
+    // References are immutable in place, so the transition is a new
+    // incarnation: delete the serving row and insert a rollback row with
+    // the same owner/generation/custody and a fresh token. A delayed reader
+    // bound to the serving token never sees the rollback incarnation.
     if let Some(predecessor) = &handle.predecessor {
         tx.execute(
-            "UPDATE posted_file_references SET kind = 'rollback' \
-             WHERE generation_id = $1 AND kind = 'serving'",
+            "WITH retired AS ( \
+                 DELETE FROM posted_file_references \
+                 WHERE generation_id = $1 AND kind = 'serving' \
+                 RETURNING owner_id, generation_id, plaintext_sha256 \
+             ) \
+             INSERT INTO posted_file_references \
+                 (kind, owner_id, generation_id, plaintext_sha256) \
+             SELECT 'rollback', owner_id, generation_id, plaintext_sha256 \
+             FROM retired",
             &[predecessor],
         )
         .await

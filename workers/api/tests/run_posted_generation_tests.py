@@ -49,6 +49,7 @@ EXPECTED = {
     "posted_generation_registry_admission::postgres_admission_missing_legacy_registration_refuses_without_adopting_custody",
     "posted_generation_registry_admission::postgres_admission_selected_health_reuses_usable_and_replaces_terminal_failed",
     "posted_generation_completion::postgres_completion_failed_predecessor_runs_to_atomic_publication",
+    "posted_generation_completion::postgres_completion_managed_serving_predecessor_promotes_replacement_exactly_once",
     "posted_generation_completion::postgres_completion_promotion_refuses_a_drifted_predecessor_basis",
     "posted_generation_completion::postgres_completion_promotion_race_commits_exactly_once",
     "posted_generation_completion::postgres_completion_concurrent_replacement_admissions_commit_once",

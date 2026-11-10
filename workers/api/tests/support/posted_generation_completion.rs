@@ -264,6 +264,124 @@ fn postgres_completion_failed_predecessor_runs_to_atomic_publication() {
 }
 
 #[test]
+fn postgres_completion_managed_serving_predecessor_promotes_replacement_exactly_once() {
+    run_test(async {
+        let mut db = connect().await;
+        let c = case(&db).await;
+        let (_old, _) = failed_predecessor(&db, &c).await;
+        let attempt = acquire(&mut db, &c.job, &c.owner, 0).await;
+        let first = usable_candidate(&mut db, &attempt, &c).await;
+        let hash = c.sealed.hash.clone();
+        assert!(
+            matches!(
+                promote_candidate(&mut db, &first).await,
+                Ok(PromotionOutcome::Promoted)
+            ),
+            "first managed generation was not promoted"
+        );
+        // The promoted managed predecessor holds a serving reference.
+        assert_eq!(
+            reference_count(&db, &c.sealed.generation, "serving").await,
+            1
+        );
+        let serving_token: String = db
+            .query_one(
+                "SELECT reference_token FROM posted_file_references \
+                 WHERE generation_id = $1 AND kind = 'serving'",
+                &[&c.sealed.generation],
+            )
+            .await
+            .quiet("read predecessor serving token")
+            .get(0);
+        db.execute(
+            "UPDATE posted_file_health SET state = 'terminal_failed', \
+             failure_kind = 'retention' WHERE generation_id = $1",
+            &[&c.sealed.generation],
+        )
+        .await
+        .quiet("fail promoted managed predecessor");
+
+        // A replacement candidate for the same hash, pinned to the
+        // terminally failed managed predecessor.
+        let uuid = db_uuid(&db).await;
+        let plan = digest(&db, "plan", &uuid).await;
+        let (job, owner) = seed_job(&db, &uuid).await;
+        let replacement = Case {
+            sealed: Sealed::new(&uuid, &hash, &plan, 0x20),
+            uuid,
+            job,
+            owner,
+        };
+        let attempt = acquire(&mut db, &replacement.job, &replacement.owner, 0).await;
+        let handle = usable_candidate(&mut db, &attempt, &replacement).await;
+
+        assert!(
+            matches!(
+                promote_candidate(&mut db, &handle).await,
+                Ok(PromotionOutcome::Promoted)
+            ),
+            "replacement of a managed serving predecessor was not promoted"
+        );
+        let (selected, pending, _) = registry_state(&db, &hash).await;
+        assert_eq!(
+            selected.as_deref(),
+            Some(replacement.sealed.generation.as_str())
+        );
+        assert!(pending.is_none());
+        // The predecessor serving incarnation is retired and a
+        // fresh-token rollback incarnation carries the same custody.
+        assert_eq!(
+            reference_count(&db, &c.sealed.generation, "serving").await,
+            0
+        );
+        assert_eq!(
+            reference_count(&db, &c.sealed.generation, "rollback").await,
+            1
+        );
+        let rollback_token: String = db
+            .query_one(
+                "SELECT reference_token FROM posted_file_references \
+                 WHERE generation_id = $1 AND kind = 'rollback'",
+                &[&c.sealed.generation],
+            )
+            .await
+            .quiet("read predecessor rollback token")
+            .get(0);
+        assert_ne!(
+            rollback_token, serving_token,
+            "rollback must be a fresh incarnation, not the serving token"
+        );
+        assert_eq!(
+            reference_count(&db, &replacement.sealed.generation, "serving").await,
+            1
+        );
+        assert_eq!(
+            reference_count(&db, &replacement.sealed.generation, "in_flight").await,
+            0
+        );
+        let (pred_state, _, _) = health_state(&db, &c.sealed.generation).await;
+        assert_eq!(pred_state, "terminal_failed");
+
+        // Replay is a receipt and publishes nothing twice.
+        assert!(
+            matches!(
+                promote_candidate(&mut db, &handle).await,
+                Ok(PromotionOutcome::AlreadyPromoted)
+            ),
+            "managed-predecessor promotion replay was not a receipt"
+        );
+        assert_eq!(
+            reference_count(&db, &c.sealed.generation, "rollback").await,
+            1
+        );
+        assert_eq!(
+            reference_count(&db, &replacement.sealed.generation, "serving").await,
+            1
+        );
+    });
+}
+
+#[test]
 fn postgres_completion_promotion_refuses_a_drifted_predecessor_basis() {
     run_test(async {
         let mut db = connect().await;
