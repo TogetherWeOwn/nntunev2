@@ -83,6 +83,23 @@ fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
     })
 }
 
+/// Migration 0037 may still be pending in production. Until it lands there
+/// are no compat credentials, so lifecycle reads/revokes are empty no-ops
+/// instead of missing-relation errors. A probe failure stays loud.
+async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
+    let rows = client
+        .query_typed(
+            "SELECT to_regclass('public.subsonic_credentials') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(rows
+        .first()
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false))
+}
+
 async fn transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
     let tx = client.transaction().await.map_err(|_| StoreError)?;
     // Hyperdrive transaction pooling requires the timeout on this transaction.
@@ -419,6 +436,9 @@ pub(super) async fn list(
     client: &mut Client,
     user_id: &str,
 ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+    if !compat_table_present(client).await? {
+        return Ok(Vec::new());
+    }
     let tx = transaction(client).await?;
     // Metadata projection cannot accidentally serialize HMACs or envelopes.
     let rows = tx.query_typed(
@@ -465,6 +485,9 @@ pub(super) async fn revoke(
     user_id: &str,
     now: u64,
 ) -> Result<u64, StoreError> {
+    if !compat_table_present(client).await? {
+        return Ok(0);
+    }
     let now = i64::try_from(now).map_err(|_| StoreError)?;
     let tx = transaction(client).await?;
     // Same owner fence as issuance: serialize per owner and fence account

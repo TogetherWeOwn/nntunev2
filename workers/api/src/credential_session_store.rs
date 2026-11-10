@@ -96,6 +96,21 @@ pub async fn revoke_sessions_and_native_credentials(
         return Ok(0);
     }
     let now = i64::try_from(now).map_err(|_| StoreError)?;
+    // Migration 0037 may still be pending in production. The compat table
+    // must not turn this existing native path into a 500 before it lands:
+    // probe first, and only touch the table when it exists. A probe failure
+    // stays loud so a real database error never skips revocation silently.
+    let compat_table = client
+        .query_typed(
+            "SELECT to_regclass('public.subsonic_credentials') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let compat_table = compat_table
+        .first()
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false);
     let transaction = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -117,14 +132,16 @@ pub async fn revoke_sessions_and_native_credentials(
         )
         .await
         .map_err(|_| StoreError)?;
-    transaction
-        .query_typed(
-            "UPDATE subsonic_credentials SET revoked_at = to_timestamp($2::bigint::double precision) \
-             WHERE user_id = $1 AND revoked_at IS NULL",
-            &[(&user_id, Type::TEXT), (&now, Type::INT8)],
-        )
-        .await
-        .map_err(|_| StoreError)?;
+    if compat_table {
+        transaction
+            .query_typed(
+                "UPDATE subsonic_credentials SET revoked_at = to_timestamp($2::bigint::double precision) \
+                 WHERE user_id = $1 AND revoked_at IS NULL",
+                &[(&user_id, Type::TEXT), (&now, Type::INT8)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
     transaction.commit().await.map_err(|_| StoreError)?;
     Ok(revoked.len() as u64)
 }
