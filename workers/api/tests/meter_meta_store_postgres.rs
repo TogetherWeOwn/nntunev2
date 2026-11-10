@@ -213,13 +213,13 @@ async fn shared_recording_occurrences_use_recording_level_only() {
     // first so the result cannot depend on insertion or id order: a
     // recording-only lookup must claim neither occurrence's artifact
     // metadata, only the mirror recording duration.
-    let app = app().await;
+    let seed_app = app().await;
     // Larger local id first: the outcome must not ride on insert order.
-    seed_track(&app, OCCURRENCE_B, SHARED_RECORDING, Some(240_000), 3).await;
-    seed_track(&app, OCCURRENCE_A, SHARED_RECORDING, Some(60_000), 4).await;
-    seed_media(&app, OCCURRENCE_A).await;
+    seed_track(&seed_app, OCCURRENCE_B, SHARED_RECORDING, Some(240_000), 3).await;
+    seed_track(&seed_app, OCCURRENCE_A, SHARED_RECORDING, Some(60_000), 4).await;
+    seed_media(&seed_app, OCCURRENCE_A).await;
     let hash_b = "b".repeat(64);
-    app.batch_execute(&format!(
+    seed_app.batch_execute(&format!(
         "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) \
          VALUES ('{hash_b}', 4000000, 'ci-bucket', 'ci/key-b', 1700000100) \
          ON CONFLICT (content_hash) DO NOTHING; \
@@ -229,9 +229,13 @@ async fn shared_recording_occurrences_use_recording_level_only() {
     ))
     .await
     .unwrap();
-    let mirror = mirror().await;
-    seed_recording(&mirror, SHARED_RECORDING, 241_000).await;
-    let (store, attempts) = meter_store(app, Ok(mirror));
+    let seed_mirror = mirror().await;
+    seed_recording(&seed_mirror, SHARED_RECORDING, 241_000).await;
+    // The injected catalogue test store is single-shot: `connect` and
+    // `connect_mirror` take the injected clients, so each lookup needs
+    // a fresh store (fresh connections to the same seeded rows), as
+    // every other test in this binary does. `attempts` is per-store.
+    let (store, attempts) = meter_store(app().await, Ok(mirror().await));
     let meta = store
         .track_meter_meta(USER, SHARED_RECORDING)
         .await
@@ -253,11 +257,16 @@ async fn shared_recording_occurrences_use_recording_level_only() {
         NOW + 241 + nntune_api::playback::LEASE_TTL_SECS
     );
     // Exact local ids keep their own occurrence identity and metadata.
-    let meta_a = store.track_meter_meta(USER, OCCURRENCE_A).await.unwrap();
+    // (Fresh single-shot store per lookup; same seeded rows.)
+    let (store_a, attempts_a) = meter_store(app().await, Ok(mirror().await));
+    let meta_a = store_a.track_meter_meta(USER, OCCURRENCE_A).await.unwrap();
+    assert_eq!(attempts_a.get(), 1);
     assert_eq!(meta_a.track_duration_ms, Some(60_000));
     assert_eq!(meta_a.bitrate_kbps, Some(128));
     assert_eq!(meta_a.file_bytes, Some(2_000_000));
-    let meta_b = store.track_meter_meta(USER, OCCURRENCE_B).await.unwrap();
+    let (store_b, attempts_b) = meter_store(app().await, Ok(mirror().await));
+    let meta_b = store_b.track_meter_meta(USER, OCCURRENCE_B).await.unwrap();
+    assert_eq!(attempts_b.get(), 1);
     assert_eq!(meta_b.track_duration_ms, Some(240_000));
     assert_eq!(meta_b.bitrate_kbps, Some(256));
     assert_eq!(meta_b.file_bytes, Some(4_000_000));
