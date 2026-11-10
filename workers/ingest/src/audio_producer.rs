@@ -31,6 +31,31 @@ pub struct VerifiedCandidateInput<'a> {
     pub progress: &'a VerifyProgress,
 }
 
+/// Recover the persisted selection before touching scratch, or propose and
+/// atomically accept a complete verified candidate. The database winner alone
+/// is returned for a later checkpoint/classification consumer. This does not
+/// mount Matching or grant any publication/membership authority.
+pub async fn accept_verified_manifest<S, D, A>(
+    input: VerifiedCandidateInput<'_>,
+    store: S,
+    deadline: D,
+    acceptance: &A,
+) -> Result<AcceptedAudioManifest, crate::audio_acceptance::AcceptanceError>
+where
+    S: ScratchPrefixStore,
+    D: Future<Output = ()> + Unpin,
+    A: crate::audio_acceptance::ManifestAcceptanceStore,
+{
+    crate::audio_acceptance::accept_manifest(
+        acceptance,
+        input.job_id,
+        input.user_id,
+        input.expected_hash,
+        || prepare_verified_candidate(input, store, deadline),
+    )
+    .await
+}
+
 /// Compose the bounded direct-FLAC path without exposing intermediate hints.
 /// One caller-owned deadline covers all scratch I/O. Selection, transport or
 /// grouping refusal returns no partial manifest. Malformed tag blocks retain

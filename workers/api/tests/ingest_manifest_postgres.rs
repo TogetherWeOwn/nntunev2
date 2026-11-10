@@ -1,6 +1,6 @@
 //! Exact ingest freeze SQL against disposable PostgreSQL, including real locks.
 use nntune_ingest::audio_manifest::AcceptedAudioManifest;
-use nntune_ingest::audio_manifest_store::FREEZE_SQL;
+use nntune_ingest::audio_manifest_store::{FREEZE_SQL, LOAD_SQL};
 use serde_json::json;
 use tokio_postgres::{Client, Config, NoTls};
 
@@ -97,6 +97,77 @@ async fn cleanup(client: &Client, job: &str, owner: &str) {
         .execute("DELETE FROM users WHERE id=$1", &[&owner])
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn load_distinguishes_unfrozen_original_from_missing_or_fenced_and_returns_winner() {
+    let db = client().await;
+    let (job, owner) = fixture(&db).await;
+    let hash = "a".repeat(64);
+    let row = db
+        .query_opt(LOAD_SQL, &[&job, &owner, &hash])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0), None);
+    for (j, u, digest) in [
+        ("missing-job".to_owned(), owner.clone(), hash.clone()),
+        (job.clone(), "other-owner".to_owned(), hash.clone()),
+        (job.clone(), owner.clone(), "b".repeat(64)),
+    ] {
+        assert!(db
+            .query_opt(LOAD_SQL, &[&j, &u, &digest])
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let winner = manifest(&job, &owner, "Retained winner");
+    assert_eq!(
+        store(&db, &job, &owner, &winner).await,
+        Some(winner.clone())
+    );
+    let loaded: Option<String> = db
+        .query_one(LOAD_SQL, &[&job, &owner, &hash])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(loaded, Some(winner.clone()));
+    db.execute(
+        "UPDATE ingest_jobs SET content_sha256=repeat('b',64) WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .query_opt(LOAD_SQL, &[&job, &owner, &hash])
+        .await
+        .unwrap()
+        .is_none());
+    db.execute(
+        "UPDATE ingest_jobs SET content_sha256=repeat('a',64) WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE users SET deleting_at=now() WHERE id=$1", &[&owner])
+        .await
+        .unwrap();
+    assert!(db
+        .query_opt(LOAD_SQL, &[&job, &owner, &hash])
+        .await
+        .unwrap()
+        .is_none());
+    // The read never changes the already accepted record, including on refusal.
+    let retained: String = db
+        .query_one(
+            "SELECT accepted_audio_manifest_v1 FROM ingest_originals WHERE job_id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(retained, winner);
+    cleanup(&db, &job, &owner).await;
 }
 
 #[tokio::test]

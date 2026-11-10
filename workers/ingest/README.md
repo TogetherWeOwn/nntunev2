@@ -119,6 +119,19 @@ fenced database winner before copying to KV or performing mirror lookup. No
 production Matching call, timer, local occurrence plan, classification or art
 staging is enabled by this composition.
 
+`audio_acceptance.rs` adds read-first durable selection recovery. A confirmed SQL
+NULL on a present owner/job/digest-bound original alone permits lazy candidate
+production; a missing/fenced original, malformed winner or read error refuses.
+`audio_producer::accept_verified_manifest` composes that seam with verified scratch
+extraction. An existing winner returns without rereading payloads, progress or
+scratch; on a miss, atomic first acceptance may return a concurrent contender's
+winner, never our losing candidate. Both loaded and newly accepted winners are
+identity-checked before return. Legacy winners remain unchanged and unfrozen.
+The PostgreSQL adapter uses the existing bounded connector and query deadlines.
+This remains unmounted: it neither writes a checkpoint nor enables Matching,
+classification, publication or membership. Future consumers must use the returned
+winner before mirror lookup and KV persistence, and retain the write-time fence.
+
 `audio_grouping.rs` assembles a structurally validated manifest candidate only
 when extraction exactly covers that plan in order. Release-MBID hints take
 precedence over title candidates; text-only candidates partition by normalized
@@ -189,7 +202,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:45`). No ingest route
+  `src/lib.rs:46`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -203,7 +216,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:45`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:46`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -316,7 +329,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:52`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:53`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

@@ -9,6 +9,15 @@ use crate::audio_manifest::AcceptedAudioManifest;
 
 pub const FREEZE_SQL: &str = include_str!("audio_manifest_store.sql");
 
+pub const LOAD_SQL: &str = "SELECT original.accepted_audio_manifest_v1
+FROM ingest_originals AS original
+JOIN ingest_jobs AS job ON job.id = original.job_id
+JOIN users AS owner ON owner.id = job.user_id
+WHERE original.job_id = $1 AND job.user_id = $2
+  AND owner.deleting_at IS NULL
+  AND original.content_sha256 = $3
+  AND job.content_sha256 = original.content_sha256";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreezeError {
     Identity,
@@ -40,6 +49,47 @@ fn accept_stored(
     validate_candidate(&stored, job_id, user_id, original_hash)
         .map_err(|_| FreezeError::InvalidStored)?;
     Ok(stored)
+}
+
+/// Only a present, owner/digest-bound original whose manifest is SQL NULL
+/// returns None. Missing originals, deletion fences and invalid records refuse
+/// rather than authorizing regeneration. The returned selection is immutable;
+/// this read grants neither membership nor permission to publish after deletion.
+pub async fn load(
+    client: tokio_postgres::Client,
+    job_id: &str,
+    user_id: &str,
+    original_hash: &str,
+) -> Result<Option<AcceptedAudioManifest>, FreezeError> {
+    if !crate::audio_manifest::valid_identity(job_id, user_id, original_hash) {
+        return Err(FreezeError::Identity);
+    }
+    crate::library::with_db_deadline(
+        async move {
+            let row = client
+                .query_opt(LOAD_SQL, &[&job_id, &user_id, &original_hash])
+                .await
+                .map_err(|error| {
+                    if crate::library::is_deterministic_sqlstate(
+                        error.code().map(|code| code.code()),
+                    ) {
+                        FreezeError::Permanent
+                    } else {
+                        FreezeError::Unavailable
+                    }
+                })?
+                .ok_or(FreezeError::MissingOrFenced)?;
+            let raw: Option<String> = row.try_get(0).map_err(|_| FreezeError::InvalidStored)?;
+            raw.as_deref()
+                .map(|raw| accept_stored(raw, job_id, user_id, original_hash))
+                .transpose()
+        },
+        worker::Delay::from(std::time::Duration::from_millis(
+            crate::library::LIBRARY_DB_DEADLINE_MS,
+        )),
+        || FreezeError::Unavailable,
+    )
+    .await
 }
 
 /// One autocommit statement serializes contenders on the retained original row.
