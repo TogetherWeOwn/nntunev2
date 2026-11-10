@@ -47,7 +47,12 @@ async function setup(page: Page, playing = false) {
 		el.dataset.batchSeeked = 'false';
 		el.addEventListener('seeked', () => { el.dataset.batchSeeked = 'true'; }, { once: true });
 	});
+	// The seek slider lives in the expanded route at every width.
+	await page.getByTestId('player-now-playing-toggle').click();
+	await expect(page.getByTestId('now-playing-route')).toBeVisible();
 	await seekViaPlayerUi(page, audio, 0.35);
+	await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
+	await expect(page).toHaveURL(/\/library$/);
 	await expect(audio).toHaveAttribute('data-batch-seeked', 'true');
 	await expect(audio).toHaveJSProperty('seeking', false);
 	const sought = await audio.evaluate((el: HTMLAudioElement) => ({ currentTime: el.currentTime, duration: el.duration, paused: el.paused }));

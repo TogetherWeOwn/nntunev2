@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, type Snippet } from 'svelte';
 
-	let { queueToggle, expanded = false }: { queueToggle?: Snippet<[beforeOpen?: () => Promise<boolean>]>; expanded?: boolean } = $props();
+	let { queueToggle, expanded = false, onNowPlayingOpen }: { queueToggle?: Snippet<[beforeOpen?: () => Promise<boolean>]>; expanded?: boolean; onNowPlayingOpen?: (target: HTMLElement, keyboard: boolean) => void } = $props();
 	import IconSvg from '../design/IconSvg.svelte';
 	import { FAVORITE_ICON_PATHS, TRANSPORT_ICON_PATHS } from '../design/icons.js';
 	import { formatDuration } from '../format.js';
@@ -11,7 +11,7 @@
 	import { isModalOpen, isTypingTarget } from './shortcuts.js';
 	import { actionForPlayerKey, PLAYER_SHORTCUT_ROWS } from './appShortcuts.js';
 	import Artwork from './Artwork.svelte';
-	import { createCinemaController, type CinemaSnapshot } from './cinema.js';
+	import { createFullscreenController, type FullscreenSnapshot } from './fullscreen.js';
 
 	const player = usePlayerSession();
 	const transport = $derived($player.transport);
@@ -31,12 +31,20 @@
 	const id = $props.id();
 	const selected = $derived(currentTrack($player.queue));
 	const favorite = $derived(!!selected && $player.favorites.includes(selected.id));
-	let cinema = $state<CinemaSnapshot>({ supported: false, active: false, pending: false, failed: false, idle: false });
-	let cinemaController: ReturnType<typeof createCinemaController> | undefined;
+	const progress = $derived(duration > 0 ? Math.min(100, (position / duration) * 100) : 0);
+	let fullscreen = $state<FullscreenSnapshot>({ supported: false, active: false, pending: false, failed: false });
+	let fullscreenController: ReturnType<typeof createFullscreenController> | undefined;
 
-	function mountCinema(element: HTMLElement) {
-		cinemaController = createCinemaController(element, (state) => { cinema = state; });
-		return { destroy: () => { cinemaController?.destroy(); cinemaController = undefined; } };
+	function mountFullscreen(element: HTMLElement) {
+		fullscreenController = createFullscreenController(element, (state) => { fullscreen = state; });
+		return { destroy: () => { fullscreenController?.destroy(); fullscreenController = undefined; } };
+	}
+
+	function noteOpen(event: MouseEvent): void {
+		// Plain anchor navigation: modifier/middle clicks keep native behavior,
+		// and the layout only records the opener for focus restoration.
+		if (event.defaultPrevented || event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+		onNowPlayingOpen?.(event.currentTarget as HTMLElement, event.detail === 0);
 	}
 
 	$effect(() => {
@@ -86,11 +94,6 @@
 			return;
 		}
 		if (event.altKey || event.ctrlKey || event.metaKey) return;
-		if (event.key === 'Escape' && cinema.active) {
-			event.preventDefault();
-			void cinemaController?.exit();
-			return;
-		}
 		// Space still activates a focused native button/link; only passive
 		// player/main surfaces get the global transport equivalent.
 		const target = event.target instanceof HTMLElement ? event.target : null;
@@ -130,13 +133,19 @@
 	</button>
 {/snippet}
 
+{#snippet playControl()}
+	<button type="button" class="play" data-testid="player-play-pause" aria-label={active ? 'Pause' : 'Play'} title={active ? 'Pause' : 'Play'} disabled={!selected} onclick={() => player.togglePlay()}>
+		<IconSvg path={TRANSPORT_ICON_PATHS[active ? 'pause' : 'play']} />
+	</button>
+{/snippet}
+
 {#snippet seekControl()}
-	<div class="seek">
+	<div class="seek compact-hide">
 		<span>{formatDuration(position)}</span>
 		<input type="range" data-testid="player-seek" aria-label="Seek" aria-valuetext={`${formatDuration(position)} of ${duration ? formatDuration(duration) : 'unknown duration'}`} min="0" max={duration || 1} step="0.1" value={position} disabled={!duration} oninput={(event) => seek(Number(event.currentTarget.value))} />
 		<span>{duration ? formatDuration(duration) : '—'}</span>
 	</div>
-	<div class="transport-buttons">
+	<div class="transport-buttons compact-hide">
 		<button type="button" data-testid="player-seek-back" onclick={() => player.jumpRelative('back')}>Back 10 seconds</button>
 		<button type="button" data-testid="player-seek-forward" onclick={() => player.jumpRelative('forward')}>Forward 10 seconds</button>
 	</div>
@@ -148,18 +157,36 @@
 	{#if !$player.restartAvailable}<p id={`${id}-restart-hint`}>Restart is unavailable until this track can seek.</p>{/if}
 {/snippet}
 
-<section use:mountCinema class:expanded aria-label="Player" data-testid="player-bar" data-player-transport data-cinema-idle={cinema.idle} tabindex="-1">
-	{#if cinema.active || expanded}
+<section use:mountFullscreen class:expanded aria-label="Player" data-testid="player-bar" data-player-transport tabindex="-1">
+	{#if expanded}
 		<div class="cinema-artwork"><Artwork src={selected?.artworkUrl} /></div>
 	{/if}
-	<div class="cinema-controls">
-	<h2>Now playing</h2>
+	{#if !expanded}
+		<div data-testid="mini-player" class="mini-wrap">
+			<span class="mini-progress" aria-hidden="true"><span data-testid="mini-player-progress" style:width={`${progress}%`}></span></span>
+			<div class="mini-surface">
+				{#if selected}
+					<a class="identity-link" href="/now-playing" data-testid="player-now-playing-toggle" aria-label={`Now playing: ${displayTitle(selected)}${displayArtist(selected) ? ` — ${displayArtist(selected)}` : ''}`} onclick={noteOpen}>
+						<span class="compact-art" aria-hidden="true"><Artwork src={selected.artworkUrl} /></span>
+						<span class="identity" data-testid="library-now-playing">{displayTitle(selected)}{#if displayArtist(selected)}{' — '}{displayArtist(selected)}{/if}</span>
+					</a>
+					<p class="identity compact-hide" data-testid="now-playing" role={$player.queueLiveRegions ? 'status' : undefined}>Now playing: {displayTitle(selected)}{#if selected.artist}{' — '}{selected.artist}{/if}</p>
+					{@render favoriteControl()}
+					{@render playControl()}
+				{/if}
+				{@render queueToggle?.(() => fullscreenController?.exit() ?? Promise.resolve(false))}
+			</div>
+		</div>
+	{/if}
+	<div class="controls full-controls">
+	<h2 class="compact-hide">Now playing</h2>
 	{#if selected}
-		<p class="identity" data-testid="library-now-playing">
-			{displayTitle(selected)}{#if displayArtist(selected)}{' — '}{displayArtist(selected)}{/if}
-		</p>
-		<p class="identity" data-testid="now-playing" role={$player.queueLiveRegions ? 'status' : undefined}>Now playing: {displayTitle(selected)}{#if selected.artist}{' — '}{selected.artist}{/if}</p>
-		{#if !expanded}{@render favoriteControl()}{/if}
+		{#if expanded}
+			<p class="identity" data-testid="library-now-playing">
+				{displayTitle(selected)}{#if displayArtist(selected)}{' — '}{displayArtist(selected)}{/if}
+			</p>
+			<p class="identity" data-testid="now-playing" role={$player.queueLiveRegions ? 'status' : undefined}>Now playing: {displayTitle(selected)}{#if selected.artist}{' — '}{selected.artist}{/if}</p>
+		{/if}
 	{/if}
 	{#if expanded}{@render seekControl()}{/if}
 	<div class="transport-buttons">
@@ -167,29 +194,27 @@
 			<IconSvg path={TRANSPORT_ICON_PATHS.shuffle} />
 		</button>
 		<button type="button" aria-label="Previous track" title="Previous track" onclick={() => void player.previous()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-back']} /></button>
-		<button type="button" class="play" data-testid="player-play-pause" aria-label={active ? 'Pause' : 'Play'} title={active ? 'Pause' : 'Play'} onclick={() => player.togglePlay()}>
-			<IconSvg path={TRANSPORT_ICON_PATHS[active ? 'pause' : 'play']} />
-		</button>
+		{#if expanded}{@render playControl()}{/if}
 		<button type="button" data-testid="player-next" aria-label="Next track" title="Next track" onclick={() => void player.next()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-forward']} /></button>
 		<button type="button" aria-label={`Repeat: ${$player.repeat === 'off' ? 'Off' : $player.repeat === 'queue' ? 'Queue' : 'One'}`} title="Cycle repeat" aria-pressed={$player.repeat !== 'off'} onclick={() => player.cycleRepeat()}>
 			<IconSvg path={TRANSPORT_ICON_PATHS[$player.repeat === 'one' ? 'repeat-1' : 'repeat']} />
 		</button>
 	</div>
-	{#if !expanded}{@render restartControl()}{/if}
-	<p data-testid="library-restart-status" aria-live="polite">{#key $player.restartVersion}{$player.restartStatus}{/key}</p>
+	<div class="compact-hide">{#if !expanded}{@render restartControl()}{/if}</div>
+	<p class="compact-hide" data-testid="library-restart-status" aria-live="polite">{#key $player.restartVersion}{$player.restartStatus}{/key}</p>
 	{#if !expanded}{@render seekControl()}{/if}
 	<div class="sound">
 		{#if expanded && selected}{@render favoriteControl()}{/if}
-		<button type="button" aria-label={transport?.sound.muted ? 'Unmute' : 'Mute'} aria-pressed={transport?.sound.muted ?? false} onclick={() => player.toggleMute()}>
+		<button class="compact-hide" type="button" aria-label={transport?.sound.muted ? 'Unmute' : 'Mute'} aria-pressed={transport?.sound.muted ?? false} onclick={() => player.toggleMute()}>
 			<IconSvg path={TRANSPORT_ICON_PATHS[transport?.sound.muted ? 'volume-x' : 'volume-2']} />
 		</button>
-		<label for={`${id}-volume`}>Volume</label>
-		<input id={`${id}-volume`} data-testid="player-volume" type="range" min="0" max="100" step="5" value={volume} aria-valuetext={`${volume}%`} oninput={(event) => player.setVolume(Number(event.currentTarget.value) / 100)} />
-		{@render queueToggle?.(() => cinemaController?.exit() ?? Promise.resolve(false))}
-		<button type="button" data-testid="player-fullscreen" aria-label={cinema.active ? 'Exit full screen' : 'Enter full screen'} aria-pressed={cinema.active} aria-describedby={!cinema.supported ? `${id}-fullscreen-hint` : undefined} disabled={!cinema.supported || cinema.pending} onclick={() => void cinemaController?.toggle()}>{cinema.active ? 'Exit full screen' : 'Enter full screen'}</button>
-		<button type="button" aria-haspopup="dialog" onclick={() => void openHelp()}>Keyboard shortcuts</button>
+		<label class="compact-hide" for={`${id}-volume`}>Volume</label>
+		<input class="compact-hide" id={`${id}-volume`} data-testid="player-volume" type="range" min="0" max="100" step="5" value={volume} aria-valuetext={`${volume}%`} oninput={(event) => player.setVolume(Number(event.currentTarget.value) / 100)} />
+		{#if expanded}{@render queueToggle?.(() => fullscreenController?.exit() ?? Promise.resolve(false))}{/if}
+		{#if expanded}<button type="button" data-testid="player-fullscreen" aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'} aria-pressed={fullscreen.active} aria-describedby={!fullscreen.supported ? `${id}-fullscreen-hint` : undefined} disabled={!fullscreen.supported || fullscreen.pending} onclick={() => void fullscreenController?.toggle()}>{fullscreen.active ? 'Exit full screen' : 'Enter full screen'}</button>{/if}
+		<button class="compact-hide" type="button" aria-haspopup="dialog" onclick={() => void openHelp()}>Keyboard shortcuts</button>
 	</div>
-	<details>
+	<details class="compact-hide">
 		<summary>Playback</summary>
 		<div class="playback-settings">
 			<label for={`${id}-speed`}>Playback speed</label>
@@ -209,15 +234,15 @@
 			{#if expanded}{@render restartControl()}{/if}
 		</div>
 	</details>
-	{#if transport?.sound.restricted}<p>Volume control is limited by this browser. Use your device volume controls.</p>{/if}
-	{#if transport?.status === 'buffering' || transport?.status === 'loading'}<p role="status">{transport.status === 'buffering' ? 'Buffering…' : 'Loading track…'}</p>{/if}
+	{#if transport?.sound.restricted}<p class="compact-hide">Volume control is limited by this browser. Use your device volume controls.</p>{/if}
+	{#if transport?.status === 'buffering' || transport?.status === 'loading'}<p class="compact-hide" role="status">{transport.status === 'buffering' ? 'Buffering…' : 'Loading track…'}</p>{/if}
 	{#if transport?.status === 'error'}
-		<p role="alert">Could not play this track. Check your connection and try again.</p>
-		<button type="button" onclick={() => void player.retry()}>Retry playback</button>
+		<p class="compact-hide" role="alert">Could not play this track. Check your connection and try again.</p>
+		<button class="compact-hide" type="button" onclick={() => void player.retry()}>Retry playback</button>
 	{/if}
-	<p aria-live="polite">{feedback}</p>
-	{#if !cinema.supported}<p id={`${id}-fullscreen-hint`}>Full screen is unavailable in this browser.</p>{/if}
-	{#if cinema.failed}<p role="status">Could not change full screen. Try again or use your browser controls.</p>{/if}
+	<p class="compact-hide" aria-live="polite">{feedback}</p>
+	{#if expanded && !fullscreen.supported}<p id={`${id}-fullscreen-hint`}>Full screen is unavailable in this browser.</p>{/if}
+	{#if fullscreen.failed}<p class="compact-hide" role="status">Could not change full screen. Try again or use your browser controls.</p>{/if}
 
 {#if helpOpen}
 	<dialog bind:this={dialog} data-testid="shortcuts-dialog" aria-labelledby={`${id}-help`} oncancel={(event) => { event.preventDefault(); closeHelp(); }} onkeydown={onDialogKey}>
@@ -232,18 +257,23 @@
 </section>
 
 <style>
+	.mini-wrap { display: contents; }
+	.mini-progress { display: none; }
+	.mini-surface { display: contents; }
 	.expanded:not(:fullscreen) { display: flex; flex-direction: column; align-items: center; gap: var(--nt-space-3); }
-	.expanded:not(:fullscreen) .cinema-controls { width: 100%; min-width: 0; }
+	.expanded:not(:fullscreen) .controls { width: 100%; min-width: 0; }
 	.expanded:not(:fullscreen) :where(button, input, summary, select) { scroll-margin-block: calc(var(--nt-control-lg) + var(--nt-space-2)); }
 	section:fullscreen { display: flex; flex-direction: column; align-items: center; justify-content: safe center; width: 100%; height: 100%; overflow: auto; box-sizing: border-box; gap: var(--nt-space-3); }
 	.cinema-artwork { flex: 0 1 auto; min-height: 0; width: min(58dvh, 100%); aspect-ratio: 1; }
 	.cinema-artwork :global(img), .cinema-artwork :global([role='img']) { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: var(--nt-radius-pane); }
-	section:fullscreen .cinema-controls { flex: 0 0 auto; width: min(100%, 64rem); background: var(--nt-bg-raised); }
+	section:fullscreen .controls { flex: 0 0 auto; width: min(100%, 64rem); background: var(--nt-bg-raised); }
 	@media (min-width: 768px) and (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
 		section:fullscreen .cinema-artwork { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); height: 58dvh; width: min(58dvh, 100%); }
-		section:fullscreen .cinema-controls { position: relative; margin-top: auto; z-index: 1; }
-		section:fullscreen[data-cinema-idle='true']:not(:focus-within) .cinema-controls { opacity: 0; }
+		section:fullscreen .controls { position: relative; margin-top: auto; z-index: 1; }
 	}
+	.identity-link { display: flex; align-items: center; gap: var(--nt-space-2); min-width: 0; color: var(--nt-fg); text-decoration: none; }
+	.compact-art { flex: 0 0 var(--nt-space-px-40); width: var(--nt-space-px-40); height: var(--nt-space-px-40); }
+	.compact-art :global(img), .compact-art :global([role='img']) { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: var(--nt-radius-sm); }
 	.identity { overflow-wrap: anywhere; }
 	section { padding: var(--nt-space-2) var(--nt-space-3); background: var(--nt-bg-raised); border-top: 1px solid var(--nt-border); color: var(--nt-fg); }
 	.transport-buttons, .sound, .seek { display: flex; align-items: center; justify-content: center; gap: var(--nt-space-2); }
@@ -261,6 +291,25 @@
 	.playback-settings { display: flex; flex-wrap: wrap; align-items: center; gap: var(--nt-space-2); }
 	select { min-height: var(--nt-control); background: var(--nt-bg); color: var(--nt-fg); border: 1px solid var(--nt-border); border-radius: var(--nt-radius-sm); padding: var(--nt-space-2); font: inherit; }
 	:where(button, input, summary, select):focus-visible { outline: var(--nt-focus-ring-width) solid var(--nt-focus-ring); outline-offset: var(--nt-focus-ring-offset); }
+	@media (max-width: 799px) {
+		section:not(.expanded) { display: block; padding: 0; border-top: 0; background: none; }
+		section:not(.expanded) .full-controls { display: none; }
+		.mini-wrap {
+			position: sticky;
+			bottom: var(--nt-control);
+			z-index: var(--nt-z-player);
+			display: block;
+			height: var(--nt-control-lg);
+			background: var(--nt-bg-raised);
+			border-top: 1px solid var(--nt-border);
+		}
+		.mini-progress { position: absolute; inset: 0 0 auto; display: block; height: var(--nt-space-px-2); background: var(--nt-border); pointer-events: none; }
+		.mini-progress span { display: block; height: 100%; background: var(--nt-accent); }
+		.mini-surface { display: flex; align-items: center; gap: var(--nt-space-1); height: 100%; padding: var(--nt-space-1) var(--nt-space-2); }
+		.mini-surface .compact-hide { display: none !important; }
+		.mini-surface .identity-link { flex: 1; min-height: 2.75rem; }
+		.mini-surface .identity-link .identity { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--nt-text-sm); }
+	}
 	p:empty { display: none; }
 	dialog { max-width: min(38rem, calc(100vw - var(--nt-space-4))); max-height: 80dvh; padding: var(--nt-space-4); border: 1px solid var(--nt-border); border-radius: var(--nt-radius-dialog); background: var(--nt-bg-raised); color: var(--nt-fg); }
 	dialog::backdrop { background: var(--nt-scrim); }

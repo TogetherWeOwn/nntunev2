@@ -46,14 +46,14 @@ const routeForTestId: Record<ActiveTestId, string> = {
 	playerNext: './player/PlayerTransport.svelte',
 	queuePanel: './player/QueueView.svelte',
 	planLimitNotice: '../routes/library/+page.svelte',
-	// The W10 app shell declares all four in the root layout: the top bar
-	// renders in both shells (app + public header), the rail/tab bar render
-	// one per breakpoint, and the mini-player renders while a selection
-	// hint is set.
+	// The W10 app shell declares the top bar, rail and tab bar in the root
+	// layout: the top bar renders in both shells (app + public header) and
+	// the rail/tab bar render one per breakpoint. The compact transport owns
+	// the mini-player hook (C3): one play/favorite surface at every width.
 	shellTopbar: '../routes/+layout.svelte',
 	shellRail: '../routes/+layout.svelte',
 	shellTabbar: '../routes/+layout.svelte',
-	miniPlayer: '../routes/+layout.svelte'
+	miniPlayer: './player/PlayerTransport.svelte'
 };
 
 describe('retired user NZB import', () => {
@@ -90,7 +90,7 @@ describe('e2e contract hooks', () => {
 		expect(layout).toContain('const player = createPlayerSession({ flush: tick })');
 		expect(layout).toContain('providePlayerSession(player)');
 		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
-		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />');
 		const audio = sources['./player/PlayerAudio.svelte'];
 		expect(audio).toContain('const player = usePlayerSession()');
 		expect(audio).toContain('player.attach(audio)');

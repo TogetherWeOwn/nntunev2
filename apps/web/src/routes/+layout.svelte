@@ -19,9 +19,6 @@
 	import { currentTrack } from '#lib/player/queue.js';
 	import PlayerAudio from '#lib/player/PlayerAudio.svelte';
 	import QueueView from '#lib/player/QueueView.svelte';
-	import Artwork from '#lib/player/Artwork.svelte';
-	import IconSvg from '#lib/design/IconSvg.svelte';
-	import { FAVORITE_ICON_PATHS, TRANSPORT_ICON_PATHS } from '#lib/design/icons.js';
 	import { displayTitle, displayArtist } from '#lib/library/order.js';
 	import {
 		clearMiniPlayerHint,
@@ -377,15 +374,13 @@
 		};
 	});
 
-	const selectedTrack = $derived(currentTrack($player.queue));
-	const currentFavorite = $derived(!!selectedTrack && $player.favorites.includes(selectedTrack.id));
-	const miniActive = $derived($player.transport?.status === 'playing' || $player.transport?.status === 'loading' || $player.transport?.status === 'buffering');
-	const miniProgress = $derived($player.transport?.duration
-		? Math.min(100, Math.max(0, $player.transport.position / $player.transport.duration * 100)) : 0);
-	let nowPlayingOpen = $state(false);
 	let nowPlayingHeading: HTMLHeadingElement | undefined = $state();
 	let nowPlayingOpener: HTMLElement | null = null;
 	let nowPlayingReturnUrl = '/home';
+	// The compact bar link is a plain anchor (it still needs keyboard
+	// heading focus after navigation); remember its opener the same way.
+	let compactOpener: HTMLElement | null = null;
+	let compactKeyboard = false;
 	const nowPlayingRoute = $derived(page.url.pathname === '/now-playing');
 	let queueOpen = $state(false);
 	let queueHeading: HTMLHeadingElement | undefined = $state();
@@ -416,28 +411,35 @@
 	$effect(() => {
 		// Dedicated player routes own their view; a redundant query must not
 		// mount a second presentation or redirect into another player route.
+		// `?panel=now-playing` never shipped on main: an unknown panel value
+		// is ignored and the current route is kept.
 		const panel = isPublicRoute || queueRoute || nowPlayingRoute ? null : panelQuery;
 		if (panel !== priorPanel) {
 			queueOpen = panel === 'queue';
-			nowPlayingOpen = panel === 'now-playing';
 			priorPanel = panel;
+		}
+	});
+
+	$effect(() => {
+		// The Now Playing close destination is the last non-player URL.
+		// Visiting Queue must not overwrite it: Library → Now Playing →
+		// Queue → Close → Close returns to Library, not to /queue.
+		if (!nowPlayingRoute && !queueRoute) nowPlayingReturnUrl = page.url.pathname + page.url.search + page.url.hash;
+	});
+
+	$effect(() => {
+		// A keyboard activation of the compact identity link lands on the
+		// route heading; pointer opens leave focus where the user put it.
+		if (nowPlayingRoute && compactKeyboard) {
+			compactKeyboard = false;
+			void tick().then(() => nowPlayingHeading?.focus());
 		}
 	});
 
 	$effect(() => {
 		if (isPublicRoute) {
 			queueOpen = false;
-			nowPlayingOpen = false;
 			return;
-		}
-		if (nowPlayingRoute && !narrow) {
-			void goto('/home?panel=now-playing', { replaceState: true });
-		} else if (narrow && nowPlayingOpen && !nowPlayingRoute) {
-			const url = new URL(page.url.href);
-			url.searchParams.delete('panel');
-			nowPlayingReturnUrl = url.pathname + url.search + url.hash;
-			nowPlayingOpen = false;
-			void goto('/now-playing', { replaceState: true });
 		}
 		if (queueRoute && !narrow) {
 			void goto('/home?panel=queue', { replaceState: true });
@@ -456,22 +458,16 @@
 		const target = event.currentTarget as HTMLElement;
 		const keyboard = event.detail === 0;
 		// A panel outside the full-screen subtree cannot receive visible focus.
-		if (beforeOpen && (!(await beforeOpen()) || version !== queueNavigationVersion || !target.isConnected || isPublicRoute || !currentTrack($player.queue)?.streamUrl)) return;
+		// Queue itself needs no playable stream; only the transport guard
+		// (fullscreen exit + navigation freshness) may hold it.
+		if (beforeOpen && (!(await beforeOpen()) || version !== queueNavigationVersion || !target.isConnected || isPublicRoute)) return;
 		if (queueRoute || queueOpen) return closeQueue();
 		queueOpener = target;
-		nowPlayingOpen = false;
 		if (narrow) {
-			// Switching back consumes that view's return frame rather than
-			// creating Queue -> Now playing -> Queue close destinations.
 			if (nowPlayingRoute && new URL(nowPlayingReturnUrl, page.url.href).pathname === '/queue') nowPlayingReturnUrl = queueReturnUrl;
 			else queueReturnUrl = page.url.pathname + page.url.search;
 			version += 1; // Only this gesture's own navigation may preserve focus intent.
 			await goto('/queue');
-		} else if (panelQuery === 'now-playing') {
-			const url = new URL(page.url.href);
-			url.searchParams.set('panel', 'queue');
-			version += 1;
-			await goto(url, { replaceState: true, reset: false });
 		} else queueOpen = true;
 		if (keyboard && (queueOpen || narrow)) {
 			await tick();
@@ -492,48 +488,23 @@
 		else document.querySelector<HTMLElement>('[data-testid="player-queue-toggle"]')?.focus();
 	}
 
-	async function openNowPlaying(event: MouseEvent, beforeOpen?: () => Promise<boolean>): Promise<void> {
-		if (event.defaultPrevented || event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-		event.preventDefault();
-		const target = event.currentTarget as HTMLElement;
-		const keyboard = event.detail === 0;
-		let version = queueNavigationVersion;
-		if (beforeOpen && (!(await beforeOpen()) || version !== queueNavigationVersion || !target.isConnected || isPublicRoute || !currentTrack($player.queue)?.streamUrl)) return;
-		if (nowPlayingOpen || nowPlayingRoute) return;
-		nowPlayingOpener = target;
-		queueOpen = false;
-		if (narrow) {
-			if (queueRoute && new URL(queueReturnUrl, page.url.href).pathname === '/now-playing') queueReturnUrl = nowPlayingReturnUrl;
-			else nowPlayingReturnUrl = page.url.pathname + page.url.search + page.url.hash;
-			version += 1;
-			await goto('/now-playing');
-		} else if (panelQuery === 'queue') {
-			const url = new URL(page.url.href);
-			url.searchParams.set('panel', 'now-playing');
-			version += 1;
-			await goto(url, { replaceState: true, reset: false });
-		} else nowPlayingOpen = true;
-		if (keyboard) {
-			await tick();
-			if (version === queueNavigationVersion && !isPublicRoute && (nowPlayingOpen || nowPlayingRoute)) nowPlayingHeading?.focus();
-		}
+	// The compact identity link is a plain anchor (modifier/middle clicks keep
+	// native semantics); this only records the opener for focus restoration.
+	function noteNowPlayingOpen(target: HTMLElement, keyboard: boolean): void {
+		compactOpener = target;
+		compactKeyboard = keyboard;
 	}
 
 	async function closeNowPlaying(): Promise<void> {
-		nowPlayingOpen = false;
 		let version = queueNavigationVersion;
 		if (nowPlayingRoute) {
 			version += 1;
 			await goto(nowPlayingReturnUrl);
-		} else if (panelQuery === 'now-playing') {
-			const url = new URL(page.url.href);
-			url.searchParams.delete('panel');
-			version += 1;
-			await goto(url, { replaceState: true, reset: false });
 		}
 		await tick();
 		if (version !== queueNavigationVersion || isPublicRoute) return;
-		if (nowPlayingOpener?.isConnected) nowPlayingOpener.focus();
+		if (compactOpener?.isConnected) compactOpener.focus();
+		else if (nowPlayingOpener?.isConnected) nowPlayingOpener.focus();
 		else document.querySelector<HTMLElement>('[data-testid="player-now-playing-toggle"]')?.focus();
 	}
 
@@ -626,9 +597,6 @@
 {/snippet}
 
 {#snippet queueToggle(beforeOpen?: () => Promise<boolean>)}
-	{#if !nowPlayingRoute}
-		<a href="/now-playing" data-testid="player-now-playing-toggle" aria-expanded={nowPlayingOpen} aria-controls={nowPlayingOpen ? 'now-playing-view' : undefined} onclick={(event) => void openNowPlaying(event, beforeOpen)}>Now playing</a>
-	{/if}
 	<button class="nt-button" type="button" data-testid="player-queue-toggle"
 		aria-expanded={queueOpen || queueRoute} aria-controls={queueRoute ? 'main-content' : 'queue-view'}
 		onclick={(event) => void openQueue(event, beforeOpen)}>Queue</button>
@@ -745,22 +713,10 @@
 					<h2 bind:this={queueHeading} tabindex="-1">Queue</h2>
 					{@render queueContent()}
 				</aside>
-			{:else if nowPlayingOpen && !nowPlayingRoute}
-				<aside id="now-playing-view" class="nt-queue-host nt-wrap" data-testid="right-panel" data-now-playing-view aria-label="Now playing and queue" tabindex="-1">
-					<h2 bind:this={nowPlayingHeading} tabindex="-1">Now playing</h2>
-					<button class="nt-button" type="button" onclick={() => void closeNowPlaying()}>Close Now playing</button>
-					{#if selectedTrack}
-						<Artwork src={selectedTrack.artworkUrl} />
-						<p>{displayTitle(selectedTrack)}</p>
-						{#if displayArtist(selectedTrack)}<p>{displayArtist(selectedTrack)}</p>{/if}
-					{:else}
-						<p>Choose a playable track from Your Library.</p>
-					{/if}
-				</aside>
 			{/if}
 		{/if}
 	</div>
-	{#if rightSnippet && !queueOpen && !queueRoute && !nowPlayingOpen && !nowPlayingRoute}
+	{#if rightSnippet && !queueOpen && !queueRoute && !nowPlayingRoute}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}
 		</aside>
@@ -786,18 +742,7 @@
 				</div>
 			{/if}
 		</div>
-		<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />
-	{#if miniHint && !nowPlayingRoute}
-		<div class="nt-miniplayer nt-wrap" data-testid="mini-player">
-			<div class="nt-miniplayer-progress" aria-hidden="true"><span data-testid="mini-player-progress" style:width={`${miniProgress}%`}></span></div>
-			<a href="/now-playing" aria-label={`Now playing: ${miniHint.title}${miniHint.artist ? ` — ${miniHint.artist}` : ''}`} onclick={(event) => void openNowPlaying(event)}>
-				<span class="nt-miniplayer-art" aria-hidden="true"><Artwork src={selectedTrack?.artworkUrl} /></span>
-				<span class="nt-miniplayer-identity"><span class="nt-miniplayer-title">{miniHint.title}</span>{#if miniHint.artist}<span class="nt-miniplayer-artist">{' — '}{miniHint.artist}</span>{/if}</span>
-			</a>
-			<button type="button" data-testid="mini-player-favorite" aria-label={currentFavorite ? 'Remove from Favorites' : 'Save to Favorites'} aria-pressed={currentFavorite} disabled={!selectedTrack} onclick={() => player.toggleCurrentFavorite()}><IconSvg path={FAVORITE_ICON_PATHS[currentFavorite ? 'heart-filled' : 'heart']} /></button>
-			<button type="button" data-testid="mini-player-play-pause" aria-label={miniActive ? 'Pause' : 'Play'} disabled={!selectedTrack?.streamUrl} onclick={() => player.togglePlay()}><IconSvg path={TRANSPORT_ICON_PATHS[miniActive ? 'pause' : 'play']} /></button>
-		</div>
-	{/if}
+		<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />
 	<nav aria-label="Primary" data-testid="shell-tabbar" class="nt-destinations nt-tabbar">
 		{@render primaryLinks()}
 	</nav>
@@ -1005,10 +950,6 @@
 		display: none;
 	}
 
-	.nt-miniplayer {
-		display: none;
-	}
-
 	.nt-toasts {
 		position: fixed;
 		inset-inline-end: var(--nt-space-3);
@@ -1071,9 +1012,6 @@
 		background: var(--nt-surface-pane);
 	}
 
-	[data-now-playing-view] { overflow-wrap: anywhere; }
-	[data-now-playing-view] :global(img), [data-now-playing-view] :global([role='img']) { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--nt-radius-pane); }
-
 	.nt-queue-route { flex: 1; width: 100%; border: 0; }
 
 	.nt-body > :global(main) { flex: 1; min-width: 0; }
@@ -1082,29 +1020,6 @@
 		border-top: 1px solid var(--nt-border);
 		padding-block: var(--nt-space-3);
 	}
-
-	.nt-miniplayer a {
-		display: flex;
-		flex: 1;
-		align-items: center;
-		gap: var(--nt-space-2);
-		min-width: 0;
-		min-height: 2.75rem;
-		color: var(--nt-fg);
-		text-decoration: none;
-	}
-
-	.nt-miniplayer-art { flex: 0 0 var(--nt-space-px-40); width: var(--nt-space-px-40); height: var(--nt-space-px-40); }
-	.nt-miniplayer-art :global(img), .nt-miniplayer-art :global([role='img']) { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: var(--nt-radius-sm); }
-	.nt-miniplayer-identity { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--nt-text-sm); }
-	.nt-miniplayer-title { font-weight: var(--nt-weight-strong); }
-	.nt-miniplayer-artist { color: var(--nt-fg-muted); }
-	.nt-miniplayer button { display: inline-flex; flex: 0 0 2.75rem; align-items: center; justify-content: center; width: 2.75rem; height: 2.75rem; padding: 0; border: 0; border-radius: var(--nt-radius-pill); background: transparent; color: var(--nt-fg); cursor: pointer; }
-	.nt-miniplayer button[aria-pressed='true'] { color: var(--nt-accent); }
-	.nt-miniplayer button:disabled { opacity: 0.5; cursor: default; }
-	.nt-miniplayer :where(a, button):focus-visible { outline: var(--nt-focus-ring-width) solid var(--nt-focus-ring); outline-offset: var(--nt-focus-ring-offset); }
-	.nt-miniplayer-progress { position: absolute; inset: 0 0 auto; height: var(--nt-space-px-2); background: var(--nt-border); pointer-events: none; }
-	.nt-miniplayer-progress span { display: block; height: 100%; background: var(--nt-accent); }
 
 	@media (max-width: 799px) {
 		/* Keep content and native focus scrolling clear of the sticky player/nav. */
@@ -1130,18 +1045,6 @@
 
 		.nt-body {
 			display: block;
-		}
-
-		.nt-miniplayer {
-			position: sticky;
-			bottom: var(--nt-control);
-			z-index: var(--nt-z-player);
-			display: flex;
-			align-items: center;
-			gap: var(--nt-space-1);
-			height: var(--nt-control-lg);
-			padding: var(--nt-space-1) var(--nt-space-2);
-			background: var(--nt-bg-raised);
 		}
 
 		.nt-tabbar {

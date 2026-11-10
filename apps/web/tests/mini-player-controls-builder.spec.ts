@@ -99,7 +99,7 @@ test.describe('mini-player live controls', () => {
 		const audio = page.getByTestId('audio-player');
 		const original = (await audio.elementHandle())!;
 		const mini = page.getByTestId('mini-player');
-		const play = page.getByTestId('mini-player-play-pause');
+		const play = page.getByTestId('player-play-pause');
 		await expect(play).toBeEnabled();
 		await expect(play).toHaveAccessibleName('Play');
 		await expect(audio).toHaveJSProperty('paused', true);
@@ -136,25 +136,25 @@ test.describe('mini-player live controls', () => {
 		expect(await audio.evaluate((el) => (el as HTMLAudioElement & { miniEvents: string[] }).miniEvents)).toEqual([]);
 	});
 
-	test('heart mirrors the full player favorite in both directions', async ({ page }) => {
+	test('the single favorite surface toggles in both directions', async ({ page }) => {
 		await seed(page, [A]);
 		await selectPlayable(page, A);
-		const mini = page.getByTestId('mini-player-favorite');
-		const full = page.getByTestId('player-favorite');
-		await expect(mini).toHaveAccessibleName('Save to Favorites');
-		await expect(mini).toHaveAttribute('aria-pressed', 'false');
-		await mini.click();
-		await expect(mini).toHaveAttribute('aria-pressed', 'true');
-		await expect(mini).toHaveAccessibleName('Remove from Favorites');
-		await expect(full).toHaveAttribute('aria-pressed', 'true');
-		await full.click();
-		await expect(mini).toHaveAttribute('aria-pressed', 'false');
-		await expect(mini).toHaveAccessibleName('Save to Favorites');
-		await full.click();
-		await expect(mini).toHaveAttribute('aria-pressed', 'true');
-		await mini.click();
-		await expect(full).toHaveAttribute('aria-pressed', 'false');
+		const heart = page.getByTestId('player-favorite');
+		await expect(heart).toHaveCount(1);
+		await expect(heart).toHaveAccessibleName('Save to Favorites');
+		await expect(heart).toHaveAttribute('aria-pressed', 'false');
+		await heart.click();
+		await expect(heart).toHaveAttribute('aria-pressed', 'true');
+		await expect(heart).toHaveAccessibleName('Remove from Favorites');
+		await page.getByTestId('player-now-playing-toggle').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
+		const expanded = page.getByTestId('now-playing-route').getByTestId('player-favorite');
+		await expect(expanded).toHaveAttribute('aria-pressed', 'true');
+		await expanded.click();
+		await expect(expanded).toHaveAttribute('aria-pressed', 'false');
+		await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
 		await expect(page).toHaveURL(/\/library$/);
+		await expect(heart).toHaveAttribute('aria-pressed', 'false');
 	});
 
 	for (const playing of [false, true]) {
@@ -163,11 +163,15 @@ test.describe('mini-player live controls', () => {
 			await selectPlayable(page, A);
 			const audio = page.getByTestId('audio-player');
 			const original = (await audio.elementHandle())!;
-			await page.getByTestId('player-seek').fill('20');
+			await page.getByTestId('mini-player').getByRole('link').click();
+			await expect(page).toHaveURL(/\/now-playing$/);
+			await expect(page.getByTestId('now-playing-route')).toBeVisible();
+			await expect(page.getByTestId('mini-player')).toHaveCount(0);
+			await page.getByTestId('now-playing-route').getByTestId('player-seek').fill('20');
 			await expect.poll(() => time(audio)).toBeGreaterThan(19.5);
 			await expect(audio).toHaveJSProperty('seeking', false);
 			if (playing) {
-				await page.getByTestId('mini-player-play-pause').click();
+				await page.getByTestId('player-play-pause').click();
 				await expect(audio).toHaveJSProperty('paused', false);
 				// The property changes before the queued native play event.
 				// Start the navigation probe only after real playback progresses.
@@ -179,18 +183,13 @@ test.describe('mini-player live controls', () => {
 				for (const name of ['play', 'pause', 'loadstart', 'emptied', 'seeking']) el.addEventListener(name, () => events.push(name));
 				Object.assign(el, { miniEvents: events });
 			});
-
-			await page.getByTestId('mini-player').getByRole('link').click();
-			await expect(page).toHaveURL(/\/now-playing$/);
-			await expect(page.getByTestId('now-playing-route')).toBeVisible();
-			await expect(page.getByTestId('mini-player')).toHaveCount(0);
 			await expect(audio).toHaveJSProperty('paused', !playing);
 			if (playing) await expect.poll(() => time(audio)).toBeGreaterThan(before + 0.3);
 			else expect(await time(audio)).toBe(before);
 
 			await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
 			await expect(page).toHaveURL(/\/library$/);
-			const play = page.getByTestId('mini-player-play-pause');
+			const play = page.getByTestId('player-play-pause');
 			await expect(play).toHaveAccessibleName(playing ? 'Pause' : 'Play');
 			await expect(audio).toHaveJSProperty('paused', !playing);
 			const mid = await time(audio);
@@ -208,14 +207,16 @@ test.describe('mini-player live controls', () => {
 		await selectPlayable(page, A);
 		const audio = page.getByTestId('audio-player');
 		const mini = page.getByTestId('mini-player');
-		await page.getByTestId('player-seek').fill('30');
+		// Seeking lives in the expanded route; the compact bar only reports it.
+		await mini.getByRole('link').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
+		await page.getByTestId('now-playing-route').getByTestId('player-seek').fill('30');
 		await expect.poll(() => time(audio)).toBeGreaterThan(29.5);
+		await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
+		await expect(page).toHaveURL(/\/library$/);
 		await expect.poll(() => barWidth(page)).toBeGreaterThan(47);
 		expect(await barWidth(page)).toBeLessThan(53);
 		await expect(page.getByTestId('mini-player-progress')).toHaveAttribute('style', /width:\s*[\d.]+%/);
-		await page.getByTestId('player-seek').fill('45');
-		await expect.poll(() => barWidth(page)).toBeGreaterThan(72);
-		expect(await barWidth(page)).toBeLessThan(78);
 
 		await expect(mini.getByRole('slider')).toHaveCount(0);
 		await expect(mini.locator('[role="slider"], [role="progressbar"], input')).toHaveCount(0);
@@ -227,9 +228,8 @@ test.describe('mini-player live controls', () => {
 		await page.mouse.click(area.x + area.width * 0.1, area.y + area.height / 2);
 		await frames(page);
 		expect(await time(audio)).toBe(at);
-		expect(await barWidth(page)).toBeGreaterThan(72);
+		expect(await barWidth(page)).toBeGreaterThan(47);
 		await expect(page).toHaveURL(/\/library$/);
-		await expect(page.getByTestId('player-seek')).toBeVisible();
 	});
 
 	test('switching the current track retargets the mini-player and resets progress', async ({ page }) => {
@@ -238,17 +238,26 @@ test.describe('mini-player live controls', () => {
 		const audio = page.getByTestId('audio-player');
 		const link = page.getByTestId('mini-player').getByRole('link');
 		await expect(link).toHaveAccessibleName(`Now playing: ${A.title} — ${A.artist}`);
-		await page.getByTestId('player-seek').fill('30');
+		await link.click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
+		await page.getByTestId('now-playing-route').getByTestId('player-seek').fill('30');
+		await expect.poll(() => time(audio)).toBeGreaterThan(29.5);
+		await page.getByTestId('player-favorite').click();
+		await expect(page.getByTestId('player-favorite')).toHaveAttribute('aria-pressed', 'true');
+		await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
+		await expect(page).toHaveURL(/\/library$/);
 		await expect.poll(() => barWidth(page)).toBeGreaterThan(40);
-		await page.getByTestId('mini-player-favorite').click();
-		await expect(page.getByTestId('mini-player-favorite')).toHaveAttribute('aria-pressed', 'true');
 		await select(page, B);
 		// Selecting a Library row appends; Next explicitly changes current.
+		await link.click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
 		await page.getByTestId('player-next').click();
 		await expect(audio).toHaveAttribute('src', B.streamUrl!);
+		await page.getByRole('button', { name: 'Close Now playing', exact: true }).click();
+		await expect(page).toHaveURL(/\/library$/);
 		await expect(link).toHaveAccessibleName(`Now playing: ${B.title} — ${B.artist}`);
 		await expect.poll(() => barWidth(page)).toBeLessThan(5);
-		await expect(page.getByTestId('mini-player-favorite')).toHaveAttribute('aria-pressed', 'false');
+		await expect(page.getByTestId('player-favorite')).toHaveAttribute('aria-pressed', 'false');
 	});
 
 	test('empty library has no mini-player', async ({ page }) => {
@@ -259,19 +268,18 @@ test.describe('mini-player live controls', () => {
 		await expect(page.getByTestId('mini-player')).toHaveCount(0);
 	});
 
-	test('metadata-only selection shows the hint with Play disabled and nothing audible', async ({ page }) => {
+	test('metadata-only selection shows plain identity with Play disabled and nothing audible', async ({ page }) => {
 		await seed(page, [NO_STREAM]);
 		await select(page, NO_STREAM);
 		const mini = page.getByTestId('mini-player');
 		await expect(mini).toBeVisible();
-		await expect(mini.getByRole('link')).toHaveAccessibleName(`Now playing: ${NO_STREAM.title} — ${NO_STREAM.artist}`);
-		const play = page.getByTestId('mini-player-play-pause');
+		await expect(mini).toContainText(`${NO_STREAM.title} — ${NO_STREAM.artist}`);
+		await expect(mini.getByRole('link')).toHaveCount(0);
+		const play = page.getByTestId('player-play-pause');
 		await expect(play).toBeDisabled();
 		await expect(play).toHaveAccessibleName('Play');
 		expect(await barWidth(page)).toBe(0);
 		await expect(page.getByTestId('audio-player')).toHaveCount(0);
-		await mini.getByRole('link').click();
-		await expect(page).toHaveURL(/\/now-playing$/);
 	});
 
 	test('auth boundary away from Library drops the mini-player', async ({ page }) => {
@@ -280,7 +288,7 @@ test.describe('mini-player live controls', () => {
 		await expect(page.getByTestId('mini-player')).toBeVisible();
 		const audio = page.getByTestId('audio-player');
 		const original = (await audio.elementHandle())!;
-		await page.getByTestId('mini-player-play-pause').click();
+		await page.getByTestId('player-play-pause').click();
 		await expect(audio).toHaveJSProperty('paused', false);
 		await expect.poll(() => time(audio)).toBeGreaterThan(0.3);
 		await clientLink(page, '/home');
@@ -305,14 +313,14 @@ for (const width of [320, 390, 799]) {
 			await selectPlayable(page, LONG);
 			const mini = page.getByTestId('mini-player');
 			const link = mini.getByRole('link');
-			const heart = page.getByTestId('mini-player-favorite');
-			const play = page.getByTestId('mini-player-play-pause');
+			const heart = page.getByTestId('player-favorite');
+			const play = page.getByTestId('player-play-pause');
 			const tabbar = page.getByTestId('shell-tabbar');
 			await expect(mini).toBeVisible();
 
 			// Literal, complete accessible identity; one line; nothing overflows.
 			await expect(link).toHaveAccessibleName(`Now playing: ${LONG.title} — ${LONG.artist}`);
-			const identity = mini.locator('.nt-miniplayer-identity');
+			const identity = mini.locator('.identity-link .identity');
 			await expect(identity).toHaveText(`${LONG.title} — ${LONG.artist}`);
 			await expect(mini.locator('b, i')).toHaveCount(0);
 			const style = await identity.evaluate((el) => {
@@ -328,7 +336,7 @@ for (const width of [320, 390, 799]) {
 			expect(bar.height).toBe(56);
 			expect(bar.x).toBeGreaterThanOrEqual(0);
 			expect(bar.x + bar.width).toBeLessThanOrEqual(width + 0.5);
-			const art = await box(mini.locator('.nt-miniplayer-art'));
+			const art = await box(mini.locator('.compact-art'));
 			expect([art.width, art.height]).toEqual([40, 40]);
 			const [l, h, p] = [await box(link), await box(heart), await box(play)];
 			expect(l.height).toBeGreaterThanOrEqual(44);

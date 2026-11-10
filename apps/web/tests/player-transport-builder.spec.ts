@@ -96,6 +96,9 @@ for (const playing of [false, true]) {
 			}
 		});
 		const toggle = page.getByTestId('player-fullscreen');
+		// Full screen is the expanded Now Playing view at every width.
+		await page.getByTestId('player-now-playing-toggle').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
 		await toggle.click();
 		await expect.poll(() => page.evaluate(() => document.fullscreenElement?.getAttribute('data-testid'))).toBe('player-bar');
 		await expect(toggle).toHaveAccessibleName('Exit full screen');
@@ -125,6 +128,8 @@ for (const width of [390, 1280]) {
 		await page.setViewportSize({ width, height: 844 });
 		const { audio, errors } = await openTransport(page, { playing: false });
 		const original = (await audio.elementHandle())!;
+		await page.getByTestId('player-now-playing-toggle').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
 		await page.getByTestId('player-fullscreen').click();
 		await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
 		await page.getByTestId('player-queue-toggle').focus();
@@ -142,32 +147,31 @@ for (const width of [390, 1280]) {
 	});
 }
 
-test('cinema idle hides only unfocused fine-pointer controls; keyboard focus and pointer activity reveal them', async ({ page }) => {
+test('full-screen controls stay visible without an idle layer', async ({ page }) => {
 	await page.setViewportSize({ width: 1280, height: 900 });
 	await page.emulateMedia({ reducedMotion: 'no-preference' });
 	const { errors } = await openTransport(page, { playing: false });
+	await page.getByTestId('player-now-playing-toggle').click();
+	await expect(page.getByTestId('now-playing-route')).toBeVisible();
 	await page.getByTestId('player-fullscreen').click();
 	const player = page.getByTestId('player-bar');
-	const controls = player.locator('.cinema-controls');
+	const controls = player.locator('.controls');
+	await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
 	await blurToBody(page);
-	await expect(player).toHaveAttribute('data-cinema-idle', 'true', { timeout: 7000 });
-	await expect(controls).toHaveCSS('opacity', '0');
-	await page.getByTestId('player-play-pause').focus();
+	// Well past the retired 3s idle timeout, controls remain fully visible.
+	await page.waitForTimeout(3500);
+	await expect(player).not.toHaveAttribute('data-cinema-idle', /.+/);
 	await expect(controls).toHaveCSS('opacity', '1');
-	await expect(player).toHaveAttribute('data-cinema-idle', 'true', { timeout: 7000 });
-	await expect(controls).toHaveCSS('opacity', '1');
-	await blurToBody(page);
-	await page.mouse.move(200, 100);
-	await expect(player).toHaveAttribute('data-cinema-idle', 'false');
-	await expect(controls).toHaveCSS('opacity', '1');
+	await expect(page.getByTestId('player-play-pause')).toBeVisible();
 	await page.evaluate(() => document.exitFullscreen());
-	await expect(player).toHaveAttribute('data-cinema-idle', 'false');
 	expect(errors).toEqual([]);
 });
 
 test('unsupported and refused full screen leave a usable transport and truthful recovery feedback', async ({ page }) => {
 	await page.addInitScript(() => Object.defineProperty(document, 'fullscreenEnabled', { configurable: true, value: false }));
 	const { audio, errors } = await openTransport(page, { playing: false });
+	await page.getByTestId('player-now-playing-toggle').click();
+	await expect(page.getByTestId('now-playing-route')).toBeVisible();
 	await expect(page.getByTestId('player-fullscreen')).toBeDisabled();
 	await expect(page.getByText('Full screen is unavailable in this browser.')).toBeVisible();
 	await page.getByTestId('player-play-pause').click();
@@ -178,6 +182,8 @@ test('unsupported and refused full screen leave a usable transport and truthful 
 
 test('a native full-screen rejection never changes playback and allows a real retry', async ({ page }) => {
 	const { audio, errors } = await openTransport(page, { playing: false });
+	await page.getByTestId('player-now-playing-toggle').click();
+	await expect(page.getByTestId('now-playing-route')).toBeVisible();
 	await page.getByTestId('player-bar').evaluate((el) => {
 		const native = el.requestFullscreen;
 		el.requestFullscreen = () => { el.requestFullscreen = native; return Promise.reject(new Error('Test refusal')); };
@@ -201,6 +207,8 @@ for (const appearance of ['light', 'dark'] as const) {
 			await page.emulateMedia({ reducedMotion: 'reduce' });
 			await page.addInitScript((value) => localStorage.setItem('nntune:appearance:v1', value), appearance);
 			const { errors } = await openTransport(page, { playing: false });
+			await page.getByTestId('player-now-playing-toggle').click();
+			await expect(page.getByTestId('now-playing-route')).toBeVisible();
 			await page.getByTestId('player-fullscreen').click();
 			const player = page.getByTestId('player-bar');
 			await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
@@ -215,8 +223,8 @@ for (const appearance of ['light', 'dark'] as const) {
 			expect(ring.width).toBeGreaterThanOrEqual(2);
 			expect(ring.style).toBe('solid');
 			await blurToBody(page);
-			await expect(player).toHaveAttribute('data-cinema-idle', 'true', { timeout: 7000 });
-			await expect(player.locator('.cinema-controls')).toHaveCSS('opacity', '1');
+			await expect(player).not.toHaveAttribute('data-cinema-idle', /.+/);
+			await expect(player.locator('.controls')).toHaveCSS('opacity', '1');
 			expect(await player.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
 			expect((await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze()).violations).toEqual([]);
 			await page.screenshot({ path: `test-results/cinema-${appearance}-${width}.png` });
@@ -231,13 +239,15 @@ test('full-screen overflow-safe centering keeps long metadata and transport reac
 	await page.emulateMedia({ reducedMotion: 'reduce' });
 	const items = [{ ...ITEMS[0], title: 'LongTitle'.repeat(40), artist: 'LongArtist'.repeat(40) }];
 	const { errors } = await openTransport(page, { playing: false, items });
+	await page.getByTestId('player-now-playing-toggle').click();
+	await expect(page.getByTestId('now-playing-route')).toBeVisible();
 	await page.getByTestId('player-fullscreen').click();
 	const player = page.getByTestId('player-bar');
 	await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
 	await player.evaluate((el) => { el.scrollTop = 0; });
 	const geometry = await player.evaluate((el) => ({
 		top: el.getBoundingClientRect().top,
-		controlsTop: el.querySelector('.cinema-controls')!.getBoundingClientRect().top,
+		controlsTop: el.querySelector('.controls')!.getBoundingClientRect().top,
 		width: el.clientWidth, scrollWidth: el.scrollWidth
 	}));
 	expect(geometry.controlsTop).toBeGreaterThanOrEqual(geometry.top);
@@ -255,6 +265,8 @@ for (const width of [390, 1280]) {
 		const { audio, errors } = await openTransport(page, { playing: false });
 		await page.locator('nav[aria-label="Primary"] a[href="/home"]:visible').click();
 		await expect(page).toHaveURL(/\/home$/);
+		await page.getByTestId('player-now-playing-toggle').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
 		await page.getByTestId('player-fullscreen').click();
 		await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
 		await page.evaluate(() => {
@@ -284,6 +296,8 @@ for (const width of [390, 1280]) {
 	test(`pending navigation supersedes a late full-screen Queue exit at ${width}px`, async ({ page }) => {
 		await page.setViewportSize({ width, height: 844 });
 		const { audio, errors } = await openTransport(page, { playing: false });
+		await page.getByTestId('player-now-playing-toggle').click();
+		await expect(page.getByTestId('now-playing-route')).toBeVisible();
 		await page.getByTestId('player-fullscreen').click();
 		await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true);
 		await page.evaluate(() => {
