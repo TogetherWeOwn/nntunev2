@@ -8,13 +8,14 @@
 //! loopback, single-host, no-hostaddr configuration for `nntune_ci` before
 //! any connection is opened.
 //!
-//! Scope: preparation only. Migration 0037 keeps the unique plaintext hash
-//! constraint, so failed-generation replacement, reuse, promotion and
-//! publication are NOT implemented or exercised here, and nothing in this
-//! file shows the whole finding fixed. Fixtures are synthetic sealed byte
-//! buffers keyed by database UUIDs; custody rows are retained by design, so
-//! nothing is cleaned up. Failures print only static labels: no connection
-//! URL, query text or row data.
+//! Scope: preparation plus the narrow generation completion (0054):
+//! fenced reuse of a usable winner, one replacement pinned to a
+//! terminally failed predecessor, retention confirmation and atomic
+//! promotion. Track-pointer wire-up, rollout/drain and R2 cleanup remain
+//! out of scope. Fixtures are synthetic sealed byte buffers keyed by
+//! database UUIDs; custody rows are retained by design, so nothing is
+//! cleaned up. Failures print only static labels: no connection URL,
+//! query text or row data.
 #![cfg(feature = "postgres-tests")]
 
 use nntune_ingest::posted_files::{
@@ -55,6 +56,8 @@ const MIGRATION_0044: &str =
     include_str!("../../../migrations/0046_posted_file_reference_fence.sql");
 const MIGRATION_0045: &str =
     include_str!("../../../migrations/0047_posted_file_legacy_writer_retirement.sql");
+const MIGRATION_0054: &str =
+    include_str!("../../../migrations/0054_posted_file_multi_generation.sql");
 
 #[path = "support/posted_generation_media_v1.rs"]
 mod posted_generation_media_v1;
@@ -65,6 +68,8 @@ mod posted_generation_abandon;
 mod posted_generation_attempt_acquisition;
 #[path = "support/posted_generation_checkpoint.rs"]
 mod posted_generation_checkpoint;
+#[path = "support/posted_generation_completion.rs"]
+mod posted_generation_completion;
 #[path = "support/posted_generation_content.rs"]
 mod posted_generation_content;
 #[path = "support/posted_generation_dispatch.rs"]

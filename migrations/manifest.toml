@@ -373,3 +373,8 @@ sha256 = "ded2a3b6d1300a6b72409efed7285a94ce3ad3f6645b31703f53e0b483e1c518"
 file = "0053_posted_file_retained_failures.sql"
 target = "app"
 sha256 = "ef1d9c032d7351038ced0c0f023f6056ac03c04cffda89c9c7b4eaf878254d28"
+
+[[migration]]
+file = "0054_posted_file_multi_generation.sql"
+target = "app"
+sha256 = "5f329f70036b586019293de6dbc7a811ec26df2766203040753205900d259dcf"

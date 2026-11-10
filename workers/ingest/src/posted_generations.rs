@@ -1,8 +1,13 @@
 //! Short PostgreSQL transactions for immutable posted-file custody.
 //!
-//! Preparation only: migration 0037 retains the unique hash constraint, so
-//! replacement is refused until the legacy writer/publication rollout is
-//! complete. Migration 0042 rejects unfenced health changes on registered
+//! Preparation only: migration 0054 replaces the 0037 global hash UNIQUE
+//! with a legacy-only partial index, so this adapter admits at most one
+//! pending generation per hash. A usable selected winner is reused
+//! read-only; a terminally failed winner is recorded as the operation
+//! predecessor for one replacement candidate. Full promotion must still
+//! pass [`confirm_retention`]/[`promote_candidate`]; the legacy
+//! writer/publication rollout stays separate. Migration 0042 rejects
+//! unfenced health changes on registered
 //! legacy custody; 0043 serializes new registration with existing legacy-row
 //! writes, including stale transaction snapshots. Migration 0045 prepares an
 //! OFF-by-default, monotonic database retirement gate for all legacy inserts
@@ -483,11 +488,14 @@ async fn read_handle(
     }))
 }
 
-/// Atomic absent-hash admission. The registry alone selects physical custody;
-/// missing legacy registration is an error, never an implicit hash-row winner.
-/// The preparation schema deliberately refuses terminal-predecessor replacement
-/// until the complete rollout fence lands. A zero-row insert is never
-/// interpreted as admission of the caller's mint.
+/// Atomic admission. The registry alone selects physical custody;
+/// missing legacy registration is an error, never an implicit hash-row
+/// winner. A usable selected winner is returned read-only
+/// ([`AdmissionOutcome::ReusedUsableWinner`] after the pinned fence); a
+/// terminally failed winner is recorded as the predecessor for one
+/// replacement candidate (G1). Unknown/verifying winners are busy.
+/// A zero-row insert is never interpreted as admission of the caller's
+/// mint.
 pub async fn admit(
     client: &mut Client,
     attempt: &AttemptHandle,
@@ -549,10 +557,15 @@ pub async fn admit(
     if registry.get::<_, i64>("revision") != expected.revision || selected != expected.selected {
         return Ok(AdmissionOutcome::StaleOrDiverged);
     }
+    // The terminally failed winner (if any) becomes this operation's
+    // pinned predecessor. Usable winners reuse without a candidate;
+    // unknown/verifying winners are busy.
+    let mut predecessor: Option<String> = None;
     if let Some(id) = selected {
         let Some(health) = tx
             .query_opt(
-                "SELECT state, revision FROM posted_file_health WHERE generation_id = $1 FOR UPDATE",
+                "SELECT state, revision, verified_at, retention_checked_at \
+                 FROM posted_file_health WHERE generation_id = $1 FOR UPDATE",
                 &[&id],
             )
             .await
@@ -563,14 +576,48 @@ pub async fn admit(
         if Some(health.get::<_, i64>("revision")) != expected.health_revision {
             return Ok(AdmissionOutcome::StaleOrDiverged);
         }
-        return Ok(match health.get::<_, &str>("state") {
-            // The complete reuse/publication lease is not implemented in this
-            // preparation slice. Do not return an unfenced reusable bundle.
-            "usable" | "terminal_failed" => AdmissionOutcome::InconsistentOrMissing,
-            _ => AdmissionOutcome::ClaimBusy,
-        });
-    }
-    if expected.health_revision.is_some() {
+        match health.get::<_, &str>("state") {
+            "usable" => {
+                // Fenced reuse: both evidence stamps pinned by the
+                // usable CHECK, custody validated, and a managed winner
+                // must already be promoted. No candidate is created.
+                if health.get::<_, Option<i64>>("verified_at").is_none()
+                    || health
+                        .get::<_, Option<i64>>("retention_checked_at")
+                        .is_none()
+                {
+                    return Ok(AdmissionOutcome::InconsistentOrMissing);
+                }
+                let row = tx
+                    .query_opt("SELECT * FROM posted_files WHERE id = $1", &[&id])
+                    .await
+                    .map_err(database_error)?
+                    .ok_or(StoreError::Inconsistent)?;
+                let bundle = StoredGeneration { row };
+                if bundle.custody()?.plaintext_sha256 != expected.hash.as_str() {
+                    return Ok(AdmissionOutcome::InconsistentOrMissing);
+                }
+                if let Some(op_id) = bundle.row.get::<_, Option<String>>("generation_operation") {
+                    let promoted = tx
+                        .query_opt(
+                            "SELECT state FROM posted_file_operations WHERE id = $1",
+                            &[&op_id],
+                        )
+                        .await
+                        .map_err(database_error)?;
+                    if promoted.is_none_or(|r| r.get::<_, &str>("state") != "promoted") {
+                        return Ok(AdmissionOutcome::InconsistentOrMissing);
+                    }
+                }
+                tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+                return Ok(AdmissionOutcome::ReusedUsableWinner(bundle));
+            }
+            "terminal_failed" => {
+                predecessor = Some(id);
+            }
+            _ => return Ok(AdmissionOutcome::ClaimBusy),
+        }
+    } else if expected.health_revision.is_some() {
         return Ok(AdmissionOutcome::InconsistentOrMissing);
     }
     let p = &mint.custody;
@@ -627,8 +674,9 @@ pub async fn admit(
     let inserted = tx
         .execute(
             "INSERT INTO posted_file_operations (id, plaintext_sha256, generation_id, job_id, \
-             attempt, attempt_token, claim_token, lease_until, registry_revision) \
-             SELECT $1,$2,$3,a.job_id,a.attempt,a.token,gen_random_uuid()::text,a.lease_until,$7 \
+             attempt, attempt_token, claim_token, lease_until, registry_revision, \
+             predecessor, predecessor_health_revision) \
+             SELECT $1,$2,$3,a.job_id,a.attempt,a.token,gen_random_uuid()::text,a.lease_until,$7,$8,$9 \
              FROM posted_file_job_attempts a WHERE a.job_id = $4 AND a.attempt = $5 AND a.token = $6 \
              AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint ON CONFLICT DO NOTHING",
             &[
@@ -639,6 +687,8 @@ pub async fn admit(
                 &attempt.attempt,
                 &attempt.token,
                 &revision,
+                &predecessor,
+                &expected.health_revision,
             ],
         )
         .await
@@ -662,13 +712,15 @@ pub async fn admit(
     let updated = tx
         .execute(
             "UPDATE posted_file_registry SET pending_operation = $2, revision = $3 \
-             WHERE plaintext_sha256 = $1 AND revision = $4 AND selected_generation IS NULL \
+             WHERE plaintext_sha256 = $1 AND revision = $4 \
+             AND selected_generation IS NOT DISTINCT FROM $5::text \
              AND pending_operation IS NULL",
             &[
                 &expected.hash,
                 &mint.operation_id,
                 &revision,
                 &expected.revision,
+                &predecessor,
             ],
         )
         .await
@@ -1080,6 +1132,261 @@ pub async fn finish_verification(
     .await
     .map_err(database_error)?;
     commit_mutation(tx, handle).await
+}
+
+/// Confirm retention for a verified candidate: stamps
+/// `retention_checked_at` from the database clock and moves health to
+/// `usable`. Requires a current handle on a verifying round whose
+/// `verified_at` is present and whose retention stamp is still absent;
+/// anything else is incomplete evidence, never a stamp. This is the only
+/// writer of the `usable` state alongside [`promote_candidate`]'s fence;
+/// it selects nothing and changes no custody, references or budgets.
+/// After success the candidate is promotable but no longer mutable
+/// through the pending-candidate path. On CommitUnknown, retry this
+/// original handle: a fresh handle re-observes durable state.
+pub async fn confirm_retention(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<MutationOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    };
+    if current.get::<_, &str>("state") != "verifying"
+        || handle.round == 0
+        || current.get::<_, Option<i64>>("verified_at").is_none()
+        || current
+            .get::<_, Option<i64>>("retention_checked_at")
+            .is_some()
+    {
+        return Ok(MutationOutcome::Incomplete);
+    }
+    tx.execute(
+        "UPDATE posted_file_health SET retention_checked_at = \
+         extract(epoch FROM clock_timestamp())::bigint, state = 'usable', \
+         revision = revision + 1 WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    commit_mutation(tx, handle).await
+}
+
+/// Result of the atomic publication step. `AlreadyPromoted` is a durable
+/// receipt for this original handle only; it grants no posting authority.
+/// `NotReady` means the handle fence is current but the candidate is not
+/// yet `usable` — confirm retention first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    Promoted,
+    AlreadyPromoted,
+    NotReady,
+    StaleOrDiverged,
+}
+
+/// Atomically publish a usable candidate as the registry selection:
+/// operation `pending` → `promoted`, registry selection moves from the
+/// pinned predecessor to this generation, the in-flight reference becomes
+/// serving, and a predecessor serving reference becomes rollback
+/// (legacy pins are kept). Custody, evidence and history are preserved;
+/// the predecessor health revision is re-checked under lock so a drifted
+/// replacement basis refuses. Lock order matches admission: owning
+/// job/attempt, registry, operation/health, predecessor health,
+/// references; both leases are re-checked after lock waits with the DB
+/// clock. No transaction spans network work. On CommitUnknown, retry
+/// this original handle: a matching promoted receipt is idempotent, a
+/// fresh handle must be re-observed. This publishes the generation only;
+/// track-pointer wire-up, rollout and drain remain separate operations.
+pub async fn promote_candidate(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<PromotionOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_attempt(&tx, &handle.attempt).await? {
+        return Ok(PromotionOutcome::StaleOrDiverged);
+    }
+    // Receipt for an earlier promotion: the operation is promoted, the
+    // registry already selects this generation and nothing is pending.
+    let receipt = tx
+        .query_opt(
+            "SELECT o.plaintext_sha256, r.selected_generation, r.pending_operation \
+             FROM posted_file_operations o \
+             JOIN posted_file_registry r ON r.plaintext_sha256 = o.plaintext_sha256 \
+             WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3 \
+             AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6 \
+             AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text \
+             AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint \
+             AND o.state = 'promoted' AND r.selected_generation = o.generation_id \
+             AND r.pending_operation IS NULL FOR UPDATE OF r, o",
+            &[
+                &handle.operation,
+                &handle.generation,
+                &handle.claim_token,
+                &handle.attempt.job_id,
+                &handle.attempt.attempt,
+                &handle.attempt.token,
+                &handle.registry_revision,
+                &handle.predecessor,
+                &handle.predecessor_health_revision,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if receipt.is_some() {
+        tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+        return Ok(PromotionOutcome::AlreadyPromoted);
+    }
+    let Some(registry) = tx
+        .query_opt(
+            "SELECT revision, selected_generation, pending_operation FROM posted_file_registry r \
+             JOIN posted_file_operations o ON o.plaintext_sha256 = r.plaintext_sha256 \
+             WHERE o.id = $1 AND r.pending_operation = o.id AND r.revision = $2 \
+             AND r.selected_generation IS NOT DISTINCT FROM $3::text FOR UPDATE OF r",
+            &[
+                &handle.operation,
+                &handle.registry_revision,
+                &handle.predecessor,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(PromotionOutcome::StaleOrDiverged);
+    };
+    let Some(current) = tx
+        .query_opt(
+            "SELECT o.id, o.plaintext_sha256, o.claim_token, o.lease_until, h.state, \
+             h.verified_at, h.retention_checked_at, h.revision, h.round, h.round_token \
+             FROM posted_file_operations o \
+             JOIN posted_file_health h ON h.generation_id = o.generation_id \
+             WHERE o.id = $1 AND o.generation_id = $2 AND o.claim_token = $3 \
+             AND o.job_id = $4 AND o.attempt = $5 AND o.attempt_token = $6 \
+             AND o.registry_revision = $7 AND o.predecessor IS NOT DISTINCT FROM $8::text \
+             AND o.predecessor_health_revision IS NOT DISTINCT FROM $9::bigint \
+             AND h.revision = $10 AND h.round = $11 AND h.round_token = $12 \
+             AND o.state = 'pending' FOR UPDATE OF o, h",
+            &[
+                &handle.operation,
+                &handle.generation,
+                &handle.claim_token,
+                &handle.attempt.job_id,
+                &handle.attempt.attempt,
+                &handle.attempt.token,
+                &handle.registry_revision,
+                &handle.predecessor,
+                &handle.predecessor_health_revision,
+                &handle.health_revision,
+                &handle.round,
+                &handle.round_token,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(PromotionOutcome::StaleOrDiverged);
+    };
+    if current.get::<_, &str>("state") != "usable"
+        || current.get::<_, Option<i64>>("verified_at").is_none()
+        || current
+            .get::<_, Option<i64>>("retention_checked_at")
+            .is_none()
+    {
+        return Ok(PromotionOutcome::NotReady);
+    }
+    // Pin the predecessor basis under lock: a drifted predecessor health
+    // refuses the publication rather than selecting on stale evidence.
+    if let Some(predecessor) = &handle.predecessor {
+        let prior = tx
+            .query_opt(
+                "SELECT revision FROM posted_file_health WHERE generation_id = $1 FOR UPDATE",
+                &[predecessor],
+            )
+            .await
+            .map_err(database_error)?;
+        if prior
+            .is_none_or(|r| Some(r.get::<_, i64>("revision")) != handle.predecessor_health_revision)
+        {
+            return Ok(PromotionOutcome::StaleOrDiverged);
+        }
+    }
+    // Re-evaluate both leases with the DB clock AFTER all lock waits.
+    let leases = tx
+        .query_opt(
+            "SELECT o.lease_until > extract(epoch FROM clock_timestamp())::bigint AS active \
+             FROM posted_file_operations o JOIN posted_file_job_attempts a ON a.job_id = o.job_id \
+             WHERE o.id = $1 AND a.attempt = $2 AND a.token = $3 \
+             AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint",
+            &[
+                &handle.operation,
+                &handle.attempt.attempt,
+                &handle.attempt.token,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if leases.is_none_or(|r| !r.get::<_, bool>("active")) {
+        return Ok(PromotionOutcome::StaleOrDiverged);
+    }
+    let hash: String = current.get("plaintext_sha256");
+    let registry_revision: i64 = registry.get("revision");
+    let promoted = tx
+        .execute(
+            "UPDATE posted_file_operations SET state = 'promoted' WHERE id = $1 AND state = 'pending'",
+            &[&handle.operation],
+        )
+        .await
+        .map_err(database_error)?;
+    if promoted != 1 {
+        return Err(StoreError::Inconsistent);
+    }
+    let published = tx
+        .execute(
+            "UPDATE posted_file_registry SET selected_generation = $3, pending_operation = NULL, \
+             revision = revision + 1 WHERE plaintext_sha256 = $1 AND revision = $2 \
+             AND pending_operation = $4 AND selected_generation IS NOT DISTINCT FROM $5::text",
+            &[
+                &hash,
+                &registry_revision,
+                &handle.generation,
+                &handle.operation,
+                &handle.predecessor,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if published != 1 {
+        return Err(StoreError::Inconsistent);
+    }
+    let removed = tx
+        .execute(
+            "DELETE FROM posted_file_references WHERE kind = 'in_flight' \
+             AND owner_id = $1 AND generation_id = $2",
+            &[&handle.operation, &handle.generation],
+        )
+        .await
+        .map_err(database_error)?;
+    if removed != 1 {
+        return Err(StoreError::Inconsistent);
+    }
+    tx.execute(
+        "INSERT INTO posted_file_references (kind, owner_id, generation_id, plaintext_sha256) \
+         VALUES ('serving', $1, $2, $3)",
+        &[&handle.operation, &handle.generation, &hash],
+    )
+    .await
+    .map_err(database_error)?;
+    // A predecessor serving reference becomes rollback; legacy pins stay.
+    if let Some(predecessor) = &handle.predecessor {
+        tx.execute(
+            "UPDATE posted_file_references SET kind = 'rollback' \
+             WHERE generation_id = $1 AND kind = 'serving'",
+            &[predecessor],
+        )
+        .await
+        .map_err(database_error)?;
+    }
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(PromotionOutcome::Promoted)
 }
 
 /// A stopped candidate is not a conclusively failed generation. None of these

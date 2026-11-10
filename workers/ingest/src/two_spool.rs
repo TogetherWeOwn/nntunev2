@@ -648,33 +648,38 @@ pub const POSTED_FILE_UPSERT_PARAM_ORDER: [&str; 6] = [
     "post_copy",
 ];
 
-/// First-spool admission: one row per plaintext sha256, first writer
-/// wins (`ON CONFLICT (plaintext_sha256) DO NOTHING` — a replay carries
-/// the same deterministic key, so redeliveries converge). Verification
-/// and exhaustion move the row through [`mark_two_spool_verified_sql`]
-/// / [`mark_repost_exhausted_sql`], never a second insert.
+/// First-spool admission: one legacy row per plaintext sha256, first
+/// writer wins (partial conflict target — managed twins share the hash
+/// under the registry, so a replay carries the same deterministic key
+/// and redeliveries converge). Verification and exhaustion move the
+/// legacy row through [`mark_two_spool_verified_sql`]
+/// / [`mark_repost_exhausted_sql`], never a second legacy insert.
 pub fn upsert_posted_file_sql() -> &'static str {
-    "INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, original_nzb_sha256, post_copy) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (plaintext_sha256) DO NOTHING"
+    "INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, original_nzb_sha256, post_copy) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL DO NOTHING"
 }
 
-/// Dedupe lookup: the verified two-spool post for one sha256, if any.
-/// Only `two_spool_verified` rows are reusable; anything else posts
-/// fresh (see [`decide_dedupe`]).
+/// Dedupe lookup: the verified two-spool legacy post for one sha256, if
+/// any. Only `two_spool_verified` legacy rows are reusable; anything else
+/// posts fresh (see [`decide_dedupe`]). Deterministic when managed twins
+/// share the hash: legacy row first, then oldest, then id.
 pub fn select_verified_by_sha_sql() -> &'static str {
-    "SELECT id, two_spool_verified FROM posted_files WHERE plaintext_sha256 = $1 AND two_spool_verified"
+    "SELECT id, two_spool_verified FROM posted_files WHERE plaintext_sha256 = $1 AND two_spool_verified AND generation_operation IS NULL ORDER BY created_at ASC, id ASC LIMIT 1"
 }
 
-/// Mark one row verified on both spools with its final verified count.
-/// Parameters: `verified_count` ($1), `plaintext_sha256` ($2).
+/// Mark the legacy row verified on both spools with its final verified
+/// count. Scoped to legacy rows so a managed twin on the same hash is
+/// never touched. Parameters: `verified_count` ($1),
+/// `plaintext_sha256` ($2).
 pub fn mark_two_spool_verified_sql() -> &'static str {
-    "UPDATE posted_files SET verify_copy = 'verified', verified_count = $1, two_spool_verified = TRUE WHERE plaintext_sha256 = $2"
+    "UPDATE posted_files SET verify_copy = 'verified', verified_count = $1, two_spool_verified = TRUE WHERE plaintext_sha256 = $2 AND generation_operation IS NULL"
 }
 
-/// Mark one row re-post-exhausted (typed state; the track keeps its
-/// original NZB). Parameters: `verified_count` ($1),
+/// Mark the legacy row re-post-exhausted (typed state; the track keeps
+/// its original NZB). Scoped to legacy rows so a managed twin on the same
+/// hash is never touched. Parameters: `verified_count` ($1),
 /// `plaintext_sha256` ($2).
 pub fn mark_repost_exhausted_sql() -> &'static str {
-    "UPDATE posted_files SET verify_copy = 'missing', verified_count = $1, repost_exhausted = TRUE WHERE plaintext_sha256 = $2"
+    "UPDATE posted_files SET verify_copy = 'missing', verified_count = $1, repost_exhausted = TRUE WHERE plaintext_sha256 = $2 AND generation_operation IS NULL"
 }
 
 /// Check upsert values before they touch the database. Bounds mirror

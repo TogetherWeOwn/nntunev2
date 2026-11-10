@@ -1,9 +1,10 @@
-//! Registry authority at admission; not enabled multi-generation replacement.
+//! Registry authority at admission with the narrow multi-generation
+//! completion (0054): fenced reuse and terminal-failure replacement.
 //!
 //! The session-local read projection supplies a second physical identity for
-//! each hash without dropping the public unique constraint or touching custody.
-//! It detects the obsolete scalar lookup even on a conflicting registry insert.
-//! This is a cardinality regression, not migration/drain/upgrade acceptance.
+//! each hash without touching custody. It detects the obsolete scalar lookup
+//! even on a conflicting registry insert. This is a cardinality regression,
+//! not track-wire-up/drain/upgrade acceptance.
 
 use super::posted_generation_legacy_fence::insert_legacy;
 use super::*;
@@ -118,37 +119,100 @@ fn postgres_admission_missing_legacy_registration_refuses_without_adopting_custo
 }
 
 #[test]
-fn postgres_admission_selected_health_never_implicitly_reuses_or_replaces() {
+fn postgres_admission_selected_health_reuses_usable_and_replaces_terminal_failed() {
     run_test(async {
         let mut db = connect().await;
         let (c, old) = legacy_case(&db).await;
         register(&db, &old).await;
         let attempt = acquire(&mut db, &c.job, &c.owner, 0).await;
         // Seeded policy states are not authenticated content or failure proof.
-        for state in ["unknown", "verifying", "usable", "terminal_failed"] {
+        for state in ["unknown", "verifying"] {
             db.execute(
-                "UPDATE posted_file_health SET state = $2, \
-                 failure_kind = CASE WHEN $2 = 'terminal_failed' THEN 'retention' ELSE NULL END, \
-                 verified_at = CASE WHEN $2 = 'usable' THEN 1700000000 ELSE NULL END, \
-                 retention_checked_at = CASE WHEN $2 = 'usable' THEN 1700000000 ELSE NULL END \
+                "UPDATE posted_file_health SET state = $2, failure_kind = NULL, \
+                 verified_at = NULL, retention_checked_at = NULL \
                  WHERE generation_id = $1",
                 &[&old.generation, &state],
             )
             .await
             .quiet("seed predecessor policy state");
             let before = snapshot(&db, &old).await;
-            let result = try_admit(&mut db, &attempt, &c.sealed).await;
-            if matches!(state, "usable" | "terminal_failed") {
-                assert!(matches!(
-                    result,
-                    Ok(AdmissionOutcome::InconsistentOrMissing)
-                ));
-            } else {
-                assert!(matches!(result, Ok(AdmissionOutcome::ClaimBusy)));
-            }
+            assert!(matches!(
+                try_admit(&mut db, &attempt, &c.sealed).await,
+                Ok(AdmissionOutcome::ClaimBusy)
+            ));
             assert_eq!(snapshot(&db, &old).await, before);
             assert_eq!(operation_rows(&db, &c.sealed).await, 0);
         }
+        // Usable winners reuse read-only: the stored bundle is returned and
+        // no candidate, selection change or custody write is created.
+        db.execute(
+            "UPDATE posted_file_health SET state = 'usable', failure_kind = NULL, \
+             verified_at = 1700000000, retention_checked_at = 1700000000 \
+             WHERE generation_id = $1",
+            &[&old.generation],
+        )
+        .await
+        .quiet("seed predecessor usable state");
+        let before = snapshot(&db, &old).await;
+        match try_admit(&mut db, &attempt, &c.sealed).await {
+            Ok(AdmissionOutcome::ReusedUsableWinner(bundle)) => {
+                assert_eq!(bundle.generation_id(), old.generation);
+                assert!(bundle.custody().expect("reused custody") == old.custody());
+            }
+            _ => panic!("usable selected winner was not reused"),
+        }
+        assert_eq!(snapshot(&db, &old).await, before);
+        assert_eq!(operation_rows(&db, &c.sealed).await, 0);
+        // Terminally failed winners admit exactly one replacement that
+        // pins the failed generation as predecessor; selection stays put.
+        db.execute(
+            "UPDATE posted_file_health SET state = 'terminal_failed', \
+             failure_kind = 'retention', verified_at = NULL, retention_checked_at = NULL \
+             WHERE generation_id = $1",
+            &[&old.generation],
+        )
+        .await
+        .quiet("seed predecessor terminal failure");
+        let health_revision: i64 = db
+            .query_one(
+                "SELECT revision FROM posted_file_health WHERE generation_id = $1",
+                &[&old.generation],
+            )
+            .await
+            .quiet("read predecessor health revision")
+            .get(0);
+        match try_admit(&mut db, &attempt, &c.sealed).await {
+            Ok(AdmissionOutcome::Admitted(handle, bundle)) => {
+                assert_eq!(handle.generation_id(), c.sealed.generation);
+                assert_eq!(bundle.plan_sha256(), c.sealed.plan);
+            }
+            _ => panic!("terminal failed predecessor was not replaced"),
+        }
+        assert_eq!(operation_rows(&db, &c.sealed).await, 1);
+        let op = db
+            .query_one(
+                "SELECT predecessor, predecessor_health_revision, state \
+                 FROM posted_file_operations WHERE id = $1",
+                &[&c.sealed.op],
+            )
+            .await
+            .quiet("read replacement predecessor pin");
+        assert_eq!(
+            op.get::<_, Option<String>>(0).as_deref(),
+            Some(old.generation.as_str())
+        );
+        assert_eq!(op.get::<_, Option<i64>>(1), Some(health_revision));
+        assert_eq!(op.get::<_, &str>(2), "pending");
+        // Selection still holds the failed predecessor while pending.
+        let selected: Option<String> = db
+            .query_one(
+                "SELECT selected_generation FROM posted_file_registry WHERE plaintext_sha256 = $1",
+                &[&old.hash],
+            )
+            .await
+            .quiet("read registry selection")
+            .get(0);
+        assert_eq!(selected.as_deref(), Some(old.generation.as_str()));
     });
 }
 

@@ -59,9 +59,12 @@
 //! AAD `field` element: cross-envelope and cross-row substitution fail
 //! closed at decrypt time.
 //!
-//! The conflict target is `ON CONFLICT (plaintext_sha256) DO NOTHING`
-//! (first writer wins): rows are content-global, and a divergent later
-//! write is a pipeline bug that must not flap a shared row. Every post
+//! The conflict target is the partial legacy index
+//! (`ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL`,
+//! first legacy writer wins): legacy rows stay content-global, and a
+//! divergent later legacy write is a pipeline bug that must not flap a
+//! shared row. Managed twins share the hash under the registry instead.
+//! Every post
 //! mints a fresh file key, header nonce, DEKs and GCM nonces, so envelope
 //! bytes are NOT stable across posts — existence (and reuse of the stored
 //! key/manifest) is decided *before* posting, never re-sealed on replay;
@@ -439,7 +442,9 @@ pub const POSTED_FILE_INSERT_PARAM_ORDER: [&str; 28] = [
     "media_header",
 ];
 
-/// Full-row insert converging on the sha. Copy states bind as their
+/// Full-row insert converging on the sha. The partial conflict target
+/// keeps legacy first-wins (`generation_operation IS NULL`); managed twins
+/// share the hash under the registry instead. Copy states bind as their
 /// [`spool_copy_state_db_str`] strings; envelope `*_envelope_version`
 /// columns bind the literal `2`.
 pub fn insert_posted_file_sql() -> &'static str {
@@ -453,12 +458,15 @@ pub fn insert_posted_file_sql() -> &'static str {
      manifest_payload_nonce, manifest_payload_format, media_format, media_key_mode, media_header) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 2, $15, \
      $16, $17, $18, $19, $20, 2, $21, $22, $23, $24, $25, $26, $27, $28) \
-     ON CONFLICT (plaintext_sha256) DO NOTHING"
+     ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL DO NOTHING"
 }
 
-/// Re-selects the DB-owned id for a sha (dedupe classification).
+/// Re-selects the DB-owned id for a sha (dedupe classification). Managed
+/// twins may share the hash, so the lookup is deterministic: legacy rows
+/// first, then oldest, then id — never an arbitrary retained winner.
 pub fn select_posted_file_id_by_sha_sql() -> &'static str {
-    "SELECT id FROM posted_files WHERE plaintext_sha256 = $1"
+    "SELECT id FROM posted_files WHERE plaintext_sha256 = $1 \
+     ORDER BY (generation_operation IS NULL) DESC, created_at ASC, id ASC LIMIT 1"
 }
 
 /// Full-row read for the verify/retention consumers, in documented order.
@@ -793,7 +801,9 @@ mod tests {
     #[test]
     fn insert_sql_shape() {
         let sql = insert_posted_file_sql();
-        assert!(sql.contains("ON CONFLICT (plaintext_sha256) DO NOTHING"));
+        assert!(sql.contains(
+            "ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL DO NOTHING"
+        ));
         // Envelope versions bind as the literal 2 on both sides.
         assert!(sql.contains("$14, 2, $15"));
         assert!(sql.contains("$20, 2, $21"));
