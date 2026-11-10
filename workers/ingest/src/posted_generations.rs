@@ -635,8 +635,27 @@ pub async fn admit(
                 return Ok(AdmissionOutcome::ClaimBusy);
             }
         }
-    } else if expected.health_revision.is_some() {
-        return Ok(AdmissionOutcome::InconsistentOrMissing);
+    } else {
+        if expected.health_revision.is_some() {
+            return Ok(AdmissionOutcome::InconsistentOrMissing);
+        }
+        // No selected winner: an abandoned operation on this hash is
+        // durably authority-less and never replacement eligible
+        // (observe() joins health on the selected generation, so it
+        // cannot see the abandoned candidate). Refuse instead of
+        // minting a fresh candidate over abandoned custody.
+        let abandoned = tx
+            .query_opt(
+                "SELECT 1 FROM posted_file_operations \
+                 WHERE plaintext_sha256 = $1 AND state = 'abandoned'",
+                &[&expected.hash],
+            )
+            .await
+            .map_err(database_error)?
+            .is_some();
+        if abandoned {
+            return Ok(AdmissionOutcome::InconsistentOrMissing);
+        }
     }
     let p = &mint.custody;
     let inserted = tx

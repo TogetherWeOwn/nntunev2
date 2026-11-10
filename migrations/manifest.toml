@@ -377,4 +377,4 @@ sha256 = "ef1d9c032d7351038ced0c0f023f6056ac03c04cffda89c9c7b4eaf878254d28"
 [[migration]]
 file = "0054_posted_file_multi_generation.sql"
 target = "app"
-sha256 = "5f329f70036b586019293de6dbc7a811ec26df2766203040753205900d259dcf"
+sha256 = "b4738318e117bdc379c35a943cd6af22ba3d62c51269b16fd28c5f88b98fb005"
