@@ -685,6 +685,9 @@ impl MirrorBinding {
     }
 }
 
+#[path = "subsonic_pg.rs"]
+mod subsonic_pg;
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,

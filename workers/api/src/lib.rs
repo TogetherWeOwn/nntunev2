@@ -9,8 +9,8 @@
 //! audio/artwork via the stream worker) plugs in behind the `Library`
 //! seam. Until then the Worker uses `MemStore::empty()`, which holds no
 //! credentials and rejects every auth attempt. Per-client `apiKey`
-//! credentials will resolve against `subsonic_clients`
-//! (`migrations/0023_subsonic_clients.sql`).
+//! credentials resolve through the unmounted async core and the additive
+//! `subsonic_credentials` schema; legacy `subsonic_clients` is never promoted.
 
 pub mod account_deletion;
 pub mod admin;
@@ -41,6 +41,7 @@ pub mod session;
 pub mod session_retry_store;
 pub mod stripe;
 pub mod subsonic_auth;
+pub mod subsonic_config;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;
