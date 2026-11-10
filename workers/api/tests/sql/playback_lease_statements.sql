@@ -203,9 +203,9 @@ WITH got AS (
 SELECT count(*) AS n INTO TEMP TABLE pls_acquire_deleting FROM got;
 
 WITH touched AS (
-    UPDATE playback_leases SET expires_at = LEAST(playback_leases.continuation_until, GREATEST(playback_leases.expires_at, 2400)), updated_at = GREATEST(playback_leases.updated_at, 2260)
+    UPDATE playback_leases SET expires_at = LEAST(playback_leases.continuation_until, GREATEST(playback_leases.expires_at, 2400)), updated_at = GREATEST(playback_leases.updated_at, 2160)
     FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4 AND playback_leases.expires_at > 2260 AND playback_leases.continuation_until > 2260
+    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4 AND playback_leases.expires_at > 2160 AND playback_leases.continuation_until > 2160
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_deleting FROM touched;
@@ -238,6 +238,9 @@ BEGIN
     END IF;
     IF (SELECT n FROM pls_touch_deleting) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'touch must refuse a deleting account (zero rows)';
+    END IF;
+    IF (SELECT expires_at FROM playback_leases WHERE user_id = 'pls-user') IS DISTINCT FROM 2200 THEN
+        RAISE EXCEPTION 'deleting-account touch must leave the live lease unchanged';
     END IF;
     IF (SELECT epoch FROM pls_got5) IS DISTINCT FROM 4 THEN
         RAISE EXCEPTION 'post-expiry acquire must bump the epoch';
