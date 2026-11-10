@@ -299,11 +299,13 @@
 	@media (max-width: 799px) {
 		/* The section is the sticky element: a sticky child inside a
 		 * 56px-tall section cannot stick beyond it. */
-		section:not(.expanded) { position: sticky; bottom: var(--nt-control); z-index: var(--nt-z-player); display: block; height: var(--nt-control-lg); padding: 0; border-top: 1px solid var(--nt-border); background: var(--nt-bg-raised); }
+		section:not(.expanded) { position: sticky; bottom: var(--nt-control); z-index: var(--nt-z-player); display: block; height: var(--nt-control-lg); padding: 0; border-top: 0; }
 		section:not(.expanded) .full-controls { display: none; }
 		.mini-wrap {
 			display: block;
-			height: 100%;
+			height: var(--nt-control-lg);
+			background: var(--nt-bg-raised);
+			border-top: 1px solid var(--nt-border);
 		}
 		.mini-progress { position: absolute; inset: 0 0 auto; display: block; height: var(--nt-space-px-2); background: var(--nt-border); pointer-events: none; }
 		.mini-progress span { display: block; height: 100%; background: var(--nt-accent); }

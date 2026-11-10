@@ -294,7 +294,7 @@ for (const playing of [false, true]) {
 				// mounted and enabled, and the mini row remains the visible surface.
 				await expect(page.getByTestId('player-next')).toBeHidden();
 				await expect(page.getByTestId('player-next')).toBeEnabled();
-				await expect(page.getByRole('button', { name: 'Previous track', exact: true })).toBeEnabled();
+				await expect(page.locator('button[aria-label="Previous track"]')).toBeEnabled();
 				return page.locator('[data-player-transport] button:not([data-testid="player-favorite"])').evaluateAll((nodes) => nodes.map((node) => ({
 					label: node.getAttribute('aria-label'), text: node.textContent,
 					disabled: (node as HTMLButtonElement).disabled, pressed: node.getAttribute('aria-pressed')
