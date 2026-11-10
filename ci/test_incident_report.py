@@ -1298,6 +1298,34 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(json.dumps((backend.issues, backend.comments), sort_keys=True), before)
         self.assertTrue(backend.graphql_calls)  # Read-only GraphQL queries still run.
 
+    def test_dispatch_cli_projects_same_gate_delivery_before_newer_success(self):
+        for kind in ("failure", "recovery"):
+            for receipt in (False, True):
+                with self.subTest(kind=kind, receipt=receipt):
+                    pending = {"run_id": 9, "attempt": 1, "kind": kind,
+                               "cursor": None, "delivered": False}
+                    rows = [issue(7, state="open", body=MARKER +
+                                  "\n<!-- incident-delivery: " + json.dumps(pending) + " -->")]
+                    comments = {7: [{"body": occurrence(9, kind=kind)}] if receipt else []}
+                    backend = StatefulAPI(runs=[make_run()], jobs={(10, 1): [smoke("success")]},
+                                          issues=rows, comments=comments)
+                    before = json.dumps((rows, backend.issues, backend.comments), sort_keys=True)
+                    expected = [f"delivered #7: {KEY}"]
+                    if kind == "failure":
+                        expected.append(f"recovered #7: {SMOKE}")
+                    output = self.dry_run(backend)
+                    self.assertEqual(output.splitlines(), ["DRY RUN: " + a for a in expected])
+                    self.assertEqual(self.dry_run(backend), output)
+                    # Also exercise API implementations returning caller-owned issue dictionaries.
+                    self.assertEqual(ir.report(backend, 10, dry_run=True), expected)
+                    self.assertEqual(backend.writes, [])
+                    self.assertEqual(json.dumps((rows, backend.issues, backend.comments),
+                                                sort_keys=True), before)
+                    writer = StatefulAPI(runs=[make_run()], jobs={(10, 1): [smoke("success")]},
+                                         issues=rows, comments=comments)
+                    self.assertEqual(ir.report(writer, 10), expected)
+                    self.assertEqual(writer.issues[0]["state"], "closed")
+
     def test_dispatch_cli_retains_hold_supersession_and_refusals(self):
         run = make_run()
         backend = StatefulAPI(runs=[run], jobs={(10, 1): [smoke("success")]},
