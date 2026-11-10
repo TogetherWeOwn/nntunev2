@@ -67,16 +67,14 @@ async fn mirror() -> Client {
 #[tokio::test]
 async fn local_uuid_resolves_app_and_mirror_rungs() {
     let app = app().await;
-    app.execute(
-        "INSERT INTO tracks VALUES ($1, $2, 60000)",
-        &[&LOCAL_TRACK, &SHORT_RECORDING],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO tracks VALUES ('{LOCAL_TRACK}', '{SHORT_RECORDING}', 60000)"
+    ))
     .await
     .unwrap();
-    app.execute(
-        "INSERT INTO track_media VALUES ('u1', $1, repeat('a',64), 128, 1700000200)",
-        &[&LOCAL_TRACK],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO track_media VALUES ('u1', '{LOCAL_TRACK}', repeat('a',64), 128, 1700000200)"
+    ))
     .await
     .unwrap();
     app.execute(
@@ -87,10 +85,9 @@ async fn local_uuid_resolves_app_and_mirror_rungs() {
     .unwrap();
     let mirror = mirror().await;
     mirror
-        .execute(
-            "INSERT INTO mb_recording VALUES ($1, 'Short', 61000)",
-            &[&SHORT_RECORDING],
-        )
+        .batch_execute(&format!(
+            "INSERT INTO mb_recording VALUES ('{SHORT_RECORDING}', 'Short', 61000)"
+        ))
         .await
         .unwrap();
     let attempts = Rc::new(Cell::new(0));
@@ -106,18 +103,16 @@ async fn local_uuid_resolves_app_and_mirror_rungs() {
 #[tokio::test]
 async fn recording_mbid_resolves_artifact_and_short_mirror() {
     let app = app().await;
-    app.execute(
-        "INSERT INTO tracks VALUES ($1, $2, 60000)",
-        &[&LOCAL_TRACK, &SHORT_RECORDING],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO tracks VALUES ('{LOCAL_TRACK}', '{SHORT_RECORDING}', 60000)"
+    ))
     .await
     .unwrap();
     let mirror = mirror().await;
     mirror
-        .execute(
-            "INSERT INTO mb_recording VALUES ($1, 'Short', 61000)",
-            &[&SHORT_RECORDING],
-        )
+        .batch_execute(&format!(
+            "INSERT INTO mb_recording VALUES ('{SHORT_RECORDING}', 'Short', 61000)"
+        ))
         .await
         .unwrap();
     let attempts = Rc::new(Cell::new(0));
@@ -145,10 +140,9 @@ async fn recording_mbid_without_artifact_uses_mirror_only() {
     let app = app().await;
     let mirror = mirror().await;
     mirror
-        .execute(
-            "INSERT INTO mb_recording VALUES ($1, 'Orphan', 61000)",
-            &[&ORPHAN_RECORDING],
-        )
+        .batch_execute(&format!(
+            "INSERT INTO mb_recording VALUES ('{ORPHAN_RECORDING}', 'Orphan', 61000)"
+        ))
         .await
         .unwrap();
     let attempts = Rc::new(Cell::new(0));
@@ -174,18 +168,16 @@ async fn recording_mbid_without_artifact_uses_mirror_only() {
 #[tokio::test]
 async fn long_recording_never_falls_back_to_900() {
     let app = app().await;
-    app.execute(
-        "INSERT INTO tracks VALUES ($1, $2, NULL)",
-        &[&LONG_TRACK, &LONG_RECORDING],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO tracks VALUES ('{LONG_TRACK}', '{LONG_RECORDING}', NULL)"
+    ))
     .await
     .unwrap();
     let mirror = mirror().await;
     mirror
-        .execute(
-            "INSERT INTO mb_recording VALUES ($1, 'Long', 1500000)",
-            &[&LONG_RECORDING],
-        )
+        .batch_execute(&format!(
+            "INSERT INTO mb_recording VALUES ('{LONG_RECORDING}', 'Long', 1500000)"
+        ))
         .await
         .unwrap();
     let attempts = Rc::new(Cell::new(0));
@@ -230,10 +222,9 @@ async fn unknown_id_falls_back_without_error() {
 #[tokio::test]
 async fn unconfigured_mirror_degrades_without_attempt() {
     let app = app().await;
-    app.execute(
-        "INSERT INTO tracks VALUES ($1, $2, 60000)",
-        &[&LOCAL_TRACK, &SHORT_RECORDING],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO tracks VALUES ('{LOCAL_TRACK}', '{SHORT_RECORDING}', 60000)"
+    ))
     .await
     .unwrap();
     let attempts = Rc::new(Cell::new(0));
@@ -247,10 +238,9 @@ async fn unconfigured_mirror_degrades_without_attempt() {
 #[tokio::test]
 async fn configured_mirror_failure_never_degrades() {
     let app = app().await;
-    app.execute(
-        "INSERT INTO tracks VALUES ($1, $2, 60000)",
-        &[&LOCAL_TRACK, &SHORT_RECORDING],
-    )
+    app.batch_execute(&format!(
+        "INSERT INTO tracks VALUES ('{LOCAL_TRACK}', '{SHORT_RECORDING}', 60000)"
+    ))
     .await
     .unwrap();
     let attempts = Rc::new(Cell::new(0));

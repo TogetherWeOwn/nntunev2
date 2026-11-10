@@ -13310,9 +13310,10 @@ mod tests {
     #[test]
     fn play_continuation_uses_recording_duration_rung() {
         // The recording-duration rung (the mirror probe) drives the
-        // deadline exactly like the artifact duration: a known short
-        // recording gets duration + slack, never the 900 s fallback,
-        // and a >900 s recording is not cut off before it finishes.
+        // immutable continuation deadline exactly like the artifact
+        // duration: a known short recording gets duration + slack,
+        // never the 900 s fallback, and a >900 s recording keeps its
+        // full deadline even though the grant token stays capped.
         for (mb_duration_ms, expected_window) in [(60_000_u64, 60_u64), (1_500_000, 1500)] {
             let h = play_harness();
             let cookie = play_user(&h);
@@ -13331,9 +13332,19 @@ mod tests {
             );
             assert_eq!(started.status, 200, "{}", started.body);
             let started: serde_json::Value = serde_json::from_str(&started.body).unwrap();
+            let lease = h.store.playback_leases.borrow()["user-plays-1"].clone();
+            assert_eq!(
+                lease.continuation_until,
+                NOW + expected_window + crate::playback::LEASE_TTL_SECS
+            );
+            // The grant token caps at MAX_GRANT_TTL; the short
+            // recording's 105 s deadline fits under it, the long
+            // recording's grant truncates to 900 s while its stored
+            // deadline above stays at the full 1545 s.
             assert_eq!(
                 started["expires_at"],
-                NOW + expected_window + crate::playback::LEASE_TTL_SECS
+                NOW + crate::play_grant::MAX_GRANT_TTL
+                    .min(expected_window + crate::playback::LEASE_TTL_SECS)
             );
         }
     }
