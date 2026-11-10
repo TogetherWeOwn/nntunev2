@@ -75,6 +75,27 @@ impl fmt::Debug for ClassificationCheckpoint {
 }
 
 impl ClassificationCheckpoint {
+    /// Private storage seam. Never accept this JSON from a client.
+    pub fn parse(raw: &str) -> Result<Self, ClassError> {
+        serde_json::from_str::<ClassificationCheckpoint>(raw).map_err(|_| ClassError::Evidence)
+    }
+
+    pub fn is_for(&self, job_id: &str, user_id: &str) -> bool {
+        self.job_id == job_id && self.user_id == user_id
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn original_content_sha256(&self) -> &str {
+        &self.original_content_sha256
+    }
+
     pub fn entries(&self) -> &[ClassifiedEntry] {
         &self.entries
     }

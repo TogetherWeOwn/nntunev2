@@ -180,7 +180,11 @@ entries — mixing refuses the whole checkpoint. Verified duplicates collapse on
 equal recording MBID (case-insensitive) and medium/track, with losers referencing
 the surviving lower ordinal directly. Legacy unfrozen manifests refuse; no
 winner is upgraded in place. This is preparation only: no caller stores the
-checkpoint, mints mirror evidence or enables publication.
+checkpoint, mints mirror evidence or enables publication. Migration 0040 adds
+a bounded immutable classification field to retained originals, and
+`audio_classifications_store` provides the same single owner/deletion-fenced
+first-acceptance update as the manifest store (first winner wins on
+concurrent deliveries) plus a digest-bound read. Both remain unmounted.
 Full Unicode normalization, image validation/staging, resolved artist/release
 coalescing and durable position/classification freezing remain integration
 gates.
