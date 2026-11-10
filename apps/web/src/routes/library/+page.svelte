@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import EntityLinks from '#lib/library/EntityLinks.svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
@@ -1908,7 +1909,7 @@
 
 	function libraryRowClick(event: MouseEvent, id: string): void {
 		if (!event.ctrlKey && !event.metaKey && !event.shiftKey) return;
-		if (event.target instanceof Element && event.target.closest('input, .nt-library-copy, .nt-library-star, .nt-library-more')) return;
+		if (event.target instanceof Element && event.target.closest('input, a, .nt-library-copy, .nt-library-star, .nt-library-more')) return;
 		event.preventDefault();
 		event.stopPropagation();
 		selectInteractionRow(id, event.shiftKey);
@@ -2692,6 +2693,7 @@
 						<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
 					{/if}
 				</button>
+				<EntityLinks item={track} />
 				<button type="button" class="nt-library-more"
 					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
 					aria-haspopup="menu"

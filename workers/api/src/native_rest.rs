@@ -474,6 +474,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // scope.
             if path == "/v1/library"
                 || path == "/v1/artists"
+                || one_segment_after("/v1/artists/", path)
                 || path == "/v1/releases"
                 || one_segment_after("/v1/releases/", path)
                 || path == "/v1/tracks"

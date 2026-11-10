@@ -660,6 +660,9 @@ fn route_map_is_exhaustive_and_default_deny() {
         // Catalog reads → library:read (roots and subpaths, GET and HEAD).
         ("GET", "/v1/library", Bearer(Scope::LibraryRead)),
         ("GET", "/v1/artists", Bearer(Scope::LibraryRead)),
+        ("GET", "/v1/artists/art_123", Bearer(Scope::LibraryRead)),
+        ("GET", "/v1/artists/art_123/releases", Deny),
+        ("GET", "/v1/artists/", Deny),
         ("GET", "/v1/releases", Bearer(Scope::LibraryRead)),
         ("GET", "/v1/releases/rel_123", Bearer(Scope::LibraryRead)),
         ("GET", "/v1/tracks", Bearer(Scope::LibraryRead)),

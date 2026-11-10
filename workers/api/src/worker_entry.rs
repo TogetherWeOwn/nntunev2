@@ -1171,6 +1171,7 @@ fn catalogue_release_from_row(
         year: row.try_get("year").map_err(|_| StoreError)?,
         artist_mbid: row.try_get("artist_mbid").map_err(|_| StoreError)?,
         artist_name: row.try_get("artist_name").map_err(|_| StoreError)?,
+        release_group_mbid: row.try_get("release_group_mbid").map_err(|_| StoreError)?,
     })
 }
 
@@ -3717,6 +3718,88 @@ impl Store for PgStore {
         .await
     }
 
+    /// Artist detail, member-scoped. The app-side member release set comes
+    /// first (whole ledger, own OR shared, like the collection reads); an
+    /// empty set answers `None` before any mirror connection. The mirror
+    /// then reads this artist's member releases (the join is the membership
+    /// probe: zero rows means non-member or unknown, both `None`) and only
+    /// then the artist row itself, so artist identity is read directly and
+    /// never through the first-page artist list.
+    async fn catalogue_artist(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<Option<crate::catalogue::ArtistDetailDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                    return Ok(None);
+                };
+                let client = self.connect().await?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_artist")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(None);
+                }
+                self.require_mirror()?;
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::try_from(crate::catalogue::CATALOGUE_ARTIST_RELEASES_MAX + 1)
+                    .map_err(|_| StoreError)?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_artist");
+                let releases = mirror
+                    .query_typed(
+                        crate::catalogue::artist_member_releases_statement(),
+                        &[
+                            (&key, Type::TEXT),
+                            (&member_releases, Type::TEXT_ARRAY),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                if releases.is_empty() {
+                    return Ok(None);
+                }
+                let releases: Vec<crate::catalogue::ReleaseDbRow> = releases
+                    .iter()
+                    .map(catalogue_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let artist = mirror
+                    .query_typed(
+                        crate::catalogue::artist_read_statement(),
+                        &[(&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                if artist.len() > 1 {
+                    return Err(StoreError);
+                }
+                let Some(artist) = artist.first() else {
+                    return Ok(None);
+                };
+                Ok(Some(crate::catalogue::ArtistDetailDbRow {
+                    artist: catalogue_artist_from_row(artist)?,
+                    releases,
+                }))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     /// Member-scoped release collection: same membership input as
     /// [`Self::catalogue_artists`], then the first page of the member
     /// releases themselves.
@@ -5678,6 +5761,12 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/artists/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        // Same single-segment rule as release detail.
+        "/v1/artists/{mbid}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -6247,9 +6336,15 @@ mod tests {
             "/v1/releases/".to_string(),
             format!("/v1/releases/{mbid}/art"),
             format!("/v1/releases/{mbid}/tracks/extra"),
+            "/v1/artists/".to_string(),
+            format!("/v1/artists/{mbid}/releases"),
         ] {
             assert_eq!(served_display_path(&path), "unknown", "{path}");
         }
+        assert_eq!(
+            served_display_path(&format!("/v1/artists/{mbid}")),
+            "/v1/artists/{mbid}"
+        );
     }
 
     #[test]

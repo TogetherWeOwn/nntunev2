@@ -7,6 +7,7 @@
 		libraryItemKey,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { entityLinks } from '#lib/library/entity-links.js';
 	import { filterLibraryItems } from '#lib/library/filter.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
@@ -100,7 +101,16 @@
 		</p>
 		<ul>
 			{#each results as item (libraryItemKey(item))}
-				<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
+				{@const links = entityLinks(item)}
+				<li>
+					{displayTitle(item)}
+					{#if displayArtist(item)}
+						{' — '}{#if links.artistHref}<a href={links.artistHref}>{displayArtist(item)}</a>{:else}{displayArtist(item)}{/if}
+					{/if}
+					{#if links.albumHref}
+						{' · '}<a href={links.albumHref} aria-label={`Album for ${displayTitle(item)}`}>Album</a>
+					{/if}
+				</li>
 			{/each}
 		</ul>
 	{/if}

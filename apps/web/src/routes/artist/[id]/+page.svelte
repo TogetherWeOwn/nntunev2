@@ -1,0 +1,95 @@
+<script lang="ts">
+	import { untrack } from 'svelte';
+	import { invalidate } from '$app/navigation';
+	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { createCollectionPreference } from '#lib/catalogue/preference.svelte.js';
+	import ReleaseGrid from '#lib/catalogue/ReleaseGrid.svelte';
+	import { catalogueAuthGeneration } from '#lib/catalogue/auth.svelte.js';
+	import { filterReleases, releaseFilters, type ReleaseFilter } from '#lib/catalogue/catalogue.js';
+	import '#lib/catalogue/catalogue.css';
+	import type { PageData } from './$types';
+
+	let { data }: { data: PageData } = $props();
+	let filter = $state<ReleaseFilter>('all');
+	let retrying = $state(false);
+	const preference = createCollectionPreference('artists', { baseUrl: PUBLIC_API_BASE_URL });
+	$effect(() => {
+		const mbid = detail?.artist.mbid;
+		const generation = data.authGeneration;
+		if (mbid) untrack(() => preference.load(mbid, generation));
+		else preference.clear();
+		return () => preference.clear();
+	});
+	const authChanged = $derived(data.authGeneration !== catalogueAuthGeneration());
+	const detail = $derived(authChanged ? null : data.value);
+	const releases = $derived(filterReleases(detail?.releases ?? [], filter));
+	$effect(() => { void data.value?.artist.mbid; filter = 'all'; });
+
+	async function retry() {
+		retrying = true;
+		try { await invalidate('catalogue:artist'); } finally { retrying = false; }
+	}
+</script>
+
+<svelte:head><title>{detail?.artist.name || 'Artist'} · NNTune</title></svelte:head>
+
+<article class="catalogue-page" aria-label="Artist">
+	{#if detail}
+		<header class="catalogue-hero">
+			<div>
+				<p>Artist{detail.artist.type ? ` · ${detail.artist.type}` : ''}</p>
+				<h1>{detail.artist.name || 'Unnamed artist'}</h1>
+				{#if detail.artist.country}<p>{detail.artist.country}</p>{/if}
+				<button class="nt-button nt-button--ghost" aria-pressed={preference.value ?? undefined} aria-busy={preference.pending}
+					disabled={preference.pending || preference.value === null || preference.failure !== null} onclick={() => preference.toggle()}>
+					{preference.value ? 'Following' : 'Follow'}
+				</button>
+				{#if preference.pending}
+					<p role="status">{preference.value === null ? 'Checking follow status…' : 'Updating follow status…'}</p>
+				{:else if preference.failure === 'signed-out'}
+					<p role="status">Sign in to follow artists.</p><a href="/login">Sign in</a>
+				{:else if preference.failure === 'account-deleting'}
+					<p role="status">Followed artists cannot change while account deletion is scheduled.</p>
+				{:else if preference.failure}
+					<p role="status">{preference.failure === 'not-found' ? 'Follow status is unavailable for this artist.' : "We couldn't confirm follow status. Check it again before making another change."}</p>
+					<button class="nt-button nt-button--ghost" onclick={() => preference.retry()}>Retry follow status</button>
+				{/if}
+			</div>
+		</header>
+		<section aria-labelledby="artist-popular">
+			<h2 id="artist-popular">Popular</h2>
+			<p>ListenBrainz popularity is not available here yet. Releases below are not ranked by popularity.</p>
+		</section>
+		<section aria-labelledby="artist-discography">
+			<h2 id="artist-discography">Discography</h2>
+			<p class="catalogue-note">Available releases in your library and the shared catalogue, grouped by release group where known.</p>
+			<div class="catalogue-filters" role="group" aria-label="Release type">
+				{#each releaseFilters as item (item.value)}
+					<button class="nt-button nt-button--ghost" aria-pressed={filter === item.value} onclick={() => filter = item.value}>{item.label}</button>
+				{/each}
+			</div>
+			{#if detail.truncated}<p role="status">Showing the first 50 available releases. This discography may be incomplete.</p>{/if}
+			{#if releases.length}<ReleaseGrid {releases} />
+			{:else}<p role="status">No {filter === 'all' ? 'releases' : releaseFilters.find((item) => item.value === filter)?.label.toLowerCase()} available in this selection.</p>{/if}
+		</section>
+		<section aria-labelledby="artist-appears-on">
+			<h2 id="artist-appears-on">Appears on</h2>
+			<p>Guest appearances are not available in this mirror response.</p>
+		</section>
+		<section aria-labelledby="artist-about">
+			<h2 id="artist-about">About this data</h2>
+			<p>MusicBrainz core metadata (CC0). Artist ID: <span class="catalogue-id">{detail.artist.mbid}</span></p>
+			<p class="catalogue-note">No artist photos, listener estimates or biographies are added.</p>
+		</section>
+	{:else}
+		<h1>Artist</h1>
+		{#if authChanged || data.failure === 'signed-out'}
+			<p>Sign in to browse artists available to your account.</p><a class="nt-button" href="/login">Sign in</a>
+		{:else if data.failure === 'not-found'}
+			<p>This artist is not available in your catalogue.</p><a href="/library">Go to your library</a>
+		{:else}
+			<p role="status">We couldn't load this artist. Your library has not changed.</p>
+			<button class="nt-button" disabled={retrying} onclick={retry}>{retrying ? 'Retrying…' : 'Retry'}</button>
+		{/if}
+	{/if}
+</article>
