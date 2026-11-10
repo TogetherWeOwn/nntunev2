@@ -1873,8 +1873,6 @@ fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "email-rate-limit", email, 0, 32)
 }
 
-/// Stand-in user id for register/start taken-email shapes, shaped like
-/// the real 16-byte random user ids and stable per email.
 fn valid_challenge_id(value: &str) -> bool {
     value.len() == 43
         && value
@@ -1882,6 +1880,9 @@ fn valid_challenge_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Public register/start user handle, stable per normalized email and
+/// independent of stored account state. Internal user ids stay server-side;
+/// register/finish resolves enrollment through the stored challenge instead.
 fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
@@ -2460,12 +2461,12 @@ where
         Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
-    let shape = |user_id: String| {
+    let shape = || {
         json_response(
             200,
             serde_json::json!({
                 "challenge": challenge.id.clone(),
-                "user_id": user_id,
+                "user_id": fake_user_id(ctx.cfg, &email),
                 "rp_id": ctx.cfg.rp_id,
             }),
         )
@@ -2512,7 +2513,7 @@ where
                     // Unstored challenge + deterministic stand-in user id:
                     // same shape on every call, no row growth, finish
                     // fails generically at lookup.
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 Err(_) => return internal(),
             }
@@ -2533,7 +2534,7 @@ where
                 Ok(()) => user,
                 // Unique-email race: another request just claimed the row,
                 // indistinguishable from a taken account by design.
-                Err(_) => return shape(fake_user_id(ctx.cfg, &email)),
+                Err(_) => return shape(),
             }
         }
     };
@@ -2552,7 +2553,7 @@ where
         .unwrap_or(false);
     ctx.audit(&user.id, "auth.register_start", admitted).await;
     if !admitted {
-        return shape(user.id.clone());
+        return shape();
     }
     // Challenge insert plus concurrent-reap healing. With the migration
     // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
@@ -2573,7 +2574,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 if ctx
                     .store
@@ -2596,7 +2597,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 match ctx.store.challenge_by_id(&challenge.id).await {
                     Ok(Some(row))
@@ -2621,7 +2622,7 @@ where
                 }
             }
             Ok(Some(_)) => {
-                return shape(fake_user_id(ctx.cfg, &email));
+                return shape();
             }
             Err(_) => return internal(),
         }
@@ -2629,7 +2630,7 @@ where
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
     ctx.send_magic_link_if_allowed(req, &user.id, &email).await;
-    shape(user.id.clone())
+    shape()
 }
 
 async fn register_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -17397,7 +17398,7 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
-        let user_id = start["user_id"].as_str().unwrap().to_string();
+        let user_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let att = fx_none_attestation(cred_id, &fx_es256_cose(cose_seed));
         let resp = h.call(
@@ -17788,7 +17789,10 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start_body: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start_body["challenge"].as_str().unwrap().to_string();
-        let racer_id = start_body["user_id"].as_str().unwrap().to_string();
+        let racer_id = block_on(h.store.user_by_email("racer@example.com"))
+            .unwrap()
+            .unwrap()
+            .id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let code_hash = auth::hash_invite_code(&code);
         assert!(
@@ -18789,6 +18793,20 @@ mod tests {
         let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
 
+        let user = block_on(h.store.user_by_email("new@example.com"))
+            .unwrap()
+            .unwrap();
+        let public_handle = start["user_id"].as_str().unwrap();
+        assert_ne!(public_handle, user.id);
+        assert_eq!(
+            block_on(h.store.challenge_by_id(&challenge))
+                .unwrap()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some(user.id.as_str())
+        );
+
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
@@ -18830,6 +18848,22 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+        assert_eq!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(block_on(h.store.credentials_for_user(public_handle))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|session| session.user_id == user.id));
 
         // Login with an assertion (sign_count 2 > stored 1).
         let resp = h.call(
@@ -19355,6 +19389,101 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
             assert_eq!(body["allow_credentials"], serde_json::json!([]), "{email}");
         }
+    }
+
+    #[test]
+    fn register_start_public_handle_survives_account_cleanup() {
+        let h = harness();
+        seed_user(&h, "known", "known@example.com");
+        seed_user(&h, "resumed", "resumed@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"known-cred"),
+            user_id: "known".to_string(),
+            public_key: fx_es256_cose(55),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let start_at = |email: &str, now| {
+            let mut ctx = h.ctx();
+            ctx.now = now;
+            let req = Request {
+                method: "POST".to_string(),
+                path: "/v1/auth/passkey/register/start".to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: serde_json::json!({"email": email}).to_string().into_bytes(),
+            };
+            let resp = block_on(handle(&ctx, &req));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 3);
+            assert_eq!(body["rp_id"], h.config.rp_id);
+            assert_eq!(
+                b64url_decode(body["user_id"].as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                16
+            );
+            assert!(valid_challenge_id(body["challenge"].as_str().unwrap()));
+            body
+        };
+        let emails = [
+            "fresh@example.com",
+            "resumed@example.com",
+            "known@example.com",
+        ];
+        let before: Vec<_> = emails.iter().map(|email| start_at(email, NOW)).collect();
+        let internal_ids: Vec<_> = emails
+            .iter()
+            .map(|email| block_on(h.store.user_by_email(email)).unwrap().unwrap().id)
+            .collect();
+        for (body, internal_id) in before.iter().zip(&internal_ids) {
+            assert_ne!(body["user_id"].as_str().unwrap(), internal_id);
+        }
+        assert_ne!(before[0]["user_id"], before[1]["user_id"]);
+        assert_ne!(before[0]["user_id"], before[2]["user_id"]);
+        assert_eq!(h.mailer.sent.borrow().len(), 2);
+
+        let later = NOW + UNVERIFIED_USER_TTL_SECS + 1;
+        start_at("maintenance@example.com", later);
+        for email in &emails[..2] {
+            assert!(block_on(h.store.user_by_email(email)).unwrap().is_none());
+        }
+        assert_eq!(
+            block_on(h.store.user_by_email(emails[2]))
+                .unwrap()
+                .unwrap()
+                .id,
+            internal_ids[2]
+        );
+        for (index, email) in emails.iter().enumerate() {
+            let after = start_at(email, later);
+            assert_eq!(before[index]["user_id"], after["user_id"]);
+            assert_ne!(before[index]["challenge"], after["challenge"]);
+            let internal_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
+            let row = block_on(
+                h.store
+                    .challenge_by_id(after["challenge"].as_str().unwrap()),
+            )
+            .unwrap();
+            if index < 2 {
+                assert_ne!(internal_id, internal_ids[index]);
+                assert_eq!(row.unwrap().user_id.as_deref(), Some(internal_id.as_str()));
+            } else {
+                assert!(row.is_none());
+            }
+        }
+        let normalized = start_at("  FRESH@EXAMPLE.COM  ", later);
+        assert_eq!(normalized["user_id"], before[0]["user_id"]);
+        assert!(h
+            .mailer
+            .sent
+            .borrow()
+            .iter()
+            .all(|(email, _)| email != emails[2]));
     }
 
     #[test]
