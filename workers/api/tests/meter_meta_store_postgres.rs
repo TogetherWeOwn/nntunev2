@@ -89,13 +89,23 @@ async fn migrated_stores_have_no_cross_side_relations() {
     }
 }
 
+// Every seed below is ensure-exists with identical row content across
+// callers, and this binary's tests share one database and run in
+// parallel. Bare `ON CONFLICT DO NOTHING` (no arbiter) is deliberate
+// on the three tables with a second unique index (tracks'
+// (release_id, medium_no, track_no), users' email, ingest_jobs' PK
+// id): a column-scoped arbiter matches only that one index, so a
+// concurrent identical insert whose conflict speculative insertion
+// detects on the other index raises E23505 instead of skipping
+// (observed: tracks at `(8888…, 1, 1)`). Identical-content
+// re-inserts must converge, never error.
 async fn seed_user_and_job(app: &Client) {
     app.batch_execute(&format!(
         "INSERT INTO users (id, email, created_at) VALUES ('{USER}', 'u1@ci.invalid', 1700000000) \
-         ON CONFLICT (id) DO NOTHING; \
+         ON CONFLICT DO NOTHING; \
          INSERT INTO ingest_jobs (id, user_id, idempotency_key, status) \
          VALUES ('job-meter-1', '{USER}', 'meter-1', 'done') \
-         ON CONFLICT (user_id, idempotency_key) DO NOTHING"
+         ON CONFLICT DO NOTHING"
     ))
     .await
     .unwrap();
@@ -117,7 +127,7 @@ async fn seed_track(
     app.batch_execute(&format!(
         "INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms) \
          VALUES ('{track}', '{recording}', '88888888-8888-8888-8888-888888888888', 'Track', {medium_no}, 1, {duration_sql}) \
-         ON CONFLICT (id) DO NOTHING"
+         ON CONFLICT DO NOTHING"
     ))
     .await
     .unwrap();

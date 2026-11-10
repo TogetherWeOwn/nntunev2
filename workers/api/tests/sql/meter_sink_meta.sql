@@ -201,17 +201,20 @@ BEGIN
     -- Two occurrences sharing one recording MBID: a recording-only
     -- match is ambiguous (the Rust side must claim neither
     -- occurrence's artifact rungs, only the mirror rung), while each
-    -- exact local id keeps its own occurrence metadata. Insert the
-    -- larger local id first so the outcome cannot ride on order.
+    -- exact local id keeps its own occurrence metadata. They occupy
+    -- fresh track positions (1,3)/(1,4) on the release, never (1,1):
+    -- the schema enforces UNIQUE (release_id, medium_no, track_no)
+    -- and (1,1) already holds the Meter Track. Insert the larger
+    -- local id first so the outcome cannot ride on order.
     INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms)
     VALUES ('88888888-8888-8888-8888-888888888888',
             '99999999-9999-9999-9999-999999999999',
             '44444444-4444-4444-4444-444444444444',
-            'Shared B', 1, 1, 240000),
+            'Shared B', 1, 3, 240000),
            ('11111111-1111-1111-1111-111111111111',
             '99999999-9999-9999-9999-999999999999',
             '44444444-4444-4444-4444-444444444444',
-            'Shared A', 1, 1, 60000);
+            'Shared A', 1, 4, 60000);
     INSERT INTO mb_recording (mbid, title, duration_ms)
     VALUES ('99999999-9999-9999-9999-999999999999', 'Shared', 241000);
     SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid,
