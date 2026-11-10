@@ -662,6 +662,11 @@ class GitFixture(unittest.TestCase):
         result = self.run_workflow(files, live)
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertIn("lacks source_rename_history", result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "failed")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertIn("lacks source_rename_history", outcomes["diagnostic"])
+        self.assertIn('"outcome": "not_run"', result.stdout)
 
     def test_workflow_effective_merge_base_manifest_is_independent(self):
         self.write("0001_final.sql")
@@ -680,6 +685,17 @@ class GitFixture(unittest.TestCase):
         result = self.run_workflow(files, live)
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertIn("append-only against base", result.stderr)
+        report = self.workflow_api / "pr-validation.json"
+        outcomes = json.loads(report.read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertEqual(outcomes["event"]["base"], self.base)
+        self.assertEqual(outcomes["effective"]["base"], advanced)
+        self.assertIn("append-only against base", outcomes["diagnostic"])
+        self.assertLessEqual(len(outcomes["diagnostic"]), 1024)
+        self.assertLess(report.stat().st_size, 16384)
+        self.assertIn('"outcome": "failed"', result.stdout)
+        self.assertNotIn("pinned Git source lineage and applied aliases verified", result.stdout)
 
     def test_workflow_bracket_exhaustion_and_observed_head_movement_fail(self):
         pages, metadata = self.workflow_inputs()

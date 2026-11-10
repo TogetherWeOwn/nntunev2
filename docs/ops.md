@@ -495,7 +495,13 @@ Equal metadata brackets are not a transactional snapshot or proof against
 arbitrary ABA: pinned Git coverage rejects migration substitutions, but
 makes no independent authenticity claim for unrelated non-migration fields.
 The selected attempt, both projections, retained pages and both validation
-outcomes are retained as bounded Actions evidence for seven days.
+outcomes are retained as bounded Actions evidence for seven days. Handled
+validation errors retain each pass as `verified`, `failed` or `not_run`, plus
+a diagnostic capped at 1024 characters, without changing the nonzero exit.
+This fixed two-pass summary is emitted even when the shared evidence budget
+is exhausted; it performs no further Git or API reads. Process-launch or
+acquisition failures still fail the job; only evidence produced before that
+failure can be uploaded, never invented outcomes for a checker that did not run.
 
 `migration_history.py` declares hard bounds: 512 commits, 2048 edges,
 fewer than 3000 API files, 3000 migration paths per snapshot/diff,
