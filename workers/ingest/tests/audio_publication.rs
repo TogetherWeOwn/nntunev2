@@ -54,8 +54,7 @@ fn manifest(titles: &[&str]) -> AcceptedAudioManifest {
     manifest_with(
         titles
             .iter()
-            .enumerate()
-            .map(|(_, t)| json!({"title": t, "track_no": 1}))
+            .map(|t| json!({"title": t, "track_no": 1}))
             .collect(),
     )
 }
