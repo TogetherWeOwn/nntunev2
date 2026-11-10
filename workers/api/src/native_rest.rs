@@ -483,6 +483,13 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             {
                 return Bearer(Scope::LibraryRead);
             }
+            // Application-owned MusicBrainz search: the entry reattaches
+            // the raw query for exactly this route (like the admin ingest
+            // list), so the bare path or the `?query` form map to the same
+            // least-privilege `library:read`. Nothing deeper maps.
+            if path == "/v1/mb/search" || path.starts_with("/v1/mb/search?") {
+                return Bearer(Scope::LibraryRead);
+            }
             if path == "/v1/stream" || path.starts_with("/v1/stream/") {
                 return Bearer(Scope::StreamRead);
             }

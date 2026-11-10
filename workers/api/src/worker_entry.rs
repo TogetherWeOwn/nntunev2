@@ -5819,11 +5819,13 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // module logs header values.
     // The runtime path strips the query string everywhere; the admin
     // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
+    // production. Search needs `q`/`type`/`limit`/`offset` too, so the
+    // entry reattaches a non-empty raw query for these two GET routes.
+    // Their handlers parse strictly; every other route keeps the bare path.
     let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+    let handler_path = if req.method() == Method::Get
+        && (bare_path == "/v1/admin/ingest" || bare_path == "/v1/mb/search")
+    {
         match req.url().ok().and_then(|url| {
             url.query()
                 .filter(|query| !query.is_empty())

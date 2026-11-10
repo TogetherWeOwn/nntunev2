@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, beforeNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
@@ -27,6 +27,7 @@
 		type Toast
 	} from '#lib/shell/toasts.js';
 	import { onRightPanel } from '#lib/shell/right-panel.js';
+	import type QuickSearchComponent from '#lib/search/QuickSearch.svelte';
 	import '../app.css';
 	import type { LayoutProps } from './$types';
 
@@ -271,6 +272,7 @@
 	// when Upgrade unmounted the original control, not a detached opener.
 	// Any navigation also drops an open menu.
 	afterNavigate(() => {
+		closeQuickSearch();
 		openMenu = null;
 		menuOpener = null;
 		if (!restoreAfterNavigation) return;
@@ -278,15 +280,65 @@
 		restoreFocus();
 	});
 
-	// Top-bar search: plain navigation to the Search page, never
-	// search-as-you-type. No request fires until the Search page itself
-	// loads its results from the library API.
+	// Keep the quick-search chunk out of ordinary shell navigation.
+	let QuickSearch = $state<typeof QuickSearchComponent | null>(null);
+	let quickSearchRequested = false;
+	function closeQuickSearch(): void {
+		quickSearchRequested = false;
+		QuickSearch = null;
+	}
+	$effect(() => {
+		if (isPublicRoute) return;
+		const onShortcut = async (event: KeyboardEvent) => {
+			if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 'k') return;
+			event.preventDefault();
+			if (event.repeat || quickSearchRequested || document.querySelector('dialog[open]')) return;
+			quickSearchRequested = true;
+			try {
+				const module = await import('#lib/search/QuickSearch.svelte');
+				if (quickSearchRequested && !isPublicRoute) QuickSearch = module.default;
+			} catch {
+				quickSearchRequested = false;
+				pushToast('Could not open quick search. Use the Search page.');
+			}
+		};
+		window.addEventListener('keydown', onShortcut);
+		return () => { window.removeEventListener('keydown', onShortcut); closeQuickSearch(); };
+	});
+
+	// Preserve focus in the shell while the search route updates its results.
 	let searchText = $state('');
+	let shellSearchTimer: ReturnType<typeof setTimeout> | undefined;
+	beforeNavigate(() => clearTimeout(shellSearchTimer));
+	function onShellSearchInput(): void {
+		clearTimeout(shellSearchTimer);
+		const query = searchText.trim();
+		shellSearchTimer = setTimeout(() => {
+			void goto(query ? `/search?q=${encodeURIComponent(query)}` : '/search', {
+				replace: page.url.pathname.startsWith('/search'), reset: false
+			});
+		}, 200);
+	}
+	function onShellSearchKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Escape') {
+			clearTimeout(shellSearchTimer);
+			searchText = '';
+			(event.currentTarget as HTMLInputElement).blur();
+			if (page.url.pathname.startsWith('/search')) void goto('/search');
+		} else if (event.key === 'ArrowDown') {
+			const first = document.querySelector<HTMLElement>('main [data-search-result]');
+			if (first) { event.preventDefault(); first.focus(); }
+		}
+	}
+	$effect(() => {
+		void isPublicRoute;
+		return () => clearTimeout(shellSearchTimer);
+	});
 
 	function onSearchSubmit(event: SubmitEvent): void {
 		event.preventDefault();
+		clearTimeout(shellSearchTimer);
 		const query = searchText.trim();
-		searchText = '';
 		goto(query ? `/search?q=${encodeURIComponent(query)}` : '/search');
 	}
 
@@ -301,6 +353,9 @@
 	// boundary — this tab (security page, account menu) or another tab's
 	// storage event — drops both so the next account starts clean.
 	function clearShellAtAuthBoundary(): void {
+		closeQuickSearch();
+		clearTimeout(shellSearchTimer);
+		searchText = '';
 		clearMiniPlayerHint();
 		clearToasts();
 	}
@@ -424,6 +479,9 @@
 				placeholder="Search"
 				autocomplete="off"
 				bind:value={searchText}
+					oninput={onShellSearchInput}
+					onkeydown={onShellSearchKeydown}
+					aria-keyshortcuts="Control+k Meta+k"
 			/>
 		</form>
 		<div class="nt-appearance">
@@ -530,6 +588,10 @@
 			</div>
 		{/each}
 	</div>
+{/if}
+
+{#if QuickSearch && !isPublicRoute}
+	<QuickSearch onclose={closeQuickSearch} />
 {/if}
 
 {#if paywall}
