@@ -1,0 +1,316 @@
+name: migrations-staging-apply
+
+# Agent-dispatchable staging migration apply (docs/ops.md, "Staging
+# migrations"). The scheduled/CI deploy path never applies
+# migrations/*.sql; an authorized agent dispatches this workflow by hand
+# after the card's board approval, so the migrator credential never
+# reaches an agent: it is read only inside this job (environment:
+# staging) and is never printed. The job checks out the exact input ref
+# and runs that ref's pinned .github/scripts/apply_migration.py with
+# --expect-database nntunev2_staging and a verify-full URL; any
+# manifest/sha mismatch refuses exactly as the migrator does, and the
+# recorded schema_migrations row lands in the job summary as evidence.
+# Mode `all-pending` applies every unrecorded manifest entry up to the
+# input file in manifest order, refusing on the first failure.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact 40-hex commit whose migrations/manifest.toml and apply_migration.py provide the migration bytes
+        type: string
+        required: true
+      file:
+        description: "Migration file basename (e.g. 0054_example.sql); in all-pending mode the last file to apply"
+        type: string
+        required: true
+      applied_by:
+        description: Identity recorded in schema_migrations.applied_by
+        type: string
+        required: true
+      board_approval:
+        description: Paperclip board-approval interaction id for the DDL (recorded in the job summary)
+        type: string
+        required: true
+      mode:
+        description: single file, or every unrecorded manifest entry up to file in order
+        type: choice
+        options:
+          - single
+          - all-pending
+        default: single
+
+permissions:
+  contents: read
+
+# One staging apply at a time: a queued dispatch waits instead of racing
+# the apply transaction. Never cancel: a cancelled apply can leave the
+# commit outcome unknown (docs/ops.md, "Staging migrations").
+concurrency:
+  group: migrations-staging-apply
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+    steps:
+      - name: Validate dispatch inputs
+        env:
+          PINNED_REF: ${{ inputs.ref }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_BY: ${{ inputs.applied_by }}
+          BOARD_APPROVAL: ${{ inputs.board_approval }}
+          APPLY_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PINNED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' "ref must be a full 40-hex commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$MIGRATION_FILE" =~ ^[0-9]{4}_[A-Za-z0-9_]+\.sql$ ]]; then
+            printf '%s\n' "file must be a migration basename like 0054_example.sql" >&2
+            exit 1
+          fi
+          for value in "$APPLIED_BY" "$BOARD_APPROVAL"; do
+            if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* || ${#value} -gt 200 ]]; then
+              printf '%s\n' "applied_by and board_approval must be non-empty, single-line, at most 200 chars" >&2
+              exit 1
+            fi
+          done
+          if [[ "$APPLY_MODE" != single && "$APPLY_MODE" != all-pending ]]; then
+            printf '%s\n' "mode must be single or all-pending" >&2
+            exit 1
+          fi
+          {
+            echo "### migrations-staging-apply dispatch"
+            echo "Ref: \`$PINNED_REF\`"
+            echo "File: \`$MIGRATION_FILE\`"
+            echo "Mode: \`$APPLY_MODE\`"
+            echo "Applied by: \`$APPLIED_BY\`"
+            echo "Board approval: \`$BOARD_APPROVAL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out pinned migration source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Verify checkout matches pinned ref
+        env:
+          PINNED_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "$PINNED_REF" ]; then
+            printf '%s\n' "checked-out HEAD does not equal the pinned ref; refusing" >&2
+            exit 1
+          fi
+
+      - name: Ensure postgres client
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null || [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client ca-certificates
+          fi
+          test -r /etc/ssl/certs/ca-certificates.crt
+
+      - name: Apply migration(s)
+        id: apply
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_BY: ${{ inputs.applied_by }}
+          APPLY_MODE: ${{ inputs.mode }}
+          EXPECT_DATABASE: nntunev2_staging
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          import urllib.parse
+
+          FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
+
+          def die(message):
+              print(f"migrations-staging-apply: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def normalize_url(raw, expected_database):
+              if not raw:
+                  die("staging migrator secret is missing")
+              url = urllib.parse.urlsplit(raw)
+              database = urllib.parse.unquote(url.path.removeprefix("/"))
+              if (url.scheme not in ("postgres", "postgresql") or not url.hostname
+                      or not url.username or not database or url.fragment):
+                  die("staging migrator URL is malformed")
+              if database != expected_database:
+                  die("staging migrator URL does not target the expected database")
+              query = urllib.parse.parse_qs(url.query, strict_parsing=True)
+              if (set(query) - {"sslmode", "sslrootcert"}
+                      or len(query.get("sslmode", [])) > 1
+                      or query.get("sslrootcert", ["system"]) != ["system"]):
+                  die("staging migrator URL carries unsupported connection options")
+              query["sslmode"] = ["verify-full"]
+              return urllib.parse.urlunsplit(
+                  (url.scheme, url.netloc, url.path,
+                   urllib.parse.urlencode(query, doseq=True), ""))
+
+          def manifest_app_files(manifest_path, through):
+              try:
+                  with open(manifest_path, "rb") as handle:
+                      entries = tomllib.load(handle).get("migration", [])
+              except (OSError, tomllib.TOMLDecodeError):
+                  die("cannot read the pinned migrations/manifest.toml")
+              app = [e["file"] for e in entries if e.get("target") == "app"]
+              if through not in app:
+                  die("file is not an app migration in the pinned manifest")
+              return app[:app.index(through) + 1]
+
+          expected_database = os.environ["EXPECT_DATABASE"]
+          database_url = normalize_url(
+              os.environ.get("PLANETSCALE_MIGRATOR_URL_STAGING", ""), expected_database)
+          applied_by = os.environ["APPLIED_BY"]
+          if (not applied_by or len(applied_by) > 200
+                  or any(ord(ch) < 0x20 for ch in applied_by)):
+              die("applied_by must be non-empty printable text")
+          migration_file = os.environ["MIGRATION_FILE"]
+          if not FILE_RE.fullmatch(migration_file):
+              die("file must be a migration basename")
+          if os.environ["APPLY_MODE"] == "all-pending":
+              files = manifest_app_files("migrations/manifest.toml", migration_file)
+          else:
+              files = [migration_file]
+          child_env = {**os.environ, "DATABASE_URL": database_url}
+          # Written even when the loop refuses mid-prefix (die exits via
+          # SystemExit, which still runs `finally`), so the evidence step
+          # reports the successfully applied prefix on a red run.
+          done = []
+          try:
+              for filename in files:
+                  if not FILE_RE.fullmatch(filename):
+                      die("manifest carries a malformed migration filename")
+                  result = subprocess.run(
+                      ["python3", ".github/scripts/apply_migration.py",
+                       "--file", f"migrations/{filename}",
+                       "--applied-by", applied_by,
+                       "--expect-database", expected_database],
+                      capture_output=True, text=True, env=child_env, timeout=180)
+                  # apply_migration.py output is fixed, non-secret text.
+                  if result.stdout:
+                      print(result.stdout, end="")
+                  if result.returncode != 0:
+                      if result.stderr:
+                          print(result.stderr, end="", file=sys.stderr)
+                      die(f"apply refused on the first failure at migrations/{filename}")
+                  done.append(filename)
+          finally:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  handle.write(f"applied_files={','.join(done)}\n")
+          PY
+
+      - name: Record evidence in job summary
+        if: always()
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_BY: ${{ inputs.applied_by }}
+          BOARD_APPROVAL: ${{ inputs.board_approval }}
+          APPLY_MODE: ${{ inputs.mode }}
+          APPLIED_FILES: ${{ steps.apply.outputs.applied_files }}
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+          EXPECT_DATABASE: nntunev2_staging
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.parse
+
+          FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
+
+          def die(message):
+              print(f"migrations-staging-apply: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def child_env(raw, expected_database):
+              if not raw:
+                  die("staging migrator secret is missing")
+              url = urllib.parse.urlsplit(raw)
+              database = urllib.parse.unquote(url.path.removeprefix("/"))
+              if (url.scheme not in ("postgres", "postgresql") or not url.hostname
+                      or not url.username or not database or url.fragment):
+                  die("staging migrator URL is malformed")
+              if database != expected_database:
+                  die("staging migrator URL does not target the expected database")
+              query = urllib.parse.parse_qs(url.query, strict_parsing=True)
+              if (set(query) - {"sslmode", "sslrootcert"}
+                      or len(query.get("sslmode", [])) > 1
+                      or query.get("sslrootcert", ["system"]) != ["system"]):
+                  die("staging migrator URL carries unsupported connection options")
+              if query.get("sslmode", ["verify-full"])[0] != "verify-full":
+                  die("staging migrator URL requires sslmode=verify-full")
+              # libpq env from parsed parts; credentials never reach argv
+              # or output and the URL is never printed.
+              url.port  # raises on a malformed port
+              return {
+                  "PATH": os.environ["PATH"],
+                  "HOME": os.environ.get("HOME", "/home/runner"),
+                  "PGHOST": url.hostname, "PGPORT": str(url.port or 5432),
+                  "PGDATABASE": database,
+                  "PGUSER": urllib.parse.unquote(url.username),
+                  "PGPASSWORD": urllib.parse.unquote(url.password or ""),
+                  "PGSSLMODE": "verify-full",
+                  "PGSSLROOTCERT": "/etc/ssl/certs/ca-certificates.crt",
+                  "PGCONNECT_TIMEOUT": "10",
+                  "PGOPTIONS": ("-c default_transaction_read_only=on "
+                                "-c statement_timeout=30000 -c lock_timeout=10000 "
+                                "-c search_path=public,pg_catalog"),
+              }
+
+          def read_row(child, filename):
+              sql = ("SELECT file, sha256, applied_at, applied_by "
+                     f"FROM public.schema_migrations WHERE file = '{filename}';")
+              result = subprocess.run(
+                  ["psql", "--no-psqlrc", "--no-password", "--quiet",
+                   "--tuples-only", "--no-align", "--field-separator", "\t",
+                   "--set", "ON_ERROR_STOP=1"],
+                  input=sql, text=True, capture_output=True, timeout=60, env=child)
+              if result.returncode != 0:
+                  die("evidence read failed; connection details redacted")
+              return result.stdout.strip()
+
+          requested = os.environ["MIGRATION_FILE"]
+          applied_files = [f for f in os.environ["APPLIED_FILES"].split(",") if f]
+          if not applied_files:
+              applied_files = [requested]
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a") as handle:
+              handle.write("### Recorded schema_migrations rows\n")
+          missing = []
+          for filename in applied_files:
+              if not FILE_RE.fullmatch(filename):
+                  die("malformed migration filename in evidence list")
+          # The read-only child carries credentials env-side, never in argv.
+          child = child_env(
+              os.environ.get("PLANETSCALE_MIGRATOR_URL_STAGING", ""),
+              os.environ["EXPECT_DATABASE"])
+          with open(summary, "a") as handle:
+              for filename in applied_files:
+                  row = read_row(child, filename)
+                  if not row:
+                      missing.append(filename)
+                      continue
+                  handle.write(f"- `{row}`\n")
+          if os.environ["APPLY_OUTCOME"] == "success" and missing:
+              die("apply succeeded but no recorded row exists for: " + ", ".join(missing))
+          PY

@@ -110,6 +110,39 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("python3 .github/scripts/test_workflow_policy_hardening.py", job(ci, "public-text"))
         self.assertIn("public-text", job(ci, "ci-ok"))
 
+    def test_staging_apply_is_agent_dispatchable_and_pinned(self):
+        # The authorized agent dispatches this workflow by hand after board
+        # approval; it must pin the exact ref, target only staging, never
+        # print its credential, and record the receipt as evidence.
+        text = (WORKFLOWS / "migrations-staging-apply.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("workflow_dispatch:", triggers)
+        for event in ("pull_request", "push", "schedule"):
+            self.assertNotIn(event + ":", triggers)
+        for name in ("ref:", "file:", "applied_by:", "board_approval:", "mode:"):
+            self.assertIn(name, triggers)
+        self.assertIn("group: migrations-staging-apply", text)
+        self.assertIn("cancel-in-progress: false", text)
+        apply = job(text, "apply")
+        self.assertIn("    environment:\n      name: staging\n", apply)
+        self.assertIn("ref: ${{ inputs.ref }}", apply)
+        self.assertIn("persist-credentials: false", apply)
+        self.assertIn("git rev-parse HEAD", apply)
+        self.assertIn("--expect-database", apply)
+        self.assertIn("nntunev2_staging", apply)
+        self.assertIn("secrets.PLANETSCALE_MIGRATOR_URL_STAGING", apply)
+        self.assertIn("verify-full", apply)
+        self.assertIn(".github/scripts/apply_migration.py", apply)
+        self.assertIn("schema_migrations", apply)
+        self.assertIn("GITHUB_STEP_SUMMARY", apply)
+        # The credential is env-only: no echo of the secret and no GITHUB_ENV
+        # hand-off of a derived URL (masking would not cover a modified copy).
+        self.assertNotIn('echo "$PLANETSCALE', apply)
+        self.assertNotIn("$GITHUB_ENV", apply)
+        # all-pending walks manifest order and refuses on the first failure.
+        self.assertIn("all-pending", apply)
+        self.assertIn("first failure", apply)
+
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter
         # leaves Rust/docs-only PRs waiting forever.

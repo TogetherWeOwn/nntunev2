@@ -353,9 +353,29 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-Nothing in CI applies `migrations/*.sql`; staging migrations are applied
-out-of-band **before** merge, by the migrator role, after board approval for
-the DDL. Applies go through `.github/scripts/apply_migration.py`, which
+The scheduled/CI deploy path never applies `migrations/*.sql`. Staging
+migrations are applied **before** merge, after board approval for the
+DDL, by the authoring agent itself: once board approval is recorded on
+the card, the agent dispatches the `migrations-staging-apply` workflow
+(`.github/workflows/migrations-staging-apply.yml`) with the exact
+40-hex commit `ref`, the migration `file`, an `applied_by` identity and
+the Paperclip board-approval interaction id. The workflow checks out
+that exact ref and runs the pinned `.github/scripts/apply_migration.py`
+from it with `--expect-database nntunev2_staging` and a `verify-full`
+URL, so the migrator credential
+(`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
+is read only inside the job and never reaches the agent. Any
+manifest/sha mismatch refuses exactly as the migrator does. Mode
+`all-pending` applies every unrecorded manifest entry up to `file` in
+manifest order, refusing on the first failure. The recorded
+`schema_migrations` row lands in the job summary; post it on the card
+before merging. The `board_approval` input is an audit record of the
+card's own gate, not a workflow-side call — the workflow cannot call
+Paperclip. Prerequisite: `PLANETSCALE_MIGRATOR_URL_STAGING` must be
+scoped to the `staging` environment before the first dispatch; the
+workflow declares `environment: staging`. Copying an existing value
+into an environment scope needs an authorized admin holding that value.
+Applies go through `.github/scripts/apply_migration.py`, which
 verifies the file bytes against `migrations/manifest.toml` and writes a
 `public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
 the same transaction** as the migration effects. A single exact outer

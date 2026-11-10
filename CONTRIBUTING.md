@@ -159,10 +159,13 @@ labels are the durable record behind it.
 - Staging migrations: staging is verified against the database itself —
   applies are recorded in `schema_migrations` and the staging deploy gate
   compares them with `migrations/manifest.toml`; see "Staging migrations"
-  in `docs/ops.md`. Green checks are not enough for such a PR: the DDL
-  needs board approval before it is applied to staging (via
-  `.github/scripts/apply_migration.py`), and the PR merges only once the
-  apply is recorded. A PR that renames a migration must rename it
+  in `docs/ops.md`. Green checks are not enough for such a PR: once the
+  DDL has board approval on its card, the authoring agent dispatches
+  `.github/workflows/migrations-staging-apply.yml` with the approved
+  commit `ref`, migration `file`, `applied_by` and the board-approval
+  interaction id (it runs `.github/scripts/apply_migration.py` pinned at
+  that ref), and the PR merges only once the apply is recorded in the
+  job summary. A PR that renames a migration must rename it
   byte-identically and carry its `renamed_from` manifest history
   (`migrations-staging` enforces it).
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
