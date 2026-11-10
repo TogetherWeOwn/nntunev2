@@ -55,6 +55,73 @@ fn manifest_roundtrip_preserves_selection_and_untrusted_hints() {
 }
 
 #[test]
+fn legacy_manifests_do_not_silently_acquire_effective_discs() {
+    let manifest = parse(&input()).unwrap();
+    assert_eq!(manifest.effective_discs(), None);
+    let stored = serde_json::to_value(&manifest).unwrap();
+    assert!(stored.get("effective_discs").is_none());
+    assert_eq!(parse(&stored).unwrap(), manifest);
+}
+
+#[test]
+fn frozen_disc_vector_is_complete_positive_and_consistent_with_all_hints() {
+    let mut value = input();
+    value["effective_discs"] = json!([1, 1]);
+    assert_eq!(
+        parse(&value).unwrap().effective_discs(),
+        Some(&[Some(1); 2][..])
+    );
+    for bad in [
+        json!([]),
+        json!([1]),
+        json!([1, 1, 1]),
+        json!([0, 1]),
+        json!([-1, 1]),
+        json!([null, 1]),
+        json!([2, 1]),
+        json!([2147483648_u64, 1]),
+    ] {
+        value["effective_discs"] = bad;
+        assert!(parse(&value).is_err());
+    }
+    value["effective_discs"] = json!([1, 1]);
+    value["entries"][1]["hints"]["disc_no"] = json!(2);
+    assert!(
+        parse(&value).is_err(),
+        "later tag invalidates implicit disc on earlier entry"
+    );
+    value["effective_discs"] = json!([null, 2]);
+    assert!(parse(&value).is_ok());
+    value["entries"][1]["hints"]["disc_no"] = json!(0);
+    value["effective_discs"] = json!([null, null]);
+    assert!(
+        parse(&value).is_ok(),
+        "present malformed tag is not implicit disc one"
+    );
+    value["entries"][1]["release_group_ref"] = json!(2);
+    assert!(
+        parse(&value).is_err(),
+        "separate first release has no disc tags"
+    );
+    value["effective_discs"] = json!([1, null]);
+    assert!(parse(&value).is_ok());
+}
+
+#[test]
+fn disc_vector_duplicate_field_is_rejected_and_not_leaked_by_debug() {
+    let mut value = input();
+    value["effective_discs"] = json!([1, 1]);
+    let manifest = parse(&value).unwrap();
+    assert!(!format!("{manifest:?}").contains("effective_discs"));
+    let raw = value.to_string().replacen(
+        "\"effective_discs\":[1,1]",
+        "\"effective_discs\":[1,1],\"effective_discs\":[1,1]",
+        1,
+    );
+    assert!(AcceptedAudioManifest::parse(&raw).is_err());
+}
+
+#[test]
 fn manifest_rejects_unknown_versions_fields_duplicate_keys_and_oversize() {
     let mut value = input();
     value["version"] = json!(2);

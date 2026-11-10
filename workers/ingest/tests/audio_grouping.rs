@@ -268,6 +268,97 @@ fn candidate_rejects_invalid_job_and_owner_identity() {
 }
 
 #[test]
+fn all_absent_disc_tags_freeze_disc_one_without_inventing_track_numbers() {
+    let mut hints = vec![hint(Some("X"), Some("A")); 3];
+    hints[0].track_no = Some(4);
+    hints[1].track_no = Some(0);
+    let manifest = grouped(hints);
+    assert_eq!(manifest.effective_discs(), Some(&[Some(1); 3][..]));
+    assert_eq!(manifest.entries()[0].hints.track_no, Some(4));
+    assert_eq!(manifest.entries()[1].hints.track_no, Some(0));
+    assert_eq!(manifest.entries()[2].hints.track_no, None);
+    assert!(manifest.entries().iter().all(|e| e.hints.disc_no.is_none()));
+}
+
+#[test]
+fn any_disc_tag_disables_implicit_discs_for_the_whole_release() {
+    for tagged in [1, 2, 0, -1, i32::MAX] {
+        let mut hints = vec![hint(Some("X"), Some("A")); 3];
+        hints[2].disc_no = Some(tagged);
+        let manifest = grouped(hints);
+        assert_eq!(
+            manifest.effective_discs(),
+            Some(&[None, None, (tagged > 0).then_some(tagged)][..])
+        );
+        assert_eq!(manifest.entries()[2].hints.disc_no, Some(tagged));
+    }
+}
+
+#[test]
+fn effective_discs_are_scoped_to_release_not_artist_or_candidate_title() {
+    let mut hints = vec![
+        hint(Some("X"), Some("A")),
+        hint(Some("X"), Some("B")),
+        hint(Some("X"), Some("A")),
+        hint(Some("Y"), Some("A")),
+        hint(Some("X"), Some("B")),
+    ];
+    for entry in &mut hints {
+        entry.album_artist = entry.track_artist.clone();
+    }
+    hints[2].disc_no = Some(2);
+    let manifest = grouped(hints);
+    assert_eq!(
+        refs(&manifest),
+        vec![(1, 1), (2, 2), (1, 1), (1, 4), (2, 2)]
+    );
+    assert_eq!(
+        manifest.effective_discs(),
+        Some(&[None, Some(1), Some(2), Some(1), Some(1)][..])
+    );
+}
+
+#[test]
+fn multidisc_values_freeze_without_splitting_or_dropping_selections() {
+    let mut hints = vec![hint(Some("X"), Some("A")); 4];
+    for (entry, disc) in hints.iter_mut().zip([1, 2, 0, -2]) {
+        entry.disc_no = Some(disc);
+        entry.track_no = Some(1);
+    }
+    let manifest = grouped(hints);
+    assert_eq!(refs(&manifest), vec![(1, 1); 4]);
+    assert_eq!(manifest.entries().len(), 4);
+    assert_eq!(
+        manifest.effective_discs(),
+        Some(&[Some(1), Some(2), None, None][..])
+    );
+    let back = AcceptedAudioManifest::parse(&serde_json::to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(back, manifest);
+    assert_eq!(back.effective_discs(), manifest.effective_discs());
+}
+
+#[test]
+fn frozen_discs_survive_checkpoint_redrive_and_refuse_a_changed_candidate() {
+    use nntune_ingest::{checkpoint, dispatch::build_search_dispatch, jobs::JobState, retry};
+    let msg = build_search_dispatch("owner", "query", "indexer", &[3000], 25, 0).unwrap();
+    let mut cp = checkpoint::initial(&msg);
+    cp.state = JobState::Matching;
+    let (plan, extracted) = inputs(vec![hint(Some("X"), Some("A")); 2]);
+    let first = prepare_manifest(&cp.job_id, "owner", &plan, extracted).unwrap();
+    cp.freeze_audio_manifest(first.clone()).unwrap();
+    let (_, mut changed) = inputs(vec![hint(Some("X"), Some("A")); 2]);
+    changed[1].hints.disc_no = Some(2);
+    let second = prepare_manifest(&cp.job_id, "owner", &plan, changed).unwrap();
+    assert!(cp.freeze_audio_manifest(second).is_err());
+    retry::redrive_checkpoint(&mut cp);
+    assert_eq!(cp.audio_manifest(), Some(&first));
+    assert_eq!(
+        cp.audio_manifest().unwrap().effective_discs(),
+        Some(&[Some(1); 2][..])
+    );
+}
+
+#[test]
 fn candidate_validates_hints_and_round_trips_without_regrouping() {
     let mut invalid = hint(Some("X"), Some("A"));
     invalid.release_mbid = Some("invalid".into());

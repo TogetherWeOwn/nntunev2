@@ -94,6 +94,10 @@ struct ManifestRecord {
     original_content_sha256: String,
     entries: Vec<AudioEntry>,
     art_blobs: Vec<ArtBlob>,
+    /// Indexed by audio_ordinal - 1. None means a legacy, not-yet-frozen
+    /// manifest; a null element means that entry's effective disc is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_discs: Option<Vec<Option<i32>>>,
 }
 
 /// Immutable after parsing; intentionally redacted in checkpoint Debug output.
@@ -127,6 +131,7 @@ impl AcceptedAudioManifest {
             job_id: job_id.to_owned(),
             user_id: user_id.to_owned(),
             original_content_sha256: original_content_sha256.to_owned(),
+            effective_discs: Some(derive_effective_discs(&entries)),
             entries,
             art_blobs: Vec::new(),
         })
@@ -165,6 +170,31 @@ impl AcceptedAudioManifest {
     pub fn art_blobs(&self) -> &[ArtBlob] {
         &self.0.art_blobs
     }
+
+    /// Frozen job-local disc hints, never mirror occurrence authority. Consumers
+    /// must refuse position/dedup work on legacy manifests returning None; do not
+    /// regenerate a durable winner from current tags or silently assume disc 1.
+    pub fn effective_discs(&self) -> Option<&[Option<i32>]> {
+        self.0.effective_discs.as_deref()
+    }
+}
+
+fn derive_effective_discs(entries: &[AudioEntry]) -> Vec<Option<i32>> {
+    let tagged = entries
+        .iter()
+        .filter(|entry| entry.hints.disc_no.is_some())
+        .map(|entry| entry.release_group_ref)
+        .collect::<std::collections::BTreeSet<_>>();
+    entries
+        .iter()
+        .map(|entry| {
+            if tagged.contains(&entry.release_group_ref) {
+                entry.hints.disc_no.filter(|&disc| disc > 0)
+            } else {
+                Some(1)
+            }
+        })
+        .collect()
 }
 
 fn hash(raw: &str) -> bool {
@@ -290,7 +320,12 @@ impl ManifestRecord {
                 used_blobs.insert(art.content_hash.as_str());
             }
         }
-        if used_blobs.len() != blobs.len() {
+        if used_blobs.len() != blobs.len()
+            || self
+                .effective_discs
+                .as_ref()
+                .is_some_and(|discs| *discs != derive_effective_discs(&self.entries))
+        {
             return Err(ManifestError::Invalid);
         }
         Ok(())

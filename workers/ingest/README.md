@@ -102,10 +102,19 @@ Guest suffixes are stripped only for dominance counting; conflicting artist keys
 use a job-local Various holder. Unknown albums keep separate releases. Artist
 and release references independently name their first selected-audio ordinal;
 disc tags never split a release, and original hints/entries are preserved.
+Candidate construction freezes an ordinal-indexed `effective_discs` vector before
+any dedup: a release with no disc tags uses disc 1; once any member has a disc tag,
+only each entry's own positive disc survives. Absent, malformed and nonpositive
+values then stay missing. This never supplies a track number or mirror position.
+Private parsing checks the complete vector against the frozen groups and hints;
+round trips/redrive retain it. Legacy v1 manifests without the vector stay
+readable but return no frozen discs: future position/dedup consumers must refuse
+them, not regenerate a durable winner or assume disc 1. No stored winner is
+upgraded in place.
 This implementation explicitly refuses non-ASCII grouping text rather than
 pretending Unicode lowercasing is case-folding. Full Unicode grouping, image
-validation/staging, effective local positions and post-match identity-gated dedup
-remain integration gates. No runtime producer invokes this candidate seam.
+validation/staging, surviving local track positions and post-match identity-gated
+dedup remain integration gates. No runtime producer invokes this candidate seam.
 
 This is unmounted preparation: no production caller freezes a manifest yet.
 The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
