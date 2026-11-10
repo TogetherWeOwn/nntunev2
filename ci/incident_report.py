@@ -189,10 +189,15 @@ def save_delivery(api, issue, state, dry_run):
         payload.update(state="closed", state_reason="completed")
     if not dry_run:
         api.request("PATCH", f"/issues/{issue['number']}", payload)
-        issue.update(payload)
+    issue.update(payload)
 
 
 def ensure_comment(api, issue, key, occurrence, kind, dry_run):
+    return _ensure_comment(api, dict(issue) if dry_run else issue,
+                           key, occurrence, kind, dry_run)
+
+
+def _ensure_comment(api, issue, key, occurrence, kind, dry_run):
     state = delivery(issue)
     if state is None or (state["run_id"], state["attempt"], state["kind"]) != (*occurrence, kind):
         # The previous completed delivery's cursor is a safe lower bound: the
@@ -244,6 +249,10 @@ def ensure_comment(api, issue, key, occurrence, kind, dry_run):
 
 
 def reconcile_pending(api, issues, dry_run):
+    return _reconcile_pending(api, [dict(i) for i in issues] if dry_run else issues, dry_run)
+
+
+def _reconcile_pending(api, issues, dry_run):
     actions = []
     keys = {workflow + ":" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
             for workflow, gates in GATES.items() for name in gates}
@@ -257,7 +266,7 @@ def reconcile_pending(api, issues, dry_run):
         if state is not None and not state["delivered"]:
             if source(issue) != (state["run_id"], state["attempt"]):
                 raise ReportError("Incident delivery source mismatch")
-            done = ensure_comment(api, issue, key, (state["run_id"], state["attempt"]),
+            done = _ensure_comment(api, issue, key, (state["run_id"], state["attempt"]),
                                   state["kind"], dry_run)
             actions.append(f"{'delivered' if done else 'pending'} #{issue['number']}: {key}")
     return actions
@@ -336,7 +345,11 @@ def report(api, run_id, dry_run=False, newer_evidence=None):
     # Retain source ordering even after recovery, so a delayed older failure
     # cannot reopen the same episode. Reuse a closed keyed issue on recurrence.
     issues = api.pages("/issues?state=all&labels=incident")
-    actions = reconcile_pending(api, issues, dry_run)
+    # Share projected delivery/closure state within this plan, never with the
+    # caller or remote issue snapshot. Only top-level issue fields are changed.
+    if dry_run:
+        issues = [dict(i) for i in issues]
+    actions = _reconcile_pending(api, issues, dry_run)
     for name, evidence in GATES[workflow].items():
         job = gate_result(jobs, name, evidence)
         if job is None:

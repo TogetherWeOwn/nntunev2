@@ -4,6 +4,26 @@ Staging-first, evidence-recorded procedure for a PlanetScale Postgres
 database restore. Docs only: this runbook authorizes no restore by itself
 and changes no code or migration.
 
+## 2026-11-07 MB lifecycle notice
+
+**MB restore/cutover steps below are unavailable until revalidated for the
+replacement.** The former cluster and its Hyperdrive config were retired;
+`HYPERDRIVE_ID_MB` is unset. Reported PS-5 replacement setup is not a completed
+import or serving mirror. Historical references below to a ~100 GB target and
+a config serving both environments do not describe current topology.
+
+Use the [dated operations inventory](ops.md#planetscale-postgres) and
+[ADR 0007 amendment](adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement).
+Before any MB restore/cutover, revalidate the actual dataset size, backup
+provenance/retention, target, grants and live consumers; retain the one-branch,
+no-extra-replica and ≤$10/month all-in bounds. The generic new-target procedure
+below is not permission to add an MB branch or spend. Validated import/readiness,
+reviewed replacement binding/manifest/contract alignment and separate activation
+acceptance must precede variable wiring, per the
+[enablement runbook](ops.md#operator-runbook-enabling-staging-mb--staging-ingest).
+Do not reuse a retired ID or infer current shared-reader impact. App restore
+authority and the existing security/release gates are unchanged.
+
 ## 0. Scope and authority
 
 - **In scope:** the app database (`nntunev2_staging` on cluster `nntunev2` /

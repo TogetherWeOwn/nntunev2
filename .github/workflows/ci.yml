@@ -450,6 +450,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_renamed_from.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
           python3 .github/scripts/test_migrations_rename_check.py
+          python3 .github/scripts/test_migration_snapshot.py
           python3 .github/scripts/test_apply_migration.py
           python3 .github/scripts/test_schema_migrations_backfill.py
           python3 .github/scripts/test_migrations_gate_root_validity.py
@@ -645,6 +646,7 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test meter_meta_store_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
