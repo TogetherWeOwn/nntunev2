@@ -1614,11 +1614,13 @@ ${MB_INVENTORY}`);
     const result = generateConfig();
     expect(result.status, result.output).toBe(0);
     expect(result.toml).toBeDefined();
-    expect(parseToml(result.toml!)).toMatchObject({
+    const config = parseToml(result.toml!);
+    expect(config).not.toHaveProperty('build.command');
+    expect(config).not.toHaveProperty('env.staging.build.command');
+    expect(config).toMatchObject({
       name: 'nntune-api',
       main: 'build/worker/shim.mjs',
       compatibility_date: '2026-10-01',
-      build: { command: 'cargo install -q worker-build --locked && worker-build --release -- --locked' },
       env: {
         staging: {
           name: 'nntune-api-staging',

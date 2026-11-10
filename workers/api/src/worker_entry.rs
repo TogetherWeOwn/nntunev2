@@ -3348,20 +3348,20 @@ impl Store for PgStore {
         .await
     }
 
-    async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
-                // backends); the affected count was never read here.
-                client
-                    .query_typed(
-                        "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                let mut client = self.connect().await?;
+                crate::credential_session_store::revoke_sessions_and_native_credentials(
+                    &mut client,
+                    user_id,
+                    now,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -3374,48 +3374,24 @@ impl Store for PgStore {
     // database (only its HMAC plus the non-secret listing prefix). The
     // composite UNIQUE (pepper_version, key_hmac) is the lookup identity.
 
-    async fn insert_native_credential(&self, row: &NativeCredentialRow) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let scopes: Vec<String> = row
-            .record
-            .scopes
-            .iter()
-            .map(|scope| scope.as_str().to_string())
-            .collect();
-        let client = self.connect().await?;
-        // Account-deletion fence (ADR 0002 rule 3): the insert only lands
-        // while the owner's deleting_at is NULL, holding the user row
-        // FOR SHARE through the statement, so a fresh session during the
-        // 24 h grace cannot mint a new long-lived bearer path behind the
-        // marker. A fenced (0-row) insert fails closed as StoreError; the
-        // handler classifies it through `account_deleting` into the typed
-        // 409. The owner binds $2 (the user_id column), never a value.
-        let affected = client
-            .execute(
-                "INSERT INTO native_rest_credentials (id, user_id, label, key_prefix, key_hmac, \
-                 pepper_version, scopes, created_at, expires_at, created_from_ip) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
-                 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
-                &[
-                    &row.record.id,
-                    &row.record.user_id,
-                    &row.label,
-                    &row.record.key_prefix,
-                    &row.record.key_hmac,
-                    &i32::try_from(row.record.pepper_version).map_err(|_| StoreError)?,
-                    &scopes,
-                    &i64_of(row.record.created_at)?,
-                    &i64_of(row.record.expires_at)?,
-                    &row.created_from_ip,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        if affected == 0 {
-            return Err(StoreError);
-        }
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+    async fn insert_native_credential(
+        &self,
+        row: &NativeCredentialRow,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::credential_session_store::insert_native_credential(
+                    &mut client,
+                    row,
+                    session_id,
+                )
+                .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn native_credentials_for_user(
@@ -3501,37 +3477,6 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(exists.is_some())
-            },
-            TOTAL_TIMEOUT_MS,
-        )
-        .await
-    }
-
-    async fn revoke_all_native_credentials(
-        &self,
-        user_id: &str,
-        now: u64,
-    ) -> Result<u64, StoreError> {
-        Self::bounded(
-            async {
-                // An empty user id (upstream bug) must never become a mass
-                // revocation: revoke nothing without a database round trip.
-                if user_id.is_empty() {
-                    return Ok(0);
-                }
-                let client = self.connect().await?;
-                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
-                // backends); `RETURNING id` keeps the revoked count the
-                // `execute` result used to carry.
-                let revoked = client
-                    .query_typed(
-                        "UPDATE native_rest_credentials SET revoked_at = $2 \
-                 WHERE user_id = $1 AND revoked_at IS NULL RETURNING id",
-                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(revoked.len() as u64)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -7549,53 +7494,29 @@ mod tests {
     }
 
     #[test]
-    fn fenced_native_credential_mint_pins_owner_and_zero_row_guard() {
+    fn native_credential_writes_use_the_postgres_tested_transactions() {
         let source = include_str!("worker_entry.rs");
         let production = source
             .split_once("#[cfg(test)]")
             .expect("test module must exist")
             .0;
-        let fn_body = |name: &str| {
-            production
-                .split_once(name)
+        for name in [
+            "insert_native_credential",
+            "revoke_sessions_and_native_credentials",
+        ] {
+            let body = production
+                .split_once(&format!("async fn {name}("))
                 .unwrap_or_else(|| panic!("{name} must exist"))
                 .1
                 .split_once("\n    async fn ")
                 .expect("a following fn must bound the body")
-                .0
-                .to_string()
-        };
-        const NATIVE_FENCE: &str = "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
-        let mint = fn_body("async fn insert_native_credential(");
-        assert!(
-            mint.contains(NATIVE_FENCE),
-            "insert_native_credential must select its row through the owner fence"
-        );
-        assert!(
-            !mint.contains("WHERE id = $1"),
-            "insert_native_credential fence binds the owner ($2), never $1"
-        );
-        assert!(
-            mint.contains("SELECT $1, $2"),
-            "insert_native_credential must keep SELECT $1 bound to the credential id and $2 to the owner"
-        );
-        let mint_guard = mint
-            .find("if affected == 0")
-            .expect("insert_native_credential must fail closed on 0 rows");
-        let mint_ok = mint
-            .find("Ok(())")
-            .expect("insert_native_credential must return Ok on the write path");
-        assert!(
-            mint_guard < mint_ok,
-            "the zero-row guard must precede the success return"
-        );
-        let mint_arm_end = mint[mint_guard..]
-            .find('}')
-            .expect("the zero-row guard arm must close");
-        assert!(
-            mint[mint_guard..mint_guard + mint_arm_end].contains("return Err"),
-            "the zero-row guard must fail closed (return Err), not Ok"
-        );
+                .0;
+            assert!(
+                body.contains(&format!("crate::credential_session_store::{name}(")),
+                "the runtime must use the same transaction exercised by PostgreSQL tests"
+            );
+            assert!(body.contains("TOTAL_TIMEOUT_MS"));
+        }
     }
 
     #[test]

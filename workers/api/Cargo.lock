@@ -1735,7 +1735,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "velmora"
 version = "0.1.0"
-source = "git+https://github.com/TogetherWeOwn/velmora?rev=fe8b840b077027f9792430c5fe9f6fc53ed0012b#fe8b840b077027f9792430c5fe9f6fc53ed0012b"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=a0a9694dca3244f4bdd2e890395d3735a198ce90#a0a9694dca3244f4bdd2e890395d3735a198ce90"
 dependencies = [
  "chacha20poly1305",
  "crc32fast",

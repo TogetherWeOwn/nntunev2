@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Same immutable pin as velmora in crates/nntune-core/Cargo.toml.
-velmora-test-nntp = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "fe8b840b077027f9792430c5fe9f6fc53ed0012b" }
+velmora-test-nntp = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "a0a9694dca3244f4bdd2e890395d3735a198ce90" }
 
 [dev-dependencies]
 # Consumer-boundary acceptance (tests/pinned_engine_boundary.rs): the

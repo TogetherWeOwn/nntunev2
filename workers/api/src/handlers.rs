@@ -1157,7 +1157,15 @@ pub trait Store {
             self.revoke_session(id).await.map(|_| true)
         }
     }
-    fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Atomically revoke all sessions and native credentials for one owner.
+    /// Returns the number of newly revoked credentials, preserving timestamps
+    /// on already revoked rows. An empty owner revokes nothing. Must serialize
+    /// with credential issuance; composing two independent writes is not valid.
+    fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>>;
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -1435,12 +1443,14 @@ pub trait Store {
         async { Err(StoreError) }
     }
     /// Persist a freshly issued native REST credential row (migration
-    /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
-    /// never report a mint it did not durably record; production and the
-    /// test fake override it.
+    /// 0019) only while the issuing session is still live and belongs to the
+    /// credential owner. The check and insert must serialize with session
+    /// revocation and retain the account-deletion fence through commit.
+    /// Fail-closed default: an unprovisioned store never reports a mint.
     fn insert_native_credential(
         &self,
         _row: &NativeCredentialRow,
+        _session_id: &str,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Err(StoreError) }
     }
@@ -1478,19 +1488,6 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
-    }
-    /// Bulk revoke for the recovery/revoke-all path (ADR 0010: the
-    /// session-compromise response revokes every unrevoked row alongside
-    /// the sessions): transitions each live row for `user_id`, stamps the
-    /// transition with the store's wall-clock `now`, and returns how many
-    /// transitioned. An empty user id revokes nothing. Fail-closed
-    /// default is `0`; production and the test fake override it.
-    fn revoke_all_native_credentials(
-        &self,
-        _user_id: &str,
-        _now: u64,
-    ) -> impl Future<Output = Result<u64, StoreError>> {
-        async { Ok(0) }
     }
     /// Best-effort successful-use accounting (`last_used_at`): called by
     /// the bearer gate after authorization, its outcome never changes the
@@ -1873,8 +1870,6 @@ fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "email-rate-limit", email, 0, 32)
 }
 
-/// Stand-in user id for register/start taken-email shapes, shaped like
-/// the real 16-byte random user ids and stable per email.
 fn valid_challenge_id(value: &str) -> bool {
     value.len() == 43
         && value
@@ -1882,6 +1877,9 @@ fn valid_challenge_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Public register/start user handle, stable per normalized email and
+/// independent of stored account state. Internal user ids stay server-side;
+/// register/finish resolves enrollment through the stored challenge instead.
 fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
@@ -2460,12 +2458,12 @@ where
         Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
-    let shape = |user_id: String| {
+    let shape = || {
         json_response(
             200,
             serde_json::json!({
                 "challenge": challenge.id.clone(),
-                "user_id": user_id,
+                "user_id": fake_user_id(ctx.cfg, &email),
                 "rp_id": ctx.cfg.rp_id,
             }),
         )
@@ -2512,7 +2510,7 @@ where
                     // Unstored challenge + deterministic stand-in user id:
                     // same shape on every call, no row growth, finish
                     // fails generically at lookup.
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 Err(_) => return internal(),
             }
@@ -2533,7 +2531,7 @@ where
                 Ok(()) => user,
                 // Unique-email race: another request just claimed the row,
                 // indistinguishable from a taken account by design.
-                Err(_) => return shape(fake_user_id(ctx.cfg, &email)),
+                Err(_) => return shape(),
             }
         }
     };
@@ -2552,7 +2550,7 @@ where
         .unwrap_or(false);
     ctx.audit(&user.id, "auth.register_start", admitted).await;
     if !admitted {
-        return shape(user.id.clone());
+        return shape();
     }
     // Challenge insert plus concurrent-reap healing. With the migration
     // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
@@ -2573,7 +2571,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 if ctx
                     .store
@@ -2596,7 +2594,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 match ctx.store.challenge_by_id(&challenge.id).await {
                     Ok(Some(row))
@@ -2621,7 +2619,7 @@ where
                 }
             }
             Ok(Some(_)) => {
-                return shape(fake_user_id(ctx.cfg, &email));
+                return shape();
             }
             Err(_) => return internal(),
         }
@@ -2629,7 +2627,7 @@ where
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
     ctx.send_magic_link_if_allowed(req, &user.id, &email).await;
-    shape(user.id.clone())
+    shape()
 }
 
 async fn register_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -3622,30 +3620,17 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    // ADR 0010 session-compromise response: the same event revokes every
-    // unrevoked native REST credential alongside the sessions. Native
-    // credentials go first: if the session sweep then fails, the caller
-    // keeps a valid session and can retry, while already-revoked bearer
-    // keys fail closed. The reverse order would strand live bearer keys
-    // behind dead sessions with no retry path. The two sweeps are
-    // separate store calls (no cross-table transaction), so a failure
-    // between them returns 500 and the caller retries the whole event.
+    // ADR 0010: one committed event covers both sessions and credentials.
+    // On failure neither sweep commits; retain the cookie so the caller can
+    // retry. Audit success only after the store reports the committed result.
     let revoked_native = match ctx
         .store
-        .revoke_all_native_credentials(&claims.user_id, ctx.now)
+        .revoke_sessions_and_native_credentials(&claims.user_id, ctx.now)
         .await
     {
         Ok(revoked) => revoked,
         Err(_) => return internal(),
     };
-    if ctx
-        .store
-        .revoke_all_sessions(&claims.user_id)
-        .await
-        .is_err()
-    {
-        return internal();
-    }
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
     if revoked_native > 0 {
         ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
@@ -4168,7 +4153,12 @@ where
         created_from_ip: ctx.source_ip.clone(),
         last_used_at: None,
     };
-    if ctx.store.insert_native_credential(&row).await.is_err() {
+    if ctx
+        .store
+        .insert_native_credential(&row, &claims.session_id)
+        .await
+        .is_err()
+    {
         // A fenced insert (account being deleted) is the typed 409,
         // never the generic 500; anything else stays generic so a probe
         // failure cannot leak a new shape. Mirrors `vault_put` (ADR 0002
@@ -7247,6 +7237,8 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
+        revoke_session_before_mint: RefCell<bool>,
+        fail_bulk_revoke: RefCell<bool>,
         /// User ids that still own a legacy `provider_vaults` row. The
         /// product no longer reads or writes vaults; the reaper and
         /// magic admission keep protecting these accounts.
@@ -8221,21 +8213,29 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
-            for row in self.sessions.borrow_mut().values_mut() {
-                if row.user_id == user_id {
-                    row.revoked = true;
-                }
-            }
-            Ok(())
-        }
         async fn insert_native_credential(
             &self,
             row: &NativeCredentialRow,
+            session_id: &str,
         ) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's insert writes nothing and fails (ADR 0002 rule 3).
-            if self.deleting_users.borrow().contains(&row.record.user_id) {
+            // Pin a session transition after handler authentication.
+            if *self.revoke_session_before_mint.borrow() {
+                self.sessions
+                    .borrow_mut()
+                    .get_mut(session_id)
+                    .expect("mint must bind the authenticated session")
+                    .revoked = true;
+            }
+            // Mirror the production account and session fences.
+            if self.deleting_users.borrow().contains(&row.record.user_id)
+                || !self
+                    .sessions
+                    .borrow()
+                    .get(session_id)
+                    .is_some_and(|session| {
+                        session.user_id == row.record.user_id && !session.revoked
+                    })
+            {
                 return Err(StoreError);
             }
             let mut rows = self.native_credentials.borrow_mut();
@@ -8305,15 +8305,21 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_native_credentials(
+        async fn revoke_sessions_and_native_credentials(
             &self,
             user_id: &str,
             now: u64,
         ) -> Result<u64, StoreError> {
-            // Mirror the production statement: empty user revokes nothing
-            // (an upstream bug must never become a mass revocation).
+            if *self.fail_bulk_revoke.borrow() {
+                return Err(StoreError);
+            }
             if user_id.is_empty() {
                 return Ok(0);
+            }
+            for row in self.sessions.borrow_mut().values_mut() {
+                if row.user_id == user_id {
+                    row.revoked = true;
+                }
             }
             let mut revoked = 0;
             for row in self.native_credentials.borrow_mut().values_mut() {
@@ -11347,6 +11353,192 @@ mod tests {
             Some("in_seed"),
             "the anchor stays with the recovery"
         );
+    }
+
+    #[test]
+    fn billing_stale_held_and_terminal_commit_orders_keep_fresh_status_and_grace() {
+        // Both passes fold the same stored row. Only the fresh snapshot
+        // contains its anchor; equal coverage must not hide stale evidence
+        // when the held/terminal pass commits after a status/grace change.
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let grace = end + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        for status in [
+            "incomplete",
+            "unpaid",
+            "paused",
+            "canceled",
+            "incomplete_expired",
+        ] {
+            for (before, after) in [("active", "past_due"), ("past_due", "active")] {
+                for empty in [false, true] {
+                    for stale_first in [false, true] {
+                        let h = stripe_harness();
+                        seed_billing_user(&h, "u1");
+                        let initial_grace = (before == "past_due").then_some(grace);
+                        block_on(h.store.store_reconcile_outcome(
+                            "u1",
+                            &stored_seed(
+                                PLAN_PLUS,
+                                before,
+                                Some(end),
+                                Some("in_seed"),
+                                initial_grace,
+                            ),
+                        ))
+                        .expect("seed stores");
+                        let input = fold_input(
+                            PLAN_PLUS,
+                            before,
+                            Some(end),
+                            initial_grace,
+                            Some("in_seed"),
+                        );
+                        let invoice = |id, invoice_end| {
+                            test_invoice(
+                                id,
+                                "cus_test_1",
+                                "sub_test_1",
+                                PRICE_PLUS,
+                                BILLING_NOW - BILLING_PERIOD,
+                                invoice_end,
+                                BILLING_NOW,
+                            )
+                        };
+                        let stale = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    status,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: if empty {
+                                    vec![]
+                                } else {
+                                    vec![invoice("in_old", BILLING_NOW)]
+                                },
+                            },
+                            BILLING_NOW,
+                        );
+                        assert_eq!(stale.fail_closed, None);
+                        assert_eq!(stale.row.status, before);
+                        assert_eq!(stale.row.grace_until_unix, initial_grace);
+                        assert_eq!(stale.row.paid_through_unix, Some(end));
+                        assert_eq!(
+                            stale.row.paid_invoice_id, None,
+                            "stale evidence, never a re-pin"
+                        );
+                        assert_eq!(stale.read_anchor.as_deref(), Some("in_seed"));
+                        assert!(
+                            stale.history.is_empty(),
+                            "held/terminal paths do not backfill history"
+                        );
+                        let fresh = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    after,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: vec![invoice("in_seed", end)],
+                            },
+                            BILLING_NOW,
+                        );
+                        let commits = if stale_first {
+                            [&stale, &fresh]
+                        } else {
+                            [&fresh, &stale]
+                        };
+                        for outcome in commits {
+                            block_on(h.store.store_reconcile_outcome("u1", outcome))
+                                .expect("pass stores");
+                        }
+                        let row = h.store.billing_rows.borrow()["u1"].clone();
+                        assert_eq!(
+                            row.status, after,
+                            "{status}, empty={empty}, stale_first={stale_first}"
+                        );
+                        assert_eq!(row.grace_until_unix, (after == "past_due").then_some(grace));
+                        assert_eq!(row.plan_id, PLAN_PLUS);
+                        assert_eq!(row.paid_through_unix, Some(end));
+                        assert_eq!(row.paid_invoice_id.as_deref(), Some("in_seed"));
+                        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn billing_permuted_invoice_history_replays_idempotently() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let line = |price, start, end| {
+            test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                price,
+                BILLING_NOW + start,
+                BILLING_NOW + end,
+                BILLING_NOW,
+            )
+            .lines
+            .expect("lines")
+            .data
+            .remove(0)
+        };
+        let lines = [
+            line(PRICE_PRO, 1, 10),
+            line(PRICE_PLUS, 0, 15),
+            line(PRICE_PRO, 10, 30),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut invoice = test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + 1,
+                BILLING_NOW + 30,
+                BILLING_NOW,
+            );
+            invoice.lines.as_mut().expect("lines").data = order.map(|i| lines[i].clone()).to_vec();
+            let input = block_on(h.store.load_reconcile_input("u1")).expect("input loads");
+            let outcome = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "active",
+                        PRICE_PRO,
+                    ),
+                    invoices: vec![invoice],
+                },
+                BILLING_NOW,
+            );
+            assert_eq!(outcome.history.len(), 1);
+            assert_eq!(outcome.history[0].period_start_unix, BILLING_NOW + 1);
+            block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("replay stores");
+            let history = h.store.invoice_history.borrow();
+            assert_eq!(
+                history.len(),
+                1,
+                "all permutations retain the same invoice identity"
+            );
+            assert_eq!(history["in_mix"], outcome.history[0]);
+        }
     }
 
     #[test]
@@ -17211,7 +17403,7 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
-        let user_id = start["user_id"].as_str().unwrap().to_string();
+        let user_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let att = fx_none_attestation(cred_id, &fx_es256_cose(cose_seed));
         let resp = h.call(
@@ -17602,7 +17794,10 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start_body: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start_body["challenge"].as_str().unwrap().to_string();
-        let racer_id = start_body["user_id"].as_str().unwrap().to_string();
+        let racer_id = block_on(h.store.user_by_email("racer@example.com"))
+            .unwrap()
+            .unwrap()
+            .id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let code_hash = auth::hash_invite_code(&code);
         assert!(
@@ -18084,6 +18279,67 @@ mod tests {
         );
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows.len(), 1, "fenced mint stores nothing");
+    }
+
+    #[test]
+    fn credentials_mint_store_refusal_returns_no_secret_or_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        *h.store.revoke_session_before_mint.borrow_mut() = true;
+        let before = h.store.audits.borrow().len();
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("secret"));
+        assert!(!resp.body.contains("ntk_"));
+        assert!(h.store.native_credentials.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), before);
+    }
+
+    #[test]
+    fn session_revoke_all_failure_retains_cookie_and_writes_no_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let before = h.store.audits.borrow().len();
+        *h.store.fail_bulk_revoke.borrow_mut() = true;
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert_eq!(h.store.audits.borrow().len(), before);
+        assert!(h.store.sessions.borrow().values().all(|row| !row.revoked));
+        assert!(h
+            .store
+            .native_credentials
+            .borrow()
+            .values()
+            .all(|row| row.record.revoked_at.is_none()));
+        *h.store.fail_bulk_revoke.borrow_mut() = false;
+        let retry = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert_eq!(retry.set_cookie, Some(session::clear_cookie_header()));
     }
 
     #[test]
@@ -18603,6 +18859,20 @@ mod tests {
         let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
 
+        let user = block_on(h.store.user_by_email("new@example.com"))
+            .unwrap()
+            .unwrap();
+        let public_handle = start["user_id"].as_str().unwrap();
+        assert_ne!(public_handle, user.id);
+        assert_eq!(
+            block_on(h.store.challenge_by_id(&challenge))
+                .unwrap()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some(user.id.as_str())
+        );
+
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
@@ -18644,6 +18914,22 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+        assert_eq!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(block_on(h.store.credentials_for_user(public_handle))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|session| session.user_id == user.id));
 
         // Login with an assertion (sign_count 2 > stored 1).
         let resp = h.call(
@@ -19169,6 +19455,101 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
             assert_eq!(body["allow_credentials"], serde_json::json!([]), "{email}");
         }
+    }
+
+    #[test]
+    fn register_start_public_handle_survives_account_cleanup() {
+        let h = harness();
+        seed_user(&h, "known", "known@example.com");
+        seed_user(&h, "resumed", "resumed@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"known-cred"),
+            user_id: "known".to_string(),
+            public_key: fx_es256_cose(55),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let start_at = |email: &str, now| {
+            let mut ctx = h.ctx();
+            ctx.now = now;
+            let req = Request {
+                method: "POST".to_string(),
+                path: "/v1/auth/passkey/register/start".to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: serde_json::json!({"email": email}).to_string().into_bytes(),
+            };
+            let resp = block_on(handle(&ctx, &req));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 3);
+            assert_eq!(body["rp_id"], h.config.rp_id);
+            assert_eq!(
+                b64url_decode(body["user_id"].as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                16
+            );
+            assert!(valid_challenge_id(body["challenge"].as_str().unwrap()));
+            body
+        };
+        let emails = [
+            "fresh@example.com",
+            "resumed@example.com",
+            "known@example.com",
+        ];
+        let before: Vec<_> = emails.iter().map(|email| start_at(email, NOW)).collect();
+        let internal_ids: Vec<_> = emails
+            .iter()
+            .map(|email| block_on(h.store.user_by_email(email)).unwrap().unwrap().id)
+            .collect();
+        for (body, internal_id) in before.iter().zip(&internal_ids) {
+            assert_ne!(body["user_id"].as_str().unwrap(), internal_id);
+        }
+        assert_ne!(before[0]["user_id"], before[1]["user_id"]);
+        assert_ne!(before[0]["user_id"], before[2]["user_id"]);
+        assert_eq!(h.mailer.sent.borrow().len(), 2);
+
+        let later = NOW + UNVERIFIED_USER_TTL_SECS + 1;
+        start_at("maintenance@example.com", later);
+        for email in &emails[..2] {
+            assert!(block_on(h.store.user_by_email(email)).unwrap().is_none());
+        }
+        assert_eq!(
+            block_on(h.store.user_by_email(emails[2]))
+                .unwrap()
+                .unwrap()
+                .id,
+            internal_ids[2]
+        );
+        for (index, email) in emails.iter().enumerate() {
+            let after = start_at(email, later);
+            assert_eq!(before[index]["user_id"], after["user_id"]);
+            assert_ne!(before[index]["challenge"], after["challenge"]);
+            let internal_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
+            let row = block_on(
+                h.store
+                    .challenge_by_id(after["challenge"].as_str().unwrap()),
+            )
+            .unwrap();
+            if index < 2 {
+                assert_ne!(internal_id, internal_ids[index]);
+                assert_eq!(row.unwrap().user_id.as_deref(), Some(internal_id.as_str()));
+            } else {
+                assert!(row.is_none());
+            }
+        }
+        let normalized = start_at("  FRESH@EXAMPLE.COM  ", later);
+        assert_eq!(normalized["user_id"], before[0]["user_id"]);
+        assert!(h
+            .mailer
+            .sent
+            .borrow()
+            .iter()
+            .all(|(email, _)| email != emails[2]));
     }
 
     #[test]
