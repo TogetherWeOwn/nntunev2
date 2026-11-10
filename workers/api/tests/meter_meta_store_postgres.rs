@@ -98,14 +98,22 @@ async fn seed_user_and_job(app: &Client) {
     .unwrap();
 }
 
-async fn seed_track(app: &Client, track: &str, recording: &str, duration: Option<i32>) {
+async fn seed_track(
+    app: &Client,
+    track: &str,
+    recording: &str,
+    duration: Option<i32>,
+    medium_no: i32,
+) {
     seed_user_and_job(app).await;
     let duration_sql = duration
         .map(|d| d.to_string())
         .unwrap_or_else(|| "NULL".into());
+    // The migrated schema enforces UNIQUE (release_id, medium_no, track_no),
+    // so parallel tests seeding different tracks need distinct medium numbers.
     app.batch_execute(&format!(
         "INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms) \
-         VALUES ('{track}', '{recording}', '88888888-8888-8888-8888-888888888888', 'Track', 1, 1, {duration_sql}) \
+         VALUES ('{track}', '{recording}', '88888888-8888-8888-8888-888888888888', 'Track', {medium_no}, 1, {duration_sql}) \
          ON CONFLICT (id) DO NOTHING"
     ))
     .await
@@ -116,8 +124,8 @@ async fn seed_media(app: &Client, track: &str) {
     seed_user_and_job(app).await;
     let hash = "a".repeat(64);
     app.batch_execute(&format!(
-        "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key) \
-         VALUES ('{hash}', 2000000, 'ci-bucket', 'ci/key') \
+        "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) \
+         VALUES ('{hash}', 2000000, 'ci-bucket', 'ci/key', 1700000100) \
          ON CONFLICT (content_hash) DO NOTHING; \
          INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) \
          VALUES ('{USER}', '{track}', 'job-meter-1', '{hash}', 'flac', 128, 1700000200) \
@@ -147,7 +155,7 @@ fn meter_store(app: Client, mirror: Result<Client, StoreError>) -> (impl Store, 
 #[tokio::test]
 async fn local_uuid_resolves_app_and_mirror_rungs() {
     let app = app().await;
-    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000)).await;
+    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000), 1).await;
     seed_media(&app, LOCAL_TRACK).await;
     let mirror = mirror().await;
     seed_recording(&mirror, SHORT_RECORDING, 61_000).await;
@@ -163,7 +171,7 @@ async fn local_uuid_resolves_app_and_mirror_rungs() {
 #[tokio::test]
 async fn recording_mbid_resolves_artifact_and_short_mirror() {
     let app = app().await;
-    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000)).await;
+    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000), 1).await;
     let mirror = mirror().await;
     seed_recording(&mirror, SHORT_RECORDING, 61_000).await;
     let (store, attempts) = meter_store(app, Ok(mirror));
@@ -212,7 +220,7 @@ async fn recording_mbid_without_artifact_uses_mirror_only() {
 #[tokio::test]
 async fn long_recording_never_falls_back_to_900() {
     let app = app().await;
-    seed_track(&app, LONG_TRACK, LONG_RECORDING, None).await;
+    seed_track(&app, LONG_TRACK, LONG_RECORDING, None, 2).await;
     let mirror = mirror().await;
     seed_recording(&mirror, LONG_RECORDING, 1_500_000).await;
     let (store, attempts) = meter_store(app, Ok(mirror));
@@ -257,7 +265,7 @@ async fn unknown_id_falls_back_without_error() {
 #[tokio::test]
 async fn unconfigured_mirror_degrades_without_attempt() {
     let app = app().await;
-    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000)).await;
+    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000), 1).await;
     let attempts = Rc::new(Cell::new(0));
     let store = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
     let meta = store.track_meter_meta(USER, LOCAL_TRACK).await.unwrap();
@@ -269,7 +277,7 @@ async fn unconfigured_mirror_degrades_without_attempt() {
 #[tokio::test]
 async fn configured_mirror_failure_never_degrades() {
     let app = app().await;
-    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000)).await;
+    seed_track(&app, LOCAL_TRACK, SHORT_RECORDING, Some(60_000), 1).await;
     let attempts = Rc::new(Cell::new(0));
     let store = catalogue_store_for_postgres_test(app, true, Err(StoreError), attempts.clone());
     assert!(store.track_meter_meta(USER, LOCAL_TRACK).await.is_err());
