@@ -48,8 +48,8 @@ def main(argv=None):
             active_pass = "effective"
             verify(args.root, effective, args.head_sha, manifest_text, coverage,
                    budget=budget, audit=outcomes["effective"])
-            active_pass = None
             budget.remaining(1)
+            active_pass = None
         else:
             coverage = api_coverage(files_text, metadata_text, args.base_sha, args.head_sha)
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text, coverage)
