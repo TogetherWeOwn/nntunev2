@@ -964,12 +964,35 @@ detector. Completed failed/cancelled promotion attempts are reported, but
 an attempt still waiting on an environment approval is not completed and
 is not detected by this observer. Do not claim unattended hold coverage.
 
-Read-only replay of a completed main-branch run:
-`GITHUB_REPOSITORY=TogetherWeOwn/nntunev2 python3 -I ci/incident_report.py --run-id <run-id> --dry-run`
-(with a granted `GITHUB_TOKEN`). Dry runs perform REST GETs and read-only
-GraphQL queries and print planned issue actions without writing. Superseded runs print `superseded` instead
-of replaying stale alerts. Offline API-fixture tests run in the required
-`release-proof` CI job; neither mode touches staging or production.
+For an authorized read-only assessment of a completed main-branch run,
+use the `gate-incidents.yml` manual dispatch on `main` with
+`mode=run-id-dry-run` and `run_id=<run-id>`. The ID must be a positive ASCII
+decimal without leading zeros, at most 20 digits. This uses the same trusted
+checkout, main-ref guard and `gate-incident-writer` serialization as normal
+reporting. It invokes the existing reporter with `--run-id` and **always**
+`--dry-run`; there is no dispatch boolean or mode that enables targeted writes.
+The default `mode=recent` requires an empty run ID and retains the scheduled
+one-hour reporting lane. Unsupported modes, ambiguous inputs and invalid IDs
+fail before invoking the reporter; they never fall back to writing.
+
+Dry runs perform REST GETs and read-only GraphQL queries. The Actions log keeps
+all planned issue actions, including unrelated gates and pending-delivery
+reconciliation, plus holds, supersession and refusal diagnostics; do not filter
+the report down to one alert. A read refusal fails the job, not a successful
+empty assessment. No observed source is executed and no artifacts are fetched.
+Offline selector and API-fixture tests run in the required `release-proof` CI
+job; neither reporting mode starts staging or production resources.
+
+This read-only route does not authorize a dispatch, a write-capable replay or
+incident closure. Before any separately admitted write route, verify the exact
+run/attempt/SHA, trusted reporter revision, newest qualifying evidence, complete
+all-state incident/pending intents and the entire action set under serialization.
+The historical CLI still supports writes; do not run it from a host to bypass
+the workflow or an incident hold. Legacy job success is not paid-product
+admission, safe-target qualification, measured counts/skip/budget or identity
+proof, nor bounded startup/use-window/cleanup evidence. Preserve each incident's
+recovery contract and qualification holds. A successful dry-run never triggers
+writes automatically, and an observer success alone is not verified recovery.
 
 ### Production seed precondition (one-time)
 
