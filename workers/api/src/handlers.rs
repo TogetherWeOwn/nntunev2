@@ -957,7 +957,8 @@ pub trait Store {
         }
     }
     /// Derivation metadata for one (user, track) pair
-    /// (`meter_sink::track_meter_meta_statement`); unknown or
+    /// (`meter_sink::track_meter_meta_app_statement` plus
+    /// `meter_sink::track_meter_meta_mirror_statement`); unknown or
     /// non-UUID tracks resolve to the all-`None` meta (the fallback
     /// rung), never an error — only a store failure errors. Default
     /// `Err` fails closed like [`Store::live_subscription`] (the sink
@@ -13303,6 +13304,37 @@ mod tests {
                 assert!(beat.get("lease_expires_at").is_none());
                 assert_eq!(h.store.playback_leases.borrow()["user-plays-1"], row);
             }
+        }
+    }
+
+    #[test]
+    fn play_continuation_uses_recording_duration_rung() {
+        // The recording-duration rung (the mirror probe) drives the
+        // deadline exactly like the artifact duration: a known short
+        // recording gets duration + slack, never the 900 s fallback,
+        // and a >900 s recording is not cut off before it finishes.
+        for (mb_duration_ms, expected_window) in [(60_000_u64, 60_u64), (1_500_000, 1500)] {
+            let h = play_harness();
+            let cookie = play_user(&h);
+            seed_entitled(&h, "user-plays-1", "plus", 1);
+            h.store.meter_meta.borrow_mut().insert(
+                ("user-plays-1".to_string(), "track-9".to_string()),
+                crate::meter_sink::TrackMeterMeta {
+                    mb_duration_ms: Some(mb_duration_ms),
+                    ..Default::default()
+                },
+            );
+            let started = play_call(
+                &h,
+                &cookie,
+                serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+            );
+            assert_eq!(started.status, 200, "{}", started.body);
+            let started: serde_json::Value = serde_json::from_str(&started.body).unwrap();
+            assert_eq!(
+                started["expires_at"],
+                NOW + expected_window + crate::playback::LEASE_TTL_SECS
+            );
         }
     }
 

@@ -2977,7 +2977,7 @@ impl Store for PgStore {
                 let client = self.connect().await?;
                 let rows = client
                     .query_typed(
-                        crate::meter_sink::track_meter_meta_statement(),
+                        crate::meter_sink::track_meter_meta_app_statement(),
                         &[(&track_id, Type::TEXT), (&user_id, Type::TEXT)],
                     )
                     .await
@@ -2985,18 +2985,24 @@ impl Store for PgStore {
                 if rows.len() > 1 {
                     return Err(StoreError);
                 }
-                let Some(row) = rows.first() else {
-                    return Ok(crate::meter_sink::TrackMeterMeta::default());
-                };
                 let u64_of_i32 = |v: Option<i32>| v.and_then(|v| u64::try_from(v).ok());
                 let u64_of_i64 = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+                let Some(row) = rows.first() else {
+                    // No artifact row: the playback id is the recording
+                    // MBID itself, so the mirror probe can still supply
+                    // the recording-duration rung.
+                    return Ok(crate::meter_sink::TrackMeterMeta {
+                        mb_duration_ms: self.mb_duration_for(track_id).await?,
+                        ..Default::default()
+                    });
+                };
+                let track_mbid: Option<String> =
+                    row.try_get("track_mbid").map_err(|_| StoreError)?;
                 Ok(crate::meter_sink::TrackMeterMeta {
                     track_duration_ms: u64_of_i32(
                         row.try_get("track_duration_ms").map_err(|_| StoreError)?,
                     ),
-                    mb_duration_ms: u64_of_i32(
-                        row.try_get("mb_duration_ms").map_err(|_| StoreError)?,
-                    ),
+                    mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
                     bitrate_kbps: u64_of_i32(row.try_get("bitrate_kbps").map_err(|_| StoreError)?),
                     file_bytes: u64_of_i64(row.try_get("file_bytes").map_err(|_| StoreError)?),
                 })
@@ -3004,6 +3010,40 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    /// Recording-duration rung for [`track_meter_meta`](Store::track_meter_meta):
+    /// the mirror probe for one recording MBID, or `None` without a
+    /// probe. An absent mirror binding degrades to `None` (the
+    /// derivation falls through to the media rungs), exactly like the
+    /// library read's no-enrichment mode; a configured mirror that
+    /// refuses never degrades, so a known duration is never silently
+    /// replaced by the unknown-duration fallback.
+    async fn mb_duration_for(&self, mbid: Option<&str>) -> Result<Option<u64>, StoreError> {
+        let Some(mbid) = mbid else {
+            return Ok(None);
+        };
+        if self.mirror_binding == MirrorBinding::Unconfigured {
+            return Ok(None);
+        }
+        let mirror = self.connect_mirror().await?;
+        let rows = mirror
+            .query_typed(
+                crate::meter_sink::track_meter_meta_mirror_statement(),
+                &[(&mbid, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if rows.len() > 1 {
+            return Err(StoreError);
+        }
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => Ok(row
+                .try_get("mb_duration_ms")
+                .map_err(|_| StoreError)?
+                .and_then(|v: i32| u64::try_from(v).ok())),
+        }
     }
 
     async fn record_play_window(

@@ -16,9 +16,10 @@
 //! union ([`crate::ledger::prepare_play_window`]) — client-reported
 //! play time is never an input — and written through the monotonic
 //! play-window upsert, so duplicate or stale flushes add zero.
-//! Track metadata for the derivation resolves via
-//! [`track_meter_meta_statement`]: the confirming file size prefers
-//! the stream-reported blob length, then the cached object's
+//! Track metadata for the derivation resolves via the app/mirror
+//! split in [`track_meter_meta_app_statement`] and
+//! [`track_meter_meta_mirror_statement`]: the confirming file size
+//! prefers the stream-reported blob length, then the cached object's
 //! `byte_size`; duration walks track → MusicBrainz recording →
 //! bitrate ([`crate::ledger::resolve_duration_ms`]).
 //!
@@ -113,20 +114,45 @@ pub enum PlayWindowOutcome {
     Fenced,
 }
 
-/// SQL for [`TrackMeterMeta`]: parameters track id as UUID text ($1)
-/// and user id ($2). At most one row (the track); the media rungs pick
-/// the caller's most recently verified media for the track. Column
-/// aliases match the struct fields. Callers only run this for
+/// App-side SQL for [`TrackMeterMeta`]: parameters track id as UUID
+/// text ($1) and user id ($2). App tables only (`tracks`,
+/// `track_media`, `cache_objects` are app-target; `mb_recording` is
+/// mirror-target and is never named here, so this runs on the app
+/// connection alone). The track resolves by local id **or** recording
+/// MBID: catalogue, library and track responses expose the recording
+/// MBID as the playback id, while artifact rows carry an independent
+/// local id (`tracks.id` vs `tracks.mbid`). An exact local-id match
+/// wins over a recording-MBID match when both namespaces collide,
+/// since the media rungs key off the artifact row. At most one row
+/// (the track); the media rungs pick the caller's most recently
+/// verified media for the track. `track_mbid` carries the resolved
+/// row's recording MBID for the caller's mirror probe
+/// ([`track_meter_meta_mirror_statement`]); it is internal plumbing,
+/// not a [`TrackMeterMeta`] field. Callers only run this for
 /// UUID-shaped track ids — a non-UUID track can still be metered on
 /// the fallback rung, so residency in `tracks` is never required.
-pub fn track_meter_meta_statement() -> &'static str {
-    "SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms, \
+pub fn track_meter_meta_app_statement() -> &'static str {
+    "SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid, \
      (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = $2 \
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps, \
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c \
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2 \
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes \
-     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid WHERE t.id = $1::uuid"
+     FROM tracks t WHERE t.id = $1::uuid OR t.mbid = $1::uuid \
+     ORDER BY (t.id = $1::uuid) DESC, t.id LIMIT 1"
+}
+
+/// Mirror-side SQL for [`TrackMeterMeta`]'s recording-duration rung:
+/// parameters the recording MBID as UUID text ($1). Mirror tables
+/// only (`mb_recording` is mirror-target); runs on the mirror
+/// connection. At most one row (the recording); zero rows means no
+/// known recording duration and the derivation falls through to the
+/// media rungs. Callers resolve the probe key from the app row's
+/// `track_mbid`, or — when no artifact row exists at all — from the
+/// playback id itself, which is then the recording MBID by
+/// construction.
+pub fn track_meter_meta_mirror_statement() -> &'static str {
+    "SELECT duration_ms AS mb_duration_ms FROM mb_recording WHERE mbid = $1::uuid"
 }
 
 /// True when `track_id` is shaped like the UUID `tracks.id` carries
@@ -357,19 +383,27 @@ mod tests {
     }
 
     #[test]
-    fn meta_statement_is_pinned() {
-        let sql = track_meter_meta_statement();
-        assert!(sql.contains("FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid"));
-        assert!(sql.contains("WHERE t.id = $1::uuid"));
-        assert!(sql.contains("m.user_id = $2"));
+    fn meta_statements_are_pinned() {
+        let app = track_meter_meta_app_statement();
+        // App-target tables only: no mirror relation may appear here,
+        // or the statement cannot plan on the app connection.
+        assert!(!app.contains("mb_recording"), "app statement names mirror");
+        assert!(app.contains("FROM tracks t"));
+        assert!(app.contains("WHERE t.id = $1::uuid OR t.mbid = $1::uuid"));
+        assert!(app.contains("ORDER BY (t.id = $1::uuid) DESC"));
+        assert!(app.contains("m.user_id = $2"));
         for alias in [
             "track_duration_ms",
-            "mb_duration_ms",
+            "track_mbid",
             "bitrate_kbps",
             "file_bytes",
         ] {
-            assert!(sql.contains(&format!("AS {alias}")), "{alias}");
+            assert!(app.contains(&format!("AS {alias}")), "{alias}");
         }
+        let mirror = track_meter_meta_mirror_statement();
+        assert!(mirror.contains("FROM mb_recording WHERE mbid = $1::uuid"));
+        assert!(mirror.contains("AS mb_duration_ms"));
+        assert!(!mirror.contains("tracks t"));
     }
 
     #[test]
