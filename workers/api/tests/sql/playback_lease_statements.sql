@@ -144,6 +144,17 @@ WITH got AS (
 )
 SELECT epoch INTO TEMP TABLE pls_dl_takeover FROM got;
 
+-- Abandoned lease before the continuation deadline: the lease bound alone
+-- refuses a touch, even while the immutable deadline is still ahead.
+UPDATE playback_leases SET expires_at = 3065 WHERE user_id = 'pls-deadline';
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = LEAST(playback_leases.continuation_until, GREATEST(playback_leases.expires_at, 3115)), updated_at = GREATEST(playback_leases.updated_at, 3070)
+    FROM (SELECT id FROM users WHERE id = 'pls-deadline' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-deadline' AND session_id = 'sess-b' AND play_id = 'play-b' AND epoch = 2 AND playback_leases.expires_at > 3070 AND playback_leases.continuation_until > 3070
+    RETURNING expires_at
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_dl_abandoned FROM touched;
+
 -- Legacy row (deadline 0, lease still fresh): a touch is refused and a
 -- different session may acquire immediately (fail closed).
 UPDATE playback_leases SET continuation_until = 0, expires_at = 9000
@@ -201,60 +212,63 @@ SELECT count(*) AS n INTO TEMP TABLE pls_touch_deleting FROM touched;
 
 DO $$
 BEGIN
-    IF (SELECT epoch FROM pls_got1) <> 1 THEN
+    IF (SELECT epoch FROM pls_got1) IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'first acquire must land at epoch 1';
     END IF;
-    IF (SELECT epoch FROM pls_got2) <> 2 THEN
+    IF (SELECT epoch FROM pls_got2) IS DISTINCT FROM 2 THEN
         RAISE EXCEPTION 'same-session re-acquire must bump the epoch';
     END IF;
-    IF (SELECT n FROM pls_got3) <> 0 THEN
+    IF (SELECT n FROM pls_got3) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'live lease must refuse another session (zero rows)';
     END IF;
-    IF (SELECT epoch FROM pls_got4) <> 3 THEN
+    IF (SELECT epoch FROM pls_got4) IS DISTINCT FROM 3 THEN
         RAISE EXCEPTION 'takeover must bump the epoch';
     END IF;
-    IF (SELECT n FROM pls_touch_stale) <> 0 THEN
+    IF (SELECT n FROM pls_touch_stale) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'displaced holder touch must not extend';
     END IF;
-    IF (SELECT expires_at FROM pls_touch_ok) <> 2100 THEN
+    IF (SELECT expires_at FROM pls_touch_ok) IS DISTINCT FROM 2100 THEN
         RAISE EXCEPTION 'holder touch must extend the lease';
     END IF;
-    IF (SELECT expires_at FROM pls_touch_reordered) <> 2100 THEN
+    IF (SELECT expires_at FROM pls_touch_reordered) IS DISTINCT FROM 2100 THEN
         RAISE EXCEPTION 'out-of-order touch must not shorten the stored deadline';
     END IF;
-    IF (SELECT n FROM pls_acquire_deleting) <> 0 THEN
+    IF (SELECT n FROM pls_acquire_deleting) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'acquire must refuse a deleting account (zero rows)';
     END IF;
-    IF (SELECT n FROM pls_touch_deleting) <> 0 THEN
+    IF (SELECT n FROM pls_touch_deleting) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'touch must refuse a deleting account (zero rows)';
     END IF;
-    IF (SELECT epoch FROM pls_got5) <> 4 THEN
+    IF (SELECT epoch FROM pls_got5) IS DISTINCT FROM 4 THEN
         RAISE EXCEPTION 'post-expiry acquire must bump the epoch';
     END IF;
     IF (SELECT session_id || ':' || play_id FROM playback_leases
-        WHERE user_id = 'pls-user') <> 'sess-3:play-4' THEN
+        WHERE user_id = 'pls-user') IS DISTINCT FROM 'sess-3:play-4' THEN
         RAISE EXCEPTION 'final holder must be the post-expiry acquirer';
     END IF;
 
-    IF (SELECT epoch FROM pls_dl_acquire) <> 1 THEN
+    IF (SELECT epoch FROM pls_dl_acquire) IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'deadline fixture first acquire must land at epoch 1';
     END IF;
-    IF (SELECT expires_at FROM pls_dl_clamped) <> 3060 THEN
+    IF (SELECT expires_at FROM pls_dl_clamped) IS DISTINCT FROM 3060 THEN
         RAISE EXCEPTION 'touch must clamp the lease to the continuation deadline';
     END IF;
-    IF (SELECT n FROM pls_dl_equal) <> 0 THEN
+    IF (SELECT n FROM pls_dl_equal) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'touch at the expiry/deadline instant must be refused';
     END IF;
-    IF (SELECT epoch FROM pls_dl_takeover) <> 2 THEN
+    IF (SELECT epoch FROM pls_dl_takeover) IS DISTINCT FROM 2 THEN
         RAISE EXCEPTION 'passed deadline must permit takeover by another session';
     END IF;
-    IF (SELECT n FROM pls_dl_legacy_touch) <> 0 THEN
+    IF (SELECT n FROM pls_dl_abandoned) IS DISTINCT FROM 0 THEN
+        RAISE EXCEPTION 'touch must refuse an abandoned lease before its continuation deadline';
+    END IF;
+    IF (SELECT n FROM pls_dl_legacy_touch) IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'legacy zero-deadline row must refuse touches';
     END IF;
-    IF (SELECT epoch FROM pls_dl_legacy_acquire) <> 3 THEN
+    IF (SELECT epoch FROM pls_dl_legacy_acquire) IS DISTINCT FROM 3 THEN
         RAISE EXCEPTION 'legacy zero-deadline row must be acquirable by another session';
     END IF;
-    IF (SELECT continuation_until FROM playback_leases WHERE user_id = 'pls-deadline') <> 3200 THEN
+    IF (SELECT continuation_until FROM playback_leases WHERE user_id = 'pls-deadline') IS DISTINCT FROM 3200 THEN
         RAISE EXCEPTION 'acquire must overwrite the continuation deadline';
     END IF;
 
@@ -269,7 +283,7 @@ BEGIN
 
     -- Plans-row caps read: the seeded plus row carries 100 h / 1 stream.
     IF (SELECT stream_hours_month || ':' || max_concurrent_streams
-        FROM plans WHERE id = 'plus') <> '100:1' THEN
+        FROM plans WHERE id = 'plus') IS DISTINCT FROM '100:1' THEN
         RAISE EXCEPTION 'plus caps row must read 100:1';
     END IF;
     IF EXISTS (SELECT 1 FROM plans WHERE id = 'no-such-plan') THEN

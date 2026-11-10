@@ -18,9 +18,10 @@
 //! session, same play, same track as the stored lease row — skips the
 //! subscription and cap gates: the track that crosses the cap (or whose
 //! subscription lapses mid-play) finishes, and seeks/refreshes within
-//! the current play stay allowed. The next new start is refused.
-//! Abuse of a continuation is bounded by the meter: one play id bills
-//! at most its track's duration + 2 s, however often it is refreshed.
+//! the current live play stay allowed up to its immutable continuation
+//! deadline. Grants cannot outlast that deadline. A new start always
+//! passes the gates again; one play id bills at most its track's
+//! duration + 2 s.
 //!
 //! Lease rules (one row per user, holder = client session id):
 //! - TTL [`LEASE_TTL_SECS`], client heartbeat every
@@ -32,9 +33,10 @@
 //!   the grant, so the displaced player's next heartbeat reports
 //!   `superseded` and it pauses itself. The hard guarantee is its next
 //!   grant request, which the lease gate refuses.
-//! - Expiry only frees the lease for OTHER sessions: the holding
-//!   session's row still matches, so its continuation/heartbeat after
-//!   a stall re-extends the same epoch instead of minting a new play.
+//! - Expiry or the continuation deadline frees the lease for every
+//!   session. A stalled holder starts a newly entitled play rather
+//!   than extending an elapsed lease. Retaining the row preserves
+//!   monotonically increasing epochs across abandoned plays.
 
 use crate::billing::{EffectivePlan, SubscriptionView};
 
