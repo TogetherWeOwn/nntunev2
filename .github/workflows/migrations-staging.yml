@@ -65,26 +65,26 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_VALUE_0: /dev/null
+          GIT_CONFIG_KEY_1: core.fsmonitor
+          GIT_CONFIG_VALUE_1: 'false'
+        working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          # Keep both coverage sources. Complete API pages cover net PR
-          # changes; the checker independently collects every per-parent
-          # Git rename, including files created then renamed within the PR.
-          # Metadata pins the API response and detects the 3000-file cap.
-          # Project only consumed fields before the bounded checker input:
-          # unrelated patches and PR bodies can exceed its byte budget.
-          # Keep every record and page boundary, including non-migrations;
-          # counts, truncation, rename paths and pinned SHAs still fail closed.
-          gh api "repos/$REPO/pulls/$PR_NUMBER" \
-            | jq -c '{base: {sha: .base.sha}, head: {sha: .head.sha}, changed_files}' \
-            > "$RUNNER_TEMP/pr-metadata.json"
-          gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
-            | jq -c 'map(map({filename, status} + (if has("previous_filename") then {previous_filename} else {} end)))' \
-            > "$RUNNER_TEMP/pr-files.json"
+          # B0 remains the only executable source. Bracket every complete
+          # attempt; B1 must retain event identities and descend from B0.
+          # Raw reads, projections, attempts and both Git passes share bounds.
+          python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from migration_snapshot import main; sys.exit(main())' \
+            "$GITHUB_WORKSPACE/trusted-checker/.github/scripts" \
+            --root "$GITHUB_WORKSPACE/pr-data" \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --event-file "$GITHUB_EVENT_PATH" --output-dir "$RUNNER_TEMP"
       - name: Check migration rename history
         if: github.event_name == 'pull_request'
         working-directory: ${{ runner.temp }}
@@ -109,9 +109,22 @@ jobs:
             --root "$GITHUB_WORKSPACE/pr-data" \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             --files-file "$RUNNER_TEMP/pr-files.json" \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --validation-output "$RUNNER_TEMP/pr-validation.json" \
             --metadata-file "$RUNNER_TEMP/pr-metadata.json" <<'PY'
           import sys
           sys.path.insert(0, sys.argv.pop(1))
           from migrations_rename_check import main
           sys.exit(main())
           PY
+      - name: Retain pinned snapshot and validation evidence
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: migration-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/pr-metadata.json
+            ${{ runner.temp }}/pr-files.json
+            ${{ runner.temp }}/pr-validation.json

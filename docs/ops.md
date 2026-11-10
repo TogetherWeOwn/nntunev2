@@ -474,11 +474,46 @@ unreachable/forged evidence, invalid path/type, or truncated API/Git
 input refuses. New metadata is proved in the PR that adds it; immutable
 base metadata retains that proof after squash merge, even though the
 original PR commits need not remain ancestors of the new default head.
+The API collector retains projected metadata before and after a complete
+file-list attempt, including every page and non-migration record. Both
+samples must agree on PR number, repository IDs/names, refs, commits and
+file count. An observed head change or retarget fails; it never adopts a
+live head. A recorded effective base B1 may equal the event base B0 or be
+its Git-verified descendant in the same repository/ref. Every observed base
+must also equal or descend from the preceding observation across brackets
+and attempts; an observed rewind or divergent transition is a hard failure.
+B1 need not be an ancestor of H. Its immutable object must be available in the full data
+checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
+fetch or trust-pin substitution. Missing/incompatible trusted B0 code also
+still fails; advancing the evidence base cannot recover absent executables.
+
+Validation independently runs the existing verifier on **both B0/H and
+B1/H**, each with its own unique merge-base manifest baseline. Only the
+second pass reconciles complete API migration coverage against the Git net
+diff; B1 never exempts chronological edges or history required by B0/H.
+Equal metadata brackets are not a transactional snapshot or proof against
+arbitrary ABA: pinned Git coverage rejects migration substitutions, but
+makes no independent authenticity claim for unrelated non-migration fields.
+The selected attempt, both projections, retained pages and both validation
+outcomes are retained as bounded Actions evidence for seven days. Handled
+validation errors retain each pass as `verified`, `failed` or `not_run`, plus
+a diagnostic capped at 1024 characters, without changing the nonzero exit.
+This fixed two-pass summary is emitted even when the shared evidence budget
+is exhausted; it performs no further Git or API reads. Process-launch or
+acquisition failures still fail the job; only evidence produced before that
+failure can be uploaded, never invented outcomes for a checker that did not run.
+
 `migration_history.py` declares hard bounds: 512 commits, 2048 edges,
 fewer than 3000 API files, 3000 migration paths per snapshot/diff,
-2 MB per input/blob, 8 MB per Git response, 128 MB aggregate Git output,
-100000 lineage states, 250000 event references, and 20 seconds per Git
-command. Exceeding a bound refuses rather than truncates evidence.
+2 MB per input/blob, 8 MB per raw API/Git response, 128 MB aggregate
+API/Git output, 100000 lineage states, 250000 event references, and
+20 seconds per Git command. Acquisition allows at most three whole
+attempts, 15 seconds per API request and a 60-second collection window;
+only a bracket mismatch retries, discarding all prior pages. Structural,
+identity, authorization, byte/cap or ancestry failures are hard failures.
+Retries and both history passes share one 180-second deadline/output
+allowance inside the five-minute job. Exceeding a bound refuses rather
+than truncates evidence. Full verification runs on GitHub Actions.
 
 Inside the existing advisory-locked apply transaction, rows under any
 historical source name are **deny-only** evidence: any non-permitted
