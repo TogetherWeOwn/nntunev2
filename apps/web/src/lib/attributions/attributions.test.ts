@@ -84,7 +84,14 @@ describe('attribution inventory v1', () => {
 		expect(validateAttributionInventory(duplicate)).toContain('entries[9].id is duplicated');
 	});
 
-	it.each(['', 'not a URL', '/relative', 'http://example.org', 'javascript:alert(1)', 'https://', 'https://user:pass@example.org', ' https://example.org'])(
+	it('rejects sparse holes in entries and evidence', () => {
+		expect(validateAttributionInventory({ schemaVersion: 1, entries: new Array(1) })).toContain('entries[0] must be an object');
+		const sparseEvidence = clone();
+		sparseEvidence.entries[0].evidence = new Array(1);
+		expect(validateAttributionInventory(sparseEvidence)).toContain('entries[0].evidence must contain repository references');
+	});
+
+	it.each(['', 'not a URL', '/relative', 'http://example.org', 'javascript:alert(1)', 'https://', 'https://user:pass@example.org', ' https://example.org', 'https:example.org/license', 'https:/example.org/license'])(
 		'rejects invalid provenance URL %s', (bad) => {
 			for (const field of ['sourceUrl', 'licenseUrl']) {
 				const value = clone();
