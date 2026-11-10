@@ -75,7 +75,7 @@ pub fn mirror_snapshot_digest(release_mbid: &str, recordings: &[MirrorRecording]
     canonical.push_str(&lines.join("\n"));
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn validate_snapshot(snapshot: &MirrorSnapshot) -> Result<(), EvidenceError> {
