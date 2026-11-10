@@ -167,9 +167,23 @@ discs and non-ASCII titles refuse. A job-wide 100,000 identity-comparison cap
 refuses the whole plan rather than returning a partial result on adversarial
 same-pair input. This is local-only preparation, not a mirror classifier or
 persisted result, and must not be mixed with verified matches.
-Full Unicode normalization, image validation/staging, mirror-occurrence dedup,
-resolved artist/release coalescing and durable position/classification freezing
-remain integration gates.
+
+`audio_classifications.rs` prepares a durable classification checkpoint for one
+accepted manifest, unmounted. Every entry is classified exactly once as
+all-local or verified mirror occurrence. A verified entry carries the recording
+and release MBIDs plus the hex SHA-256 digest of the exact mirror snapshot the
+occurrence was derived from, and its medium/track positions come only from that
+evidence; an all-local entry's positions come only from `audio_positions.rs` for
+its release group. Validated evidence must agree with any release-MBID hint in
+the manifest, and verified entries never share one release group with all-local
+entries — mixing refuses the whole checkpoint. Verified duplicates collapse on
+equal recording MBID (case-insensitive) and medium/track, with losers referencing
+the surviving lower ordinal directly. Legacy unfrozen manifests refuse; no
+winner is upgraded in place. This is preparation only: no caller stores the
+checkpoint, mints mirror evidence or enables publication.
+Full Unicode normalization, image validation/staging, resolved artist/release
+coalescing and durable position/classification freezing remain integration
+gates.
 
 This is unmounted preparation: no production caller freezes a manifest yet.
 The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
@@ -202,7 +216,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:46`). No ingest route
+  `src/lib.rs:48`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -216,7 +230,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:46`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:48`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -329,7 +343,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:53`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:55`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

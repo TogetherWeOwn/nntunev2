@@ -159,6 +159,14 @@ impl AcceptedAudioManifest {
         self.0.job_id == job_id && self.0.user_id == user_id
     }
 
+    pub fn job_id(&self) -> &str {
+        &self.0.job_id
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.0.user_id
+    }
+
     pub fn original_content_sha256(&self) -> &str {
         &self.0.original_content_sha256
     }
