@@ -112,9 +112,26 @@ readable but return no frozen discs: future position/dedup consumers must refuse
 them, not regenerate a durable winner or assume disc 1. No stored winner is
 upgraded in place.
 This implementation explicitly refuses non-ASCII grouping text rather than
-pretending Unicode lowercasing is case-folding. Full Unicode grouping, image
-validation/staging, surviving local track positions and post-match identity-gated
-dedup remain integration gates. No runtime producer invokes this candidate seam.
+pretending Unicode lowercasing is case-folding. No runtime producer invokes this
+candidate seam.
+
+`audio_positions.rs` prepares an all-local occurrence plan from a manifest with
+frozen effective discs. Within each release it collapses equal positive pairs
+only when local identity also agrees: nonempty normalized title plus duration
+within 2 seconds or 1% (symmetric, using the larger duration), equal nonempty
+fingerprints, or equal claimed recording MBIDs. Only surviving lower ordinals
+can win; tolerance chains through discarded copies cannot bridge identities.
+Any missing or contradictory surviving pair sends the entire release to
+`(1, audio_ordinal)`. Otherwise claimed pairs survive. Every file remains in the
+plan, and losers directly reference the lowest agreeing survivor and its final
+position; the original manifest and selectors are untouched. Unfrozen legacy
+discs and non-ASCII titles refuse. A job-wide 100,000 identity-comparison cap
+refuses the whole plan rather than returning a partial result on adversarial
+same-pair input. This is local-only preparation, not a mirror classifier or
+persisted result, and must not be mixed with verified matches.
+Full Unicode normalization, image validation/staging, mirror-occurrence dedup,
+resolved artist/release coalescing and durable position/classification freezing
+remain integration gates.
 
 This is unmounted preparation: no production caller freezes a manifest yet.
 The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
@@ -147,7 +164,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:42`). No ingest route
+  `src/lib.rs:43`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -161,7 +178,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:42`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:43`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -274,7 +291,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:49`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:50`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

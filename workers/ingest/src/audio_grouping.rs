@@ -33,7 +33,7 @@ enum CandidateKey {
     Single(u32),
 }
 
-fn text(raw: Option<&str>) -> Result<Option<String>, GroupingError> {
+pub(crate) fn text(raw: Option<&str>) -> Result<Option<String>, GroupingError> {
     let Some(raw) = raw else { return Ok(None) };
     if raw.len() > 4096 || raw.chars().any(char::is_control) {
         return Err(GroupingError::Manifest(ManifestError::Invalid));
