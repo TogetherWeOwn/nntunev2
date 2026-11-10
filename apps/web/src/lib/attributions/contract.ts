@@ -28,7 +28,11 @@ function httpsUrl(value: unknown): boolean {
 	// standalone `new URL` parse normalizes authority-less forms such as
 	// `https:example.org/...` to an HTTPS host, but a page using the
 	// original as an href would resolve them relative to its own URL.
-	if (!/^https:\/\//i.test(value)) return false;
+	// The negative lookahead also rejects an empty authority: WHATWG
+	// special-URL parsing skips extra separators, so `https:///…` or
+	// `https://\…` would otherwise promote the first path segment to
+	// the hostname while the stored value still has no explicit authority.
+	if (!/^https:\/\/(?![\/\\])/i.test(value)) return false;
 	try {
 		const url = new URL(value);
 		return url.protocol === 'https:' && !!url.hostname && !url.username && !url.password;
