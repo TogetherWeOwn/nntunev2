@@ -1157,7 +1157,15 @@ pub trait Store {
             self.revoke_session(id).await.map(|_| true)
         }
     }
-    fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Atomically revoke all sessions and native credentials for one owner.
+    /// Returns the number of newly revoked credentials, preserving timestamps
+    /// on already revoked rows. An empty owner revokes nothing. Must serialize
+    /// with credential issuance; composing two independent writes is not valid.
+    fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>>;
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -1435,12 +1443,14 @@ pub trait Store {
         async { Err(StoreError) }
     }
     /// Persist a freshly issued native REST credential row (migration
-    /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
-    /// never report a mint it did not durably record; production and the
-    /// test fake override it.
+    /// 0019) only while the issuing session is still live and belongs to the
+    /// credential owner. The check and insert must serialize with session
+    /// revocation and retain the account-deletion fence through commit.
+    /// Fail-closed default: an unprovisioned store never reports a mint.
     fn insert_native_credential(
         &self,
         _row: &NativeCredentialRow,
+        _session_id: &str,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Err(StoreError) }
     }
@@ -1478,19 +1488,6 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
-    }
-    /// Bulk revoke for the recovery/revoke-all path (ADR 0010: the
-    /// session-compromise response revokes every unrevoked row alongside
-    /// the sessions): transitions each live row for `user_id`, stamps the
-    /// transition with the store's wall-clock `now`, and returns how many
-    /// transitioned. An empty user id revokes nothing. Fail-closed
-    /// default is `0`; production and the test fake override it.
-    fn revoke_all_native_credentials(
-        &self,
-        _user_id: &str,
-        _now: u64,
-    ) -> impl Future<Output = Result<u64, StoreError>> {
-        async { Ok(0) }
     }
     /// Best-effort successful-use accounting (`last_used_at`): called by
     /// the bearer gate after authorization, its outcome never changes the
@@ -3623,30 +3620,17 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    // ADR 0010 session-compromise response: the same event revokes every
-    // unrevoked native REST credential alongside the sessions. Native
-    // credentials go first: if the session sweep then fails, the caller
-    // keeps a valid session and can retry, while already-revoked bearer
-    // keys fail closed. The reverse order would strand live bearer keys
-    // behind dead sessions with no retry path. The two sweeps are
-    // separate store calls (no cross-table transaction), so a failure
-    // between them returns 500 and the caller retries the whole event.
+    // ADR 0010: one committed event covers both sessions and credentials.
+    // On failure neither sweep commits; retain the cookie so the caller can
+    // retry. Audit success only after the store reports the committed result.
     let revoked_native = match ctx
         .store
-        .revoke_all_native_credentials(&claims.user_id, ctx.now)
+        .revoke_sessions_and_native_credentials(&claims.user_id, ctx.now)
         .await
     {
         Ok(revoked) => revoked,
         Err(_) => return internal(),
     };
-    if ctx
-        .store
-        .revoke_all_sessions(&claims.user_id)
-        .await
-        .is_err()
-    {
-        return internal();
-    }
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
     if revoked_native > 0 {
         ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
@@ -4169,7 +4153,12 @@ where
         created_from_ip: ctx.source_ip.clone(),
         last_used_at: None,
     };
-    if ctx.store.insert_native_credential(&row).await.is_err() {
+    if ctx
+        .store
+        .insert_native_credential(&row, &claims.session_id)
+        .await
+        .is_err()
+    {
         // A fenced insert (account being deleted) is the typed 409,
         // never the generic 500; anything else stays generic so a probe
         // failure cannot leak a new shape. Mirrors `vault_put` (ADR 0002
@@ -7248,6 +7237,8 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
+        revoke_session_before_mint: RefCell<bool>,
+        fail_bulk_revoke: RefCell<bool>,
         /// User ids that still own a legacy `provider_vaults` row. The
         /// product no longer reads or writes vaults; the reaper and
         /// magic admission keep protecting these accounts.
@@ -8222,21 +8213,29 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
-            for row in self.sessions.borrow_mut().values_mut() {
-                if row.user_id == user_id {
-                    row.revoked = true;
-                }
-            }
-            Ok(())
-        }
         async fn insert_native_credential(
             &self,
             row: &NativeCredentialRow,
+            session_id: &str,
         ) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's insert writes nothing and fails (ADR 0002 rule 3).
-            if self.deleting_users.borrow().contains(&row.record.user_id) {
+            // Pin a session transition after handler authentication.
+            if *self.revoke_session_before_mint.borrow() {
+                self.sessions
+                    .borrow_mut()
+                    .get_mut(session_id)
+                    .expect("mint must bind the authenticated session")
+                    .revoked = true;
+            }
+            // Mirror the production account and session fences.
+            if self.deleting_users.borrow().contains(&row.record.user_id)
+                || !self
+                    .sessions
+                    .borrow()
+                    .get(session_id)
+                    .is_some_and(|session| {
+                        session.user_id == row.record.user_id && !session.revoked
+                    })
+            {
                 return Err(StoreError);
             }
             let mut rows = self.native_credentials.borrow_mut();
@@ -8306,15 +8305,21 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_native_credentials(
+        async fn revoke_sessions_and_native_credentials(
             &self,
             user_id: &str,
             now: u64,
         ) -> Result<u64, StoreError> {
-            // Mirror the production statement: empty user revokes nothing
-            // (an upstream bug must never become a mass revocation).
+            if *self.fail_bulk_revoke.borrow() {
+                return Err(StoreError);
+            }
             if user_id.is_empty() {
                 return Ok(0);
+            }
+            for row in self.sessions.borrow_mut().values_mut() {
+                if row.user_id == user_id {
+                    row.revoked = true;
+                }
             }
             let mut revoked = 0;
             for row in self.native_credentials.borrow_mut().values_mut() {
@@ -18274,6 +18279,67 @@ mod tests {
         );
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows.len(), 1, "fenced mint stores nothing");
+    }
+
+    #[test]
+    fn credentials_mint_store_refusal_returns_no_secret_or_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        *h.store.revoke_session_before_mint.borrow_mut() = true;
+        let before = h.store.audits.borrow().len();
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("secret"));
+        assert!(!resp.body.contains("ntk_"));
+        assert!(h.store.native_credentials.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), before);
+    }
+
+    #[test]
+    fn session_revoke_all_failure_retains_cookie_and_writes_no_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let before = h.store.audits.borrow().len();
+        *h.store.fail_bulk_revoke.borrow_mut() = true;
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert_eq!(h.store.audits.borrow().len(), before);
+        assert!(h.store.sessions.borrow().values().all(|row| !row.revoked));
+        assert!(h
+            .store
+            .native_credentials
+            .borrow()
+            .values()
+            .all(|row| row.record.revoked_at.is_none()));
+        *h.store.fail_bulk_revoke.borrow_mut() = false;
+        let retry = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert_eq!(retry.set_cookie, Some(session::clear_cookie_header()));
     }
 
     #[test]
