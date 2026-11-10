@@ -921,6 +921,41 @@ impl PgStore {
         connected
     }
 
+    /// Recording-duration rung for [`track_meter_meta`](Store::track_meter_meta):
+    /// the mirror probe for one recording MBID, or `None` without a
+    /// probe. An absent mirror binding degrades to `None` (the
+    /// derivation falls through to the media rungs), exactly like the
+    /// library read's no-enrichment mode; a configured mirror that
+    /// refuses never degrades, so a known duration is never silently
+    /// replaced by the unknown-duration fallback.
+    async fn mb_duration_for(&self, mbid: Option<&str>) -> Result<Option<u64>, StoreError> {
+        let Some(mbid) = mbid else {
+            return Ok(None);
+        };
+        if self.mirror_binding == MirrorBinding::Unconfigured {
+            return Ok(None);
+        }
+        let mirror = self.connect_mirror().await?;
+        let rows = mirror
+            .query_typed(
+                crate::meter_sink::track_meter_meta_mirror_statement(),
+                &[(&mbid, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if rows.len() > 1 {
+            return Err(StoreError);
+        }
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => {
+                let duration: Option<i32> =
+                    row.try_get("mb_duration_ms").map_err(|_| StoreError)?;
+                Ok(duration.and_then(|v| u64::try_from(v).ok()))
+            }
+        }
+    }
+
     /// Map one `billing_operations` row to its single-flight shape: the
     /// payload fields parse tolerantly (a corrupt payload degrades to no
     /// reuse, never to a blocked flight).
@@ -3010,40 +3045,6 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
-    }
-
-    /// Recording-duration rung for [`track_meter_meta`](Store::track_meter_meta):
-    /// the mirror probe for one recording MBID, or `None` without a
-    /// probe. An absent mirror binding degrades to `None` (the
-    /// derivation falls through to the media rungs), exactly like the
-    /// library read's no-enrichment mode; a configured mirror that
-    /// refuses never degrades, so a known duration is never silently
-    /// replaced by the unknown-duration fallback.
-    async fn mb_duration_for(&self, mbid: Option<&str>) -> Result<Option<u64>, StoreError> {
-        let Some(mbid) = mbid else {
-            return Ok(None);
-        };
-        if self.mirror_binding == MirrorBinding::Unconfigured {
-            return Ok(None);
-        }
-        let mirror = self.connect_mirror().await?;
-        let rows = mirror
-            .query_typed(
-                crate::meter_sink::track_meter_meta_mirror_statement(),
-                &[(&mbid, Type::TEXT)],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        if rows.len() > 1 {
-            return Err(StoreError);
-        }
-        match rows.first() {
-            None => Ok(None),
-            Some(row) => Ok(row
-                .try_get("mb_duration_ms")
-                .map_err(|_| StoreError)?
-                .and_then(|v: i32| u64::try_from(v).ok())),
-        }
     }
 
     async fn record_play_window(
