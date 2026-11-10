@@ -309,6 +309,33 @@ class Collect(GitCase):
         (_, evidence), _ = self.collect(a, files(1), b, b, files(2), b)
         self.assertEqual(evidence["attempt"], 2)
 
+    def test_count_change_before_files_fetch_retries_only_valid_closing_count(self):
+        for opening_count, closing_count in ((1, 2), (2, 1)):
+            with self.subTest(opening=opening_count, closing=closing_count):
+                before = meta(base=self.base, head=self.head, count=opening_count)
+                after = meta(base=self.moved, head=self.head, count=closing_count)
+                records = files(closing_count)
+                (pages, evidence), script = self.collect(
+                    before, records, after, after, records, after)
+                self.assertEqual(evidence["attempt"], 2)
+                self.assertEqual(evidence["before"]["base"]["sha"], self.moved)
+                self.assertEqual(sum(map(len, pages)), closing_count)
+                self.assertEqual(script.items, [])
+
+        before = meta(base=self.base, head=self.head, count=1)
+        after = meta(base=self.moved, head=self.head, count=2)
+        for records, pattern in (
+                (files(3), "truncated or duplicated"),
+                (files(1) + files(1), "invalid or duplicate"),
+                ([{"filename": "docs/a.md", "status": "bogus"}] + files(1),
+                 "invalid or duplicate"),
+                ([{"filename": "migrations/0002_Bad-name.sql", "status": "added"}]
+                 + files(1), "invalid migration path")):
+            with self.subTest(pattern=pattern, records=records):
+                script = self.fails(pattern, before, records, after,
+                                    after, files(2), after)
+                self.assertEqual(len(script.paths), 3)
+
     def test_observed_rewinds_and_sibling_transitions_are_not_retried_away(self):
         (self.root / "next.txt").write_text("another advance\n")
         newest = self.commit("second advance")
