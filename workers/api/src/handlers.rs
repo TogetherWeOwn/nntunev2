@@ -245,6 +245,9 @@ pub struct Config {
     /// looked up by exact version (composite `UNIQUE (pepper_version,
     /// key_hmac)`, migration 0019).
     pub native_rest_pepper_version: u32,
+    /// Dedicated compatibility keyring, loaded only from the Worker secret.
+    /// Absent or invalid configuration disables issuance, not native routes.
+    pub subsonic_index: Option<crate::subsonic_config::SubsonicIndexConfig>,
     /// Stripe bearer secret (`STRIPE_SECRET_KEY` Worker secret), test mode
     /// only. `None` until the operator provisions it (see the Worker entry
     /// and `wrangler.toml.example`); unprovisioned, every Stripe-touching
@@ -340,6 +343,7 @@ impl Config {
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
+            subsonic_index: None,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             play_grant_secret: None,
@@ -1433,6 +1437,41 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
         async { Err(StoreError) }
+    }
+    /// Compatibility lifecycle is native-session-only. Implementations must
+    /// fence the live owner and commit before returning success; false means
+    /// no insert (deleting owner or active-credential limit). The default
+    /// cannot mint, list invented data, or claim a successful revocation.
+    fn insert_subsonic_credential(
+        &self,
+        _row: &crate::subsonic_lifecycle::PreparedCredential,
+        _session: &SessionClaims,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn subsonic_credentials_for_user(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError>>
+    {
+        async { Err(StoreError) }
+    }
+    fn revoke_subsonic_credential(
+        &self,
+        _id: &str,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Stores that enable compatibility issuance must include it in recovery.
+    /// The default is safe only because default issuance always refuses.
+    fn revoke_all_subsonic_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Ok(0) }
     }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
@@ -3640,6 +3679,14 @@ where
     };
     if ctx
         .store
+        .revoke_all_subsonic_credentials(&claims.user_id, ctx.now)
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    if ctx
+        .store
         .revoke_all_sessions(&claims.user_id)
         .await
         .is_err()
@@ -4017,6 +4064,9 @@ where
         Err(_) => unavailable(),
     }
 }
+
+#[path = "subsonic_handlers.rs"]
+mod subsonic_handlers;
 
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
@@ -6838,6 +6888,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plays"
             | "/v1/plays/heartbeat"
             | "/v1/credentials"
+            | "/v1/subsonic-credentials"
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
@@ -6876,6 +6927,9 @@ fn options_preflight_served(path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/v1/credentials/") {
         return !rest.is_empty() && !rest.contains('/');
+    }
+    if let Some(rest) = path.strip_prefix("/v1/subsonic-credentials/") {
+        return crate::meter_sink::is_uuid_shaped(rest);
     }
     // Playlist subpaths preflight only as single items: nested,
     // trailing-slash, or empty-segment shapes are denied before spend on
@@ -7051,6 +7105,11 @@ where
         // above never sees its Authorization header; it is absent
         // from `is_known_path` on purpose (no browser preflight).
         ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
+        ("POST", "/v1/subsonic-credentials") => subsonic_handlers::mint(ctx, req).await,
+        ("GET", "/v1/subsonic-credentials") => subsonic_handlers::list(ctx, req).await,
+        ("DELETE", path) if path.starts_with("/v1/subsonic-credentials/") => {
+            subsonic_handlers::revoke(ctx, req).await
+        }
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -7247,6 +7306,9 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
+        subsonic_credentials:
+            RefCell<HashMap<String, (String, crate::subsonic_lifecycle::ListedCredential)>>,
+        fail_subsonic_write: RefCell<bool>,
         /// User ids that still own a legacy `provider_vaults` row. The
         /// product no longer reads or writes vaults; the reaper and
         /// magic admission keep protecting these accounts.
@@ -8228,6 +8290,110 @@ mod tests {
                 }
             }
             Ok(())
+        }
+        async fn insert_subsonic_credential(
+            &self,
+            row: &crate::subsonic_lifecycle::PreparedCredential,
+            session: &SessionClaims,
+        ) -> Result<bool, StoreError> {
+            if !self
+                .sessions
+                .borrow()
+                .get(&session.session_id)
+                .is_some_and(|r| {
+                    !r.revoked
+                        && r.user_id == row.record.user_id
+                        && r.rotation_counter == session.rotation_counter
+                })
+            {
+                return Ok(false);
+            }
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let owner = &row.record.user_id;
+            if !self.users.borrow().contains_key(owner)
+                || self.deleting_users.borrow().contains(owner)
+            {
+                return Ok(false);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            if rows
+                .values()
+                .filter(|(u, r)| u == owner && r.revoked_at.is_none())
+                .count()
+                >= 32
+            {
+                return Ok(false);
+            }
+            rows.insert(
+                row.record.id.clone(),
+                (
+                    owner.clone(),
+                    crate::subsonic_lifecycle::ListedCredential {
+                        id: row.record.id.clone(),
+                        label: row.label.clone(),
+                        auth_mode: match row.record.auth_mode {
+                            crate::subsonic_auth::AuthMode::ApiKey => "apikey",
+                            crate::subsonic_auth::AuthMode::Token => "token",
+                            crate::subsonic_auth::AuthMode::Both => "both",
+                        }
+                        .to_string(),
+                        created_at: row.created_at,
+                        last_used_at: None,
+                        revoked_at: None,
+                    },
+                ),
+            );
+            Ok(true)
+        }
+        async fn subsonic_credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+            Ok(self
+                .subsonic_credentials
+                .borrow()
+                .values()
+                .filter(|(u, _)| u == user_id)
+                .map(|(_, r)| r.clone())
+                .collect())
+        }
+        async fn revoke_subsonic_credential(
+            &self,
+            id: &str,
+            user_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            let Some((u, row)) = rows.get_mut(id) else {
+                return Ok(false);
+            };
+            if u != user_id {
+                return Ok(false);
+            }
+            row.revoked_at.get_or_insert(now);
+            Ok(true)
+        }
+        async fn revoke_all_subsonic_credentials(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut count = 0;
+            for (u, row) in self.subsonic_credentials.borrow_mut().values_mut() {
+                if u == user_id && row.revoked_at.is_none() {
+                    row.revoked_at = Some(now);
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
         async fn insert_native_credential(
             &self,
@@ -15505,6 +15671,241 @@ mod tests {
     }
 
     // --- Native REST credentials (ADR 0010) -------------------------------------
+
+    fn subsonic_harness() -> Harness {
+        let mut h = harness();
+        h.config.subsonic_index = Some(
+            crate::subsonic_config::SubsonicIndexConfig::parse(
+                &serde_json::json!({"current_version":1,"keys":{"1":crate::b64::encode(&[7;32])}})
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        h
+    }
+
+    fn subsonic_mint(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/subsonic-credentials",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    #[test]
+    fn subsonic_lifecycle_show_once_listing_and_owner_revocation() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let foreign = magic_login(&h, "b@example.com");
+        for mode in ["apikey", "token", "both"] {
+            let response = subsonic_mint(
+                &h,
+                &cookie,
+                serde_json::json!({"label":"client", "auth_mode":mode}),
+            );
+            assert_eq!(response.status, 201, "{}", response.body);
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            let id = value["id"].as_str().unwrap();
+            assert_eq!(value["api_key"].is_string(), mode != "token");
+            assert_eq!(value["token_secret"].is_string(), mode != "apikey");
+            let listing = h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None,
+            );
+            assert_eq!(listing.status, 200);
+            assert!(
+                !listing.body.contains("username")
+                    && !listing.body.contains("secret")
+                    && !listing.body.contains("api_key")
+            );
+            for key in ["username", "api_key", "token_secret"] {
+                if let Some(s) = value[key].as_str() {
+                    assert!(!listing.body.contains(s));
+                    assert!(!format!("{:?}", h.store.audits.borrow()).contains(s));
+                }
+            }
+            let path = format!("/v1/subsonic-credentials/{id}");
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(foreign.clone()), Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.store.subsonic_credentials.borrow()[id].1.revoked_at,
+                Some(NOW)
+            );
+        }
+        let listing = h.call_full("GET", "/v1/subsonic-credentials", None, Some(foreign), None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&listing.body).unwrap()["credentials"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn subsonic_lifecycle_requires_native_fresh_session_and_origin() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/subsonic-credentials".into(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"label":"client"}"#.to_vec(),
+        };
+        let ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".into(),
+        };
+        let response = block_on(handle(&ctx, &req));
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("reauth_required"));
+        req.origin = None;
+        assert_ne!(
+            h.call_full(
+                "POST",
+                &req.path,
+                Some("{\"label\":\"client\"}".into()),
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            201
+        );
+        req.cookie = None;
+        req.authorization = Some("Bearer nsk_not_a_session".into());
+        req.origin = Some(ORIGIN.into());
+        assert_ne!(block_on(handle(&ctx, &req)).status, 201);
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+        req.method = "GET".into();
+        req.cookie = Some(cookie);
+        req.authorization = None;
+        assert_eq!(block_on(handle(&ctx, &req)).status, 200);
+    }
+
+    #[test]
+    fn subsonic_lifecycle_refuses_unconfigured_invalid_and_failed_writes() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            503
+        );
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for body in [
+            serde_json::json!({"label":"client","auth_mode":"native"}),
+            serde_json::json!({"label":"x".repeat(65)}),
+            serde_json::json!({"label":"client","scope":"native-rest"}),
+            serde_json::json!({"label":""}),
+        ] {
+            assert_eq!(subsonic_mint(&h, &cookie, body).status, 422);
+        }
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        let response = subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"}));
+        assert_eq!(response.status, 500);
+        assert!(
+            !response.body.contains("nsk_")
+                && !response.body.contains("nst_")
+                && !response.body.contains("nsu_")
+        );
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+    }
+
+    #[test]
+    fn subsonic_lifecycle_cap_deletion_and_recovery_are_fail_closed() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for _ in 0..32 {
+            assert_eq!(
+                subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+                201
+            );
+        }
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            422
+        );
+        h.store.deleting_users.borrow_mut().insert("u1".into());
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            409
+        );
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN)
+            )
+            .status,
+            500
+        );
+        assert_eq!(
+            h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            200
+        );
+        *h.store.fail_subsonic_write.borrow_mut() = false;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+        assert!(h
+            .store
+            .subsonic_credentials
+            .borrow()
+            .values()
+            .all(|(_, r)| r.revoked_at == Some(NOW)));
+    }
 
     fn peppered_cfg() -> Config {
         cfg().with_native_rest_pepper(vec![7u8; 32], 1)

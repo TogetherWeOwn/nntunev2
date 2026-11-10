@@ -42,6 +42,8 @@ pub mod session_retry_store;
 pub mod stripe;
 pub mod subsonic_auth;
 pub mod subsonic_config;
+pub mod subsonic_http;
+pub mod subsonic_lifecycle;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;

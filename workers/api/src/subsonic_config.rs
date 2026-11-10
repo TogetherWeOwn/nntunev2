@@ -214,6 +214,14 @@ impl SubsonicIndexConfig {
         self.previous.as_ref().map(|p| p.0)
     }
 
+    /// New credentials are indexed only under the current version.
+    pub fn current_pepper(&self) -> Pepper<'_> {
+        Pepper {
+            version: self.current_version,
+            bytes: &self.current_key,
+        }
+    }
+
     /// Borrowing view for the auth core. The keyring holds no copy.
     pub fn keyring(&self) -> Result<IndexKeyring<'_>, AuthError> {
         IndexKeyring::new(
@@ -248,7 +256,7 @@ mod tests {
     }
 
     fn err(s: &str) -> ConfigError {
-        SubsonicIndexConfig::parse(s).err().expect("must fail")
+        SubsonicIndexConfig::parse(s).expect_err("must fail")
     }
 
     #[test]

@@ -18,6 +18,44 @@ acceptance checklist. Results are recorded here when the staging run lands
   Run only in an approved staging qualification window; the probes below are
   a procedure, not permission to contact a live service.
 
+## Credential lifecycle (implementation; not staging evidence)
+
+The native, session-only `/v1/subsonic-credentials` collection supports:
+
+- `POST`: a fresh session (the native 600-second privilege window) and exact
+  Origin are required. The JSON body contains a non-empty `label` (trimmed,
+  at most 64 bytes, no control characters) and optional `auth_mode`:
+  `apikey` (default), `token` or `both`. The generated username and applicable
+  API key/token secret are shown only in the successful 201 response, after
+  the database transaction commits. Responses are private/no-store.
+- `GET`: an ordinary session lists at most 100 metadata rows, active first.
+  No username, API key, HMAC, token secret or encrypted envelope is listed.
+- `DELETE /v1/subsonic-credentials/{id}`: fresh session plus exact Origin;
+  owner-only, idempotent revocation. Foreign and unknown IDs return the
+  same 404. Reissue by creating a new credential then revoking the old one;
+  lost secrets cannot be recovered.
+
+The per-owner active limit is 32, serialized in the same transaction as the
+insert. Issuance rechecks the selected live session and account under lock.
+Session-compromise recovery also revokes compatibility credentials; its
+production transaction revokes sessions and compatibility keys together,
+so a session read before recovery cannot mint a key after that commit.
+
+`SUBSONIC_INDEX_PEPPER` is read only as a Worker secret, never an ordinary
+var or the native REST pepper. Its format is the bounded versioned keyring
+in `workers/api/src/subsonic_config.rs`. Missing or invalid configuration
+refuses issuance with 503 without exposing secret details or taking other
+native routes down. Token modes reuse the exact-version vault KEK set and
+the row/field-bound v2 envelope. No provisioning, credential generation or
+migration application is authorized by this procedure.
+
+The draft still mounts the empty compatibility store on `/rest/*`;
+credentials created through these native endpoints do not yet enable
+browsing or playback. The duplicate-rejecting query/form parser is written
+but is not yet mounted. Its eventual transport must reject duplicate auth
+parameters, including encoded names and copies split across query/form,
+before constructing credentials.
+
 ## Checklist
 
 | # | Client | Steps | Expect |

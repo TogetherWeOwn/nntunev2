@@ -23,7 +23,10 @@ async fn database() -> Client {
     client
         .batch_execute(
             "SET search_path = pg_temp;
-        CREATE TEMP TABLE users (id TEXT PRIMARY KEY, deleting_at TIMESTAMPTZ);",
+        CREATE TEMP TABLE users (id TEXT PRIMARY KEY, deleting_at TIMESTAMPTZ);
+        CREATE TEMP TABLE sessions (LIKE public.sessions INCLUDING ALL);
+        INSERT INTO sessions (id,user_id,created_at,expires_at,rotation_counter,revoked)
+        VALUES ('test-session','subsonic-test-owner',100,1000,0,false);",
         )
         .await
         .unwrap();
@@ -223,6 +226,182 @@ async fn failed_commit_does_not_report_success_or_persist_last_used() {
         .unwrap()
         .get(0);
     assert!(untouched);
+}
+
+fn claims() -> crate::session::SessionClaims {
+    crate::session::SessionClaims {
+        session_id: "test-session".into(),
+        user_id: USER.into(),
+        created_at: 100,
+        issued_at: 100,
+        expires_at: 1000,
+        rotation_counter: 0,
+    }
+}
+
+fn prepared(mode: AuthMode) -> crate::subsonic_lifecycle::IssuedCredential {
+    crate::subsonic_lifecycle::issue(
+        USER,
+        "test client",
+        mode,
+        120,
+        &crate::native_rest::Pepper {
+            version: 1,
+            bytes: &[7; 32],
+        },
+        1,
+        &[8; 32],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lifecycle_persists_all_modes_and_owner_scoped_sticky_revocation() {
+    let mut client = database().await;
+    for mode in [AuthMode::ApiKey, AuthMode::Token, AuthMode::Both] {
+        let issued = prepared(mode);
+        let s = &issued.prepared.record;
+        assert!(insert(&mut client, &issued.prepared, &claims())
+            .await
+            .unwrap());
+        let selected = lookup(&mut client, None, &s.username)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.auth_mode, mode);
+        assert_eq!(selected.api_key_hmac, s.api_key_hmac);
+        assert_eq!(selected.token.is_some(), s.token.is_some());
+        let listing = list(&mut client, USER).await.unwrap();
+        let row = listing.iter().find(|r| r.id == s.id).unwrap();
+        assert_eq!(row.created_at, 120);
+        assert_eq!(row.label, "test client");
+        let json = serde_json::to_string(row).unwrap();
+        assert!(!json.contains(&s.username));
+        assert!(!json.contains("hmac") && !json.contains("token_secret"));
+        assert_eq!(
+            revoke(&mut client, Some(&s.id), "foreign-owner", 121)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(lookup(&mut client, None, &s.username)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            revoke(&mut client, Some(&s.id), USER, 121).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            revoke(&mut client, Some(&s.id), USER, 122).await.unwrap(),
+            1
+        );
+        assert!(lookup(&mut client, None, &s.username)
+            .await
+            .unwrap()
+            .is_none());
+        let listing = list(&mut client, USER).await.unwrap();
+        assert_eq!(
+            listing.iter().find(|r| r.id == s.id).unwrap().revoked_at,
+            Some(121)
+        );
+    }
+    assert!(list(&mut client, "foreign-owner").await.unwrap().is_empty());
+    revoke(&mut client, None, USER, 123).await.unwrap();
+    assert!(
+        !insert(&mut client, &prepared(AuthMode::Both).prepared, &claims())
+            .await
+            .unwrap()
+    );
+    assert!(client
+        .query_one("SELECT revoked FROM sessions", &[])
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    assert!(list(&mut client, USER)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.revoked_at.is_some()));
+}
+
+#[tokio::test]
+async fn lifecycle_active_cap_and_deleting_owner_refuse_issuance() {
+    let mut client = database().await;
+    client
+        .batch_execute("UPDATE sessions SET rotation_counter = 1")
+        .await
+        .unwrap();
+    assert!(
+        !insert(&mut client, &prepared(AuthMode::ApiKey).prepared, &claims())
+            .await
+            .unwrap()
+    );
+    client
+        .batch_execute("UPDATE sessions SET rotation_counter = 0")
+        .await
+        .unwrap();
+    for _ in 1..MAX_ACTIVE_CREDENTIALS {
+        assert!(
+            insert(&mut client, &prepared(AuthMode::ApiKey).prepared, &claims())
+                .await
+                .unwrap()
+        );
+    }
+    let extra = prepared(AuthMode::Both);
+    assert!(!insert(&mut client, &extra.prepared, &claims())
+        .await
+        .unwrap());
+    assert_eq!(
+        list(&mut client, USER).await.unwrap().len(),
+        MAX_ACTIVE_CREDENTIALS as usize
+    );
+    revoke(&mut client, Some(ID), USER, 121).await.unwrap();
+    assert!(insert(&mut client, &extra.prepared, &claims())
+        .await
+        .unwrap());
+    client
+        .batch_execute("UPDATE users SET deleting_at = now()")
+        .await
+        .unwrap();
+    assert!(
+        !insert(&mut client, &prepared(AuthMode::Token).prepared, &claims())
+            .await
+            .unwrap()
+    );
+    assert!(list(&mut client, USER).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn lifecycle_failed_commit_never_reports_issue_or_revoke_success() {
+    let mut client = database().await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION pg_temp.reject_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'test commit failure'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_lifecycle AFTER INSERT OR UPDATE ON subsonic_credentials
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_lifecycle()",
+        )
+        .await
+        .unwrap();
+    let issued = prepared(AuthMode::Both);
+    assert!(insert(&mut client, &issued.prepared, &claims())
+        .await
+        .is_err());
+    assert!(lookup(&mut client, None, &issued.prepared.record.username)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(revoke(&mut client, Some(ID), USER, 121).await.is_err());
+    assert!(lookup(&mut client, None, "generated-client")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(list(&mut client, USER)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.revoked_at.is_none()));
 }
 
 #[tokio::test]
