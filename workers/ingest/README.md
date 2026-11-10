@@ -57,6 +57,34 @@ NZB upload ───────────────────────
   `conflict` (nothing is enqueued then either; the failure stays readable
   via the job status).
 
+## Accepted audio manifest preparation
+
+`audio_manifest.rs` defines a private, versioned checkpoint contract for selected
+files, separate audio-only ordinals, independent artist/release grouping hints
+and hash-deduplicated staged-art descriptors. Source selectors refer to the
+retained job/hash-bound original NZB plus its file/member/audio selection, never
+an expiring URL. Structural acceptance does not verify file tags, MusicBrainz
+occurrences, image pixels or source provenance. The producer must establish those
+facts at their respective trust boundaries.
+
+`JobCheckpoint::freeze_audio_manifest` accepts the first selection only in
+`Matching`; retry and manual redrive preserve it and refuse a changed selection.
+Private storage checks its job/user binding, keeps manifest-bearing checkpoints
+without the legacy 30-day expiry, and omits the manifest from public job status
+and Debug output. Legacy checkpoints remain readable with no manifest and retain
+their existing TTL. Missing manifests must not be reconstructed from positional
+recording arrays for normalized writes.
+
+This is non-behavioural preparation: no production caller freezes a manifest yet.
+The freeze guard is checkpoint-local; KV has no compare-and-swap. Production
+integration must establish serialized durable first acceptance across concurrent
+deliveries before mirror lookup, not assume that the in-memory guard provides it.
+Tag/fingerprint extraction, the specified grouping/dedup algorithm, persisted
+classifications and trusted mirror snapshots, original-selector resolution,
+normalized SQL publication, retention cleanup and lifetime source sealing remain
+integration work. No membership, cover-art byte acquisition or caching is added.
+AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
+
 ## Security rules
 
 - `indexer_ref` is an opaque vault handle. Raw indexer/provider keys are
