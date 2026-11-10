@@ -27,6 +27,9 @@ def main(argv=None):
     parser.add_argument("--manifest", default="migrations/manifest.toml")
     parser.add_argument("--output", help="write verified chronological edges, never ledger rows")
     args = parser.parse_args(argv)
+    outcomes = {"event": {"outcome": "not_run"}, "effective": {"outcome": "not_run"}}
+    active_pass = None
+    status = 0
     try:
         files_text, metadata_text = read_input(args.files_file), read_input(args.metadata_file)
         manifest_text = read_input(args.root / args.manifest)
@@ -36,25 +39,42 @@ def main(argv=None):
             expected = event_metadata(args.event_file, args.base_sha, args.head_sha)
             effective, coverage = snapshot_coverage(args.root, args.base_sha, args.head_sha,
                                                     files_text, metadata_text, expected, budget)
-            outcomes = {"event": {}, "effective": {}}
+            for name, base in (("event", args.base_sha), ("effective", effective)):
+                outcomes[name].update(base=base, head=args.head_sha)
             # Never let B1 absorb an event-range edge or the original baseline.
+            active_pass = "event"
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text,
                            budget=budget, audit=outcomes["event"])
+            active_pass = "effective"
             verify(args.root, effective, args.head_sha, manifest_text, coverage,
                    budget=budget, audit=outcomes["effective"])
             budget.remaining(1)
-            if args.validation_output:
-                pathlib.Path(args.validation_output).write_text(json.dumps(outcomes, indent=2) + "\n",
-                                                               encoding="utf-8")
-            print("migrations-staging: dual history validation " + json.dumps(outcomes, sort_keys=True))
+            active_pass = None
         else:
             coverage = api_coverage(files_text, metadata_text, args.base_sha, args.head_sha)
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text, coverage)
+    except (HistoryError, OSError, UnicodeError) as exc:
+        diagnostic = str(exc)[:1024]
+        if active_pass:
+            outcomes[active_pass]["outcome"] = "failed"
+        outcomes["diagnostic"] = diagnostic
+        print(f"migrations-staging: {diagnostic}", file=sys.stderr)
+        status = 1
+    try:
+        if args.event_file:
+            # A fixed two-pass summary and capped diagnostic survive even an
+            # exhausted evidence budget; no more Git/API reads occur here.
+            report = json.dumps(outcomes, sort_keys=True)
+            print("migrations-staging: dual history validation " + report)
+            if args.validation_output:
+                pathlib.Path(args.validation_output).write_text(report + "\n", encoding="utf-8")
+        if status:
+            return status
         if args.output:
             # Event count and field lengths are bounded by verification.
             pathlib.Path(args.output).write_text(json.dumps(edges, indent=2) + "\n", encoding="utf-8")
-    except (HistoryError, OSError, UnicodeError) as exc:
-        print(f"migrations-staging: {exc}", file=sys.stderr)
+    except (OSError, UnicodeError) as exc:
+        print(f"migrations-staging: {str(exc)[:1024]}", file=sys.stderr)
         return 1
     print("migrations-staging: pinned Git source lineage and applied aliases verified")
     return 0
