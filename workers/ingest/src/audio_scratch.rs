@@ -84,7 +84,8 @@ impl<S: ScratchPrefixStore, D: Future<Output = ()> + Unpin> ScratchAudioReader<S
             if !record.spool.is_empty() {
                 return Err(SelectionError::Unsupported);
             }
-            if record.key != VerifyProgress::file_key(job_id, progress.round, index, &file.name)
+            let name = file.filename.as_deref().unwrap_or(&file.subject);
+            if record.key != VerifyProgress::file_key(job_id, progress.round, index, name)
                 || record.size == 0
                 || record.size > MAX_ASSEMBLED_BYTES
                 || record.sha256.len() != 64
@@ -255,7 +256,7 @@ impl ScratchPrefixStore for R2ScratchPrefixes {
             let object = self
                 .bucket
                 .get(expected.key.clone())
-                .range(worker::r2::Range::OffsetWithLength {
+                .range(worker::Range::OffsetWithLength {
                     offset: 0,
                     length: length as u64,
                 })
@@ -271,8 +272,8 @@ impl ScratchPrefixStore for R2ScratchPrefixes {
                 return Err(());
             }
             let (range_offset, range_length) = match object.range().map_err(|_| ())? {
-                worker::r2::Range::OffsetWithLength { offset, length } => (offset, length),
-                worker::r2::Range::Prefix { length } => (0, length),
+                worker::Range::OffsetWithLength { offset, length } => (offset, length),
+                worker::Range::Prefix { length } => (0, length),
                 _ => return Err(()),
             };
             Ok(ScratchPrefixResponse {
