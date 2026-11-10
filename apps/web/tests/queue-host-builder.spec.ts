@@ -290,7 +290,9 @@ for (const playing of [false, true]) {
 			const controls = async () => {
 				await expect(page.locator('[data-player-transport]')).toHaveCount(1);
 				await expect(page.getByTestId('player-next')).toHaveCount(1);
-				await expect(page.getByTestId('player-next')).toBeVisible();
+				// Compact full controls are display:none per C3; the control stays
+				// mounted and enabled, and the mini row remains the visible surface.
+				await expect(page.getByTestId('player-next')).toBeHidden();
 				await expect(page.getByTestId('player-next')).toBeEnabled();
 				await expect(page.getByRole('button', { name: 'Previous track', exact: true })).toBeEnabled();
 				return page.locator('[data-player-transport] button:not([data-testid="player-favorite"])').evaluateAll((nodes) => nodes.map((node) => ({

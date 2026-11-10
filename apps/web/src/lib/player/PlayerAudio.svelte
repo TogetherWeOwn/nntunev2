@@ -66,6 +66,7 @@
 	.mini-hint p { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 	.mini-progress { display: none; }
 	@media (max-width: 799px) {
+		.mini-hint { position: sticky; bottom: var(--nt-control); z-index: var(--nt-z-player); height: var(--nt-control-lg); background: var(--nt-bg-raised); border-top: 1px solid var(--nt-border); }
 		.mini-progress { position: absolute; inset: 0 0 auto; display: block; height: var(--nt-space-px-2); background: var(--nt-border); pointer-events: none; }
 		.mini-progress span { display: block; height: 100%; background: var(--nt-accent); }
 	}

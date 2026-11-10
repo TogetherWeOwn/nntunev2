@@ -281,11 +281,12 @@ for (const width of [390, 1280]) {
 		await page.getByTestId('player-queue-toggle').click();
 		await expect.poll(() => page.evaluate(() => typeof (window as unknown as { releaseCinema?: () => void }).releaseCinema)).toBe('function');
 		await page.goBack();
-		await expect(page).toHaveURL(/\/library$/);
+		// Now Playing is a real route (C1), so Back lands on /home.
+		await expect(page).toHaveURL(/\/home$/);
 		await page.evaluate(() => (window as unknown as { releaseCinema: () => void }).releaseCinema());
 		await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
 		await expect(page.getByTestId('player-queue-toggle')).toHaveAttribute('aria-expanded', 'false');
-		await expect(page).toHaveURL(/\/library$/);
+		await expect(page).toHaveURL(/\/home$/);
 		await expect(page.getByTestId('queue-panel')).toHaveCount(0);
 		await expect(audio).toHaveJSProperty('paused', true);
 		expect(errors).toEqual([]);
@@ -725,6 +726,11 @@ for (const width of [1280, 390, 320]) {
 	test(`populated transport and help have no serious accessibility violations at ${width}px`, async ({ page }) => {
 		await page.setViewportSize({ width, height: 800 });
 		const { errors } = await openTransport(page, { playing: false });
+		// On compact widths the full controls live in the Now Playing view (C3).
+		if (width < 800) {
+			await page.getByTestId('player-now-playing-toggle').click();
+			await expect(page.getByTestId('now-playing-route')).toBeVisible();
+		}
 		await page.getByTestId('player-bar').scrollIntoViewIfNeeded();
 		const bar = page.getByTestId('player-bar');
 		expect(await bar.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
@@ -746,6 +752,11 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.addInitScript((appearance) => localStorage.setItem('nntune:appearance:v1', appearance), theme);
 			const { audio, errors } = await openTransport(page, { playing: false });
 			await expect(page.locator('html')).toHaveAttribute('data-appearance', theme);
+			// On compact widths the stencil controls live in the Now Playing view (C3).
+			if (width < 800) {
+				await page.getByTestId('player-now-playing-toggle').click();
+				await expect(page.getByTestId('now-playing-route')).toBeVisible();
+			}
 			const bar = page.getByTestId('player-bar');
 			async function stencil(button: Locator, name: IconName) {
 				const svg = button.locator('svg');

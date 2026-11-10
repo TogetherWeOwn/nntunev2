@@ -94,6 +94,11 @@
 			return;
 		}
 		if (event.altKey || event.ctrlKey || event.metaKey) return;
+		if (event.key === 'Escape' && fullscreen.active) {
+			event.preventDefault();
+			void fullscreenController?.exit();
+			return;
+		}
 		// Space still activates a focused native button/link; only passive
 		// player/main surfaces get the global transport equivalent.
 		const target = event.target instanceof HTMLElement ? event.target : null;
@@ -292,16 +297,13 @@
 	select { min-height: var(--nt-control); background: var(--nt-bg); color: var(--nt-fg); border: 1px solid var(--nt-border); border-radius: var(--nt-radius-sm); padding: var(--nt-space-2); font: inherit; }
 	:where(button, input, summary, select):focus-visible { outline: var(--nt-focus-ring-width) solid var(--nt-focus-ring); outline-offset: var(--nt-focus-ring-offset); }
 	@media (max-width: 799px) {
-		section:not(.expanded) { display: block; padding: 0; border-top: 0; background: none; }
+		/* The section is the sticky element: a sticky child inside a
+		 * 56px-tall section cannot stick beyond it. */
+		section:not(.expanded) { position: sticky; bottom: var(--nt-control); z-index: var(--nt-z-player); display: block; height: var(--nt-control-lg); padding: 0; border-top: 1px solid var(--nt-border); background: var(--nt-bg-raised); }
 		section:not(.expanded) .full-controls { display: none; }
 		.mini-wrap {
-			position: sticky;
-			bottom: var(--nt-control);
-			z-index: var(--nt-z-player);
 			display: block;
-			height: var(--nt-control-lg);
-			background: var(--nt-bg-raised);
-			border-top: 1px solid var(--nt-border);
+			height: 100%;
 		}
 		.mini-progress { position: absolute; inset: 0 0 auto; display: block; height: var(--nt-space-px-2); background: var(--nt-border); pointer-events: none; }
 		.mini-progress span { display: block; height: 100%; background: var(--nt-accent); }
