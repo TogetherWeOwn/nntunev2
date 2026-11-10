@@ -34,7 +34,9 @@ pub enum PublicationError {
 
 /// One surviving entry that a future normalized publisher may write, in
 /// ordinal order. Losers (`duplicate_of: Some`) never appear here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Selectors and hints stay redacted in Debug output, matching the
+/// manifest's redaction policy.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PublicationEntry {
     pub audio_ordinal: u32,
     pub release_group_ref: u32,
@@ -44,6 +46,12 @@ pub struct PublicationEntry {
     pub track_no: i32,
     pub source_selector: AudioSelector,
     pub hints: AudioHints,
+}
+
+impl fmt::Debug for PublicationEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PublicationEntry([redacted])")
+    }
 }
 
 /// Preparation result only, not a durable publication record. Production
