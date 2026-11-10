@@ -234,12 +234,41 @@ fn unsupported_unicode_is_refused_not_grouped_with_incomplete_case_folding() {
 }
 
 #[test]
-fn candidate_validates_identity_and_hints_and_round_trips_without_regrouping() {
-    let (plan, extracted) = inputs(vec![hint(Some("X"), Some("A"))]);
-    assert!(matches!(
-        prepare_manifest("not-a-job", "owner", &plan, extracted),
-        Err(GroupingError::Manifest(_))
-    ));
+fn candidate_accepts_url_safe_job_ids_without_requiring_a_uuid() {
+    let longest = "a".repeat(64);
+    for job_id in ["not-a-job", "job_1", "A", longest.as_str()] {
+        let (plan, extracted) = inputs(vec![hint(Some("X"), Some("A"))]);
+        let manifest = prepare_manifest(job_id, "owner", &plan, extracted).unwrap();
+        assert!(manifest.is_for(job_id, "owner"));
+        let stored = serde_json::to_string(&manifest).unwrap();
+        assert!(AcceptedAudioManifest::parse(&stored)
+            .unwrap()
+            .is_for(job_id, "owner"));
+    }
+}
+
+#[test]
+fn candidate_rejects_invalid_job_and_owner_identity() {
+    let oversized_job = "a".repeat(65);
+    for job_id in ["", "job/path", "job\n", "jób", oversized_job.as_str()] {
+        let (plan, extracted) = inputs(vec![hint(Some("X"), Some("A"))]);
+        assert!(matches!(
+            prepare_manifest(job_id, "owner", &plan, extracted),
+            Err(GroupingError::Manifest(_))
+        ));
+    }
+    let oversized_owner = "a".repeat(129);
+    for owner in ["", "owner\n", oversized_owner.as_str()] {
+        let (plan, extracted) = inputs(vec![hint(Some("X"), Some("A"))]);
+        assert!(matches!(
+            prepare_manifest(JOB, owner, &plan, extracted),
+            Err(GroupingError::Manifest(_))
+        ));
+    }
+}
+
+#[test]
+fn candidate_validates_hints_and_round_trips_without_regrouping() {
     let mut invalid = hint(Some("X"), Some("A"));
     invalid.release_mbid = Some("invalid".into());
     let (plan, extracted) = inputs(vec![invalid]);
