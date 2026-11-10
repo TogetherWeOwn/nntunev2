@@ -34,9 +34,9 @@ M1 exit verification cannot pass yet (see
    staging; un-park each leg by removing its spec guard together with
    its gate entry.
 3. Row 6 stays a GAP until the `staging-api` lane records
-   `deployed=true` with a matching `source_sha` and the rollback
-   pointer (last good staging revision plus its deploy run) is
-   recorded per the staging promotion checklist.
+   `deployed=true`, `outcome=deployed` and a matching `source_sha`,
+   and the rollback pointer (last good staging revision plus its
+   deploy run) is recorded per the staging promotion checklist.
 4. Only then run the exact-head journey (invite → subscription →
    admin-ingested catalogue → play/seek) and record the rollback
    pointer, updating the traceability matrix and this handoff in the
@@ -50,13 +50,19 @@ M1 exit verification cannot pass yet (see
     (conclusion `success`, push event on that SHA)
   - deploy: https://github.com/TogetherWeOwn/nntunev2/actions/runs/42870749181
     (conclusion `success`, push event on that SHA)
-- The deploy run deployed all staging lanes (`staging-api`,
-  `staging-web`, `staging-mb`, `staging-ingest` all `success`, none
-  skipped) and its post-deploy synthetic smoke and full journey jobs
-  succeeded. It does not prove M1 exit: a green run is not staging
+- In the deploy run, `staging-web` and `staging-api` executed their
+  deploy steps (`Deploy to staging` and `Deploy api to staging` /
+  `Record API deployment outcome` respectively, all `success`),
+  whereas `staging-mb` (`Prepare`/`Build`/`Generate`/
+  `Deploy mb to staging`) and `staging-ingest` (`Prepare`/`Build`/
+  Hyperdrive gate/`Generate`/`Deploy ingest to staging`) skipped
+  theirs — only the configuration check and `Record outcome` ran,
+  so those lanes were unconfigured and their green jobs are not
+  deploys. It does not prove M1 exit: a green run is not staging
   evidence (see blockers below), and row 6 stays a GAP until the
-  `staging-api` lane records `deployed=true` with a matching
-  `source_sha` recording and the rollback pointer is kept.
+  `staging-api` lane records `deployed=true`, `outcome=deployed`
+  and a matching `source_sha` with the rollback pointer under the
+  staging promotion checklist.
 - Docs-only changes use focused static and diff checks plus exact-head
   Actions runs; no local full suite. This change's verification is
   its CI `ci-ok` gate plus review.
@@ -66,8 +72,8 @@ M1 exit verification cannot pass yet (see
 First unfinished step: admin ingest seeds one curated album on
 staging (blocker 1 above). Do not start the M1 exit journey until
 the parked legs in rows 3 and 4 can be un-parked, the `staging-api`
-lane records `deployed=true` with a matching `source_sha`, and the
-rollback pointer is ready (blockers 2–4).
+lane records `deployed=true`, `outcome=deployed` and a matching
+`source_sha`, and the rollback pointer is ready (blockers 2–4).
 
 This file is a dated snapshot. Live assignments, dependencies and
 status remain in the assignment tracker.
