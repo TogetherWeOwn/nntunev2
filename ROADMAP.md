@@ -1,6 +1,6 @@
 # NNTune v2 roadmap
 
-Last reviewed: **2026-11-09 (UTC)**
+Last reviewed: **2026-11-10 (UTC)**
 
 Maintained by the project maintainers. For questions or suggestions, open a
 [GitHub issue](https://github.com/TogetherWeOwn/nntunev2/issues).
@@ -18,6 +18,26 @@ Detailed accepted decisions remain in the [architecture decision records](docs/a
 This summary does not replace those specifications or authorize a launch.
 See [GitHub releases](https://github.com/TogetherWeOwn/nntunev2/releases) for
 published release history, rather than inferring completion from this page.
+
+## Approved vs proposed scope
+
+| Item | State |
+|---|---|
+| Shared curated catalogue; lossless first, video embed second, otherwise hidden | approved 2026-11-03 |
+| One concurrent stream; private playlists; no downloads; no user provider or intake | approved 2026-11-03 |
+| Invite-only paywall in test mode; stream-hour caps; playback stops at cap | approved 2026-11-03 |
+| R1 → R2 → R3 → R4 programme order | approved 2026-11-03 |
+| M1 exit (invite → subscription → admin ingest → play/seek, exact-head + rollback) | approved 2026-11-03; implemented in part, verification pending |
+| Audio leveling, verified rendition quality, speculative prefetch | deferred 2026-11-04 (not delivered) |
+| Genre browsing, lyrics depth, discovery personalisation, social/cross-device | conditional on later data, licences and separate decisions |
+| Public availability and live billing | proposed; requires separate decisions and release validation |
+
+Milestone requirements live in [docs/specs/](docs/specs/README.md); the
+programme status with verification routes lives in
+[docs/plans/](docs/plans/README.md); material owner decisions are
+recorded in [docs/decisions/](docs/decisions/README.md); deploy and
+rollback procedures are in [docs/runbooks/](docs/runbooks/README.md);
+the dated source snapshot is in [docs/handoff.md](docs/handoff.md).
 
 ## Product boundaries
 
