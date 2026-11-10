@@ -105,9 +105,19 @@ oversize chunks and chunk floods refuse the whole candidate. The reader stops at
 the requested length and drops the cancelling body on success, refusal or timeout.
 The runtime adapter uses workers-rs ByteStream's cancel-on-drop stream; native
 fake-stream tests exercise drop behavior, not a deployed R2 cancellation claim.
-The 30-second deadline constant is available for the future producer; no live
-caller constructs this reader or arms that timer yet. These helpers add no route,
-cache, manifest freeze or membership.
+The 30-second deadline constant is available for the future runtime caller; no
+live caller constructs this reader or arms that timer yet. These helpers add no
+route, cache, manifest freeze or membership.
+
+`audio_producer.rs` composes this verified-scratch reader, bounded extraction and
+candidate grouping behind one input binding. It reuses manifest identity checks
+before any scratch I/O, preserves every selected file and effective disc, and
+returns no partial candidate on selection, transport or grouping refusal. The
+caller supplies one job-wide deadline, not a fresh deadline per file. This is an
+unmounted candidate producer, not first acceptance: its caller must still use the
+fenced database winner before copying to KV or performing mirror lookup. No
+production Matching call, timer, local occurrence plan, classification or art
+staging is enabled by this composition.
 
 `audio_grouping.rs` assembles a structurally validated manifest candidate only
 when extraction exactly covers that plan in order. Release-MBID hints take
@@ -306,7 +316,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:51`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:52`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

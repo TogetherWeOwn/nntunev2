@@ -208,6 +208,14 @@ fn text(raw: &str) -> bool {
     raw.len() <= MAX_TEXT_BYTES && !raw.chars().any(char::is_control)
 }
 
+pub(crate) fn valid_identity(job_id: &str, user_id: &str, original_hash: &str) -> bool {
+    validate_job_id(job_id)
+        && !user_id.is_empty()
+        && user_id.len() <= 128
+        && text(user_id)
+        && hash(original_hash)
+}
+
 fn image_mime(raw: &str) -> bool {
     matches!(raw, "image/jpeg" | "image/png" | "image/webp")
 }
@@ -222,11 +230,7 @@ fn archive_path(raw: &str) -> bool {
 impl ManifestRecord {
     fn validate(&self) -> Result<(), ManifestError> {
         if self.version != 1
-            || !validate_job_id(&self.job_id)
-            || self.user_id.is_empty()
-            || self.user_id.len() > 128
-            || !text(&self.user_id)
-            || !hash(&self.original_content_sha256)
+            || !valid_identity(&self.job_id, &self.user_id, &self.original_content_sha256)
             || self.entries.is_empty()
             || self.entries.len() > MAX_AUDIO_ENTRIES
             || self.art_blobs.len() > self.entries.len()
