@@ -182,3 +182,8 @@ sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
 file = "0037_subsonic_credentials.sql"
 target = "app"
 sha256 = "e0d05ff850b376f07af53020c97d9128cc0ea915a029cf9009f5f16d6823fa1f"
+
+[[migration]]
+file = "0038_ingest_acceptance_order.sql"
+target = "app"
+sha256 = "f9d18a1c324f54c8110b88fb7f23fbdfeadc6485fe2d064eb8c563d1220b6187"
