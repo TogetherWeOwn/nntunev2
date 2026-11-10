@@ -694,7 +694,11 @@ class PreparedCLI(unittest.TestCase):
         result, out, err = self.check()
         self.assertEqual(result, 1, out + err)
         self.assertIn("lacks source_rename_history", err)
-        self.assertFalse((self.evidence_dir / "validation.json").exists())
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "failed")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertIn("lacks source_rename_history", outcomes["diagnostic"])
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
 
     def test_effective_merge_base_manifest_is_independent(self):
         self.write("0001_final.sql")
@@ -712,7 +716,14 @@ class PreparedCLI(unittest.TestCase):
         result, out, err = self.check()
         self.assertEqual(result, 1, out + err)
         self.assertIn("append-only against base", err)
-        self.assertFalse((self.evidence_dir / "validation.json").exists())
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertEqual(outcomes["event"]["base"], self.base)
+        self.assertEqual(outcomes["effective"]["base"], advanced)
+        self.assertIn("append-only against base", outcomes["diagnostic"])
+        self.assertIn('"outcome": "failed"', out)
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
 
     def test_missing_tampered_and_oversized_evidence_fail_closed(self):
         self.valid_evidence()
@@ -728,7 +739,10 @@ class PreparedCLI(unittest.TestCase):
                     try:
                         result, out, err = self.check()
                         self.assertEqual(result, 1, out + err)
-                        self.assertFalse((self.evidence_dir / "validation.json").exists())
+                        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+                        self.assertEqual(outcomes["event"]["outcome"], "not_run")
+                        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+                        self.assertTrue(outcomes["diagnostic"])
                         self.assertFalse((self.evidence_dir / "edges.json").exists())
                     finally:
                         path.write_bytes(original)
@@ -753,7 +767,48 @@ class PreparedCLI(unittest.TestCase):
         self.assertIn("shared evidence output bound", err)
         self.assertEqual(len(budgets), 2)
         self.assertIs(budgets[0], budgets[1])
-        self.assertFalse((self.evidence_dir / "validation.json").exists())
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertIn("shared evidence output bound", outcomes["diagnostic"])
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
+
+    def test_failure_diagnostic_has_a_fixed_bound(self):
+        self.valid_evidence()
+        with mock.patch.object(rename_fixture.migrations_rename_check, "verify",
+                               side_effect=history.HistoryError("x" * 100000)):
+            result, out, err = self.check()
+        self.assertEqual(result, 1)
+        report = self.evidence_dir / "validation.json"
+        outcomes = json.loads(report.read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "failed")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertEqual(len(outcomes["diagnostic"]), 1024)
+        self.assertLess(report.stat().st_size, 16384)
+        self.assertLess(len(out), 16384)
+        self.assertLess(len(err), 2048)
+
+    def test_expired_budget_retains_not_run_outcomes(self):
+        self.valid_evidence()
+        path = self.evidence_dir / "pr-metadata.json"
+        metadata = json.loads(path.read_text())
+        metadata["deadline"] = 0
+        path.write_text(json.dumps(metadata))
+        result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "not_run")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertIn("expired shared evidence budget", outcomes["diagnostic"])
+
+    def test_unwritable_validation_output_is_a_failure(self):
+        self.valid_evidence()
+        (self.evidence_dir / "validation.json").mkdir()
+        result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertIn('"outcome": "verified"', out)
+        self.assertNotIn("pinned Git source lineage and applied aliases verified", out)
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
 
 
 if __name__ == "__main__":
