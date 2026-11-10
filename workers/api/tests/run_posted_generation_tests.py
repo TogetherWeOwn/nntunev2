@@ -12,6 +12,9 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[3]
+# Phase 1 runs 287 serial PostgreSQL tests, so 180 seconds cannot cover it:
+# the bank was observed still progressing when the phase timeout killed it.
+PHASE_TIMEOUT_SECONDS = 900
 # Retirement is irreversible on this disposable service. Run it separately,
 # after every test that needs to seed an old-writer compatibility fixture.
 RETIREMENT_CASE = (
@@ -344,10 +347,24 @@ def main():
         (command, ["--exact", RETIREMENT_CASE], {RETIREMENT_CASE}),
     ]
     for bank, filters, required in phases:
-        result = subprocess.run(
-            bank + ["--", "--test-threads=1", *filters], cwd=ROOT, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=180,
-        )
+        try:
+            result = subprocess.run(
+                bank + ["--", "--test-threads=1", *filters], cwd=ROOT, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                timeout=PHASE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as expired:
+            partial = expired.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            partial = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", partial)
+            print(partial, flush=True)
+            completed = len(re.findall(r"(?m)^test .* \.\.\. ok$", partial))
+            sys.exit(
+                f"Posted-generation bank phase timed out after "
+                f"{PHASE_TIMEOUT_SECONDS}s with {completed} completed cases; "
+                f"the phase needs more time or is hung mid-case"
+            )
         output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
         print(output, flush=True)
         if result.returncode != 0:
