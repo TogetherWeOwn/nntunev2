@@ -116,6 +116,22 @@ impl<'de> Deserialize<'de> for AcceptedAudioManifest {
 }
 
 impl AcceptedAudioManifest {
+    pub(crate) fn from_entries(
+        job_id: &str,
+        user_id: &str,
+        original_content_sha256: &str,
+        entries: Vec<AudioEntry>,
+    ) -> Result<Self, ManifestError> {
+        Self::accept(ManifestRecord {
+            version: 1,
+            job_id: job_id.to_owned(),
+            user_id: user_id.to_owned(),
+            original_content_sha256: original_content_sha256.to_owned(),
+            entries,
+            art_blobs: Vec::new(),
+        })
+    }
+
     /// Private producer/storage seam. Never accept this JSON from a client.
     pub fn parse(raw: &str) -> Result<Self, ManifestError> {
         if raw.len() > MAX_MANIFEST_BYTES {

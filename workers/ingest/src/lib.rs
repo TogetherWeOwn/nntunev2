@@ -31,6 +31,7 @@ use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod api_error;
+pub mod audio_grouping;
 pub mod audio_manifest;
 pub mod audio_manifest_store;
 pub mod audio_selection;

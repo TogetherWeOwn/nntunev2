@@ -92,8 +92,20 @@ shrinks requests to the remaining budget, stops polling at the prefix cap, and
 retains budget-exhausted/malformed selections with empty hints. Transport errors
 and oversized/chunk-flooding adapters refuse the whole candidate. Runtime scratch
 binding, range enforcement, cancellation and I/O deadlines remain adapter work;
-no runtime reader is installed. Grouping and image validation/staging also remain
-unwired; these helpers add no fetch or cache.
+no runtime reader is installed. These helpers add no fetch or cache.
+
+`audio_grouping.rs` assembles a structurally validated manifest candidate only
+when extraction exactly covers that plan in order. Release-MBID hints take
+precedence over title candidates; text-only candidates partition by normalized
+album title, then album artist or common/two-thirds-dominant track artist.
+Guest suffixes are stripped only for dominance counting; conflicting artist keys
+use a job-local Various holder. Unknown albums keep separate releases. Artist
+and release references independently name their first selected-audio ordinal;
+disc tags never split a release, and original hints/entries are preserved.
+This implementation explicitly refuses non-ASCII grouping text rather than
+pretending Unicode lowercasing is case-folding. Full Unicode grouping, image
+validation/staging, effective local positions and post-match identity-gated dedup
+remain integration gates. No runtime producer invokes this candidate seam.
 
 This is unmounted preparation: no production caller freezes a manifest yet.
 The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
@@ -126,7 +138,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:41`). No ingest route
+  `src/lib.rs:42`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -140,7 +152,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:41`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:42`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -253,7 +265,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:48`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:49`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
