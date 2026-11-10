@@ -61,7 +61,7 @@ describe('attribution inventory v1', () => {
 
 	it.each([
 		{ kind: ['package'] },
-		{ kind: { toString: () => 'package' } }
+		{ kind: { toString: (): string => 'package' } }
 	])('rejects coerced package kinds without package metadata: %j', ({ kind }) => {
 		const value = clone();
 		value.entries[0].kind = kind;
