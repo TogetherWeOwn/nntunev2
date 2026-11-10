@@ -1,5 +1,13 @@
 # NNTune v2 agent notes
 
+## Documentation map
+
+- Start with the [roadmap](ROADMAP.md) for agreed product boundaries and conditional work.
+- Read the [handoff](docs/handoff.md) for the dated source state, remaining work and published evidence.
+- Use the [M1 traceability matrix](docs/m1-exit-traceability.md) and the
+  [staging promotion checklist](docs/ops.md#staging-promotion-checklist) for acceptance and rollback.
+- Consult the [architecture decision records](docs/adr/README.md) for design decisions and amendments.
+
 ## CI and verification location
 
 Full test suites and CI gates run on GitHub Actions, never as local

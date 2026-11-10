@@ -1,6 +1,6 @@
 # NNTune v2 roadmap
 
-Last reviewed: **2026-11-13 (UTC)**
+Last reviewed: **2026-11-21 (UTC)**
 
 Maintained by the project maintainers. For questions or suggestions, open a
 [GitHub issue](https://github.com/TogetherWeOwn/nntunev2/issues).
@@ -14,10 +14,11 @@ they are not release dates, availability guarantees or commitments to build
 every item. Later work depends on validation, suitable data and licences,
 privacy safeguards and release review.
 
-Detailed accepted decisions remain in the [architecture decision records](docs/adr/README.md).
-This summary does not replace those specifications or authorize a launch.
-See [GitHub releases](https://github.com/TogetherWeOwn/nntunev2/releases) for
-published release history, rather than inferring completion from this page.
+Find accepted decisions and amendments in the [architecture decision records](docs/adr/README.md).
+The [M1 matrix](docs/m1-exit-traceability.md) defines the staging exit and maps
+its checks. The [handoff](docs/handoff.md) records source and staging evidence as
+of a named revision. See [GitHub releases](https://github.com/TogetherWeOwn/nntunev2/releases)
+for published releases.
 
 ## Product boundaries
 
@@ -29,9 +30,12 @@ an audio-only or background-playback source, and it is never sold, upsold or
 gated as a separate paid extra.
 
 The initial scope is one concurrent stream per user and private playlists.
-The staging subscription journey uses payment test mode; it does not activate
-paid billing. Public availability and live billing require separate decisions
-and release validation, not publication of this roadmap.
+The [accepted plan matrix](docs/adr/0004-plan-matrix.md) specifies no trial or
+free plan. At the monthly stream-hour cap, new playback is refused while a
+track already playing can finish. Staging uses payment test mode. Public
+availability and live billing require separate decisions and release validation.
+M1 uses owner-issued invites. The later scope allows eligible paid members to
+invite during owner-scheduled windows.
 
 ## Storage direction
 
@@ -50,12 +54,11 @@ the stream Worker decrypts authenticated chunks for ranged playback and keeps
 metering. This is not end-user end-to-end encryption: authorized Workers can
 decrypt. Upload checksums cover ciphertext; plaintext and keys stay out of logs.
 
-These are requirements, not delivered features. The earlier assurance-target
-and planning-input deferral basis is resolved; the revised crypto design still
-requires independent Security, Applied Cryptography and QA acceptance before
-implementation. Delivery resumes in dependency order only after that acceptance
-and verified producer outputs. Design revision and the independent
-session/idempotency contract may proceed. No plaintext fallback or hidden
+Implementation has landed in bounded increments. See the
+[storage handoff](docs/handoff.md#storage-and-catalogue) for what is present
+in source and what remains before activation. ADR 0015 retains the exact-design
+Security, Applied Cryptography and QA gates and requires verified producer
+outputs before downstream reactivation. No plaintext fallback or hidden
 valid-playback/library cap is allowed.
 Migration stays staged, using disposable buckets until the provider is
 production-ready. Retain legacy readers and inventory, coexistence, restore
@@ -65,6 +68,11 @@ leave it as a fallback.
 See [ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md).
 
 ## Direction
+
+The programme order agreed on 2026-11-03 is R1 (shell and core playback),
+R2 (catalogue), R3 (discovery and video), then R4 (cross-device and
+conditional social features). The sections below describe the scope of each
+stage. M1 is a separate staging acceptance gate for launch consideration.
 
 ### Reliable everyday listening
 
@@ -87,10 +95,21 @@ within this area, not claims of current support.
 
 Build towards useful listening-history views and optional ListenBrainz-based
 discovery, with meaningful fallbacks when history or linked data is absent.
-Genre browsing depends on licence-compatible data and adequate coverage of the
-playable catalogue; mood labels are not assumed to have the same foundation.
+Genre browsing depends on licence-compatible data and coverage of the
+playable catalogue. Mood labels need their own data assessment.
 Music-video discovery is conditional on validated links and the official embed
-rules. Lyrics remain conditional on suitable sources and usage rights.
+rules. The [embed decision](docs/adr/0012-compliant-youtube-video-and-brainz-data.md)
+records the launch legal question and the historical spike's flag-off status.
+Use [ADR 0007's amendment](docs/adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement)
+for the weekly core-CC0 mirror refresh plan. Genre browsing needs
+[measured coverage of at least 80% of playable artists](docs/genre-root-coverage.md#later-real-data-measurement-and-guardrails).
+
+The 2026-11-03 lyrics scope uses suitable embedded tags or sidecar files from
+the curated collection first, with a free, credited source as a conditional
+fallback and the panel hidden when lyrics are absent. Any lyric-line search
+is limited to lyrics held from the curated collection. Synced lyrics remain
+off pending a separate licensing decision. See the
+[attribution inventory](docs/attributions.md#scope-and-provenance).
 
 ### Later, conditional possibilities
 
