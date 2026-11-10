@@ -185,6 +185,19 @@ a bounded immutable classification field to retained originals, and
 `audio_classifications_store` provides the same single owner/deletion-fenced
 first-acceptance update as the manifest store (first winner wins on
 concurrent deliveries) plus a digest-bound read. Both remain unmounted.
+
+`audio_classifications_acceptance.rs` composes them behind one seam, mirroring
+`audio_acceptance.rs`: a confirmed persisted checkpoint is returned without
+retrieving mirror evidence; only a confirmed miss invokes the lazy evidence
+producer, classifies from the accepted manifest, and freezes through the
+store. A fenced/missing original or read error refuses before the producer
+runs, a concurrent first classification returns the database winner rather
+than our losing candidate, and the accepted manifest and returned winner are
+both identity-checked against the job/owner/original digest before return.
+The PostgreSQL adapter uses the existing bounded connector. This remains
+unmounted: the future publication consumer must use the returned winner
+before mirror-snapshot or KV publication, and classification grants no
+membership, catalogue or playback authority.
 Full Unicode normalization, image validation/staging, resolved artist/release
 coalescing and durable position/classification freezing remain integration
 gates.
@@ -220,7 +233,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:48`). No ingest route
+  `src/lib.rs:50`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -234,7 +247,7 @@ AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:48`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:50`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -347,7 +360,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:55`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:57`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
