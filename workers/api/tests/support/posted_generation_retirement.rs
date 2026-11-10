@@ -393,6 +393,10 @@ fn zz_postgres_retirement_lifecycle_serializes_inserts_health_snapshots_and_repl
         assert!(custody_digest(&db).await == all_before);
         assert!(snapshot(&db, &c.sealed).await == managed_before);
         expect_retired(insert_legacy(&db, &refused).await).await;
-        assert_eq!(count(&db, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'posted_files'::regclass AND contype = 'u' AND pg_get_constraintdef(oid) = 'UNIQUE (plaintext_sha256)'", &[]).await, 1);
+        // Post-0054 dedupe shape: the 0037 global UNIQUE is replaced by the
+        // legacy-only partial unique index, so historical replay must not
+        // resurrect a global UNIQUE that would collapse managed generations.
+        assert_eq!(count(&db, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'posted_files'::regclass AND contype = 'u' AND pg_get_constraintdef(oid) = 'UNIQUE (plaintext_sha256)'", &[]).await, 0);
+        assert_eq!(count(&db, "SELECT count(*) FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = 'posted_files_plaintext_sha256_legacy_uq' AND i.indisunique", &[]).await, 1);
     });
 }
