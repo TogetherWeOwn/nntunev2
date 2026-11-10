@@ -3027,7 +3027,7 @@ impl Store for PgStore {
                     // MBID itself, so the mirror probe can still supply
                     // the recording-duration rung.
                     return Ok(crate::meter_sink::TrackMeterMeta {
-                        mb_duration_ms: self.mb_duration_for(track_id).await?,
+                        mb_duration_ms: self.mb_duration_for(Some(track_id)).await?,
                         ..Default::default()
                     });
                 };
