@@ -77,6 +77,10 @@ name = "credential_session_postgres"
 required-features = ["postgres-tests"]
 
 [[test]]
+name = "subsonic_deadlock_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
 name = "ingest_manifest_postgres"
 required-features = ["postgres-tests"]
 

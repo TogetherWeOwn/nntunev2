@@ -308,10 +308,14 @@ pub(super) async fn insert(
     let s = &prepared.record;
     let tx = transaction(client).await?;
     // Serialize issue/cap checks per owner and fence account deletion through
-    // commit. Every credential mutation follows users-first lock order.
+    // commit. FOR NO KEY UPDATE still conflicts with concurrent owners,
+    // with the non-key deleting_at update, and with FOR UPDATE cancellation,
+    // but stays compatible with the FOR KEY SHARE a reauthentication insert
+    // takes on this row through the sessions FK. FOR UPDATE would block that
+    // FK check and close a lock cycle against the session row below.
     let owners = tx
         .query_typed(
-            "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR UPDATE",
+            "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE",
             &[(&s.user_id, Type::TEXT)],
         )
         .await
@@ -463,9 +467,13 @@ pub(super) async fn revoke(
 ) -> Result<u64, StoreError> {
     let now = i64::try_from(now).map_err(|_| StoreError)?;
     let tx = transaction(client).await?;
+    // Same owner fence as issuance: serialize per owner and fence account
+    // deletion, while remaining compatible with the reauthentication
+    // sessions FK check. Recovery keeps users-first lock order through
+    // commit, and its session UPDATE below takes no parent lock.
     let owners = tx
         .query_typed(
-            "SELECT id FROM users WHERE id = $1 FOR UPDATE",
+            "SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE",
             &[(&user_id, Type::TEXT)],
         )
         .await
