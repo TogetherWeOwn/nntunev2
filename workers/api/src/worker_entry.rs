@@ -505,6 +505,7 @@ async fn query_playback_lease_row(
             play_id: row.try_get("play_id").map_err(|_| StoreError)?,
             epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
             expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            continuation_until: u64_of(row.try_get("continuation_until").map_err(|_| StoreError)?)?,
         })),
     }
 }
@@ -2877,6 +2878,7 @@ impl Store for PgStore {
         now: u64,
         expires_at: u64,
         takeover: bool,
+        continuation_until: u64,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
@@ -2892,6 +2894,7 @@ impl Store for PgStore {
                             (&i64_of(expires_at)?, Type::INT8),
                             (&i64_of(now)?, Type::INT8),
                             (&takeover, Type::BOOL),
+                            (&i64_of(continuation_until)?, Type::INT8),
                         ],
                     )
                     .await

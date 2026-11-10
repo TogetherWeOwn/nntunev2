@@ -121,24 +121,48 @@ pub struct LeaseRow {
     pub play_id: String,
     pub epoch: u64,
     pub expires_at: u64,
+    /// Immutable per acquired play: the absolute bound past which the
+    /// play can neither continue nor extend its lease (`0` for rows
+    /// that predate the column, which therefore fail closed).
+    pub continuation_until: u64,
+}
+
+/// Continuation deadline for a play acquired at `now`: a known positive
+/// duration rounds up to whole seconds plus [`LEASE_TTL_SECS`] of slack;
+/// an unknown or zero duration falls back to the grant TTL cap.
+/// Saturating, so it never wraps.
+pub fn continuation_until(now: u64, duration_ms: Option<u64>) -> u64 {
+    let window = match duration_ms {
+        Some(ms) if ms > 0 => ms.div_ceil(1000).saturating_add(LEASE_TTL_SECS),
+        _ => crate::play_grant::MAX_GRANT_TTL,
+    };
+    now.saturating_add(window)
 }
 
 impl LeaseRow {
-    /// True while the lease has not expired at `now` (strict: at the
-    /// expiry instant it is already free for other sessions, matching
-    /// the acquire statement's `expires_at <= now`).
+    /// True while neither the lease expiry nor the continuation deadline
+    /// has passed at `now` (strict: at either instant the lease is
+    /// already free for other sessions, matching the acquire statement).
     pub fn is_live(&self, now: u64) -> bool {
-        self.expires_at > now
+        self.expires_at > now && self.continuation_until > now
     }
 
     /// True when this row is the same client session continuing the
     /// same play of the same track — the continuation case that skips
-    /// the subscription/cap gates. Expiry is irrelevant here: it frees
-    /// the lease for others, it does not revoke the holder's own play
-    /// (a stall then resumes the same epoch, metered under the same
-    /// play id).
-    pub fn is_continuation(&self, session_id: &str, play_id: &str, track_id: &str) -> bool {
-        self.session_id == session_id && self.play_id == play_id && self.track_id == track_id
+    /// the subscription/cap gates. Requires the exact identity and that
+    /// both the lease expiry and the continuation deadline lie beyond
+    /// `now`: a stale or deadline-passed play is a new start.
+    pub fn is_continuation(
+        &self,
+        session_id: &str,
+        play_id: &str,
+        track_id: &str,
+        now: u64,
+    ) -> bool {
+        self.session_id == session_id
+            && self.play_id == play_id
+            && self.track_id == track_id
+            && self.is_live(now)
     }
 
     /// Seconds until another session may acquire without a takeover
@@ -185,17 +209,28 @@ impl LeaseHeartbeat {
     }
 
     /// Classify a heartbeat against the stored row. `Active` requires
-    /// the exact (session, play, epoch) triple — an epoch mismatch is
-    /// a takeover even from the same session (its newer play replaced
-    /// this one). The handler still performs the conditional touch;
-    /// this is the read-side classification it reports.
-    pub fn classify(row: Option<&LeaseRow>, session_id: &str, play_id: &str, epoch: u64) -> Self {
+    /// the exact (session, play, epoch) triple still live at `now` — an
+    /// epoch mismatch is a takeover even from the same session (its
+    /// newer play replaced this one). The exact identity with either
+    /// bound elapsed is `Expired`. The handler still performs the
+    /// conditional touch; this is the read-side classification it reports.
+    pub fn classify(
+        row: Option<&LeaseRow>,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+    ) -> Self {
         match row {
             None => LeaseHeartbeat::Expired,
             Some(row)
                 if row.session_id == session_id && row.play_id == play_id && row.epoch == epoch =>
             {
-                LeaseHeartbeat::Active
+                if row.is_live(now) {
+                    LeaseHeartbeat::Active
+                } else {
+                    LeaseHeartbeat::Expired
+                }
             }
             Some(_) => LeaseHeartbeat::Superseded,
         }
@@ -216,12 +251,15 @@ impl LeaseHeartbeat {
 
 /// Parameters: user_id. The user's lease row, if any.
 pub fn playback_lease_select_statement() -> &'static str {
-    "SELECT session_id, track_id, play_id, epoch, expires_at FROM playback_leases WHERE user_id = $1"
+    "SELECT session_id, track_id, play_id, epoch, expires_at, continuation_until FROM playback_leases WHERE user_id = $1"
 }
 
 /// Parameters: user_id, session_id, track_id, play_id, expires_at, now,
-/// takeover. Atomic acquire: inserts at epoch 1, or replaces the row at
-/// epoch+1 when the stored lease has expired (`expires_at <= now`), the
+/// takeover, continuation_until. The stored `expires_at` is clamped to
+/// the deadline (`LEAST`), and the deadline is rewritten per acquired
+/// play. Atomic acquire: inserts at epoch 1, or replaces the row at
+/// epoch+1 when the stored lease or its continuation deadline has passed
+/// (`<= now`), the
 /// same session re-acquires, or `takeover` is set. Zero rows back means
 /// another session holds a live lease — the caller reads the row for
 /// the `Retry-After` — or the deletion fence refused the write (the
@@ -230,18 +268,20 @@ pub fn playback_lease_select_statement() -> &'static str {
 /// row, never from a client-supplied value, so concurrent acquires
 /// cannot mint colliding epochs.
 pub fn playback_lease_acquire_statement() -> &'static str {
-    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, continuation_until, updated_at) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $8, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, continuation_until = EXCLUDED.continuation_until, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.continuation_until <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
 }
 
 /// Parameters: user_id, session_id, play_id, epoch, expires_at, now.
 /// Heartbeat/continuation extension: extends only the exact holder's
 /// row; zero rows back means the caller no longer holds the lease
 /// (superseded between its read and this touch) or the deletion fence
-/// refused. The write is monotonic (`GREATEST`): overlapping heartbeats
+/// refused. Abandoned (`expires_at <= now`) or past-deadline rows are
+/// refused, and the result never exceeds `continuation_until`. The
+/// write is monotonic (`GREATEST`): overlapping heartbeats
 /// from the same holder can arrive out of order, and an older request
 /// must never shorten the deadline a newer one already stored.
 pub fn playback_lease_touch_statement() -> &'static str {
-    "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
+    "UPDATE playback_leases SET expires_at = LEAST(playback_leases.continuation_until, GREATEST(playback_leases.expires_at, $5)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND playback_leases.continuation_until > $6 RETURNING expires_at"
 }
 
 #[cfg(test)]
@@ -258,6 +298,7 @@ mod tests {
             play_id: "play-7".to_string(),
             epoch: 3,
             expires_at: NOW + 30,
+            continuation_until: NOW + 200,
         }
     }
 
@@ -308,42 +349,101 @@ mod tests {
     }
 
     #[test]
-    fn continuation_needs_the_exact_session_play_track() {
+    fn continuation_needs_identity_and_both_bounds() {
         let row = lease();
-        assert!(row.is_continuation("sess-1", "play-7", "track-9"));
-        assert!(!row.is_continuation("sess-2", "play-7", "track-9"));
-        assert!(!row.is_continuation("sess-1", "play-8", "track-9"));
-        assert!(!row.is_continuation("sess-1", "play-7", "track-8"));
-        // Expiry does not revoke the holder's own continuation.
+        assert!(row.is_continuation("sess-1", "play-7", "track-9", NOW));
+        assert!(!row.is_continuation("sess-2", "play-7", "track-9", NOW));
+        assert!(!row.is_continuation("sess-1", "play-8", "track-9", NOW));
+        assert!(!row.is_continuation("sess-1", "play-7", "track-8", NOW));
+        // Abandoned lease: expiry instant and later refuse.
+        assert!(row.is_continuation("sess-1", "play-7", "track-9", NOW + 29));
+        assert!(!row.is_continuation("sess-1", "play-7", "track-9", NOW + 30));
         let mut stale = lease();
         stale.expires_at = NOW - 3600;
-        assert!(stale.is_continuation("sess-1", "play-7", "track-9"));
+        assert!(!stale.is_continuation("sess-1", "play-7", "track-9", NOW));
         assert!(!stale.is_live(NOW));
+        // Deadline passed while the lease is still fresh.
+        let mut capped = lease();
+        capped.expires_at = NOW + 100;
+        capped.continuation_until = NOW + 10;
+        assert!(capped.is_continuation("sess-1", "play-7", "track-9", NOW + 9));
+        assert!(!capped.is_continuation("sess-1", "play-7", "track-9", NOW + 10));
+        assert!(!capped.is_live(NOW + 10));
+        // Legacy rows (deadline 0) fail closed.
+        let mut legacy = lease();
+        legacy.continuation_until = 0;
+        assert!(!legacy.is_live(NOW));
+        assert!(!legacy.is_continuation("sess-1", "play-7", "track-9", NOW));
+    }
+
+    #[test]
+    fn continuation_deadline_computation() {
+        // Known duration: ceil seconds + TTL slack.
+        assert_eq!(
+            continuation_until(NOW, Some(180_000)),
+            NOW + 180 + LEASE_TTL_SECS
+        );
+        assert_eq!(
+            continuation_until(NOW, Some(180_001)),
+            NOW + 181 + LEASE_TTL_SECS
+        );
+        assert_eq!(continuation_until(NOW, Some(1)), NOW + 1 + LEASE_TTL_SECS);
+        // Unknown or zero duration: grant TTL cap fallback.
+        assert_eq!(continuation_until(NOW, None), NOW + 900);
+        assert_eq!(continuation_until(NOW, Some(0)), NOW + 900);
+        // Overflow saturates.
+        assert_eq!(continuation_until(u64::MAX - 1, Some(180_000)), u64::MAX);
+        assert_eq!(continuation_until(u64::MAX, None), u64::MAX);
+        assert_eq!(
+            continuation_until(NOW, Some(u64::MAX)),
+            NOW + u64::MAX.div_ceil(1000) + LEASE_TTL_SECS
+        );
+        // Touches cannot move the deadline: it is a pure function of the
+        // acquire inputs, and the row carries it immutably.
+        let row = lease();
+        assert_eq!(row.continuation_until, NOW + 200);
     }
 
     #[test]
     fn heartbeat_classification() {
         let row = lease();
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3, NOW),
             LeaseHeartbeat::Active
         );
         // Epoch bump (takeover, or a newer play from the same session).
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 2),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 2, NOW),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-2", "play-7", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-2", "play-7", 3, NOW),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-9", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-9", 3, NOW),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(None, "sess-1", "play-7", 3),
+            LeaseHeartbeat::classify(None, "sess-1", "play-7", 3, NOW),
             LeaseHeartbeat::Expired
+        );
+        // Exact identity, either bound elapsed: expired.
+        assert_eq!(
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3, NOW + 30),
+            LeaseHeartbeat::Expired
+        );
+        let mut capped = lease();
+        capped.expires_at = NOW + 100;
+        capped.continuation_until = NOW + 10;
+        assert_eq!(
+            LeaseHeartbeat::classify(Some(&capped), "sess-1", "play-7", 3, NOW + 10),
+            LeaseHeartbeat::Expired
+        );
+        // A different identity stays superseded even when elapsed.
+        assert_eq!(
+            LeaseHeartbeat::classify(Some(&capped), "sess-2", "play-7", 3, NOW + 10),
+            LeaseHeartbeat::Superseded
         );
         assert_eq!(LeaseHeartbeat::Active.as_str(), "active");
         assert_eq!(LeaseHeartbeat::Superseded.as_str(), "superseded");
@@ -354,15 +454,15 @@ mod tests {
     fn statements_match_exact_text() {
         assert_eq!(
             playback_lease_select_statement(),
-            "SELECT session_id, track_id, play_id, epoch, expires_at FROM playback_leases WHERE user_id = $1"
+            "SELECT session_id, track_id, play_id, epoch, expires_at, continuation_until FROM playback_leases WHERE user_id = $1"
         );
         assert_eq!(
             playback_lease_acquire_statement(),
-            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, continuation_until, updated_at) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $8, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, continuation_until = EXCLUDED.continuation_until, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.continuation_until <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
         );
         assert_eq!(
             playback_lease_touch_statement(),
-            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
+            "UPDATE playback_leases SET expires_at = LEAST(playback_leases.continuation_until, GREATEST(playback_leases.expires_at, $5)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND playback_leases.continuation_until > $6 RETURNING expires_at"
         );
     }
 
