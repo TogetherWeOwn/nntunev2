@@ -128,7 +128,7 @@ fn digest_mismatch_refuses_whole_derivation() {
     let mut bad = snapshot();
     bad.snapshot_sha256 = "0".repeat(64);
     assert_eq!(
-        derive_evidence(&hinted(), |_| Some(bad)),
+        derive_evidence(&hinted(), |_| Some(bad.clone())),
         Err(EvidenceError::Digest)
     );
 }
@@ -142,7 +142,7 @@ fn non_positive_snapshot_position_refuses() {
         recordings,
     };
     assert_eq!(
-        derive_evidence(&hinted(), |_| Some(bad)),
+        derive_evidence(&hinted(), |_| Some(bad.clone())),
         Err(EvidenceError::Identity)
     );
 }
@@ -156,7 +156,7 @@ fn conflicting_duplicate_recording_refuses() {
         recordings,
     };
     assert_eq!(
-        derive_evidence(&hinted(), |_| Some(bad)),
+        derive_evidence(&hinted(), |_| Some(bad.clone())),
         Err(EvidenceError::Snapshot)
     );
 }
@@ -171,7 +171,7 @@ fn release_mismatch_refuses() {
         recordings,
     };
     assert_eq!(
-        derive_evidence(&hinted(), |_| Some(bad)),
+        derive_evidence(&hinted(), |_| Some(bad.clone())),
         Err(EvidenceError::Snapshot)
     );
 }
