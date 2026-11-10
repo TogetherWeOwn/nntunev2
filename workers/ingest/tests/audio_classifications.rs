@@ -5,6 +5,9 @@ use nntune_ingest::{
     },
     audio_grouping::prepare_manifest,
     audio_manifest::{AcceptedAudioManifest, AudioHints},
+    audio_mirror_evidence::{
+        derive_evidence, mirror_snapshot_digest, MirrorRecording, MirrorSnapshot,
+    },
     audio_publication::prepare_publication,
     audio_selection::{AudioSelectionPlan, ExtractedAudio},
     dispatch::content_sha256_hex,
@@ -130,6 +133,53 @@ fn same_recording_same_position_in_two_release_groups_both_survive() {
     let frozen = manifest(hints);
     let checkpoint =
         classify_entries(&frozen, &[evidence(REC_A, 1, 1), evidence(REC_A, 1, 1)]).unwrap();
+    let rows = checkpoint.entries();
+    assert_eq!((rows[0].release_group_ref, rows[0].duplicate_of), (1, None));
+    assert_eq!((rows[1].release_group_ref, rows[1].duplicate_of), (2, None));
+    assert!(prepare_publication(&frozen, &checkpoint).is_ok());
+}
+
+#[test]
+fn retrieved_same_recording_in_two_releases_both_survive_publication() {
+    // End-to-end through the retrieval seam: hinting the same recording
+    // under two releases whose snapshots both place it at (1, 1) yields
+    // one verified slot per entry, and neither may collapse the other.
+    let mut hints = vec![hint(Some(1), "A", None), hint(Some(1), "A", None)];
+    hints[0].recording_mbid = Some(REC_A.into());
+    hints[0].release_mbid = Some(RELEASE.into());
+    hints[1].album = Some("Other".into());
+    hints[1].recording_mbid = Some(REC_A.into());
+    hints[1].release_mbid = Some(OTHER_RELEASE.into());
+    let frozen = manifest(hints);
+    let snapshot = |release: &str| {
+        let recordings = vec![MirrorRecording {
+            recording_mbid: REC_A.into(),
+            medium_no: 1,
+            track_no: 1,
+        }];
+        MirrorSnapshot {
+            release_mbid: release.into(),
+            snapshot_sha256: mirror_snapshot_digest(release, &recordings),
+            recordings,
+        }
+    };
+    let first = snapshot(RELEASE);
+    let second = snapshot(OTHER_RELEASE);
+    let slots = derive_evidence(&frozen, |release| {
+        if release.eq_ignore_ascii_case(RELEASE) {
+            Some(first.clone())
+        } else if release.eq_ignore_ascii_case(OTHER_RELEASE) {
+            Some(second.clone())
+        } else {
+            None
+        }
+    })
+    .unwrap();
+    assert!(
+        slots.iter().all(Option::is_some),
+        "retrieval must mint one verified slot per entry"
+    );
+    let checkpoint = classify_entries(&frozen, &slots).unwrap();
     let rows = checkpoint.entries();
     assert_eq!((rows[0].release_group_ref, rows[0].duplicate_of), (1, None));
     assert_eq!((rows[1].release_group_ref, rows[1].duplicate_of), (2, None));
