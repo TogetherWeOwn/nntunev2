@@ -615,7 +615,25 @@ pub async fn admit(
             "terminal_failed" => {
                 predecessor = Some(id);
             }
-            _ => return Ok(AdmissionOutcome::ClaimBusy),
+            _ => {
+                // unknown/verifying is busy only while a live handle
+                // holds it. An abandoned candidate is durably
+                // authority-less: never busy, and never replacement
+                // eligible (no failure decision follows abandonment).
+                let abandoned = tx
+                    .query_opt(
+                        "SELECT 1 FROM posted_file_operations \
+                         WHERE generation_id = $1 AND state = 'abandoned'",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(database_error)?
+                    .is_some();
+                if abandoned {
+                    return Ok(AdmissionOutcome::InconsistentOrMissing);
+                }
+                return Ok(AdmissionOutcome::ClaimBusy);
+            }
         }
     } else if expected.health_revision.is_some() {
         return Ok(AdmissionOutcome::InconsistentOrMissing);
@@ -935,7 +953,7 @@ async fn lock_candidate(
         return Ok(None);
     }
     tx.query_opt(
-        "SELECT p.article_count, h.verified_at, h.state, h.round \
+        "SELECT p.article_count, h.verified_at, h.retention_checked_at, h.state, h.round \
          FROM posted_file_operations o JOIN posted_file_job_attempts a ON a.job_id = o.job_id \
          JOIN posted_file_health h ON h.generation_id = o.generation_id \
          JOIN posted_files p ON p.id = o.generation_id AND p.generation_operation = o.id \

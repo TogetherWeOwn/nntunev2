@@ -10,10 +10,11 @@
 --
 -- Legacy inserts (generation_operation IS NULL) keep ON CONFLICT DO NOTHING
 -- first-wins against the partial index, and a BEFORE INSERT fence returns
--- NULL (zero rows) once the registry holds a non-null selection for the
--- hash, so a legacy writer can never mint a second legacy winner after a
--- managed selection. The fence takes FOR SHARE on the registry row to
--- serialize with promotion. The 0047 retirement gate is untouched and stays
+-- NULL (zero rows) once the registry holds a non-null MANAGED selection for
+-- the hash, so a legacy writer can never mint a second legacy winner after a
+-- managed selection. A legacy selection falls through to the partial UNIQUE
+-- index, which keeps raising the duplicate-hash violation. The fence takes
+-- FOR SHARE on the registry row to serialize with promotion. The 0047 retirement gate is untouched and stays
 -- OFF by default; this migration enables no rollout, drain, serving switch
 -- or R2 cleanup by itself — the generation adapter's fenced admit/reuse/
 -- promotion path owns those transitions.
@@ -29,6 +30,7 @@ CREATE OR REPLACE FUNCTION public.fence_legacy_insert_when_managed_selected() RE
 LANGUAGE plpgsql SET search_path = public, pg_catalog AS $$
 DECLARE
     selected_generation TEXT;
+    selected_operation TEXT;
 BEGIN
     IF NEW.generation_operation IS NOT NULL THEN
         RETURN NEW;
@@ -37,7 +39,13 @@ BEGIN
         FROM public.posted_file_registry r
         WHERE r.plaintext_sha256 = NEW.plaintext_sha256 FOR SHARE;
     IF FOUND AND selected_generation IS NOT NULL THEN
-        RETURN NULL;
+        SELECT p.generation_operation INTO selected_operation
+            FROM public.posted_files p
+            WHERE p.id = selected_generation
+              AND p.plaintext_sha256 = NEW.plaintext_sha256;
+        IF selected_operation IS NOT NULL THEN
+            RETURN NULL;
+        END IF;
     END IF;
     RETURN NEW;
 END $$;
