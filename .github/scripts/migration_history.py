@@ -199,11 +199,30 @@ def validate_sql_path(path):
         raise HistoryError("invalid migration path")
 
 
+class EvidenceBudget:
+    """One deadline/output allowance for acquisition, retries and both Git passes."""
+    def __init__(self, *, deadline=None, total_output=0):
+        self.deadline = time.monotonic() + 180 if deadline is None else deadline
+        self.total_output = total_output
+
+    def remaining(self, maximum):
+        remaining = min(maximum, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise HistoryError("shared evidence deadline exceeded")
+        return remaining
+
+    def consume(self, size):
+        self.total_output += size
+        if self.total_output > MAX_TOTAL_OUTPUT:
+            raise HistoryError("shared evidence output bound exceeded")
+
+
 class GitHistory:
-    def __init__(self, root, base, head):
+    def __init__(self, root, base, head, budget=None):
         if not all(COMMIT_RE.fullmatch(ref) for ref in (base, head)):
             raise HistoryError("base and head must be full pinned commit IDs")
         self.root, self.base, self.head = pathlib.Path(root), base, head
+        self.budget = budget or EvidenceBudget()
         self.total_output, self.trees, self.hashes, self.diffs = 0, {}, {}, {}
         for ref in (base, head):
             if self.git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip() != ref:
@@ -223,11 +242,11 @@ class GitHistory:
 
     def git(self, *args, limit=MAX_OUTPUT):
         """Bound stdout while reading, not after an unbounded capture_output."""
+        deadline = time.monotonic() + self.budget.remaining(GIT_TIMEOUT)
         child = subprocess.Popen(["git", "--no-replace-objects", "-C", str(self.root),
                                   "-c", f"diff.renameLimit={MAX_FILES}", *args],
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         output = bytearray()
-        deadline = time.monotonic() + GIT_TIMEOUT
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(child.stdout, selectors.EVENT_READ)
@@ -241,6 +260,7 @@ class GitHistory:
                         continue
                     output.extend(chunk)
                     self.total_output += len(chunk)
+                    self.budget.consume(len(chunk))
                     if len(output) > limit or self.total_output > MAX_TOTAL_OUTPUT:
                         raise HistoryError("Git evidence output bound exceeded")
             if child.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
@@ -372,7 +392,7 @@ class GitHistory:
         return self.states.get(self.head, self.boundary(self.head))
 
 
-def verify(root, base, head, manifest_text, coverage=None):
+def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit=None):
     """Return Git-derived edges by final entry; validate all claimed provenance.
 
     Common-baseline metadata was verified when introduced and is immutable.
@@ -381,7 +401,7 @@ def verify(root, base, head, manifest_text, coverage=None):
     no historical applied aliases may be reclassified or removed.
     """
     entries = parse_manifest(manifest_text)
-    history = GitHistory(root, base, head)
+    history = GitHistory(root, base, head, budget=budget)
     base_text = history.git("show", f"{history.merge_base}:migrations/manifest.toml",
                             limit=MAX_INPUT).decode("utf-8")
     previous = {e["file"]: e for e in parse_manifest(base_text)}
@@ -438,4 +458,7 @@ def verify(root, base, head, manifest_text, coverage=None):
                 # Net mappings are coverage, not fabricated chronological edges.
                 if not any(e[2] == old for e in states[new][1]):
                     raise HistoryError("net rename has no verified source continuity")
+    if audit is not None:
+        audit.update(base=base, head=head, merge_base=history.merge_base,
+                     commits=len(history.commits), events=len(history.events), outcome="verified")
     return result
