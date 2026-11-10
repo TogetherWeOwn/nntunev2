@@ -360,8 +360,7 @@ async fn reauthentication_overlapping_issuance_completes_without_deadlock() {
     );
     assert_eq!(
         f.db
-            .query_one("SELECT count(*)::bigint FROM sessions WHERE id='s1' AND revoked
-                        UNION ALL SELECT count(*)::bigint FROM sessions WHERE id='s1r' AND NOT revoked", &[])
+            .query_one("SELECT (SELECT count(*)::bigint FROM sessions WHERE id='s1' AND revoked) + (SELECT count(*)::bigint FROM sessions WHERE id='s1r' AND NOT revoked)", &[])
             .await
             .unwrap()
             .get::<_, i64>(0),
