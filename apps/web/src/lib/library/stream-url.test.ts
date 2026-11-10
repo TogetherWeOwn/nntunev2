@@ -68,7 +68,7 @@ describe('library player wiring', () => {
 		expect(layout).toContain('const player = createPlayerSession({ flush: tick })');
 		expect(layout).toContain('providePlayerSession(player)');
 		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
-		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />');
 		const context = sources['../player/context.ts'];
 		expect(context).toContain('setContext(PLAYER_SESSION, session)');
 		expect(context).toContain('getContext<PlayerSession>(PLAYER_SESSION)');
@@ -117,7 +117,7 @@ describe('library player markup', () => {
 		const layout = playerSources['../../routes/+layout.svelte'];
 		expect(layout).toContain("import PlayerAudio from '#lib/player/PlayerAudio.svelte'");
 		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
-		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />');
 	});
 
 	it('keeps the audio-player contract hook on an <audio> element', () => {

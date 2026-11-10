@@ -176,7 +176,7 @@ describe('library repeat hooks are declared in the library markup', () => {
 		expect(layout).toContain('providePlayerSession(player)');
 		expect(layout).toContain("import PlayerAudio from '#lib/player/PlayerAudio.svelte'");
 		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
-		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} />');
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />');
 		const context = sources['../player/context.ts'];
 		expect(context).toContain('setContext(PLAYER_SESSION, session)');
 		expect(context).toContain('getContext<PlayerSession>(PLAYER_SESSION)');
