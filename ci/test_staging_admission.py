@@ -624,11 +624,16 @@ class SourceBindingTests(Base):
     """Exercise main/verify with real Git objects; only Actions/live HTTP are fake."""
 
     def setUp(self):
+        self.init_repo()
+
+    def init_repo(self, initial_branch="fixture"):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.objects = {}
-        self.git("init", "--bare", "--quiet")
+        self.git("init", "--bare", "--quiet", f"--initial-branch={initial_branch}")
+        self.assertEqual(self.git("symbolic-ref", "HEAD").decode().strip(),
+                         f"refs/heads/{initial_branch}")
         self.contract = json.dumps(dict(CONTRACT, criteria=[{
             "id": "signup", "applicable": True, "evidence": [{
                 "classname": "signup.spec.ts", "name": "signup", "outcome": "passed"}]}])).encode()
@@ -695,7 +700,8 @@ class SourceBindingTests(Base):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
-        self.git("update-ref", "HEAD", trusted)
+        # Model a detached workflow checkout, independent of init.defaultBranch.
+        self.git("update-ref", "--no-deref", "HEAD", trusted)
         # Model checkout's full-history fallback: origin/main names the captured
         # dispatch commit, even though the remote branch has already advanced.
         self.git("update-ref", "refs/remotes/origin/main", trusted)
@@ -726,6 +732,18 @@ class SourceBindingTests(Base):
     def test_main_accepts_matching_closure_despite_unrelated_main_movement(self):
         current = dict(self.files, **{"docs/unrelated.md": ("100644", b"unrelated main change")})
         self.run_main(current_files=current)
+
+    def test_main_source_binding_is_independent_of_initial_branch(self):
+        for initial_branch in ("main", "master"):
+            with self.subTest(initial_branch=initial_branch):
+                self.init_repo(initial_branch)
+                unrelated = dict(self.files, **{"docs/unrelated.md": ("100644", b"unrelated main change")})
+                self.run_main(current_files=unrelated)
+                changed = dict(self.files, **{"e2e/helpers/accounts.ts": ("100644", b"corrected input")})
+                self.refused("producer.*drift", self.run_main, trusted_files=changed)
+                self.refused("producer.*drift", self.run_main, current_files=changed)
+                changed = dict(self.files, **{"migrations/manifest.toml": ("100644", b"new manifest")})
+                self.refused("current migration manifest drift", self.run_main, current_files=changed)
 
     def test_main_refuses_older_executable_evidence_inputs(self):
         for name in ("e2e/tests/signup.spec.ts", "e2e/helpers/accounts.ts", "e2e/helpers/access.ts",
@@ -844,7 +862,7 @@ class CurrentMainTests(Base):
                                                stderr=subprocess.PIPE, env=env, timeout=15)
             for path in (remote, local):
                 path.mkdir()
-                git_at(path, "init", "--bare", "--quiet")
+                git_at(path, "init", "--bare", "--quiet", "--initial-branch=fixture")
             tree = git_at(remote, "mktree", data=b"").decode().strip()
             trusted = git_at(remote, "commit-tree", tree, "-m", "dispatch").decode().strip()
             git_at(remote, "update-ref", "refs/heads/main", trusted)
