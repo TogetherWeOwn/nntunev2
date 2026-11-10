@@ -56,6 +56,17 @@ but is not yet mounted. Its eventual transport must reject duplicate auth
 parameters, including encoded names and copies split across query/form,
 before constructing credentials.
 
+Native `/v1/plays` now calls the shared, identity-based issuance core in
+`workers/api/src/handlers.rs` (`issue_play_for_user`). It returns a typed
+internal grant after the same subscription, hour-cap and one-user lease gates;
+it does not authenticate compatibility credentials or enable a `/rest` stream.
+A future compatibility adapter must check caller membership and curated-source
+access first, then forward the grant privately to the native stream path. No
+cookie-session fabrication, query grant or client scrobble can replace those
+steps or delivered-byte metering. The shared ingest ledger's NULL owner is not
+a caller's `library_tracks` membership; its visibility is not authorization
+for compatibility catalogue, playlist entries or art.
+
 ## Checklist
 
 | # | Client | Steps | Expect |

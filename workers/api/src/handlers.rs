@@ -5418,21 +5418,21 @@ where
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PlayIssueBody {
-    track_id: String,
+pub(crate) struct PlayIssueBody {
+    pub(crate) track_id: String,
     /// Client-generated playback session id (per tab/device): the lease
     /// holder name. Distinct from the account session cookie — two
     /// signed-in devices share one account but hold different holders.
-    session_id: String,
+    pub(crate) session_id: String,
     /// Continuation key only: present when refreshing a grant for the
     /// caller's own current play. Never accepted as a fresh play id —
     /// new starts always mint one server-side, so a replay cannot be
     /// under-metered by reusing an old id.
-    play_id: Option<String>,
+    pub(crate) play_id: Option<String>,
     /// Explicit "play here instead": take the lease from the other
     /// session now rather than waiting out its TTL.
     #[serde(default)]
-    takeover: bool,
+    pub(crate) takeover: bool,
 }
 
 #[derive(Deserialize)]
@@ -5471,12 +5471,33 @@ fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Respon
     }
 }
 
-/// Mint the grant for an already-acquired lease hold and render the
-/// issuance body. The minter re-checks the identity field rule, so an
-/// unmeterable identity still cannot mint even though the handler
-/// validated earlier; `NotConfigured` is unreachable after the
-/// up-front secret check but stays a fail-closed 500, never a token.
-fn play_grant_response(
+/// Internal issuance result, deliberately not Debug: it contains a bearer
+/// grant. Only the native HTTP adapter serializes it; other surfaces can
+/// forward the grant privately without parsing or exposing a JSON response.
+pub(crate) struct IssuedPlay {
+    pub(crate) grant: crate::play_grant::IssuedGrant,
+    pub(crate) play_id: String,
+    pub(crate) lease_epoch: u64,
+    pub(crate) lease_expires_at: u64,
+}
+
+impl IssuedPlay {
+    fn into_response(self) -> Response {
+        json_response(
+            200,
+            serde_json::json!({
+                "grant": self.grant.token,
+                "play_id": self.play_id,
+                "lease_epoch": self.lease_epoch,
+                "expires_at": self.grant.exp_unix,
+                "lease_expires_at": self.lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        )
+    }
+}
+
+fn mint_play(
     secret: &[u8],
     user_id: &str,
     track_id: &str,
@@ -5484,7 +5505,7 @@ fn play_grant_response(
     epoch: u64,
     now: u64,
     lease_expires_at: u64,
-) -> Response {
+) -> Result<IssuedPlay, Response> {
     match crate::play_grant::issue_v2_at(
         user_id,
         track_id,
@@ -5494,19 +5515,16 @@ fn play_grant_response(
         crate::play_grant::MAX_GRANT_TTL,
         Some(secret),
     ) {
-        Ok(issued) => json_response(
-            200,
-            serde_json::json!({
-                "grant": issued.token,
-                "play_id": play_id,
-                "lease_epoch": epoch,
-                "expires_at": issued.exp_unix,
-                "lease_expires_at": lease_expires_at,
-                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
-            }),
-        ),
-        Err(crate::play_grant::MintError::NotConfigured) => internal(),
-        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+        Ok(grant) => Ok(IssuedPlay {
+            grant,
+            play_id: play_id.to_string(),
+            lease_epoch: epoch,
+            lease_expires_at,
+        }),
+        Err(crate::play_grant::MintError::NotConfigured) => Err(internal()),
+        Err(crate::play_grant::MintError::InvalidIdentity) => {
+            Err(validation_failed("invalid request"))
+        }
     }
 }
 
@@ -5521,11 +5539,34 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    match issue_play_for_user(ctx, &claims.user_id, parse_body::<PlayIssueBody>(req)).await {
+        Ok(issued) => issued.into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Shared issuance after surface-specific authentication. This is not an
+/// authorizer: callers supply only their authenticated user's id and must
+/// enforce that surface's catalogue/source access before requesting a grant.
+/// It accepts no HTTP credentials and creates no account session. Keep the
+/// typed grant internal; compatibility forwarding must use a private header,
+/// never serialize a native grant into a compatibility response or URL.
+pub(crate) async fn issue_play_for_user<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: Option<PlayIssueBody>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
     // answer the typed 409 up front rather than a lease 429/500 after
     // the fence refuses the write.
-    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-        return account_deleting_response();
+    if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+        return Err(account_deleting_response());
     }
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
@@ -5536,26 +5577,25 @@ where
         .as_deref()
         .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
     else {
-        return internal();
+        return Err(internal());
     };
-    let Some(body) = parse_body::<PlayIssueBody>(req) else {
-        return validation_failed("invalid request");
+    let Some(body) = body else {
+        return Err(validation_failed("invalid request"));
     };
     if !valid_client_session_id(&body.session_id) {
-        return validation_failed("invalid session_id");
+        return Err(validation_failed("invalid session_id"));
     }
     // The track id must be meterable before any lease write: the
     // ledger field rule is the single authority (probed with a
     // placeholder play id — the same probe the minter runs with the
     // real one). User ids are server-generated; an unmeterable one
     // fails this same check rather than minting an unbillable grant.
-    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
-    {
-        return validation_failed("invalid track_id");
+    if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
+        return Err(validation_failed("invalid track_id"));
     }
-    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+    let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Continuation: the same client session refreshing the grant for
     // its own current play (seek/resume/refresh ahead of grant
@@ -5567,16 +5607,15 @@ where
     // simply a new start through the gates below.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id) {
-            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
-                .is_err()
+            if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
-                return validation_failed("invalid play_id");
+                return Err(validation_failed("invalid play_id"));
             }
             let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
             match ctx
                 .store
                 .touch_playback_lease(
-                    &claims.user_id,
+                    user_id,
                     &body.session_id,
                     play_id,
                     row.epoch,
@@ -5586,9 +5625,9 @@ where
                 .await
             {
                 Ok(true) => {
-                    return play_grant_response(
+                    return mint_play(
                         secret,
-                        &claims.user_id,
+                        user_id,
                         &body.track_id,
                         play_id,
                         row.epoch,
@@ -5597,29 +5636,29 @@ where
                     );
                 }
                 Ok(false) => {}
-                Err(_) => return internal(),
+                Err(_) => return Err(internal()),
             }
         }
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
     // never as the distant past (entitled forever).
-    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+    let subscription = match ctx.store.live_subscription(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     let effective = crate::billing::resolve_effective_plan(
         subscription.as_ref().map(|row| row.as_view()),
         i64::try_from(ctx.now).unwrap_or(i64::MAX),
     );
     if !effective.entitled {
-        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+        let ever_paid = match ctx.store.ever_subscribed(user_id).await {
             Ok(ever) => ever,
-            Err(_) => return internal(),
+            Err(_) => return Err(internal()),
         };
         let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
             .expect("an unentitled effective plan always refuses");
-        return subscription_refusal(refusal);
+        return Err(subscription_refusal(refusal));
     }
     // Caps are plan DATA from the `plans` row; a missing row fails
     // closed to the reserved `free` caps (0 h) — the 402 below, never
@@ -5627,32 +5666,34 @@ where
     let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
         Ok(Some(caps)) => caps,
         Ok(None) => crate::plan_limits::PlanId::Free.caps(),
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Gate 2: the monthly hour cap. An unreadable meter refuses the
     // new start (store default `Err`) rather than reading as zero.
     let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
     let used_seconds = match ctx
         .store
-        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .monthly_stream_seconds(user_id, &period_month)
         .await
     {
         Ok(seconds) => seconds,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     if let Some(denial) =
         crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
     {
-        return plan_limit_refusal(denial);
+        return Err(plan_limit_refusal(denial));
     }
     // A zero concurrency allowance refuses with the lease 429 wire and
     // the static retry: no lease exists to wait on. Allowances above
     // one are still enforced as one — the lease table holds a single
     // row per user by design (every seeded plan allows exactly one).
     if caps.max_concurrent_streams == 0 {
-        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-            &caps,
-            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        return Err(plan_limit_refusal(
+            crate::plan_limits::deny_concurrent_lease(
+                &caps,
+                crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+            ),
         ));
     }
     // Gate 3: the lease. The play id is minted here, never taken from
@@ -5661,13 +5702,13 @@ where
     // store; `Held` is the other-session 429 with the live TTL.
     let play_id = match random_id::<16>() {
         Ok(id) => id,
-        Err(_) => return unavailable(),
+        Err(_) => return Err(unavailable()),
     };
     let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
     match ctx
         .store
         .acquire_playback_lease(
-            &claims.user_id,
+            user_id,
             &body.session_id,
             &body.track_id,
             &play_id,
@@ -5677,9 +5718,9 @@ where
         )
         .await
     {
-        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => mint_play(
             secret,
-            &claims.user_id,
+            user_id,
             &body.track_id,
             &play_id,
             epoch,
@@ -5691,16 +5732,15 @@ where
             // after the up-front check (the marker landed mid-request):
             // re-read it so that race answers the typed 409, not a
             // concurrent-streams 429.
-            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-                account_deleting_response()
+            if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+                Err(account_deleting_response())
             } else {
-                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-                    &caps,
-                    retry_after_secs,
+                Err(plan_limit_refusal(
+                    crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
                 ))
             }
         }
-        Err(_) => internal(),
+        Err(_) => Err(internal()),
     }
 }
 
@@ -13001,6 +13041,157 @@ mod tests {
     fn play_user(h: &Harness) -> String {
         seed_user(h, "user-plays-1", "plays@example.com");
         magic_login(h, "plays@example.com")
+    }
+
+    fn shared_play_call(
+        h: &Harness,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: Option<String>,
+    ) -> Result<IssuedPlay, Response> {
+        block_on(issue_play_for_user(
+            &h.ctx(),
+            user_id,
+            Some(PlayIssueBody {
+                track_id: track_id.to_string(),
+                session_id: session_id.to_string(),
+                play_id,
+                takeover: false,
+            }),
+        ))
+    }
+
+    #[test]
+    fn shared_play_core_returns_typed_grant_without_creating_account_sessions() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let issued = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("authenticated identity can use shared gates without a cookie");
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            &issued.play_id,
+            issued.lease_epoch,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .unwrap();
+        assert_eq!(issued.grant, expected);
+        assert_eq!(issued.lease_epoch, 1);
+        assert_eq!(issued.lease_expires_at, NOW + 45);
+        let native_wire = issued.into_response();
+        assert_eq!(native_wire.status, 200);
+        assert!(native_wire.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn shared_play_core_and_native_route_contend_for_one_user_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("first holder");
+        let refused = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "native-tab"}),
+        );
+        assert_eq!(refused.status, 429);
+        assert_eq!(refused.retry_after, Some(45));
+        let takeover = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-10", "session_id": "native-tab", "takeover": true,
+            }),
+        );
+        assert_eq!(takeover.status, 200);
+        let refused = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id),
+        )
+        .map(|_| ())
+        .expect_err("old compatibility play cannot renew after native takeover");
+        assert_eq!(refused.status, 429);
+        let current = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(current.session_id, "native-tab");
+        assert_eq!(current.epoch, first.lease_epoch + 1);
+    }
+
+    #[test]
+    fn shared_play_core_enforces_subscription_and_cap_but_preserves_continuation() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        let unsubscribed = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("unsubscribed");
+        assert_eq!(unsubscribed.status, 402);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("entitled first start");
+        h.store.stream_seconds.borrow_mut().insert(
+            (
+                "user-plays-1".to_string(),
+                crate::ledger::period_month_for_timestamp(NOW),
+            ),
+            3600,
+        );
+        let continued = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id.clone()),
+        )
+        .expect("current track finishes across the cap");
+        assert_eq!(continued.play_id, first.play_id);
+        assert_eq!(continued.lease_epoch, first.lease_epoch);
+        let capped = shared_play_call(&h, "user-plays-1", "compat-holder", "track-10", None)
+            .map(|_| ())
+            .expect_err("next start at cap");
+        assert_eq!(capped.status, 402);
+        assert_eq!(h.store.playback_leases.borrow()["user-plays-1"].epoch, 1);
+    }
+
+    #[test]
+    fn shared_play_core_preserves_pre_write_validation_and_configuration_gates() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        for (session_id, track_id) in [("", "track-9"), ("holder", "not/meterable")] {
+            let refused = shared_play_call(&h, "user-plays-1", session_id, track_id, None)
+                .map(|_| ())
+                .expect_err("invalid lease input");
+            assert_eq!(refused.status, 422);
+        }
+        let malformed = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("missing body");
+        assert_eq!(malformed.status, 422);
+        let mut unconfigured = play_harness();
+        unconfigured.config.play_grant_secret = None;
+        let refused = shared_play_call(&unconfigured, "user-plays-1", "holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("missing signing secret");
+        assert_eq!(refused.status, 500);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let deleting = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("deletion refusal precedes malformed body");
+        assert_eq!(deleting.status, 409);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        assert!(unconfigured.store.playback_leases.borrow().is_empty());
     }
 
     #[test]
