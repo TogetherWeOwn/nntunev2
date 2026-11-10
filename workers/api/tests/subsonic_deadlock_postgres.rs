@@ -243,7 +243,8 @@ impl Fixture {
                  $$ BEGIN PERFORM pg_advisory_xact_lock({}); RETURN NEW; END $$;
                  DROP TRIGGER IF EXISTS session_gate ON sessions;
                  CREATE TRIGGER session_gate BEFORE INSERT ON sessions
-                 FOR EACH ROW EXECUTE FUNCTION session_gate()"
+                 FOR EACH ROW EXECUTE FUNCTION session_gate()",
+                self.lock_key
             ))
             .await
             .unwrap();
