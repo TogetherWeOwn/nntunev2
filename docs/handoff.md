@@ -23,29 +23,51 @@ Snapshot date: 2026-11-10 (UTC).
 
 ## Concrete blockers
 
-- M1 exit verification pending: exact-head staging evidence journey
-  (invite → subscription → admin-ingested catalogue → play/seek)
-  plus rollback evidence, on a deploy whose access control and
-  build-identity legs can run. Tracked in the traceability matrix as
-  PARTIAL/GAP rows; closing those rows is separate work.
-- The staging deployment-evidence basis depends on the staging
-  lanes reporting deployed status with matching source revisions;
-  skipped lanes are not evidence.
+M1 exit verification cannot pass yet (see
+[docs/m1-exit-traceability.md](m1-exit-traceability.md) rows 3, 4 and 6):
+
+1. Admin ingest must seed one curated album on staging. Matching
+   depends on the MetaBrainz replacement, which is not yet imported or
+   activated.
+2. Rows 3 and 4 keep their ingest, play, seek, meter and queue legs
+   parked by name until admin ingest can seed a curated track on
+   staging; un-park each leg by removing its spec guard together with
+   its gate entry.
+3. Row 6 stays a GAP until the `staging-api` lane records
+   `deployed=true` with a matching `source_sha` and the rollback
+   pointer (last good staging revision plus its deploy run) is
+   recorded per the staging promotion checklist.
+4. Only then run the exact-head journey (invite → subscription →
+   admin-ingested catalogue → play/seek) and record the rollback
+   pointer, updating the traceability matrix and this handoff in the
+   same change that closes a row.
 
 ## Last verification
 
-- Exact-head Actions evidence for `b926dd6d` is the CI record on
-  that revision (see the Actions run links on the merged change).
+- Exact-head Actions evidence for
+  `b926dd6db10730c0986ae72a4c09fbd5125b34d8`:
+  - ci: https://github.com/TogetherWeOwn/nntunev2/actions/runs/42870751010
+    (conclusion `success`, push event on that SHA)
+  - deploy: https://github.com/TogetherWeOwn/nntunev2/actions/runs/42870749181
+    (conclusion `success`, push event on that SHA)
+- The deploy run deployed all staging lanes (`staging-api`,
+  `staging-web`, `staging-mb`, `staging-ingest` all `success`, none
+  skipped) and its post-deploy synthetic smoke and full journey jobs
+  succeeded. It does not prove M1 exit: a green run is not staging
+  evidence (see blockers below), and row 6 stays a GAP until the
+  `staging-api` lane records `deployed=true` with a matching
+  `source_sha` recording and the rollback pointer is kept.
 - Docs-only changes use focused static and diff checks plus exact-head
   Actions runs; no local full suite. This change's verification is
   its CI `ci-ok` gate plus review.
 
 ## Next unfinished step
 
-Complete M1 exit verification on the next staging promotion: run the
-exact-head deploy, the post-deploy end-to-end journey and the
-rollback-pointer procedure, then update the traceability matrix and
-this handoff in the same change that closes a row.
+First unfinished step: admin ingest seeds one curated album on
+staging (blocker 1 above). Do not start the M1 exit journey until
+the parked legs in rows 3 and 4 can be un-parked, the `staging-api`
+lane records `deployed=true` with a matching `source_sha`, and the
+rollback pointer is ready (blockers 2–4).
 
 This file is a dated snapshot. Live assignments, dependencies and
 status remain in the assignment tracker.

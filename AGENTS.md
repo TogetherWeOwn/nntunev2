@@ -158,7 +158,9 @@ feature — never as an audio source.
   Privacy Policy wherever the embed is offered.
 
 The pre-existing extraction spike under `workers/youtube/` predates
-these rules and is awaiting retirement. The CI gate allow-lists that
+these rules and is awaiting retirement (kept, flag-off — see
+[docs/decisions/0001-youtube-embed-first.md](docs/decisions/0001-youtube-embed-first.md)).
+The CI gate allow-lists that
 path (and its design note) for the extraction rule only, temporarily.
 Do not extend the spike, and do not copy its approach into new code.
 

@@ -22,8 +22,9 @@ for covering end-to-end specs.
    shared catalogue as playable. Users never upload archives or
    provide provider credentials. For M1, the collection may stream from
    the original archive; the re-post pipeline is a later milestone.
-4. **Play and seek from the curated collection.** The same legs as
-   step 3, streamed from the curated collection. A track the collection
+4. **Play and seek from the curated collection.** The existing play
+   and seek legs, with the source set to the curated collection,
+   streamed from the curated collection. A track the collection
    does not have plays from the official video embed; an unavailable
    track is hidden by default. The stream-hour meter accrues for the
    play.
