@@ -495,7 +495,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
                 return SessionOnly;
             }
-            if path == "/v1/credentials" {
+            if path == "/v1/credentials" || path == "/v1/me/listenbrainz" {
                 return SessionOnly;
             }
             if one_segment_after("/v1/operations/", path) {
@@ -636,7 +636,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" {
+            if path == "/v1/account" || path == "/v1/me/listenbrainz" {
                 return SessionOnly;
             }
             if path.starts_with("/v1/credentials/") && path.len() > "/v1/credentials/".len() {

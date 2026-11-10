@@ -671,6 +671,110 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Fleet-shared outbound admission, using database time. None or error
+    /// means do not send. A claim excludes all other sends until its matching
+    /// completion persists the cooldown; it never expires automatically.
+    fn claim_listenbrainz_outbound(
+        &self,
+    ) -> impl Future<Output = Result<Option<crate::listenbrainz::OutboundClaim>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Atomically persist cooldown and release only this in-flight generation.
+    /// No release without durable cooldown. Errors/uncertain commits never
+    /// authorize success or automatic retry. Default refuses, like admission.
+    fn finish_listenbrainz_outbound(
+        &self,
+        claim: crate::listenbrainz::OutboundClaim,
+        wait_s: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (claim, wait_s);
+            Err(StoreError)
+        }
+    }
+    /// Persist the parsed relative provider cooldown before returning an
+    /// upstream outcome. Concurrent/older replies cannot shorten the floor.
+    /// Default refuses: a process-local cooldown is not fleet enforcement.
+    fn defer_listenbrainz_outbound(
+        &self,
+        wait_s: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = wait_s;
+            Err(StoreError)
+        }
+    }
+    /// Server-side encrypted link read, scoped only to the session user.
+    /// Never serialize this row; return `StoredLink::summary` to clients.
+    fn listenbrainz_link(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::listenbrainz::StoredLink>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// After fresh-session/CSRF checks and upstream token validation, delete
+    /// then store exactly one encrypted row with an atomic audit. Serialize
+    /// with unlink/relink and account deletion on the owner's users row.
+    /// Default refuses: no separately committed delete/insert fallback.
+    fn replace_listenbrainz_link(
+        &self,
+        user_id: &str,
+        link: &crate::listenbrainz::StoredLink,
+        source_ip: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::account_deletion::FencedWriteOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, link, source_ip, now);
+            Err(StoreError)
+        }
+    }
+    /// Idempotent encrypted-row deletion and audit in the same transaction,
+    /// using the same owner lock and deletion fence as replacement.
+    fn unlink_listenbrainz_link(
+        &self,
+        user_id: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::account_deletion::FencedWriteOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, source_ip, now);
+            Err(StoreError)
+        }
+    }
+    /// Wrap-only CAS against the complete captured envelope and username.
+    /// A same-version relink or unlink loses the claim; no credential can be
+    /// resurrected. The owner lock, deletion fence and audit are atomic.
+    fn cas_rewrap_listenbrainz_link(
+        &self,
+        user_id: &str,
+        captured: &crate::listenbrainz::StoredLink,
+        replacement: &crate::listenbrainz::StoredLink,
+        now: u64,
+    ) -> impl Future<Output = Result<crate::listenbrainz::RewrapOutcome, StoreError>> {
+        async move {
+            let _ = (user_id, captured, replacement, now);
+            Err(StoreError)
+        }
+    }
+    /// Bounded keyset scan of owner ids whose ListenBrainz link has
+    /// `kek_version < below_version` (nonzero), ascending by opaque-id ASCII byte order and strictly
+    /// after `after`, at most `limit` (1..=100). Returns ids only: no
+    /// envelopes or usernames. Default refuses (fail closed).
+    fn listenbrainz_rotation_candidates(
+        &self,
+        below_version: u32,
+        after: Option<&crate::listenbrainz_rotation::OwnerCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<crate::listenbrainz_rotation::OwnerCursor>, StoreError>>
+    {
+        async move {
+            let _ = (below_version, after, limit);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,
@@ -4221,6 +4325,64 @@ fn listed_credential(row: &NativeCredentialRow) -> serde_json::Value {
     })
 }
 
+async fn listenbrainz_status<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // A presented bearer must not be rescued by a cookie. No native REST
+    // scope grants access to third-party account credentials.
+    if req.authorization.is_some() {
+        return not_found();
+    }
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let summary = match ctx.store.listenbrainz_link(&claims.user_id).await {
+        Ok(Some(link)) if link.user_id == claims.user_id => link.summary(),
+        Ok(None) => crate::listenbrainz::LinkSummary::default(),
+        _ => return internal(),
+    };
+    // Status never opens the envelope or needs access to a KEK.
+    json_response(200, serde_json::json!(summary))
+}
+
+async fn listenbrainz_unlink<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::account_deletion::FencedWriteOutcome;
+
+    if req.authorization.is_some() {
+        return not_found();
+    }
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // One deletion-fenced transaction owns deletion and audit. Do not
+    // pre-read, decrypt, or append a separately committed best-effort audit.
+    match ctx
+        .store
+        .unlink_listenbrainz_link(&claims.user_id, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(FencedWriteOutcome::Written) => json_response(
+            200,
+            serde_json::json!(crate::listenbrainz::LinkSummary::default()),
+        ),
+        Ok(FencedWriteOutcome::AccountDeleting) => account_deleting_response(),
+        Ok(FencedWriteOutcome::NoRow) => generic_auth(),
+        Err(_) => internal(),
+    }
+}
+
 async fn credentials_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6841,6 +7003,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
+            | "/v1/me/listenbrainz"
             | "/v1/library"
             | "/api/library"
             | "/v1/artists"
@@ -7031,6 +7194,8 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", "/v1/me/listenbrainz") => listenbrainz_status(ctx, req).await,
+        ("DELETE", "/v1/me/listenbrainz") => listenbrainz_unlink(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -7247,6 +7412,9 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
+        listenbrainz_links: RefCell<HashMap<String, crate::listenbrainz::StoredLink>>,
+        listenbrainz_calls: RefCell<Vec<(String, String)>>,
+        fail_listenbrainz_store: RefCell<bool>,
         /// User ids that still own a legacy `provider_vaults` row. The
         /// product no longer reads or writes vaults; the reaper and
         /// magic admission keep protecting these accounts.
@@ -7442,6 +7610,49 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn listenbrainz_link(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::listenbrainz::StoredLink>, StoreError> {
+            self.listenbrainz_calls
+                .borrow_mut()
+                .push(("read".into(), user_id.into()));
+            if *self.fail_listenbrainz_store.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.listenbrainz_links.borrow().get(user_id).cloned())
+        }
+
+        async fn unlink_listenbrainz_link(
+            &self,
+            user_id: &str,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<crate::account_deletion::FencedWriteOutcome, StoreError> {
+            use crate::account_deletion::FencedWriteOutcome;
+            self.listenbrainz_calls
+                .borrow_mut()
+                .push(("unlink".into(), user_id.into()));
+            if *self.fail_listenbrainz_store.borrow() {
+                return Err(StoreError);
+            }
+            if !self.users.borrow().contains_key(user_id) {
+                return Ok(FencedWriteOutcome::NoRow);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(FencedWriteOutcome::AccountDeleting);
+            }
+            self.listenbrainz_links.borrow_mut().remove(user_id);
+            self.audits.borrow_mut().push(crate::vault::audit_event(
+                user_id,
+                "listenbrainz.unlink",
+                true,
+                source_ip,
+                now,
+            ));
+            Ok(FencedWriteOutcome::Written)
+        }
+
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -15688,6 +15899,247 @@ mod tests {
         assert_eq!(resp.status, 200);
         let dead = h.call_full("GET", "/v1/plans", None, Some(cookie2), None);
         assert_eq!(dead.status, 401);
+    }
+
+    // --- ListenBrainz account status and unlink --------------------------------
+
+    const LB_PATH: &str = "/v1/me/listenbrainz";
+    const LB_TEST_TOKEN: &str = "0b9e2f4a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+
+    fn seed_listenbrainz(h: &Harness, user_id: &str, username: &str) {
+        struct Keys;
+        impl crate::rotation::KekSource for Keys {
+            fn kek(&self, version: u32) -> Option<&[u8; 32]> {
+                (version == 1).then_some(&[7; 32])
+            }
+        }
+        let link = crate::listenbrainz::LinkInput::new(username, LB_TEST_TOKEN)
+            .unwrap()
+            .seal(&Keys, 1, user_id)
+            .unwrap();
+        h.store
+            .listenbrainz_links
+            .borrow_mut()
+            .insert(user_id.into(), link);
+    }
+
+    fn listenbrainz_request(method: &str, cookie: Option<&str>) -> Request {
+        Request {
+            method: method.into(),
+            path: LB_PATH.into(),
+            cookie: cookie.map(str::to_string),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn listenbrainz_status_is_owner_scoped_and_token_free() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let a = magic_login(&h, "a@example.com");
+        let b = magic_login(&h, "b@example.com");
+        seed_listenbrainz(&h, "u1", "alice_lb");
+        let mut req = listenbrainz_request("GET", Some(&a));
+        req.origin = None; // Reads do not need mutation CSRF or fresh reauth.
+        let status = block_on(handle(&h.ctx(), &req));
+        assert_eq!(status.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.body).unwrap(),
+            serde_json::json!({"linked": true, "username": "alice_lb"})
+        );
+        for secret_field in [
+            LB_TEST_TOKEN,
+            "ciphertext",
+            "envelope",
+            "kek_version",
+            "token",
+        ] {
+            assert!(!status.body.contains(secret_field));
+        }
+        req.cookie = Some(b);
+        // A body-supplied owner can neither select nor mutate another link.
+        req.body = br#"{"user_id":"u1"}"#.to_vec();
+        let status = block_on(handle(&h.ctx(), &req));
+        assert_eq!(status.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.body).unwrap(),
+            serde_json::json!({"linked": false, "username": null})
+        );
+        assert!(h.store.listenbrainz_links.borrow().contains_key("u1"));
+        assert_eq!(
+            &*h.store.listenbrainz_calls.borrow(),
+            &[("read".into(), "u1".into()), ("read".into(), "u2".into())]
+        );
+    }
+
+    #[test]
+    fn listenbrainz_unlink_is_idempotent_and_owner_scoped() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_listenbrainz(&h, "u1", "alice_lb");
+        seed_listenbrainz(&h, "u2", "bob_lb");
+        let mut req = listenbrainz_request("DELETE", Some(&cookie));
+        req.body = br#"{"user_id":"u2"}"#.to_vec();
+        for _ in 0..2 {
+            let response = block_on(handle(&h.ctx(), &req));
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({"linked": false, "username": null})
+            );
+        }
+        assert!(!h.store.listenbrainz_links.borrow().contains_key("u1"));
+        assert!(h.store.listenbrainz_links.borrow().contains_key("u2"));
+        assert_eq!(
+            &*h.store.listenbrainz_calls.borrow(),
+            &[
+                ("unlink".into(), "u1".into()),
+                ("unlink".into(), "u1".into())
+            ]
+        );
+        assert_eq!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.action == "listenbrainz.unlink")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn listenbrainz_unlink_requires_fresh_session_and_exact_origin() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_listenbrainz(&h, "u1", "alice_lb");
+        for origin in [None, Some("https://foreign.example"), Some("null")] {
+            let mut req = listenbrainz_request("DELETE", Some(&cookie));
+            req.origin = origin.map(str::to_string);
+            assert_eq!(block_on(handle(&h.ctx(), &req)).status, 401);
+        }
+        let mut stale = h.ctx();
+        stale.now += session::PRIVILEGE_REAUTH_WINDOW_SECS + 1;
+        let req = listenbrainz_request("DELETE", Some(&cookie));
+        let response = block_on(handle(&stale, &req));
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("reauth_required"));
+        assert!(h.store.listenbrainz_calls.borrow().is_empty());
+        // The same still-valid session can read status without step-up.
+        let req = listenbrainz_request("GET", Some(&cookie));
+        assert_eq!(block_on(handle(&stale, &req)).status, 200);
+        assert!(h.store.listenbrainz_links.borrow().contains_key("u1"));
+    }
+
+    #[test]
+    fn listenbrainz_rejects_bearers_and_invalid_sessions_before_link_store() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_listenbrainz(&h, "u1", "alice_lb");
+        for method in ["GET", "DELETE"] {
+            assert_eq!(
+                crate::native_rest::scope_for_operation(method, LB_PATH),
+                crate::native_rest::RouteDecision::SessionOnly
+            );
+            for cookie in [None, Some("session=invalid")] {
+                let req = listenbrainz_request(method, cookie);
+                assert_eq!(block_on(handle(&h.ctx(), &req)).status, 401);
+            }
+            for authorization in [
+                "",
+                "Bearer invalid",
+                "Bearer ntk_synthetic",
+                "Basic invalid",
+            ] {
+                for cookie in [None, Some(cookie.as_str())] {
+                    let mut req = listenbrainz_request(method, cookie);
+                    req.authorization = Some(authorization.into());
+                    assert_eq!(block_on(handle(&h.ctx(), &req)).status, 404);
+                }
+            }
+        }
+        for record in h.store.sessions.borrow_mut().values_mut() {
+            record.revoked = true;
+        }
+        for method in ["GET", "DELETE"] {
+            let req = listenbrainz_request(method, Some(&cookie));
+            assert_eq!(block_on(handle(&h.ctx(), &req)).status, 401);
+        }
+        assert!(h.store.listenbrainz_calls.borrow().is_empty());
+        assert_eq!(*h.store.native_credential_lookups.borrow(), 0);
+    }
+
+    #[test]
+    fn listenbrainz_store_failures_and_deletion_fence_never_report_success() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_listenbrainz(&h, "u1", "alice_lb");
+        *h.store.fail_listenbrainz_store.borrow_mut() = true;
+        for method in ["GET", "DELETE"] {
+            let req = listenbrainz_request(method, Some(&cookie));
+            let response = block_on(handle(&h.ctx(), &req));
+            assert_eq!(response.status, 500);
+            assert_eq!(response.body, internal().body);
+        }
+        assert!(h.store.listenbrainz_links.borrow().contains_key("u1"));
+        *h.store.fail_listenbrainz_store.borrow_mut() = false;
+        h.store.deleting_users.borrow_mut().insert("u1".into());
+        let req = listenbrainz_request("DELETE", Some(&cookie));
+        let response = block_on(handle(&h.ctx(), &req));
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains("account_deleting"));
+        assert!(h.store.listenbrainz_links.borrow().contains_key("u1"));
+        h.store.users.borrow_mut().remove("u1");
+        assert_eq!(block_on(handle(&h.ctx(), &req)).status, 401);
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != "listenbrainz.unlink"));
+    }
+
+    #[test]
+    fn listenbrainz_only_serves_exact_status_unlink_and_preflight() {
+        let h = harness();
+        assert!(is_known_path(LB_PATH));
+        assert_eq!(
+            h.call_full("OPTIONS", LB_PATH, None, None, Some(ORIGIN))
+                .status,
+            204
+        );
+        for method in ["POST", "PUT", "PATCH", "HEAD"] {
+            assert_eq!(
+                h.call_full(method, LB_PATH, None, None, Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                crate::native_rest::scope_for_operation(method, LB_PATH),
+                crate::native_rest::RouteDecision::Deny
+            );
+        }
+        for path in [
+            "/v1/me/listenbrainz/",
+            "/v1/me/listenbrainz/u1",
+            "/v1/me/listenbrainzx",
+        ] {
+            for method in ["GET", "DELETE", "OPTIONS"] {
+                assert_eq!(
+                    h.call_full(method, path, None, None, Some(ORIGIN)).status,
+                    404
+                );
+            }
+        }
     }
 
     // --- Native REST credentials (ADR 0010) -------------------------------------

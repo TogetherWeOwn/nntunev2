@@ -1,3 +1,7 @@
+<script lang="ts">
+	import ListenBrainzSection from '#lib/listenbrainz/ListenBrainzSection.svelte';
+</script>
+
 <svelte:head>
 	<title>Settings — NNTune</title>
 </svelte:head>
@@ -14,6 +18,8 @@
 			<li><a href="/library/recent">Open Recent searches</a></li>
 		</ul>
 	</section>
+
+	<ListenBrainzSection />
 
 	<section aria-labelledby="settings-account-heading">
 		<h2 id="settings-account-heading">Account</h2>
