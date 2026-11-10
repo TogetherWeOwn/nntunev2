@@ -17,6 +17,9 @@ use std::rc::Rc;
 use tokio_postgres::{Client, Config, NoTls};
 
 const USER: &str = "u1";
+const OCCURRENCE_A: &str = "11111111-1111-1111-1111-111111111111";
+const OCCURRENCE_B: &str = "88888888-8888-8888-8888-888888888888";
+const SHARED_RECORDING: &str = "99999999-9999-9999-9999-999999999999";
 const LOCAL_TRACK: &str = "22222222-2222-2222-2222-222222222222";
 const SHORT_RECORDING: &str = "33333333-3333-3333-3333-333333333333";
 const LONG_RECORDING: &str = "44444444-4444-4444-4444-444444444444";
@@ -191,6 +194,63 @@ async fn recording_mbid_resolves_artifact_and_short_mirror() {
         nntune_api::playback::continuation_until(NOW, duration),
         NOW + 60 + nntune_api::playback::LEASE_TTL_SECS
     );
+}
+
+#[tokio::test]
+async fn shared_recording_occurrences_use_recording_level_only() {
+    // Two local occurrences share one recording MBID with distinct
+    // durations and caller-owned media. Insert the larger local id
+    // first so the result cannot depend on insertion or id order: a
+    // recording-only lookup must claim neither occurrence's artifact
+    // metadata, only the mirror recording duration.
+    let app = app().await;
+    // Larger local id first: the outcome must not ride on insert order.
+    seed_track(&app, OCCURRENCE_B, SHARED_RECORDING, Some(240_000), 3).await;
+    seed_track(&app, OCCURRENCE_A, SHARED_RECORDING, Some(60_000), 4).await;
+    seed_media(&app, OCCURRENCE_A).await;
+    let hash_b = "b".repeat(64);
+    app.batch_execute(&format!(
+        "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) \
+         VALUES ('{hash_b}', 4000000, 'ci-bucket', 'ci/key-b', 1700000100) \
+         ON CONFLICT (content_hash) DO NOTHING; \
+         INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) \
+         VALUES ('{USER}', '{OCCURRENCE_B}', 'job-meter-1', '{hash_b}', 'flac', 256, 1700000200) \
+         ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING"
+    ))
+    .await
+    .unwrap();
+    let mirror = mirror().await;
+    seed_recording(&mirror, SHARED_RECORDING, 241_000).await;
+    let (store, attempts) = meter_store(app, Ok(mirror));
+    let meta = store
+        .track_meter_meta(USER, SHARED_RECORDING)
+        .await
+        .unwrap();
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(meta.track_duration_ms, None);
+    assert_eq!(meta.mb_duration_ms, Some(241_000));
+    assert_eq!(meta.bitrate_kbps, None);
+    assert_eq!(meta.file_bytes, None);
+    let duration = nntune_api::ledger::resolve_duration_ms(
+        meta.track_duration_ms,
+        meta.mb_duration_ms,
+        meta.bitrate_kbps,
+        meta.file_bytes,
+    );
+    assert_eq!(duration, Some(241_000));
+    assert_eq!(
+        nntune_api::playback::continuation_until(NOW, duration),
+        NOW + 241 + nntune_api::playback::LEASE_TTL_SECS
+    );
+    // Exact local ids keep their own occurrence identity and metadata.
+    let meta_a = store.track_meter_meta(USER, OCCURRENCE_A).await.unwrap();
+    assert_eq!(meta_a.track_duration_ms, Some(60_000));
+    assert_eq!(meta_a.bitrate_kbps, Some(128));
+    assert_eq!(meta_a.file_bytes, Some(2_000_000));
+    let meta_b = store.track_meter_meta(USER, OCCURRENCE_B).await.unwrap();
+    assert_eq!(meta_b.track_duration_ms, Some(240_000));
+    assert_eq!(meta_b.bitrate_kbps, Some(256));
+    assert_eq!(meta_b.file_bytes, Some(4_000_000));
 }
 
 #[tokio::test]

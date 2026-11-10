@@ -18,7 +18,10 @@
 -- still yields its one row with NULLs; an unknown id yields no app
 -- row and the mirror probe alone supplies the recording rung;
 -- unknown recording yields no mirror row (the fallback rung meters
--- it, never an error).
+-- it, never an error). A recording MBID shared by several local
+-- occurrences reports occurrence_ambiguous (the Rust side then
+-- claims no artifact rung); a single occurrence or an exact local
+-- id does not.
 
 BEGIN;
 
@@ -28,6 +31,7 @@ DECLARE
     got_mbid TEXT;
     got_bitrate INTEGER;
     got_bytes BIGINT;
+    got_ambiguous BOOLEAN;
     got_mb_ms INTEGER;
     row_count INTEGER;
 BEGIN
@@ -75,16 +79,19 @@ BEGIN
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '22222222-2222-2222-2222-222222222222'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '22222222-2222-2222-2222-222222222222'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
      FROM tracks t WHERE t.id = '22222222-2222-2222-2222-222222222222'::uuid
       OR t.mbid = '22222222-2222-2222-2222-222222222222'::uuid
      ORDER BY (t.id = '22222222-2222-2222-2222-222222222222'::uuid) DESC, t.id LIMIT 1;
     IF NOT FOUND OR got_track_ms <> 240000
        OR got_mbid <> '33333333-3333-3333-3333-333333333333'
-       OR got_bitrate <> 128 OR got_bytes <> 2000000 THEN
-        RAISE EXCEPTION 'full-ladder app meta wrong: track=% mbid=% kbps=% bytes=%',
-            got_track_ms, got_mbid, got_bitrate, got_bytes;
+       OR got_bitrate <> 128 OR got_bytes <> 2000000 OR got_ambiguous THEN
+        RAISE EXCEPTION 'full-ladder app meta wrong: track=% mbid=% kbps=% bytes=% ambiguous=%',
+            got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous;
     END IF;
 
     -- The same app row resolves by RECORDING MBID (the catalogue
@@ -94,16 +101,19 @@ BEGIN
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '33333333-3333-3333-3333-333333333333'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '33333333-3333-3333-3333-333333333333'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
      FROM tracks t WHERE t.id = '33333333-3333-3333-3333-333333333333'::uuid
       OR t.mbid = '33333333-3333-3333-3333-333333333333'::uuid
      ORDER BY (t.id = '33333333-3333-3333-3333-333333333333'::uuid) DESC, t.id LIMIT 1;
     IF NOT FOUND OR got_track_ms <> 240000
        OR got_mbid <> '33333333-3333-3333-3333-333333333333'
-       OR got_bitrate <> 128 OR got_bytes <> 2000000 THEN
-        RAISE EXCEPTION 'recording-id app meta wrong: track=% mbid=% kbps=% bytes=%',
-            got_track_ms, got_mbid, got_bitrate, got_bytes;
+       OR got_bitrate <> 128 OR got_bytes <> 2000000 OR got_ambiguous THEN
+        RAISE EXCEPTION 'recording-id app meta wrong: track=% mbid=% kbps=% bytes=% ambiguous=%',
+            got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous;
     END IF;
 
     -- Mirror rung for the resolved recording MBID.
@@ -153,8 +163,11 @@ BEGIN
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-3'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '22222222-2222-2222-2222-222222222222'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '22222222-2222-2222-2222-222222222222'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
      FROM tracks t WHERE t.id = '22222222-2222-2222-2222-222222222222'::uuid
       OR t.mbid = '22222222-2222-2222-2222-222222222222'::uuid
      ORDER BY (t.id = '22222222-2222-2222-2222-222222222222'::uuid) DESC, t.id LIMIT 1;
@@ -171,8 +184,11 @@ BEGIN
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '55555555-5555-5555-5555-555555555555'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '55555555-5555-5555-5555-555555555555'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
      FROM tracks t WHERE t.id = '55555555-5555-5555-5555-555555555555'::uuid
       OR t.mbid = '55555555-5555-5555-5555-555555555555'::uuid
      ORDER BY (t.id = '55555555-5555-5555-5555-555555555555'::uuid) DESC, t.id LIMIT 1;
@@ -180,6 +196,63 @@ BEGIN
        OR got_bitrate IS NOT NULL OR got_bytes IS NOT NULL THEN
         RAISE EXCEPTION 'bare-track meta wrong: track=% mbid=% kbps=% bytes=%',
             got_track_ms, got_mbid, got_bitrate, got_bytes;
+    END IF;
+
+    -- Two occurrences sharing one recording MBID: a recording-only
+    -- match is ambiguous (the Rust side must claim neither
+    -- occurrence's artifact rungs, only the mirror rung), while each
+    -- exact local id keeps its own occurrence metadata. Insert the
+    -- larger local id first so the outcome cannot ride on order.
+    INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms)
+    VALUES ('88888888-8888-8888-8888-888888888888',
+            '99999999-9999-9999-9999-999999999999',
+            '44444444-4444-4444-4444-444444444444',
+            'Shared B', 1, 1, 240000),
+           ('11111111-1111-1111-1111-111111111111',
+            '99999999-9999-9999-9999-999999999999',
+            '44444444-4444-4444-4444-444444444444',
+            'Shared A', 1, 1, 60000);
+    INSERT INTO mb_recording (mbid, title, duration_ms)
+    VALUES ('99999999-9999-9999-9999-999999999999', 'Shared', 241000);
+    SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid,
+     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
+     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
+     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '99999999-9999-9999-9999-999999999999'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '99999999-9999-9999-9999-999999999999'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
+     FROM tracks t WHERE t.id = '99999999-9999-9999-9999-999999999999'::uuid
+      OR t.mbid = '99999999-9999-9999-9999-999999999999'::uuid
+     ORDER BY (t.id = '99999999-9999-9999-9999-999999999999'::uuid) DESC, t.id LIMIT 1;
+    IF NOT FOUND OR NOT got_ambiguous
+       OR got_mbid <> '99999999-9999-9999-9999-999999999999' THEN
+        RAISE EXCEPTION 'shared-recording ambiguity wrong: mbid=% ambiguous=%',
+            got_mbid, got_ambiguous;
+    END IF;
+    SELECT duration_ms AS mb_duration_ms INTO got_mb_ms
+     FROM mb_recording WHERE mbid = '99999999-9999-9999-9999-999999999999'::uuid;
+    IF NOT FOUND OR got_mb_ms <> 241000 THEN
+        RAISE EXCEPTION 'shared-recording mirror rung wrong: %', got_mb_ms;
+    END IF;
+    SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid,
+     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
+     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
+     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> '88888888-8888-8888-8888-888888888888'::uuid
+      AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = '88888888-8888-8888-8888-888888888888'::uuid) > 1)
+     AS occurrence_ambiguous
+     INTO got_track_ms, got_mbid, got_bitrate, got_bytes, got_ambiguous
+     FROM tracks t WHERE t.id = '88888888-8888-8888-8888-888888888888'::uuid
+      OR t.mbid = '88888888-8888-8888-8888-888888888888'::uuid
+     ORDER BY (t.id = '88888888-8888-8888-8888-888888888888'::uuid) DESC, t.id LIMIT 1;
+    IF NOT FOUND OR got_track_ms <> 240000 OR got_ambiguous THEN
+        RAISE EXCEPTION 'shared-recording local-id control wrong: track=% ambiguous=%',
+            got_track_ms, got_ambiguous;
     END IF;
 
     -- Unknown id: zero app rows (the Rust side probes the mirror and

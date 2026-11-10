@@ -128,16 +128,28 @@ pub enum PlayWindowOutcome {
 /// verified media for the track. `track_mbid` carries the resolved
 /// row's recording MBID for the caller's mirror probe
 /// ([`track_meter_meta_mirror_statement`]); it is internal plumbing,
-/// not a [`TrackMeterMeta`] field. Callers only run this for
-/// UUID-shaped track ids — a non-UUID track can still be metered on
-/// the fallback rung, so residency in `tracks` is never required.
+/// not a [`TrackMeterMeta`] field. `occurrence_ambiguous` is likewise
+/// plumbing: one recording MBID may name several local release-track
+/// occurrences (ADR 0002), so a recording-only match identifies no
+/// single occurrence. It is true exactly when the chosen row is not
+/// the exact local id and more than one `tracks` row shares the
+/// recording MBID; callers must then discard the row's
+/// occurrence-specific duration/bitrate/file-size and resolve only
+/// recording-level metadata (the mirror rung) or the fallback, never
+/// claiming another occurrence's file. A recording-only match with a
+/// single `tracks` row is a justified unique occurrence and keeps its
+/// artifact rungs. Callers only run this for UUID-shaped track ids —
+/// a non-UUID track can still be metered on the fallback rung, so
+/// residency in `tracks` is never required.
 pub fn track_meter_meta_app_statement() -> &'static str {
     "SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid, \
      (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = $2 \
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps, \
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c \
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2 \
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes \
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes, \
+     (t.id <> $1::uuid AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = $1::uuid) > 1) \
+     AS occurrence_ambiguous \
      FROM tracks t WHERE t.id = $1::uuid OR t.mbid = $1::uuid \
      ORDER BY (t.id = $1::uuid) DESC, t.id LIMIT 1"
 }
@@ -392,11 +404,14 @@ mod tests {
         assert!(app.contains("WHERE t.id = $1::uuid OR t.mbid = $1::uuid"));
         assert!(app.contains("ORDER BY (t.id = $1::uuid) DESC"));
         assert!(app.contains("m.user_id = $2"));
+        assert!(app.contains("occurrence_ambiguous"));
+        assert!(app.contains("FROM tracks t2 WHERE t2.mbid = $1::uuid"));
         for alias in [
             "track_duration_ms",
             "track_mbid",
             "bitrate_kbps",
             "file_bytes",
+            "occurrence_ambiguous",
         ] {
             assert!(app.contains(&format!("AS {alias}")), "{alias}");
         }
