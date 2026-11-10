@@ -122,17 +122,15 @@ async fn extract<D: Future<Output = ()> + Unpin>(
 }
 
 fn bind_error(fx: &Fixture, job: &str, progress: &VerifyProgress) -> Option<SelectionError> {
-    match ScratchAudioReader::bind(
+    ScratchAudioReader::bind(
         job,
         &fx.xml,
         &fx.hash,
         progress,
         fx.store(),
         future::pending::<()>(),
-    ) {
-        Ok(_) => None,
-        Err(error) => Some(error),
-    }
+    )
+    .err()
 }
 
 // ---- fake scratch store ----
