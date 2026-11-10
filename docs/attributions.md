@@ -36,10 +36,14 @@ This inventory is not a claim that all distribution obligations are discharged.
   platform system fonts are not redistributed by the app.
 - MusicBrainz is **core CC0 only**, including URL relationships. No supplementary
   NC data, replication packets, tags, genres, ratings or annotations are licensed
-  for product use by this inventory. ListenBrainz dumps and LRCLIB stay planned;
-  LRCLIB's content rights remain unassessed, not inferred from server code terms.
+  for product use by this inventory. The MusicBrainz mirror has not completed
+  import or activated product reads, so the core-data entry stays planned until
+  a future integration PR verifies the consumed dataset. ListenBrainz dumps and
+  LRCLIB stay planned too; LRCLIB's content rights remain unassessed, not
+  inferred from server code terms.
 - Referenced cover art stays explicitly rights-flagged, not openly licensed by
-  assumption. This work authorizes no copying, caching or redistribution.
+  assumption, and planned alongside the mirror. This work authorizes no copying,
+  caching or redistribution.
 - The [fixture-audio licence record](fixture-audio-licences.md) and its per-album
   manifests remain authoritative and unchanged; this contract references rather
   than replaces them.

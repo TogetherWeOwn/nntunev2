@@ -49,19 +49,19 @@ export const attributionInventory: AttributionInventory = {
 			evidence: ['apps/web/src/lib/design/icons.ts', 'apps/web/src/lib/design/README.md', 'LICENSE']
 		},
 		{
-			id: 'musicbrainz-core', name: 'MusicBrainz core data', kind: 'data', status: 'active', license: 'CC0-1.0',
+			id: 'musicbrainz-core', name: 'MusicBrainz core data', kind: 'data', status: 'planned', license: 'CC0-1.0',
 			sourceUrl: 'https://musicbrainz.org/doc/MusicBrainz_Database',
 			licenseUrl: 'https://musicbrainz.org/doc/About/Data_License',
-			notice: 'NNTune uses MusicBrainz core catalogue data made available under CC0.',
-			obligations: 'CC0 does not require attribution. Core data only, including URL relationships; supplementary tags, genres, ratings, annotations and hourly Live Data Feed packets are not covered by this entry and must not enter the paid product mirror. Serve product reads from the mirror.',
-			evidence: ['workers/mb/src/lib.rs', 'docs/adr/0012-compliant-youtube-video-and-brainz-data.md', 'AGENTS.md']
+			notice: 'MusicBrainz core catalogue data is planned, not yet consumed by product reads; the replacement mirror has not completed import or activated reads.',
+			obligations: 'Inactive. CC0 does not require attribution. Core data only, including URL relationships; supplementary tags, genres, ratings, annotations and hourly Live Data Feed packets are not covered by this entry and must not enter the paid product mirror. Recheck the consumed dataset and mirror activation before activation; serve product reads from the mirror.',
+			evidence: ['workers/mb/src/lib.rs', 'docs/adr/0007-mb-mirror.md', 'AGENTS.md']
 		},
 		{
-			id: 'cover-art', name: 'Referenced cover art', kind: 'artwork', status: 'active', license: 'third-party-rights',
+			id: 'cover-art', name: 'Referenced cover art', kind: 'artwork', status: 'planned', license: 'third-party-rights',
 			sourceUrl: 'https://coverartarchive.org/',
 			licenseUrl: 'https://musicbrainz.org/doc/Cover_Art_Archive',
-			notice: 'Cover art has separate third-party rights; catalogue availability is not a redistribution licence.',
-			obligations: 'Rights-flagged references only in this inventory, not a licence grant. No new caching, copying or redistribution is authorized; review rights and any new cache separately.',
+			notice: 'Cover art has separate third-party rights; catalogue availability is not a redistribution licence. Not yet consumed; the catalogue mirror has not activated reads.',
+			obligations: 'Inactive. Rights-flagged references only in this inventory, not a licence grant. No new caching, copying or redistribution is authorized; review rights and any new cache separately.',
 			evidence: ['workers/mb/src/lib.rs', 'apps/web/src/lib/player/artwork.ts', 'AGENTS.md']
 		},
 		{

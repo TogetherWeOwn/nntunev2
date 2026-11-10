@@ -40,8 +40,8 @@ describe('attribution inventory v1', () => {
 		expect(validateAttributionInventory(clone())).toEqual([]);
 		expect(activeAttributions.length).toBeGreaterThan(0);
 		expect(activeAttributions.every((entry) => entry.status === 'active')).toBe(true);
-		expect(plannedAttributions.map((entry) => entry.id)).toEqual(['listenbrainz', 'lrclib']);
-		expect(activeAttributions.some((entry) => ['listenbrainz', 'lrclib'].includes(entry.id))).toBe(false);
+		expect(plannedAttributions.map((entry) => entry.id)).toEqual(['musicbrainz-core', 'cover-art', 'listenbrainz', 'lrclib']);
+		expect(activeAttributions.some((entry) => ['musicbrainz-core', 'cover-art', 'listenbrainz', 'lrclib'].includes(entry.id))).toBe(false);
 		expect(fixtureAudioLicenceRecord).toBe('docs/fixture-audio-licences.md');
 	});
 
