@@ -100,9 +100,11 @@ pub async fn revoke_sessions_and_native_credentials(
     // must not turn this existing native path into a 500 before it lands:
     // probe first, and only touch the table when it exists. A probe failure
     // stays loud so a real database error never skips revocation silently.
+    // Unqualified like the UPDATE below: the probe must resolve the same
+    // table the compat queries reach through the active search_path.
     let compat_table = client
         .query_typed(
-            "SELECT to_regclass('public.subsonic_credentials') IS NOT NULL",
+            "SELECT to_regclass('subsonic_credentials') IS NOT NULL",
             &[],
         )
         .await

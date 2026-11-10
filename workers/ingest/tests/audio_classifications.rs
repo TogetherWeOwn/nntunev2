@@ -5,6 +5,7 @@ use nntune_ingest::{
     },
     audio_grouping::prepare_manifest,
     audio_manifest::{AcceptedAudioManifest, AudioHints},
+    audio_publication::prepare_publication,
     audio_selection::{AudioSelectionPlan, ExtractedAudio},
     dispatch::content_sha256_hex,
 };
@@ -120,6 +121,19 @@ fn fully_verified_release_takes_positions_from_evidence_and_dedups() {
             entry(3, ClassKind::Verified, 2, 6, None),
         ]
     );
+}
+
+#[test]
+fn same_recording_same_position_in_two_release_groups_both_survive() {
+    let mut hints = vec![hint(Some(1), "A", None), hint(Some(1), "A", None)];
+    hints[1].album = Some("Other".into());
+    let frozen = manifest(hints);
+    let checkpoint =
+        classify_entries(&frozen, &[evidence(REC_A, 1, 1), evidence(REC_A, 1, 1)]).unwrap();
+    let rows = checkpoint.entries();
+    assert_eq!((rows[0].release_group_ref, rows[0].duplicate_of), (1, None));
+    assert_eq!((rows[1].release_group_ref, rows[1].duplicate_of), (2, None));
+    assert!(prepare_publication(&frozen, &checkpoint).is_ok());
 }
 
 #[test]

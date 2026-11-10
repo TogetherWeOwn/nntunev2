@@ -87,9 +87,11 @@ fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
 /// are no compat credentials, so lifecycle reads/revokes are empty no-ops
 /// instead of missing-relation errors. A probe failure stays loud.
 async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
+    // Unqualified like the queries below: the probe must resolve the same
+    // table the compat queries reach through the active search_path.
     let rows = client
         .query_typed(
-            "SELECT to_regclass('public.subsonic_credentials') IS NOT NULL",
+            "SELECT to_regclass('subsonic_credentials') IS NOT NULL",
             &[],
         )
         .await

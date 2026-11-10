@@ -11,7 +11,8 @@
 //!
 //! `previous_version` is optional (absent or `null`). `keys` holds exactly
 //! the referenced versions and nothing else, so at most two peppers are ever
-//! loaded. Versions are canonical positive decimal `u32` strings. Everything
+//! loaded. Versions are canonical positive decimal strings in `1..=i32::MAX`.
+//! Everything
 //! fails closed with a payload-free [`ConfigError`]; no error, `Debug` or
 //! `Display` output ever carries input text or key material.
 
@@ -126,18 +127,23 @@ impl fmt::Debug for SubsonicIndexConfig {
     }
 }
 
-/// Canonical positive decimal u32: digits only, no sign, no leading zero.
+/// Canonical positive decimal version in `1..=i32::MAX`: digits only, no
+/// sign, no leading zero. The upper bound matches downstream `i32` storage
+/// (`pepper_version INTEGER`) and the lifecycle `valid_version` check.
 fn parse_version_key(s: &str) -> Result<u32, ConfigError> {
     let b = s.as_bytes();
     if b.is_empty() || b.len() > 10 || !b.iter().all(u8::is_ascii_digit) || b[0] == b'0' {
         return Err(ConfigError::BadVersion);
     }
-    s.parse::<u32>().map_err(|_| ConfigError::BadVersion)
+    match s.parse::<u32>() {
+        Ok(n) if n != 0 && n <= i32::MAX as u32 => Ok(n),
+        _ => Err(ConfigError::BadVersion),
+    }
 }
 
 fn version_value(v: u64) -> Result<u32, ConfigError> {
     match u32::try_from(v) {
-        Ok(n) if n != 0 => Ok(n),
+        Ok(n) if n != 0 && n <= i32::MAX as u32 => Ok(n),
         _ => Err(ConfigError::BadVersion),
     }
 }
@@ -333,11 +339,28 @@ mod tests {
             err(&cfg(4_294_967_296, None, &[("1", k(1, 32))])),
             ConfigError::BadVersion
         );
+        // Above i32::MAX but within u32: downstream pepper_version is
+        // INTEGER and lifecycle valid_version stops at i32::MAX, so the
+        // load must refuse here rather than fail per-request.
+        assert_eq!(
+            err(&cfg(3_000_000_000, None, &[("3000000000", k(1, 32))])),
+            ConfigError::BadVersion
+        );
     }
 
     #[test]
     fn noncanonical_map_versions_rejected() {
-        for v in ["01", "+1", "-1", "1.0", "", " 1", "0x1", "99999999999"] {
+        for v in [
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            "",
+            " 1",
+            "0x1",
+            "99999999999",
+            "3000000000",
+        ] {
             assert_eq!(
                 err(&cfg(1, None, &[(v, k(1, 32))])),
                 ConfigError::BadVersion,

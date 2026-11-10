@@ -159,10 +159,11 @@ pub fn classify_entries(
         .transpose()
         .map_err(ClassError::Positions)?;
     let mut classified: Vec<ClassifiedEntry> = Vec::with_capacity(entries.len());
-    let mut verified_winners = BTreeMap::<(String, i32, i32), u32>::new();
+    let mut verified_winners = BTreeMap::<(u32, String, i32, i32), u32>::new();
     for (i, entry) in entries.iter().enumerate() {
         if let Some(ev) = &evidence[i] {
             let key = (
+                entry.release_group_ref,
                 ev.recording_mbid.to_ascii_lowercase(),
                 ev.medium_no,
                 ev.track_no,
