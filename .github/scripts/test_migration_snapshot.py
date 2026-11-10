@@ -773,6 +773,30 @@ class PreparedCLI(unittest.TestCase):
         self.assertIn("shared evidence output bound", outcomes["diagnostic"])
         self.assertFalse((self.evidence_dir / "edges.json").exists())
 
+    def test_final_deadline_failure_marks_effective_pass_failed(self):
+        self.valid_evidence()
+        calls = []
+        real_verify = history.verify
+
+        def verify(*args, **kw):
+            result = real_verify(*args, **kw)
+            calls.append(kw["audit"]["outcome"])
+            if len(calls) == 2:
+                kw["budget"].deadline = 0
+            return result
+
+        with mock.patch.object(rename_fixture.migrations_rename_check, "verify", side_effect=verify):
+            result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertEqual(calls, ["verified", "verified"])
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertIn("shared evidence deadline exceeded", outcomes["diagnostic"])
+        self.assertIn('"outcome": "failed"', out)
+        self.assertNotIn("pinned Git source lineage and applied aliases verified", out)
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
+
     def test_failure_diagnostic_has_a_fixed_bound(self):
         self.valid_evidence()
         with mock.patch.object(rename_fixture.migrations_rename_check, "verify",
