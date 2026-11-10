@@ -58,7 +58,7 @@ BEGIN
         1,
         NULL, NULL
     )
-    ON CONFLICT (plaintext_sha256) DO NOTHING;
+    ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL DO NOTHING;
     SELECT count(*) INTO row_count_var FROM posted_files
     WHERE plaintext_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       AND backbone_post = 'spool-post' AND backbone_verify = 'spool-verify'
@@ -123,7 +123,7 @@ BEGIN
         1,
         NULL, NULL
     )
-    ON CONFLICT (plaintext_sha256) DO NOTHING;
+    ON CONFLICT (plaintext_sha256) WHERE generation_operation IS NULL DO NOTHING;
     GET DIAGNOSTICS row_count_var = ROW_COUNT;
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'posted_files replay inserted instead of converging on the sha';
