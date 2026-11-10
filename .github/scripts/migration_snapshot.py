@@ -162,8 +162,14 @@ def collect_attempts(root, expected, budget, collection_deadline):
         check_base(root, observed_base, expected["head"]["sha"], after["base"]["sha"], budget)
         observed_base = after["base"]["sha"]
         # Structural defects are hard failures even during a moving bracket.
-        # Validate against this attempt's declared initial count before retrying.
-        api_coverage(compact(pages), compact(before), before["base"]["sha"], expected["head"]["sha"])
+        # A changed count may match either bracket, but never accept that attempt.
+        coverage_metadata = before
+        count = sum(map(len, pages))
+        if (before != after and count != before["changed_files"]
+                and count == after["changed_files"]):
+            coverage_metadata = after
+        api_coverage(compact(pages), compact(coverage_metadata),
+                     coverage_metadata["base"]["sha"], expected["head"]["sha"])
         if time.monotonic() >= collection_deadline:
             raise HistoryError("API collection timed out")
         if before != after:

@@ -514,7 +514,7 @@ class GitFixture(unittest.TestCase):
         (workspace / "pr-data").symlink_to(self.root, target_is_directory=True)
         scripts = workspace / "trusted-checker/.github/scripts"
         scripts.mkdir(parents=True)
-        for name in ("migration_history.py", "migrations_rename_check.py", "migration_snapshot.py"):
+        for name in ("migration_history.py", "migration_snapshot.py", "migrations_rename_check.py"):
             if not missing_code:
                 shutil.copyfile(source / ".github/scripts" / name, scripts / name)
         api = workspace / "api"
@@ -720,7 +720,8 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(h.collect(), states)
 
     def workflow_checker(self, entries, *, poison=False, files=None, metadata=None,
-                         missing=None, truncated=False, missing_code=False):
+                         missing=None, truncated=False, missing_code=False,
+                         missing_snapshot=False):
         """Run the real isolated workflow launcher against checker-free PR data."""
         scripts = pathlib.Path(__file__).resolve().parent
         workflow = (scripts.parent / "workflows/migrations-staging.yml").read_text()
@@ -735,7 +736,8 @@ class GitFixture(unittest.TestCase):
             bad = "raise RuntimeError('PR-controlled Python must not load')\n"
             (self.root / ".github/scripts").mkdir(parents=True)
             for directory in (self.root, self.root / ".github/scripts"):
-                for name in ("migrations_rename_check.py", "migration_history.py", "json.py", "sitecustomize.py"):
+                for name in ("migrations_rename_check.py", "migration_history.py",
+                             "migration_snapshot.py", "json.py", "sitecustomize.py"):
                     (directory / name).write_text(bad)
         if files is None:
             files = [[{"filename": "migrations/manifest.toml", "status": "modified"}] + [
@@ -754,6 +756,13 @@ class GitFixture(unittest.TestCase):
                 (evidence / "files.json").write_text("[[")
             if missing_code:
                 scripts = evidence / "absent-trusted-scripts"
+            if missing_snapshot:
+                # Trusted closure lacking only the snapshot dependency.
+                scripts = evidence / "partial-trusted-scripts"
+                scripts.mkdir()
+                real = pathlib.Path(__file__).resolve().parent
+                for name in ("migration_history.py", "migrations_rename_check.py"):
+                    shutil.copyfile(real / name, scripts / name)
             args = [sys.executable, "-I", "-", str(scripts), "--root", str(self.root),
                     "--base-sha", self.base, "--head-sha", head,
                     "--files-file", str(evidence / "files.json"),
@@ -819,6 +828,51 @@ class GitFixture(unittest.TestCase):
         self.assertIn("ModuleNotFoundError", result.stderr)
         self.assertNotIn("PR-controlled Python must not load", result.stderr)
 
+    def test_workflow_missing_trusted_snapshot_never_falls_back_to_pr(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), poison=True, missing_snapshot=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ModuleNotFoundError", result.stderr)
+        self.assertIn("migration_snapshot", result.stderr)
+        self.assertNotIn("PR-controlled Python must not load", result.stderr)
+
+    def legacy_cli(self, entries, **overrides):
+        """Legacy caller contract: no --event-file, minimal evidence files."""
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("record source metadata")
+        files = [{"filename": "migrations/manifest.toml", "status": "modified"}] + [
+            {"filename": "migrations/" + e["file"], "status": "added"} for e in entries]
+        metadata = {"base": {"sha": self.base}, "head": {"sha": head}, "changed_files": len(files)}
+        metadata.update(overrides)
+        (self.root / "files.json").write_text(json.dumps([files]))
+        (self.root / "metadata.json").write_text(json.dumps(metadata))
+        args = ["--root", str(self.root), "--base-sha", self.base, "--head-sha", head,
+                "--files-file", str(self.root / "files.json"),
+                "--metadata-file", str(self.root / "metadata.json")]
+        return args, head
+
+    def test_legacy_caller_contract_without_event_file(self):
+        entries = self.chain()
+        args, _ = self.legacy_cli(entries)
+        self.assertNotIn("--event-file", args)
+        output = self.root / "edges.json"
+        validation = self.root / "validation.json"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(migrations_rename_check.main(args + ["--output", str(output)]), 0)
+        self.assertEqual("migrations-staging: pinned Git source lineage and applied aliases verified\n",
+                         out.getvalue())
+        self.assertNotIn("dual history", out.getvalue())
+        self.assertFalse(validation.exists())
+        edges = json.loads(output.read_text())
+        self.assertEqual(json.loads(json.dumps(self.verify(entries))), edges)
+
+    def test_legacy_rejects_moved_base_as_before(self):
+        entries = self.chain()
+        args, head = self.legacy_cli(entries, base={"sha": "0" * 40})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(migrations_rename_check.main(args), 1)
+        self.assertIn("API metadata does not match pinned event commits", err.getvalue())
+
 
 class WorkflowBoundary(unittest.TestCase):
     def test_separate_immutable_code_and_data_pins(self):
@@ -831,6 +885,15 @@ class WorkflowBoundary(unittest.TestCase):
         self.assertIn("path: pr-data", data)
         self.assertIn("fetch-depth: 0", data)
         self.assertEqual(workflow.count("persist-credentials: false"), 2)
+        collect = data.split("      - name: Collect pinned PR API evidence")[1].split(
+            "      - name: Check migration rename history")[0]
+        self.assertIn("working-directory: ${{ runner.temp }}", collect)
+        self.assertIn("python3 -I -c", collect)
+        self.assertIn('"$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', collect)
+        self.assertIn('--event-file "$GITHUB_EVENT_PATH"', collect)
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", collect)
+        self.assertIn("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", collect)
+        self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", collect)
         check = workflow.split("      - name: Check migration rename history")[1]
         self.assertIn("working-directory: ${{ runner.temp }}", check)
         self.assertIn('python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', check)

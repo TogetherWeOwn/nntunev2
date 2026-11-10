@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bounded PR API snapshot collection: strict projection, brackets and budgets."""
+import contextlib
 import copy
+import io
 import hashlib
 import json
 import os
@@ -307,6 +309,33 @@ class Collect(GitCase):
         (_, evidence), _ = self.collect(a, files(1), b, b, files(2), b)
         self.assertEqual(evidence["attempt"], 2)
 
+    def test_count_change_before_files_fetch_retries_only_valid_closing_count(self):
+        for opening_count, closing_count in ((1, 2), (2, 1)):
+            with self.subTest(opening=opening_count, closing=closing_count):
+                before = meta(base=self.base, head=self.head, count=opening_count)
+                after = meta(base=self.moved, head=self.head, count=closing_count)
+                records = files(closing_count)
+                (pages, evidence), script = self.collect(
+                    before, records, after, after, records, after)
+                self.assertEqual(evidence["attempt"], 2)
+                self.assertEqual(evidence["before"]["base"]["sha"], self.moved)
+                self.assertEqual(sum(map(len, pages)), closing_count)
+                self.assertEqual(script.items, [])
+
+        before = meta(base=self.base, head=self.head, count=1)
+        after = meta(base=self.moved, head=self.head, count=2)
+        for records, pattern in (
+                (files(3), "truncated or duplicated"),
+                (files(1) + files(1), "invalid or duplicate"),
+                ([{"filename": "docs/a.md", "status": "bogus"}] + files(1),
+                 "invalid or duplicate"),
+                ([{"filename": "migrations/0002_Bad-name.sql", "status": "added"}]
+                 + files(1), "invalid migration path")):
+            with self.subTest(pattern=pattern, records=records):
+                script = self.fails(pattern, before, records, after,
+                                    after, files(2), after)
+                self.assertEqual(len(script.paths), 3)
+
     def test_observed_rewinds_and_sibling_transitions_are_not_retried_away(self):
         (self.root / "next.txt").write_text("another advance\n")
         newest = self.commit("second advance")
@@ -572,6 +601,159 @@ class SnapshotAndResume(GitCase):
         budget = snapshot.resumed_budget(text)
         with self.assertRaisesRegex(history.HistoryError, "output bound"):
             budget.consume(1)
+
+
+class PreparedCLI(unittest.TestCase):
+    """Exercise opt-in support directly; the staging workflow stays on its old caller."""
+    setUp = rename_fixture.GitFixture.setUp
+    git = rename_fixture.GitFixture.git
+    commit = rename_fixture.GitFixture.commit
+    write = rename_fixture.GitFixture.write
+    rename = rename_fixture.GitFixture.rename
+    entries = rename_fixture.GitFixture.entries
+    prepare = rename_fixture.GitFixture.prepare
+
+    def acquire(self, records, effective, samples=None):
+        head = self.git("rev-parse", "HEAD")
+        expected = snapshot.project_metadata(meta(base=self.base, head=head, count=len(records)))
+        live = copy.deepcopy(expected)
+        live["base"]["sha"] = effective
+        self.evidence_dir = self.root / "evidence"
+        self.evidence_dir.mkdir()
+        self.event_file = self.evidence_dir / "event.json"
+        self.event_file.write_text(json.dumps({"number": 7, "repository": expected["base"]["repo"],
+                                               "pull_request": expected}))
+        script = Script(*(samples or [live, records, live]))
+        with mock.patch.object(snapshot, "request", side_effect=script), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(snapshot.main([
+                "--root", str(self.root), "--base-sha", self.base, "--head-sha", head,
+                "--event-file", str(self.event_file), "--output-dir", str(self.evidence_dir)]), 0)
+        self.args = ["--root", str(self.root), "--base-sha", self.base, "--head-sha", head,
+                     "--event-file", str(self.event_file),
+                     "--files-file", str(self.evidence_dir / "pr-files.json"),
+                     "--metadata-file", str(self.evidence_dir / "pr-metadata.json"),
+                     "--validation-output", str(self.evidence_dir / "validation.json"),
+                     "--output", str(self.evidence_dir / "edges.json")]
+
+    def check(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = rename_fixture.migrations_rename_check.main(self.args)
+        return result, out.getvalue(), err.getvalue()
+
+    def valid_evidence(self):
+        self.write("0001_final.sql")
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(self.entries()))
+        self.commit("add migration")
+        self.acquire([{"filename": "migrations/0001_final.sql", "status": "added"},
+                      {"filename": "migrations/manifest.toml", "status": "modified"}], self.base)
+
+    def test_prepared_cli_recovers_advanced_base_and_records_both_histories(self):
+        self.write("0001_final.sql")
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(self.entries()))
+        head = self.commit("add migration")
+        self.git("checkout", "-qb", "advanced-base", self.base)
+        (self.root / "README.md").write_text("base advances independently\n")
+        advanced = self.commit("advance base")
+        self.git("checkout", "--detach", head)
+        records = [{"filename": "migrations/0001_final.sql", "status": "added"},
+                   {"filename": "migrations/manifest.toml", "status": "modified"}]
+        before = snapshot.project_metadata(meta(base=self.base, head=head, count=2))
+        live = copy.deepcopy(before)
+        live["base"]["sha"] = advanced
+        with self.assertRaisesRegex(history.HistoryError, "pinned event commits"):
+            history.api_coverage(json.dumps([records]), json.dumps(live), self.base, head)
+        self.acquire(records, advanced, [before, records, live, live, records, live])
+        result, out, err = self.check()
+        self.assertEqual(result, 0, out + err)
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["base"], self.base)
+        self.assertEqual(outcomes["effective"]["base"], advanced)
+        for outcome in outcomes.values():
+            self.assertEqual(outcome["head"], head)
+            self.assertEqual(outcome["merge_base"], self.base)
+            self.assertEqual(outcome["outcome"], "verified")
+        evidence = json.loads((self.evidence_dir / "pr-metadata.json").read_text())
+        self.assertEqual(evidence["attempt"], 2)
+        self.assertEqual(evidence["event"]["base"]["sha"], self.base)
+
+    def test_original_range_cannot_be_hidden_by_effective_base(self):
+        self.write("0001_old.sql")
+        self.commit("birth")
+        self.rename("0001_old.sql", "0002_final.sql", edit=True)
+        advanced = self.git("rev-parse", "HEAD")
+        entries = self.entries()  # Deliberately omit the event-range edge.
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(entries))
+        head = self.commit("missing source history")
+        records = [{"filename": "migrations/manifest.toml", "status": "modified"}]
+        coverage = history.api_coverage(json.dumps([records]), json.dumps({
+            "base": {"sha": advanced}, "head": {"sha": head}, "changed_files": 1}), advanced, head)
+        history.verify(self.root, advanced, head, rename_fixture.manifest(entries), coverage)
+        self.acquire(records, advanced)
+        result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertIn("lacks source_rename_history", err)
+        self.assertFalse((self.evidence_dir / "validation.json").exists())
+
+    def test_effective_merge_base_manifest_is_independent(self):
+        self.write("0001_final.sql")
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(self.entries()))
+        self.base = self.commit("original baseline")
+        entries = self.entries()
+        entries[0]["renamed_from"] = [{"file": "0000_historical.sql", "sha256": entries[0]["sha256"]}]
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(entries))
+        advanced = self.commit("effective baseline with inherited applied alias")
+        entries[0]["renamed_from"] = []
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(entries))
+        head = self.commit("remove effective baseline alias")
+        history.verify(self.root, self.base, head, rename_fixture.manifest(entries))
+        self.acquire([{"filename": "migrations/manifest.toml", "status": "modified"}], advanced)
+        result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertIn("append-only against base", err)
+        self.assertFalse((self.evidence_dir / "validation.json").exists())
+
+    def test_missing_tampered_and_oversized_evidence_fail_closed(self):
+        self.valid_evidence()
+        for name in ("event.json", "pr-files.json", "pr-metadata.json"):
+            path = self.evidence_dir / name
+            original = path.read_bytes()
+            for damage in (None, b"{}", b"[" * (history.MAX_INPUT + 1)):
+                with self.subTest(file=name, damage=None if damage is None else len(damage)):
+                    if damage is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(damage)
+                    try:
+                        result, out, err = self.check()
+                        self.assertEqual(result, 1, out + err)
+                        self.assertFalse((self.evidence_dir / "validation.json").exists())
+                        self.assertFalse((self.evidence_dir / "edges.json").exists())
+                    finally:
+                        path.write_bytes(original)
+
+    def test_shared_budget_is_not_reset_between_original_and_effective_passes(self):
+        self.valid_evidence()
+        budgets = []
+        real_verify = history.verify
+
+        def verify(*args, **kw):
+            budget = kw["budget"]
+            budgets.append(budget)
+            if len(budgets) == 2:
+                budget.consume(1)
+            result = real_verify(*args, **kw)
+            budget.total_output = history.MAX_TOTAL_OUTPUT
+            return result
+
+        with mock.patch.object(rename_fixture.migrations_rename_check, "verify", side_effect=verify):
+            result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertIn("shared evidence output bound", err)
+        self.assertEqual(len(budgets), 2)
+        self.assertIs(budgets[0], budgets[1])
+        self.assertFalse((self.evidence_dir / "validation.json").exists())
 
 
 if __name__ == "__main__":
