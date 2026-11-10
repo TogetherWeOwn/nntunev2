@@ -38,6 +38,7 @@ pub mod audio_classifications_store;
 pub mod audio_grouping;
 pub mod audio_manifest;
 pub mod audio_manifest_store;
+pub mod audio_mirror_evidence;
 pub mod audio_positions;
 pub mod audio_producer;
 pub mod audio_scratch;

@@ -198,6 +198,22 @@ The PostgreSQL adapter uses the existing bounded connector. This remains
 unmounted: the future publication consumer must use the returned winner
 before mirror-snapshot or KV publication, and classification grants no
 membership, catalogue or playback authority.
+
+`audio_mirror_evidence.rs` retrieves mirror evidence for that
+classification seam, unmounted. For each accepted entry carrying both a
+recording-MBID and a release-MBID hint, it binds the hinted recording to
+one exact mirror snapshot — the release-recordings projection of the
+hinted release, identified by its canonical SHA-256 digest
+(`mirror_snapshot_digest`). Only a digest-verified snapshot that actually
+contains the hinted recording yields evidence, carrying the snapshot's own
+medium/track positions and digest; an unhinted entry, a missing snapshot,
+or a recording absent from the snapshot is all-local. An invalid snapshot
+(malformed MBID, non-positive position, conflicting duplicate recording,
+digest mismatch, release mismatch) refuses the whole derivation rather
+than guessing. Hinted MBIDs are claims, never proof: presence in the
+digest-bound snapshot is the evidence. No transport, KV publication or
+membership authority is enabled; the future publisher must pass snapshots
+from trusted mirror reads through this seam before classification.
 Full Unicode normalization, image validation/staging, resolved artist/release
 coalescing and durable position/classification freezing remain integration
 gates.
