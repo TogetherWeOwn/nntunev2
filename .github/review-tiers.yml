@@ -111,8 +111,10 @@ tiers:
     - "**/*.sh"
     - "**/Makefile"
     # DB schema, migrations, tenant isolation, personal data.
+    # SQL stays sensitive via default-sensitive plus the anchored trees
+    # in this file (migrations, workers, design docs); no SQL glob is
+    # listed, so a future SQL file elsewhere stays sensitive by default.
     - "migrations/**"
-    - "**/*.sql"
     - "config/**"
     # Runtime/network/IAM config, infra, deploy/release paths.
     - "**/wrangler.toml"
