@@ -91,6 +91,9 @@ ADR 0006; default issuance is `library:read` only:
   model §5 (cost-bearing: drives provider egress and metering like any other grant).
 - `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
   ADR 0004).
+- `library:write` — per-account collection preference writes: saved-album
+  add/remove and artist follow/unfollow on `/v1/me/library/…`
+  (account preference only; never ingest, playback or billing).
 
 **Route map is exhaustive and default-deny.** A bearer key is accepted only
 for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
@@ -98,8 +101,12 @@ for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
 `/v1/playlists` require `library:read`; playlist create/edit/delete require
 `playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
 playback on `/v1/stream` requires `stream:read`; ingest submission requires
-`ingest:submit`. Every other operation, including an unlisted method on a
-listed route, is denied to bearer keys and must use session auth. In
+`ingest:submit`. The collection-saves surface splits read from write:
+`GET /v1/me/library/albums`, `GET /v1/me/library/artists` and their
+single-segment state reads require `library:read`, while `PUT`/`DELETE` on
+those item paths require `library:write`. Every other operation, including
+an unlisted method on a listed route, is denied to bearer keys and must
+use session auth. In
 particular, `/v1/me`, `/v1/indexers`,
 `GET /v1/operations/{operation_id}`, library membership writes,
 `DELETE /v1/libraries/{id}`, and every provider-vault operation (including

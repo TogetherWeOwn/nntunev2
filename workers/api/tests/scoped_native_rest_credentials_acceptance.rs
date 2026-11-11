@@ -21,7 +21,8 @@
 //! - Scope vocabulary: `pub const SCOPE_LIBRARY_READ: &str = "library:read";`
 //!   `SCOPE_PLAYLISTS_WRITE = "playlists:write"`, `SCOPE_PLAYS_WRITE =
 //!   "plays:write"`, `SCOPE_STREAM_READ = "stream:read"`, `SCOPE_INGEST_SUBMIT
-//!   = "ingest:submit"`, plus `pub const ALL_SCOPES: [&str; 5]` in that
+//!   = "ingest:submit"`, `SCOPE_LIBRARY_WRITE = "library:write"`
+//!   (collection-saves writes), plus `pub const ALL_SCOPES: [&str; 6]` in that
 //!   order. `pub enum Scope { LibraryRead, PlaylistsWrite, PlaysWrite,
 //!   StreamRead, IngestSubmit }` (`Debug + Clone + Copy + PartialEq + Eq +
 //!   Hash`) with `as_str() -> &'static str` and `parse(&str) ->
@@ -132,8 +133,8 @@ use nntune_api::native_rest::{
     authorize, credential_hmac, extract_bearer_key, issue_credential, revoke_all_for_user,
     revoke_credential, scope_for_operation, CredentialError, IssuedCredential, Pepper,
     RouteDecision, Scope, ALL_SCOPES, CREDENTIAL_PREFIX, KEY_PREFIX_LEN, MAX_CREDENTIAL_TTL_SECS,
-    SCOPE_INGEST_SUBMIT, SCOPE_LIBRARY_READ, SCOPE_PLAYLISTS_WRITE, SCOPE_PLAYS_WRITE,
-    SCOPE_STREAM_READ,
+    SCOPE_INGEST_SUBMIT, SCOPE_LIBRARY_READ, SCOPE_LIBRARY_WRITE, SCOPE_PLAYLISTS_WRITE,
+    SCOPE_PLAYS_WRITE, SCOPE_STREAM_READ,
 };
 use nntune_api::session;
 
@@ -176,15 +177,17 @@ fn scope_vocabulary_parses_and_round_trips() {
             "playlists:write",
             "plays:write",
             "stream:read",
-            "ingest:submit"
+            "ingest:submit",
+            "library:write"
         ],
-        "ADR 0010 vocabulary, in order"
+        "ADR 0010 vocabulary in order plus the appended collection-saves write scope"
     );
     assert_eq!(SCOPE_LIBRARY_READ, "library:read");
     assert_eq!(SCOPE_PLAYLISTS_WRITE, "playlists:write");
     assert_eq!(SCOPE_PLAYS_WRITE, "plays:write");
     assert_eq!(SCOPE_STREAM_READ, "stream:read");
     assert_eq!(SCOPE_INGEST_SUBMIT, "ingest:submit");
+    assert_eq!(SCOPE_LIBRARY_WRITE, "library:write");
 
     for (text, scope) in [
         ("library:read", Scope::LibraryRead),
@@ -192,6 +195,7 @@ fn scope_vocabulary_parses_and_round_trips() {
         ("plays:write", Scope::PlaysWrite),
         ("stream:read", Scope::StreamRead),
         ("ingest:submit", Scope::IngestSubmit),
+        ("library:write", Scope::LibraryWrite),
     ] {
         assert_eq!(Scope::parse(text), Some(scope), "must parse {text}");
         assert_eq!(scope.as_str(), text, "must render back to {text}");
@@ -208,7 +212,8 @@ fn scope_vocabulary_parses_and_round_trips() {
         "library:read ",
         " library:read",
         "library:read\n",
-        "library:write",
+        "library:write ",
+        "Library:Write",
         "admin",
         "*",
     ] {
@@ -565,6 +570,12 @@ fn canonical_route(scope: Scope) -> (&'static str, &'static str) {
         Scope::PlaysWrite => ("POST", "/v1/plays"),
         Scope::StreamRead => ("GET", "/v1/stream"),
         Scope::IngestSubmit => ("POST", "/v1/ingest"),
+        // The item segment must satisfy the MBID shape gate: a malformed
+        // segment classifies Deny, never a scope answer.
+        Scope::LibraryWrite => (
+            "PUT",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
+        ),
     }
 }
 
@@ -576,6 +587,7 @@ fn scope_matrix_scope_a_cannot_reach_scope_b() {
         Scope::PlaysWrite,
         Scope::StreamRead,
         Scope::IngestSubmit,
+        Scope::LibraryWrite,
     ];
     for held in scopes {
         let cred = issued(&[held], 3600, NOW);
@@ -677,6 +689,55 @@ fn route_map_is_exhaustive_and_default_deny() {
             "/v1/playlists/pl_1",
             Bearer(Scope::PlaylistsWrite),
         ),
+        // Collection saves: reads ride library:read; saves/removals need
+        // the appended library:write scope; the bare root serves nothing.
+        // Positive item paths use well-formed MBIDs — the shape gate
+        // denies malformed segments before they reach any scope answer.
+        ("GET", "/v1/me/library/albums", Bearer(Scope::LibraryRead)),
+        ("GET", "/v1/me/library/artists", Bearer(Scope::LibraryRead)),
+        (
+            "GET",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryRead),
+        ),
+        (
+            "GET",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryRead),
+        ),
+        (
+            "PUT",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryWrite),
+        ),
+        (
+            "DELETE",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryWrite),
+        ),
+        (
+            "PUT",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryWrite),
+        ),
+        (
+            "DELETE",
+            "/v1/me/library/artists/12345678-1234-1234-1234-1234567890ab",
+            Bearer(Scope::LibraryWrite),
+        ),
+        ("GET", "/v1/me/library", Deny),
+        ("PUT", "/v1/me/library/albums", Deny),
+        (
+            "GET",
+            "/v1/me/library/albums/12345678-1234-1234-1234-1234567890ab/x",
+            Deny,
+        ),
+        // Malformed single segments deny at the gate on every method —
+        // never a scope answer for a path dispatch would 404 anyway.
+        ("GET", "/v1/me/library/albums/m_1", Deny),
+        ("HEAD", "/v1/me/library/artists/m_1", Deny),
+        ("PUT", "/v1/me/library/albums/m_1", Deny),
+        ("DELETE", "/v1/me/library/artists/m_1", Deny),
         // Play events → plays:write; playback → stream:read; ingest → submit.
         ("POST", "/v1/plays", Bearer(Scope::PlaysWrite)),
         ("GET", "/v1/stream", Bearer(Scope::StreamRead)),

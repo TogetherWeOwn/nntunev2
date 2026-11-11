@@ -73,6 +73,10 @@ name = "catalogue_store_postgres"
 required-features = ["postgres-tests"]
 
 [[test]]
+name = "collection_store_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
 name = "credential_session_postgres"
 required-features = ["postgres-tests"]
 

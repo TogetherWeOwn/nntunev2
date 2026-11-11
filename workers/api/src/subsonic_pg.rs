@@ -276,7 +276,7 @@ impl CredentialStore for PgStore {
         digest: &str,
     ) -> Result<Option<CredentialRecord>, AuthError> {
         Self::bounded(
-            async { lookup(&mut self.connect().await?, Some(version), digest).await },
+            async { lookup(&mut *self.connect().await?, Some(version), digest).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -284,7 +284,7 @@ impl CredentialStore for PgStore {
     }
     async fn by_username(&self, username: &str) -> Result<Option<CredentialRecord>, AuthError> {
         Self::bounded(
-            async { lookup(&mut self.connect().await?, None, username).await },
+            async { lookup(&mut *self.connect().await?, None, username).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -296,7 +296,7 @@ impl CredentialStore for PgStore {
         now: u64,
     ) -> Result<bool, AuthError> {
         Self::bounded(
-            async { mutate(&mut self.connect().await?, selected, None, now).await },
+            async { mutate(&mut *self.connect().await?, selected, None, now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -309,7 +309,7 @@ impl CredentialStore for PgStore {
         now: u64,
     ) -> Result<bool, AuthError> {
         Self::bounded(
-            async { mutate(&mut self.connect().await?, selected, Some(reindex), now).await },
+            async { mutate(&mut *self.connect().await?, selected, Some(reindex), now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await

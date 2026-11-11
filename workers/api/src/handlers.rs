@@ -1597,6 +1597,98 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
+    /// Collection-saves state probe: the caller's stored `saved_at` unix
+    /// instant for (kind, mbid), `None` when unsaved. App-database read;
+    /// the handler runs target validation before calling, so `None` is a
+    /// preference answer, never an existence claim about the target.
+    /// `mbid` arrives pre-normalized (lowercase, well-formed). Fail-open
+    /// default keeps out-of-tree impls compiling; production and the test
+    /// fake override it.
+    fn collection_save_state(
+        &self,
+        _user_id: &str,
+        _kind: crate::collection::SaveKind,
+        _mbid: &str,
+    ) -> impl Future<Output = Result<Option<i64>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Bounded first page of the caller's collection saves for `kind`,
+    /// newest save first (`saved_at DESC, mbid ASC`), capped at
+    /// [`crate::collection::COLLECTION_PAGE_MAX`]. App-database read.
+    /// Fail-open-empty default; production and the test fake override it.
+    fn collection_save_page(
+        &self,
+        _user_id: &str,
+        _kind: crate::collection::SaveKind,
+    ) -> impl Future<Output = Result<Vec<crate::collection::CollectionListRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Fenced idempotent save (ADR 0002 rule 3, in-statement writer
+    /// fence): `Ok(Some(saved_at))` when the write landed or replayed
+    /// (the stored first-save instant — replay never refreshes it),
+    /// `Ok(None)` when the fence refused (the handler classifies into
+    /// the typed 409), `Err` on a store failure. `mbid` arrives
+    /// pre-normalized; `now` is the save instant in unix seconds.
+    /// Fail-CLOSED default (`Err`): an unprovisioned store must never
+    /// silently report a preference it did not durably write.
+    fn collection_save(
+        &self,
+        _user_id: &str,
+        _kind: crate::collection::SaveKind,
+        _mbid: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Option<i64>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Fenced removal: `Ok(0..=1)` affected rows — `0` covers both
+    /// "nothing was saved" (the idempotent no-op success) and
+    /// "fence refused", which the handler splits with an
+    /// `account_deleting` re-read (fence closed → typed 409; otherwise
+    /// the idempotent success). `Err` on a store failure. `mbid`
+    /// arrives pre-normalized; removal never re-runs target validation.
+    /// Fail-closed default like [`Self::collection_save`].
+    fn collection_remove(
+        &self,
+        _user_id: &str,
+        _kind: crate::collection::SaveKind,
+        _mbid: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Caller-member artist probe for follow validation: `true` when the
+    /// artist exists in the mirror AND owns at least one of the caller's
+    /// member release MBIDs (the whole uncapped own-or-shared ledger).
+    /// `false` covers non-member and mirror-absent targets alike — the
+    /// handler answers 404 for both, indistinguishably. `mbid` arrives
+    /// pre-normalized. Fail-open-false default; production and the test
+    /// fake override it.
+    fn collection_artist_member(
+        &self,
+        _user_id: &str,
+        _mbid: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
+    /// Mirror release enrichment for the saved-album page: arbitrary
+    /// well-formed release MBIDs (already normalized and deduplicated),
+    /// mirror-only — no owner data crosses the cluster. Absent or
+    /// unconfigured mirrors answer `Ok(vec![])` (degrade per field,
+    /// never a dropped row); a configured-but-failed mirror answers
+    /// `Err`. Fail-open-empty default.
+    fn collection_releases(
+        &self,
+        _mbids: &[String],
+    ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Mirror artist enrichment for the followed-artist page: same
+    /// absence/failure split as [`Self::collection_releases`].
+    fn collection_artists(
+        &self,
+        _mbids: &[String],
+    ) -> impl Future<Output = Result<Vec<crate::catalogue::ArtistDbRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
@@ -4040,6 +4132,308 @@ where
             &release, &tracks,
         )),
         Err(_) => unavailable(),
+    }
+}
+
+// --- Collection saves (durable saved albums + followed artists) -----------------
+//
+// The `/v1/me/library/{albums,artists}` surface is an account preference
+// ledger (migration 0041), never ingest, playback, listens or access —
+// wire contract in docs/collection-saves-api-contract.md. Reads share the
+// catalogue's session-or-bearer resolution; writes add the mutation
+// Origin pin for cookie sessions (a presented `library:write` bearer is
+// never a cross-site form post). Owner scoping lives in the SQL: the
+// caller's id comes only from the verified session or credential.
+//
+// Every save and state-read route validates its target BEFORE touching
+// saved state, so malformed, non-member and mirror-absent MBIDs answer
+// one identical 404 (no existence oracle), and an absent source is never
+// reported as saved. Removal skips validation on purpose: a target whose
+// membership lapsed stays removable.
+
+/// Extract and normalize the single-segment MBID of a collection item
+/// path. `None` — nested, trailing-slash, empty or malformed shapes —
+/// answers the plain 404 before any authentication or store work.
+fn collection_mbid(path: &str, prefix: &str) -> Option<String> {
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    crate::collection::normalize_mbid(rest)
+}
+
+/// Resolve the collection-write caller: a gate-authorized `library:write`
+/// bearer wins (a bearer-carrying request is never a cross-site form
+/// post, so it skips the Origin pin); otherwise the session cookie must
+/// pass the CSRF origin pin like every session mutation.
+async fn collection_mutation_caller<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Result<String, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Some(user) = bearer {
+        if !user.is_empty() {
+            return Ok(user.to_string());
+        }
+    }
+    match ctx.authenticate(req, true).await {
+        Ok((claims, _token)) => Ok(claims.user_id),
+        Err(resp) => Err(resp),
+    }
+}
+
+/// Target validation shared by the save and state-read routes: `Ok(true)`
+/// resolvable, `Ok(false)` answers the plain 404. Albums resolve through
+/// the release detail's own membership-plus-mirror read (same
+/// well-formed, member, mirror-known predicate); artists through the
+/// member-artist probe (mirror existence AND ownership of a member
+/// release). Store or mirror failures fail retryable — a transient
+/// outage must never look like a not-resolved target.
+async fn collection_target_known<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    kind: crate::collection::SaveKind,
+    mbid: &str,
+) -> Result<bool, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    match kind {
+        crate::collection::SaveKind::Album => ctx
+            .store
+            .catalogue_release(user_id, mbid)
+            .await
+            .map(|row| row.is_some())
+            .map_err(|_| unavailable()),
+        crate::collection::SaveKind::Artist => ctx
+            .store
+            .collection_artist_member(user_id, mbid)
+            .await
+            .map_err(|_| unavailable()),
+    }
+}
+
+/// `GET /v1/me/library/albums`: bounded first page of the caller's saved
+/// albums, mirror-enriched per field — absent enrichment never drops a
+/// saved row, but a configured-mirror failure is retryable, never a
+/// silent degrade.
+async fn collection_saved_albums<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    let page = match ctx
+        .store
+        .collection_save_page(&user_id, crate::collection::SaveKind::Album)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return unavailable(),
+    };
+    // Well-formed stored MBIDs only, deduplicated: a poisoned stored value
+    // never reaches a mirror probe (its enrichment stays all-null).
+    let mut mbids: Vec<String> = page
+        .iter()
+        .filter_map(|row| crate::collection::normalize_mbid(&row.mbid))
+        .collect();
+    mbids.sort();
+    mbids.dedup();
+    let hits = match ctx.store.collection_releases(&mbids).await {
+        Ok(hits) => hits,
+        Err(_) => return unavailable(),
+    };
+    catalogue_response(&crate::collection::assemble_saved_albums(&page, &hits))
+}
+
+/// `GET /v1/me/library/artists`: same bounded-page read over the
+/// followed-artist collection.
+async fn collection_followed_artists<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    let page = match ctx
+        .store
+        .collection_save_page(&user_id, crate::collection::SaveKind::Artist)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return unavailable(),
+    };
+    let mut mbids: Vec<String> = page
+        .iter()
+        .filter_map(|row| crate::collection::normalize_mbid(&row.mbid))
+        .collect();
+    mbids.sort();
+    mbids.dedup();
+    let hits = match ctx.store.collection_artists(&mbids).await {
+        Ok(hits) => hits,
+        Err(_) => return unavailable(),
+    };
+    catalogue_response(&crate::collection::assemble_followed_artists(&page, &hits))
+}
+
+/// The state read (`GET`), idempotent save (`PUT`) and idempotent removal
+/// (`DELETE`) for one `/v1/me/library/{albums,artists}/{mbid}` item.
+/// Shape and MBID gates run before authentication, so unserved and
+/// malformed shapes spend nothing.
+async fn collection_item<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    bearer: Option<&str>,
+    kind: crate::collection::SaveKind,
+    prefix: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(mbid) = collection_mbid(&req.path, prefix) else {
+        return not_found();
+    };
+    match req.method.as_str() {
+        "GET" => {
+            let user_id = match catalogue_caller(ctx, req, bearer).await {
+                Ok(user_id) => user_id,
+                Err(resp) => return resp,
+            };
+            match collection_target_known(ctx, &user_id, kind, &mbid).await {
+                Ok(true) => {}
+                Ok(false) => return not_found(),
+                Err(resp) => return resp,
+            }
+            let saved_at = match ctx.store.collection_save_state(&user_id, kind, &mbid).await {
+                Ok(saved_at) => saved_at,
+                Err(_) => return unavailable(),
+            };
+            match kind {
+                crate::collection::SaveKind::Album => {
+                    catalogue_response(&crate::collection::saved_state(saved_at))
+                }
+                crate::collection::SaveKind::Artist => {
+                    catalogue_response(&crate::collection::followed_state(saved_at))
+                }
+            }
+        }
+        "PUT" => {
+            let user_id = match collection_mutation_caller(ctx, req, bearer).await {
+                Ok(user_id) => user_id,
+                Err(resp) => return resp,
+            };
+            // The save statement is fenced on `deleting_at` (ADR 0002
+            // rule 3); answer the typed 409 up front rather than a
+            // generic failure after the fence refuses the write.
+            if matches!(ctx.store.account_deleting(&user_id).await, Ok(true)) {
+                return account_deleting_response();
+            }
+            match collection_target_known(ctx, &user_id, kind, &mbid).await {
+                Ok(true) => {}
+                Ok(false) => return not_found(),
+                Err(resp) => return resp,
+            }
+            match ctx
+                .store
+                .collection_save(&user_id, kind, &mbid, ctx.now)
+                .await
+            {
+                Ok(Some(saved_at)) => match kind {
+                    crate::collection::SaveKind::Album => {
+                        catalogue_response(&crate::collection::saved_state(Some(saved_at)))
+                    }
+                    crate::collection::SaveKind::Artist => {
+                        catalogue_response(&crate::collection::followed_state(Some(saved_at)))
+                    }
+                },
+                Ok(None) => {
+                    // Zero rows: the deletion fence closed after the
+                    // up-front check (the marker landed mid-request) or
+                    // the user row is gone. Re-read the fence state to
+                    // split the typed 409 from a vanished-account write;
+                    // a FAILED probe answers the outage, never a
+                    // fabricated 404 the caller would take as state.
+                    let deleting = match ctx.store.account_deleting(&user_id).await {
+                        Ok(deleting) => deleting,
+                        Err(_) => return internal(),
+                    };
+                    match crate::collection::collection_write_outcome(false, deleting) {
+                        crate::collection::CollectionWriteOutcome::AccountDeleting => {
+                            account_deleting_response()
+                        }
+                        _ => not_found(),
+                    }
+                }
+                Err(_) => internal(),
+            }
+        }
+        "DELETE" => {
+            let user_id = match collection_mutation_caller(ctx, req, bearer).await {
+                Ok(user_id) => user_id,
+                Err(resp) => return resp,
+            };
+            if matches!(ctx.store.account_deleting(&user_id).await, Ok(true)) {
+                return account_deleting_response();
+            }
+            match ctx.store.collection_remove(&user_id, kind, &mbid).await {
+                Ok(affected) => {
+                    // A fence-refused delete and a never-saved target both
+                    // affect zero rows; the fence re-read separates them —
+                    // a closed fence answers the typed 409, anything else
+                    // is the idempotent success (removal never re-runs
+                    // target validation, so a lapsed member stays
+                    // removable). A FAILED probe answers the outage: the
+                    // write may have refused, so a fabricated unsaved
+                    // state would lie about the row it just left behind.
+                    if affected == 0 {
+                        match ctx.store.account_deleting(&user_id).await {
+                            Ok(true) => return account_deleting_response(),
+                            Ok(false) => {}
+                            Err(_) => return internal(),
+                        }
+                    }
+                    match kind {
+                        crate::collection::SaveKind::Album => {
+                            catalogue_response(&crate::collection::saved_state(None))
+                        }
+                        crate::collection::SaveKind::Artist => {
+                            catalogue_response(&crate::collection::followed_state(None))
+                        }
+                    }
+                }
+                Err(_) => internal(),
+            }
+        }
+        _ => not_found(),
     }
 }
 
@@ -6920,6 +7314,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/artists"
             | "/v1/releases"
             | "/v1/tracks"
+            | "/v1/me/library/albums"
+            | "/v1/me/library/artists"
     )
 }
 
@@ -7161,6 +7557,37 @@ where
                 .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
         {
             catalogue_release(ctx, req, bearer_user.as_deref()).await
+        }
+        // Collection saves: the bounded lists at the collection roots and
+        // the item routes (state read, idempotent save, idempotent
+        // removal). The handler re-gates the item shape so nested or
+        // malformed MBID segments 404 before any authentication or store
+        // work; the bare `/v1/me/library` root serves nothing.
+        ("GET", "/v1/me/library/albums") => {
+            collection_saved_albums(ctx, req, bearer_user.as_deref()).await
+        }
+        ("GET", "/v1/me/library/artists") => {
+            collection_followed_artists(ctx, req, bearer_user.as_deref()).await
+        }
+        ("GET" | "PUT" | "DELETE", path) if path.starts_with("/v1/me/library/albums/") => {
+            collection_item(
+                ctx,
+                req,
+                bearer_user.as_deref(),
+                crate::collection::SaveKind::Album,
+                "/v1/me/library/albums/",
+            )
+            .await
+        }
+        ("GET" | "PUT" | "DELETE", path) if path.starts_with("/v1/me/library/artists/") => {
+            collection_item(
+                ctx,
+                req,
+                bearer_user.as_deref(),
+                crate::collection::SaveKind::Artist,
+                "/v1/me/library/artists/",
+            )
+            .await
         }
         // Single-segment credential ids only; deeper shapes 404 inside
         // the handler. `options_preflight_served` keeps browser preflights
@@ -7471,6 +7898,18 @@ mod tests {
         fail_catalogue_reads: RefCell<bool>,
         /// Fail only the second read in release detail, after membership.
         fail_catalogue_release_tracks: RefCell<bool>,
+        /// Collection saves (migration 0041): keyed `(user_id, kind, mbid)`
+        /// with the first-save unix instant, mirroring the production
+        /// composite key and the replay-keeps-first-instant rule.
+        collection_saves: RefCell<HashMap<(String, String, String), i64>>,
+        /// Collection store-error pin: every collection read AND write
+        /// fails like a production outage (the handler must answer
+        /// retryable reads / opaque writes, never invented state).
+        fail_collection: RefCell<bool>,
+        /// Fail only the `account_deleting` probe: the handler must
+        /// never fabricate saved/unsaved state or a 404 when the fence
+        /// classification itself erred.
+        fail_deleting_probe: RefCell<bool>,
     }
 
     impl FakeStore {
@@ -8655,7 +9094,172 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn collection_save_state(
+            &self,
+            user_id: &str,
+            kind: crate::collection::SaveKind,
+            mbid: &str,
+        ) -> Result<Option<i64>, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .collection_saves
+                .borrow()
+                .get(&(
+                    user_id.to_string(),
+                    kind.as_str().to_string(),
+                    mbid.to_string(),
+                ))
+                .copied())
+        }
+        async fn collection_save_page(
+            &self,
+            user_id: &str,
+            kind: crate::collection::SaveKind,
+        ) -> Result<Vec<crate::collection::CollectionListRow>, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows: Vec<crate::collection::CollectionListRow> = self
+                .collection_saves
+                .borrow()
+                .iter()
+                .filter(|((owner, k, _), _)| owner == user_id && k == kind.as_str())
+                .map(
+                    |((_, _, mbid), saved_at)| crate::collection::CollectionListRow {
+                        mbid: mbid.clone(),
+                        saved_at: *saved_at,
+                    },
+                )
+                .collect();
+            rows.sort_by(|a, b| {
+                b.saved_at
+                    .cmp(&a.saved_at)
+                    .then_with(|| a.mbid.cmp(&b.mbid))
+            });
+            rows.truncate(crate::collection::COLLECTION_PAGE_MAX);
+            Ok(rows)
+        }
+        async fn collection_save(
+            &self,
+            user_id: &str,
+            kind: crate::collection::SaveKind,
+            mbid: &str,
+            now: u64,
+        ) -> Result<Option<i64>, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            // Mirror the in-statement writer fence: no row lands for a
+            // deleting (or missing) account. A missing user row reads as
+            // the fence too — the fake does not model reaped users.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(None);
+            }
+            let key = (
+                user_id.to_string(),
+                kind.as_str().to_string(),
+                mbid.to_string(),
+            );
+            let mut saves = self.collection_saves.borrow_mut();
+            let entry = saves
+                .entry(key)
+                .or_insert(i64::try_from(now).map_err(|_| StoreError)?);
+            Ok(Some(*entry))
+        }
+        async fn collection_remove(
+            &self,
+            user_id: &str,
+            kind: crate::collection::SaveKind,
+            mbid: &str,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(0);
+            }
+            Ok(u64::from(
+                self.collection_saves
+                    .borrow_mut()
+                    .remove(&(
+                        user_id.to_string(),
+                        kind.as_str().to_string(),
+                        mbid.to_string(),
+                    ))
+                    .is_some(),
+            ))
+        }
+        async fn collection_artist_member(
+            &self,
+            user_id: &str,
+            mbid: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            // Artist exists in the (fake) mirror AND owns at least one
+            // member release.
+            if !self
+                .catalogue_artists
+                .borrow()
+                .iter()
+                .any(|row| crate::catalogue::enrichment_key(&row.mbid).as_deref() == Some(mbid))
+            {
+                return Ok(false);
+            }
+            let member = self.fake_member_releases(user_id);
+            Ok(self.catalogue_releases.borrow().iter().any(|row| {
+                row.artist_mbid
+                    .as_deref()
+                    .and_then(crate::catalogue::enrichment_key)
+                    .as_deref()
+                    == Some(mbid)
+                    && crate::catalogue::enrichment_key(&row.mbid)
+                        .is_some_and(|key| member.iter().any(|m| m == &key))
+            }))
+        }
+        async fn collection_releases(
+            &self,
+            mbids: &[String],
+        ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .catalogue_releases
+                .borrow()
+                .iter()
+                .filter(|row| {
+                    crate::catalogue::enrichment_key(&row.mbid)
+                        .is_some_and(|key| mbids.iter().any(|m| m == &key))
+                })
+                .cloned()
+                .collect())
+        }
+        async fn collection_artists(
+            &self,
+            mbids: &[String],
+        ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
+            if *self.fail_collection.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .catalogue_artists
+                .borrow()
+                .iter()
+                .filter(|row| {
+                    crate::catalogue::enrichment_key(&row.mbid)
+                        .is_some_and(|key| mbids.iter().any(|m| m == &key))
+                })
+                .cloned()
+                .collect())
+        }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_deleting_probe.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
@@ -23058,5 +23662,450 @@ mod tests {
         );
         assert_not_found_envelope(revoke.status, &revoke.body, "revoke");
         assert_eq!(revoke.body, catch_all.body, "revoke vs catch-all");
+    }
+
+    // --- Collection saves: durable saved albums + followed artists -----------
+
+    const COL_ALBUM: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const COL_ARTIST: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const COL_OTHER_ARTIST: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    fn lib_row(user_release: Option<&str>) -> crate::catalogue::LibraryDbRow {
+        crate::catalogue::LibraryDbRow {
+            job_id: "job-1".to_string(),
+            release_mbid: user_release.map(str::to_string),
+            recording_mbids: Vec::new(),
+            recording_mbid: None,
+            recording_ord: 0,
+            recording_title: None,
+            duration_ms: None,
+            medium_no: None,
+            track_no: None,
+            release_title: None,
+            artist_mbid: None,
+            artist_name: None,
+        }
+    }
+
+    fn release_row(
+        mbid: &str,
+        artist_mbid: Option<&str>,
+        title: &str,
+    ) -> crate::catalogue::ReleaseDbRow {
+        crate::catalogue::ReleaseDbRow {
+            mbid: mbid.to_string(),
+            title: title.to_string(),
+            release_type: Some("Album".to_string()),
+            year: Some(1983),
+            artist_mbid: artist_mbid.map(str::to_string),
+            artist_name: artist_mbid.map(|_| "New Order".to_string()),
+        }
+    }
+
+    fn artist_row(mbid: &str, name: &str) -> crate::catalogue::ArtistDbRow {
+        crate::catalogue::ArtistDbRow {
+            mbid: mbid.to_string(),
+            name: name.to_string(),
+            sort_name: name.to_string(),
+            artist_type: Some("Group".to_string()),
+            country: Some("GB".to_string()),
+        }
+    }
+
+    /// u1 owns COL_ALBUM (whose artist is COL_ARTIST) in its ledger and the
+    /// fake mirror knows both rows; u2 holds an empty catalogue.
+    fn collection_seeded() -> Harness {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("u1".to_string(), vec![lib_row(Some(COL_ALBUM))]);
+        h.store.catalogue_releases.borrow_mut().push(release_row(
+            COL_ALBUM,
+            Some(COL_ARTIST),
+            "Power, Corruption & Lies",
+        ));
+        h.store
+            .catalogue_artists
+            .borrow_mut()
+            .push(artist_row(COL_ARTIST, "New Order"));
+        h.store
+            .catalogue_artists
+            .borrow_mut()
+            .push(artist_row(COL_OTHER_ARTIST, "Stranger"));
+        h
+    }
+
+    fn collection_put(h: &Harness, path: &str, cookie: &str) -> Response {
+        h.call_full("PUT", path, None, Some(cookie.to_string()), Some(ORIGIN))
+    }
+
+    fn collection_get(h: &Harness, path: &str, cookie: &str) -> Response {
+        h.call_full("GET", path, None, Some(cookie.to_string()), Some(ORIGIN))
+    }
+
+    fn collection_del(h: &Harness, path: &str, cookie: &str) -> Response {
+        h.call_full("DELETE", path, None, Some(cookie.to_string()), Some(ORIGIN))
+    }
+
+    #[test]
+    fn collection_album_save_read_remove_round_trip() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+
+        // Save: 200 with the first-save instant rendered ISO-8601.
+        let resp = collection_put(&h, &item, &cookie);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["saved_at"], "2023-11-14T22:13:20Z");
+
+        // Replay is idempotent: same instant, never a refresh.
+        let replay = collection_put(&h, &item, &cookie);
+        assert_eq!(replay.status, 200);
+        assert_eq!(replay.body, resp.body);
+
+        // State read reports saved.
+        let state = collection_get(&h, &item, &cookie);
+        assert_eq!(state.status, 200);
+        assert_eq!(state.body, resp.body);
+
+        // List carries the enriched entry.
+        let list = collection_get(&h, "/v1/me/library/albums", &cookie);
+        assert_eq!(list.status, 200, "{}", list.body);
+        let entries: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["mbid"], COL_ALBUM);
+        assert_eq!(entries[0]["title"], "Power, Corruption & Lies");
+        assert_eq!(entries[0]["artist"], "New Order");
+        assert_eq!(entries[0]["release_type"], "Album");
+        assert_eq!(
+            entries[0]["art_url"],
+            format!("/v1/releases/{COL_ALBUM}/art")
+        );
+
+        // Remove twice: both answer the idempotent success.
+        for _ in 0..2 {
+            let del = collection_del(&h, &item, &cookie);
+            assert_eq!(del.status, 200, "{}", del.body);
+            let del_body: serde_json::Value = serde_json::from_str(&del.body).unwrap();
+            assert_eq!(del_body["saved"], false);
+            assert_eq!(del_body["saved_at"], serde_json::Value::Null);
+        }
+        // State after removal: valid target, reported unsaved.
+        let after = collection_get(&h, &item, &cookie);
+        let after_body: serde_json::Value = serde_json::from_str(&after.body).unwrap();
+        assert_eq!(after_body["saved"], false);
+    }
+
+    #[test]
+    fn collection_artist_follow_read_unfollow_round_trip() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/artists/{COL_ARTIST}");
+
+        let resp = collection_put(&h, &item, &cookie);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["followed"], true);
+        assert_eq!(body["followed_at"], "2023-11-14T22:13:20Z");
+
+        let list = collection_get(&h, "/v1/me/library/artists", &cookie);
+        let entries: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["mbid"], COL_ARTIST);
+        assert_eq!(entries[0]["name"], "New Order");
+        assert_eq!(entries[0]["type"], "Group");
+        assert_eq!(entries[0]["country"], "GB");
+
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 200);
+        let del_body: serde_json::Value = serde_json::from_str(&del.body).unwrap();
+        assert_eq!(del_body["followed"], false);
+        let after: serde_json::Value =
+            serde_json::from_str(&collection_get(&h, &item, &cookie).body).unwrap();
+        assert_eq!(after["followed"], false);
+    }
+
+    #[test]
+    fn collection_targets_gate_malformed_nonmember_and_unknown_mbids() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+
+        // Malformed, nested and trailing shapes 404 before auth.
+        for path in [
+            "/v1/me/library/albums/not-an-mbid",
+            "/v1/me/library/albums/",
+            "/v1/me/library",
+            "/v1/me/library/albums",
+        ] {
+            let resp = collection_put(&h, path, &cookie);
+            assert_eq!(resp.status, 404, "PUT {path}");
+        }
+        let nested = collection_put(&h, &format!("/v1/me/library/albums/{COL_ALBUM}/x"), &cookie);
+        assert_eq!(nested.status, 404);
+
+        // Well-formed but non-member release: PUT and state GET 404; the
+        // row is never written.
+        let foreign = format!(
+            "/v1/me/library/albums/{}",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(collection_put(&h, &foreign, &cookie).status, 404);
+        assert_eq!(collection_get(&h, &foreign, &cookie).status, 404);
+        // An artist existing in the mirror but owning no member release
+        // 404s the same way (no existence oracle).
+        let unreachable_artist = format!("/v1/me/library/artists/{COL_OTHER_ARTIST}");
+        assert_eq!(collection_put(&h, &unreachable_artist, &cookie).status, 404);
+        // A second user's empty catalogue sees the same targets as
+        // non-member.
+        let cookie2 = magic_login(&h, "b@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        assert_eq!(collection_put(&h, &item, &cookie2).status, 404);
+        assert_eq!(collection_get(&h, &item, &cookie2).status, 404);
+    }
+
+    #[test]
+    fn collection_saves_are_owner_scoped_with_no_cross_account_state() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        assert_eq!(collection_put(&h, &item, &cookie).status, 200);
+
+        // A second user's state read says unsaved even when the target is
+        // member-reachable for them too (seed them the same release).
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("u2".to_string(), vec![lib_row(Some(COL_ALBUM))]);
+        let cookie2 = magic_login(&h, "b@example.com");
+        let state: serde_json::Value =
+            serde_json::from_str(&collection_get(&h, &item, &cookie2).body).unwrap();
+        assert_eq!(state["saved"], false);
+        let list: serde_json::Value =
+            serde_json::from_str(&collection_get(&h, "/v1/me/library/albums", &cookie2).body)
+                .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+        // No response ever carries the owner's identity.
+        let owner_state = collection_get(&h, &item, &cookie);
+        assert!(!owner_state.body.contains("u1"));
+    }
+
+    #[test]
+    fn collection_writes_require_auth_and_origin_pin() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+
+        // No cookie: generic 401 on both reads and writes.
+        let anon = h.call_full("PUT", &item, None, None, Some(ORIGIN));
+        assert_eq!(anon.status, 401);
+        let anon_get = h.call_full("GET", &item, None, None, None);
+        assert_eq!(anon_get.status, 401);
+        // Missing/foreign Origin on a cookie mutation: generic 401, no
+        // store write.
+        for origin in [None, Some("https://evil.example")] {
+            let resp = h.call_full("PUT", &item, None, Some(cookie.clone()), origin);
+            assert_eq!(resp.status, 401, "origin {origin:?}");
+        }
+        let del = h.call_full(
+            "DELETE",
+            &item,
+            None,
+            Some(cookie.clone()),
+            Some("https://evil.example"),
+        );
+        assert_eq!(del.status, 401);
+        assert!(h.store.collection_saves.borrow().is_empty());
+        // GET never consults Origin.
+        let get = h.call_full("GET", &item, None, Some(cookie), None);
+        assert_eq!(get.status, 200);
+    }
+
+    #[test]
+    fn collection_writes_answer_account_deleting_409() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let put = collection_put(&h, &item, &cookie);
+        assert_eq!(put.status, 409, "{}", put.body);
+        let body: serde_json::Value = serde_json::from_str(&put.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 409);
+        // Reads stay served during the grace window.
+        let get = collection_get(&h, &item, &cookie);
+        assert_eq!(get.status, 200);
+    }
+
+    #[test]
+    fn collection_store_outages_are_retryable_reads_opaque_writes() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        *h.store.fail_collection.borrow_mut() = true;
+        for (method, expected) in [("GET", 503), ("PUT", 500), ("DELETE", 500)] {
+            let resp = h.call_full(method, &item, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, expected, "{method}");
+        }
+        // Target-validation outage (the catalogue release read) is the
+        // retryable 503 on reads and writes alike — never a false 404.
+        *h.store.fail_collection.borrow_mut() = false;
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        let resp = collection_get(&h, &item, &cookie);
+        assert_eq!(resp.status, 503);
+        let resp = collection_put(&h, &item, &cookie);
+        assert_eq!(resp.status, 503);
+    }
+
+    #[test]
+    fn collection_bearer_scopes_split_read_and_write() {
+        // Scopes are independent (`authorize` requires the exact required
+        // scope): `library:read` serves GETs only, `library:write` serves
+        // the mutation without a cookie and without the Origin pin, and
+        // neither implies the other.
+        for scope in ["library:read", "library:write"] {
+            let mut h = collection_seeded();
+            h.config = peppered_cfg();
+            let cookie = magic_login(&h, "a@example.com");
+            let minted = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": [scope], "ttl_secs": 3600}),
+            );
+            assert_eq!(minted.status, 201, "{}", minted.body);
+            let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+            let auth = || Some(format!("Bearer {secret}"));
+            let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+
+            let get = h.call_bearer("GET", &item, auth());
+            let list = h.call_bearer("GET", "/v1/me/library/albums", auth());
+            let put = h.call_bearer("PUT", &item, auth());
+            let del = h.call_bearer("DELETE", &item, auth());
+            if scope == "library:read" {
+                assert_eq!(get.status, 200, "{scope} GET: {}", get.body);
+                assert_eq!(list.status, 200, "{scope} list");
+                assert_eq!(put.status, 403, "{scope} PUT");
+                assert_eq!(del.status, 403, "{scope} DELETE");
+            } else {
+                assert_eq!(get.status, 403, "{scope} GET");
+                assert_eq!(list.status, 403, "{scope} list");
+                assert_eq!(put.status, 200, "{scope} PUT: {}", put.body);
+                assert_eq!(del.status, 200, "{scope} DELETE");
+            }
+        }
+        // A credential minted with both scopes serves the whole surface.
+        let mut h = collection_seeded();
+        h.config = peppered_cfg();
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read", "library:write"], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let auth = || Some(format!("Bearer {secret}"));
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        assert_eq!(h.call_bearer("GET", &item, auth()).status, 200);
+        assert_eq!(h.call_bearer("PUT", &item, auth()).status, 200);
+        assert_eq!(h.call_bearer("DELETE", &item, auth()).status, 200);
+    }
+
+    #[test]
+    fn collection_list_is_bounded_and_ordered() {
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        // Seed 55 saves directly (past the 50 bound): the page caps and
+        // orders newest-first with the mbid tiebreak — no cursor exists.
+        {
+            let mut saves = h.store.collection_saves.borrow_mut();
+            for i in 0..55 {
+                let mbid = format!("{:08x}-0000-4000-8000-000000000000", i);
+                saves.insert(
+                    ("u1".to_string(), "album".to_string(), mbid),
+                    1_700_000_000 - i as i64,
+                );
+            }
+        }
+        let resp = collection_get(&h, "/v1/me/library/albums", &cookie);
+        assert_eq!(resp.status, 200);
+        let entries: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 50);
+        for entry in entries {
+            let saved: serde_json::Value = entry["saved_at"].clone();
+            assert!(saved.is_string());
+            // Newest-first strictly (distinct instants here): the five
+            // oldest saves (idx 50..=54) never appear.
+            let mbid = entry["mbid"].as_str().unwrap();
+            let idx = i64::from_str_radix(&mbid[..8], 16).unwrap();
+            assert!(idx <= 49, "first page holds the newest 50");
+        }
+    }
+
+    #[test]
+    fn collection_zero_row_writes_never_fabricate_on_a_failed_probe() {
+        // The marker lands mid-request (seeded after the up-front check):
+        // the fenced write affects zero rows, then the fence re-read
+        // fails. Neither method may guess — DELETE must not report an
+        // unsaved state for a row it may still hold, PUT must not 404 a
+        // refusal it could not classify. Both answer the opaque 500.
+        for (collection, kind, mbid) in [
+            ("albums", "album", COL_ALBUM),
+            ("artists", "artist", COL_ARTIST),
+        ] {
+            let h = collection_seeded();
+            let cookie = magic_login(&h, "a@example.com");
+            let item = format!("/v1/me/library/{collection}/{mbid}");
+
+            let saved = collection_put(&h, &item, &cookie);
+            assert_eq!(saved.status, 200, "seed save {collection}");
+            // Arm the mid-request fence + failing probe, then remove:
+            // the fake's own fence check zero-rows the write, and the
+            // post-write probe errs.
+            h.store.deleting_users.borrow_mut().insert("u1".to_string());
+            *h.store.fail_deleting_probe.borrow_mut() = true;
+            let del = collection_del(&h, &item, &cookie);
+            assert_eq!(del.status, 500, "DELETE {collection}: {}", del.body);
+            // The row itself is untouched (the fake fence refused it).
+            assert!(h.store.collection_saves.borrow().contains_key(&(
+                "u1".to_string(),
+                kind.to_string(),
+                mbid.to_string()
+            )));
+
+            // PUT against a refused (zero-row) save with a failing
+            // probe: the fallback classification errs, never a 404.
+            let put = collection_put(&h, &item, &cookie);
+            assert_eq!(put.status, 500, "PUT {collection}: {}", put.body);
+        }
+    }
+
+    #[test]
+    fn collection_zero_row_delete_still_splits_the_live_409() {
+        // Same zero-row shape with a WORKING probe: the closed fence
+        // still answers the typed 409, and a live account keeps the
+        // idempotent unsaved success.
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let item = format!("/v1/me/library/albums/{COL_ALBUM}");
+        assert_eq!(collection_put(&h, &item, &cookie).status, 200);
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 409, "{}", del.body);
+        let body: serde_json::Value = serde_json::from_str(&del.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+
+        let h = collection_seeded();
+        let cookie = magic_login(&h, "a@example.com");
+        let del = collection_del(&h, &item, &cookie);
+        assert_eq!(del.status, 200, "never-saved removal stays idempotent");
     }
 }

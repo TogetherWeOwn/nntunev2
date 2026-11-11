@@ -21,6 +21,7 @@ pub mod b64;
 pub mod billing;
 pub mod billing_reconcile;
 pub mod catalogue;
+pub mod collection;
 pub mod credential_session_store;
 mod field_envelope;
 pub mod handlers;

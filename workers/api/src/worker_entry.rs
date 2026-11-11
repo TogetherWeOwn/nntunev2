@@ -701,15 +701,64 @@ struct PgStore {
     trace_id: String,
     mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-    test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    test_client: Option<PgTestSlot>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
 
+/// Shared slot one injected test client lives in. `Client` is not
+/// `Clone`, so repeated store calls in one test instead CHECK the client
+/// out of its slot: the [`ClientCheckout`] guard below returns it when
+/// the call ends, keeping the single seeded connection (and its
+/// per-connection temp tables) shared across every call a test makes.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+type PgTestSlot = std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::Client>>>;
+
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
-    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    client: Result<PgTestSlot, StoreError>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+/// The client a store call holds while its statements run. Production
+/// checkouts own their client; test checkouts borrow the injected one
+/// and return it on drop. `Deref`/`DerefMut` keep every caller shape —
+/// `client.execute(...)`, `client.transaction()`, `&mut client` —
+/// identical to holding an owned `tokio_postgres::Client`. (Shared
+/// helpers taking `&impl GenericClient` get `&*client`: `GenericClient`
+/// is sealed, so the guard itself cannot satisfy that bound.)
+struct ClientCheckout {
+    client: Option<tokio_postgres::Client>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    return_to: Option<PgTestSlot>,
+}
+
+impl std::ops::Deref for ClientCheckout {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("live checkout")
+    }
+}
+
+impl std::ops::DerefMut for ClientCheckout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("live checkout")
+    }
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl Drop for ClientCheckout {
+    fn drop(&mut self) {
+        if let (Some(slot), Some(client)) = (&self.return_to, self.client.take()) {
+            let mut guard = slot.borrow_mut();
+            // Returning into an occupied slot is a test-harness misuse
+            // (a client cannot be in two places); drop it rather than
+            // silently sharing one connection across live checkouts.
+            if guard.is_none() {
+                *guard = Some(client);
+            }
+        }
+    }
 }
 
 /// Inject connection acquisition only; execute the production catalogue SQL,
@@ -729,9 +778,9 @@ pub fn catalogue_store_for_postgres_test(
         } else {
             MirrorBinding::Unconfigured
         },
-        test_client: std::cell::RefCell::new(Some(app)),
+        test_client: Some(std::rc::Rc::new(std::cell::RefCell::new(Some(app)))),
         test_mirror: Some(CatalogueTestMirror {
-            client: std::cell::RefCell::new(Some(mirror)),
+            client: mirror.map(|c| std::rc::Rc::new(std::cell::RefCell::new(Some(c)))),
             attempts,
         }),
     }
@@ -747,7 +796,7 @@ pub fn session_retry_store_for_postgres_test(
         env: None,
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
-        test_client: std::cell::RefCell::new(Some(client)),
+        test_client: Some(std::rc::Rc::new(std::cell::RefCell::new(Some(client)))),
         test_mirror: None,
     }
 }
@@ -783,10 +832,18 @@ impl PgStore {
         with_deadline(operation, timeout_ms, StoreError).await
     }
 
-    async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+    async fn connect(&self) -> Result<ClientCheckout, StoreError> {
+        // The injected client is checked out, not cloned: `Client` is not
+        // `Clone`, so the guard below borrows the slot's one connection
+        // (keeping its per-connection temp tables) and returns it on
+        // drop. A second live checkout of the same slot fails closed.
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = self.test_client.borrow_mut().take() {
-            return Ok(client);
+        if let Some(slot) = &self.test_client {
+            let client = slot.borrow_mut().take().ok_or(StoreError)?;
+            return Ok(ClientCheckout {
+                client: Some(client),
+                return_to: Some(slot.clone()),
+            });
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -838,7 +895,11 @@ impl PgStore {
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
                     .map_err(|_| StoreError)?;
-                Ok(client)
+                Ok(ClientCheckout {
+                    client: Some(client),
+                    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                    return_to: None,
+                })
             },
             TOTAL_TIMEOUT_MS,
             StoreError,
@@ -867,11 +928,19 @@ impl PgStore {
     /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
     /// are the `mirror_*` literals so an incident names the cluster that
     /// refused; empty app results never need a mirror connection.
-    async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
+    async fn connect_mirror(&self) -> Result<ClientCheckout, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(mirror) = &self.test_mirror {
             mirror.attempts.set(mirror.attempts.get() + 1);
-            return mirror.client.borrow_mut().take().ok_or(StoreError)?;
+            // Same checkout-not-clone rationale as `connect`: repeated
+            // mirror probes share the injected connection through the
+            // slot, never through a `Client: Clone` bound.
+            let slot = mirror.client.as_ref().map_err(|_| StoreError)?;
+            let client = slot.borrow_mut().take().ok_or(StoreError)?;
+            return Ok(ClientCheckout {
+                client: Some(client),
+                return_to: Some(slot.clone()),
+            });
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -914,7 +983,11 @@ impl PgStore {
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
                     .map_err(|_| StoreError)?;
-                Ok(client)
+                Ok(ClientCheckout {
+                    client: Some(client),
+                    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                    return_to: None,
+                })
             },
             TOTAL_TIMEOUT_MS,
             StoreError,
@@ -2331,7 +2404,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                insert_credential_on(&client, credential).await
+                insert_credential_on(&*client, credential).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -2871,7 +2944,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = query_playback_lease_row(&client, user_id).await?;
+                let row = query_playback_lease_row(&*client, user_id).await?;
                 Ok(row)
             },
             TOTAL_TIMEOUT_MS,
@@ -2920,7 +2993,7 @@ impl Store for PgStore {
                     // row (deleted mid-race) reads as retry-now.
                     None => {
                         let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
+                            match query_playback_lease_row(&*client, user_id).await? {
                                 Some(row) => row.retry_after_secs(now),
                                 None => 0,
                             };
@@ -3373,7 +3446,7 @@ impl Store for PgStore {
         session: &crate::session::SessionClaims,
     ) -> Result<bool, StoreError> {
         Self::bounded(
-            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            async { subsonic_pg::insert(&mut *self.connect().await?, row, session).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -3383,7 +3456,7 @@ impl Store for PgStore {
         user_id: &str,
     ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
         Self::bounded(
-            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            async { subsonic_pg::list(&mut *self.connect().await?, user_id).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -3396,7 +3469,7 @@ impl Store for PgStore {
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                subsonic_pg::revoke(&mut *self.connect().await?, Some(id), user_id, now)
                     .await
                     .map(|count| count == 1)
             },
@@ -3410,7 +3483,7 @@ impl Store for PgStore {
         now: u64,
     ) -> Result<u64, StoreError> {
         Self::bounded(
-            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
+            async { subsonic_pg::revoke(&mut *self.connect().await?, None, user_id, now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -3955,6 +4028,280 @@ impl Store for PgStore {
                         self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
                     })?;
                 rows.iter().map(catalogue_release_track_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Collection-saves state probe (migration 0041): caller-scoped
+    /// app read, reached only after the handler validated the target.
+    async fn collection_save_state(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_state_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_state")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("saved_at").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Bounded collection page, caller-scoped app read; the statement
+    /// itself orders `saved_at DESC, mbid ASC` and binds the shared page
+    /// cap so the response can never grow with the saved set.
+    async fn collection_save_page(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+    ) -> Result<Vec<crate::collection::CollectionListRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_list_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&limit, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_page")
+                    })?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(crate::collection::CollectionListRow {
+                            mbid: row.try_get("mbid").map_err(|_| StoreError)?,
+                            saved_at: row.try_get("saved_at").map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Fenced idempotent save: one statement (the `INSERT … ON CONFLICT`
+    /// carries the ADR 0002 rule-3 writer fence), returning the stored
+    /// first-save instant on land or replay; zero rows means the fence
+    /// refused, which the handler classifies into the typed 409.
+    async fn collection_save(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+        now: u64,
+    ) -> Result<Option<i64>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let saved_at = i64::try_from(now).map_err(|_| StoreError)?;
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_save_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                            (&saved_at, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_save")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("saved_at").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Fenced idempotent removal: `RETURNING` rows report the
+    /// affected-row count the handler splits (idempotent no-op vs.
+    /// fence-refused) through the same unnamed path as the other
+    /// statements — `execute` would prepare a named statement that a
+    /// pooled backend cannot keep.
+    async fn collection_remove(
+        &self,
+        user_id: &str,
+        kind: crate::collection::SaveKind,
+        mbid: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
+                        crate::collection::collection_delete_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&mbid, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_remove")
+                    })?;
+                Ok(rows.len() as u64)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member-artist probe for follow validation: the caller's whole
+    /// uncapped member release set drives a single mirror `EXISTS`, so an
+    /// artist owning only releases past the listing cap still validates.
+    /// App-side empty membership (or a malformed target) answers `false`
+    /// before any mirror connection.
+    async fn collection_artist_member(
+        &self,
+        user_id: &str,
+        mbid: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                    return Ok(false);
+                };
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artist_member")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(false);
+                }
+                self.require_mirror()?;
+                let mirror = self.connect_mirror().await?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::artist_membership_statement(),
+                        &[(&member_releases, Type::TEXT_ARRAY), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artist_member")
+                    })?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Mirror release enrichment for the saved-album page: arbitrary
+    /// well-formed MBIDs, no owner data. An unconfigured mirror degrades
+    /// to `Ok(vec![])` (per-field nulls, never dropped saves); a
+    /// configured-but-failed mirror propagates the real error.
+    async fn collection_releases(
+        &self,
+        mbids: &[String],
+    ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                if mbids.is_empty() || self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(Vec::new());
+                }
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::releases_by_mbid_statement(),
+                        &[(&mbids, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_releases")
+                    })?;
+                rows.iter().map(catalogue_release_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Mirror artist enrichment for the followed-artist page: same
+    /// absence/failure split as [`Self::collection_releases`].
+    async fn collection_artists(
+        &self,
+        mbids: &[String],
+    ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                if mbids.is_empty() || self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(Vec::new());
+                }
+                let mirror = self.connect_mirror().await?;
+                let limit = i64::try_from(crate::collection::COLLECTION_PAGE_MAX)
+                    .map_err(|_| StoreError)?;
+                let rows = mirror
+                    .query_typed(
+                        crate::collection::artists_by_mbid_statement(),
+                        &[(&mbids, Type::TEXT_ARRAY), (&limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.collection_artists")
+                    })?;
+                rows.iter().map(catalogue_artist_from_row).collect()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4777,8 +5124,8 @@ impl Store for PgStore {
                 }
                 let client = self.connect().await?;
                 let now_i = i64_of(now)?;
-                delete_expired_rate_limit_slots(&client, now_i).await?;
-                Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+                delete_expired_rate_limit_slots(&*client, now_i).await?;
+                Ok(claim_rate_limit_slot(&*client, &budget, now, now_i)
                     .await?
                     .is_some())
             },
@@ -4839,7 +5186,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                prune_expired_challenges_on(&client, now).await
+                prune_expired_challenges_on(&*client, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4871,7 +5218,7 @@ impl SingleUseStore for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                claim_single_use_on(&client, candidate).await
+                claim_single_use_on(&*client, candidate).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5683,6 +6030,16 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/me/library/albums/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        "/v1/me/library/albums/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/me/library/artists/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        "/v1/me/library/artists/{mbid}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -5867,7 +6224,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-            test_client: std::cell::RefCell::new(None),
+            test_client: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },
