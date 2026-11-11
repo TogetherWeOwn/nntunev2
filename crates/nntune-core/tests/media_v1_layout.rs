@@ -55,6 +55,54 @@ fn article_spans_and_ranged_reads_match_the_successor_wire_format() {
 }
 
 #[test]
+fn every_article_ciphertext_span_matches_wire_chunk_geometry() {
+    use media::{HEADER_SIZE, PLAIN_CHUNK_SIZE, TAG_SIZE};
+
+    for size in [
+        0,
+        1,
+        PLAIN_CHUNK_SIZE - 1,
+        PLAIN_CHUNK_SIZE,
+        PLAIN_CHUNK_SIZE + 1,
+        11 * PLAIN_CHUNK_SIZE,
+        11 * PLAIN_CHUNK_SIZE + 1,
+    ] {
+        // Build the wire as independent chunk lengths: each plaintext chunk,
+        // including the empty final chunk for empty media, carries one tag.
+        let mut chunks = Vec::new();
+        let mut remaining = size;
+        loop {
+            let plain_len = remaining.min(PLAIN_CHUNK_SIZE);
+            chunks.push(plain_len + TAG_SIZE);
+            remaining -= plain_len;
+            if remaining == 0 {
+                break;
+            }
+        }
+        for policy in [1, 11, u64::MAX] {
+            let group_size = policy.min(chunks.len() as u64) as usize;
+            let spans = plan_articles(size, policy).unwrap();
+            let groups: Vec<_> = chunks.chunks(group_size).collect();
+            assert_eq!(spans.len(), groups.len(), "size={size}, policy={policy}");
+            let mut offset = HEADER_SIZE;
+            for (index, (span, group)) in spans.iter().zip(groups).enumerate() {
+                let len: u64 = group.iter().sum();
+                assert_eq!(
+                    span.ciphertext_offset, offset,
+                    "size={size}, policy={policy}, span={index}"
+                );
+                assert_eq!(
+                    span.ciphertext_len, len,
+                    "size={size}, policy={policy}, span={index}"
+                );
+                offset += len;
+            }
+            assert_eq!(offset, HEADER_SIZE + size + chunks.len() as u64 * TAG_SIZE);
+        }
+    }
+}
+
+#[test]
 fn complete_read_rejects_tampering_truncation_and_extra_bytes() {
     let plain = vec![7; 65_537];
     let key = FileKey::generate(&mut SystemRng).unwrap();
