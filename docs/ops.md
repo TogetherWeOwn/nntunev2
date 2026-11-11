@@ -360,8 +360,10 @@ the card, the agent dispatches the `migrations-staging-apply` workflow
 (`.github/workflows/migrations-staging-apply.yml`) with the exact
 40-hex commit `ref`, the migration `file`, an `applied_by` identity and
 the Paperclip board-approval interaction id. The workflow checks out
-that exact ref and runs the pinned `.github/scripts/apply_migration.py`
-from it with `--expect-database nntunev2_staging` and a `verify-full`
+that exact ref as data only (migration bytes and manifest) and runs
+the trusted `.github/scripts/apply_migration.py` from the workflow's
+own ref — never code from the dispatch-supplied ref — with
+`--expect-database nntunev2_staging` and a `verify-full`
 URL, so the migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any

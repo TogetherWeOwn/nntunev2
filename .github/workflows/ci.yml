@@ -316,7 +316,7 @@ jobs:
       - name: Structural-test the CC0 fixture secret wiring
         run: python3 .github/scripts/test_ci_fixture_secrets.py
       - name: Test workflow and offline account-export boundaries
-        run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 scripts/test_account_export.py
+        run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
       - name: Test offline playable-artist root coverage (synthetic only)
         run: python3 scripts/test_genre_root_coverage.py
 

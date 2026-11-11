@@ -126,22 +126,22 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         apply = job(text, "apply")
         self.assertIn("    environment:\n      name: staging\n", apply)
         self.assertIn("ref: ${{ inputs.ref }}", apply)
-        self.assertIn("persist-credentials: false", apply)
-        self.assertIn("git rev-parse HEAD", apply)
+        # Two checkouts: dispatch-supplied ref as data only, the workflow's
+        # own ref as the only executed code.
+        self.assertIn("path: data", apply)
+        self.assertIn("path: trusted", apply)
+        self.assertIn("ref: ${{ github.sha }}", apply)
+        self.assertEqual(apply.count("persist-credentials: false"), 2)
+        self.assertIn("staging_apply.py", apply)
         self.assertIn("--expect-database", apply)
         self.assertIn("nntunev2_staging", apply)
         self.assertIn("secrets.PLANETSCALE_MIGRATOR_URL_STAGING", apply)
-        self.assertIn("verify-full", apply)
-        self.assertIn(".github/scripts/apply_migration.py", apply)
-        self.assertIn("schema_migrations", apply)
-        self.assertIn("GITHUB_STEP_SUMMARY", apply)
         # The credential is env-only: no echo of the secret and no GITHUB_ENV
         # hand-off of a derived URL (masking would not cover a modified copy).
         self.assertNotIn('echo "$PLANETSCALE', apply)
         self.assertNotIn("$GITHUB_ENV", apply)
         # all-pending walks manifest order and refuses on the first failure.
         self.assertIn("all-pending", apply)
-        self.assertIn("first failure", apply)
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter
