@@ -925,6 +925,56 @@ class WorkflowBoundary(unittest.TestCase):
         self.assertIn("  pull-requests: read", workflow)
 
 
+class FreshImportInputs(unittest.TestCase):
+    def setUp(self):
+        self.source = {
+            "file": "0042_final.sql", "target": "app",
+            "sha256": hashlib.sha256(BODY).hexdigest(),
+            "renamed_from": [{"file": "0041_old.sql", "sha256": hashlib.sha256(BODY).hexdigest()}],
+            "source_rename_history": [{
+                "parent": "1" * 40, "commit": "2" * 40,
+                "old_path": "migrations/0041_old.sql", "new_path": "migrations/0042_final.sql",
+                "old_sha256": hashlib.sha256(BODY).hexdigest(),
+                "new_sha256": hashlib.sha256(BODY).hexdigest(),
+            }],
+        }
+
+    def check(self, candidate, baseline=None, sql=BODY):
+        history.validate_fresh_import(self.source, candidate, baseline or [], sql)
+
+    def test_exact_entry_and_bytes_match(self):
+        self.check(copy.deepcopy(self.source))
+
+    def test_changed_or_missing_metadata_fails(self):
+        for key, value in (("file", "0043_other.sql"), ("target", "mirror"),
+                           ("sha256", "0" * 64), ("renamed_from", []),
+                           ("source_rename_history", []), ("extra", True)):
+            with self.subTest(key=key), self.assertRaises(history.HistoryError):
+                candidate = copy.deepcopy(self.source)
+                candidate[key] = value
+                self.check(candidate)
+
+    def test_baseline_current_alias_and_history_collisions_fail(self):
+        for name in ("0042_final.sql", "0041_old.sql"):
+            with self.subTest(name=name), self.assertRaises(history.HistoryError):
+                self.check(copy.deepcopy(self.source), [{
+                    "file": name, "target": "app", "sha256": "0" * 64,
+                }])
+        baseline = [{"file": "0040_other.sql", "target": "app", "sha256": "0" * 64,
+                     "renamed_from": [{"file": "0042_final.sql", "sha256": "0" * 64}]}]
+        with self.assertRaises(history.HistoryError):
+            self.check(copy.deepcopy(self.source), baseline)
+
+    def test_bad_sql_and_oversized_metadata_fail(self):
+        for blob in (b"different", bytearray(BODY), b"x" * (history.MAX_BLOB + 1)):
+            with self.subTest(size=len(blob)), self.assertRaises(history.HistoryError):
+                self.check(copy.deepcopy(self.source), sql=blob)
+        source = copy.deepcopy(self.source)
+        source["extra"] = "x" * (history.MAX_INPUT + 1)
+        with self.assertRaises(history.HistoryError):
+            history.validate_fresh_import(source, copy.deepcopy(source), [], BODY)
+
+
 class StrictInputs(unittest.TestCase):
     def test_history_schema_and_target_confusion(self):
         edge = dict(zip(history.EDGE_KEYS, ("a" * 40, "b" * 40, "migrations/0001_old.sql",

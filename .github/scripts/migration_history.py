@@ -125,6 +125,31 @@ def validate_entries(entries):
     return entries
 
 
+def validate_fresh_import(source, candidate, baseline, sql_bytes):
+    """Compare one candidate with a separately verified source entry.
+
+    This dormant helper does not establish source authority or verify Git history;
+    callers must do both independently before treating a match as evidence.
+    """
+    validate_entries([source])
+    if not isinstance(baseline, list):
+        raise HistoryError("baseline must be a list of entries")
+    validate_entries(baseline + [candidate])
+    try:
+        source_json = json.dumps(source, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        candidate_json = json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if max(len(source_json.encode()), len(candidate_json.encode())) > MAX_INPUT:
+            raise HistoryError("import metadata bound exceeded")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise HistoryError("import metadata is not canonical JSON") from exc
+    if source_json != candidate_json:
+        raise HistoryError("import metadata differs from source")
+    if not isinstance(sql_bytes, bytes) or len(sql_bytes) > MAX_BLOB:
+        raise HistoryError("import SQL blob is invalid or oversized")
+    if hashlib.sha256(sql_bytes).hexdigest() != source["sha256"]:
+        raise HistoryError("import SQL hash differs from source")
+
+
 def read_input(path):
     try:
         with pathlib.Path(path).open("rb") as stream:
