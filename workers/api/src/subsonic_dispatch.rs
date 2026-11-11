@@ -59,10 +59,13 @@
 //!   lease, so resume works. Uncached tracks answer 70 until the stream
 //!   Worker's deferred miss adapter serves them (upstream 404/502).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use nntune_subsonic::auth::Identity;
-use nntune_subsonic::library::{Album, Artist, Song, UserAccount, NOW};
+use nntune_subsonic::auth::{AuthStore, Identity};
+use nntune_subsonic::envelope::code;
+use nntune_subsonic::library::{
+    Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount, NOW,
+};
 
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 
@@ -232,6 +235,289 @@ pub fn build_snapshot(
     });
 
     (out_artists, out_albums, out_songs)
+}
+
+impl AuthStore for ProductionStore {
+    // The snapshot is constructed only after the async core succeeded, so
+    // any verification the sync dispatcher asks for is a re-statement of
+    // that fact. The sync dispatcher never calls these with credentials
+    // the async core rejected (error 42/43/44/40/10 are answered before
+    // dispatch), and fixture credentials never reach this store.
+    fn verify_api_key(&self, _api_key: &str) -> Option<Identity> {
+        Some(self.identity.clone())
+    }
+
+    fn verify_password(&self, _username: &str, _password: &str) -> Option<Identity> {
+        Some(self.identity.clone())
+    }
+
+    fn verify_token(&self, _username: &str, _token: &str, _salt: &str) -> Option<Identity> {
+        Some(self.identity.clone())
+    }
+}
+
+fn not_authorized() -> (i64, String) {
+    (
+        code::NOT_AUTHORIZED,
+        "User is not authorized for the given operation.".to_string(),
+    )
+}
+
+fn catalogue_date_desc(left: &Option<String>, right: &Option<String>) -> std::cmp::Ordering {
+    left.as_ref()
+        .map(std::cmp::Reverse)
+        .cmp(&right.as_ref().map(std::cmp::Reverse))
+}
+
+impl Library for ProductionStore {
+    fn user_account(&self, username: &str) -> Option<UserAccount> {
+        (username == self.identity.username).then(|| self.account.clone())
+    }
+
+    fn artists(&self) -> Vec<Artist> {
+        self.artists.clone()
+    }
+
+    fn artists_last_modified(&self) -> i64 {
+        self.now_millis
+    }
+
+    fn artist(&self, id: &str) -> Option<Artist> {
+        self.artists.iter().find(|a| a.id == id).cloned()
+    }
+
+    fn albums_for_artist(&self, artist_id: &str) -> Vec<Album> {
+        self.albums
+            .iter()
+            .filter(|a| a.artist_id == artist_id)
+            .cloned()
+            .collect()
+    }
+
+    fn album(&self, id: &str) -> Option<Album> {
+        self.albums.iter().find(|a| a.id == id).cloned()
+    }
+
+    fn all_albums(&self) -> Vec<Album> {
+        self.albums.clone()
+    }
+
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
+        let mut albums = self.all_albums();
+        let mut offset = query.offset;
+        match query.list_type {
+            "random" => {
+                // Deterministic id order: no RNG in a per-request snapshot.
+                albums.sort_by(|a, b| a.id.cmp(&b.id));
+                offset = 0;
+            }
+            // No play history exists yet: frequent keeps every album eligible
+            // (play_count 0, MemStore order), recent/highest/starred are empty.
+            "frequent" => {}
+            "recent" => return Vec::new(),
+            "byYear" => {
+                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
+                    albums.retain(|album| {
+                        album
+                            .year
+                            .is_some_and(|year| (from.min(to)..=from.max(to)).contains(&year))
+                    });
+                    albums.sort_by(|a, b| {
+                        let years = if from > to {
+                            b.year.cmp(&a.year)
+                        } else {
+                            a.year.cmp(&b.year)
+                        };
+                        years.then(a.name.cmp(&b.name))
+                    });
+                }
+            }
+            "byGenre" => return Vec::new(),
+            "highest" => return Vec::new(),
+            "starred" => return Vec::new(),
+            "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
+            "alphabeticalByArtist" => {
+                albums.sort_by(|a, b| a.artist.cmp(&b.artist).then(a.name.cmp(&b.name)))
+            }
+            "newest" => albums.sort_by(|a, b| b.created.cmp(&a.created)),
+            _ => return Vec::new(),
+        }
+        albums.into_iter().skip(offset).take(query.size).collect()
+    }
+
+    fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)> {
+        // Albums with at least one member song, via a set so the filter is
+        // O(songs + albums) rather than a per-album scan of the snapshot.
+        let albums_with_songs: HashSet<&str> = self
+            .songs
+            .iter()
+            .map(|song| song.album_id.as_str())
+            .collect();
+        let mut albums = self.all_albums();
+        albums.retain(|album| albums_with_songs.contains(album.id.as_str()));
+        match query.list_type {
+            "random" => albums.sort_by(|a, b| a.id.cmp(&b.id)),
+            "newest" => albums.sort_by(|a, b| catalogue_date_desc(&a.curated_at, &b.curated_at)),
+            "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
+            "alphabeticalByArtist" => albums.sort_by(|a, b| {
+                a.artist_sort_name
+                    .cmp(&b.artist_sort_name)
+                    .then(a.name.cmp(&b.name))
+            }),
+            "byYear" => {
+                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
+                    albums
+                        .retain(|album| album.year.is_some_and(|year| (from..=to).contains(&year)));
+                }
+                albums.sort_by(|a, b| {
+                    catalogue_date_desc(&a.release_date, &b.release_date)
+                        .then_with(|| catalogue_date_desc(&a.curated_at, &b.curated_at))
+                });
+            }
+            kind => {
+                return Err((
+                    code::GENERIC,
+                    format!("Unsupported album list type: {kind}"),
+                ))
+            }
+        }
+        Ok(albums
+            .into_iter()
+            .skip(query.offset)
+            .take(query.size)
+            .collect())
+    }
+
+    fn random_songs(&self, _identity: &Identity, size: usize) -> Vec<Song> {
+        let mut songs = self.all_songs();
+        songs.sort_by(|a, b| a.id.cmp(&b.id));
+        songs.truncate(size);
+        songs
+    }
+
+    fn songs_for_album(&self, album_id: &str) -> Vec<Song> {
+        let mut out: Vec<Song> = self
+            .songs
+            .iter()
+            .filter(|s| s.album_id == album_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.track.cmp(&b.track).then(a.id.cmp(&b.id)));
+        out
+    }
+
+    fn song(&self, id: &str) -> Option<Song> {
+        self.songs.iter().find(|s| s.id == id).cloned()
+    }
+
+    fn all_songs(&self) -> Vec<Song> {
+        let mut out = self.songs.clone();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    fn genres(&self) -> Vec<(String, i64, i64)> {
+        let mut counts: BTreeMap<String, (std::collections::HashSet<String>, i64)> =
+            BTreeMap::new();
+        for song in &self.songs {
+            if song.genre.is_empty() {
+                continue;
+            }
+            let entry = counts.entry(song.genre.clone()).or_default();
+            entry.0.insert(song.album_id.clone());
+            entry.1 += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(name, (albums, songs))| (name, songs, albums.len() as i64))
+            .collect()
+    }
+
+    fn audio(&self, _song_id: &str) -> Option<Vec<u8>> {
+        // Never fixture bytes; the mount serves `stream` through grants.
+        None
+    }
+
+    fn cover(&self, _cover_id: &str) -> Option<Vec<u8>> {
+        // Rights-flagged art: never cached CAA bytes (see module docs).
+        None
+    }
+
+    fn avatar(&self, _username: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn lyrics(&self, _artist: &str, _title: &str) -> Option<String> {
+        None
+    }
+
+    fn playlists(&self, _identity: &Identity) -> Vec<Playlist> {
+        Vec::new()
+    }
+
+    fn playlist(&self, _identity: &Identity, _id: &str) -> Option<Playlist> {
+        None
+    }
+
+    fn create_playlist(&mut self, identity: &Identity, name: String) -> Playlist {
+        // The trait is infallible, so refusal is signalled with an id-less
+        // placeholder: nothing is stored, getPlaylists stays empty, and a
+        // following getPlaylist(id) can never resolve this id. Clients
+        // must treat an empty playlist id as refusal.
+        Playlist {
+            id: String::new(),
+            name,
+            owner: identity.username.clone(),
+            song_ids: Vec::new(),
+            created: NOW.to_string(),
+            changed: NOW.to_string(),
+        }
+    }
+
+    fn update_playlist(
+        &mut self,
+        _identity: &Identity,
+        _id: &str,
+        _name: Option<String>,
+        _add: Vec<String>,
+        _remove: Vec<usize>,
+    ) -> Result<(), (i64, String)> {
+        Err(not_authorized())
+    }
+
+    fn delete_playlist(&mut self, _identity: &Identity, _id: &str) -> Result<(), (i64, String)> {
+        Err(not_authorized())
+    }
+
+    fn star(&mut self, _identity: &Identity, _kind: StarKind, _id: &str) -> bool {
+        false
+    }
+
+    fn unstar(&mut self, _identity: &Identity, _kind: StarKind, _id: &str) {}
+
+    fn starred(&self, _identity: &Identity, _kind: StarKind) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn set_rating(&mut self, _identity: &Identity, _id: &str, _rating: i64) -> bool {
+        false
+    }
+
+    fn rating(&self, _identity: &Identity, _id: &str) -> Option<i64> {
+        None
+    }
+
+    fn scrobble(&mut self, _identity: &Identity, _song_id: &str) -> bool {
+        // The endpoint ignores this return (fire-and-forget reporting); no
+        // history table exists, so nothing is durably recorded.
+        false
+    }
+
+    fn queue(&self, _identity: &Identity) -> Option<PlayQueue> {
+        None
+    }
+
+    fn save_queue(&mut self, _identity: &Identity, _queue: PlayQueue) {}
 }
 
 #[cfg(test)]
