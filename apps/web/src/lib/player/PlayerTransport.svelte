@@ -304,6 +304,7 @@
 	.identity { overflow-wrap: anywhere; }
 	section { padding: var(--nt-space-2) var(--nt-space-3); background: var(--nt-bg-raised); border-top: 1px solid var(--nt-border); color: var(--nt-fg); }
 	.transport-buttons, .sound, .seek { display: flex; align-items: center; justify-content: center; gap: var(--nt-space-2); }
+	.transport-buttons { flex-wrap: wrap; }
 	button { display: inline-flex; align-items: center; justify-content: center; min-height: var(--nt-control); min-width: var(--nt-control); padding: var(--nt-space-2); border: 0; border-radius: var(--nt-radius-pill); background: var(--nt-surface-tint); color: var(--nt-fg); font: inherit; cursor: pointer; }
 	button:disabled { opacity: 0.5; cursor: default; }
 	button[aria-pressed='true'] { color: var(--nt-accent); }

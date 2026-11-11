@@ -314,6 +314,7 @@ for (const width of [320, 390, 799]) {
 			const mini = page.getByTestId('mini-player');
 			const link = mini.getByRole('link');
 			const heart = page.getByTestId('player-favorite');
+			const restart = page.getByTestId('library-restart');
 			const play = page.getByTestId('player-play-pause');
 			const tabbar = page.getByTestId('shell-tabbar');
 			await expect(mini).toBeVisible();
@@ -381,7 +382,7 @@ for (const width of [320, 390, 799]) {
 			// Keyboard: visible ring on each stop, Enter/Space activation.
 			await page.keyboard.press('Shift');
 			await link.focus();
-			for (const target of [link, heart, play]) {
+			for (const target of [link, heart, restart, play]) {
 				await expect(target).toBeFocused();
 				const ring = await target.evaluate((el) => {
 					const css = getComputedStyle(el);
