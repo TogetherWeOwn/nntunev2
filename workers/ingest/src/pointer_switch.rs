@@ -1122,9 +1122,10 @@ mod tests {
             );
         }
         assert!(!sql.contains("$5"), "{sql}");
-        // Fenced on the owner row, exactly like the switch.
+        // Fenced on the owner row, exactly like the switch: the restore
+        // list joins `ingest_originals o` with the same writer fence.
         assert!(
-            sql.contains("FROM (SELECT id FROM users WHERE id = $4 AND deleting_at IS NULL FOR SHARE) AS writer_fence"),
+            sql.contains("ingest_originals o, (SELECT id FROM users WHERE id = $4 AND deleting_at IS NULL FOR SHARE) AS writer_fence"),
             "{sql}"
         );
         assert!(sql.contains("writer_fence.id IS NOT NULL"), "{sql}");

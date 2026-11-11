@@ -16,8 +16,8 @@ use super::posted_generation_legacy_fence::insert_legacy;
 use super::*;
 use nntune_ingest::posted_generations::{
     begin_verification_round, confirm_article, confirm_retention, finish_verification,
-    prepare_content_check, promote_candidate, record_content_check, ArticleSide, ContentCheckReport,
-    ContentCheckResult, GenerationHandle, MutationOutcome, PromotionOutcome,
+    prepare_content_check, promote_candidate, record_content_check, ArticleSide,
+    ContentCheckReport, ContentCheckResult, GenerationHandle, MutationOutcome, PromotionOutcome,
 };
 use std::sync::Arc;
 use tokio::sync::Barrier;

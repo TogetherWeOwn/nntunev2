@@ -1208,7 +1208,12 @@ pub async fn confirm_retention(
     // backbones by custody validation) qualifies. Presence-only
     // candidates stay `verifying` — they are never usable for reuse.
     let checks = content::load_checks(&tx, handle).await?;
-    if checks != [Some(ContentCheckState::Intact), Some(ContentCheckState::Intact)] {
+    if checks
+        != [
+            Some(ContentCheckState::Intact),
+            Some(ContentCheckState::Intact),
+        ]
+    {
         return Ok(MutationOutcome::Incomplete);
     }
     tx.execute(

@@ -916,12 +916,7 @@ where
         // gaps without a set reach here; re-check). A gapped file with no
         // triage cannot prove byte-identity.
         if gaps.is_empty() {
-            return staged(
-                sink,
-                StagingProof::TransportComplete,
-                sha256_hex,
-                md5_hex,
-            );
+            return staged(sink, StagingProof::TransportComplete, sha256_hex, md5_hex);
         }
         return blocked(spec, BlockReason::Par2Unusable, &recs, 0);
     };
@@ -1561,7 +1556,8 @@ mod tests {
         let (mut source, ids) = PostSource::new(&data, 64 << 10);
         let mut sink = MemorySink::new();
         sink.corrupt_digest = true;
-        let outcome = download_full_file(&spec(&ids, "content", None), &mut source, &mut sink).await;
+        let outcome =
+            download_full_file(&spec(&ids, "content", None), &mut source, &mut sink).await;
         match outcome {
             FullFileOutcome::RepostBlocked(blocked) => {
                 assert_eq!(blocked.reason, BlockReason::SinkFailed);
