@@ -98,6 +98,9 @@ SESSION_TTL_SECS = "86400"
 # [[services]]
 # binding = "STREAM"
 # service = "nntune-stream"
+# [[env.staging.services]]
+# binding = "STREAM"
+# service = "nntune-stream-staging"
 
 # Workers Logs persistence for the structured api records (the build_sha
 # evidence is read there). Without this block the deployed Worker has
@@ -129,6 +132,9 @@ SESSION_TTL_SECS = "86400"
 # zone_name = "nntune.com"
 # [[env.staging.routes]]
 # pattern = "staging.nntune.com/healthz"
+# zone_name = "nntune.com"
+# [[env.staging.routes]]
+# pattern = "staging.nntune.com/rest/*"
 # zone_name = "nntune.com"
 
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values

@@ -35,8 +35,29 @@
 //!   CC BY-NC-SA data that must never ship in this paid product, so no
 //!   genre text is mapped from the mirror.
 //! - `random_songs`/`album_list("random")` are deterministic id-ordered
-//!   prefixes: a per-request snapshot holds no RNG. `frequent`/`recent`/
-//!   `highest`/`starred` lists reflect the empty per-user history above.
+//!   prefixes: a per-request snapshot holds no RNG. `recent`/`highest`/
+//!   `starred` reflect the empty per-user history above. `frequent`
+//!   mirrors the shared-crate contract (`MemStore`): with no history
+//!   every album is eligible with play count 0.
+//!
+//! Stream-time limits, stated honestly:
+//!
+//! - One stream is enforced per Subsonic credential (the server-owned
+//!   compatibility session), not per device: the protocol authenticates
+//!   the account, and there is no per-device identity to hang a second
+//!   session on. Two devices sharing one credential therefore share one
+//!   lease — a second play replaces the first instead of waiting — and
+//!   both signed grants stay valid for their 15-minute TTL. The native
+//!   path has the same property per client-supplied session id. A
+//!   per-device limit needs protocol identities this surface cannot
+//!   mint without breaking client compatibility.
+//! - Every `stream` request issues a fresh play (`play_id` is never a
+//!   continuation): Subsonic clients carry no play identity, so a seek
+//!   re-checks subscription/hour-cap and the shared lease. That is the
+//!   mandated entitlement check running on each play, not a missed
+//!   continuation; within the cap the same compat session replaces the
+//!   lease, so resume works. Uncached tracks answer 70 until the stream
+//!   Worker's deferred miss adapter serves them (upstream 404/502).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -73,6 +94,12 @@ pub struct ProductionStore {
     artists: Vec<Artist>,
     albums: Vec<Album>,
     songs: Vec<Song>,
+    /// Request time (epoch millis), captured at the mount. Reported as
+    /// the artists index's `lastModified`: the member reads carry no
+    /// per-artist modification signal, so the honest freshness marker is
+    /// "may have changed as of this request" rather than a frozen
+    /// timestamp that would pin client caches forever.
+    now_millis: i64,
 }
 
 impl ProductionStore {
@@ -82,6 +109,7 @@ impl ProductionStore {
         artists: Vec<Artist>,
         albums: Vec<Album>,
         songs: Vec<Song>,
+        now_millis: i64,
     ) -> Self {
         Self {
             identity,
@@ -89,6 +117,7 @@ impl ProductionStore {
             artists,
             albums,
             songs,
+            now_millis,
         }
     }
 }
@@ -117,7 +146,19 @@ pub fn build_snapshot(
             name: a.name.clone(),
         })
         .collect();
-    out_artists.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    // Browse order follows the MusicBrainz sort name (falling back to the
+    // display name), matching the native catalogue ordering contract; the
+    // mapped Artist carries only name, so the sort reads the row map.
+    out_artists.sort_by(|a, b| {
+        let key = |x: &Artist| {
+            let sort = artist_sort
+                .get(x.id.as_str())
+                .copied()
+                .unwrap_or(x.name.as_str());
+            (sort, x.name.as_str(), x.id.as_str())
+        };
+        key(a).cmp(&key(b))
+    });
 
     // Album duration is the summed member track durations (seconds) — from
     // the rows above, never an estimate or a transcoder's output.
@@ -237,9 +278,7 @@ impl Library for ProductionStore {
     }
 
     fn artists_last_modified(&self) -> i64 {
-        // The snapshot carries no artist timestamps; report the same fixed
-        // clock the fixtures use rather than a fabricated wall-clock.
-        1_767_225_600_000
+        self.now_millis
     }
 
     fn artist(&self, id: &str) -> Option<Artist> {

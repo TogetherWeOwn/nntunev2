@@ -325,6 +325,13 @@ jobs:
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/api/ingest"
           zone_name = "nntune.com"
+          # OpenSubsonic API: the Worker authenticates per request
+          # (plaintext `p=` answers error 42; no credential provisioned
+          # yet answers error 0). Playback is proxied over the STREAM
+          # service binding below.
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/rest/*"
+          zone_name = "nntune.com"
 
           [env.staging.vars]
           RP_ID = "${API_RP_ID_STAGING}"
@@ -336,6 +343,15 @@ jobs:
           # Worker also holds the QA_AUTH_TOKEN secret. Never set in
           # deploy-production.yml.
           QA_CODE_SEAM = "1"
+
+          # Stream Worker service binding (`STREAM`): the Subsonic
+          # `/rest/stream` mount proxies minted play grants privately to
+          # `GET /play/{track_id}` (see STREAM_SERVICE_BINDING in
+          # src/worker_entry.rs). Staging binds nntune-stream-staging,
+          # never the production Worker.
+          [[env.staging.services]]
+          binding = "STREAM"
+          service = "nntune-stream-staging"
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the

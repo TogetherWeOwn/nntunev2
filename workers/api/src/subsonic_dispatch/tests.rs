@@ -21,6 +21,8 @@ const SONG_1: &str = "33333333-3333-4333-8333-333333333333";
 const SONG_2: &str = "44444444-4444-4444-8444-444444444444";
 const SONG_3: &str = "55555555-5555-4555-8555-555555555555";
 const ARTIST_A: &str = "66666666-6666-4666-8666-666666666666";
+const ARTIST_Z: &str = "77777777-7777-4777-8777-777777777777";
+const TEST_NOW_MILLIS: i64 = 1_766_000_000_000;
 
 fn artist_row(mbid: &str, name: &str, sort_name: &str) -> ArtistDbRow {
     ArtistDbRow {
@@ -65,7 +67,12 @@ fn track_row(
 }
 
 fn fixture_rows() -> (Vec<ArtistDbRow>, Vec<ReleaseDbRow>, Vec<TrackDbRow>) {
-    let artists = vec![artist_row(ARTIST_A, "Artist A", "A, Artist")];
+    // Two artists prove browse order follows sort_name: "Zebra" sorts by
+    // "0,0" ahead of "Artist A" even though its display name sorts last.
+    let artists = vec![
+        artist_row(ARTIST_A, "Artist A", "A, Artist"),
+        artist_row(ARTIST_Z, "Zebra", "0,0"),
+    ];
     let releases = vec![
         release_row(ALBUM_A, "Album A", Some(2001), ARTIST_A),
         release_row(ALBUM_B, "Album B", Some(1999), ARTIST_A),
@@ -95,6 +102,7 @@ fn store() -> ProductionStore {
         artists,
         albums,
         songs,
+        TEST_NOW_MILLIS,
     )
 }
 
@@ -162,14 +170,19 @@ fn snapshot_ordering_is_deterministic() {
     // Songs sort by album, track, id — Album A's tracks come first.
     assert_eq!(s1.first().map(|s| s.id.as_str()), Some(SONG_1));
     assert_eq!(s2.first().map(|s| s.id.as_str()), Some(SONG_1));
-    // Albums sort by name, artists by name.
+    // Albums sort by name.
     assert_eq!(b1.first().map(|a| a.id.as_str()), Some(ALBUM_A));
+    // Artists sort by sort_name, not display name: "Zebra" ("0,0") leads.
+    assert_eq!(
+        a1.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+        vec![ARTIST_Z, ARTIST_A]
+    );
 }
 
 #[test]
 fn store_serves_membership_reads_only() {
     let store = store();
-    assert_eq!(store.artists().len(), 1);
+    assert_eq!(store.artists().len(), 2);
     assert!(store.artist(ARTIST_A).is_some());
     assert!(store.artist("unknown").is_none());
     let albums = store.all_albums();
@@ -189,7 +202,8 @@ fn store_serves_membership_reads_only() {
         Some("mel@example.com".into())
     );
     assert!(store.user_account("other").is_none());
-    assert_eq!(store.artists_last_modified(), 1_767_225_600_000);
+    // The index freshness marker is the request time, never a fixture date.
+    assert_eq!(store.artists_last_modified(), TEST_NOW_MILLIS);
 }
 
 #[test]

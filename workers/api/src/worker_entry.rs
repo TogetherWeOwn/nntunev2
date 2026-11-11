@@ -819,6 +819,116 @@ impl PgStore {
         .await
     }
 
+    /// Member catalogue for the Subsonic mount's per-request snapshot:
+    /// one membership probe feeds all three mirror reads, bound by
+    /// `SUBSONIC_SNAPSHOT_CAP` instead of the native page size.
+    async fn subsonic_member_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        Self::bounded(
+            async {
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let client = self.connect().await?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                let pairs = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_track_pairs_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?;
+                let pairs: Vec<crate::catalogue::MembershipTrackPairRow> = pairs
+                    .iter()
+                    .map(catalogue_member_pair_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_pairs = crate::catalogue::member_pair_arrays(&pairs);
+                if member_releases.is_empty() && member_pairs.is_empty() {
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
+                }
+                self.require_mirror()?;
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.subsonic_member_catalogue");
+                let artist_rows = mirror
+                    .query_typed(
+                        crate::catalogue::artists_list_statement(),
+                        &[
+                            (&member_releases, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
+                    .iter()
+                    .map(catalogue_artist_from_row)
+                    .collect::<Result<_, _>>()?;
+                let release_rows = mirror
+                    .query_typed(
+                        crate::catalogue::releases_list_statement(),
+                        &[
+                            (&member_releases, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let release_rows: Vec<crate::catalogue::ReleaseDbRow> = release_rows
+                    .iter()
+                    .map(catalogue_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let (pair_releases, pair_recordings) =
+                    crate::catalogue::member_pair_columns(&member_pairs);
+                let track_rows = mirror
+                    .query_typed(
+                        crate::catalogue::tracks_list_statement(),
+                        &[
+                            (&pair_releases, Type::TEXT_ARRAY),
+                            (&pair_recordings, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let track_rows: Vec<crate::catalogue::TrackDbRow> = track_rows
+                    .iter()
+                    .map(catalogue_track_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok((
+                    artist_rows,
+                    release_rows,
+                    crate::catalogue::retain_member_track_occurrences(track_rows, &member_pairs),
+                ))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
@@ -5789,6 +5899,13 @@ fn emit_record(
 /// the minted grant, never through a public fetch.
 const STREAM_SERVICE_BINDING: &str = "STREAM";
 
+/// Member-collection cap for the Subsonic mount's per-request snapshot.
+/// The native paged reads bind `CATALOGUE_MAX_PAGE_SIZE` (50), which would
+/// truncate every library past the first page and make those songs
+/// unstreamable; the snapshot reads the whole member collection under this
+/// far larger but still bounded cap (rows are in-memory only).
+const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
+
 fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", &res.content_type)?;
@@ -5859,7 +5976,8 @@ pub async fn subsonic_mount(
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_mirror: None,
     };
-    let now = worker::Date::now().as_millis() / 1000;
+    let now_millis = worker::Date::now().as_millis();
+    let now = now_millis / 1000;
     let keyring = match config
         .subsonic_index
         .as_ref()
@@ -5911,24 +6029,19 @@ pub async fn subsonic_mount(
         is_admin,
         is_manager: role == "manager",
     };
-    // Membership catalogue snapshot (already member-scoped by the reads).
-    let catalogue = async {
-        Ok::<_, StoreError>((
-            store.catalogue_artists(principal.user_id()).await?,
-            store.catalogue_releases(principal.user_id()).await?,
-            store.catalogue_tracks(principal.user_id()).await?,
-        ))
-    };
-    let (artist_rows, release_rows, track_rows) = match catalogue.await {
-        Ok(rows) => rows,
-        Err(_) => {
-            return respond_document(&core::render_error(
-                query,
-                code::GENERIC,
-                "Internal server error.",
-            ));
-        }
-    };
+    // Membership catalogue snapshot (already member-scoped; read whole
+    // under the snapshot cap, never through the 50-row native pages).
+    let (artist_rows, release_rows, track_rows) =
+        match store.subsonic_member_catalogue(principal.user_id()).await {
+            Ok(rows) => rows,
+            Err(_) => {
+                return respond_document(&core::render_error(
+                    query,
+                    code::GENERIC,
+                    "Internal server error.",
+                ));
+            }
+        };
     let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
 
     // 3. Stream interception.
@@ -6007,6 +6120,7 @@ pub async fn subsonic_mount(
         };
         let headers = Headers::new();
         headers.set("Authorization", &format!("Bearer {}", issued.grant.token))?;
+        headers.set(crate::logging::TRACE_HEADER, &trace_id)?;
         if let Some(range_value) = range {
             headers.set("Range", &range_value)?;
         }
@@ -6032,9 +6146,13 @@ pub async fn subsonic_mount(
                         forwarded.push((name.to_string(), value));
                     }
                 }
-                let bytes = upstream.bytes().await?;
-                let mut response = Response::from_bytes(bytes)?;
-                response = response.with_status(status);
+                // Stream, never buffer: the stream Worker's meter counts
+                // the bytes this Worker pulls, so a materialized proxy
+                // would charge a full song for a listener who left after
+                // two seconds. `upstream.stream()` clones the delivery
+                // handle, so dropping `upstream` cannot cancel the source.
+                let stream = upstream.stream()?;
+                let mut response = Response::from_stream(stream)?.with_status(status);
                 let headers = Headers::new();
                 headers.set("Content-Type", &content_type)?;
                 for (name, value) in &forwarded {
@@ -6050,7 +6168,7 @@ pub async fn subsonic_mount(
 
     // 4. Everything else: transport-free dispatcher over the snapshot.
     let app = SubsonicApp::production(core::ProductionStore::new(
-        identity, account, artists, albums, songs,
+        identity, account, artists, albums, songs, now_millis,
     ));
     respond_document(&app.handle(method, path, query, body))
 }
@@ -6271,7 +6389,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 24] = [
+    const DB_FAILURE_EVENTS: [&str; 25] = [
         "api.db.mirror_unconfigured",
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
@@ -6296,6 +6414,7 @@ mod tests {
         "api.db.statement_failed.checkout_operation_by_id",
         "api.db.statement_failed.update_checkout_operation",
         "api.db.statement_failed.subsonic_account",
+        "api.db.statement_failed.subsonic_member_catalogue",
     ];
 
     #[test]
