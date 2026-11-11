@@ -62,9 +62,16 @@ worker = "0.8"
 
 [features]
 postgres-tests = []
+# Source-only bridge candidate. Never select without the qualified outer facade;
+# ordinary generated-default builds must not expose arbitrary private RPC.
+preparation-service = []
 
 [[test]]
 name = "session_refresh_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
+name = "posted_generations_postgres"
 required-features = ["postgres-tests"]
 
 [[test]]

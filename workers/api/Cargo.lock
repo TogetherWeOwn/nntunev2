@@ -886,9 +886,11 @@ name = "nntune-core"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "quick-xml",
  "serde",
  "serde_json",
  "velmora",
+ "zeroize",
 ]
 
 [[package]]
@@ -899,6 +901,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "md5",
  "nntune-core",
  "nntune-logging",
  "nntune-ssrf-guard",
