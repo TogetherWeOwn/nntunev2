@@ -2,10 +2,11 @@
 //! about caller-visible Subsonic behaviour of [`ProductionStore`] and the
 //! error/stream helpers — no database, no worker types.
 
-use super::{build_snapshot, FLAC_CONTENT_TYPE, FLAC_SUFFIX};
+use super::{build_snapshot, ProductionStore, FLAC_CONTENT_TYPE, FLAC_SUFFIX};
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::ledger::STREAM_BYTES_PER_SEC;
-use nntune_subsonic::library::NOW;
+use nntune_subsonic::auth::Identity;
+use nntune_subsonic::library::{Library, UserAccount, NOW};
 
 const ALBUM_A: &str = "11111111-1111-4111-8111-111111111111";
 const ALBUM_B: &str = "22222222-2222-4222-8222-222222222222";
@@ -14,6 +15,7 @@ const SONG_2: &str = "44444444-4444-4444-8444-444444444444";
 const SONG_3: &str = "55555555-5555-4555-8555-555555555555";
 const ARTIST_A: &str = "66666666-6666-4666-8666-666666666666";
 const ARTIST_Z: &str = "77777777-7777-4777-8777-777777777777";
+const TEST_NOW_MILLIS: i64 = 1_766_000_000_000;
 
 fn artist_row(mbid: &str, name: &str, sort_name: &str) -> ArtistDbRow {
     ArtistDbRow {
@@ -76,6 +78,28 @@ fn fixture_rows() -> (Vec<ArtistDbRow>, Vec<ReleaseDbRow>, Vec<TrackDbRow>) {
     (artists, releases, tracks)
 }
 
+fn store() -> ProductionStore {
+    let (artists, releases, tracks) = fixture_rows();
+    let (artists, albums, songs) = build_snapshot(&artists, &releases, &tracks);
+    ProductionStore::new(
+        Identity {
+            username: "mel".to_string(),
+            email: "mel@example.com".to_string(),
+            is_admin: false,
+        },
+        UserAccount {
+            email: "mel@example.com".to_string(),
+            is_admin: false,
+            is_manager: false,
+        },
+        artists,
+        albums,
+        songs,
+        TEST_NOW_MILLIS,
+    )
+}
+
+
 #[test]
 fn snapshot_maps_flac_size_duration_and_year() {
     let (artists, releases, tracks) = fixture_rows();
@@ -127,4 +151,40 @@ fn snapshot_ordering_is_deterministic() {
         a1.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
         vec![ARTIST_Z, ARTIST_A]
     );
+}
+
+#[test]
+fn store_serves_membership_reads_only() {
+    let store = store();
+    assert_eq!(store.artists().len(), 2);
+    assert!(store.artist(ARTIST_A).is_some());
+    assert!(store.artist("unknown").is_none());
+    let albums = store.all_albums();
+    assert_eq!(albums.len(), 2);
+    assert_eq!(
+        store.album(ALBUM_A).map(|a| a.id),
+        Some(ALBUM_A.to_string())
+    );
+    let songs = store.songs_for_album(ALBUM_A);
+    assert_eq!(
+        songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec![SONG_1, SONG_2]
+    );
+    assert!(store.genres().is_empty(), "empty genre is filtered out");
+    assert_eq!(
+        store.user_account("mel").map(|u| u.email),
+        Some("mel@example.com".into())
+    );
+    assert!(store.user_account("other").is_none());
+    // The index freshness marker is the request time, never a fixture date.
+    assert_eq!(store.artists_last_modified(), TEST_NOW_MILLIS);
+}
+
+#[test]
+fn store_never_serves_fixture_bytes_or_rights_flagged_art() {
+    let store = store();
+    assert!(store.audio(SONG_1).is_none());
+    assert!(store.cover(ALBUM_A).is_none());
+    assert!(store.avatar("mel").is_none());
+    assert!(store.lyrics("a", "b").is_none());
 }
