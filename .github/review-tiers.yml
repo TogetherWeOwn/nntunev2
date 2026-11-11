@@ -157,6 +157,8 @@ tiers:
     - "apps/web/src/toolchain-security.test.ts"
     - "apps/web/src/lib/signed-in-email.test.ts"
     - "apps/web/src/lib/build-identity.test.ts"
+    - "apps/web/src/lib/contract.test.ts"
+    - "apps/web/src/lib/attributions/attributions.test.ts"
     - "fixtures/cc0/**"
     - "fixtures/subsonic/**/*.py"
     # Sensitive fixtures (grant vectors, credentials, signer scripts).
