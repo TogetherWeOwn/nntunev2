@@ -1,9 +1,11 @@
 # Attribution inventory contract
 
-This delivers attribution **data and validation**, not the in-app licences/about
-page. Presentation, navigation, accessibility and final page copy remain separate
-design and implementation work. There is no new route, UI, token, dependency,
-network request, ingest behaviour or artwork cache.
+The versioned inventory below is consumed by the in-app licences/about section
+(`About NNTune` at `/settings#about-nntune`, `apps/web/src/routes/settings/+page.svelte`).
+That section adds no new route, token, component or copy of its own: headings
+and the version line follow the approved design, and every notice, obligation
+and provenance URL renders verbatim from this contract. There is no new
+dependency, network request, ingest behaviour or artwork cache.
 
 ## Integration
 
@@ -11,10 +13,14 @@ network request, ingest behaviour or artwork cache.
 `attributionInventory` (`schemaVersion: 1`), `activeAttributions`,
 `plannedAttributions`, `fixtureAudioLicenceRecord`, and the pure
 `validateAttributionInventory(unknown): string[]` validator. Types are exported
-alongside the data. A future Svelte page can import from `$lib/attributions` and
-render **activeAttributions**, not the whole inventory. Planned entries are
-inactive provenance records, never evidence of current integrations. Schema
-shape or meaning changes require a versioned contract update and consumer review.
+alongside the data. The Settings page imports from `$lib/attributions` and
+renders **active** licence entries under `Licences`, active data entries under
+`Data sources` (omitted while none are active), and **planned** entries under a
+separate `Planned sources` heading; it also embeds the serialized inventory as
+a `nntune-attribution-inventory` JSON block and renders an announced error when
+validation fails. Planned entries are inactive provenance records, never
+evidence of current integrations, and must not be presented as shipped sources.
+Schema shape or meaning changes require a versioned contract update and consumer review.
 
 Each entry has an ID, name, kind, activation state, licence identifier (or an
 explicit unresolved-rights marker), authoritative source/licence URLs, our own
