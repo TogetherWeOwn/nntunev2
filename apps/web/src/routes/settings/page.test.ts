@@ -61,6 +61,8 @@ describe('settings About NNTune (licences/about)', () => {
 			expect(about, entry.id).toContain(entry.obligations);
 			expect(about, entry.id).toContain(`href="${entry.sourceUrl}"`);
 			expect(about, entry.id).toContain(`href="${entry.licenseUrl}"`);
+			// Link names are unique per entry so link lists never repeat.
+			expect(about, entry.id).toContain(`>Source — ${entry.name}</a>`);
 		}
 		// Original icon work, never a third-party icon-set credit.
 		expect(about).not.toContain('Lucide');
@@ -84,8 +86,15 @@ describe('settings About NNTune (licences/about)', () => {
 
 	it('keeps planned sources inactive and labelled, never presented as shipped data', () => {
 		const about = aboutSection(body());
+		// Rendered as grouped lists (active first, then planned), never in a
+		// different order than the inventory's own grouping.
 		const ids = attributionIds(body());
-		expect(ids).toEqual(attributionInventory.entries.map((entry) => entry.id));
+		expect(ids).toEqual([
+			...activeAttributions
+				.filter((entry) => entry.kind !== 'data' && entry.kind !== 'artwork')
+				.map((entry) => entry.id),
+			...plannedAttributions.map((entry) => entry.id)
+		]);
 		for (const entry of plannedAttributions) {
 			expect(about, entry.id).toContain(
 				`data-attribution-id="${entry.id}" data-status="planned"`
@@ -103,7 +112,9 @@ describe('settings About NNTune (licences/about)', () => {
 		// No "Data sources" h3 while no data source is active.
 		expect(about).not.toContain('settings-about-sources-heading');
 		expect(
-			plannedAttributions.every((entry) => entry.status === 'planned' && entry.kind === 'data' || entry.kind === 'artwork')
+			plannedAttributions.every(
+				(entry) => entry.status === 'planned' && (entry.kind === 'data' || entry.kind === 'artwork')
+			)
 		).toBe(true);
 	});
 
@@ -115,8 +126,8 @@ describe('settings About NNTune (licences/about)', () => {
 		expect(validateAttributionInventory(parsed)).toEqual([]);
 		expect(parsed).toEqual(attributionInventory);
 		// The visible lists are derived from the same object: every parsed
-		// entry id renders exactly once, in inventory order.
-		expect(attributionIds(body())).toEqual(parsed.entries.map((entry) => entry.id));
+		// entry still renders exactly once.
+		expect(attributionIds(body()).sort()).toEqual(parsed.entries.map((entry) => entry.id).sort());
 		expect(head()).toContain('https://');
 	});
 
@@ -134,10 +145,12 @@ describe('settings About NNTune (licences/about)', () => {
 			}
 		}));
 		const { default: BrokenSettings } = await import('./+page.svelte');
-		const html = render(BrokenSettings).body;
-		const about = html.slice(html.indexOf('id="about-nntune"'));
+		const rendered = render(BrokenSettings);
+		const about = rendered.body.slice(rendered.body.indexOf('id="about-nntune"'));
 		expect(about).toContain('role="alert"');
 		expect(about).toContain('Attribution data is unavailable.');
 		expect(about).not.toContain('data-attribution-id=');
+		// Provenance ships only alongside a valid render.
+		expect(rendered.head).not.toContain('nntune-attribution-inventory');
 	});
 });

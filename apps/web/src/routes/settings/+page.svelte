@@ -18,22 +18,29 @@
 	const licenceEntries = active.filter((entry) => entry.kind !== 'data' && entry.kind !== 'artwork');
 	const dataEntries = active.filter((entry) => entry.kind === 'data' || entry.kind === 'artwork');
 
-	// Machine-readable provenance: the exact serialized inventory the lists
-	// above render from, embedded verbatim for consumers that parse the page.
-	// `<` is escaped so the payload can never close the script element early.
+	// Machine-readable provenance (present only alongside a valid render):
+	// the exact serialized inventory the lists below render from, embedded
+	// verbatim for consumers that parse the page. `<` is escaped so the
+	// payload can never close the script element early.
 	const attributionJson = JSON.stringify(attributionInventory).replaceAll('<', '\\u003c');
 
-	function licenceText(license: string): string {
-		if (license === 'MIT') return 'MIT License';
-		if (license === 'OFL-1.1') return 'Open Font License';
-		return 'Licence';
+	// Link labels carry the entry name so repeated links stay distinguishable
+	// in link lists (WCAG 2.4.4); MIT/Open Font License are the official
+	// licence titles, and non-licence provenance pointers are labelled as
+	// provenance rather than as a licence grant (see inventory obligations).
+	function licenceText(entry: Attribution): string {
+		if (entry.license === 'MIT') return `MIT License — ${entry.name}`;
+		if (entry.license === 'OFL-1.1') return 'Open Font License';
+		return `Provenance — ${entry.name}`;
 	}
 </script>
 
 <svelte:head>
 	<title>Settings — NNTune</title>
 	<meta name="nntune:attributions:schema" content="1" />
-	<script type="application/json" id="nntune-attribution-inventory">{@html attributionJson}</script>
+	{#if validationErrors.length === 0}
+		<script type="application/json" id="nntune-attribution-inventory">{@html attributionJson}</script>
+	{/if}
 </svelte:head>
 
 <main class="nt-wrap" id="main-content">
@@ -99,9 +106,9 @@
 			<p>{entry.notice}</p>
 			<p>{entry.obligations}</p>
 			<p>
-				<a href={entry.sourceUrl}>Source</a>
+				<a href={entry.sourceUrl}>Source — {entry.name}</a>
 				{' · '}
-				<a href={entry.licenseUrl}>{licenceText(entry.license)}</a>
+				<a href={entry.licenseUrl}>{licenceText(entry)}</a>
 				{#if entry.id === 'figtree'}
 					{' · '}
 					<a href="/fonts/OFL.txt">Open Font License (shipped copy)</a>

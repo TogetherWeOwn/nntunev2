@@ -2,9 +2,11 @@
 
 The versioned inventory below is consumed by the in-app licences/about section
 (`About NNTune` at `/settings#about-nntune`, `apps/web/src/routes/settings/+page.svelte`).
-That section adds no new route, token, component or copy of its own: headings
-and the version line follow the approved design, and every notice, obligation
-and provenance URL renders verbatim from this contract. There is no new
+That section adds no new route, token, component or dependency: headings, the
+version line and the two licence intro lines follow the approved UX design
+(TWO-4355 §8), and every notice, obligation and provenance URL renders verbatim
+from this contract (link labels and the unavailable-error line are the only
+functional page strings). There is no new
 dependency, network request, ingest behaviour or artwork cache.
 
 ## Integration
@@ -13,7 +15,7 @@ dependency, network request, ingest behaviour or artwork cache.
 `attributionInventory` (`schemaVersion: 1`), `activeAttributions`,
 `plannedAttributions`, `fixtureAudioLicenceRecord`, and the pure
 `validateAttributionInventory(unknown): string[]` validator. Types are exported
-alongside the data. The Settings page imports from `$lib/attributions` and
+alongside the data. The Settings page imports from `#lib/attributions` and
 renders **active** licence entries under `Licences`, active data entries under
 `Data sources` (omitted while none are active), and **planned** entries under a
 separate `Planned sources` heading; it also embeds the serialized inventory as
