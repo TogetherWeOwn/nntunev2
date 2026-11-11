@@ -20,7 +20,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::nzb::{
-    normalize_message_id, MAX_ENCODED_BYTES, MAX_FILES, MAX_SEGMENTS_PER_FILE, MAX_SEGMENT_BYTES,
+    normalize_message_id, MAX_DOCUMENT_BYTES, MAX_ENCODED_BYTES, MAX_FILES, MAX_SEGMENTS_PER_FILE,
+    MAX_SEGMENT_BYTES, MAX_SEGMENT_TEXT_BYTES,
 };
 use crate::{Error, Result};
 
@@ -139,8 +140,8 @@ fn write_text<W: io::Write>(writer: &mut Writer<W>, text: &str) -> Result<()> {
 
 /// Mirrors the parser's bounds so emitted documents always parse back:
 /// file/segment counts, per-segment byte range, contiguous 1-based
-/// numbering, bare message-ID shape, and the cumulative encoded-bytes
-/// ceiling.
+/// numbering, bare message-ID shape, the cumulative encoded-bytes
+/// ceiling, per-text-node byte caps, and the total document byte limit.
 fn validate(files: &[FileInput]) -> Result<()> {
     if files.is_empty() {
         return Err(Error::Malformed("NZB needs at least one file".into()));
@@ -152,12 +153,32 @@ fn validate(files: &[FileInput]) -> Result<()> {
         });
     }
     let mut total_encoded: i64 = 0;
+    // Upper bound on the serialized document, so the parser's document
+    // byte limit holds sight unseen: every text field plus a fixed
+    // allowance per element for tags, attributes and separators. Text
+    // is counted at its worst-case XML-escaped width (6 bytes per char,
+    // for `&quot;`) and the allowance over-counts the real XML, so
+    // passing this estimate guarantees the emitted document passes; no
+    // caller can smuggle a parse-back failure past validate().
+    let mut document_bytes: u64 = 512;
     for file in files {
         if file.subject.trim().is_empty() {
             return Err(Error::Malformed("NZB file subject is empty".into()));
         }
+        if file.subject.len() > MAX_SEGMENT_TEXT_BYTES {
+            return Err(Error::Bounds {
+                bound: "NZB file subject",
+                limit: MAX_SEGMENT_TEXT_BYTES as i64,
+            });
+        }
         if file.poster.is_empty() {
             return Err(Error::Malformed("NZB file poster is empty".into()));
+        }
+        if file.poster.len() > MAX_SEGMENT_TEXT_BYTES {
+            return Err(Error::Bounds {
+                bound: "NZB file poster",
+                limit: MAX_SEGMENT_TEXT_BYTES as i64,
+            });
         }
         if file.date < 0 {
             return Err(Error::Malformed("NZB file date is negative".into()));
@@ -169,7 +190,20 @@ fn validate(files: &[FileInput]) -> Result<()> {
             if group.is_empty() {
                 return Err(Error::Malformed("NZB group name is empty".into()));
             }
+            if group.len() > MAX_SEGMENT_TEXT_BYTES {
+                return Err(Error::Bounds {
+                    bound: "NZB group name",
+                    limit: MAX_SEGMENT_TEXT_BYTES as i64,
+                });
+            }
         }
+        document_bytes += (file.subject.len() + file.poster.len()) as u64 * 6
+            + file
+                .groups
+                .iter()
+                .map(|g| g.len() as u64 * 6 + 24)
+                .sum::<u64>()
+            + 256;
         if file.segments.is_empty() {
             return Err(Error::Malformed(
                 "NZB file needs at least one segment".into(),
@@ -205,6 +239,13 @@ fn validate(files: &[FileInput]) -> Result<()> {
             // Rejects `<…>`-wrapped IDs, whitespace/control bytes, and
             // over-long IDs — the same bare-ID rule the parser applies.
             normalize_message_id(&segment.message_id)?;
+            document_bytes += segment.message_id.len() as u64 * 6 + 64;
+        }
+        if document_bytes > MAX_DOCUMENT_BYTES {
+            return Err(Error::Bounds {
+                bound: "NZB document bytes",
+                limit: MAX_DOCUMENT_BYTES as i64,
+            });
         }
     }
     Ok(())
@@ -314,6 +355,37 @@ mod tests {
         let doc = parse(&xml).unwrap();
         assert_eq!(doc.files[0].subject, file.subject);
         assert_eq!(doc.files[0].posted_at_unix, file.date);
+    }
+
+    #[test]
+    fn validation_mirrors_parser_text_and_document_caps() {
+        let good = two_segment_file();
+        // Subject, poster and group text longer than the parser's
+        // per-text-node cap must be rejected before any XML is emitted.
+        let mut bad = good.clone();
+        bad.subject = "s".repeat(MAX_SEGMENT_TEXT_BYTES + 1);
+        assert!(write_nzb(&[bad]).is_err());
+        let mut bad = good.clone();
+        bad.poster = "p".repeat(MAX_SEGMENT_TEXT_BYTES + 1);
+        assert!(write_nzb(&[bad]).is_err());
+        let mut bad = good.clone();
+        bad.groups = vec!["g".repeat(MAX_SEGMENT_TEXT_BYTES + 1)];
+        assert!(write_nzb(&[bad]).is_err());
+        // Files whose combined escaped text overruns the parser's
+        // document byte limit must be rejected too. 64 files stays
+        // under the accepted file count, so only the document cap can
+        // fire here.
+        let mut big = good.clone();
+        big.subject = "s".repeat(100_000);
+        let files: Vec<_> = (0..64).map(|_| big.clone()).collect();
+        let result = write_nzb(&files);
+        assert!(matches!(
+            result,
+            Err(crate::Error::Bounds {
+                bound: "NZB document bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
