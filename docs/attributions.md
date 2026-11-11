@@ -3,8 +3,8 @@
 The versioned inventory below is consumed by the in-app licences/about section
 (`About NNTune` at `/settings#about-nntune`, `apps/web/src/routes/settings/+page.svelte`).
 That section adds no new route, token, component or dependency: headings, the
-version line and the two licence intro lines follow the approved UX design
-(TWO-4355 §8), and every visible notice and provenance URL renders verbatim
+version line and the two licence intro lines follow the approved UX design,
+and every visible notice and provenance URL renders verbatim
 from this contract (link labels and the unavailable-error line are the only
 functional page strings; obligations remain JSON-only compliance guidance). There is no new
 dependency, network request, ingest behaviour or artwork cache.
