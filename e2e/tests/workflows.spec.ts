@@ -1631,7 +1631,9 @@ ${MB_INVENTORY}`);
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/ingest', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/rest/*', zone_name: 'nntune.com' },
           ],
+          services: [{ binding: 'STREAM', service: 'nntune-stream-staging' }],
           vars: {
             RP_ID: 'staging.nntune.com',
             RP_ORIGIN: 'https://staging.nntune.com',
