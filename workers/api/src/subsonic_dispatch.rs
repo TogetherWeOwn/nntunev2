@@ -62,12 +62,19 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nntune_subsonic::auth::{AuthStore, Identity};
-use nntune_subsonic::envelope::code;
+use nntune_subsonic::endpoints::Params;
+use nntune_subsonic::envelope::{
+    code, error_document, render_json, render_jsonp, render_xml, JSON_CONTENT_TYPE,
+    XML_CONTENT_TYPE,
+};
 use nntune_subsonic::library::{
     Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount, NOW,
 };
+use nntune_subsonic::HttpResponse;
 
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
+use crate::subsonic_auth::AuthError;
+use crate::subsonic_http::CredentialParseError;
 
 /// Production FLAC identity: the catalogue is FLAC-only, so every song
 /// advertises `audio/flac`/`flac` and the stream mount refuses any
@@ -81,10 +88,6 @@ pub const FLAC_SUFFIX: &str = "flac";
 /// succeeded, so the `AuthStore` answers below are safe by construction
 /// (see the `AuthStore` impl note) and never consult fixture credentials.
 #[derive(Clone, Debug)]
-// Interim (slice 2 of 6): the `AuthStore`/`Library` impls that read these
-// fields land in slices 3-4; this allow is removed by the final slice so
-// the cumulative diff vs the reviewed tree is empty.
-#[allow(dead_code)]
 pub struct ProductionStore {
     identity: Identity,
     account: UserAccount,
@@ -518,6 +521,168 @@ impl Library for ProductionStore {
     }
 
     fn save_queue(&mut self, _identity: &Identity, _queue: PlayQueue) {}
+}
+
+// --- Error documents -----------------------------------------------------
+//
+// The mount answers authentication failures itself (the sync dispatcher
+// only ever sees already-authenticated requests). Rendering mirrors
+// `SubsonicApp::render`: `f=json`/`jsonp` select JSON, everything else
+// XML; a broken JSONP callback falls back to JSON error 10 via
+// `render_jsonp`.
+
+/// Merge a POST form body onto the query string the same way the shared
+/// dispatcher does (`SubsonicApp::merge_query`): query pairs first, body
+/// pairs after, so query wins on duplicates (`Params::get` returns the
+/// first value). Non-POST requests and empty bodies pass the query
+/// through unchanged.
+///
+/// The mount renders every pre-dispatch error through this merged
+/// parameter string, not the query alone: a client that selects its
+/// response format (`f`/`callback`) in the POST body must still get
+/// JSON/JSONP error documents. Callers pass a body that already survived
+/// the bounded read in the worker shell (oversized/unreadable faults are
+/// answered query-only before the mount, since body pairs are untrusted
+/// past the cap).
+pub fn merged_query_params(method: &str, query: &str, body: &str) -> String {
+    if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
+        if query.is_empty() {
+            body.to_string()
+        } else {
+            format!("{query}&{body}")
+        }
+    } else {
+        query.to_string()
+    }
+}
+
+pub fn render_error(query: &str, error_code: i64, message: &str) -> HttpResponse {
+    let params = Params::parse(query);
+    let doc = error_document(error_code, message);
+    match params.get("f") {
+        Some("json") => HttpResponse {
+            status: 200,
+            content_type: JSON_CONTENT_TYPE.to_string(),
+            body: render_json(&doc),
+        },
+        Some("jsonp") => {
+            let (body, content_type) = render_jsonp(&doc, params.get("callback"));
+            HttpResponse {
+                status: 200,
+                content_type: content_type.to_string(),
+                body,
+            }
+        }
+        _ => HttpResponse {
+            status: 200,
+            content_type: XML_CONTENT_TYPE.to_string(),
+            body: render_xml(&doc),
+        },
+    }
+}
+
+/// Error-10 document for a duplicate/malformed credential sender (no
+/// store or credential material is ever touched on this path).
+pub fn parse_error_response(query: &str, err: CredentialParseError) -> HttpResponse {
+    render_error(query, code::GENERIC, &err.to_string())
+}
+
+/// Map an async-core failure onto its Subsonic (code, message) pair.
+pub fn auth_error_response(query: &str, err: AuthError) -> HttpResponse {
+    let (error_code, message) = match err {
+        AuthError::Unsupported => (
+            code::UNSUPPORTED_AUTH,
+            "Provided authentication mechanism not supported.".to_string(),
+        ),
+        AuthError::Conflicting => (
+            code::CONFLICTING_AUTH,
+            "Conflicting authentication parameters.".to_string(),
+        ),
+        AuthError::MissingSalt => (
+            code::REQUIRED_PARAM_MISSING,
+            "Required parameter is missing.".to_string(),
+        ),
+        AuthError::InvalidKey => (code::INVALID_API_KEY, "Invalid API key.".to_string()),
+        AuthError::InvalidToken => (
+            code::WRONG_CREDENTIALS,
+            "Wrong username or password.".to_string(),
+        ),
+        AuthError::Unavailable => (code::GENERIC, "Internal server error.".to_string()),
+    };
+    render_error(query, error_code, &message)
+}
+
+/// Map a native play-issuance refusal onto its Subsonic response. Only the
+/// HTTP status is read — the native JSON body is never inspected, never
+/// logged, never forwarded (it would otherwise name the paywall/plan).
+/// Paywall, deleting-account and concurrency rejections are all "not
+/// authorized for this play"; anything else is an internal error.
+pub fn issuance_refusal_response(query: &str, status: u16) -> HttpResponse {
+    match status {
+        402 | 409 | 429 => render_error(
+            query,
+            code::NOT_AUTHORIZED,
+            "User is not authorized for the given operation.",
+        ),
+        _ => render_error(query, code::GENERIC, "Internal server error."),
+    }
+}
+
+/// Map a stream-Worker answer onto its Subsonic response when it is not a
+/// playable range: unknown/missing curated source answers 70, anything
+/// else is an internal error. Playable answers (200/206) never reach here.
+pub fn upstream_refusal_response(query: &str, status: u16) -> HttpResponse {
+    match status {
+        404 | 502 => render_error(query, code::NOT_FOUND, "Song not found."),
+        _ => render_error(query, code::GENERIC, "Internal server error."),
+    }
+}
+
+// --- Stream (FLAC-only, one stream) --------------------------------------
+//
+// `stream.view` is served by the mount, not the sync dispatcher: after
+// authentication the mount issues a native play (subscription, monthly
+// hour cap, one-stream lease — `issue_play_for_user`) with a server-owned
+// compatibility session id (never client-supplied), then proxies the
+// grant privately to the stream Worker.
+
+// Server-owned lease-holder name for Subsonic playback: derived from the
+// authenticated user + credential ids, so each credential holds its own
+// lease holder while distinct Subsonic clients on one account still share
+// the single-stream lease (the lease table is per user). Bounded to the
+// lease column (≤128) and stable per credential across requests.
+pub fn compat_session_id(user_id: &str, credential_id: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"subsonic-compat-session\0");
+    hasher.update(user_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(credential_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("subsonic-{}", crate::b64::encode(&digest[..16]))
+}
+
+// True when the request asks for transcoding this FLAC-only surface cannot
+// honour: a `format` other than `flac` (case-insensitive), or a positive
+// `maxBitRate` cap. `maxBitRate=0` means "no cap" in Subsonic, and an
+// absent parameter means original bytes, so both pass through.
+pub fn rejects_transcode(params: &Params) -> bool {
+    if let Some(format) = params.get("format") {
+        if !format.eq_ignore_ascii_case(FLAC_SUFFIX) {
+            return true;
+        }
+    }
+    if let Some(max_bit_rate) = params.get("maxBitRate") {
+        match max_bit_rate.parse::<i64>() {
+            Ok(value) => return value > 0,
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+pub fn transcode_refusal_response(query: &str) -> HttpResponse {
+    render_error(query, code::GENERIC, "Transcoding is not supported.")
 }
 
 #[cfg(test)]
