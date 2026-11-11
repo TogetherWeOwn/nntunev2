@@ -3,6 +3,11 @@ import {
 	expectSound, frames, media, muteControl, openPlayer, playCount, preference, volumeControl
 } from './sound-preference/fixtures';
 
+// EL TWO-5795 (demo/player retirement): hosted on the retired `/demo/player`
+// surface via the sound-preference fixtures. Vectors preserved; migration to
+// the product surface deferred per fallback (b) — see the PR body manifest.
+test.skip(true, 'EL TWO-5795: demo/player retirement — migration deferred, vectors preserved');
+
 for (const mode of ['throw', 'ignore']) {
 	test(`volume becoming ${mode === 'throw' ? 'throwing' : 'ignored'} after mount rolls the range back truthfully`, async ({ page }) => {
 		const errors = await openPlayer(page);

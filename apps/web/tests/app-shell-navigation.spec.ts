@@ -183,6 +183,25 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 	await page.route('**/api/library', (route) =>
 		route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 	);
+	// EL TWO-5795 media-mock migration: PLAYABLE_ITEMS formerly fetched the
+	// deleted /api/demo/audio; serve a local silent WAV so playback advances
+	// without any synthetic-media server. Inert for non-playing tests.
+	await page.route('**/shell-audio/**', (route) => {
+		const wav = Buffer.alloc(44 + 16_000);
+		wav.write('RIFF', 0);
+		wav.writeUInt32LE(36 + 16_000, 4);
+		wav.write('WAVEfmt ', 8);
+		wav.writeUInt32LE(16, 16);
+		wav.writeUInt16LE(1, 20);
+		wav.writeUInt16LE(1, 22);
+		wav.writeUInt32LE(8_000, 24);
+		wav.writeUInt32LE(16_000, 28);
+		wav.writeUInt16LE(2, 32);
+		wav.writeUInt16LE(16, 34);
+		wav.write('data', 36);
+		wav.writeUInt32LE(16_000, 40);
+		return route.fulfill({ status: 200, contentType: 'audio/wav', body: wav });
+	});
 }
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
@@ -860,8 +879,10 @@ const PLAYABLE_ITEMS = [1, 2, 3].map((index) => ({
 	artist: 'Shell Band',
 	// Both stream-url spellings: the fixture only needs the field the
 	// graduated player reads; the other is ignored extra JSON.
-	streamUrl: '/api/demo/audio',
-	stream_url: '/api/demo/audio'
+	// EL TWO-5795: pointed at the route-mocked WAV in NAV-03b after the
+	// synthetic-media endpoints were retired with the demo route.
+	streamUrl: '/shell-audio/shell.wav',
+	stream_url: '/shell-audio/shell.wav'
 }));
 
 /** Describe the currently focused element for tab-order recording. */
