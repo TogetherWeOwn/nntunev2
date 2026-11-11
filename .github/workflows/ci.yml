@@ -641,6 +641,9 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Meter-metadata boundary runs below against independently migrated
+      # app/mirror stores (their own env vars); it must not run here on the
+      # single shared database, where the split-store env vars are absent.
       - name: Exercise production session retry adapter under PostgreSQL contention
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
@@ -657,6 +660,18 @@ jobs:
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      # Independently migrated app/mirror stores for the meter-metadata
+      # boundary test: each store receives only its target's migration
+      # history from the manifest, so the split is a schema fact.
+      - name: Prepare independently migrated app/mirror stores
+        run: bash workers/api/tests/prepare_migrated_stores.sh
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise meter metadata against migrated app/mirror stores
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test meter_meta_store_postgres
+        env:
+          NNTUNE_TEST_APP_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_app_ci
+          NNTUNE_TEST_MIRROR_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_mirror_ci
       # The bank runner's own inventory guard: a missing, empty or extra
       # compiled inventory must be rejected before any execution starts.
       - name: Verify PostgreSQL acceptance inventory guard
