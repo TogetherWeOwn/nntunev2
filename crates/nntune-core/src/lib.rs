@@ -22,6 +22,7 @@
 //! - [`yenc`]: yEnc encode/decode with an explicit SIMD fast path (x86_64 SSE2,
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
+//! - [`media_layout`]: bounded article ranges derived from the media v1 geometry.
 //! - [`media`]: `velmora.media.v1`, the media encryption format (age v1
 //!   STREAM payload, 48-byte committing header): sealing, commitment-gated
 //!   ranged reads and full verification. NNTune uses
@@ -44,6 +45,8 @@ pub use velmora::{
     article, error, media, nntp, nzb, par2, pinned_transport, rng, segment_identity, transport,
     transports, yenc, Error, Result,
 };
+
+pub mod media_layout;
 
 pub mod original_source;
 pub mod transcode;
