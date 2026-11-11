@@ -60,6 +60,8 @@ async function focusCheckpoint(page: Page, name: string) {
 async function attachFocusJournal(page: Page, testInfo: import('@playwright/test').TestInfo) {
 	const journal = await page.evaluate(() => (window as unknown as { focusJournal: object[] }).focusJournal);
 	await testInfo.attach('focus-event-journal', { body: JSON.stringify(journal, null, 2), contentType: 'application/json' });
+	// CI retains test-result attachments on failure only; keep passing journals in the job log.
+	console.log(JSON.stringify({ test: testInfo.title, focusEventJournal: journal }));
 }
 
 async function queueAll(page: Page) {
