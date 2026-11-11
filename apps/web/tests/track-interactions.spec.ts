@@ -142,7 +142,7 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 	}
 });
 
-for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'outside-focus', 'scroll-then-focus'] as const) {
+for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'outside-focus', 'scroll-then-focus', 'explicit-focus', 'scroll-then-explicit-focus'] as const) {
 	test(`track menu focus contract: ${scenario}`, async ({ page }, testInfo) => {
 		await page.setViewportSize({ width: 1280, height: 1000 });
 		await seed(page);
@@ -211,6 +211,16 @@ for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'ou
 				await page.mouse.click(coordinates!.x, coordinates!.y);
 				expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid') || document.activeElement?.tagName || null)).toBe(baseline);
 				await expect(menu(page)).toHaveCount(0);
+			} else if (scenario.endsWith('explicit-focus')) {
+				const before = await page.evaluate(() => window.scrollY);
+				const focusStart = await page.evaluate(() => (window as unknown as { focusJournal: object[] }).focusJournal.length);
+				await refresh.evaluate((node: HTMLElement) => node.focus({ preventScroll: true }));
+				await expect(menu(page)).toHaveCount(0);
+				await expect(refresh).toBeFocused();
+				expect(await page.evaluate(() => window.scrollY)).toBe(before);
+				const events = await page.evaluate((start) => (window as unknown as { focusJournal: Array<{ type: string }> }).focusJournal.slice(start), focusStart);
+				expect(events.some((event) => event.type === 'focusin')).toBe(true);
+				expect(events.filter((event) => ['scroll', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].includes(event.type))).toEqual([]);
 			} else if (scenario.endsWith('focus')) {
 				await refresh.click();
 				await expect(menu(page)).toHaveCount(0);
