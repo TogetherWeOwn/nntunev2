@@ -401,6 +401,8 @@ for (const width of [320, 390, 799]) {
 			await expect(audio).toHaveJSProperty('paused', true);
 			await expect(play).toHaveAccessibleName('Play');
 			await page.keyboard.press('Shift+Tab');
+			await expect(restart).toBeFocused();
+			await page.keyboard.press('Shift+Tab');
 			await expect(heart).toBeFocused();
 			await page.keyboard.press('Enter');
 			await expect(heart).toHaveAttribute('aria-pressed', 'true');
