@@ -1631,6 +1631,7 @@ ${MB_INVENTORY}`);
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/ingest', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/rest/*', zone_name: 'nntune.com' },
           ],
           vars: {
             RP_ID: 'staging.nntune.com',
@@ -1647,6 +1648,22 @@ ${MB_INVENTORY}`);
         },
       },
     });
+  });
+
+  test('generated TOML binds STREAM only once the staging stream Worker exists', () => {
+    // Without the operator var the services block is omitted entirely: a
+    // binding to a missing Worker would make Wrangler reject the deploy.
+    const absent = generateConfig();
+    expect(absent.status, absent.output).toBe(0);
+    expect(parseToml(absent.toml!)).not.toHaveProperty('env.staging.services');
+    const bound = generateConfig({ STREAM_SERVICE_STAGING: 'nntune-stream-staging' });
+    expect(bound.status, bound.output).toBe(0);
+    const config = parseToml(bound.toml!) as {
+      env: { staging: { services?: Array<{ binding: string; service: string }> } };
+    };
+    expect(config.env.staging.services).toEqual([
+      { binding: 'STREAM', service: 'nntune-stream-staging' },
+    ]);
   });
 
   test('the pinned staging deploy consumes that config and injects BUILD_SHA', () => {
@@ -1667,6 +1684,7 @@ ${MB_INVENTORY}`);
     ['stale host', { API_RP_ID_STAGING: 'obsolete.example', API_RP_ORIGIN_STAGING: 'https://obsolete.example' }, 'API_RP_ID_STAGING must equal the staging RP ID'],
     ['noncanonical origin', { API_RP_ORIGIN_STAGING: 'https://staging.nntune.com/' }, 'API_RP_ORIGIN_STAGING must be the canonical serialized origin'],
     ['non-https origin', { API_RP_ORIGIN_STAGING: 'http://staging.nntune.com' }, 'API_RP_ORIGIN_STAGING must be https'],
+    ['wrong stream service', { STREAM_SERVICE_STAGING: 'nntune-stream' }, 'STREAM_SERVICE_STAGING must equal the staging stream Worker name'],
   ] as const) {
     test(`generator rejects ${name} before writing deploy config`, () => {
       const result = generateConfig(overrides);

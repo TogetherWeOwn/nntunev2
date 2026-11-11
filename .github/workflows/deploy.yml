@@ -230,6 +230,7 @@ jobs:
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+          STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
@@ -276,6 +277,18 @@ jobs:
           if mirror_id:
               assert mirror_id == mb["staging"], \
                   "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
+          # Stream pin: the generated config binds STREAM_SERVICE_STAGING
+          # for the Subsonic `/rest/stream` proxy (STREAM in
+          # src/worker_entry.rs). The var is optional: absent or empty omits
+          # the services block (stream answers Subsonic error 70); a set
+          # value must name the staging stream Worker exactly, so a stray
+          # var can never bind the production Worker from staging (names
+          # only). Binding a Worker that does not exist yet would make
+          # Wrangler reject the whole API deploy.
+          stream_service = os.environ.get("STREAM_SERVICE_STAGING", "")
+          if stream_service:
+              assert stream_service == "nntune-stream-staging", \
+                  "STREAM_SERVICE_STAGING must equal the staging stream Worker name"
           PY
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
@@ -325,6 +338,14 @@ jobs:
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/api/ingest"
           zone_name = "nntune.com"
+          # OpenSubsonic API: the Worker authenticates per request
+          # (plaintext `p=` answers error 42; no credential provisioned
+          # yet answers error 0). Playback is proxied over the STREAM
+          # service binding, generated below only when the staging stream
+          # Worker exists (STREAM_SERVICE_STAGING set).
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/rest/*"
+          zone_name = "nntune.com"
 
           [env.staging.vars]
           RP_ID = "${API_RP_ID_STAGING}"
@@ -362,6 +383,24 @@ jobs:
             echo "mirror: configured (MB_DB bound)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "mirror: absent (no-enrichment mode)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "${STREAM_SERVICE_STAGING:-}" ]; then
+            # Stream Worker service binding (`STREAM`): the Subsonic
+            # `/rest/stream` mount proxies minted play grants privately to
+            # `GET /play/{track_id}` (see STREAM_SERVICE_BINDING in
+            # src/worker_entry.rs). Only generated once the staging stream
+            # Worker exists (the pinned name passed preflight above): a
+            # binding to a missing Worker would make Wrangler reject the
+            # whole API deploy. Without it, stream answers error 70.
+            cat >> wrangler.toml <<EOF
+
+          [[env.staging.services]]
+          binding = "STREAM"
+          service = "${STREAM_SERVICE_STAGING}"
+          EOF
+            echo "stream: configured (STREAM bound)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stream: absent (Subsonic stream answers error 70)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
