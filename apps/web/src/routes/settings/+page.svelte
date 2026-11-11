@@ -1,5 +1,51 @@
+<script lang="ts">
+	import {
+		attributionInventory,
+		validateAttributionInventory,
+		type Attribution
+	} from '#lib/attributions/index.js';
+	import { APP_VERSION } from '#lib/version.js';
+	import { BUILD_SHA, isBuildShaKnown } from '#lib/build.js';
+
+	// Attribution rendering is a pure function of the shipped inventory:
+	// no fetch, loading skeleton or router state. The only failure mode is a
+	// failed structural validation, which renders an announced error instead
+	// of a partial list. Headings and list spacing follow the existing
+	// Settings sections (h2 + paragraph + ul); no new token or component.
+	const validationErrors = validateAttributionInventory(attributionInventory);
+	// Only active entries render visibly: planned/inactive sources are absent
+	// from the page entirely (no "coming soon" or greyed entries) and exist
+	// only in the machine-readable JSON provenance below.
+	const active = attributionInventory.entries.filter((entry) => entry.status === 'active');
+	const licenceEntries = active.filter((entry) => entry.kind !== 'data' && entry.kind !== 'artwork');
+	const dataEntries = active.filter((entry) => entry.kind === 'data' || entry.kind === 'artwork');
+
+	// Machine-readable provenance (present only alongside a valid render):
+	// the exact serialized inventory the lists below render from, embedded
+	// verbatim for consumers that parse the page. `<` is escaped so the
+	// payload can never close the script element early. The whole script
+	// element is built as one {@html} string because Svelte escapes text
+	// interpolations (including {@html}) inside <script> elements, which
+	// would HTML-escape the JSON quotes and break consumers.
+	const attributionJson = JSON.stringify(attributionInventory).replaceAll('<', '\\u003c');
+	const attributionScript =
+		`<script type="application/json" id="nntune-attribution-inventory">${attributionJson}<\/script>`;
+
+	// Link labels carry the entry name so repeated links stay distinguishable
+	// in link lists (WCAG 2.4.4); MIT is the official licence title, and
+	// non-licence provenance pointers are labelled as provenance rather than
+	// as a licence grant (see inventory obligations). The Figtree entry
+	// carries no licence link here: its "Open Font License" link lives in the
+	// Typeface intro sentence, pointing at the shipped same-origin copy.
+	function licenceText(entry: Attribution): string {
+		if (entry.license === 'MIT') return `MIT License — ${entry.name}`;
+		return `Provenance — ${entry.name}`;
+	}
+</script>
+
 <svelte:head>
 	<title>Settings — NNTune</title>
+	<meta name="nntune:attributions:schema" content="1" />
 </svelte:head>
 
 <main class="nt-wrap" id="main-content">
@@ -22,4 +68,49 @@
 			<li><a href="/account/billing">Open Account</a></li>
 		</ul>
 	</section>
+
+	<section aria-labelledby="settings-about-heading" id="about-nntune">
+		<h2 id="settings-about-heading">About NNTune</h2>
+		<p>Version {APP_VERSION}{isBuildShaKnown(BUILD_SHA) ? ` · build ${BUILD_SHA.slice(0, 7)}` : ''}</p>
+
+		{#if validationErrors.length > 0}
+			<p role="alert">Attribution data is unavailable.</p>
+		{:else}
+			<h3 id="settings-about-licences-heading">Licences</h3>
+			<p>NNTune is open source under the <a href="https://github.com/TogetherWeOwn/nntunev2/blob/main/LICENSE">MIT License</a>.</p>
+			<p>Typeface: Figtree, SIL <a href="/fonts/OFL.txt">Open Font License</a> 1.1.</p>
+			<ul>
+				{#each licenceEntries as entry (entry.id)}
+					{@render attributionEntry(entry)}
+				{/each}
+			</ul>
+
+			{#if dataEntries.length > 0}
+				<h3 id="settings-about-sources-heading">Data sources</h3>
+				<ul>
+					{#each dataEntries as entry (entry.id)}
+						{@render attributionEntry(entry)}
+					{/each}
+				</ul>
+			{/if}
+		{/if}
+	</section>
+
+	{#if validationErrors.length === 0}
+		{@html attributionScript}
+	{/if}
+
+	{#snippet attributionEntry(entry: Attribution)}
+		<li data-attribution-id={entry.id} data-status={entry.status}>
+			<strong>{entry.name}</strong> ({entry.license}{entry.package?.version ? ` ${entry.package.version}` : ''})
+			<p>{entry.notice}</p>
+			<p>
+				<a href={entry.sourceUrl}>Source — {entry.name}</a>
+				{#if entry.id !== 'figtree'}
+					{' · '}
+					<a href={entry.licenseUrl}>{licenceText(entry)}</a>
+				{/if}
+			</p>
+		</li>
+	{/snippet}
 </main>
