@@ -33,7 +33,7 @@ describe('shared kit SVG renderer', () => {
 		const data = JSON.stringify(ICON_NAMES.map((name) => [name, ICON_PATHS[name]]));
 		const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
 		const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-		expect(hex).toBe('512810fb379c684dee5028a5d86169e7b1b11c9a644a68959e77c6858f231a70');
+		expect(hex).toBe('c2e485c7fa316c9a1244426dcbdfb2776e341c88d57d29bf12820b2a101ec5a9');
 	});
 
 	it('keeps the same decorative SVG attributes and shapes for all named icons', () => {
@@ -54,9 +54,9 @@ describe('shared kit SVG renderer', () => {
 		expect(body).not.toContain('aria-hidden');
 	});
 
-	it('exposes only the existing nine transport stencils through the narrow import', () => {
+	it('exposes only the existing ten transport stencils through the narrow import', () => {
 		expect(Object.keys(TRANSPORT_ICON_PATHS)).toEqual([
-			'play', 'pause', 'skip-back', 'skip-forward', 'shuffle', 'repeat', 'repeat-1', 'volume-2', 'volume-x'
+			'play', 'pause', 'skip-back', 'skip-forward', 'restart', 'shuffle', 'repeat', 'repeat-1', 'volume-2', 'volume-x'
 		]);
 		for (const [name, path] of Object.entries(TRANSPORT_ICON_PATHS)) {
 			expect(path).toBe(ICON_PATHS[name as keyof typeof ICON_PATHS]);

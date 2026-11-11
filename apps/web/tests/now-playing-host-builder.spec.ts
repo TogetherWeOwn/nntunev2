@@ -243,10 +243,9 @@ for (const playing of [false, true]) {
 		await page.keyboard.press('0');
 		await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeLessThan(3);
 		await expect(surface.getByTestId('library-restart-status')).toContainText('Restarted');
-		await expect(surface.getByTestId('library-restart')).not.toBeVisible();
+		await expect(surface.getByTestId('library-restart')).toBeVisible();
 		await seek.fill('24');
 		await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => Math.floor(el.currentTime))).toBeGreaterThanOrEqual(24);
-		await surface.getByText('Playback', { exact: true }).click();
 		await surface.getByTestId('library-restart').click();
 		await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeLessThan(3);
 		await expect(surface.getByTestId('library-restart-status')).toContainText('Restarted');
@@ -294,6 +293,8 @@ for (const width of [320, 360, 390]) {
 			}
 			await page.keyboard.press('Tab');
 			await expect(surface.getByRole('button', { name: 'Previous track', exact: true })).toBeFocused();
+			await page.keyboard.press('Tab');
+			await expect(surface.getByTestId('library-restart')).toBeFocused();
 			for (const id of ['player-play-pause', 'player-next']) {
 				await page.keyboard.press('Tab');
 				await expect(surface.getByTestId(id)).toBeFocused();

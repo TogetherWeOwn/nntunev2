@@ -13,6 +13,7 @@ export const ICON_NAMES = [
 	'pause',
 	'skip-back',
 	'skip-forward',
+	'restart',
 	'shuffle',
 	'repeat',
 	'repeat-1',
@@ -73,6 +74,7 @@ export const TRANSPORT_ICON_PATHS = {
 	pause: `<rect x="6" y="5" width="4" height="14" rx="1"${F}/><rect x="14" y="5" width="4" height="14" rx="1"${F}/>`,
 	'skip-back': `<path d="M5 5h2.5v14H5z"${F}/><path d="M19 5v14L9.5 12z"${F}/>`,
 	'skip-forward': `<path d="M16.5 5H19v14h-2.5z"${F}/><path d="M5 5v14l9.5-7z"${F}/>`,
+	restart: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
 	shuffle:
 		'<path d="M3 6h2c5 0 9 12 14 12h2"/><path d="m18 15 3 3-3 3"/><path d="M3 18h2c5 0 9-12 14-12h2"/><path d="m18 3 3 3-3 3"/>',
 	repeat:

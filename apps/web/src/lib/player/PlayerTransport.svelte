@@ -24,6 +24,18 @@
 		? `Sleep in ${Math.ceil(sleep.remainingMs / 60000)} minutes`
 		: sleep.kind === 'end-of-track' ? 'Sleep at end of track'
 		: `Sleep after ${sleep.remainingTracks} tracks`);
+	// The compact bar replaces the full-controls restart below 800px.
+	// Only one `library-restart` node is mounted at a time; match the CSS
+	// breakpoint so the visible copy switches with the layout.
+	let compact = $state(false);
+	$effect(() => {
+		const query = window.matchMedia('(max-width: 799px)');
+		const sync = () => { compact = query.matches; };
+		sync();
+		query.addEventListener('change', sync);
+		return () => query.removeEventListener('change', sync);
+	});
+
 	let feedback = $state('');
 	let dialog: HTMLDialogElement | undefined = $state();
 	let opener: HTMLElement | null = null;
@@ -162,6 +174,12 @@
 	{#if !$player.restartAvailable}<p id={`${id}-restart-hint`}>Restart is unavailable until this track can seek.</p>{/if}
 {/snippet}
 
+{#snippet restartIconControl()}
+	<button type="button" data-testid="library-restart" aria-label="Restart current track" title="Restart current track" disabled={!$player.restartAvailable} aria-describedby={$player.restartAvailable ? undefined : `${id}-restart-hint`} onclick={() => player.restart()}>
+		<IconSvg path={TRANSPORT_ICON_PATHS.restart} />
+	</button>
+{/snippet}
+
 <section use:mountFullscreen class:expanded aria-label="Player" data-testid="player-bar" data-player-transport tabindex="-1">
 	{#if expanded}
 		<div class="cinema-artwork"><Artwork src={selected?.artworkUrl} /></div>
@@ -177,6 +195,7 @@
 					</a>
 					<p class="identity compact-hide" data-testid="now-playing" role={$player.queueLiveRegions ? 'status' : undefined}>Now playing: {displayTitle(selected)}{#if selected.artist}{' — '}{selected.artist}{/if}</p>
 					{@render favoriteControl()}
+					{#if compact}{@render restartIconControl()}{/if}
 					{@render playControl()}
 				{/if}
 				{@render queueToggle?.(() => fullscreenController?.exit() ?? Promise.resolve(false))}
@@ -199,14 +218,15 @@
 			<IconSvg path={TRANSPORT_ICON_PATHS.shuffle} />
 		</button>
 		<button type="button" aria-label="Previous track" title="Previous track" onclick={() => void player.previous()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-back']} /></button>
+		{#if expanded}{@render restartIconControl()}{/if}
 		{#if expanded}{@render playControl()}{/if}
 		<button type="button" data-testid="player-next" aria-label="Next track" title="Next track" onclick={() => void player.next()}><IconSvg path={TRANSPORT_ICON_PATHS['skip-forward']} /></button>
 		<button type="button" aria-label={`Repeat: ${$player.repeat === 'off' ? 'Off' : $player.repeat === 'queue' ? 'Queue' : 'One'}`} title="Cycle repeat" aria-pressed={$player.repeat !== 'off'} onclick={() => player.cycleRepeat()}>
 			<IconSvg path={TRANSPORT_ICON_PATHS[$player.repeat === 'one' ? 'repeat-1' : 'repeat']} />
 		</button>
 	</div>
-	<div class="compact-hide">{#if !expanded}{@render restartControl()}{/if}</div>
-	<p class="compact-hide" data-testid="library-restart-status" aria-live="polite">{#key $player.restartVersion}{$player.restartStatus}{/key}</p>
+	{#if expanded && !$player.restartAvailable}<p id={`${id}-restart-hint`}>Restart is unavailable until this track can seek.</p>{/if}
+	<div class="compact-hide">{#if !expanded && !compact}{@render restartControl()}{/if}</div>
 	{#if !expanded}{@render seekControl()}{/if}
 	<div class="sound">
 		{#if expanded && selected}{@render favoriteControl()}{/if}
@@ -236,7 +256,6 @@
 				{/if}
 			</select>
 			<p>{sleepText}</p>
-			{#if expanded}{@render restartControl()}{/if}
 		</div>
 	</details>
 	{#if transport?.sound.restricted}<p class="compact-hide">Volume control is limited by this browser. Use your device volume controls.</p>{/if}
@@ -259,9 +278,12 @@
 	</dialog>
 {/if}
 	</div>
+	<p class:sr-only={!expanded && compact} data-testid="library-restart-status" aria-live="polite">{#key $player.restartVersion}{$player.restartStatus}{/key}</p>
+	{#if !expanded && compact && !$player.restartAvailable}<p id={`${id}-restart-hint`} class="sr-only">Restart is unavailable until this track can seek.</p>{/if}
 </section>
 
 <style>
+	.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
 	.mini-wrap { display: contents; }
 	.mini-progress { display: none; }
 	.mini-surface { display: contents; }
