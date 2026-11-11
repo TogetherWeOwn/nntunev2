@@ -2775,7 +2775,11 @@ fn postgres_admin_ingest_delete_with_frozen_plan_is_refused() {
     run_test(async {
         let mut client = connect().await;
         let (admin, _) = seed_admin_test_users(&client).await;
-        let attempt = accepted_ingest_attempt(&admin, "frozen", NOW);
+        let mut attempt = accepted_ingest_attempt(&admin, "frozen", NOW);
+        // Seed the job exactly as the production upload does: the stored
+        // idempotency key is the derived `admin:`-namespaced content hash,
+        // which is what `admitted` pins, not the attempt's own key.
+        attempt.idempotency_key = crate::admin_ingest::idempotency_key(&attempt.content_sha256_hex);
         let job_id = attempt.job_id.clone();
         admin_ingest_upload_on(&mut client, &attempt)
             .await
