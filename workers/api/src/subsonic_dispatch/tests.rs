@@ -100,13 +100,17 @@ fn store() -> ProductionStore {
     )
 }
 
-fn query(list_type: &str) -> AlbumListQuery<'_> {
+fn mel() -> Identity {
+    Identity {
+        username: "mel".to_string(),
+        email: "mel@example.com".to_string(),
+        is_admin: false,
+    }
+}
+
+fn query<'a>(identity: &'a Identity, list_type: &'a str) -> AlbumListQuery<'a> {
     AlbumListQuery {
-        identity: &Identity {
-            username: "mel".to_string(),
-            email: "mel@example.com".to_string(),
-            is_admin: false,
-        },
+        identity,
         list_type,
         size: 10,
         offset: 0,
@@ -232,22 +236,23 @@ fn per_user_state_fails_closed_without_a_history_store() {
 #[test]
 fn album_list_semantics_match_the_fixture_library() {
     let store = store();
-    let mut q = query("random");
+    let identity = mel();
+    let mut q = query(&identity, "random");
     assert_eq!(store.album_list(q).len(), 2);
     // Random ignores offset.
     q.offset = 1;
     assert_eq!(store.album_list(q).len(), 2);
     // frequent keeps every album eligible (no history yet).
-    assert_eq!(store.album_list(query("frequent")).len(), 2);
+    assert_eq!(store.album_list(query(&identity, "frequent")).len(), 2);
     // recent/highest/starred/byGenre are history- or genre-backed: empty.
-    assert!(store.album_list(query("recent")).is_empty());
-    assert!(store.album_list(query("highest")).is_empty());
-    assert!(store.album_list(query("starred")).is_empty());
-    assert!(store.album_list(query("byGenre")).is_empty());
+    assert!(store.album_list(query(&identity, "recent")).is_empty());
+    assert!(store.album_list(query(&identity, "highest")).is_empty());
+    assert!(store.album_list(query(&identity, "starred")).is_empty());
+    assert!(store.album_list(query(&identity, "byGenre")).is_empty());
     // Unknown types are rejected upstream; the fallback is empty.
-    assert!(store.album_list(query("podcast")).is_empty());
+    assert!(store.album_list(query(&identity, "podcast")).is_empty());
     // byYear filters on the release year across swapped bounds.
-    let mut q = query("byYear");
+    let mut q = query(&identity, "byYear");
     q.from_year = Some(2005);
     q.to_year = Some(2000);
     let filtered = store.album_list(q);
@@ -258,11 +263,12 @@ fn album_list_semantics_match_the_fixture_library() {
 #[test]
 fn album_list2_supports_five_types_and_rejects_the_rest() {
     let store = store();
-    assert_eq!(store.album_list2(query("random")).unwrap().len(), 2);
-    assert_eq!(store.album_list2(query("newest")).unwrap().len(), 2);
-    assert!(store.album_list2(query("recent")).is_err());
-    assert!(store.album_list2(query("frequent")).is_err());
-    let (code, message) = store.album_list2(query("recent")).unwrap_err();
+    let identity = mel();
+    assert_eq!(store.album_list2(query(&identity, "random")).unwrap().len(), 2);
+    assert_eq!(store.album_list2(query(&identity, "newest")).unwrap().len(), 2);
+    assert!(store.album_list2(query(&identity, "recent")).is_err());
+    assert!(store.album_list2(query(&identity, "frequent")).is_err());
+    let (code, message) = store.album_list2(query(&identity, "recent")).unwrap_err();
     assert_eq!(code, 0);
     assert!(message.contains("recent"));
 }

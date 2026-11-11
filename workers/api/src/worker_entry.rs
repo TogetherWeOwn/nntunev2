@@ -5829,7 +5829,7 @@ pub async fn subsonic_mount(
     use crate::subsonic_dispatch as core;
     use nntune_subsonic::endpoints::Params;
     use nntune_subsonic::envelope::code;
-    use nntune_subsonic::library::{Identity, UserAccount};
+    use nntune_subsonic::{Identity, UserAccount};
     use nntune_subsonic::routes::{route, Route};
     use nntune_subsonic::{MemStore, SubsonicApp};
 
@@ -6003,20 +6003,31 @@ pub async fn subsonic_mount(
             &format!("https://nntune-stream/play/{song_id}"),
             &init,
         )?;
-        let mut upstream = fetcher.fetch_request(request).await?;
+        // With the `http` feature, `fetch_request` returns
+        // `http::Response<Body>`; convert back to `worker::Response` for
+        // `status_code()`/`bytes()` (stream Worker reads the same way).
+        let http_resp = fetcher.fetch_request(request).await?;
+        let mut upstream = Response::try_from(http_resp)?;
         let status = upstream.status_code();
         return match status {
             200 | 206 => {
+                let content_type = upstream
+                    .headers()
+                    .get("content-type")?
+                    .unwrap_or_else(|| "audio/flac".to_string());
+                let mut forwarded: Vec<(String, String)> = Vec::new();
+                for name in ["Content-Range", "Accept-Ranges", "Content-Length"] {
+                    if let Some(value) = upstream.headers().get(name)? {
+                        forwarded.push((name.to_string(), value));
+                    }
+                }
                 let bytes = upstream.bytes().await?;
                 let mut response = Response::from_bytes(bytes)?;
                 response = response.with_status(status);
                 let headers = Headers::new();
-                let content_type = upstream.headers().get("content-type")?.unwrap_or_default();
                 headers.set("Content-Type", &content_type)?;
-                for name in ["Content-Range", "Accept-Ranges", "Content-Length"] {
-                    if let Some(value) = upstream.headers().get(name)? {
-                        headers.set(name, &value)?;
-                    }
+                for (name, value) in &forwarded {
+                    headers.set(name, value)?;
                 }
                 headers.set("Cache-Control", "private, no-store")?;
                 *response.headers_mut() = headers;
