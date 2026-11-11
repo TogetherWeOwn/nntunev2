@@ -3,8 +3,8 @@
 //! The engine modules are re-exported from `velmora`
 //! (TogetherWeOwn/velmora, pinned by git `rev` in this crate's
 //! `Cargo.toml`); their sources, tests and benches live there. This crate
-//! keeps only the NNTune-specific [`transcode`] and [`original_source`]
-//! modules and their tests.
+//! keeps NNTune-specific modules and their tests, including [`transcode`],
+//! [`original_source`], and [`nzb_writer`].
 //!
 //! Compiles for `wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`)
 //! **and** native targets (ingest/streaming services, Container batch jobs).
@@ -45,5 +45,6 @@ pub use velmora::{
     transports, yenc, Error, Result,
 };
 
+pub mod nzb_writer;
 pub mod original_source;
 pub mod transcode;
