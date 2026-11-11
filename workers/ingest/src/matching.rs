@@ -21,6 +21,8 @@
 //! rather than DLQ-ing the match or wiping recordings. See
 //! [`recording_mbids_or_fallback`].
 
+pub mod admin_policy;
+
 use serde::Deserialize;
 
 use crate::queue::{validate_mbid, LibraryWrite, QueueMsg};

@@ -1312,6 +1312,7 @@ mod tests {
             provider_id: None,
             transcode_inputs: Vec::new(),
             transcode_next: 7,
+            accepted_audio_manifest_v1: None,
         };
         record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
         assert_eq!(cp.transcode_inputs.len(), 1);

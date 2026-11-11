@@ -283,7 +283,7 @@ impl handlers::Store for UnreachableStore {
         session_by_id(id: &str) -> Result<Option<session::SessionRecord>, handlers::StoreError>,
         rotate_session_row(id: &str, expected_counter: u32, new_counter: u32, new_expires_at: u64) -> Result<bool, handlers::StoreError>,
         revoke_session(id: &str) -> Result<(), handlers::StoreError>,
-        revoke_all_sessions(user_id: &str) -> Result<(), handlers::StoreError>,
+        revoke_sessions_and_native_credentials(user_id: &str, now: u64) -> Result<u64, handlers::StoreError>,
         insert_audit(event: &vault::AuditEvent) -> Result<(), handlers::StoreError>
     }
 }
