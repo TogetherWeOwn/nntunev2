@@ -39,25 +39,25 @@ mod posted_generation_database;
 use posted_generation_database::{connect, validate_disposable_database_config, Quiet};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MIGRATION_0037: &str = include_str!("../../../migrations/0039_posted_file_generations.sql");
-const MIGRATION_0038: &str = include_str!("../../../migrations/0040_posted_file_rechecks.sql");
+const MIGRATION_0037: &str = include_str!("../../../migrations/0043_posted_file_generations.sql");
+const MIGRATION_0038: &str = include_str!("../../../migrations/0044_posted_file_rechecks.sql");
 const MIGRATION_0039: &str =
-    include_str!("../../../migrations/0041_posted_file_content_checks.sql");
+    include_str!("../../../migrations/0045_posted_file_content_checks.sql");
 
 const MIGRATION_0040: &str =
-    include_str!("../../../migrations/0042_posted_file_recheck_cursor.sql");
+    include_str!("../../../migrations/0046_posted_file_recheck_cursor.sql");
 const MIGRATION_0041: &str =
-    include_str!("../../../migrations/0043_posted_file_presence_provenance.sql");
+    include_str!("../../../migrations/0047_posted_file_presence_provenance.sql");
 const MIGRATION_0042: &str =
-    include_str!("../../../migrations/0044_posted_file_legacy_health_fence.sql");
+    include_str!("../../../migrations/0048_posted_file_legacy_health_fence.sql");
 const MIGRATION_0043: &str =
-    include_str!("../../../migrations/0045_posted_file_registration_fence.sql");
+    include_str!("../../../migrations/0049_posted_file_registration_fence.sql");
 const MIGRATION_0044: &str =
-    include_str!("../../../migrations/0046_posted_file_reference_fence.sql");
+    include_str!("../../../migrations/0050_posted_file_reference_fence.sql");
 const MIGRATION_0045: &str =
-    include_str!("../../../migrations/0047_posted_file_legacy_writer_retirement.sql");
+    include_str!("../../../migrations/0051_posted_file_legacy_writer_retirement.sql");
 const MIGRATION_0054: &str =
-    include_str!("../../../migrations/0054_posted_file_multi_generation.sql");
+    include_str!("../../../migrations/0058_posted_file_multi_generation.sql");
 
 #[path = "support/posted_generation_media_v1.rs"]
 mod posted_generation_media_v1;

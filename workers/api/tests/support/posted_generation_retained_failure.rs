@@ -380,7 +380,7 @@ fn postgres_retained_failure_decision_is_immutable_and_forward_migration_replay_
             .quiet("digest decision")
             .get(0);
         db.batch_execute(include_str!(
-            "../../../../migrations/0053_posted_file_retained_failures.sql"
+            "../../../../migrations/0057_posted_file_retained_failures.sql"
         ))
         .await
         .quiet("replay forward failure migration");

@@ -316,7 +316,7 @@ fn postgres_retained_provenance_is_immutable_and_migration_replay_preserves_it()
         let before: String = db.query_one("SELECT md5(o::text) FROM posted_file_retained_observations o WHERE generation_id = $1", &[&s.generation]).await.quiet("digest provenance").get(0);
         for _ in 0..2 {
             db.batch_execute(include_str!(
-                "../../../../migrations/0052_posted_file_retained_observations.sql"
+                "../../../../migrations/0056_posted_file_retained_observations.sql"
             ))
             .await
             .quiet("replay retained provenance migration");
