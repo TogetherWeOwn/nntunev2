@@ -332,7 +332,22 @@ pub fn handle_endpoint<S: Library>(
     identity: &Identity,
     name: &str,
     params: &Params,
+    legacy_media: bool,
 ) -> EndpointResult {
+    if !legacy_media {
+        match name {
+            "download" => {
+                return EndpointResult::Err(
+                    code::GENERIC,
+                    "Offline downloads are not supported.".to_string(),
+                );
+            }
+            // A production adapter must use signed grants, the concurrency
+            // lease and metered delivery. Never fall back to fixture bytes.
+            "stream" => return not_found_with("Song not found."),
+            _ => {}
+        }
+    }
     match name {
         "ping" => EndpointResult::Doc(vec![]),
         "getLicense" => EndpointResult::Doc(vec![(
@@ -833,7 +848,7 @@ pub fn handle_endpoint<S: Library>(
                         ("scrobblingEnabled", Value::bool_value(true)),
                         ("adminRole", Value::bool_value(account.is_admin)),
                         ("settingsRole", Value::bool_value(true)),
-                        ("downloadRole", Value::bool_value(true)),
+                        ("downloadRole", Value::bool_value(legacy_media)),
                         ("uploadRole", Value::bool_value(account.can_manage())),
                         ("playlistRole", Value::bool_value(true)),
                         ("coverArtRole", Value::bool_value(account.can_manage())),

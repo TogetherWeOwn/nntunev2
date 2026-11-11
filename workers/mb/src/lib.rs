@@ -42,6 +42,19 @@ mod api_error;
 use api_error::ApiError;
 
 pub mod replication;
+pub mod snapshot;
+
+/// Backend selector var. Unset (every deployed environment) keeps the
+/// Hyperdrive repository; `r2snapshot` routes to the phase 0 spike backend
+/// ([`snapshot`]), which only the spike measurement Worker sets.
+pub const MB_BACKEND_VAR: &str = "MB_BACKEND";
+pub const MB_BACKEND_R2_SNAPSHOT: &str = "r2snapshot";
+
+/// Whether `main` routes to the snapshot spike backend for this
+/// `MB_BACKEND` value (`None` when the var is unset).
+pub fn snapshot_backend_selected(backend: Option<&str>) -> bool {
+    backend == Some(MB_BACKEND_R2_SNAPSHOT)
+}
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
@@ -2893,6 +2906,14 @@ pub async fn main(
     env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if snapshot_backend_selected(
+        env.var(MB_BACKEND_VAR)
+            .map(|v| v.to_string())
+            .ok()
+            .as_deref(),
+    ) {
+        return snapshot::spike_fetch(req, env).await;
+    }
     worker::Router::new()
         .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
@@ -3224,6 +3245,34 @@ mod tests {
             .headers
             .contains(&("cache-control".to_owned(), "no-store".to_owned())));
         assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn snapshot_backend_is_selected_only_by_r2snapshot() {
+        assert!(!snapshot_backend_selected(None));
+        assert!(!snapshot_backend_selected(Some("")));
+        assert!(!snapshot_backend_selected(Some("postgres")));
+        assert!(!snapshot_backend_selected(Some("R2Snapshot")));
+        assert!(snapshot_backend_selected(Some("r2snapshot")));
+
+        // The entry point needs wasm-bindgen, so pin its source: the
+        // selector must read MB_BACKEND and return the spike route before
+        // the default router is built.
+        let entry = include_str!("lib.rs")
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1;
+        let select = entry
+            .find("snapshot_backend_selected(")
+            .expect("main must call the backend selector");
+        let spike = entry
+            .find("return snapshot::spike_fetch(req, env).await;")
+            .expect("main must dispatch to the snapshot spike");
+        let router = entry
+            .find("worker::Router::new()")
+            .expect("main must build the default router");
+        assert!(entry[select..spike].contains("env.var(MB_BACKEND_VAR)"));
+        assert!(select < spike && spike < router);
     }
 
     #[test]

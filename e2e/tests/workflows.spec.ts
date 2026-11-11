@@ -14,12 +14,13 @@ const stagingWorkflow = readFileSync(new URL('e2e-staging.yml', workflowDir), 'u
 function runShell(script: string, env: Record<string, string> = {}, cwd?: string) {
   const scratch = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'workflow-test-'));
   const outputFile = join(scratch, 'github-output');
+  const summaryFile = join(scratch, 'github-step-summary');
   try {
     const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], {
       encoding: 'utf8',
       timeout: 5_000,
       ...(cwd ? { cwd } : {}),
-      env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, ...env },
+      env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile, ...env },
     });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
@@ -1613,11 +1614,13 @@ ${MB_INVENTORY}`);
     const result = generateConfig();
     expect(result.status, result.output).toBe(0);
     expect(result.toml).toBeDefined();
-    expect(parseToml(result.toml!)).toMatchObject({
+    const config = parseToml(result.toml!);
+    expect(config).not.toHaveProperty('build.command');
+    expect(config).not.toHaveProperty('env.staging.build.command');
+    expect(config).toMatchObject({
       name: 'nntune-api',
       main: 'build/worker/shim.mjs',
       compatibility_date: '2026-10-01',
-      build: { command: 'cargo install -q worker-build --locked && worker-build --release -- --locked' },
       env: {
         staging: {
           name: 'nntune-api-staging',
@@ -1942,11 +1945,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(section).toMatch(
       /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
     );
-    // Shared mirror binding, generated from HYPERDRIVE_ID_MB and pinned to
-    // the api MB_DB manifest inventory id.
+    // Optional shared mirror binding: generated only when HYPERDRIVE_ID_MB is
+    // non-empty, and then pinned to the api MB_DB manifest inventory id.
     expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
+    expect(section).toContain('mirror: absent (no-enrichment mode)');
     expect(section).toMatch(
-      /^[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
+      /^[ \t]*if \[ -n "\$\{HYPERDRIVE_ID_MB:-\}" \]; then\n(?:[ \t]*#[^\n]*\n)*[ \t]*cat >> wrangler\.toml <<EOF\n\n[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
     );
   };
 
@@ -2792,9 +2796,10 @@ function suiteXml(testcases: string): string {
 }
 
 const CATALOGUE_FRESH_CASES = [
-  'catalogue aliases return the same empty library for each fresh account',
-  'catalogue collections expose empty-array contracts for a fresh account',
-  'Library renders the real API empty state for a fresh account',
+  'catalogue aliases return the same library for each fresh account',
+  'catalogue collections expose member-scoped array contracts for a fresh account',
+  'Library renders the real API state for a fresh account',
+  'admin-published rich catalogue is shared by two fresh accounts',
 ] as const;
 const M1_NAMED_CASES = [
   ['ingest-play-meter.spec.ts', 'ingested track carries recording_mbids'],
@@ -2812,7 +2817,7 @@ const M1_NAMED_CASES = [
 const CONFIGURED_JOURNEY_ENV = {
   REQUIRE_QA_AUTH_TOKEN: 'true',
   QA_AUTH_TOKEN: 'dummy-qa-token',
-  MAX_ALLOWED_SKIPS: '11',
+  MAX_ALLOWED_SKIPS: '12',
 };
 const cataloguePassingCases = () => CATALOGUE_FRESH_CASES.map((name) =>
   PASSING('catalogue.spec.ts', name),
@@ -2823,9 +2828,11 @@ const parkedM1Cases = () => M1_NAMED_CASES.map(([file, name]) =>
 
 test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('configured full journey reports catalogue passes and named M1 skips honestly', () => {
-    const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), CONFIGURED_JOURNEY_ENV);
+    const result = runGateScript(suiteXml(cataloguePassingCases() + parkedM1Cases()), {
+      ...CONFIGURED_JOURNEY_ENV, SHARED_CATALOGUE_PUBLISHED: 'true',
+    });
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 14 | 3 | 11 | 0 |');
+    expect(result.summary).toContain('| 15 | 4 | 11 | 0 |');
     for (const name of CATALOGUE_FRESH_CASES) {
       expect(result.summary).toContain(`catalogue.spec.ts: ${name} | passed |`);
     }
@@ -2835,6 +2842,41 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.summary).toContain('do not establish populated-library isolation');
     expect(result.summary).toContain('skips, never playback or metering proof');
   });
+
+  test('parked populated catalogue uses its skip budget without granting acceptance', () => {
+    const name = CATALOGUE_FRESH_CASES[3];
+    const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', name),
+      PASSING('catalogue.spec.ts', name).replace('/>', '><skipped/></testcase>'));
+    const xml = suiteXml(cases + parkedM1Cases());
+    const result = runGateScript(xml, CONFIGURED_JOURNEY_ENV);
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 15 | 3 | 12 | 0 |');
+    expect(result.summary).toContain(`${name} | skipped |`);
+    expect(result.summary).not.toContain(`${name} | passed |`);
+    expect(result.summary).toContain('PARKED: shared catalogue requires an admin-consumer publish');
+    expect(result.summary).toContain('SHARED_CATALOGUE_PUBLISHED=true');
+    expect(result.summary).toContain('A park is not acceptance.');
+    const overBudget = runGateScript(xml, { ...CONFIGURED_JOURNEY_ENV, MAX_ALLOWED_SKIPS: '11' });
+    expect(overBudget.status).not.toBe(0);
+    expect(overBudget.output).toContain('above the allow-list budget of 11');
+    const published = runGateScript(xml, { ...CONFIGURED_JOURNEY_ENV, SHARED_CATALOGUE_PUBLISHED: 'true' });
+    expect(published.status).not.toBe(0);
+    expect(published.summary).toContain(`${name} | skipped |`);
+    expect(published.output).toContain('outside the allow-list');
+  });
+
+  for (const published of ['false', 'true']) {
+    test(`passing empty controls cannot replace a missing populated catalogue leg (published=${published})`, () => {
+      const name = CATALOGUE_FRESH_CASES[3];
+      const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', name), '');
+      const result = runGateScript(suiteXml(cases + parkedM1Cases()), {
+        ...CONFIGURED_JOURNEY_ENV, SHARED_CATALOGUE_PUBLISHED: published,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.summary).toContain(`${name} | missing |`);
+      expect(result.output).toContain('required named journey evidence is incomplete');
+    });
+  }
 
   test('configured full journey rejects a missing catalogue case', () => {
     const cases = cataloguePassingCases().replace(PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[0]), '');
@@ -2888,12 +2930,12 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '11'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '12'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
+    expect(stepBlock).toContain('SHARED_CATALOGUE_PUBLISHED: ${{ vars.SHARED_CATALOGUE_PUBLISHED }}');
     // The secret-held real-NZB staging leg is retired (CC0-only fixture
     // rule): no prepare step feeds the gate a mode anymore. The standard
-    // eleven-skip budget (fixme, nine parked legs, capped stream leg)
-    // budgets every staging run.
+    // budget includes the shared-catalogue park, which ends at publication.
     expect(stepBlock).not.toContain('REAL_NZB_MODE');
     expect(stepBlock).not.toContain('steps.real-nzb');
   });
@@ -3010,10 +3052,10 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('above the allow-list budget');
   });
 
-  test('standard mode passes the parked-leg evidence at the workflow budget of 11', () => {
+  test('standard mode passes the legacy parked-leg evidence at a budget of 11', () => {
     // The retired-real-NZB staging shape: one live journey, the fixme and
     // the ten parked legs (nine user-track legs plus the capped stream
-    // leg), budgeted by the workflow's MAX_ALLOWED_SKIPS '11'.
+    // leg), without the additional shared-catalogue park.
     const result = runGateScript(realNzbXml(), { MAX_ALLOWED_SKIPS: '11' });
     expect(result.status).toBe(0);
     expect(result.summary).toContain('| 12 | 1 | 11 | 0 |');
@@ -3057,20 +3099,15 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('outside the allow-list');
   });
 
-  test('the script default budget is eleven when MAX_ALLOWED_SKIPS is unset', () => {
-    // The full standard evidence (fixme plus the ten parked legs) passes
-    // at the script default, and the same evidence fails the budget when
-    // the caller pins it to ten — pinning the default at eleven.
-    const parkedOnly = PARKED_SKIP_CASES.map(
-      ([file, name]) =>
-        `<testcase classname="${file}" name="${name}"><skipped message="parked (user NZB ingest retired)"/></testcase>`,
-    ).join('');
-    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + parkedOnly);
+  test('the script default budget is twelve when MAX_ALLOWED_SKIPS is unset', () => {
+    const sharedSkip = PASSING('catalogue.spec.ts', CATALOGUE_FRESH_CASES[3])
+      .replace('/>', '><skipped/></testcase>');
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + parkedM1Cases() + sharedSkip);
     const atDefault = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
     expect(atDefault.status).toBe(0);
-    const atTen = runGateScript(xml, { MAX_ALLOWED_SKIPS: '10' });
-    expect(atTen.status).not.toBe(0);
-    expect(atTen.output).toContain('above the allow-list budget of 10');
+    const atEleven = runGateScript(xml, { MAX_ALLOWED_SKIPS: '11' });
+    expect(atEleven.status).not.toBe(0);
+    expect(atEleven.output).toContain('above the allow-list budget of 11');
   });
 
   test('skips above the budget still fail', () => {

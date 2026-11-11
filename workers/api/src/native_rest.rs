@@ -495,7 +495,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
                 return SessionOnly;
             }
-            if path == "/v1/credentials" {
+            if path == "/v1/credentials" || path == "/v1/subsonic-credentials" {
                 return SessionOnly;
             }
             if one_segment_after("/v1/operations/", path) {
@@ -567,6 +567,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Session-only writes (never reachable by bearer).
             if path == "/v1/indexers"
                 || path == "/v1/credentials"
+                || path == "/v1/subsonic-credentials"
                 || path == "/v1/auth/passkey/login/start"
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
@@ -637,6 +638,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return SessionOnly;
             }
             if path == "/v1/account" {
+                return SessionOnly;
+            }
+            if one_segment_after("/v1/subsonic-credentials/", path) {
                 return SessionOnly;
             }
             if path.starts_with("/v1/credentials/") && path.len() > "/v1/credentials/".len() {

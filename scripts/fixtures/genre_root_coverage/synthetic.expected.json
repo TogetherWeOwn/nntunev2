@@ -1,0 +1,17 @@
+{
+  "artists_with_resolved_root": 4,
+  "dataset_kind": "synthetic",
+  "denominator": 5,
+  "metric": "unique-playable-artist-count",
+  "numerator": 4,
+  "percentage_display": "80.000000",
+  "percentage_exact": "80",
+  "playable_artists": 5,
+  "real_data_gate": "not_evaluated",
+  "schema_version": 1,
+  "status": "meets_threshold",
+  "threshold_met": true,
+  "threshold_percentage": 80,
+  "uncovered_artists": 1,
+  "unknown_root_ids_for_playable_artists": ["unknown-root"]
+}

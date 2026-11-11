@@ -4,6 +4,7 @@ The full suite keeps its existing deadline and fail-closed aggregate. Offline
 preflight doubles cover unavailable browsers; CI must still launch real Chromium.
 """
 
+import json
 import re
 import unittest
 
@@ -21,6 +22,10 @@ class TestWebPlaywrightImage(unittest.TestCase):
 
     def test_image_matches_all_three_locked_web_browser_packages(self):
         lock = (ROOT / "apps/web/pnpm-lock.yaml").read_text()
+        web = json.loads((ROOT / "apps/web/package.json").read_text())
+        e2e = json.loads((ROOT / "e2e/package.json").read_text())
+        pinned = e2e["devDependencies"]["@playwright/test"]
+        self.assertEqual(web["devDependencies"]["@playwright/test"], f"^{pinned}")
         versions = []
         for package in ("@playwright/test", "playwright", "playwright-core"):
             matches = re.findall(
@@ -29,7 +34,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
             )
             self.assertTrue(matches, f"no locked {package}")
             versions.extend(matches)
-        self.assertEqual(len(set(versions)), 1, "web browser packages drifted")
+        self.assertEqual(set(versions), {pinned}, "web browser packages drifted")
         image = step_field(self.job, "container")
         self.assertIsNotNone(image, "web-e2e must not install OS/browser dependencies per run")
         self.assertRegex(

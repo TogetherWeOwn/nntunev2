@@ -275,6 +275,14 @@ fn config_from_env(env: &Env) -> Option<Config> {
         }
         (None, Some(_)) | (Some(_), None) => return None,
     };
+    let mut config = config;
+    // Dedicated Worker secret only: ordinary vars and the native pepper may
+    // never supply compatibility key material. Missing/invalid stays disabled
+    // per request, without taking unrelated native endpoints down.
+    config.subsonic_index = env.secret("SUBSONIC_INDEX_PEPPER").ok().and_then(|raw| {
+        let raw = zeroize::Zeroizing::new(raw.to_string());
+        crate::subsonic_config::SubsonicIndexConfig::parse(&raw).ok()
+    });
     // Stripe test-mode secrets (Checkout-shape slice): both optional at
     // startup — unprovisioned paths fail closed per-request (the webhook
     // 500s so Stripe retries it; purchases refuse without a Stripe call)
@@ -664,11 +672,69 @@ pub async fn with_deadline<T, E>(
     // Both futures are dropped here, before the caller observes the result.
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorBinding {
+    Unconfigured,
+    Configured,
+}
+
+impl MirrorBinding {
+    fn from_env(env: &Env) -> Self {
+        // Only a genuinely absent binding enables no-enrichment mode. A
+        // present invalid binding (or a lookup exception) still fails through
+        // connect_mirror's opaque mirror_binding diagnostic, never degrades.
+        match worker::js_sys::Reflect::get(
+            env,
+            &worker::wasm_bindgen::JsValue::from_str(MIRROR_HYPERDRIVE_BINDING),
+        ) {
+            Ok(value) if value.is_undefined() => Self::Unconfigured,
+            _ => Self::Configured,
+        }
+    }
+}
+
+#[path = "subsonic_pg.rs"]
+mod subsonic_pg;
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
+    mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_mirror: Option<CatalogueTestMirror>,
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+struct CatalogueTestMirror {
+    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+/// Inject connection acquisition only; execute the production catalogue SQL,
+/// decoders, early returns and error propagation against disposable PostgreSQL.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn catalogue_store_for_postgres_test(
+    app: tokio_postgres::Client,
+    mirror_configured: bool,
+    mirror: Result<tokio_postgres::Client, StoreError>,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+) -> impl Store {
+    PgStore {
+        env: None,
+        trace_id: "postgres-catalogue-test".into(),
+        mirror_binding: if mirror_configured {
+            MirrorBinding::Configured
+        } else {
+            MirrorBinding::Unconfigured
+        },
+        test_client: std::cell::RefCell::new(Some(app)),
+        test_mirror: Some(CatalogueTestMirror {
+            client: std::cell::RefCell::new(Some(mirror)),
+            attempts,
+        }),
+    }
 }
 
 /// Inject only connection acquisition; the handler still executes the real
@@ -680,7 +746,9 @@ pub fn session_retry_store_for_postgres_test(
     PgStore {
         env: None,
         trace_id: "postgres-refresh-test".into(),
+        mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_mirror: None,
     }
 }
 
@@ -787,15 +855,23 @@ impl PgStore {
         connected
     }
 
+    fn require_mirror(&self) -> Result<(), StoreError> {
+        match self.mirror_binding {
+            MirrorBinding::Configured => Ok(()),
+            MirrorBinding::Unconfigured => Err(self.statement_failed("api.db.mirror_unconfigured")),
+        }
+    }
+
     /// Mirror-cluster connection for the MusicBrainz enrichment reads (ADR
     /// 0002 §1): same dial/handshake/timeout shape as [`Self::connect`],
     /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
     /// are the `mirror_*` literals so an incident names the cluster that
-    /// refused (every catalogue read touches both).
+    /// refused; empty app results never need a mirror connection.
     async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = self.test_client.borrow_mut().take() {
-            return Ok(client);
+        if let Some(mirror) = &self.test_mirror {
+            mirror.attempts.set(mirror.attempts.get() + 1);
+            return mirror.client.borrow_mut().take().ok_or(StoreError)?;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -3271,21 +3347,70 @@ impl Store for PgStore {
         .await
     }
 
-    async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
-                // backends); the affected count was never read here.
-                client
-                    .query_typed(
-                        "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                let mut client = self.connect().await?;
+                crate::credential_session_store::revoke_sessions_and_native_credentials(
+                    &mut client,
+                    user_id,
+                    now,
+                )
+                .await
             },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn insert_subsonic_credential(
+        &self,
+        row: &crate::subsonic_lifecycle::PreparedCredential,
+        session: &crate::session::SessionClaims,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn subsonic_credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn revoke_subsonic_credential(
+        &self,
+        id: &str,
+        user_id: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                    .await
+                    .map(|count| count == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn revoke_all_subsonic_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -3297,48 +3422,24 @@ impl Store for PgStore {
     // database (only its HMAC plus the non-secret listing prefix). The
     // composite UNIQUE (pepper_version, key_hmac) is the lookup identity.
 
-    async fn insert_native_credential(&self, row: &NativeCredentialRow) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let scopes: Vec<String> = row
-            .record
-            .scopes
-            .iter()
-            .map(|scope| scope.as_str().to_string())
-            .collect();
-        let client = self.connect().await?;
-        // Account-deletion fence (ADR 0002 rule 3): the insert only lands
-        // while the owner's deleting_at is NULL, holding the user row
-        // FOR SHARE through the statement, so a fresh session during the
-        // 24 h grace cannot mint a new long-lived bearer path behind the
-        // marker. A fenced (0-row) insert fails closed as StoreError; the
-        // handler classifies it through `account_deleting` into the typed
-        // 409. The owner binds $2 (the user_id column), never a value.
-        let affected = client
-            .execute(
-                "INSERT INTO native_rest_credentials (id, user_id, label, key_prefix, key_hmac, \
-                 pepper_version, scopes, created_at, expires_at, created_from_ip) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
-                 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
-                &[
-                    &row.record.id,
-                    &row.record.user_id,
-                    &row.label,
-                    &row.record.key_prefix,
-                    &row.record.key_hmac,
-                    &i32::try_from(row.record.pepper_version).map_err(|_| StoreError)?,
-                    &scopes,
-                    &i64_of(row.record.created_at)?,
-                    &i64_of(row.record.expires_at)?,
-                    &row.created_from_ip,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        if affected == 0 {
-            return Err(StoreError);
-        }
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+    async fn insert_native_credential(
+        &self,
+        row: &NativeCredentialRow,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::credential_session_store::insert_native_credential(
+                    &mut client,
+                    row,
+                    session_id,
+                )
+                .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn native_credentials_for_user(
@@ -3430,37 +3531,6 @@ impl Store for PgStore {
         .await
     }
 
-    async fn revoke_all_native_credentials(
-        &self,
-        user_id: &str,
-        now: u64,
-    ) -> Result<u64, StoreError> {
-        Self::bounded(
-            async {
-                // An empty user id (upstream bug) must never become a mass
-                // revocation: revoke nothing without a database round trip.
-                if user_id.is_empty() {
-                    return Ok(0);
-                }
-                let client = self.connect().await?;
-                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
-                // backends); `RETURNING id` keeps the revoked count the
-                // `execute` result used to carry.
-                let revoked = client
-                    .query_typed(
-                        "UPDATE native_rest_credentials SET revoked_at = $2 \
-                 WHERE user_id = $1 AND revoked_at IS NULL RETURNING id",
-                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(revoked.len() as u64)
-            },
-            TOTAL_TIMEOUT_MS,
-        )
-        .await
-    }
-
     async fn record_native_credential_use(&self, id: &str, now: u64) -> Result<(), StoreError> {
         Self::bounded(
             async {
@@ -3517,6 +3587,17 @@ impl Store for PgStore {
                     .iter()
                     .map(catalogue_library_page_from_row)
                     .collect::<Result<_, _>>()?;
+                if page.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if self.mirror_binding == MirrorBinding::Unconfigured {
+                    return Ok(crate::catalogue::assemble_library_rows(
+                        &page,
+                        &[],
+                        &[],
+                        &[],
+                    ));
+                }
                 // Well-formed page MBIDs only, deduplicated: malformed
                 // stored values never reach a mirror probe.
                 let mut recording_mbids: Vec<String> = page
@@ -3620,6 +3701,10 @@ impl Store for PgStore {
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.catalogue_artists");
@@ -3665,6 +3750,10 @@ impl Store for PgStore {
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
+                if member_releases.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.catalogue_releases");
@@ -3713,6 +3802,10 @@ impl Store for PgStore {
                     .map(catalogue_member_pair_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_pairs = crate::catalogue::member_pair_arrays(&member);
+                if member_pairs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let (pair_releases, pair_recordings) =
                     crate::catalogue::member_pair_columns(&member_pairs);
                 let mirror = self.connect_mirror().await?;
@@ -3773,6 +3866,7 @@ impl Store for PgStore {
                 if member.is_empty() {
                     return Ok(None);
                 }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let rows = mirror
                     .query_typed(
@@ -3841,6 +3935,10 @@ impl Store for PgStore {
                     .map(catalogue_member_recording_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_recordings = crate::catalogue::member_recording_mbids(&member);
+                if member_recordings.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.require_mirror()?;
                 let mirror = self.connect_mirror().await?;
                 let limit = i64::from(crate::catalogue::CATALOGUE_RELEASE_TRACKS_MAX);
                 let rows = mirror
@@ -5767,8 +5865,11 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         store: &PgStore {
             env: Some(env.clone()),
             trace_id: trace_id.clone(),
+            mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_mirror: None,
         },
         mailer: &WebhookMailer {
             origin: config.origin.clone(),
@@ -5863,7 +5964,8 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 22] = [
+    const DB_FAILURE_EVENTS: [&str; 23] = [
+        "api.db.mirror_unconfigured",
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -6054,6 +6156,17 @@ mod tests {
             );
         }
         for event in DB_FAILURE_EVENTS {
+            if event == "api.db.mirror_unconfigured" {
+                let gate = production
+                    .split_once("fn require_mirror(&self)")
+                    .unwrap()
+                    .1
+                    .split_once("\n    }\n")
+                    .unwrap()
+                    .0;
+                assert!(gate.contains("self.statement_failed(\"api.db.mirror_unconfigured\")"));
+                continue;
+            }
             if let Some(phase) = event.strip_prefix("api.db.connect_failed.") {
                 let literal = format!("\"api.db.connect_failed.{phase}\"");
                 // Mirror phases live in the mirror connect; the app
@@ -7425,53 +7538,29 @@ mod tests {
     }
 
     #[test]
-    fn fenced_native_credential_mint_pins_owner_and_zero_row_guard() {
+    fn native_credential_writes_use_the_postgres_tested_transactions() {
         let source = include_str!("worker_entry.rs");
         let production = source
             .split_once("#[cfg(test)]")
             .expect("test module must exist")
             .0;
-        let fn_body = |name: &str| {
-            production
-                .split_once(name)
+        for name in [
+            "insert_native_credential",
+            "revoke_sessions_and_native_credentials",
+        ] {
+            let body = production
+                .split_once(&format!("async fn {name}("))
                 .unwrap_or_else(|| panic!("{name} must exist"))
                 .1
                 .split_once("\n    async fn ")
                 .expect("a following fn must bound the body")
-                .0
-                .to_string()
-        };
-        const NATIVE_FENCE: &str = "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
-        let mint = fn_body("async fn insert_native_credential(");
-        assert!(
-            mint.contains(NATIVE_FENCE),
-            "insert_native_credential must select its row through the owner fence"
-        );
-        assert!(
-            !mint.contains("WHERE id = $1"),
-            "insert_native_credential fence binds the owner ($2), never $1"
-        );
-        assert!(
-            mint.contains("SELECT $1, $2"),
-            "insert_native_credential must keep SELECT $1 bound to the credential id and $2 to the owner"
-        );
-        let mint_guard = mint
-            .find("if affected == 0")
-            .expect("insert_native_credential must fail closed on 0 rows");
-        let mint_ok = mint
-            .find("Ok(())")
-            .expect("insert_native_credential must return Ok on the write path");
-        assert!(
-            mint_guard < mint_ok,
-            "the zero-row guard must precede the success return"
-        );
-        let mint_arm_end = mint[mint_guard..]
-            .find('}')
-            .expect("the zero-row guard arm must close");
-        assert!(
-            mint[mint_guard..mint_guard + mint_arm_end].contains("return Err"),
-            "the zero-row guard must fail closed (return Err), not Ok"
-        );
+                .0;
+            assert!(
+                body.contains(&format!("crate::credential_session_store::{name}(")),
+                "the runtime must use the same transaction exercised by PostgreSQL tests"
+            );
+            assert!(body.contains("TOTAL_TIMEOUT_MS"));
+        }
     }
 
     #[test]

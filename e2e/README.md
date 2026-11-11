@@ -201,7 +201,8 @@ npm-based harness (`e2e/package-lock.json`).
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for provider 430 control | Real staging NNTP provider (a real service despite the `SYNTHETIC_` names — rename needs an operator; defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the provider allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a transport the endpoint helper cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for provider 430 control | No default — fail closed when missing. |
 | `TEST_NZB_PATH` | retired | Runtime path of the former secret-held real-NZB staging fixture. That leg is retired under the CC0-only fixture rule (`docs/fixture-audio-licences.md`): no workflow sets this anymore, staging ingests no NZB, and the legs that needed an uploaded track skip by name until admin ingest can seed a curated track. Never set. |
-| `REAL_NZB_MODE` | retired | Former journey-gate mode flag for the retired real-NZB leg. No workflow sets it; the gate's standard eleven-skip budget governs every run. |
+| `REAL_NZB_MODE` | retired | Former journey-gate mode flag for the retired real-NZB leg. No workflow sets it; the gate's standard twelve-skip budget governs every run. |
+| `SHARED_CATALOGUE_PUBLISHED` | after admin publish | Set to `true` only after an admin consumer publishes a curated matched release on staging. Before that, the named shared-catalogue case is a budgeted `PARKED:` skip, not acceptance. Once true, a skip fails the gate; a missing case fails configured runs in either mode. |
 | `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | retired | Former NZB fixture secrets for the retired staging leg. No workflow references them; the operator deletes them. |
 
 How the suite uses them:
@@ -293,8 +294,9 @@ How the suite uses them:
   skip by name under TWO-1635. User NZB ingest is retired, so they wait
   for admin ingest to seed a curated track on staging (RAR-set legs
   additionally keep their TWO-1174 park). The journey gate budgets the
-  fixed standard allow-list of eleven skips (fixme plus the ten parked
-  legs); any failure or off-list skip still fails the run. The dormant
+  standard budget of twelve skips (fixme, the ten parked legs and the
+  shared-catalogue park until publication); any failure or off-list skip
+  still fails the run. The shared park is never counted as passed. The dormant
   resolver (`helpers/real-nzb-fixture.ts`), the truncation script
   (`scripts/prepare-real-nzb.mjs`) and the gate's `REAL_NZB_MODE` branch
   stay only until the parked specs un-park or are deleted; owner rule
@@ -345,8 +347,17 @@ How the suite uses them:
   junit evidence, zero journeys ran, every journey skipped, more skips than
   the one remaining `test.fixme` leg (recording_mbids),
   any skip outside that allow-list, any failure, or a missing `QA_AUTH_TOKEN`
-  fails the job instead of passing silently. Failure artifacts
-  are kept 7 days.
+  fails the job instead of passing silently. The named populated-catalogue leg
+  in `tests/catalogue.spec.ts` has a budgeted `PARKED:` skip while
+  `SHARED_CATALOGUE_PUBLISHED` is not `true`: the configured full-journey gate
+  can be green, but that is not populated-catalogue acceptance. With the variable
+  `true`, a skip fails the gate. A missing, duplicated or failed case fails in
+  either mode. After the admin consumer publishes
+  a curated matched release on staging, set the repository variable
+  `SHARED_CATALOGUE_PUBLISHED=true` and rerun the post-deploy journey. The leg
+  must then observe identical nonempty, mirror-enriched libraries in two distinct
+  fresh QA-seam accounts; empty data cannot pass merely by setting the variable.
+  Failure artifacts are kept 7 days.
 - `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
   chromium install (`--with-deps`), `tsc --noEmit`,
   helper/workflow self-tests, `playwright test --list`, and the

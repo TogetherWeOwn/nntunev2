@@ -106,6 +106,45 @@ public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
 Worker secrets and the staging variable values are Operator-wired, and the
 lane skips until they are.
 
+### Catalogue mirror availability
+
+The staging API can deploy without `HYPERDRIVE_ID_MB`. An unset or empty
+variable omits the generated `MB_DB` Hyperdrive block and reports
+`mirror: absent (no-enrichment mode)`. A nonempty variable must still match
+the shared mirror ID in the binding manifest. The app Hyperdrive cache-disabled
+attestation, read-only schema gate and deployment-outcome records remain required.
+
+`PgStore` checks binding presence once per request; absence is not a caught
+connection error. Empty app library pages and empty member collections return
+before any mirror connection, whether or not the binding is configured.
+
+- `/v1/library` and its `/api/library` alias return the same app-backed rows
+  without enrichment when the binding is absent. Stored MBIDs, full recording
+  arrays, legacy playback IDs and distinct `occurrence_key` values are preserved;
+  mirror title/artist/duration/position fields remain null. Existing own-origin
+  art-path derivation is unchanged; this does not add an art cache.
+- Nonempty member `/v1/tracks`, `/v1/releases`, `/v1/artists` and member release
+  detail return the existing opaque 503 `service_unavailable` envelope without
+  connecting when the mirror is absent. Internally this logs
+  `api.db.mirror_unconfigured`, never configuration values.
+- Release detail and its track read probe app membership before requiring the
+  mirror. Malformed/nonmember IDs remain 404 (or an empty store track result),
+  not a mirror-availability oracle.
+- A configured mirror that fails to connect or execute a statement is still a
+  store error, not no-enrichment mode. Existing `api.db.connect_failed.mirror_*`
+  and statement-failure diagnostics remain opaque. Library store errors remain
+  generic 500s; entity store errors use the opaque 503 envelope.
+
+Regression coverage is in `tests/catalogue_store_postgres.rs` (real production
+store reads with disposable app rows and injected mirror acquisition), the
+handler tests in `src/handlers.rs`, and the offline deployment workflow tests in
+`e2e/tests/api-deploy-outcome.spec.ts`. CI runs these on GitHub Actions; no local
+full-suite transcript substitutes for exact-head Actions evidence.
+
+This follows [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails):
+CC0 core only, no NC enrichment, no new art caching, and no YouTube playback or
+clean-room UI changes. The M1 contract remains additive and unchanged.
+
 ### Session refresh retries without a stale-cookie grace period
 
 An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:
@@ -564,7 +603,7 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:477-529`) and
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:479-536`) and
 `fixture-check` (`.github/workflows/ci.yml:93-102`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under

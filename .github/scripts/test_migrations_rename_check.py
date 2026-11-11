@@ -484,7 +484,21 @@ class GitFixture(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(migrations_rename_check.main(args), 1)
 
-    def run_workflow(self, pages, metadata, api_exit=0):
+    def full_metadata(self, metadata):
+        result = copy.deepcopy(metadata)
+        result.setdefault("number", 1)
+        for side in ("base", "head"):
+            result[side].setdefault("ref", "main" if side == "base" else "feature")
+            result[side].setdefault("repo", {"id": 1, "full_name": "example/project"})
+        return result
+
+    def event(self, metadata):
+        metadata = self.full_metadata(metadata)
+        metadata = {key: metadata[key] for key in ("number", "base", "head", "changed_files")}
+        return {"number": 1, "repository": metadata["base"]["repo"], "pull_request": metadata}
+
+    def run_workflow(self, pages, metadata, api_exit=0, *, samples=None, event=None,
+                     missing_code=False, poison=False):
         from test_ci_pnpm_retry import split_jobs, split_steps, step_field
 
         source = pathlib.Path(__file__).resolve().parents[2]
@@ -500,28 +514,52 @@ class GitFixture(unittest.TestCase):
         (workspace / "pr-data").symlink_to(self.root, target_is_directory=True)
         scripts = workspace / "trusted-checker/.github/scripts"
         scripts.mkdir(parents=True)
-        for name in ("migration_history.py", "migrations_rename_check.py"):
-            shutil.copyfile(source / ".github/scripts" / name, scripts / name)
+        for name in ("migration_history.py", "migration_snapshot.py", "migrations_rename_check.py"):
+            if not missing_code:
+                shutil.copyfile(source / ".github/scripts" / name, scripts / name)
         api = workspace / "api"
         api.mkdir()
         self.workflow_api = api
-        self.assertFalse((self.root / ".github/scripts").exists())
+        if poison:
+            bad = "raise RuntimeError('PR-controlled Python must not load')\n"
+            for name in ("migration_snapshot.py", "migration_history.py", "json.py", "sitecustomize.py"):
+                (self.root / name).write_text(bad)
         (api / "files.json").write_text(json.dumps(pages))
-        (api / "metadata.json").write_text(json.dumps(metadata))
-        # Exercise the actual workflow shell and jq, replacing only the network.
+        metadata = self.full_metadata(metadata)
+        if event is None:
+            event = self.event(metadata)
+            event["pull_request"]["base"]["sha"] = self.base
+            event["pull_request"]["head"]["sha"] = self.git("rev-parse", "HEAD")
+        (api / "event.json").write_text(json.dumps(event))
+        (api / "samples.json").write_text(json.dumps(
+            [self.full_metadata(m) for m in samples] if samples else [metadata]))
+        # Exercise the actual workflow shell/isolated imports, replacing only network.
         stub = api / "gh"
         stub.write_text(
-            "#!/usr/bin/env python3\nimport os, pathlib, sys\n"
+            "#!/usr/bin/env python3\nimport os, pathlib, sys, json\n"
             "root = pathlib.Path(os.environ['RUNNER_TEMP'])\n"
             "files = '/files?' in sys.argv[-1]\n"
-            "print((root / ('files.json' if files else 'metadata.json')).read_text())\n"
+            "if files:\n"
+            "    pages = json.loads((root / 'files.json').read_text())\n"
+            "    page = int(sys.argv[-1].rsplit('page=', 1)[1])\n"
+            "    print(json.dumps(pages[page - 1] if page <= len(pages) else []))\n"
+            "else:\n"
+            "    counter = root / 'calls'\n"
+            "    n = int(counter.read_text()) if counter.exists() else 0\n"
+            "    samples = json.loads((root / 'samples.json').read_text())\n"
+            "    print(json.dumps(samples[min(n, len(samples) - 1)]))\n"
+            "    counter.write_text(str(n + 1))\n"
             "sys.exit(int(os.environ['API_EXIT']) if files else 0)\n"
         )
         stub.chmod(0o755)
         env = {**os.environ, "PATH": str(api) + os.pathsep + os.environ["PATH"],
                "BASH_ENV": "/dev/null", "RUNNER_TEMP": str(api), "REPO": "example/project", "PR_NUMBER": "1",
                "BASE_SHA": self.base, "HEAD_SHA": self.git("rev-parse", "HEAD"),
-               "GITHUB_WORKSPACE": str(workspace), "API_EXIT": str(api_exit)}
+               "GITHUB_WORKSPACE": str(workspace), "GITHUB_EVENT_PATH": str(api / "event.json"),
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+               "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "core.hooksPath",
+               "GIT_CONFIG_VALUE_0": "/dev/null", "GIT_CONFIG_KEY_1": "core.fsmonitor",
+               "GIT_CONFIG_VALUE_1": "false", "API_EXIT": str(api_exit)}
         return subprocess.run(["bash", "-eo", "pipefail", "-c", command], cwd=api,
                               env=env, capture_output=True, text=True, timeout=30)
 
@@ -553,7 +591,7 @@ class GitFixture(unittest.TestCase):
     def test_workflow_projection_keeps_fail_closed_coverage_checks(self):
         pages, metadata = self.workflow_inputs()
         for mutation, diagnostic in (("truncated", "truncated or duplicated"),
-                                     ("short-page", "pagination is malformed or incomplete"),
+                                     ("short-page", "truncated or duplicated"),
                                      ("missing-migration", "API migration coverage differs"),
                                      ("missing-old-path", "distinct old path"),
                                      ("stale-head", "pinned event commits"),
@@ -580,8 +618,106 @@ class GitFixture(unittest.TestCase):
                 self.assertIn(diagnostic, result.stderr)
         # A plausible complete response followed by an API failure must not pass.
         result = self.run_workflow(pages, metadata, api_exit=7)
-        self.assertEqual(7, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("API request failed", result.stderr)
         self.assertNotIn("verified", result.stdout)
+
+    def test_workflow_recovers_advanced_base_without_changing_event_or_head(self):
+        pages, metadata = self.workflow_inputs()
+        head = metadata["head"]["sha"]
+        self.git("checkout", "-qb", "advanced-base", self.base)
+        (self.root / "README.md").write_text("base branch advances independently\n")
+        advanced = self.commit("advance base")
+        self.git("checkout", "--detach", head)
+        live = copy.deepcopy(metadata)
+        live["base"]["sha"] = advanced
+        # Before the fix this exact event B0 / live B1 fixture is refused.
+        with self.assertRaisesRegex(history.HistoryError, "pinned event commits"):
+            history.api_coverage(json.dumps(pages), json.dumps(live), self.base, head)
+        result = self.run_workflow(pages, live, samples=[metadata, live, live, live])
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
+        self.assertEqual(snapshot["attempt"], 2)
+        self.assertEqual(snapshot["event"]["base"]["sha"], self.base)
+        self.assertEqual(snapshot["before"]["base"]["sha"], advanced)
+        self.assertEqual(snapshot["before"]["head"]["sha"], head)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(outcomes["event"]["base"], self.base)
+        self.assertEqual(outcomes["effective"]["base"], advanced)
+        self.assertEqual(outcomes["event"]["merge_base"], self.base)
+        self.assertEqual(outcomes["effective"]["merge_base"], self.base)
+
+    def test_workflow_original_range_cannot_be_hidden_by_effective_base(self):
+        self.write("0001_old.sql")
+        self.commit("birth")
+        self.rename("0001_old.sql", "0002_final.sql", edit=True)
+        advanced = self.git("rev-parse", "HEAD")
+        entries = self.entries()  # Deliberately omit the chronological edge.
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("missing source history")
+        files = [[{"filename": "migrations/manifest.toml", "status": "modified"}]]
+        live = {"base": {"sha": advanced}, "head": {"sha": head}, "changed_files": 1}
+        coverage = history.api_coverage(json.dumps(files), json.dumps(live), advanced, head)
+        history.verify(self.root, advanced, head, manifest(entries), coverage)
+        result = self.run_workflow(files, live)
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("lacks source_rename_history", result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "failed")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertIn("lacks source_rename_history", outcomes["diagnostic"])
+        self.assertIn('"outcome": "not_run"', result.stdout)
+
+    def test_workflow_effective_merge_base_manifest_is_independent(self):
+        self.write("0001_final.sql")
+        (self.root / "migrations/manifest.toml").write_text(manifest(self.entries()))
+        self.base = self.commit("original baseline")
+        entries = self.entries()
+        entries[0]["renamed_from"] = [{"file": "0000_historical.sql", "sha256": entries[0]["sha256"]}]
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        advanced = self.commit("effective baseline with inherited applied alias")
+        entries[0]["renamed_from"] = []
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("remove effective baseline alias")
+        history.verify(self.root, self.base, head, manifest(entries))
+        files = [[{"filename": "migrations/manifest.toml", "status": "modified"}]]
+        live = {"base": {"sha": advanced}, "head": {"sha": head}, "changed_files": 1}
+        result = self.run_workflow(files, live)
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("append-only against base", result.stderr)
+        report = self.workflow_api / "pr-validation.json"
+        outcomes = json.loads(report.read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertEqual(outcomes["event"]["base"], self.base)
+        self.assertEqual(outcomes["effective"]["base"], advanced)
+        self.assertIn("append-only against base", outcomes["diagnostic"])
+        self.assertLessEqual(len(outcomes["diagnostic"]), 1024)
+        self.assertLess(report.stat().st_size, 16384)
+        self.assertIn('"outcome": "failed"', result.stdout)
+        self.assertNotIn("pinned Git source lineage and applied aliases verified", result.stdout)
+
+    def test_workflow_bracket_exhaustion_and_observed_head_movement_fail(self):
+        pages, metadata = self.workflow_inputs()
+        changed = copy.deepcopy(metadata)
+        changed["changed_files"] += 1
+        result = self.run_workflow(pages, metadata, samples=[metadata, changed] * 3)
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("all bounded attempts", result.stderr)
+        moved = copy.deepcopy(metadata)
+        moved["head"]["sha"] = self.base
+        result = self.run_workflow(pages, metadata, samples=[metadata, moved])
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("pinned event commits", result.stderr)
+
+    def test_workflow_both_launchers_isolate_imports_and_refuse_missing_code(self):
+        pages, metadata = self.workflow_inputs()
+        result = self.run_workflow(pages, metadata, poison=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        result = self.run_workflow(pages, metadata, poison=True, missing_code=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("ModuleNotFoundError", result.stderr)
+        self.assertNotIn("PR-controlled Python must not load", result.stderr)
 
     def test_duplicate_net_and_git_coverage_is_idempotent(self):
         self.write("0001_old.sql")
@@ -600,7 +736,8 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(h.collect(), states)
 
     def workflow_checker(self, entries, *, poison=False, files=None, metadata=None,
-                         missing=None, truncated=False, missing_code=False):
+                         missing=None, truncated=False, missing_code=False,
+                         missing_snapshot=False):
         """Run the real isolated workflow launcher against checker-free PR data."""
         scripts = pathlib.Path(__file__).resolve().parent
         workflow = (scripts.parent / "workflows/migrations-staging.yml").read_text()
@@ -615,7 +752,8 @@ class GitFixture(unittest.TestCase):
             bad = "raise RuntimeError('PR-controlled Python must not load')\n"
             (self.root / ".github/scripts").mkdir(parents=True)
             for directory in (self.root, self.root / ".github/scripts"):
-                for name in ("migrations_rename_check.py", "migration_history.py", "json.py", "sitecustomize.py"):
+                for name in ("migrations_rename_check.py", "migration_history.py",
+                             "migration_snapshot.py", "json.py", "sitecustomize.py"):
                     (directory / name).write_text(bad)
         if files is None:
             files = [[{"filename": "migrations/manifest.toml", "status": "modified"}] + [
@@ -634,6 +772,13 @@ class GitFixture(unittest.TestCase):
                 (evidence / "files.json").write_text("[[")
             if missing_code:
                 scripts = evidence / "absent-trusted-scripts"
+            if missing_snapshot:
+                # Trusted closure lacking only the snapshot dependency.
+                scripts = evidence / "partial-trusted-scripts"
+                scripts.mkdir()
+                real = pathlib.Path(__file__).resolve().parent
+                for name in ("migration_history.py", "migrations_rename_check.py"):
+                    shutil.copyfile(real / name, scripts / name)
             args = [sys.executable, "-I", "-", str(scripts), "--root", str(self.root),
                     "--base-sha", self.base, "--head-sha", head,
                     "--files-file", str(evidence / "files.json"),
@@ -699,6 +844,51 @@ class GitFixture(unittest.TestCase):
         self.assertIn("ModuleNotFoundError", result.stderr)
         self.assertNotIn("PR-controlled Python must not load", result.stderr)
 
+    def test_workflow_missing_trusted_snapshot_never_falls_back_to_pr(self):
+        self.write("0001_new.sql")
+        result = self.workflow_checker(self.entries(), poison=True, missing_snapshot=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ModuleNotFoundError", result.stderr)
+        self.assertIn("migration_snapshot", result.stderr)
+        self.assertNotIn("PR-controlled Python must not load", result.stderr)
+
+    def legacy_cli(self, entries, **overrides):
+        """Legacy caller contract: no --event-file, minimal evidence files."""
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        head = self.commit("record source metadata")
+        files = [{"filename": "migrations/manifest.toml", "status": "modified"}] + [
+            {"filename": "migrations/" + e["file"], "status": "added"} for e in entries]
+        metadata = {"base": {"sha": self.base}, "head": {"sha": head}, "changed_files": len(files)}
+        metadata.update(overrides)
+        (self.root / "files.json").write_text(json.dumps([files]))
+        (self.root / "metadata.json").write_text(json.dumps(metadata))
+        args = ["--root", str(self.root), "--base-sha", self.base, "--head-sha", head,
+                "--files-file", str(self.root / "files.json"),
+                "--metadata-file", str(self.root / "metadata.json")]
+        return args, head
+
+    def test_legacy_caller_contract_without_event_file(self):
+        entries = self.chain()
+        args, _ = self.legacy_cli(entries)
+        self.assertNotIn("--event-file", args)
+        output = self.root / "edges.json"
+        validation = self.root / "validation.json"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(migrations_rename_check.main(args + ["--output", str(output)]), 0)
+        self.assertEqual("migrations-staging: pinned Git source lineage and applied aliases verified\n",
+                         out.getvalue())
+        self.assertNotIn("dual history", out.getvalue())
+        self.assertFalse(validation.exists())
+        edges = json.loads(output.read_text())
+        self.assertEqual(json.loads(json.dumps(self.verify(entries))), edges)
+
+    def test_legacy_rejects_moved_base_as_before(self):
+        entries = self.chain()
+        args, head = self.legacy_cli(entries, base={"sha": "0" * 40})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(migrations_rename_check.main(args), 1)
+        self.assertIn("API metadata does not match pinned event commits", err.getvalue())
+
 
 class WorkflowBoundary(unittest.TestCase):
     def test_separate_immutable_code_and_data_pins(self):
@@ -711,6 +901,15 @@ class WorkflowBoundary(unittest.TestCase):
         self.assertIn("path: pr-data", data)
         self.assertIn("fetch-depth: 0", data)
         self.assertEqual(workflow.count("persist-credentials: false"), 2)
+        collect = data.split("      - name: Collect pinned PR API evidence")[1].split(
+            "      - name: Check migration rename history")[0]
+        self.assertIn("working-directory: ${{ runner.temp }}", collect)
+        self.assertIn("python3 -I -c", collect)
+        self.assertIn('"$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', collect)
+        self.assertIn('--event-file "$GITHUB_EVENT_PATH"', collect)
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", collect)
+        self.assertIn("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", collect)
+        self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", collect)
         check = workflow.split("      - name: Check migration rename history")[1]
         self.assertIn("working-directory: ${{ runner.temp }}", check)
         self.assertIn('python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', check)

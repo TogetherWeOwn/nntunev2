@@ -114,7 +114,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -159,7 +159,7 @@ jobs:
       group: ${{ github.workflow }}-staging-api-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -183,14 +183,12 @@ jobs:
         working-directory: workers/api
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
-          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
           set -euo pipefail
           missing=""
           [ -n "${HYPERDRIVE_ID_STAGING:-}" ] || missing="$missing HYPERDRIVE_ID_STAGING"
-          [ -n "${HYPERDRIVE_ID_MB:-}" ] || missing="$missing HYPERDRIVE_ID_MB"
           [ -n "${API_RP_ID_STAGING:-}" ] || missing="$missing API_RP_ID_STAGING"
           [ -n "${API_RP_ORIGIN_STAGING:-}" ] || missing="$missing API_RP_ORIGIN_STAGING"
           if [ -n "$missing" ]; then
@@ -203,6 +201,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build api with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-api.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true'
@@ -256,12 +266,16 @@ jobs:
           # Mirror pin: the generated config binds HYPERDRIVE_ID_MB for the
           # catalogue slice-1 mirror probes (`MB_DB` in src/worker_entry.rs),
           # likewise bypassing binding-parity. The mirror is shared, so the
-          # manifest must name the same id in both environments.
+          # manifest must name the same id in both environments. The var is
+          # optional: absent or empty omits the MB_DB block (no-enrichment
+          # mode); a present id must equal the manifest id exactly.
           mb = next(b for b in api["binding"] if b["binding"] == "MB_DB")
           assert mb["staging"] == mb["prod"], \
               "api MB_DB must name the shared mirror id in both environments"
-          assert os.environ["HYPERDRIVE_ID_MB"] == mb["staging"], \
-              "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
+          mirror_id = os.environ.get("HYPERDRIVE_ID_MB", "")
+          if mirror_id:
+              assert mirror_id == mb["staging"], \
+                  "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
           PY
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
@@ -274,8 +288,7 @@ jobs:
           main = "build/worker/shim.mjs"
           compatibility_date = "2026-10-01"
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-api-staging"
@@ -337,12 +350,19 @@ jobs:
           [[env.staging.hyperdrive]]
           binding = "HYPERDRIVE"
           id = "${HYPERDRIVE_ID_STAGING}"
+          EOF
+          if [ -n "${HYPERDRIVE_ID_MB:-}" ]; then
+            # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
+            cat >> wrangler.toml <<EOF
 
-          # Shared MusicBrainz read mirror for the catalogue slice-1 probes.
           [[env.staging.hyperdrive]]
           binding = "MB_DB"
           id = "${HYPERDRIVE_ID_MB}"
           EOF
+            echo "mirror: configured (MB_DB bound)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "mirror: absent (no-enrichment mode)" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
         run: |
@@ -442,7 +462,7 @@ jobs:
       group: ${{ github.workflow }}-staging-mb-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -480,6 +500,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build mb with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/mb
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-mb.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-mb.log"
+          git diff --exit-code -- Cargo.lock
       - name: Generate staging wrangler.toml
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/mb
@@ -516,8 +548,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-mb-staging"
@@ -640,7 +671,7 @@ jobs:
       group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -694,6 +725,18 @@ jobs:
               echo "Enable only after search intake closes — runbook step 1."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build ingest with canonical tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        working-directory: workers/ingest
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-ingest.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-ingest.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
@@ -750,8 +793,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-ingest-staging"
@@ -922,6 +964,8 @@ jobs:
       # Same-run staging-api outcome, so build identity holds the API to
       # expected_sha only when it deployed this run and says web=API=head
       # is not claimed when it was unconfigured.
+      api_deployed: ${{ needs.staging-api.outputs.deployed }}
+      api_source_sha: ${{ needs.staging-api.outputs.source_sha }}
       api_deploy_outcome: ${{ needs.staging-api.outputs.outcome }}
     secrets:
       STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
