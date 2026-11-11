@@ -16,7 +16,8 @@ use super::posted_generation_legacy_fence::insert_legacy;
 use super::*;
 use nntune_ingest::posted_generations::{
     begin_verification_round, confirm_article, confirm_retention, finish_verification,
-    promote_candidate, ArticleSide, GenerationHandle, MutationOutcome, PromotionOutcome,
+    prepare_content_check, promote_candidate, record_content_check, ArticleSide, ContentCheckReport,
+    ContentCheckResult, GenerationHandle, MutationOutcome, PromotionOutcome,
 };
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -82,7 +83,26 @@ async fn failed_predecessor(db: &Client, c: &Case) -> (Sealed, i64) {
     (old, revision)
 }
 
+fn lane(side: ArticleSide) -> &'static str {
+    match side {
+        ArticleSide::Post => "pool-a",
+        ArticleSide::Verify => "pool-b",
+    }
+}
+
+fn intact(s: &Sealed, side: ArticleSide) -> ContentCheckResult<'_> {
+    ContentCheckResult::Intact(ContentCheckReport {
+        backbone: lane(side),
+        plan_sha256: &s.plan,
+        plaintext_sha256: &s.hash,
+        plaintext_size: 1024,
+        checked_articles: 3,
+    })
+}
+
 /// Admit the replacement and run it to a usable, promotable candidate.
+/// Presence alone never retains: both backbones observe `Intact` content
+/// before `confirm_retention` may mark the candidate `usable`.
 async fn usable_candidate(db: &mut Client, attempt: &AttemptHandle, c: &Case) -> GenerationHandle {
     let admitted_handle = match try_admit(db, attempt, &c.sealed).await {
         Ok(AdmissionOutcome::Admitted(handle, _)) => handle,
@@ -104,6 +124,16 @@ async fn usable_candidate(db: &mut Client, attempt: &AttemptHandle, c: &Case) ->
         finish_verification(db, &handle).await,
         "finish verification",
     );
+    for side in [ArticleSide::Post, ArticleSide::Verify] {
+        let permit = match prepare_content_check(db, &handle, side).await {
+            Ok(Some(permit)) => permit,
+            _ => panic!("expected a content-check permit"),
+        };
+        handle = applied(
+            record_content_check(db, &permit, intact(&c.sealed, side)).await,
+            "record intact content",
+        );
+    }
     applied(confirm_retention(db, &handle).await, "confirm retention")
 }
 
@@ -551,12 +581,12 @@ fn postgres_completion_migration_0054_replay_preserves_multi_generation_custody(
             "SELECT (SELECT md5(string_agg(t::text, ',' ORDER BY t.id)) FROM posted_files t \
                  WHERE t.plaintext_sha256 = $1), \
                  (SELECT md5(t::text) FROM posted_file_registry t WHERE t.plaintext_sha256 = $1), \
-                 (SELECT md5(t::text) FROM posted_file_operations t WHERE t.id = $2), \
+                 (SELECT md5(t::text) FROM posted_file_operations t WHERE t.id = $3), \
                  (SELECT md5(t::text) FROM posted_file_health t WHERE t.generation_id = $2), \
                  (SELECT md5(string_agg(t::text, ',' ORDER BY t.kind, t.owner_id)) \
                    FROM posted_file_references t WHERE t.generation_id = $2)";
         let before_row = db
-            .query_one(snapshot_sql, &[&hash, &c.sealed.generation])
+            .query_one(snapshot_sql, &[&hash, &c.sealed.generation, &c.sealed.op])
             .await
             .quiet("snapshot multi-generation custody");
         let before: Vec<Option<String>> = (0..5).map(|i| before_row.get(i)).collect();
@@ -570,10 +600,14 @@ fn postgres_completion_migration_0054_replay_preserves_multi_generation_custody(
             .quiet("replay migration 0054 again");
 
         let after_row = db
-            .query_one(snapshot_sql, &[&hash, &c.sealed.generation])
+            .query_one(snapshot_sql, &[&hash, &c.sealed.generation, &c.sealed.op])
             .await
             .quiet("snapshot custody after replay");
         let after: Vec<Option<String>> = (0..5).map(|i| after_row.get(i)).collect();
+        assert!(
+            after.iter().all(Option::is_some),
+            "every custody component must resolve: {after:?}"
+        );
         assert_eq!(before, after, "migration replay changed custody");
         assert_eq!(
             count(
@@ -583,6 +617,93 @@ fn postgres_completion_migration_0054_replay_preserves_multi_generation_custody(
             )
             .await,
             2
+        );
+    });
+}
+
+#[test]
+fn postgres_completion_presence_only_candidate_is_not_retained() {
+    run_test(async {
+        let mut db = connect().await;
+        let c = case(&db).await;
+        let attempt = acquire(&mut db, &c.job, &c.owner, 0).await;
+        let admitted_handle = match try_admit(&mut db, &attempt, &c.sealed).await {
+            Ok(AdmissionOutcome::Admitted(handle, _)) => handle,
+            _ => panic!("candidate was not admitted"),
+        };
+        let mut handle = applied(
+            begin_verification_round(&mut db, &admitted_handle).await,
+            "begin verification round",
+        );
+        for slot in SLOTS {
+            for side in [ArticleSide::Post, ArticleSide::Verify] {
+                handle = applied(
+                    confirm_article(&mut db, &handle, slot, side).await,
+                    "confirm fixture article",
+                );
+            }
+        }
+        handle = applied(
+            finish_verification(&mut db, &handle).await,
+            "finish verification",
+        );
+        // Presence completion stamps `verified_at` but is not content
+        // proof: retention without any `Intact` observation is incomplete,
+        // the candidate stays `verifying`, and it cannot promote.
+        assert!(
+            matches!(
+                confirm_retention(&mut db, &handle).await,
+                Ok(MutationOutcome::Incomplete)
+            ),
+            "presence-only candidate was retained"
+        );
+        let (state, _, retained) = health_state(&db, &c.sealed.generation).await;
+        assert_eq!(state, "verifying");
+        assert!(retained.is_none());
+        assert!(
+            matches!(
+                promote_candidate(&mut db, &handle).await,
+                Ok(PromotionOutcome::NotReady)
+            ),
+            "presence-only candidate promoted"
+        );
+        // One intact side is still not enough; both backbones must observe.
+        let permit = match prepare_content_check(&mut db, &handle, ArticleSide::Post).await {
+            Ok(Some(permit)) => permit,
+            _ => panic!("expected a content-check permit"),
+        };
+        handle = applied(
+            record_content_check(&mut db, &permit, intact(&c.sealed, ArticleSide::Post)).await,
+            "record intact post side",
+        );
+        assert!(
+            matches!(
+                confirm_retention(&mut db, &handle).await,
+                Ok(MutationOutcome::Incomplete)
+            ),
+            "single-sided candidate was retained"
+        );
+        let permit = match prepare_content_check(&mut db, &handle, ArticleSide::Verify).await {
+            Ok(Some(permit)) => permit,
+            _ => panic!("expected a content-check permit"),
+        };
+        handle = applied(
+            record_content_check(&mut db, &permit, intact(&c.sealed, ArticleSide::Verify)).await,
+            "record intact verify side",
+        );
+        handle = applied(
+            confirm_retention(&mut db, &handle).await,
+            "confirm retention after both intact sides",
+        );
+        let (state, _, retained) = health_state(&db, &c.sealed.generation).await;
+        assert_eq!(state, "usable");
+        assert!(retained.is_some());
+        assert!(
+            matches!(
+                promote_candidate(&mut db, &handle).await,
+                Ok(PromotionOutcome::Promoted)
+            ),
+            "content-verified candidate was not promoted"
         );
     });
 }

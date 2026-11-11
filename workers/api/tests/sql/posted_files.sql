@@ -21,6 +21,7 @@ DO $$
 DECLARE
     row_count_var INTEGER;
     file_id_var TEXT;
+    got_constraint TEXT;
 BEGIN
     -- Statement 1: full crypto-complete insert. id and created_at are
     -- DB-owned; post_verified_at/last_retention_check stay NULL until the
@@ -201,46 +202,133 @@ BEGIN
         NULL;
     END;
 
-    -- Negative: short header nonce.
+    -- Negative: short header nonce. The row is otherwise crypto-complete
+    -- so the targeted CHECK — not the completeness guard — rejects it.
     BEGIN
-        INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, header_nonce)
-        VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                'spool-post', 'spool-verify', 1,
-                '\x000000000000000000000000'::bytea);
+        INSERT INTO posted_files (
+            plaintext_sha256, backbone_post, backbone_verify, article_count,
+            plaintext_size, article_payload_size, header_nonce,
+            file_key_encrypted, file_key_envelope_version, file_key_kek_version,
+            file_key_dek_wrapped_nonce, file_key_dek_wrapped,
+            file_key_payload_nonce, file_key_payload_format,
+            manifest_encrypted, manifest_envelope_version, manifest_kek_version,
+            manifest_dek_wrapped_nonce, manifest_dek_wrapped,
+            manifest_payload_nonce, manifest_payload_format
+        ) VALUES (
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'spool-post', 'spool-verify', 1,
+            720896, 721072, '\x000000000000000000000000000000000000000000'::bytea,
+            '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1,
+            '\x0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1
+        );
         RAISE EXCEPTION 'CHECK accepted a short header nonce';
     EXCEPTION WHEN check_violation THEN
-        NULL;
+        GET STACKED DIAGNOSTICS got_constraint = CONSTRAINT_NAME;
+        IF got_constraint = 'posted_files_crypto_complete' THEN
+            RAISE EXCEPTION 'completeness guard fired instead of the header nonce CHECK';
+        END IF;
     END;
 
-    -- Negative: short wrapped DEK.
+    -- Negative: short wrapped DEK (complete companions; targeted CHECK).
     BEGIN
-        INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, file_key_dek_wrapped)
-        VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                'spool-post', 'spool-verify', 1,
-                '\x00000000000000000000000000000000'::bytea);
+        INSERT INTO posted_files (
+            plaintext_sha256, backbone_post, backbone_verify, article_count,
+            plaintext_size, article_payload_size, header_nonce,
+            file_key_encrypted, file_key_envelope_version, file_key_kek_version,
+            file_key_dek_wrapped_nonce, file_key_dek_wrapped,
+            file_key_payload_nonce, file_key_payload_format,
+            manifest_encrypted, manifest_envelope_version, manifest_kek_version,
+            manifest_dek_wrapped_nonce, manifest_dek_wrapped,
+            manifest_payload_nonce, manifest_payload_format
+        ) VALUES (
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'spool-post', 'spool-verify', 1,
+            720896, 721072, '\x000000000000000000000000000000000000000000000000'::bytea,
+            '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x00000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1,
+            '\x0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1
+        );
         RAISE EXCEPTION 'CHECK accepted a short wrapped DEK';
     EXCEPTION WHEN check_violation THEN
-        NULL;
+        GET STACKED DIAGNOSTICS got_constraint = CONSTRAINT_NAME;
+        IF got_constraint = 'posted_files_crypto_complete' THEN
+            RAISE EXCEPTION 'completeness guard fired instead of the wrapped DEK CHECK';
+        END IF;
     END;
 
-    -- Negative: wrong envelope version.
+    -- Negative: wrong envelope version (complete companions; targeted CHECK).
     BEGIN
-        INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, file_key_envelope_version)
-        VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                'spool-post', 'spool-verify', 1, 1);
+        INSERT INTO posted_files (
+            plaintext_sha256, backbone_post, backbone_verify, article_count,
+            plaintext_size, article_payload_size, header_nonce,
+            file_key_encrypted, file_key_envelope_version, file_key_kek_version,
+            file_key_dek_wrapped_nonce, file_key_dek_wrapped,
+            file_key_payload_nonce, file_key_payload_format,
+            manifest_encrypted, manifest_envelope_version, manifest_kek_version,
+            manifest_dek_wrapped_nonce, manifest_dek_wrapped,
+            manifest_payload_nonce, manifest_payload_format
+        ) VALUES (
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'spool-post', 'spool-verify', 1,
+            720896, 721072, '\x000000000000000000000000000000000000000000000000'::bytea,
+            '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
+            1, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1,
+            '\x0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1
+        );
         RAISE EXCEPTION 'CHECK accepted envelope version 1';
     EXCEPTION WHEN check_violation THEN
-        NULL;
+        GET STACKED DIAGNOSTICS got_constraint = CONSTRAINT_NAME;
+        IF got_constraint = 'posted_files_crypto_complete' THEN
+            RAISE EXCEPTION 'completeness guard fired instead of the envelope version CHECK';
+        END IF;
     END;
 
-    -- Negative: wrong payload format.
+    -- Negative: wrong payload format (complete companions; targeted CHECK).
     BEGIN
-        INSERT INTO posted_files (plaintext_sha256, backbone_post, backbone_verify, article_count, manifest_payload_format)
-        VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                'spool-post', 'spool-verify', 1, 2);
+        INSERT INTO posted_files (
+            plaintext_sha256, backbone_post, backbone_verify, article_count,
+            plaintext_size, article_payload_size, header_nonce,
+            file_key_encrypted, file_key_envelope_version, file_key_kek_version,
+            file_key_dek_wrapped_nonce, file_key_dek_wrapped,
+            file_key_payload_nonce, file_key_payload_format,
+            manifest_encrypted, manifest_envelope_version, manifest_kek_version,
+            manifest_dek_wrapped_nonce, manifest_dek_wrapped,
+            manifest_payload_nonce, manifest_payload_format
+        ) VALUES (
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'spool-post', 'spool-verify', 1,
+            720896, 721072, '\x000000000000000000000000000000000000000000000000'::bytea,
+            '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 1,
+            '\x0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445'::bytea,
+            2, 1, '\x000000000000000000000000'::bytea,
+            '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+            '\x000000000000000000000000'::bytea, 2
+        );
         RAISE EXCEPTION 'CHECK accepted payload format 2';
     EXCEPTION WHEN check_violation THEN
-        NULL;
+        GET STACKED DIAGNOSTICS got_constraint = CONSTRAINT_NAME;
+        IF got_constraint = 'posted_files_crypto_complete' THEN
+            RAISE EXCEPTION 'completeness guard fired instead of the payload format CHECK';
+        END IF;
     END;
 
     -- Negative: half-filled crypto half (geometry without envelopes).

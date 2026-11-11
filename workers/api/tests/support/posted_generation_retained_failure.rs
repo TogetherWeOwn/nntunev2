@@ -275,7 +275,9 @@ fn postgres_retained_failure_reference_recreation_and_changed_health_retire_orig
 
 #[test]
 fn postgres_retained_failure_receipt_error_rolls_back_health_and_same_permit_can_retry() {
-    run_test(async {
+    // Installs a persistent trigger on the shared failure table: run
+    // exclusive so concurrent conclusion tests cannot trip over it.
+    run_blocking(true, async {
         let mut db = connect().await;
         let f = withdrawn(&mut db).await;
         seed_repair(&db, &f).await;

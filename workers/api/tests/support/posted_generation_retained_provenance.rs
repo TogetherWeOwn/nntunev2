@@ -259,7 +259,9 @@ fn postgres_retained_stale_callbacks_create_no_provenance() {
 
 #[test]
 fn postgres_retained_provenance_and_content_roll_back_with_health_failure() {
-    run_test(async {
+    // Installs a persistent trigger on the shared health table: run
+    // exclusive so concurrent tests cannot trip over it.
+    run_blocking(true, async {
         let mut db = connect().await;
         let f = retained(&mut db, true).await;
         let s = &f.case.sealed;
