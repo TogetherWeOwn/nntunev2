@@ -7,7 +7,12 @@ const tracks = [
 ];
 
 // EL TWO-5795: demo surface arm retired with the route; library arm kept.
-test('library: filtered end jumps use full indices, announce once and preserve transport', async ({
+// SLICE 1 DEFERRAL: the library arm opens the product queue through
+// data-testid="player-queue-toggle", which lands with the queue host in
+// slice 4 (player UI/layout). Skipped here; vectors preserved verbatim.
+// Restore (un-skip) in slice 4 with the queue host; same end-jump vectors
+// as the active QTOP-B-01..04/08 library cases in queue-move-ends.spec.ts.
+test.skip('library: filtered end jumps use full indices, announce once and preserve transport', async ({
 	page,
 	baseURL
 }) => {
