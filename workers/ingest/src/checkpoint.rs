@@ -272,7 +272,13 @@ pub async fn get_two_spool(env: &Env, job_id: &str) -> Result<Option<TwoSpoolPro
 pub async fn put_two_spool(env: &Env, job_id: &str, progress: &TwoSpoolProgress) -> Result<()> {
     let key =
         two_spool_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    put_json(env, key, &serde_json::to_string(progress)?).await
+    put_json(
+        env,
+        key,
+        &serde_json::to_string(progress)?,
+        Some(CHECKPOINT_TTL_SECS),
+    )
+    .await
 }
 
 #[cfg(test)]

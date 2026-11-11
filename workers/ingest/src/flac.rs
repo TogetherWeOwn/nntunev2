@@ -763,6 +763,7 @@ fn parse_streaminfo(body: &[u8]) -> Result<StreamInfo, FlacReject> {
 
 // --- Frame walk ----------------------------------------------------------
 
+#[derive(Debug)]
 struct FrameHeader {
     block_samples: u32,
     header_len: usize,
