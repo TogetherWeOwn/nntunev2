@@ -297,17 +297,25 @@ async fn subsonic_snapshot_returns_every_member_track() {
     .await
     .unwrap();
     let mirror = mirror_client().await;
+    // Scalar MBIDs go in as SQL literals (synthetic constants): binding a
+    // `&str` to a `$1::uuid` slot fails tokio-postgres's type check, so the
+    // production code binds text arrays (`query_typed`, `Type::TEXT_ARRAY`)
+    // instead.
     mirror
         .execute(
-            "INSERT INTO mb_artist VALUES ($1::uuid, 'Artist A', 'A, Artist', 'Person', 'US')",
-            &[&SNAPSHOT_ARTIST],
+            &format!(
+                "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}'::uuid, 'Artist A', 'A, Artist', 'Person', 'US')"
+            ),
+            &[],
         )
         .await
         .unwrap();
     mirror
         .execute(
-            "INSERT INTO mb_release VALUES ($1::uuid, 'Album 51', 'Album', 2001, $2::uuid)",
-            &[&SNAPSHOT_RELEASE, &SNAPSHOT_ARTIST],
+            &format!(
+                "INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}'::uuid, 'Album 51', 'Album', 2001, '{SNAPSHOT_ARTIST}'::uuid)"
+            ),
+            &[],
         )
         .await
         .unwrap();
@@ -320,8 +328,10 @@ async fn subsonic_snapshot_returns_every_member_track() {
         .unwrap();
     mirror
         .execute(
-            "INSERT INTO mb_track SELECT $1::uuid, g::uuid, 1, 1 FROM unnest($2::text[]) AS g",
-            &[&SNAPSHOT_RELEASE, &recordings],
+            &format!(
+                "INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, 1 FROM unnest($1::text[]) AS g"
+            ),
+            &[&recordings],
         )
         .await
         .unwrap();
