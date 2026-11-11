@@ -124,7 +124,7 @@ fn corrected_fifth_start_finishes_without_a_sixth_email_debit() {
     assert!(refusals.iter().all(|body| body == &refusals[0]));
     let value = start(&h, " RECEIPT@EXAMPLE.COM ", Some(CODE));
     let id = value["challenge"].as_str().unwrap();
-    let user = value["user_id"].as_str().unwrap();
+    let user = h.store.challenges.borrow()[id].user_id.clone().unwrap();
     assert_eq!(email_slots(&h, EMAIL), 5);
     let start_key = format!("invite:{}:start", rate_limit_ip_key(IP));
     assert_eq!(slots(&h, &start_key, "auth.invite_redeem"), 5);
@@ -178,7 +178,7 @@ fn corrected_fifth_start_finishes_without_a_sixth_email_debit() {
         user
     );
     assert_eq!(
-        h.store.invited_by.borrow()[user],
+        h.store.invited_by.borrow()[user.as_str()],
         Some("issuer".to_string())
     );
     assert_eq!(
@@ -447,6 +447,7 @@ fn receipt_cannot_move_to_another_challenge_user_or_purpose() {
         let (value, finish) = admitted(&h);
         let id = value["challenge"].as_str().unwrap();
         burn_email(&h, EMAIL);
+        let admitted_user = h.store.challenges.borrow()[id].user_id.clone().unwrap();
         {
             let mut rows = h.store.challenges.borrow_mut();
             let row = rows.get_mut(id).unwrap();
@@ -465,7 +466,7 @@ fn receipt_cannot_move_to_another_challenge_user_or_purpose() {
                 !row.admits_invite_email(
                     &h.config,
                     id,
-                    value["user_id"].as_str().unwrap(),
+                    admitted_user.as_str(),
                     Some(CODE),
                     &email_rate_limit_key(&h.config, EMAIL),
                     NOW
@@ -509,8 +510,8 @@ fn credited_finish_still_obeys_client_lookup_and_cpu_budgets() {
     ] {
         let h = setup();
         let (value, finish) = admitted(&h);
-        let user = value["user_id"].as_str().unwrap();
         let id = value["challenge"].as_str().unwrap();
+        let user = h.store.challenges.borrow()[id].user_id.clone().unwrap();
         let (scope, limit, window) = match action {
             "auth.invite_redeem" => (
                 format!("invite:{}:{user}", rate_limit_ip_key(IP)),
@@ -532,13 +533,16 @@ fn credited_finish_still_obeys_client_lookup_and_cpu_budgets() {
             for index in 0..limit {
                 let challenge =
                     auth::new_registration_challenge(&h.config.rp_id, ORIGIN, NOW).unwrap();
-                block_on(
-                    h.store
-                        .insert_challenge(&challenge, Some(user), PURPOSE_REGISTER, None),
-                )
+                block_on(h.store.insert_challenge(
+                    &challenge,
+                    Some(user.as_str()),
+                    PURPOSE_REGISTER,
+                    None,
+                ))
                 .unwrap();
                 let other_email = format!("client-budget-{index}@example.com");
-                let (token, magic) = auth::issue_magic_link(user, &other_email, NOW).unwrap();
+                let (token, magic) =
+                    auth::issue_magic_link(user.as_str(), &other_email, NOW).unwrap();
                 block_on(h.store.insert_magic(&magic)).unwrap();
                 let body = fixture_body(&challenge.id, &token, Some("client-budget-wrong"));
                 assert_eq!(h.call("POST", FINISH, body).status, 401);
@@ -577,6 +581,11 @@ fn credited_finish_rechecks_every_invite_predicate() {
         let h = setup();
         let (value, finish) = admitted(&h);
         burn_email(&h, EMAIL);
+        let challenge_id = value["challenge"].as_str().unwrap();
+        let internal_user = h.store.challenges.borrow()[challenge_id]
+            .user_id
+            .clone()
+            .unwrap();
         let hash = auth::hash_invite_code(CODE);
         {
             let mut invites = h.store.invites.borrow_mut();
@@ -589,7 +598,7 @@ fn credited_finish_rechecks_every_invite_predicate() {
                     invite.redeemed_at = Some(NOW);
                 }
                 "email" => invite.email = Some("not-the-mailbox@example.com".to_string()),
-                "self" => invite.issued_by = Some(value["user_id"].as_str().unwrap().to_string()),
+                "self" => invite.issued_by = Some(internal_user.clone()),
                 _ => unreachable!(),
             }
         }
@@ -713,8 +722,15 @@ fn concurrent_reap_healing_keeps_the_exact_receipt_on_every_insert_path() {
             _ => *h.store.orphan_user_after_next_challenge.borrow_mut() = Some(user_id.to_string()),
         }
         let (value, finish) = admitted(&h);
-        assert_eq!(value["user_id"], user_id);
         let id = value["challenge"].as_str().unwrap();
+        assert_eq!(
+            value["user_id"].as_str().unwrap(),
+            fake_user_id(&h.config, EMAIL)
+        );
+        assert_eq!(
+            h.store.challenges.borrow()[id].user_id.as_deref(),
+            Some(user_id)
+        );
         assert_eq!(
             h.store.challenges.borrow()[id].invite_budget_receipt,
             Some(InviteBudgetReceipt {
