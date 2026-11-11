@@ -19,9 +19,12 @@
 //! envelope for every state except [`TrackPointerState::Switched`], so a
 //! track that is still reposting (or blocked) plays exactly what it played
 //! before; the flip to the new envelope is atomic per track at the switch.
-//! Rollback ([`PointerEvent::Rollback`]) restores the original pointer and
-//! is possible only while the original is not yet retired
-//! ([`can_retire_original`]).
+//! Rollback ([`PointerEvent::Rollback`]) restores the original pointer
+//! and is possible only while the original is not yet retired
+//! ([`can_retire_original`]): [`restore_track_source_sql`] atomically
+//! puts the retained `ingest_originals` envelope back, CAS-guarded
+//! against intervening switches, so a rollback names and restores the
+//! original target — the ledger job id alone cannot rebuild it.
 //!
 //! Envelope boundary (spec §7: KEK never in ingest): the switch binds only
 //! sealed envelopes ([`crate::track_writers::TrackSourceParams`], validated
@@ -500,9 +503,44 @@ pub fn switch_track_source_sql() -> &'static str {
 }
 
 /// Fetch the serving pointer for CAS classification and rollback reads.
-/// Parameters: `track_id` ($1).
+/// Parameters: `track_id` ($1). Job ids only: the sealed envelope itself
+/// is never returned here (rollback restores it from the retained
+/// `ingest_originals` original via [`restore_track_source_sql`]).
 pub fn select_track_source_envelope_sql() -> &'static str {
     "SELECT track_id, source_job_id FROM track_sources WHERE track_id = $1::text::uuid"
+}
+
+/// `$n` parameter order for [`restore_track_source_sql`] (the fence owner
+/// binds as `$4` and is not named here, mirroring
+/// [`SWITCH_SOURCE_PARAM_ORDER`]).
+pub const RESTORE_SOURCE_PARAM_ORDER: [&str; 3] = [
+    "track_id",
+    "expected_switched_job_id",
+    "original_source_job_id",
+];
+
+/// Rollback: restore the original sealed envelope onto the track pointer
+/// in one atomic statement. The original envelope is read from the
+/// retained `ingest_originals` row keyed by the ledger's
+/// `original_source_job_id` (written at admin ingest, before any switch,
+/// and kept while rollback is legal), so a rollback can name *and* put
+/// back the original target — an ID alone cannot reconstruct it.
+///
+/// The `WHERE` pins the CAS guard (`source_job_id = $2`): if another
+/// switch/rollback already moved the pointer, the restore matches 0 rows
+/// instead of overwriting it. A zero-row result therefore means one of:
+/// the pointer no longer serves the switched job (diverged), or the
+/// retained original row is gone (rollback target missing); the caller
+/// separates them with [`select_track_source_envelope_sql`] plus
+/// [`select_pointer_switch_sql`] and must surface a missing original as
+/// an error, never as a successful rollback. Fenced exactly like the
+/// switch: the owner's `users` row `FOR SHARE` while `deleting_at IS
+/// NULL` gates the write without becoming a column.
+///
+/// Parameters: `track_id` ($1), `expected_switched_job_id` ($2),
+/// `original_source_job_id` ($3), fence owner ($4).
+pub fn restore_track_source_sql() -> &'static str {
+    "UPDATE track_sources SET source_job_id = $3, nzb_ref_encrypted = o.nzb_ref_encrypted, nzb_ref_envelope_version = o.nzb_ref_envelope_version, nzb_ref_kek_version = o.nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce = o.nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped = o.nzb_ref_dek_wrapped, nzb_ref_payload_nonce = o.nzb_ref_payload_nonce, nzb_ref_payload_format = o.nzb_ref_payload_format FROM ingest_originals o, (SELECT id FROM users WHERE id = $4 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE track_sources.track_id = $1::text::uuid AND track_sources.source_job_id = $2 AND o.job_id = $3 AND writer_fence.id IS NOT NULL"
 }
 
 /// Outcome of one CAS [`switch_track_source_sql`] write.
@@ -1043,6 +1081,57 @@ mod tests {
             select_track_source_envelope_sql(),
             "SELECT track_id, source_job_id FROM track_sources WHERE track_id = $1::text::uuid"
         );
+    }
+
+    #[test]
+    fn restore_source_statement_restores_the_retained_original_envelope() {
+        let sql = restore_track_source_sql();
+        assert_eq!(RESTORE_SOURCE_PARAM_ORDER.len(), 3);
+        // CAS guard: rollback lands only while the pointer still serves
+        // the switched job; an intervening switch diverged it.
+        assert!(
+            sql.contains(
+                "WHERE track_sources.track_id = $1::text::uuid AND track_sources.source_job_id = $2"
+            ),
+            "{sql}"
+        );
+        // The original envelope comes from the retained row, never from
+        // the caller or the ledger job id alone: every `nzb_ref_*` column
+        // is sourced from `ingest_originals o` keyed by the original job.
+        assert!(sql.contains("FROM ingest_originals o"), "{sql}");
+        for column in [
+            "nzb_ref_encrypted",
+            "nzb_ref_envelope_version",
+            "nzb_ref_kek_version",
+            "nzb_ref_dek_wrapped_nonce",
+            "nzb_ref_dek_wrapped",
+            "nzb_ref_payload_nonce",
+            "nzb_ref_payload_format",
+        ] {
+            assert!(
+                sql.contains(&format!("= o.{column}")),
+                "missing retained column {column}: {sql}"
+            );
+        }
+        assert!(sql.contains("AND o.job_id = $3"), "{sql}");
+        assert!(sql.contains("source_job_id = $3"), "{sql}");
+        for i in [1, 2, 3, 4] {
+            assert!(
+                sql.contains(&format!("${i}")),
+                "missing placeholder ${i}: {sql}"
+            );
+        }
+        assert!(!sql.contains("$5"), "{sql}");
+        // Fenced on the owner row, exactly like the switch.
+        assert!(
+            sql.contains("FROM (SELECT id FROM users WHERE id = $4 AND deleting_at IS NULL FOR SHARE) AS writer_fence"),
+            "{sql}"
+        );
+        assert!(sql.contains("writer_fence.id IS NOT NULL"), "{sql}");
+        assert!(!sql.contains("FOR UPDATE"), "{sql}");
+        assert!(!sql.contains("NOWAIT"), "{sql}");
+        assert!(!sql.contains("SKIP LOCKED"), "{sql}");
+        assert!(!sql.contains("track_sources.user_id"), "{sql}");
     }
 
     #[test]

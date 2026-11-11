@@ -355,9 +355,11 @@ pub fn repair_read_order(record: &PostedFileRecord) -> Vec<RepairSource> {
         order.push(RepairSource::SpoolVerify);
     }
     order.push(RepairSource::Par2);
-    if record.repost_exhausted
-        || (!record.two_spool_verified && record.verify_copy == SpoolCopyState::Missing)
-    {
+    // A `Missing` verify copy only says the article is absent, not that
+    // the same-ID re-post budget ran out: only durable exhaustion mints
+    // new IDs. Otherwise every first `STAT` 430 would abandon the
+    // existing article IDs without spending their re-post budget.
+    if record.repost_exhausted {
         order.push(RepairSource::MintNewIds);
     }
     order
@@ -1061,6 +1063,23 @@ mod tests {
                 RepairSource::Par2,
                 RepairSource::MintNewIds,
             ]
+        );
+    }
+
+    #[test]
+    fn missing_verify_copy_with_budget_unspent_does_not_mint_new_ids() {
+        // A first `STAT` 430 marks the verify copy `Missing` without
+        // spending the same-ID re-post budget: repair must keep the
+        // existing article IDs until durable exhaustion, not mint new
+        // ones on the `Missing` state alone.
+        let mut record =
+            PostedFileRecord::fresh_post(SHA, "backbone-a", "backbone-b", 3, Some(NZB_SHA))
+                .unwrap();
+        record.verify_copy = SpoolCopyState::Missing;
+        assert!(!record.repost_exhausted);
+        assert_eq!(
+            repair_read_order(&record),
+            vec![RepairSource::SpoolPost, RepairSource::Par2,]
         );
     }
 

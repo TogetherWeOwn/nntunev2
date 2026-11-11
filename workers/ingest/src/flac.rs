@@ -52,8 +52,9 @@
 //!
 //! Offset base: every byte offset in [`SeekPoint`] and
 //! [`seektable_bytes`] is measured from the first byte of the FLAC stream
-//! (byte 0 = `f`). Producer and consumer are this module, so the base is
-//! consistent by construction.
+//! (byte 0 = `f`).
+//! The embedded RFC 9639 SEEKTABLE form, [`seektable_embed_bytes`], is
+//! instead relative to the first frame header, as the spec requires.
 //!
 //! Caps (Worker isolate memory is 128 MiB; the caller feeds staged bytes,
 //! so these bound CPU/misuse, never the job — an over-cap file is a typed
@@ -303,6 +304,27 @@ pub fn seektable_bytes(index: &[SeekPoint]) -> Vec<u8> {
     for point in index {
         out.extend_from_slice(&point.sample_number.to_be_bytes());
         out.extend_from_slice(&point.byte_offset.to_be_bytes());
+        out.extend_from_slice(&point.frame_samples.to_be_bytes());
+    }
+    out
+}
+
+/// Serialize the seek index as an embeddable RFC 9639 SEEKTABLE body.
+/// Same 18-byte point shape as [`seektable_bytes`], but each offset is
+/// relative to the first frame header (`first_frame_offset` is the
+/// absolute offset of that header, e.g. `FlacWalk::first_frame_offset`),
+/// as the spec requires for embedded tables. Points before the first
+/// frame saturate to 0.
+pub fn seektable_embed_bytes(index: &[SeekPoint], first_frame_offset: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(index.len() * 18);
+    for point in index {
+        out.extend_from_slice(&point.sample_number.to_be_bytes());
+        out.extend_from_slice(
+            &point
+                .byte_offset
+                .saturating_sub(first_frame_offset)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&point.frame_samples.to_be_bytes());
     }
     out
@@ -874,12 +896,33 @@ fn parse_frame_header(
     let block_bits = (bytes[pos + 2] >> 4) & 0x0F;
     let rate_bits = bytes[pos + 2] & 0x0F;
     let channels = (bytes[pos + 3] >> 4) & 0x0F;
-    if channels > 0x0A {
+    // RFC 9639 channel assignment: 0-7 are 1-8 independent channels;
+    // 8 (left/side), 9 (right/side) and 10 (mid/side) are all stereo.
+    let frame_channels: u8 = match channels {
+        0..=7 => channels + 1,
+        8..=10 => 2,
+        _ => return Err(FlacReject::BadFrameHeader),
+    };
+    if frame_channels != streaminfo.channels {
         return Err(FlacReject::BadFrameHeader);
     }
     let sample_bits = (bytes[pos + 3] >> 1) & 0x07;
-    if sample_bits == 0x03 {
-        return Err(FlacReject::BadFrameHeader);
+    // Sample-size code 0 means "take it from STREAMINFO"; an explicit
+    // size must agree with STREAMINFO. Code 3 is reserved.
+    let frame_bits: Option<u8> = match sample_bits {
+        0 => None,
+        1 => Some(8),
+        2 => Some(12),
+        4 => Some(16),
+        5 => Some(20),
+        6 => Some(24),
+        7 => Some(32),
+        _ => return Err(FlacReject::BadFrameHeader),
+    };
+    if let Some(bits) = frame_bits {
+        if bits != streaminfo.bits_per_sample {
+            return Err(FlacReject::BadFrameHeader);
+        }
     }
     if bytes[pos + 3] & 0x01 != 0 {
         return Err(FlacReject::BadFrameHeader);
@@ -1302,7 +1345,23 @@ fn parse_picture(body: &[u8]) -> Result<ExtractedArt, SkippedArt> {
             reason: "picture dimensions out of range",
         });
     }
-    let data = body[cursor..cursor + data_len as usize].to_vec();
+    // Signature-level check only (no image decoder): the magic bytes must
+    // match the declared MIME so a mislabelled body is never staged.
+    let picture = &body[cursor..cursor + data_len as usize];
+    let signature_ok = match mime.as_str() {
+        "image/jpeg" => picture.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => picture.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/webp" => {
+            picture.len() >= 12 && &picture[0..4] == b"RIFF" && &picture[8..12] == b"WEBP"
+        }
+        _ => false,
+    };
+    if !signature_ok {
+        return Err(SkippedArt {
+            reason: "picture bytes do not match the declared mime signature",
+        });
+    }
+    let data = picture.to_vec();
     let sha256_hex = sha256_hex(&data);
     Ok(ExtractedArt {
         mime,
@@ -1962,6 +2021,84 @@ mod tests {
         let again = rewrite_tags(&input, &test_tags()).expect("rewrite again");
         assert_eq!(tagged.sha256_hex, again.sha256_hex);
         assert_eq!(tagged.bytes, again.bytes);
+    }
+
+    #[test]
+    fn frame_header_rejects_channel_and_sample_size_mismatch() {
+        let streaminfo = parse_streaminfo(&test_streaminfo(192, [0; 16])).expect("streaminfo");
+        let good = test_frame(0, 192, 1);
+        parse_frame_header(&good, 0, &streaminfo, 0).expect("unmodified header parses");
+        let header_end = 4 + 1;
+        let recrc = |frame: &mut Vec<u8>| {
+            let crc = crc8(&frame[..header_end]);
+            frame[header_end] = crc;
+        };
+        // Channel code 2 (3 channels) against STREAMINFO stereo.
+        let mut bad_channels = good.clone();
+        bad_channels[3] = (bad_channels[3] & 0x0F) | 0x20;
+        recrc(&mut bad_channels);
+        assert_eq!(
+            parse_frame_header(&bad_channels, 0, &streaminfo, 0).unwrap_err(),
+            FlacReject::BadFrameHeader
+        );
+        // Mid/side (code 10) is still stereo and must be accepted.
+        let mut mid_side = good.clone();
+        mid_side[3] = (mid_side[3] & 0x0F) | 0xA0;
+        recrc(&mut mid_side);
+        parse_frame_header(&mid_side, 0, &streaminfo, 0).expect("mid/side is stereo");
+        // Sample-size code 4 (16-bit) against STREAMINFO 8-bit.
+        let mut bad_bits = good.clone();
+        bad_bits[3] = (bad_bits[3] & 0xF1) | (4 << 1);
+        recrc(&mut bad_bits);
+        assert_eq!(
+            parse_frame_header(&bad_bits, 0, &streaminfo, 0).unwrap_err(),
+            FlacReject::BadFrameHeader
+        );
+        // Sample-size code 0 defers to STREAMINFO.
+        let mut inherit_bits = good.clone();
+        inherit_bits[3] &= 0xF1;
+        recrc(&mut inherit_bits);
+        parse_frame_header(&inherit_bits, 0, &streaminfo, 0).expect("code 0 inherits");
+    }
+
+    #[test]
+    fn picture_rejects_signature_mismatch_with_declared_mime() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes());
+        body.extend_from_slice(&9u32.to_be_bytes());
+        body.extend_from_slice(b"image/png");
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&8u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        body.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        body.extend_from_slice(&jpeg);
+        assert!(parse_picture(&body).is_err());
+        parse_picture(&test_picture_block()[..]).expect("valid png still staged");
+    }
+
+    #[test]
+    fn embedded_seektable_offsets_are_relative_to_first_frame() {
+        let index = [
+            SeekPoint {
+                sample_number: 0,
+                byte_offset: 100,
+                frame_samples: 192,
+            },
+            SeekPoint {
+                sample_number: 192,
+                byte_offset: 1000,
+                frame_samples: 192,
+            },
+        ];
+        let embedded = seektable_embed_bytes(&index, 100);
+        assert_eq!(embedded.len(), 36);
+        assert_eq!(&embedded[8..16], &0u64.to_be_bytes());
+        assert_eq!(&embedded[26..34], &900u64.to_be_bytes());
+        // The absolute-base serializer is unchanged.
+        assert_eq!(&seektable_bytes(&index)[26..34], &1000u64.to_be_bytes());
     }
 
     #[test]
