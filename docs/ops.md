@@ -371,7 +371,10 @@ manifest/sha mismatch refuses exactly as the migrator does. Mode
 `all-pending` applies every unrecorded manifest entry up to `file` in
 manifest order, refusing on the first failure. The recorded
 `schema_migrations` row lands in the job summary; post it on the card
-before merging. The `board_approval` input is an audit record of the
+before merging. Only a row from a successful apply counts as merge
+evidence — on a failed run, rows are diagnostic, and the receipt and
+effects must be reconciled before retrying (an older row for the same
+filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
 card's own gate, not a workflow-side call — the workflow cannot call
 Paperclip. Prerequisite: `PLANETSCALE_MIGRATOR_URL_STAGING` must be
 scoped to the `staging` environment before the first dispatch; the

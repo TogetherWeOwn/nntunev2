@@ -169,6 +169,33 @@ class StagingApplyTests(unittest.TestCase):
         self.assertEqual(output.read_text().strip(),
                          "applied_files=0054_first.sql")
 
+    # In-flight file is named in the evidence summary on failure.
+    def test_in_flight_file_reported_on_failure(self):
+        data, _, root = self._roots(manifest_text())
+        summary = root / "summary.md"
+        summary.write_text("")
+        progress = root / "progress"
+        progress.write_text("0055_second.sql")
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(summary),
+               "APPLY_PROGRESS": str(progress),
+               "PATH": os.environ["PATH"], "HOME": "/tmp"}
+
+        def fake_psql(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="")
+
+        original = staging_apply.subprocess.run
+        staging_apply.subprocess.run = fake_psql
+        try:
+            staging_apply.run_evidence(str(data), "0055_second.sql",
+                                       "0054_first.sql", "failure", DB, env)
+        finally:
+            staging_apply.subprocess.run = original
+        text = summary.read_text()
+        self.assertIn("In-flight at failure", text)
+        self.assertIn("0055_second.sql", text)
+        self.assertIn("reconcile", text)
+
     # Finding 1: only trusted code executes; data code never runs, and
     # the child environment is allowlisted.
     def test_only_trusted_migrator_executes_with_allowlisted_env(self):

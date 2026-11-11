@@ -147,10 +147,16 @@ def apply_files(trusted_root, data_root, migration_file, applied_by, mode,
     if not Path(script).is_file():
         raise StagingApplyError("trusted apply_migration.py is missing")
     done = []
+    progress_path = source.get("APPLY_PROGRESS", ".apply-progress")
     try:
         for filename in files:
             if not FILE_RE.fullmatch(filename):
                 raise StagingApplyError("manifest carries a malformed migration filename")
+            # In-flight marker on the shared job filesystem: if the job
+            # times out, the evidence step can still name the file whose
+            # commit outcome is unknown instead of silently omitting it.
+            with open(progress_path, "w") as handle:
+                handle.write(filename)
             argv = [sys.executable, "-I", str(script),
                     "--file", str(Path(data_root) / "migrations" / filename),
                     "--manifest", str(Path(data_root) / "migrations/manifest.toml"),
@@ -229,6 +235,16 @@ def run_evidence(data_root, migration_file, applied_files, apply_outcome,
     summary_path = source["GITHUB_STEP_SUMMARY"]
     with open(summary_path, "a") as handle:
         handle.write("### Recorded schema_migrations rows\n")
+    progress_path = source.get("APPLY_PROGRESS", ".apply-progress")
+    if Path(progress_path).is_file():
+        in_flight = Path(progress_path).read_text().strip()
+        if (in_flight and in_flight not in files
+                and (apply_outcome or "") != "success"):
+            with open(summary_path, "a") as handle:
+                handle.write(
+                    f"- In-flight at failure: `{in_flight}` "
+                    "(outcome unknown — reconcile the receipt and effects "
+                    "before retrying)\n")
     missing = []
     for filename in files:
         if not FILE_RE.fullmatch(filename):
