@@ -275,6 +275,14 @@ fn config_from_env(env: &Env) -> Option<Config> {
         }
         (None, Some(_)) | (Some(_), None) => return None,
     };
+    let mut config = config;
+    // Dedicated Worker secret only: ordinary vars and the native pepper may
+    // never supply compatibility key material. Missing/invalid stays disabled
+    // per request, without taking unrelated native endpoints down.
+    config.subsonic_index = env.secret("SUBSONIC_INDEX_PEPPER").ok().and_then(|raw| {
+        let raw = zeroize::Zeroizing::new(raw.to_string());
+        crate::subsonic_config::SubsonicIndexConfig::parse(&raw).ok()
+    });
     // Stripe test-mode secrets (Checkout-shape slice): both optional at
     // startup — unprovisioned paths fail closed per-request (the webhook
     // 500s so Stripe retries it; purchases refuse without a Stripe call)
@@ -684,6 +692,9 @@ impl MirrorBinding {
         }
     }
 }
+
+#[path = "subsonic_pg.rs"]
+mod subsonic_pg;
 
 struct PgStore {
     env: Option<Env>,
@@ -3351,6 +3362,55 @@ impl Store for PgStore {
                 )
                 .await
             },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn insert_subsonic_credential(
+        &self,
+        row: &crate::subsonic_lifecycle::PreparedCredential,
+        session: &crate::session::SessionClaims,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn subsonic_credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn revoke_subsonic_credential(
+        &self,
+        id: &str,
+        user_id: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                    .await
+                    .map(|count| count == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn revoke_all_subsonic_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await

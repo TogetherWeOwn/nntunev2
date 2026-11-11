@@ -353,9 +353,41 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-Nothing in CI applies `migrations/*.sql`; staging migrations are applied
-out-of-band **before** merge, by the migrator role, after board approval for
-the DDL. Applies go through `.github/scripts/apply_migration.py`, which
+The scheduled/CI deploy path never applies `migrations/*.sql`. Staging
+migrations are applied **before** merge, after board approval for the
+DDL, by the authoring agent itself: once board approval is recorded on
+the card, the agent dispatches the `migrations-staging-apply` workflow
+(`.github/workflows/migrations-staging-apply.yml`) with the exact
+40-hex commit `ref`, the migration `file`, an `applied_by` identity and
+the Paperclip board-approval interaction id. The workflow checks out
+that exact ref as data only (migration bytes and manifest) and runs
+the trusted `.github/scripts/apply_migration.py` from the workflow's
+own ref — never code from the dispatch-supplied ref — with
+`--expect-database nntunev2_staging` and a `verify-full`
+URL. So long as the `staging` environment's deployment-branch policy
+restricts deployments to the protected branch (`main`) — and the
+workflow additionally refuses dispatches not from `main` — the
+migrator credential
+(`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
+is read only inside the job and never reaches the agent. Any
+manifest/sha mismatch refuses exactly as the migrator does. Mode
+`all-pending` applies every unrecorded manifest entry up to `file` in
+manifest order, refusing on the first failure. The recorded
+`schema_migrations` row lands in the job summary; post it on the card
+before merging. Only a row from a successful apply counts as merge
+evidence — on a failed run, rows are diagnostic, and the receipt and
+effects must be reconciled before retrying (an older row for the same
+filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
+card's own gate, not a workflow-side call — the workflow cannot call
+Paperclip. Prerequisites before the first dispatch: (a)
+`PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
+environment, and (b) the `staging` environment's deployment-branch
+policy must restrict deployments to the protected branch (`main`) so
+the trusted checkout can only run reviewed workflow code; the
+workflow declares `environment: staging` and refuses dispatches not
+from `main`. Copying an existing value
+into an environment scope needs an authorized admin holding that value.
+Applies go through `.github/scripts/apply_migration.py`, which
 verifies the file bytes against `migrations/manifest.toml` and writes a
 `public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
 the same transaction** as the migration effects. A single exact outer

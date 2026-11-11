@@ -110,6 +110,58 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("python3 .github/scripts/test_workflow_policy_hardening.py", job(ci, "public-text"))
         self.assertIn("public-text", job(ci, "ci-ok"))
 
+    def test_staging_apply_is_agent_dispatchable_and_pinned(self):
+        # The authorized agent dispatches this workflow by hand after board
+        # approval; it must pin the exact ref, target only staging, never
+        # print its credential, and record the receipt as evidence.
+        text = (WORKFLOWS / "migrations-staging-apply.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("workflow_dispatch:", triggers)
+        for event in ("pull_request", "push", "schedule"):
+            self.assertNotIn(event + ":", triggers)
+        for name in ("ref:", "file:", "applied_by:", "board_approval:", "mode:"):
+            self.assertIn(name, triggers)
+        self.assertIn("group: migrations-staging-apply", text)
+        self.assertIn("cancel-in-progress: false", text)
+        apply = job(text, "apply")
+        self.assertIn("    environment:\n      name: staging\n", apply)
+        self.assertIn("ref: ${{ inputs.ref }}", apply)
+        # Two checkouts: dispatch-supplied ref as data only, the workflow's
+        # own ref as the only executed code.
+        self.assertIn("path: data", apply)
+        self.assertIn("path: trusted", apply)
+        self.assertIn("ref: ${{ github.sha }}", apply)
+        self.assertEqual(apply.count("persist-credentials: false"), 2)
+        self.assertIn("staging_apply.py", apply)
+        self.assertIn("--expect-database", apply)
+        self.assertIn("nntunev2_staging", apply)
+        self.assertIn("secrets.PLANETSCALE_MIGRATOR_URL_STAGING", apply)
+        # The credential is env-only: no echo of the secret and no GITHUB_ENV
+        # hand-off of a derived URL (masking would not cover a modified copy).
+        self.assertNotIn('echo "$PLANETSCALE', apply)
+        self.assertNotIn("$GITHUB_ENV", apply)
+        # Main-branch dispatch guard: the trusted code runs only from the
+        # protected branch, so a dispatch from any other branch is refused
+        # before the checkouts or the credential are reached.
+        self.assertIn("WORKFLOW_REF: ${{ github.ref }}", apply)
+        self.assertIn('"$WORKFLOW_REF" != "refs/heads/main"', apply)
+        self.assertIn("must be dispatched from refs/heads/main; refusing", apply)
+        # Both driver invocations run with -E -s (no PYTHON* environment and
+        # no user site directory) so dispatch-supplied environment cannot
+        # reach the trusted driver; any bare python3 invocation fails here.
+        self.assertEqual(
+            apply.count("python3 -E -s trusted/.github/scripts/staging_apply.py"),
+            2,
+        )
+        self.assertEqual(apply.count("python3 "), 2)
+        # all-pending walks manifest order and refuses on the first failure.
+        self.assertIn("all-pending", apply)
+        # The evidence step runs only once apply has started: a refused
+        # dispatch (validation, checkout or verify failure) stops before
+        # the credential is reached, while a started apply that fails
+        # still records evidence.
+        self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
+
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter
         # leaves Rust/docs-only PRs waiting forever.
