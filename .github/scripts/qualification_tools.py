@@ -99,10 +99,20 @@ def install():
             f"https://static.crates.io/crates/{name}/{name}-{version}.crate", 20_000_000
         ), pin["sha256"])
         (source_dir / "source.crate").write_bytes(archive)
-        # Cargo independently checks registry packages and uses the shipped lock.
-        # Never execute from the downloaded source directory.
+        # Install the checksum-verified archive itself, not a second registry
+        # fetch of the same version. The crate is unpacked with the data filter
+        # (no links, absolute paths or escapes) and built with its shipped lock.
+        # Only locked dependency downloads still use the network. Never execute
+        # from the downloaded source directory.
+        unpack_dir = source_dir / "src"
+        unpack_dir.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as crate:
+            crate.extractall(unpack_dir, filter="data")
+        package_dir = unpack_dir / f"{name}-{version}"
+        if not (package_dir / "Cargo.toml").is_file() or not (package_dir / "Cargo.lock").is_file():
+            raise ValueError("verified crate lacks manifest or lockfile")
         subprocess.run([
-            "cargo", "install", name, "--version", f"={version}", "--locked",
+            "cargo", "install", "--path", str(package_dir), "--locked",
             "--root", str(tool_root),
         ], cwd=ROOT, check=True)
         print(f"verified {name} {version} crate sha256", flush=True)
