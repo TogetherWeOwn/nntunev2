@@ -5993,11 +5993,18 @@ pub async fn subsonic_mount(
     }
 
     let trace_id = crate::logging::resolve_trace_id(trace_id.as_deref());
+    // Every pre-dispatch error below renders through the merged
+    // query+body parameters (query wins duplicates), mirroring the shared
+    // dispatcher's response-format selection: a body-selected `f`/`callback`
+    // must not silently fall back to XML. The worker shell has already
+    // bounded the body read by the time the mount runs; oversized or
+    // unreadable bodies are answered query-only there, before the mount.
+    let merged = core::merged_query_params(method, query, body);
     let config = match config_from_env(&env) {
         Some(cfg) => cfg,
         None => {
             return respond_document(&core::render_error(
-                query,
+                &merged,
                 code::GENERIC,
                 "Internal server error.",
             ));
@@ -6022,7 +6029,7 @@ pub async fn subsonic_mount(
         Some(k) => k,
         None => {
             return respond_document(&core::auth_error_response(
-                query,
+                &merged,
                 crate::subsonic_auth::AuthError::Unavailable,
             ));
         }
@@ -6030,7 +6037,7 @@ pub async fn subsonic_mount(
     let form_body = (!body.is_empty()).then_some(body.as_bytes());
     let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
         Ok(c) => c,
-        Err(err) => return respond_document(&core::parse_error_response(query, err)),
+        Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
     };
     let principal = match crate::subsonic_auth::authenticate(
         &store,
@@ -6042,13 +6049,13 @@ pub async fn subsonic_mount(
     .await
     {
         Ok(p) => p,
-        Err(err) => return respond_document(&core::auth_error_response(query, err)),
+        Err(err) => return respond_document(&core::auth_error_response(&merged, err)),
     };
     let (email, role) = match store.subsonic_account(principal.user_id()).await {
         Ok(Some(pair)) => pair,
         _ => {
             return respond_document(&core::render_error(
-                query,
+                &merged,
                 code::GENERIC,
                 "Internal server error.",
             ));
@@ -6072,7 +6079,7 @@ pub async fn subsonic_mount(
             Ok(rows) => rows,
             Err(_) => {
                 return respond_document(&core::render_error(
-                    query,
+                    &merged,
                     code::GENERIC,
                     "Internal server error.",
                 ));
@@ -6082,29 +6089,20 @@ pub async fn subsonic_mount(
 
     // 3. Stream interception.
     if matches!(route(path), Route::Endpoint("stream")) {
-        let merged = if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
-            if query.is_empty() {
-                body.to_string()
-            } else {
-                format!("{query}&{body}")
-            }
-        } else {
-            query.to_string()
-        };
         let params = Params::parse(&merged);
         if core::rejects_transcode(&params) {
-            return respond_document(&core::transcode_refusal_response(query));
+            return respond_document(&core::transcode_refusal_response(&merged));
         }
         let Some(song_id) = params.get("id").map(str::to_string) else {
             return respond_document(&core::render_error(
-                query,
+                &merged,
                 code::REQUIRED_PARAM_MISSING,
                 "Required parameter is missing.",
             ));
         };
         if !songs.iter().any(|song| song.id == song_id) {
             return respond_document(&core::render_error(
-                query,
+                &merged,
                 code::NOT_FOUND,
                 "Song not found.",
             ));
@@ -6143,7 +6141,7 @@ pub async fn subsonic_mount(
         let issued = match issued {
             Ok(issued) => issued,
             Err(refusal) => {
-                return respond_document(&core::issuance_refusal_response(query, refusal.status));
+                return respond_document(&core::issuance_refusal_response(&merged, refusal.status));
             }
         };
         // Unprovisioned stream binding means the source cannot be served:
@@ -6151,7 +6149,7 @@ pub async fn subsonic_mount(
         let fetcher = match env.service(STREAM_SERVICE_BINDING) {
             Ok(fetcher) => fetcher,
             Err(_) => {
-                return respond_document(&core::upstream_refusal_response(query, 502));
+                return respond_document(&core::upstream_refusal_response(&merged, 502));
             }
         };
         let headers = Headers::new();
@@ -6198,7 +6196,7 @@ pub async fn subsonic_mount(
                 *response.headers_mut() = headers;
                 Ok(response)
             }
-            _ => respond_document(&core::upstream_refusal_response(query, status)),
+            _ => respond_document(&core::upstream_refusal_response(&merged, status)),
         };
     }
 

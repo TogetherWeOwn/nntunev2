@@ -531,6 +531,31 @@ impl Library for ProductionStore {
 // XML; a broken JSONP callback falls back to JSON error 10 via
 // `render_jsonp`.
 
+/// Merge a POST form body onto the query string the same way the shared
+/// dispatcher does (`SubsonicApp::merge_query`): query pairs first, body
+/// pairs after, so query wins on duplicates (`Params::get` returns the
+/// first value). Non-POST requests and empty bodies pass the query
+/// through unchanged.
+///
+/// The mount renders every pre-dispatch error through this merged
+/// parameter string, not the query alone: a client that selects its
+/// response format (`f`/`callback`) in the POST body must still get
+/// JSON/JSONP error documents. Callers pass a body that already survived
+/// the bounded read in the worker shell (oversized/unreadable faults are
+/// answered query-only before the mount, since body pairs are untrusted
+/// past the cap).
+pub fn merged_query_params(method: &str, query: &str, body: &str) -> String {
+    if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
+        if query.is_empty() {
+            body.to_string()
+        } else {
+            format!("{query}&{body}")
+        }
+    } else {
+        query.to_string()
+    }
+}
+
 pub fn render_error(query: &str, error_code: i64, message: &str) -> HttpResponse {
     let params = Params::parse(query);
     let doc = error_document(error_code, message);

@@ -4,8 +4,8 @@
 
 use super::{
     auth_error_response, build_snapshot, compat_session_id, issuance_refusal_response,
-    parse_error_response, rejects_transcode, transcode_refusal_response, upstream_refusal_response,
-    ProductionStore, FLAC_CONTENT_TYPE, FLAC_SUFFIX,
+    merged_query_params, parse_error_response, rejects_transcode, transcode_refusal_response,
+    upstream_refusal_response, ProductionStore, FLAC_CONTENT_TYPE, FLAC_SUFFIX,
 };
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::ledger::STREAM_BYTES_PER_SEC;
@@ -245,7 +245,8 @@ fn per_user_state_fails_closed_without_a_history_store() {
     assert!(!store.set_rating(&identity, SONG_1, 5));
     assert!(store.rating(&identity, SONG_1).is_none());
     // The scrobble endpoint ignores this return; with no history table,
-    // recent/frequent must stay empty (see module docs).
+    // recent stays empty while frequent keeps every album eligible
+    // (see module docs and the album_list test below).
     assert!(!store.scrobble(&identity, SONG_1));
     assert!(store.queue(&identity).is_none());
     // create_playlist is infallible: id-less placeholder, never stored.
@@ -364,6 +365,48 @@ fn error_rendering_selects_format_and_never_leaks() {
         assert!(text.contains(&format!("\"code\":{code}")), "{text}");
         assert!(text.contains(fragment), "{text}");
     }
+}
+
+#[test]
+fn merged_params_carry_body_selected_format_into_error_documents() {
+    // The merge mirrors the shared dispatcher: query pairs first (query
+    // wins duplicates), body pairs after; non-POST and empty bodies pass
+    // the query through unchanged.
+    assert_eq!(merged_query_params("POST", "", "f=json"), "f=json");
+    assert_eq!(
+        merged_query_params("POST", "f=json", "f=jsonp&callback=cb"),
+        "f=json&f=jsonp&callback=cb"
+    );
+    assert_eq!(merged_query_params("GET", "f=json", "f=jsonp"), "f=json");
+    assert_eq!(merged_query_params("POST", "f=json", ""), "f=json");
+    assert_eq!(merged_query_params("POST", "", ""), "");
+
+    // Body-only `f=json` on a POST auth failure renders JSON, not XML —
+    // the mount passes the merged string to its error renderers.
+    let merged = merged_query_params("POST", "", "apiKey=invalid&f=json");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Body-only `f=jsonp&callback=cb` renders JSONP with the callback.
+    let merged = merged_query_params("POST", "", "apiKey=invalid&f=jsonp&callback=cb");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "text/javascript");
+    assert!(body_str(&resp).starts_with("/**/cb("));
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Query `f` still wins over body `f`: query `f=json` over body
+    // `f=jsonp` renders JSON, not JSONP.
+    let merged = merged_query_params("POST", "f=json", "apiKey=invalid&f=jsonp&callback=cb");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Parse errors likewise honour the merged format selector.
+    let merged = merged_query_params("POST", "", "f=json");
+    let resp = parse_error_response(&merged, CredentialParseError::DuplicateCredential);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":0"));
 }
 
 #[test]
