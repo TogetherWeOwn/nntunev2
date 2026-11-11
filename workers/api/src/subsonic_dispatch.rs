@@ -47,8 +47,7 @@ use nntune_subsonic::envelope::{
     XML_CONTENT_TYPE,
 };
 use nntune_subsonic::library::{
-    Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount,
-    NOW,
+    Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount, NOW,
 };
 use nntune_subsonic::HttpResponse;
 
@@ -108,10 +107,8 @@ pub fn build_snapshot(
         .iter()
         .map(|a| (a.mbid.as_str(), a.sort_name.as_str()))
         .collect();
-    let release_year: HashMap<&str, Option<i16>> = releases
-        .iter()
-        .map(|r| (r.mbid.as_str(), r.year))
-        .collect();
+    let release_year: HashMap<&str, Option<i16>> =
+        releases.iter().map(|r| (r.mbid.as_str(), r.year)).collect();
 
     let mut out_artists: Vec<Artist> = artists
         .iter()
@@ -127,7 +124,9 @@ pub fn build_snapshot(
     let mut duration_secs: HashMap<&str, i64> = HashMap::new();
     for track in tracks {
         let secs = i64::from(track.duration_ms.unwrap_or(0)) / 1000;
-        *duration_secs.entry(track.release_mbid.as_str()).or_insert(0) += secs;
+        *duration_secs
+            .entry(track.release_mbid.as_str())
+            .or_insert(0) += secs;
     }
 
     let mut out_albums: Vec<Album> = releases
@@ -439,11 +438,7 @@ impl Library for ProductionStore {
         Err(not_authorized())
     }
 
-    fn delete_playlist(
-        &mut self,
-        _identity: &Identity,
-        _id: &str,
-    ) -> Result<(), (i64, String)> {
+    fn delete_playlist(&mut self, _identity: &Identity, _id: &str) -> Result<(), (i64, String)> {
         Err(not_authorized())
     }
 
@@ -513,10 +508,7 @@ pub fn render_error(query: &str, error_code: i64, message: &str) -> HttpResponse
 
 /// Error-10 document for a duplicate/malformed credential sender (no
 /// store or credential material is ever touched on this path).
-pub fn parse_error_response(
-    query: &str,
-    err: CredentialParseError,
-) -> HttpResponse {
+pub fn parse_error_response(query: &str, err: CredentialParseError) -> HttpResponse {
     render_error(query, code::GENERIC, &err.to_string())
 }
 
@@ -535,10 +527,7 @@ pub fn auth_error_response(query: &str, err: AuthError) -> HttpResponse {
             code::REQUIRED_PARAM_MISSING,
             "Required parameter is missing.".to_string(),
         ),
-        AuthError::InvalidKey => (
-            code::INVALID_API_KEY,
-            "Invalid API key.".to_string(),
-        ),
+        AuthError::InvalidKey => (code::INVALID_API_KEY, "Invalid API key.".to_string()),
         AuthError::InvalidToken => (
             code::WRONG_CREDENTIALS,
             "Wrong username or password.".to_string(),
