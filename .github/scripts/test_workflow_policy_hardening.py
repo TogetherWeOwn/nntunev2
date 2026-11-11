@@ -140,6 +140,20 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         # hand-off of a derived URL (masking would not cover a modified copy).
         self.assertNotIn('echo "$PLANETSCALE', apply)
         self.assertNotIn("$GITHUB_ENV", apply)
+        # Main-branch dispatch guard: the trusted code runs only from the
+        # protected branch, so a dispatch from any other branch is refused
+        # before the checkouts or the credential are reached.
+        self.assertIn("WORKFLOW_REF: ${{ github.ref }}", apply)
+        self.assertIn('"$WORKFLOW_REF" != "refs/heads/main"', apply)
+        self.assertIn("must be dispatched from refs/heads/main; refusing", apply)
+        # Both driver invocations run with -E -s (no PYTHON* environment and
+        # no user site directory) so dispatch-supplied environment cannot
+        # reach the trusted driver; any bare python3 invocation fails here.
+        self.assertEqual(
+            apply.count("python3 -E -s trusted/.github/scripts/staging_apply.py"),
+            2,
+        )
+        self.assertEqual(apply.count("python3 "), 2)
         # all-pending walks manifest order and refuses on the first failure.
         self.assertIn("all-pending", apply)
 
