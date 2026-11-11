@@ -783,6 +783,42 @@ impl PgStore {
         with_deadline(operation, timeout_ms, StoreError).await
     }
 
+    /// One account row for the Subsonic mount's identity: email drives
+    /// `getLicense`, role drives the `getUser` admin/manager flags. A
+    /// single query keeps one Hyperdrive connect per request.
+    async fn subsonic_account(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT email, role FROM users WHERE id = $1",
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_account")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| {
+                        Ok::<(String, String), StoreError>((
+                            row.try_get("email").map_err(|_| StoreError)?,
+                            row.try_get("role").map_err(|_| StoreError)?,
+                        ))
+                    })
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
@@ -5748,6 +5784,259 @@ fn emit_record(
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
+/// Service binding name for the stream Worker (`wrangler.toml.example`
+/// `[[services]]`): the mount reaches `GET /play/{track_id}` over it with
+/// the minted grant, never through a public fetch.
+const STREAM_SERVICE_BINDING: &str = "STREAM";
+
+fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
+    let mut response = Response::from_bytes(res.body.clone())?;
+    response = response.with_status(res.status);
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+/// Production Subsonic `/rest/*` mount. Decision order:
+///
+/// 1. The public OpenSubsonic route serves with no credentials, no config
+///    and no database.
+/// 2. Everything else needs the Worker config, the Subsonic index
+///    keyring, the duplicate-rejecting parse, and the async credential
+///    core against Postgres. Any failure is a Subsonic error document
+///    (generic 0 for config/database/parse-store failures; the exact
+///    auth codes for credential outcomes).
+/// 3. `stream` is intercepted rather than dispatched: transcoding is
+///    refused (FLAC only), the song must be in the caller's membership
+///    catalogue, a native play is issued behind the account and lease
+///    gates, and the grant is proxied privately to the stream Worker —
+///    whose delivered-byte settlement meters the play through the pool
+///    Durable Object. Missing curated sources answer 70. `download`
+///    keeps the dispatcher's error-0 refusal.
+/// 4. Everything else runs through the transport-free dispatcher over
+///    the per-request snapshot store.
+pub async fn subsonic_mount(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    env: Env,
+    range: Option<String>,
+    trace_id: Option<String>,
+) -> WorkerResult<Response> {
+    use crate::subsonic_dispatch as core;
+    use nntune_subsonic::endpoints::Params;
+    use nntune_subsonic::envelope::code;
+    use nntune_subsonic::library::{Identity, UserAccount};
+    use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{MemStore, SubsonicApp};
+
+    // 1. Public route: no credentials, no config, no database.
+    if matches!(route(path), Route::PublicEndpoint(_)) {
+        let app = SubsonicApp::production(MemStore::empty());
+        return respond_document(&app.handle(method, path, query, body));
+    }
+
+    let trace_id = crate::logging::resolve_trace_id(trace_id.as_deref());
+    let config = match config_from_env(&env) {
+        Some(cfg) => cfg,
+        None => {
+            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+        }
+    };
+    let store = PgStore {
+        env: Some(env.clone()),
+        trace_id: trace_id.clone(),
+        mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_mirror: None,
+    };
+    let now = worker::Date::now().as_millis() / 1000;
+    let keyring = match config
+        .subsonic_index
+        .as_ref()
+        .and_then(|cfg| cfg.keyring().ok())
+    {
+        Some(k) => k,
+        None => {
+            return respond_document(
+                &core::auth_error_response(query, crate::subsonic_auth::AuthError::Unavailable),
+            );
+        }
+    };
+    let form_body = (!body.is_empty()).then(|| body.as_bytes());
+    let credentials =
+        match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+            Ok(c) => c,
+            Err(err) => return respond_document(&core::parse_error_response(query, err)),
+        };
+    let principal = match crate::subsonic_auth::authenticate(
+        &store,
+        &credentials,
+        &keyring,
+        &config,
+        now,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => return respond_document(&core::auth_error_response(query, err)),
+    };
+    let (email, role) = match store.subsonic_account(principal.user_id()).await {
+        Ok(Some(pair)) => pair,
+        _ => {
+            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+        }
+    };
+    let is_admin = role == "admin";
+    let identity = Identity {
+        username: principal.username().to_string(),
+        email: email.clone(),
+        is_admin,
+    };
+    let account = UserAccount {
+        email,
+        is_admin,
+        is_manager: role == "manager",
+    };
+    // Membership catalogue snapshot (already member-scoped by the reads).
+    let catalogue = async {
+        Ok::<_, StoreError>((
+            store.catalogue_artists(principal.user_id()).await?,
+            store.catalogue_releases(principal.user_id()).await?,
+            store.catalogue_tracks(principal.user_id()).await?,
+        ))
+    };
+    let (artist_rows, release_rows, track_rows) = match catalogue.await {
+        Ok(rows) => rows,
+        Err(_) => {
+            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+        }
+    };
+    let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
+
+    // 3. Stream interception.
+    if matches!(route(path), Route::Endpoint("stream")) {
+        let merged = if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
+            if query.is_empty() {
+                body.to_string()
+            } else {
+                format!("{query}&{body}")
+            }
+        } else {
+            query.to_string()
+        };
+        let params = Params::parse(&merged);
+        if core::rejects_transcode(&params) {
+            return respond_document(&core::transcode_refusal_response(query));
+        }
+        let Some(song_id) = params.get("id").map(str::to_string) else {
+            return respond_document(&core::render_error(
+                query,
+                code::REQUIRED_PARAM_MISSING,
+                "Required parameter is missing.",
+            ));
+        };
+        if !songs.iter().any(|song| song.id == song_id) {
+            return respond_document(&core::render_error(query, code::NOT_FOUND, "Song not found."));
+        }
+        let stripe = WorkerStripeTransport {
+            secret_key: config.stripe_secret_key.clone(),
+        };
+        let mailer = WebhookMailer {
+            origin: config.origin.clone(),
+            env: env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let dialer = SocketDialer;
+        let dns = DohDns;
+        let ctx = handlers::Ctx {
+            cfg: &config,
+            store: &store,
+            mailer: &mailer,
+            dialer: &dialer,
+            dns: &dns,
+            stripe: &stripe,
+            now,
+            source_ip: String::new(),
+        };
+        let issued = handlers::issue_play_for_user(
+            &ctx,
+            principal.user_id(),
+            Some(handlers::PlayIssueBody {
+                track_id: song_id.clone(),
+                session_id: core::compat_session_id(
+                    principal.user_id(),
+                    principal.credential_id(),
+                ),
+                play_id: None,
+                takeover: false,
+            }),
+        )
+        .await;
+        let issued = match issued {
+            Ok(issued) => issued,
+            Err(refusal) => {
+                return respond_document(&core::issuance_refusal_response(query, refusal.status));
+            }
+        };
+        // Unprovisioned stream binding means the source cannot be served:
+        // answer 70 like any other missing curated source.
+        let fetcher = match env.service(STREAM_SERVICE_BINDING) {
+            Ok(fetcher) => fetcher,
+            Err(_) => {
+                return respond_document(&core::upstream_refusal_response(query, 502));
+            }
+        };
+        let headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", issued.grant.token))?;
+        if let Some(range_value) = range {
+            headers.set("Range", &range_value)?;
+        }
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers);
+        let request = Request::new_with_init(
+            &format!("https://nntune-stream/play/{song_id}"),
+            &init,
+        )?;
+        let mut upstream = fetcher.fetch_request(request).await?;
+        let status = upstream.status_code();
+        return match status {
+            200 | 206 => {
+                let bytes = upstream.bytes().await?;
+                let mut response = Response::from_bytes(bytes)?;
+                response = response.with_status(status);
+                let headers = Headers::new();
+                let content_type = upstream.headers().get("content-type")?.unwrap_or_default();
+                headers.set("Content-Type", &content_type)?;
+                for name in ["Content-Range", "Accept-Ranges", "Content-Length"] {
+                    if let Some(value) = upstream.headers().get(name)? {
+                        headers.set(name, &value)?;
+                    }
+                }
+                headers.set("Cache-Control", "private, no-store")?;
+                *response.headers_mut() = headers;
+                Ok(response)
+            }
+            _ => respond_document(&core::upstream_refusal_response(query, status)),
+        };
+    }
+
+    // 4. Everything else: transport-free dispatcher over the snapshot.
+    let app = SubsonicApp::production(core::ProductionStore::new(
+        identity,
+        account,
+        artists,
+        albums,
+        songs,
+    ));
+    respond_document(&app.handle(method, path, query, body))
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -5964,7 +6253,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 23] = [
+    const DB_FAILURE_EVENTS: [&str; 24] = [
         "api.db.mirror_unconfigured",
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
@@ -5988,6 +6277,7 @@ mod tests {
         "api.db.statement_failed.create_checkout_operation",
         "api.db.statement_failed.checkout_operation_by_id",
         "api.db.statement_failed.update_checkout_operation",
+        "api.db.statement_failed.subsonic_account",
     ];
 
     #[test]

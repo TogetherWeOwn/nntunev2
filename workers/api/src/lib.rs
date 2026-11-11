@@ -5,12 +5,12 @@
 //! Subsonic-compatible `/rest/*` surface (wasm32 only), which adapts to
 //! the transport-free `nntune-subsonic` dispatcher.
 //!
-//! The production Subsonic `Library` (PlanetScale via Hyperdrive, R2
-//! audio/artwork via the stream worker) plugs in behind the `Library`
-//! seam. Until then the Worker uses `MemStore::empty()`, which holds no
-//! credentials and rejects every auth attempt. Per-client `apiKey`
-//! credentials resolve through the unmounted async core and the additive
-//! `subsonic_credentials` schema; legacy `subsonic_clients` is never promoted.
+//! What `/rest/*` serves is decided by [`worker_entry::subsonic_mount`]:
+//! the duplicate-rejecting parser, the async credential core over
+//! Postgres (`subsonic_credentials`; legacy `subsonic_clients` is never
+//! promoted), the membership catalogue, and grant-minted FLAC playback
+//! through the stream Worker. Only the public OpenSubsonic route is
+//! answered without credentials.
 
 pub mod account_deletion;
 pub mod admin;
@@ -43,6 +43,7 @@ pub mod session_retry_store;
 pub mod stripe;
 pub mod subsonic_auth;
 pub mod subsonic_config;
+pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
 pub mod vault;
@@ -125,9 +126,7 @@ mod logging_tests {
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
-use nntune_subsonic::{
-    oversized_body_response, unreadable_body_response, BodyFault, FormBody, MemStore, SubsonicApp,
-};
+use nntune_subsonic::{oversized_body_response, unreadable_body_response, BodyFault, FormBody};
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
@@ -144,7 +143,7 @@ pub async fn main(
     #[cfg(target_arch = "wasm32")]
     if is_subsonic_request(&req) {
         let mut req = req;
-        return subsonic_response(&mut req).await;
+        return subsonic_response(&mut req, env).await;
     }
     worker_entry::dispatch(req, env).await
 }
@@ -187,12 +186,17 @@ mod subsonic_routing_tests {
 
 /// Serve one Subsonic request: v1 reads params from query plus POST form
 /// body (`$request->input()`), refusing bodies over 10 MB with error 10.
+/// Body/header capture lives here; dispatch (duplicate-rejecting parse,
+/// async authentication, membership catalogue, grant-minted stream proxy)
+/// is `worker_entry::subsonic_mount`.
 #[cfg(target_arch = "wasm32")]
-async fn subsonic_response(req: &mut Request) -> Result<Response> {
+async fn subsonic_response(req: &mut Request, env: Env) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().to_string();
     let query = url.query().unwrap_or("").to_string();
     let method = req.method().to_string();
+    let range = req.headers().get("range").unwrap_or_default();
+    let trace_id = req.headers().get("x-trace-id").unwrap_or_default();
 
     // v1 reads params from query plus POST form body (`$request->input()`).
     let content_type = req
@@ -245,11 +249,7 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
         String::new()
     };
 
-    // Keep the production surface fail-closed until the authenticated async
-    // store and shared playback adapter replace this empty store.
-    let app = SubsonicApp::production(MemStore::empty());
-    let res = app.handle(&method, &path, &query, &body);
-    respond(&res)
+    worker_entry::subsonic_mount(&method, &path, &query, &body, env, range, trace_id).await
 }
 
 #[cfg(target_arch = "wasm32")]
