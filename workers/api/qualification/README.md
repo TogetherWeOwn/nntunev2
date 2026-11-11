@@ -1,0 +1,358 @@
+# Source-only generated Worker qualification
+
+The required `worker-preparation-qualification` Actions job uses the canonical
+[toolchain manifest](../../../.github/worker-toolchain.json). Effective build
+adoption must read that same manifest rather than introduce a competing pin.
+No deploy workflow, Wrangler main/build command, binding grant or runtime mode
+is changed. The API bridge is built only into this job's qualification artifact.
+
+Both actual release Workers and a separate synthetic-producer qualification
+artifact are generated using the selected builder and all three verified tool
+overrides, including wasm-opt. Any missing override, fallback
+download, nonempty builder download cache, lock drift or version mismatch fails
+the job. The builder and bindgen crate archives are checked against both the
+selected SHA-256 and registry index; the Binaryen archive is checked against the
+selected SHA-256 and its published checksum. The isolated pnpm importer has a
+script-disabled frozen install. See [supply-chain limitations](SUPPLY_CHAIN.md).
+
+The Node test imports Miniflare from this package only. Actual generated JS/Wasm
+and `cloudflare:workers` execute inside workerd, without VM substitutions. The
+harness-only roots import the unchanged facade and generated Workers; they are
+not effective application entrypoints. Snapshot assertions cover the actual
+export namespaces and class prototypes, including the locked SDK's three data
+classes emitted by the builder's class wrappers. The facade must export none
+of those classes or the raw private bridge; it retains only its two composed
+entrypoints. Both Workers' snapshots are compared together so a failure reports
+the full ABI delta rather than stopping at the first namespace mismatch.
+Real service bindings exercise the
+named facade, mode refusal, a redacted injected bridge failure, and public
+surface isolation for the tested request matrix. The generated API runs with
+no keyring/config and must refuse startup; ingest's health fetch runs normally.
+The harness denies outbound fetches and uses no real credentials.
+
+A real local R2 bucket and Queue producer/consumer are composed with ingest.
+The harness writes a synthetic three-byte object and sends an opaque pointer;
+the generated Rust consumer receives it and encounters an unknown recovery
+outcome without DB prerequisites. A completion marker records callback return;
+a separate real dead-letter Queue observer must receive the exact pointer,
+proving native failure settlement rather than a successful ack. R2 readback
+checks that the object remains. This is **platform composition and
+failed-recovery retention**, not a test of the Rust tagged-object producer:
+the seed write/send are harness JavaScript. It does not establish successful
+DB-backed prepare/freeze/open, authenticated admission, the actual Rust R2
+create-only/range adapter, process-crash/ambiguous-commit recovery or deployment
+lifecycle acceptance. The separate composite control below addresses some of
+those gaps; neither control qualifies the whole foundation by itself.
+
+The fault probe replaces only the generated private method in its own test
+isolate, preserving the real generated constructor and platform lifecycle. It
+is an explicit fault injection, not production logic or successful DB evidence.
+The original public matrix runs without API configuration. A separate isolate
+now gets ephemeral harness-generated session/KEK inputs and must serve the real
+Rust health route before and after its matrix. The harness constructs the
+application Origin inside workerd and forwards through a service binding to the
+unchanged public/default facade. This avoids the Node binding proxy's separate
+nonlocal-Origin rejection; no runtime host guard is disabled. Health must also
+return the exact configured CORS origin, proving the Rust router received that
+header. That matrix covers four paths across seven methods, despite the Origin,
+mode header, query hint and binary body: 27 exact 404s plus the existing generic
+empty 204 for `OPTIONS /v1/ingest/preparation`. The scope map already covers
+`POST /v1/ingest/*`, so browser preflight answers that namespace even where no
+handler exists. The test pins its exact method/header grants and empty body;
+the 404 cases must omit those grants. No application routing or security guard
+is changed to make the harness pass. Every matrix response must carry the exact
+CORS origin and a valid Rust trace ID, not a harness/proxy response. Per-request
+bridge counts stay unchanged, including on preflight. A named-binding
+positive control must reach the injected failure and increment the same count,
+while its response remains redacted and no-store. No generated/platform class
+is replaced. These configured routes do not need a DB; successful DB-backed
+private protocol, Rust producer and composite recovery acceptance remain open.
+This is not a proof over every configured API route or credential posture.
+
+## Rust producer and database-backed composite control
+
+The ordinary ingest artifact is preserved separately and its exact prototype
+must omit both qualification bridges. Only a third, Actions-only build selects
+`preparation-qualification`; no effective Wrangler build selects that feature.
+Its raw methods have no public router entry, accept no caller-selected producer
+identity and call the existing `prepare_and_send` and `recover_delivery` directly.
+The fixed tagged-output fixture crosses the 64-KiB reader boundary, but is not a
+real FLAC parser/tagger result. These are test bridges, not a business entrypoint.
+
+A disposable loopback PostgreSQL service receives the full migration/replay/SQL
+bank. The harness refuses a missing or non-Actions/non-loopback/non-test-database
+DSN. It seeds shape-valid historical admission custody, not an authenticated
+HTTP upload or genuine original envelope. The actual Rust producer must create
+its tagged R2 object, canonical plan, encrypted API-keyring DB envelope, dispatch,
+receipt and attempt, then send through the real Queue producer. The plan service
+is the unchanged named facade in a separate generated API isolate with ephemeral
+KEK/session inputs and its own Hyperdrive binding. No JS plan freeze/open double,
+R2 write or Queue send supplies the successful producer path.
+
+The control requires exact object version/bytes/byte-derived digest, one sealed
+plan/attempt/receipt, acknowledged send, successful Rust pointer recovery in the
+real Queue callback and unchanged full-row DB fingerprints across recovery and
+producer replay. R2 must contain no plan object. Unknown pointers and replacement
+of the tagged object with a new version must refuse without DB changes or R2
+deletion. The real generated Queue consumer still owns native ack/retry; an extra
+read-only Rust recovery observes success before it, a marker observes callback
+return, and any observed dead-letter delivery vetoes the positive control. This
+is not direct instrumentation of the native ack call or an unbounded no-retry
+proof. Ordinary failed-recovery/native-DLQ acceptance remains separate above.
+
+The first composite execution reached the actual Rust R2 reader, then panicked
+at the locked SDK's class-typed `Object::range` getter: workerd returns a plain
+range dictionary, not an exported Wasm `R2Range` instance. The adapter now uses
+the locked raw bucket binding and checks the response dictionary before bounded
+body streaming. Exact key/version, numeric offset/length, absent suffix, valid
+size and exact streamed length remain required. Harness-only GET response faults
+cover offset, length, type, suffix, null range, version, non-finite size and short/
+long bodies. Each must refuse before DB dispatch while retaining the R2 object;
+the unchanged real multi-range producer/recovery path is the positive control.
+No runtime/provider guard or test expectation is relaxed to hide the panic.
+
+At head `bd7ff8df`, [exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42377491568/job/128418003741)
+passes all eight runtime subtests (nine Node passes including the enclosing test).
+This includes the corrected range faults and actual Rust composite above, not
+just the earlier JS-seeded controls.
+
+A separate synthetic structural FLAC control now feeds the actual `rewrite_tags`
+parser/tagger before the same Rust preparation/R2/private plan service/DB/Queue
+path. Fixed harness tags and producer identity cannot be chosen by the request.
+Malformed magic, frame CRC, total samples and an oversized harness body must
+refuse before R2 or DB writes. The positive fixture crosses the range boundary;
+assertions require stripped padding, fresh comments, unchanged frame bytes,
+byte-derived tagged digest distinct from the input, exact R2 version, sealed plan,
+Queue recovery and immutable producer replay. Separate fixed owner/job/operation
+custody and an isolated bucket keep the earlier control's rows and deliberately
+replaced object from satisfying or blocking this one. The original-upload hash
+must also be distinct: the admin-job unique index is global, not per owner. Both
+seeded jobs must coexist with different hashes, with each admission key and original
+custody matching its own upload identity. The first structural-control Actions run
+failed at that seed index before parsing; it is not parser/tagger acceptance.
+The fixture is generated structural data: no PCM decoder or MD5 verification is
+performed, and historical seeded admission is still not authenticated HTTP upload.
+At head `524e39f9`, [exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42381117815/job/128428780077)
+passes all nine runtime subtests (ten Node passes including the enclosing test),
+including this structural FLAC composition and all four malformed-input controls.
+The same head's [database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42381117815/job/128428780004)
+explicitly reports 255 required cases passed. These are exact-head Actions results,
+not authenticated-upload, PCM-decoder, security, staging or release acceptance.
+
+An additional lifecycle control now disposes the entire Miniflare/workerd runtime
+and creates a fresh one using the same temporary R2 persistence, external DB and
+ephemeral API keyring. No object, plan or admission is reseeded. Fresh Rust and API
+isolates must recover the stored FLAC pointer, preserve the exact R2 version/digest
+and full DB fingerprints, reject an unknown pointer, and replay the producer
+without reminting or renewing authority. Each replay removes only the old harness
+completion marker and waits for a fresh callback marker before checking DB/DLQ
+state; pre-restart replay completes first so it cannot satisfy the restart check.
+The converter must retain the selected `resourcePersistencePath`. Temporary
+persistence is removed only after runtime disposal. At head `659aafbd`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42383178630/job/128434934300)
+passes all ten runtime subtests (eleven Node passes including the enclosing test),
+including graceful runtime replacement. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42383178630/job/128434934560)
+explicitly reports 255 required cases passed. Graceful restart is not abrupt crash,
+ambiguous-commit or pending-Queue replay injection.
+
+A private-response control opens the real stored plan through the actual service
+binding before injecting status, redirect, content-type, digest, short-body,
+stream-error, oversized-body and stalled-body responses into read-only recovery.
+The oversize stream exceeds the existing 1-MiB bound and stays open: refusal must
+precede the existing ten-second operation deadline, not depend on EOF or digest
+rejection. A one-byte stalled stream must instead reach that deadline. Every
+control requires exactly one successful real plan call, a redacted refusal,
+unchanged full DB fingerprints and exact R2 version/digest, no new objects or
+Queue marker, and successful genuine recovery afterward. At head `b95b392f`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42385014133/job/128440474769)
+passes all eleven runtime subtests (twelve Node passes including the enclosing
+test), including these response controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42385014133/job/128440475247)
+explicitly reports 255 required cases passed. Workerd emits critical-error
+messages during injected stream failure; the refusal, unchanged-state and later
+genuine recovery assertions pass. This is not clean runtime diagnostics. The
+digest fault changes only the original-digest field, preserving canonical format
+and geometry; this exercises end-to-end integrity, not one particular duplicate
+digest check. Truncation does not isolate length from digest/decoder refusal.
+The synthetic redirect is returned after the actual service fetch, so it proves
+status refusal, not platform redirect-following prevention. No production bound
+or timeout is shortened to make the tests pass. This covers
+bounded private response handling, not maximum supported media-file sizing,
+network cancellation, a process crash or ambiguous commit. Process crashes,
+ambiguous DB commits, pending-Queue replay, large-media limits, deployed
+lifecycle/drain, actual staging/restore and remaining foundation review stay open.
+The FLAC composite now also faults the native Queue send before acceptance and
+after a successful real send (lost reply). Each producer call must reach exactly
+one send attempt and return a static refusal while the persisted dispatch stays
+unacknowledged. Direct recovery must work before any send; after the lost reply,
+a fresh callback marker must prove actual Rust Queue recovery. Full DB
+fingerprints must remain unchanged across both faults. An ordinary producer retry
+then sets the acknowledgement bit, changes no other persisted field, preserves
+the exact R2 version and requires another fresh callback marker. No DB reset,
+manual acknowledgement or replacement custody is used. At head `474aabaa`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42386967887/job/128446288295)
+passes all eleven runtime subtests (twelve Node passes including the enclosing
+test), including these Queue controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42386967887/job/128446288347)
+explicitly reports 255 required cases passed. The post-send throw simulates a lost
+Queue reply, not a process crash, ambiguous DB commit or pending Queue persistence
+across restart.
+
+The pre-send refusal now also precedes a full runtime replacement. A fresh
+workerd/Rust/private API composition must recover and replay that still-unsent
+pointer without changing any DB row, including acknowledgement and deadlines.
+Unknown recovery refuses; exact R2 bytes/version and the object inventory survive
+without reseeding. No callback or dead-letter marker may appear during direct
+recovery. The existing lost-reply send and ordinary acknowledgement-only retry
+then run through these fresh isolates and require new native callback markers.
+At head `0d91fa6e`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42390548525/job/128457068748)
+passes all thirteen runtime subtests (fourteen Node passes including the enclosing
+test), including this unsent-dispatch restart. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42390548525/job/128457068794)
+explicitly reports 255 required cases passed. This qualifies durable **unsent
+dispatch** recovery after graceful restart, not persistence of accepted pending
+Queue messages, abrupt crash or ambiguous commit.
+
+The accepted-but-lost-reply send now also precedes runtime replacement, after its
+native callback has positively completed. Its marker is removed before shutdown;
+fresh Rust/private API isolates must recover that same unacknowledged pointer
+without changing any DB row, deadline, R2 byte/version or inventory. Unknown
+recovery refuses and direct recovery cannot recreate a callback marker. The
+ordinary producer retry must then acknowledge only the existing dispatch and
+produce a fresh native callback. At head `b25879f3`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42392975789/job/128464253581)
+passes all fourteen runtime subtests (fifteen Node passes including the enclosing
+test), including this accepted-send restart. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42392975789/job/128464253452)
+explicitly reports 255 required cases passed. This covers graceful restart after
+a simulated lost reply and completed native delivery, **not** persistence or
+replay of an accepted pending Queue message, an abrupt crash or an ambiguous DB
+commit.
+
+An additional Actions-only subprocess now reuses the exact generated FLAC
+fixture composition and persistent R2/DB/keyring. The parent first disposes its
+runtime; the child performs a real native Queue send and holds its reply before
+the producer can acknowledge the outbox. A fresh R2 sentinel records exactly one
+attempt/acceptance. Only after observing that boundary, the parent sends SIGKILL
+to the child's entire detached Linux process group, requires the Node process's
+SIGKILL exit and verifies that no live process remains in the group before
+opening the persistence again. Cleanup also runs when the probe fails. No
+Miniflare disposal runs in the killed subprocess.
+
+Fresh Rust/private API isolates must recover and replay the same unacknowledged
+pointer, with full DB fingerprints/deadlines, exact R2 bytes/version and object
+inventory unchanged after removing only harness sentinels. Unknown pointers
+refuse. The ordinary retry afterward must change only the acknowledgement bit
+and produce a fresh native callback. At head `c2ca640a`,
+[qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42395148261/job/128470796833)
+passes all fifteen runtime subtests (sixteen Node passes including the enclosing
+test), including this SIGKILL control. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42395148261/job/128470797054)
+explicitly reports 255 required cases passed. They test **outbox recovery after
+an actual abrupt process crash**, not whether the emulator persists accepted
+pending Queue messages. A callback may have completed before the kill, so it
+cannot supply the post-crash retry's marker. No ambiguous DB commit, maximum-media,
+cancellation, deployed drain or actual staging/restore proof is inferred.
+
+### Committed transaction with an unavailable acknowledgement
+
+The Actions-only loopback PostgreSQL proxy targets four actual producer mutation
+transactions: sealed-plan freeze, immutable dispatch insert, atomic startup with
+attempt acquisition, and send acknowledgement. It parses bounded wire frames,
+waits for PostgreSQL's `CommandComplete(COMMIT)`, then drops that frame and the
+connection before the real Rust client receives success. No SQL statement,
+trigger, production adapter or credential is changed, and wire contents are never
+logged. Independent direct DB reads must prove the selected mutation committed;
+a redacted 503 and exactly one suppressed completion are both required. A trigger
+exception, pre-commit disconnect or merely discarding an already successful Rust
+result cannot satisfy this control.
+
+One fixed third fixture progresses through all four faults. Between them, fresh
+workerd/API isolates must retain the same sealed envelope, version, outbox ID,
+R2 bytes/version and later acquired token/deadlines. Pointer-only recovery refuses
+before acquisition; it cannot repair an absent receipt by starting work. Once
+startup commits, recovery is read-only. The acknowledgement commit may change
+only its monotonic bit. Native send instrumentation must record zero attempts
+for the first three faults and exactly one for the acknowledgement fault; marker
+absence is checked before that send and after earlier restarts, not inferred from
+asynchronous callback timing. An ordinary final producer retry must preserve every
+DB row and yield a new successful native Queue recovery marker. An accepted callback
+is completed before runtime replacement, not counted as pending-Queue durability.
+
+At head `6b8ec3c1`,
+[qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42397515966/job/128477977149)
+passes the plan, dispatch and startup committed-response-loss controls, then
+fails the acknowledgement phase after about ten seconds with zero Queue sends.
+Its final retry also refuses; because the preceding assertion can leave the
+fault armed, that retry is not independent unarmed-path evidence. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42397515966/job/128477977179)
+explicitly reports 255 required cases passed, not full runtime qualification.
+
+The proxy now disables Nagle on both sockets: forwarding individual protocol
+frames must not introduce delayed-ACK stalls into the producer's existing
+ten-second operation deadline. That is the working latency diagnosis, not a
+measured root cause or corrected-runtime pass. The deadline, COMMIT suppression,
+send counts and custody/recovery assertions are unchanged. Exact-head Actions
+must reach one send and one dropped acknowledgement completion, then an ordinary
+202 retry preserving the same rows. If it still fails, inspect payload-free
+phase/frame timings rather than widening the deadline or weakening assertions.
+No local runtime execution is claimed. At head `9b4c637a`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42399052738/job/128482708931)
+passes all twenty runtime subtests (21 Node passes including the enclosing test),
+including all four committed-response-loss phases and the final exact retry.
+The acknowledgement phase completes in about 1.34 seconds. This supports the
+correction, not an isolated measurement proving the latency's cause. The same
+head's [database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42399052738/job/128482708836)
+explicitly reports 255 required cases passed.
+
+These controls cover the committed/lost-response branch, not an uncommitted or
+rolled-back COMMIT, server storage failure, maximum-media/cancellation, deployed
+drain or staging/restore. The previously passing restart/client-drop and
+trigger-rollback banks retain those narrower scopes; they were not actual
+commit-response injection.
+
+A separate R2 recovery control retains the actual GET metadata and faults only
+its body: an open oversized chunk, two individually bounded chunks whose total
+exceeds the requested range, a stream error and a stalled prefix. All must reach
+exactly one real GET and return the static redacted refusal. Oversize/error
+refusals must precede the existing ten-second operation deadline; the stalled
+body must instead reach it. Full DB rows and every R2 key/version must stay
+unchanged, exact tagged bytes/digest must survive, no Queue marker may change,
+and genuine recovery must succeed after each fault. At head `5909f250`,
+[exact-head qualification Actions](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42388757301/job/128451700283)
+passes all twelve runtime subtests (thirteen Node passes including the enclosing
+test), including these R2 stream controls. The same head's
+[database job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42388757301/job/128451700112)
+explicitly reports 255 required cases passed. The injected stream-error diagnostics
+retain the earlier limits; this is not clean-diagnostic or IO-cancellation proof.
+These controls qualify bounded range stream handling, not maximum-media sizing,
+network cancellation or abrupt crash.
+
+The successful Rust composite now also repeats read-only recovery with an absent
+plan binding, the configured API's default entrypoint, and the unrelated ingest
+service. The latter two use real platform Fetchers, not fake response bodies;
+call counts and returned HTTP statuses must prove that dispatch reached the
+mistargeted service. Each refusal preserves full DB fingerprints, R2 inventory,
+exact tagged bytes/version and callback markers. Genuine named-binding recovery
+must succeed after each fault without changing that same custody. This covers
+binding refusal during recovery, not initial producer misconfiguration or a
+capability grant/deployment. At `c800560d`, the
+[qualification job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42400891623/job/128488216516)
+reached the first missing-binding refusal and unchanged DB check, then failed
+because it compared RPC proxy objects (including fresh inspection functions)
+directly. The default/wrong-binding cases and later assertions in that subtest
+were not reached. Nineteen runtime subtests passed; Node reports nineteen passes
+and two failures including the enclosing test. The corrected inventory compares
+complete, sorted object keys, versions and sizes, with an unchanged-list positive
+control; exact tagged bytes/version and full DB checks remain. Corrected controls
+await exact-head Actions; no runtime pass is claimed for the correction.
+
+No test uses candidate media keys, articles or manifests.
+Passing this job is not security review, staging/restore proof, production
+activation, posting or R2 deletion authority.
+
+Do not run this job as a local CI mirror. Full builds, clean install and runtime
+tests run on GitHub Actions for the exact PR head. A skipped or zero-test run is
+not acceptance. New test controls are unexecuted until that evidence is recorded.

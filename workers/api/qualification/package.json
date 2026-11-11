@@ -1,0 +1,18 @@
+{
+  "name": "nntune-api-qualification",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated, secretless Miniflare harness importer for the API worker.",
+  "packageManager": "pnpm@10.34.7",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "qualification": "node --test runtime.test.mjs"
+  },
+  "dependencies": {
+    "@esbuild/linux-x64": "0.28.2",
+    "miniflare": "5.20261023.0-beta"
+  }
+}
