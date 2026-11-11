@@ -6168,7 +6168,12 @@ pub async fn subsonic_mount(
 
     // 4. Everything else: transport-free dispatcher over the snapshot.
     let app = SubsonicApp::production(core::ProductionStore::new(
-        identity, account, artists, albums, songs, now_millis,
+        identity,
+        account,
+        artists,
+        albums,
+        songs,
+        now_millis as i64,
     ));
     respond_document(&app.handle(method, path, query, body))
 }

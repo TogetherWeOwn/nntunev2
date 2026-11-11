@@ -150,14 +150,18 @@ pub fn build_snapshot(
     // display name), matching the native catalogue ordering contract; the
     // mapped Artist carries only name, so the sort reads the row map.
     out_artists.sort_by(|a, b| {
-        let key = |x: &Artist| {
-            let sort = artist_sort
-                .get(x.id.as_str())
-                .copied()
-                .unwrap_or(x.name.as_str());
-            (sort, x.name.as_str(), x.id.as_str())
-        };
-        key(a).cmp(&key(b))
+        let sort_a = artist_sort
+            .get(a.id.as_str())
+            .copied()
+            .unwrap_or(a.name.as_str());
+        let sort_b = artist_sort
+            .get(b.id.as_str())
+            .copied()
+            .unwrap_or(b.name.as_str());
+        sort_a
+            .cmp(sort_b)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     // Album duration is the summed member track durations (seconds) — from
