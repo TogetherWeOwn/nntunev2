@@ -99,7 +99,6 @@ fn store() -> ProductionStore {
     )
 }
 
-
 #[test]
 fn snapshot_maps_flac_size_duration_and_year() {
     let (artists, releases, tracks) = fixture_rows();
