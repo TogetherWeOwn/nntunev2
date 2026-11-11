@@ -47,7 +47,8 @@ compatibility_date = "2026-10-01"
 workers_dev = false
 
 [build]
-command = "cargo install -q worker-build --locked && worker-build --release"
+# Prepare the canonical tools first; see docs/ops.md (Worker build tools).
+command = "worker-build --release -- --locked"
 
 [vars]
 # Audio bucket name behind the AUDIO_PUBLISH binding below (code:

@@ -338,12 +338,12 @@ invite-only, non-commercial hobby service; that framing is the
 reason for the choice, and it is recorded here so the choice is not
 quietly relitigated. The mirror therefore runs CC0-only:
 
-- The mirror uses the twice-weekly CC0 core dumps (plus the CC0
-  canonical dumps on the 1st/15th if useful); the hourly Live Data
-  Feed is dropped from ADR 0007's mirror design, and ADR 0007's
-  <2 h lag SLO is replaced by a dump-freshness target (≤4 days;
-  no dump-age monitor or pager exists yet, so nothing may claim it
-  is a monitored SLO until they are built).
+- **Cadence amended 2026-11-07:** the [ADR 0007 amendment](0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement)
+  supersedes twice-weekly/≤4-day freshness with weekly CC0 full exports;
+  twice-weekly requires demonstrated product need. Weekly automation
+  remains disabled pending its non-Container runtime and headroom
+  prerequisites. Neither cadence is a monitored SLO. The hourly Live
+  Data Feed remains excluded; the former <2 h lag SLO is not restored.
 - NC data is excluded at import: no tags/genre associations,
   ratings, annotations, or derived statistics built from them.
 - Browse-by-genre needs a CC0 source. Wikidata (P136) is the

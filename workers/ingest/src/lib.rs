@@ -31,6 +31,20 @@ use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod api_error;
+pub mod audio_acceptance;
+pub mod audio_classifications;
+pub mod audio_classifications_acceptance;
+pub mod audio_classifications_store;
+pub mod audio_grouping;
+pub mod audio_manifest;
+pub mod audio_manifest_store;
+pub mod audio_mirror_evidence;
+pub mod audio_positions;
+pub mod audio_producer;
+pub mod audio_publication;
+pub mod audio_scratch;
+pub mod audio_selection;
+pub mod audio_tags;
 pub mod caller_auth;
 pub mod checkpoint;
 pub mod dispatch;
@@ -1552,7 +1566,7 @@ async fn job_status(req: &Request, ctx: &RouteContext<()>, trace_id: &str) -> Re
         serde_json::json!({"job_id": id, "build_sha": build_sha}),
     );
     match owned_checkpoint(&caller, checkpoint::get(&ctx.env, &id).await) {
-        Ok(Some(cp)) => Response::from_json(&cp),
+        Ok(Some(cp)) => Response::from_json(&cp.public_status()),
         Ok(None) => json_error(ApiError::not_found("unknown job id")),
         Err(()) => service_unavailable("checkpoint store unavailable"),
     }

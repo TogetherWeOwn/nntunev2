@@ -104,6 +104,56 @@ pub struct JobCheckpoint {
     /// pre-existing checkpoints at the first input.
     #[serde(default)]
     pub transcode_next: usize,
+    /// Private frozen producer input. Missing on legacy checkpoints does not
+    /// authorize deriving occurrences from the old recording array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_audio_manifest_v1: Option<crate::audio_manifest::AcceptedAudioManifest>,
+}
+
+impl JobCheckpoint {
+    pub fn audio_manifest(&self) -> Option<&crate::audio_manifest::AcceptedAudioManifest> {
+        self.accepted_audio_manifest_v1.as_ref()
+    }
+
+    /// First acceptance belongs to Matching before any mirror call. Replays
+    /// accept only the identical frozen value, including after manual redrive.
+    pub fn freeze_audio_manifest(
+        &mut self,
+        manifest: crate::audio_manifest::AcceptedAudioManifest,
+    ) -> Result<(), crate::audio_manifest::ManifestError> {
+        use crate::audio_manifest::ManifestError;
+        if !manifest.is_for(&self.job_id, &self.user_id) {
+            return Err(ManifestError::Identity);
+        }
+        match self.audio_manifest() {
+            Some(existing) if existing == &manifest => return Ok(()),
+            Some(_) => return Err(ManifestError::Frozen),
+            None if self.state != JobState::Matching => return Err(ManifestError::Invalid),
+            None => {}
+        }
+        self.accepted_audio_manifest_v1 = Some(manifest);
+        Ok(())
+    }
+
+    pub fn validate_audio_manifest(&self) -> Result<(), crate::audio_manifest::ManifestError> {
+        if self
+            .audio_manifest()
+            .is_some_and(|m| !m.is_for(&self.job_id, &self.user_id))
+        {
+            return Err(crate::audio_manifest::ManifestError::Identity);
+        }
+        Ok(())
+    }
+
+    /// Preserve the legacy status shape, without serializing private selectors.
+    pub fn public_status(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("checkpoint serializes");
+        value
+            .as_object_mut()
+            .expect("checkpoint object")
+            .remove("accepted_audio_manifest_v1");
+        value
+    }
 }
 
 /// Advance one step on success. `repair_needed` is only read in `Verifying`.
@@ -348,6 +398,7 @@ mod tests {
             provider_id: None,
             transcode_inputs: Vec::new(),
             transcode_next: 0,
+            accepted_audio_manifest_v1: None,
         }
     }
 

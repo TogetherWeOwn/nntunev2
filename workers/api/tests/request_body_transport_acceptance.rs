@@ -693,9 +693,13 @@ impl handlers::Store for CountingStore {
         self.bump();
         Ok(())
     }
-    async fn revoke_all_sessions(&self, _user_id: &str) -> Result<(), handlers::StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> Result<u64, handlers::StoreError> {
         self.bump();
-        Ok(())
+        Ok(0)
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
         self.bump();

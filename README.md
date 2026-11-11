@@ -2,6 +2,9 @@
 
 Serverless music streaming on Cloudflare, from a shared curated catalogue.
 
+Read the [roadmap](ROADMAP.md) for product direction, boundaries and conditional
+future intentions. It is not a feature-availability or delivery-status tracker.
+
 ## Vision
 
 Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,
@@ -30,7 +33,7 @@ metering primitives below are built to support them from day one.
 | Config | **KV** |
 | Usage enforcement (designed) | **Postgres** daily flow ledger and live cache-grant gauge; pool Durable Object leases for concurrency (`docs/adr/0009-stack.md:30`, pool semantics in `docs/adr/0004-plan-matrix.md`) |
 | Observability | **Analytics Engine**, sampled telemetry only — never a billing/cap authority (`docs/adr/0009-stack.md:31`) |
-| Batch only | **Containers** — MusicBrainz import, par2 repair (everything interactive stays serverless) |
+| Batch only | **Containers** — par2 repair (everything interactive stays serverless); MusicBrainz import instead follows the [2026-11-07 no-Containers amendment](docs/adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement), with import/activation still gated |
 
 This is the accepted design (`docs/adr/0009-stack.md:3`), not deployed
 billing evidence: plan prices are launch proposals, not permission to

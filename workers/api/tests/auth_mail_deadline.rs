@@ -230,7 +230,11 @@ impl handlers::Store for FakeStore {
     async fn revoke_session(&self, _: &str) -> Result<(), handlers::StoreError> {
         panic!("auth-start must not revoke a session")
     }
-    async fn revoke_all_sessions(&self, _: &str) -> Result<(), handlers::StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<u64, handlers::StoreError> {
         panic!("auth-start must not revoke sessions")
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
