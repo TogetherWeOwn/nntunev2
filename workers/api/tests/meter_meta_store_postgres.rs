@@ -39,6 +39,17 @@ async fn has_table(client: &Client, table: &str) -> bool {
     row.get(0)
 }
 
+async fn has_relation(client: &Client, name: &str) -> bool {
+    let row = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = $1)",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    row.get(0)
+}
+
 /// The stores are independently migrated: neither side names the other's
 /// relations, so the split query boundary is a schema fact, not a fixture
 /// claim.
@@ -49,7 +60,7 @@ async fn migrated_stores_have_no_cross_side_relations() {
         assert!(has_table(&app, table).await, "app store misses {table}");
     }
     assert!(
-        !has_table(&app, "mb_recording").await,
+        !has_relation(&app, "mb_recording").await,
         "app store must not name mb_recording"
     );
     let mirror = mirror().await;
@@ -59,7 +70,7 @@ async fn migrated_stores_have_no_cross_side_relations() {
     );
     for table in ["tracks", "track_media", "cache_objects"] {
         assert!(
-            !has_table(&mirror, table).await,
+            !has_relation(&mirror, table).await,
             "mirror store must not name {table}"
         );
     }

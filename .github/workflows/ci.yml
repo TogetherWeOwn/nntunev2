@@ -660,18 +660,36 @@ jobs:
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
-      # Independently migrated app/mirror stores for the meter-metadata
-      # boundary test: each store receives only its target's migration
-      # history from the manifest, so the split is a schema fact.
-      - name: Prepare independently migrated app/mirror stores
-        run: bash workers/api/tests/prepare_migrated_stores.sh
-        env:
-          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
-      - name: Verify schema separation between migrated app/mirror stores
-        run: cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test meter_meta_store_postgres
-        env:
-          NNTUNE_TEST_APP_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_app_ci
-          NNTUNE_TEST_MIRROR_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_mirror_ci
+      # The preparation entry point creates its own isolated PostgreSQL
+      # container, migrates each store, runs the schema test and removes it.
+      - name: Reject externally supplied store targets
+        run: |
+          set -euo pipefail
+          docker run --rm --network none \
+            -v "$PWD/workers/api/tests/prepare_migrated_stores.sh:/input/script:ro" \
+            --entrypoint bash postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 -c '
+              set -euo pipefail
+              # No socket or network: even a broken guard cannot reach Docker or a database.
+              printf "#!/bin/bash\ntouch /tmp/docker-called\nexit 42\n" > /usr/bin/docker
+              chmod +x /usr/bin/docker
+              for mode in url argument; do
+                rm -f /tmp/docker-called
+                if [ "$mode" = url ]; then
+                  if env DATABASE_URL=invalid bash /input/script 2>/tmp/error; then exit 1; fi
+                else
+                  if env -u DATABASE_URL bash /input/script unexpected 2>/tmp/error; then exit 1; fi
+                fi
+                grep -q "external database targets and arguments are not accepted" /tmp/error
+                test ! -e /tmp/docker-called
+              done
+              # Removing the guard must reach the safe stub, proving the control is sensitive.
+              test "$(sed -n 6p /input/script)" = '\''if [ "$#" -ne 0 ] || [ "${DATABASE_URL+x}" = x ]; then'\''
+              sed "6,9d" /input/script > /tmp/mutant
+              if env DATABASE_URL=invalid bash /tmp/mutant; then exit 1; fi
+              test -e /tmp/docker-called
+            '
+      - name: Verify independently migrated app/mirror stores
+        run: env -u DATABASE_URL bash workers/api/tests/prepare_migrated_stores.sh
       # The bank runner's own inventory guard: a missing, empty or extra
       # compiled inventory must be rejected before any execution starts.
       - name: Verify PostgreSQL acceptance inventory guard
