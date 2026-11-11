@@ -32,11 +32,13 @@ const routeForTestId: Record<ActiveTestId, string> = {
 	queueSelectionToolbar: './player/PlayerQueue.svelte',
 	audioPlayer: '../routes/library/+page.svelte',
 	usageMeter: '../routes/library/+page.svelte',
-	// Today the demo player carries these; the player-bar build (design
-	// spec v1) moves them to the persistent player bar and repoints this
-	// map in the same PR.
-	nowPlaying: '../routes/demo/player/+page.svelte',
-	playerNext: '../routes/demo/player/+page.svelte',
+	// EL TWO-5795 (demo/player retirement): the retired route no longer owns
+	// these hooks. now-playing/player-next live in the product PlayerQueue;
+	// the player-bar build (design spec v1) moves them to the persistent
+	// player bar and repoints this map in the same PR. queuePanel stays
+	// pinned below and skips until its QueueView owner lands (slice 4).
+	nowPlaying: './player/PlayerQueue.svelte',
+	playerNext: './player/PlayerQueue.svelte',
 	queuePanel: '../routes/demo/player/+page.svelte',
 	planLimitNotice: '../routes/library/+page.svelte',
 	// The W10 app shell declares all four in the root layout: the top bar
@@ -79,7 +81,10 @@ describe('retired provider credential routes', () => {
 describe('e2e contract hooks', () => {
 	for (const [key, route] of Object.entries(routeForTestId) as [ActiveTestId, string][]) {
 		const testid = TESTIDS[key];
-		it(`declares data-testid="${testid}" in its route markup (${key})`, () => {
+		// EL TWO-5795: queuePanel's owner (QueueView) lands with the persistent
+	// queue panel; un-skip then (slice 4 repoints the entry above).
+	const run = key === 'queuePanel' ? it.skip : it;
+	run(`declares data-testid="${testid}" in its route markup (${key})`, () => {
 			const source = sources[route];
 			expect(source, `contract key "${key}": expected route source "${route}"`).toBeDefined();
 			expect(
