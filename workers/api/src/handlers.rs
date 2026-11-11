@@ -245,6 +245,9 @@ pub struct Config {
     /// looked up by exact version (composite `UNIQUE (pepper_version,
     /// key_hmac)`, migration 0019).
     pub native_rest_pepper_version: u32,
+    /// Dedicated compatibility keyring, loaded only from the Worker secret.
+    /// Absent or invalid configuration disables issuance, not native routes.
+    pub subsonic_index: Option<crate::subsonic_config::SubsonicIndexConfig>,
     /// Stripe bearer secret (`STRIPE_SECRET_KEY` Worker secret), test mode
     /// only. `None` until the operator provisions it (see the Worker entry
     /// and `wrangler.toml.example`); unprovisioned, every Stripe-touching
@@ -340,6 +343,7 @@ impl Config {
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
+            subsonic_index: None,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             play_grant_secret: None,
@@ -1167,10 +1171,11 @@ pub trait Store {
             self.revoke_session(id).await.map(|_| true)
         }
     }
-    /// Atomically revoke all sessions and native credentials for one owner.
-    /// Returns the number of newly revoked credentials, preserving timestamps
-    /// on already revoked rows. An empty owner revokes nothing. Must serialize
-    /// with credential issuance; composing two independent writes is not valid.
+    /// Atomically revoke all sessions, native and compatibility credentials for
+    /// one owner. Returns the number of newly revoked native credentials,
+    /// preserving timestamps on already revoked rows. An empty owner revokes
+    /// nothing. Must serialize with issuance on both surfaces; composing
+    /// independent writes is not valid.
     fn revoke_sessions_and_native_credentials(
         &self,
         user_id: &str,
@@ -1451,6 +1456,41 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
         async { Err(StoreError) }
+    }
+    /// Compatibility lifecycle is native-session-only. Implementations must
+    /// fence the live owner and commit before returning success; false means
+    /// no insert (deleting owner or active-credential limit). The default
+    /// cannot mint, list invented data, or claim a successful revocation.
+    fn insert_subsonic_credential(
+        &self,
+        _row: &crate::subsonic_lifecycle::PreparedCredential,
+        _session: &SessionClaims,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn subsonic_credentials_for_user(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError>>
+    {
+        async { Err(StoreError) }
+    }
+    fn revoke_subsonic_credential(
+        &self,
+        _id: &str,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Stores that enable compatibility issuance must include it in recovery.
+    /// The default is safe only because default issuance always refuses.
+    fn revoke_all_subsonic_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Ok(0) }
     }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019) only while the issuing session is still live and belongs to the
@@ -4013,6 +4053,9 @@ where
     }
 }
 
+#[path = "subsonic_handlers.rs"]
+mod subsonic_handlers;
+
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
 // Session-authenticated issuance surface only: `POST /v1/credentials`
@@ -5368,21 +5411,21 @@ where
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PlayIssueBody {
-    track_id: String,
+pub(crate) struct PlayIssueBody {
+    pub(crate) track_id: String,
     /// Client-generated playback session id (per tab/device): the lease
     /// holder name. Distinct from the account session cookie — two
     /// signed-in devices share one account but hold different holders.
-    session_id: String,
+    pub(crate) session_id: String,
     /// Continuation key only: present when refreshing a grant for the
     /// caller's own current play. Never accepted as a fresh play id —
     /// new starts always mint one server-side, so a replay cannot be
     /// under-metered by reusing an old id.
-    play_id: Option<String>,
+    pub(crate) play_id: Option<String>,
     /// Explicit "play here instead": take the lease from the other
     /// session now rather than waiting out its TTL.
     #[serde(default)]
-    takeover: bool,
+    pub(crate) takeover: bool,
 }
 
 #[derive(Deserialize)]
@@ -5421,13 +5464,41 @@ fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Respon
     }
 }
 
-/// Mint the grant for an already-acquired lease hold and render the
-/// issuance body. The minter re-checks the identity field rule, so an
-/// unmeterable identity still cannot mint even though the handler
-/// validated earlier; `NotConfigured` is unreachable after the
-/// up-front secret check but stays a fail-closed 500, never a token.
+/// Internal issuance result, deliberately not Debug: it contains a bearer
+/// grant. Only the native HTTP adapter serializes it; other surfaces can
+/// forward the grant privately without parsing or exposing a JSON response.
+pub(crate) struct IssuedPlay {
+    pub(crate) grant: crate::play_grant::IssuedGrant,
+    pub(crate) play_id: String,
+    pub(crate) lease_epoch: u64,
+    pub(crate) lease_expires_at: u64,
+}
+
+impl IssuedPlay {
+    fn into_response(self) -> Response {
+        json_response(
+            200,
+            serde_json::json!({
+                "grant": self.grant.token,
+                "play_id": self.play_id,
+                "lease_epoch": self.lease_epoch,
+                "expires_at": self.grant.exp_unix,
+                "lease_expires_at": self.lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        )
+    }
+}
+
+/// Mint the grant for an already-acquired lease hold. The minter
+/// re-checks the identity field rule, so an unmeterable identity still
+/// cannot mint even though the handler validated earlier;
+/// `NotConfigured` is unreachable after the up-front secret check but
+/// stays a fail-closed 500, never a token. The grant lifetime is the
+/// remaining continuation deadline (`continuation_until - now`), never
+/// the maximal TTL: a lapsed or capped play cannot renew its grant.
 #[allow(clippy::too_many_arguments)]
-fn play_grant_response(
+fn mint_play(
     secret: &[u8],
     user_id: &str,
     track_id: &str,
@@ -5436,7 +5507,7 @@ fn play_grant_response(
     now: u64,
     lease_expires_at: u64,
     continuation_until: u64,
-) -> Response {
+) -> Result<IssuedPlay, Response> {
     match crate::play_grant::issue_v2_at(
         user_id,
         track_id,
@@ -5446,19 +5517,16 @@ fn play_grant_response(
         continuation_until.saturating_sub(now),
         Some(secret),
     ) {
-        Ok(issued) => json_response(
-            200,
-            serde_json::json!({
-                "grant": issued.token,
-                "play_id": play_id,
-                "lease_epoch": epoch,
-                "expires_at": issued.exp_unix,
-                "lease_expires_at": lease_expires_at,
-                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
-            }),
-        ),
-        Err(crate::play_grant::MintError::NotConfigured) => internal(),
-        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+        Ok(grant) => Ok(IssuedPlay {
+            grant,
+            play_id: play_id.to_string(),
+            lease_epoch: epoch,
+            lease_expires_at,
+        }),
+        Err(crate::play_grant::MintError::NotConfigured) => Err(internal()),
+        Err(crate::play_grant::MintError::InvalidIdentity) => {
+            Err(validation_failed("invalid request"))
+        }
     }
 }
 
@@ -5473,11 +5541,34 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    match issue_play_for_user(ctx, &claims.user_id, parse_body::<PlayIssueBody>(req)).await {
+        Ok(issued) => issued.into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Shared issuance after surface-specific authentication. This is not an
+/// authorizer: callers supply only their authenticated user's id and must
+/// enforce that surface's catalogue/source access before requesting a grant.
+/// It accepts no HTTP credentials and creates no account session. Keep the
+/// typed grant internal; compatibility forwarding must use a private header,
+/// never serialize a native grant into a compatibility response or URL.
+pub(crate) async fn issue_play_for_user<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: Option<PlayIssueBody>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
     // answer the typed 409 up front rather than a lease 429/500 after
     // the fence refuses the write.
-    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-        return account_deleting_response();
+    if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+        return Err(account_deleting_response());
     }
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
@@ -5488,26 +5579,25 @@ where
         .as_deref()
         .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
     else {
-        return internal();
+        return Err(internal());
     };
-    let Some(body) = parse_body::<PlayIssueBody>(req) else {
-        return validation_failed("invalid request");
+    let Some(body) = body else {
+        return Err(validation_failed("invalid request"));
     };
     if !valid_client_session_id(&body.session_id) {
-        return validation_failed("invalid session_id");
+        return Err(validation_failed("invalid session_id"));
     }
     // The track id must be meterable before any lease write: the
     // ledger field rule is the single authority (probed with a
     // placeholder play id — the same probe the minter runs with the
     // real one). User ids are server-generated; an unmeterable one
     // fails this same check rather than minting an unbillable grant.
-    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
-    {
-        return validation_failed("invalid track_id");
+    if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
+        return Err(validation_failed("invalid track_id"));
     }
-    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+    let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Continuation: the same client session refreshing the grant for
     // its own current play (seek/resume/refresh ahead of grant
@@ -5519,10 +5609,9 @@ where
     // below, with a newly minted play id.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
-            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
-                .is_err()
+            if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
-                return validation_failed("invalid play_id");
+                return Err(validation_failed("invalid play_id"));
             }
             let lease_expires_at = ctx
                 .now
@@ -5531,7 +5620,7 @@ where
             match ctx
                 .store
                 .touch_playback_lease(
-                    &claims.user_id,
+                    user_id,
                     &body.session_id,
                     play_id,
                     row.epoch,
@@ -5541,9 +5630,9 @@ where
                 .await
             {
                 Ok(true) => {
-                    return play_grant_response(
+                    return mint_play(
                         secret,
-                        &claims.user_id,
+                        user_id,
                         &body.track_id,
                         play_id,
                         row.epoch,
@@ -5553,29 +5642,29 @@ where
                     );
                 }
                 Ok(false) => {}
-                Err(_) => return internal(),
+                Err(_) => return Err(internal()),
             }
         }
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
     // never as the distant past (entitled forever).
-    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+    let subscription = match ctx.store.live_subscription(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     let effective = crate::billing::resolve_effective_plan(
         subscription.as_ref().map(|row| row.as_view()),
         i64::try_from(ctx.now).unwrap_or(i64::MAX),
     );
     if !effective.entitled {
-        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+        let ever_paid = match ctx.store.ever_subscribed(user_id).await {
             Ok(ever) => ever,
-            Err(_) => return internal(),
+            Err(_) => return Err(internal()),
         };
         let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
             .expect("an unentitled effective plan always refuses");
-        return subscription_refusal(refusal);
+        return Err(subscription_refusal(refusal));
     }
     // Caps are plan DATA from the `plans` row; a missing row fails
     // closed to the reserved `free` caps (0 h) — the 402 below, never
@@ -5583,32 +5672,34 @@ where
     let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
         Ok(Some(caps)) => caps,
         Ok(None) => crate::plan_limits::PlanId::Free.caps(),
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Gate 2: the monthly hour cap. An unreadable meter refuses the
     // new start (store default `Err`) rather than reading as zero.
     let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
     let used_seconds = match ctx
         .store
-        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .monthly_stream_seconds(user_id, &period_month)
         .await
     {
         Ok(seconds) => seconds,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     if let Some(denial) =
         crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
     {
-        return plan_limit_refusal(denial);
+        return Err(plan_limit_refusal(denial));
     }
     // A zero concurrency allowance refuses with the lease 429 wire and
     // the static retry: no lease exists to wait on. Allowances above
     // one are still enforced as one — the lease table holds a single
     // row per user by design (every seeded plan allows exactly one).
     if caps.max_concurrent_streams == 0 {
-        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-            &caps,
-            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        return Err(plan_limit_refusal(
+            crate::plan_limits::deny_concurrent_lease(
+                &caps,
+                crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+            ),
         ));
     }
     // Gate 3: the lease. The play id is minted here, never taken from
@@ -5617,15 +5708,11 @@ where
     // store; `Held` is the other-session 429 with the live TTL.
     let play_id = match random_id::<16>() {
         Ok(id) => id,
-        Err(_) => return unavailable(),
+        Err(_) => return Err(unavailable()),
     };
-    let meta = match ctx
-        .store
-        .track_meter_meta(&claims.user_id, &body.track_id)
-        .await
-    {
+    let meta = match ctx.store.track_meter_meta(user_id, &body.track_id).await {
         Ok(meta) => meta,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     let duration_ms = crate::ledger::resolve_duration_ms(
         meta.track_duration_ms,
@@ -5641,7 +5728,7 @@ where
     match ctx
         .store
         .acquire_playback_lease(
-            &claims.user_id,
+            user_id,
             &body.session_id,
             &body.track_id,
             &play_id,
@@ -5652,9 +5739,9 @@ where
         )
         .await
     {
-        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => mint_play(
             secret,
-            &claims.user_id,
+            user_id,
             &body.track_id,
             &play_id,
             epoch,
@@ -5667,16 +5754,15 @@ where
             // after the up-front check (the marker landed mid-request):
             // re-read it so that race answers the typed 409, not a
             // concurrent-streams 429.
-            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-                account_deleting_response()
+            if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+                Err(account_deleting_response())
             } else {
-                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-                    &caps,
-                    retry_after_secs,
+                Err(plan_limit_refusal(
+                    crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
                 ))
             }
         }
-        Err(_) => internal(),
+        Err(_) => Err(internal()),
     }
 }
 
@@ -6870,6 +6956,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plays"
             | "/v1/plays/heartbeat"
             | "/v1/credentials"
+            | "/v1/subsonic-credentials"
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
@@ -6908,6 +6995,9 @@ fn options_preflight_served(path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/v1/credentials/") {
         return !rest.is_empty() && !rest.contains('/');
+    }
+    if let Some(rest) = path.strip_prefix("/v1/subsonic-credentials/") {
+        return crate::meter_sink::is_uuid_shaped(rest);
     }
     // Playlist subpaths preflight only as single items: nested,
     // trailing-slash, or empty-segment shapes are denied before spend on
@@ -7083,6 +7173,11 @@ where
         // above never sees its Authorization header; it is absent
         // from `is_known_path` on purpose (no browser preflight).
         ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
+        ("POST", "/v1/subsonic-credentials") => subsonic_handlers::mint(ctx, req).await,
+        ("GET", "/v1/subsonic-credentials") => subsonic_handlers::list(ctx, req).await,
+        ("DELETE", path) if path.starts_with("/v1/subsonic-credentials/") => {
+            subsonic_handlers::revoke(ctx, req).await
+        }
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -7279,6 +7374,9 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
+        subsonic_credentials:
+            RefCell<HashMap<String, (String, crate::subsonic_lifecycle::ListedCredential)>>,
+        fail_subsonic_write: RefCell<bool>,
         revoke_session_before_mint: RefCell<bool>,
         fail_bulk_revoke: RefCell<bool>,
         /// User ids that still own a legacy `provider_vaults` row. The
@@ -8258,6 +8356,110 @@ mod tests {
                 _ => Ok(false),
             }
         }
+        async fn insert_subsonic_credential(
+            &self,
+            row: &crate::subsonic_lifecycle::PreparedCredential,
+            session: &SessionClaims,
+        ) -> Result<bool, StoreError> {
+            if !self
+                .sessions
+                .borrow()
+                .get(&session.session_id)
+                .is_some_and(|r| {
+                    !r.revoked
+                        && r.user_id == row.record.user_id
+                        && r.rotation_counter == session.rotation_counter
+                })
+            {
+                return Ok(false);
+            }
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let owner = &row.record.user_id;
+            if !self.users.borrow().contains_key(owner)
+                || self.deleting_users.borrow().contains(owner)
+            {
+                return Ok(false);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            if rows
+                .values()
+                .filter(|(u, r)| u == owner && r.revoked_at.is_none())
+                .count()
+                >= 32
+            {
+                return Ok(false);
+            }
+            rows.insert(
+                row.record.id.clone(),
+                (
+                    owner.clone(),
+                    crate::subsonic_lifecycle::ListedCredential {
+                        id: row.record.id.clone(),
+                        label: row.label.clone(),
+                        auth_mode: match row.record.auth_mode {
+                            crate::subsonic_auth::AuthMode::ApiKey => "apikey",
+                            crate::subsonic_auth::AuthMode::Token => "token",
+                            crate::subsonic_auth::AuthMode::Both => "both",
+                        }
+                        .to_string(),
+                        created_at: row.created_at,
+                        last_used_at: None,
+                        revoked_at: None,
+                    },
+                ),
+            );
+            Ok(true)
+        }
+        async fn subsonic_credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+            Ok(self
+                .subsonic_credentials
+                .borrow()
+                .values()
+                .filter(|(u, _)| u == user_id)
+                .map(|(_, r)| r.clone())
+                .collect())
+        }
+        async fn revoke_subsonic_credential(
+            &self,
+            id: &str,
+            user_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            let Some((u, row)) = rows.get_mut(id) else {
+                return Ok(false);
+            };
+            if u != user_id {
+                return Ok(false);
+            }
+            row.revoked_at.get_or_insert(now);
+            Ok(true)
+        }
+        async fn revoke_all_subsonic_credentials(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut count = 0;
+            for (u, row) in self.subsonic_credentials.borrow_mut().values_mut() {
+                if u == user_id && row.revoked_at.is_none() {
+                    row.revoked_at = Some(now);
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
         async fn insert_native_credential(
             &self,
             row: &NativeCredentialRow,
@@ -8361,6 +8563,7 @@ mod tests {
             if user_id.is_empty() {
                 return Ok(0);
             }
+            self.revoke_all_subsonic_credentials(user_id, now).await?;
             for row in self.sessions.borrow_mut().values_mut() {
                 if row.user_id == user_id {
                     row.revoked = true;
@@ -13074,6 +13277,157 @@ mod tests {
         magic_login(h, "plays@example.com")
     }
 
+    fn shared_play_call(
+        h: &Harness,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: Option<String>,
+    ) -> Result<IssuedPlay, Response> {
+        block_on(issue_play_for_user(
+            &h.ctx(),
+            user_id,
+            Some(PlayIssueBody {
+                track_id: track_id.to_string(),
+                session_id: session_id.to_string(),
+                play_id,
+                takeover: false,
+            }),
+        ))
+    }
+
+    #[test]
+    fn shared_play_core_returns_typed_grant_without_creating_account_sessions() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let issued = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("authenticated identity can use shared gates without a cookie");
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            &issued.play_id,
+            issued.lease_epoch,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .unwrap();
+        assert_eq!(issued.grant, expected);
+        assert_eq!(issued.lease_epoch, 1);
+        assert_eq!(issued.lease_expires_at, NOW + 45);
+        let native_wire = issued.into_response();
+        assert_eq!(native_wire.status, 200);
+        assert!(native_wire.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn shared_play_core_and_native_route_contend_for_one_user_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("first holder");
+        let refused = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "native-tab"}),
+        );
+        assert_eq!(refused.status, 429);
+        assert_eq!(refused.retry_after, Some(45));
+        let takeover = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-10", "session_id": "native-tab", "takeover": true,
+            }),
+        );
+        assert_eq!(takeover.status, 200);
+        let refused = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id),
+        )
+        .map(|_| ())
+        .expect_err("old compatibility play cannot renew after native takeover");
+        assert_eq!(refused.status, 429);
+        let current = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(current.session_id, "native-tab");
+        assert_eq!(current.epoch, first.lease_epoch + 1);
+    }
+
+    #[test]
+    fn shared_play_core_enforces_subscription_and_cap_but_preserves_continuation() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        let unsubscribed = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("unsubscribed");
+        assert_eq!(unsubscribed.status, 402);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("entitled first start");
+        h.store.stream_seconds.borrow_mut().insert(
+            (
+                "user-plays-1".to_string(),
+                crate::ledger::period_month_for_timestamp(NOW),
+            ),
+            3600,
+        );
+        let continued = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id.clone()),
+        )
+        .expect("current track finishes across the cap");
+        assert_eq!(continued.play_id, first.play_id);
+        assert_eq!(continued.lease_epoch, first.lease_epoch);
+        let capped = shared_play_call(&h, "user-plays-1", "compat-holder", "track-10", None)
+            .map(|_| ())
+            .expect_err("next start at cap");
+        assert_eq!(capped.status, 402);
+        assert_eq!(h.store.playback_leases.borrow()["user-plays-1"].epoch, 1);
+    }
+
+    #[test]
+    fn shared_play_core_preserves_pre_write_validation_and_configuration_gates() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        for (session_id, track_id) in [("", "track-9"), ("holder", "not/meterable")] {
+            let refused = shared_play_call(&h, "user-plays-1", session_id, track_id, None)
+                .map(|_| ())
+                .expect_err("invalid lease input");
+            assert_eq!(refused.status, 422);
+        }
+        let malformed = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("missing body");
+        assert_eq!(malformed.status, 422);
+        let mut unconfigured = play_harness();
+        unconfigured.config.play_grant_secret = None;
+        let refused = shared_play_call(&unconfigured, "user-plays-1", "holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("missing signing secret");
+        assert_eq!(refused.status, 500);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let deleting = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("deletion refusal precedes malformed body");
+        assert_eq!(deleting.status, 409);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        assert!(unconfigured.store.playback_leases.borrow().is_empty());
+    }
+
     #[test]
     fn play_issue_mints_a_grant_for_an_entitled_user() {
         let h = play_harness();
@@ -15948,6 +16302,241 @@ mod tests {
     }
 
     // --- Native REST credentials (ADR 0010) -------------------------------------
+
+    fn subsonic_harness() -> Harness {
+        let mut h = harness();
+        h.config.subsonic_index = Some(
+            crate::subsonic_config::SubsonicIndexConfig::parse(
+                &serde_json::json!({"current_version":1,"keys":{"1":crate::b64::encode(&[7;32])}})
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        h
+    }
+
+    fn subsonic_mint(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/subsonic-credentials",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    #[test]
+    fn subsonic_lifecycle_show_once_listing_and_owner_revocation() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let foreign = magic_login(&h, "b@example.com");
+        for mode in ["apikey", "token", "both"] {
+            let response = subsonic_mint(
+                &h,
+                &cookie,
+                serde_json::json!({"label":"client", "auth_mode":mode}),
+            );
+            assert_eq!(response.status, 201, "{}", response.body);
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            let id = value["id"].as_str().unwrap();
+            assert_eq!(value["api_key"].is_string(), mode != "token");
+            assert_eq!(value["token_secret"].is_string(), mode != "apikey");
+            let listing = h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None,
+            );
+            assert_eq!(listing.status, 200);
+            assert!(
+                !listing.body.contains("username")
+                    && !listing.body.contains("secret")
+                    && !listing.body.contains("api_key")
+            );
+            for key in ["username", "api_key", "token_secret"] {
+                if let Some(s) = value[key].as_str() {
+                    assert!(!listing.body.contains(s));
+                    assert!(!format!("{:?}", h.store.audits.borrow()).contains(s));
+                }
+            }
+            let path = format!("/v1/subsonic-credentials/{id}");
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(foreign.clone()), Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.store.subsonic_credentials.borrow()[id].1.revoked_at,
+                Some(NOW)
+            );
+        }
+        let listing = h.call_full("GET", "/v1/subsonic-credentials", None, Some(foreign), None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&listing.body).unwrap()["credentials"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn subsonic_lifecycle_requires_native_fresh_session_and_origin() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/subsonic-credentials".into(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"label":"client"}"#.to_vec(),
+        };
+        let ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".into(),
+        };
+        let response = block_on(handle(&ctx, &req));
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("reauth_required"));
+        req.origin = None;
+        assert_ne!(
+            h.call_full(
+                "POST",
+                &req.path,
+                Some("{\"label\":\"client\"}".into()),
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            201
+        );
+        req.cookie = None;
+        req.authorization = Some("Bearer nsk_not_a_session".into());
+        req.origin = Some(ORIGIN.into());
+        assert_ne!(block_on(handle(&ctx, &req)).status, 201);
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+        req.method = "GET".into();
+        req.cookie = Some(cookie);
+        req.authorization = None;
+        assert_eq!(block_on(handle(&ctx, &req)).status, 200);
+    }
+
+    #[test]
+    fn subsonic_lifecycle_refuses_unconfigured_invalid_and_failed_writes() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            503
+        );
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for body in [
+            serde_json::json!({"label":"client","auth_mode":"native"}),
+            serde_json::json!({"label":"x".repeat(65)}),
+            serde_json::json!({"label":"client","scope":"native-rest"}),
+            serde_json::json!({"label":""}),
+        ] {
+            assert_eq!(subsonic_mint(&h, &cookie, body).status, 422);
+        }
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        let response = subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"}));
+        assert_eq!(response.status, 500);
+        assert!(
+            !response.body.contains("nsk_")
+                && !response.body.contains("nst_")
+                && !response.body.contains("nsu_")
+        );
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+    }
+
+    #[test]
+    fn subsonic_lifecycle_cap_deletion_and_recovery_are_fail_closed() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for _ in 0..32 {
+            assert_eq!(
+                subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+                201
+            );
+        }
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            422
+        );
+        h.store.deleting_users.borrow_mut().insert("u1".into());
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            409
+        );
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN)
+            )
+            .status,
+            500
+        );
+        assert_eq!(
+            h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            200
+        );
+        *h.store.fail_subsonic_write.borrow_mut() = false;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+        assert!(h
+            .store
+            .subsonic_credentials
+            .borrow()
+            .values()
+            .all(|(_, r)| r.revoked_at == Some(NOW)));
+    }
 
     fn peppered_cfg() -> Config {
         cfg().with_native_rest_pepper(vec![7u8; 32], 1)

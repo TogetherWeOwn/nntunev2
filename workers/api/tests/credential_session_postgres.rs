@@ -146,6 +146,13 @@ impl Fixture {
         .await
         .unwrap();
         db.batch_execute(
+            &include_str!("../../../migrations/0037_subsonic_credentials.sql")
+                .replace("SET search_path = public, pg_catalog;", "")
+                .replace("public.", &format!("{schema}.")),
+        )
+        .await
+        .unwrap();
+        db.batch_execute(
             "INSERT INTO users (id,email,created_at) VALUES
                ('u1','one@example.test',1),('u2','two@example.test',1);
              INSERT INTO users (id,email,created_at,deleting_at)
@@ -428,6 +435,71 @@ async fn failure_after_session_update_rolls_back_both_updates() {
         .unwrap();
     assert_eq!(n, 1);
     assert_eq!(f.credentials().await, vec![rev("c1", 600)]);
+}
+
+#[tokio::test]
+async fn compatibility_failure_rolls_back_recovery_across_all_credential_surfaces() {
+    let f = Fixture::new().await;
+    f.mint("c1", "u1", "h1", "s1").await.unwrap();
+    f.db.batch_execute(
+        "INSERT INTO subsonic_credentials
+               (user_id,subsonic_username,api_key_hmac,pepper_version,revoked_at) VALUES
+               ('u1','compat_live',repeat('a',64),1,NULL),
+               ('u1','compat_revoked',repeat('b',64),1,to_timestamp(50)),
+               ('u2','compat_foreign',repeat('c',64),1,NULL);
+             CREATE FUNCTION compatibility_revoke_failure() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN RAISE EXCEPTION 'synthetic compatibility update failure'; END $$;
+             CREATE TRIGGER compatibility_revoke_failure BEFORE UPDATE ON subsonic_credentials
+               FOR EACH STATEMENT EXECUTE FUNCTION compatibility_revoke_failure()",
+    )
+    .await
+    .unwrap();
+    let mut client = f.client().await;
+    assert!(
+        revoke_sessions_and_native_credentials(&mut client, "u1", 500)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.revoked_sessions().await, ["sr"]);
+    assert_eq!(f.credentials().await, vec![live("c1")]);
+    let rows = f.db
+        .query("SELECT subsonic_username, EXTRACT(EPOCH FROM revoked_at)::bigint FROM subsonic_credentials ORDER BY subsonic_username", &[])
+        .await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get::<_, Option<i64>>(1))
+            .collect::<Vec<_>>(),
+        vec![None, None, Some(50)]
+    );
+    f.assert_unlocked().await;
+
+    f.db.batch_execute("DROP TRIGGER compatibility_revoke_failure ON subsonic_credentials")
+        .await
+        .unwrap();
+    assert_eq!(
+        revoke_sessions_and_native_credentials(&mut client, "u1", 600)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        revoke_sessions_and_native_credentials(&mut client, "u1", 900)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(f.revoked_sessions().await, ["s1", "s1b", "sr"]);
+    assert_eq!(f.credentials().await, vec![rev("c1", 600)]);
+    let rows = f.db
+        .query("SELECT subsonic_username, EXTRACT(EPOCH FROM revoked_at)::bigint FROM subsonic_credentials ORDER BY subsonic_username", &[])
+        .await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get::<_, Option<i64>>(1))
+            .collect::<Vec<_>>(),
+        vec![None, Some(600), Some(50)]
+    );
+    f.assert_unlocked().await;
 }
 
 #[tokio::test]

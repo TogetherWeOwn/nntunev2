@@ -179,6 +179,26 @@ target = "app"
 sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
 
 [[migration]]
+file = "0037_subsonic_credentials.sql"
+target = "app"
+sha256 = "e0d05ff850b376f07af53020c97d9128cc0ea915a029cf9009f5f16d6823fa1f"
+
+[[migration]]
+file = "0038_ingest_acceptance_order.sql"
+target = "app"
+sha256 = "f9d18a1c324f54c8110b88fb7f23fbdfeadc6485fe2d064eb8c563d1220b6187"
+
+[[migration]]
+file = "0039_ingest_audio_manifest.sql"
+target = "app"
+sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
+
+[[migration]]
+file = "0040_ingest_audio_classifications.sql"
+target = "app"
+sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
+
+[[migration]]
 file = "0037_playback_continuation_deadline.sql"
 target = "app"
 sha256 = "32a54747105ae8a3be1e0edf17c9ac8d81e2714805fb9dc89098d23f8fea50fb"
