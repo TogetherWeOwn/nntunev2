@@ -6459,7 +6459,10 @@ where
                 ))
             }
         }
-        Err(_) => Err(internal()),
+        // A probe/mark/write failure is a fail-closed 503 (retryable),
+        // never a grant: the incumbent lease and any private mark stay
+        // untouched, so the client retries once the store recovers.
+        Err(_) => Err(unavailable()),
     }
 }
 
