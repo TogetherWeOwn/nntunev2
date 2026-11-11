@@ -13,7 +13,7 @@
 //!   from request data. Writes carry the `users.deleting_at IS NULL FOR
 //!   SHARE` fence like every other user-owned writer, and all three
 //!   tables FK to `users (id) ON DELETE CASCADE` so account erasure
-//!   removes preference data with the account (migration 0037).
+//!   removes preference data with the account (migration 0041).
 //! - Targets are validated catalogue members: a `track` target is the
 //!   `id` already served by `GET /v1/library` / `GET /v1/tracks` — a
 //!   recording MBID for matched rows or the ingest `job_id` for

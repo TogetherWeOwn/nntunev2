@@ -4210,7 +4210,7 @@ where
 //
 // `/v1/me/likes*`, `/v1/me/taste`, `/v1/me/history` and
 // `/v1/me/private-session`: durable likes, taste signals, real-play
-// history and private-session capture (migration 0037, `taste.rs`).
+// history and private-session capture (migration 0041, `taste.rs`).
 // Every route is `SessionOnly` in the bearer scope map — `ntk_` keys get
 // the gate's uniform 404 — so the cookie session is the only identity
 // and the Origin pin inside `authenticate(req, true)` is the CSRF guard
@@ -7849,7 +7849,7 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
-        // Per-account preference slice (migration 0037): session-only
+        // Per-account preference slice (migration 0041): session-only
         // routes — the scope map keeps every `/v1/me/*` shape `Deny`
         // to bearer keys, so the cookie session is the only identity
         // and the Origin pin inside the handlers' `authenticate` is the
@@ -8256,7 +8256,7 @@ mod tests {
         /// (release MBID, each recording MBID, and the `job_id` — matching
         /// `taste::member_target_statement`).
         shared_member_targets: RefCell<std::collections::HashSet<(String, String)>>,
-        /// Preference slice state (migration 0037): taste rows keyed by
+        /// Preference slice state (migration 0041): taste rows keyed by
         /// `(user_id, kind, target_id)`, private sessions by
         /// `(user_id, session_id)`, private-play marks by
         /// `(user_id, play_key)`.

@@ -490,7 +490,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" || path == "/v1/indexers" {
                 return SessionOnly;
             }
-            // Preference slice reads (migration 0037): session-only
+            // Preference slice reads (migration 0041): session-only
             // like the rest of `/v1/me` — API keys never see taste,
             // likes, or play history.
             if path == "/v1/me/likes" || path == "/v1/me/taste" || path == "/v1/me/history" {
