@@ -253,7 +253,61 @@ class StagingApplyTests(unittest.TestCase):
         self.assertIn(str(trusted / ".github/scripts/apply_migration.py"), argv)
         self.assertIn(str(data / "migrations/0054_first.sql"), argv)
         self.assertIn(str(data / "migrations/manifest.toml"), argv)
-        self.assertIn("-I", argv)
+        # -E -s (not isolated -I): the flag set ships with the driver and
+        # keeps the trusted script directory on sys.path for the sibling
+        # import (finding 1 in the return-#2 fix).
+        self.assertIn("-E", argv)
+        self.assertIn("-s", argv)
+        self.assertNotIn("-I", argv)
+
+    # Return-#2 finding 4: executed regression in the workflow's exact
+    # invocation shape (subprocess, relative roots, sibling import),
+    # which the in-process tests above cannot see.
+    def test_driver_subprocess_reaches_child_with_relative_roots(self):
+        scripts_dir = pathlib.Path(__file__).resolve().parent
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        workspace = pathlib.Path(tmp.name)
+        trusted_scripts = workspace / "trusted/.github/scripts"
+        data_migrations = workspace / "data/migrations"
+        trusted_scripts.mkdir(parents=True)
+        data_migrations.mkdir(parents=True)
+        # Real driver + real sibling module so the import chain executes.
+        (trusted_scripts / "staging_apply.py").write_bytes(
+            (scripts_dir / "staging_apply.py").read_bytes())
+        (trusted_scripts / "migration_history.py").write_bytes(
+            (scripts_dir / "migration_history.py").read_bytes())
+        # Trusted migrator stub: imports the sibling module and refuses
+        # unless --file/--manifest resolve to existing files.
+        (trusted_scripts / "apply_migration.py").write_text(
+            "import migration_history, pathlib, sys\n"
+            "argv = sys.argv\n"
+            "file_arg = argv[argv.index('--file') + 1]\n"
+            "manifest_arg = argv[argv.index('--manifest') + 1]\n"
+            "assert pathlib.Path(file_arg).is_file(), file_arg\n"
+            "assert pathlib.Path(manifest_arg).is_file(), manifest_arg\n"
+            "pathlib.Path('child_ran.txt').write_text('ok')\n")
+        (data_migrations / "manifest.toml").write_text(manifest_text())
+        (data_migrations / "0054_first.sql").write_text("SELECT 1;\n")
+        output = workspace / "outputs.txt"
+        output.write_text("")
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_OUTPUT": str(output),
+               "APPLY_PROGRESS": str(workspace / "progress"),
+               "PATH": os.environ["PATH"], "HOME": "/tmp"}
+        result = subprocess.run(
+            [sys.executable, "-E", "-s",
+             "trusted/.github/scripts/staging_apply.py", "apply",
+             "--trusted-root", "trusted", "--data-root", "data",
+             "--file", "0054_first.sql", "--applied-by", "tester",
+             "--mode", "single", "--expect-database", DB],
+            cwd=str(workspace), env=env, capture_output=True, text=True,
+            timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            (workspace / "trusted/child_ran.txt").is_file()
+            or (workspace / "child_ran.txt").is_file())
+        self.assertIn("applied_files=0054_first.sql", output.read_text())
 
 
 if __name__ == "__main__":

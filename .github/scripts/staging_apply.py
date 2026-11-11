@@ -108,9 +108,6 @@ def plan_files(entries, migration_file, mode):
     app_names = [entry["file"] for entry in app]
     if mode == "all-pending":
         if migration_file not in app_names:
-            entry = find_entry(entries, migration_file)
-            if entry is not None and entry.get("target") != "app":
-                raise StagingApplyError("file is not an app migration in the pinned manifest")
             raise StagingApplyError("file is not an app migration in the pinned manifest")
         return app_names[:app_names.index(migration_file) + 1]
     if mode != "single":
@@ -135,6 +132,11 @@ def apply_files(trusted_root, data_root, migration_file, applied_by, mode,
     prefix is written to GITHUB_OUTPUT even on first-failure refusal, so
     the evidence phase reports it on a red run.
     """
+    # Resolve roots before any cwd shift: the workflow passes them
+    # relative to the workspace, but the child runs with cwd=trusted_root
+    # and must see absolute script/file/manifest paths.
+    trusted_root = str(Path(trusted_root).resolve())
+    data_root = str(Path(data_root).resolve())
     source = _env(environ)
     entries = load_entries(data_root)
     files = plan_files(entries, migration_file, mode)
@@ -157,7 +159,11 @@ def apply_files(trusted_root, data_root, migration_file, applied_by, mode,
             # commit outcome is unknown instead of silently omitting it.
             with open(progress_path, "w") as handle:
                 handle.write(filename)
-            argv = [sys.executable, "-I", str(script),
+            # -E -s ignores PYTHONPATH and the user site-packages but
+            # keeps the trusted script directory on sys.path, so the
+            # sibling `import migration_history` resolves (isolated -I
+            # would drop the script directory and break that import).
+            argv = [sys.executable, "-E", "-s", str(script),
                     "--file", str(Path(data_root) / "migrations" / filename),
                     "--manifest", str(Path(data_root) / "migrations/manifest.toml"),
                     "--applied-by", applied_by,
@@ -226,6 +232,7 @@ def read_row(child, entry, filename):
 
 def run_evidence(data_root, migration_file, applied_files, apply_outcome,
                  expected_database, environ=None):
+    data_root = str(Path(data_root).resolve())
     source = _env(environ)
     entries = load_entries(data_root)
     requested = migration_file

@@ -364,7 +364,10 @@ that exact ref as data only (migration bytes and manifest) and runs
 the trusted `.github/scripts/apply_migration.py` from the workflow's
 own ref — never code from the dispatch-supplied ref — with
 `--expect-database nntunev2_staging` and a `verify-full`
-URL, so the migrator credential
+URL. So long as the `staging` environment's deployment-branch policy
+restricts deployments to the protected branch (`main`) — and the
+workflow additionally refuses dispatches not from `main` — the
+migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any
 manifest/sha mismatch refuses exactly as the migrator does. Mode
@@ -376,9 +379,13 @@ evidence — on a failed run, rows are diagnostic, and the receipt and
 effects must be reconciled before retrying (an older row for the same
 filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
 card's own gate, not a workflow-side call — the workflow cannot call
-Paperclip. Prerequisite: `PLANETSCALE_MIGRATOR_URL_STAGING` must be
-scoped to the `staging` environment before the first dispatch; the
-workflow declares `environment: staging`. Copying an existing value
+Paperclip. Prerequisites before the first dispatch: (a)
+`PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
+environment, and (b) the `staging` environment's deployment-branch
+policy must restrict deployments to the protected branch (`main`) so
+the trusted checkout can only run reviewed workflow code; the
+workflow declares `environment: staging` and refuses dispatches not
+from `main`. Copying an existing value
 into an environment scope needs an authorized admin holding that value.
 Applies go through `.github/scripts/apply_migration.py`, which
 verifies the file bytes against `migrations/manifest.toml` and writes a

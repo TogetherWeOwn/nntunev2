@@ -72,8 +72,18 @@ jobs:
           APPLIED_BY: ${{ inputs.applied_by }}
           BOARD_APPROVAL: ${{ inputs.board_approval }}
           APPLY_MODE: ${{ inputs.mode }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          # Defence in depth: the trusted checkout is this workflow's own
+          # ref, so dispatches must run from the protected branch only.
+          # The staging environment deployment-branch policy (see
+          # docs/ops.md) is the primary control; this refuses any run
+          # that reaches the job from another branch.
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            printf '%s\n' "migrations-staging-apply must be dispatched from refs/heads/main; refusing" >&2
+            exit 1
+          fi
           if [[ ! "$PINNED_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf '%s\n' "ref must be a full 40-hex commit SHA" >&2
             exit 1
@@ -149,7 +159,7 @@ jobs:
           EXPECT_DATABASE: nntunev2_staging
         run: |
           set -euo pipefail
-          python3 -I trusted/.github/scripts/staging_apply.py apply --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-by "$APPLIED_BY" --mode "$APPLY_MODE" --expect-database "$EXPECT_DATABASE"
+          python3 -E -s trusted/.github/scripts/staging_apply.py apply --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-by "$APPLIED_BY" --mode "$APPLY_MODE" --expect-database "$EXPECT_DATABASE"
 
       - name: Record evidence in job summary
         if: always()
@@ -161,4 +171,4 @@ jobs:
           EXPECT_DATABASE: nntunev2_staging
         run: |
           set -euo pipefail
-          python3 -I trusted/.github/scripts/staging_apply.py evidence --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-files "$APPLIED_FILES" --apply-outcome "$APPLY_OUTCOME" --expect-database "$EXPECT_DATABASE"
+          python3 -E -s trusted/.github/scripts/staging_apply.py evidence --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-files "$APPLIED_FILES" --apply-outcome "$APPLY_OUTCOME" --expect-database "$EXPECT_DATABASE"
