@@ -4,9 +4,9 @@ The versioned inventory below is consumed by the in-app licences/about section
 (`About NNTune` at `/settings#about-nntune`, `apps/web/src/routes/settings/+page.svelte`).
 That section adds no new route, token, component or dependency: headings, the
 version line and the two licence intro lines follow the approved UX design
-(TWO-4355 §8), and every notice, obligation and provenance URL renders verbatim
+(TWO-4355 §8), and every visible notice and provenance URL renders verbatim
 from this contract (link labels and the unavailable-error line are the only
-functional page strings). There is no new
+functional page strings; obligations remain JSON-only compliance guidance). There is no new
 dependency, network request, ingest behaviour or artwork cache.
 
 ## Integration
@@ -16,12 +16,12 @@ dependency, network request, ingest behaviour or artwork cache.
 `plannedAttributions`, `fixtureAudioLicenceRecord`, and the pure
 `validateAttributionInventory(unknown): string[]` validator. Types are exported
 alongside the data. The Settings page imports from `#lib/attributions` and
-renders **active** licence entries under `Licences`, active data entries under
-`Data sources` (omitted while none are active), and **planned** entries under a
-separate `Planned sources` heading; it also embeds the serialized inventory as
-a `nntune-attribution-inventory` JSON block and renders an announced error when
-validation fails. Planned entries are inactive provenance records, never
-evidence of current integrations, and must not be presented as shipped sources.
+renders **active** licence entries under `Licences` and active data entries
+under `Data sources` (omitted while none are active). Planned (inactive)
+entries and per-entry obligation guidance do not render visibly at all: the
+accurate inactive treatment is absence, and obligations stay in the embedded
+`nntune-attribution-inventory` JSON provenance block alongside the full
+inventory. The page renders an announced error when validation fails.
 Schema shape or meaning changes require a versioned contract update and consumer review.
 
 Each entry has an ID, name, kind, activation state, licence identifier (or an

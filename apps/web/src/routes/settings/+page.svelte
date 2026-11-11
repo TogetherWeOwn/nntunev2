@@ -13,8 +13,10 @@
 	// of a partial list. Headings and list spacing follow the existing
 	// Settings sections (h2 + paragraph + ul); no new token or component.
 	const validationErrors = validateAttributionInventory(attributionInventory);
+	// Only active entries render visibly: planned/inactive sources are absent
+	// from the page entirely (no "coming soon" or greyed entries) and exist
+	// only in the machine-readable JSON provenance below.
 	const active = attributionInventory.entries.filter((entry) => entry.status === 'active');
-	const planned = attributionInventory.entries.filter((entry) => entry.status === 'planned');
 	const licenceEntries = active.filter((entry) => entry.kind !== 'data' && entry.kind !== 'artwork');
 	const dataEntries = active.filter((entry) => entry.kind === 'data' || entry.kind === 'artwork');
 
@@ -30,12 +32,13 @@
 		`<script type="application/json" id="nntune-attribution-inventory">${attributionJson}<\/script>`;
 
 	// Link labels carry the entry name so repeated links stay distinguishable
-	// in link lists (WCAG 2.4.4); MIT/Open Font License are the official
-	// licence titles, and non-licence provenance pointers are labelled as
-	// provenance rather than as a licence grant (see inventory obligations).
+	// in link lists (WCAG 2.4.4); MIT is the official licence title, and
+	// non-licence provenance pointers are labelled as provenance rather than
+	// as a licence grant (see inventory obligations). The Figtree entry
+	// carries no licence link here: its "Open Font License" link lives in the
+	// Typeface intro sentence, pointing at the shipped same-origin copy.
 	function licenceText(entry: Attribution): string {
 		if (entry.license === 'MIT') return `MIT License — ${entry.name}`;
-		if (entry.license === 'OFL-1.1') return 'Open Font License';
 		return `Provenance — ${entry.name}`;
 	}
 </script>
@@ -74,8 +77,8 @@
 			<p role="alert">Attribution data is unavailable.</p>
 		{:else}
 			<h3 id="settings-about-licences-heading">Licences</h3>
-			<p>NNTune is open source under the MIT License.</p>
-			<p>Typeface: Figtree, SIL Open Font License 1.1.</p>
+			<p>NNTune is open source under the <a href="https://github.com/TogetherWeOwn/nntunev2/blob/main/LICENSE">MIT License</a>.</p>
+			<p>Typeface: Figtree, SIL <a href="/fonts/OFL.txt">Open Font License</a> 1.1.</p>
 			<ul>
 				{#each licenceEntries as entry (entry.id)}
 					{@render attributionEntry(entry)}
@@ -86,15 +89,6 @@
 				<h3 id="settings-about-sources-heading">Data sources</h3>
 				<ul>
 					{#each dataEntries as entry (entry.id)}
-						{@render attributionEntry(entry)}
-					{/each}
-				</ul>
-			{/if}
-
-			{#if planned.length > 0}
-				<h3 id="settings-about-planned-heading">Planned sources</h3>
-				<ul>
-					{#each planned as entry (entry.id)}
 						{@render attributionEntry(entry)}
 					{/each}
 				</ul>
@@ -110,14 +104,11 @@
 		<li data-attribution-id={entry.id} data-status={entry.status}>
 			<strong>{entry.name}</strong> ({entry.license}{entry.package?.version ? ` ${entry.package.version}` : ''})
 			<p>{entry.notice}</p>
-			<p>{entry.obligations}</p>
 			<p>
 				<a href={entry.sourceUrl}>Source — {entry.name}</a>
-				{' · '}
-				<a href={entry.licenseUrl}>{licenceText(entry)}</a>
-				{#if entry.id === 'figtree'}
+				{#if entry.id !== 'figtree'}
 					{' · '}
-					<a href="/fonts/OFL.txt">Open Font License (shipped copy)</a>
+					<a href={entry.licenseUrl}>{licenceText(entry)}</a>
 				{/if}
 			</p>
 		</li>
