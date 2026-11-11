@@ -3,8 +3,8 @@
 //! The engine modules are re-exported from `velmora`
 //! (TogetherWeOwn/velmora, pinned by git `rev` in this crate's
 //! `Cargo.toml`); their sources, tests and benches live there. This crate
-//! keeps only the NNTune-specific [`transcode`] and [`original_source`]
-//! modules and their tests.
+//! keeps the NNTune-specific transcode, original-source, NZB writing and
+//! preparation bookkeeping modules and their tests.
 //!
 //! Compiles for `wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`)
 //! **and** native targets (ingest/streaming services, Container batch jobs).
@@ -22,6 +22,9 @@
 //! - [`yenc`]: yEnc encode/decode with an explicit SIMD fast path (x86_64 SSE2,
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
+//! - [`nzb_writer`]: NZB emit side used by the poster (output always parses).
+//! - [`media_layout`]: bounded article ranges derived from the media v1 geometry.
+//! - [`preparation_plan`]: versioned, keyless preparation input and private frames.
 //! - [`media`]: `velmora.media.v1`, the media encryption format (age v1
 //!   STREAM payload, 48-byte committing header): sealing, commitment-gated
 //!   ranged reads and full verification. NNTune uses
@@ -44,6 +47,10 @@ pub use velmora::{
     article, error, media, nntp, nzb, par2, pinned_transport, rng, segment_identity, transport,
     transports, yenc, Error, Result,
 };
+
+pub mod media_layout;
+pub mod nzb_writer;
+pub mod preparation_plan;
 
 pub mod original_source;
 pub mod transcode;
