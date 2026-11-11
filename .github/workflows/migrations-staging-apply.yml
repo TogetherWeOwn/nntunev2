@@ -1,0 +1,174 @@
+name: migrations-staging-apply
+
+# Agent-dispatchable staging migration apply (docs/ops.md, "Staging
+# migrations"). The scheduled/CI deploy path never applies
+# migrations/*.sql; an authorized agent dispatches this workflow by hand
+# after the card's board approval, so the migrator credential never
+# reaches an agent: it is read only inside this job (environment:
+# staging) and is never printed. Two checkouts keep the trust boundary:
+# the dispatch-supplied `ref` is checked out as data only (migration
+# bytes, manifest) and the workflow's own ref is checked out as trusted
+# code (the staging_apply.py driver, apply_migration.py and
+# migration_history.py). Only trusted code executes, with the
+# credential behind an allowlisted child environment, so a
+# dispatch-supplied ref cannot hand the credential to its code.
+# Dispatches should run from a protected branch so the workflow file
+# itself is reviewed. --expect-database nntunev2_staging and a
+# verify-full URL are enforced by the driver; any manifest/sha mismatch
+# refuses exactly as the migrator does, and the recorded
+# schema_migrations row lands in the job summary as evidence.
+# Mode `all-pending` applies every unrecorded manifest entry up to the
+# input file in manifest order, refusing on the first failure.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact 40-hex commit whose migrations/manifest.toml and migration SQL are the data to apply
+        type: string
+        required: true
+      file:
+        description: "Migration file basename (e.g. 0054_example.sql); in all-pending mode the last file to apply"
+        type: string
+        required: true
+      applied_by:
+        description: Identity recorded in schema_migrations.applied_by
+        type: string
+        required: true
+      board_approval:
+        description: Paperclip board-approval interaction id for the DDL (recorded in the job summary)
+        type: string
+        required: true
+      mode:
+        description: single file, or every unrecorded manifest entry up to file in order
+        type: choice
+        options:
+          - single
+          - all-pending
+        default: single
+
+permissions:
+  contents: read
+
+# One staging apply at a time: a queued dispatch waits instead of racing
+# the apply transaction. Never cancel: a cancelled apply can leave the
+# commit outcome unknown (docs/ops.md, "Staging migrations").
+concurrency:
+  group: migrations-staging-apply
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+    steps:
+      - name: Validate dispatch inputs
+        env:
+          PINNED_REF: ${{ inputs.ref }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_BY: ${{ inputs.applied_by }}
+          BOARD_APPROVAL: ${{ inputs.board_approval }}
+          APPLY_MODE: ${{ inputs.mode }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Defence in depth: the trusted checkout is this workflow's own
+          # ref, so dispatches must run from the protected branch only.
+          # The staging environment deployment-branch policy (see
+          # docs/ops.md) is the primary control; this refuses any run
+          # that reaches the job from another branch.
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            printf '%s\n' "migrations-staging-apply must be dispatched from refs/heads/main; refusing" >&2
+            exit 1
+          fi
+          if [[ ! "$PINNED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' "ref must be a full 40-hex commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$MIGRATION_FILE" =~ ^[0-9]{4}_[A-Za-z0-9_]+\.sql$ ]]; then
+            printf '%s\n' "file must be a migration basename like 0054_example.sql" >&2
+            exit 1
+          fi
+          for value in "$APPLIED_BY" "$BOARD_APPROVAL"; do
+            if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* || ${#value} -gt 200 ]]; then
+              printf '%s\n' "applied_by and board_approval must be non-empty, single-line, at most 200 chars" >&2
+              exit 1
+            fi
+          done
+          if [[ "$APPLY_MODE" != single && "$APPLY_MODE" != all-pending ]]; then
+            printf '%s\n' "mode must be single or all-pending" >&2
+            exit 1
+          fi
+          {
+            echo "### migrations-staging-apply dispatch"
+            echo "Ref: \`$PINNED_REF\`"
+            echo "File: \`$MIGRATION_FILE\`"
+            echo "Mode: \`$APPLY_MODE\`"
+            echo "Applied by: \`$APPLIED_BY\`"
+            echo "Board approval: \`$BOARD_APPROVAL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out pinned migration data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: data
+          persist-credentials: false
+
+      - name: Check out trusted workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Verify checkouts match pinned revisions
+        env:
+          PINNED_REF: ${{ inputs.ref }}
+          TRUSTED_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$(git -C data rev-parse HEAD)" != "$PINNED_REF" ]; then
+            printf '%s\n' "data checkout does not equal the pinned ref; refusing" >&2
+            exit 1
+          fi
+          if [ "$(git -C trusted rev-parse HEAD)" != "$TRUSTED_REF" ]; then
+            printf '%s\n' "trusted checkout does not equal the workflow ref; refusing" >&2
+            exit 1
+          fi
+
+      - name: Ensure postgres client
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null || [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client ca-certificates
+          fi
+          test -r /etc/ssl/certs/ca-certificates.crt
+
+      - name: Apply migration(s)
+        id: apply
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_BY: ${{ inputs.applied_by }}
+          APPLY_MODE: ${{ inputs.mode }}
+          EXPECT_DATABASE: nntunev2_staging
+        run: |
+          set -euo pipefail
+          python3 -E -s trusted/.github/scripts/staging_apply.py apply --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-by "$APPLIED_BY" --mode "$APPLY_MODE" --expect-database "$EXPECT_DATABASE"
+
+      - name: Record evidence in job summary
+        if: always() && steps.apply.conclusion != 'skipped'
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          APPLIED_FILES: ${{ steps.apply.outputs.applied_files }}
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+          EXPECT_DATABASE: nntunev2_staging
+        run: |
+          set -euo pipefail
+          python3 -E -s trusted/.github/scripts/staging_apply.py evidence --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-files "$APPLIED_FILES" --apply-outcome "$APPLY_OUTCOME" --expect-database "$EXPECT_DATABASE"
