@@ -712,6 +712,42 @@ struct CatalogueTestMirror {
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
+/// Test-only seam for the Subsonic mount's snapshot read: the postgres
+/// harness drives the production `PgStore::subsonic_member_catalogue`
+/// through the injected connections (see
+/// `catalogue_store_for_postgres_test`).
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub trait SubsonicSnapshotCatalogueStore {
+    async fn subsonic_snapshot_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    >;
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl SubsonicSnapshotCatalogueStore for PgStore {
+    async fn subsonic_snapshot_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        self.subsonic_member_catalogue(user_id).await
+    }
+}
+
 /// Inject connection acquisition only; execute the production catalogue SQL,
 /// decoders, early returns and error propagation against disposable PostgreSQL.
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -720,7 +756,7 @@ pub fn catalogue_store_for_postgres_test(
     mirror_configured: bool,
     mirror: Result<tokio_postgres::Client, StoreError>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
-) -> impl Store {
+) -> impl Store + SubsonicSnapshotCatalogueStore {
     PgStore {
         env: None,
         trace_id: "postgres-catalogue-test".into(),

@@ -94,7 +94,11 @@ SESSION_TTL_SECS = "86400"
 # bind); a missing binding answers Subsonic error 70 (source unavailable)
 # rather than a grant-minted stream. Staging binds
 # `nntune-stream-staging`; production binds `nntune-stream`, never the
-# reverse.
+# reverse. In the generated staging config (deploy.yml staging-api) this
+# block is emitted only when the STREAM_SERVICE_STAGING repo variable is
+# set (deploy the staging stream Worker first, then set it); absent, the
+# block is omitted so Wrangler never rejects the API deploy for a missing
+# target — stream then answers error 70.
 # [[services]]
 # binding = "STREAM"
 # service = "nntune-stream"
