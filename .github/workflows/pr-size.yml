@@ -7,8 +7,9 @@
 # `.github/workflows/pr-size-gate.yml` and `.github/scripts/pr_size.py`) and
 # runs from that repository at the pinned ref - this repo keeps no copy of
 # the script. To adopt: copy this file to `.github/workflows/pr-size.yml`,
-# repin all three `uses:` refs to the current TogetherWeOwn/.github `main`
-# SHA, and set `exclude-extra` to this repo's generated paths.
+# repin all three `uses:` refs together to the TogetherWeOwn/.github tag
+# commit SHA, keep the `# vX.Y.Z` version comment pinact verifies against
+# that tag, and set `exclude-extra` to this repo's generated paths.
 #
 # ADVISORY PART: never make `pr-size` a required check and never add it to
 # a ruleset's required-workflows list. The labeller exits 0 on any API
@@ -63,10 +64,10 @@ jobs:
     name: pr-size
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
+      contents: read # Org reusable reads this repo at the pinned ref.
+      issues: write # Advisory labeler posts the size comment.
+      pull-requests: write # Advisory labeler reads the PR and its labels.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # This repo's generated paths, excluded on top of the script's
@@ -81,10 +82,10 @@ jobs:
     name: pr-size-gate
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
+      contents: read # Org reusable reads this repo at the pinned ref.
+      issues: write # Gate posts the pass/fail size comment.
+      pull-requests: write # Gate reads the PR size and exception label.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       exclude-extra: ""
@@ -93,7 +94,7 @@ jobs:
     name: pr-size-weekly
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
     permissions:
-      contents: read
-      issues: read
-      pull-requests: read
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
+      contents: read # Org reusable reads this repo at the pinned ref.
+      issues: read # Weekly tally reads the exception label.
+      pull-requests: read # Weekly tally reads open PRs and sizes.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
