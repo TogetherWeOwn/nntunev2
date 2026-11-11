@@ -1,6 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expect, test, type Locator } from '@playwright/test';
+// EL TWO-5795 (demo/player retirement): this spec is hosted on the retired
+// `/demo/player` surface and the deleted `/api/demo/*` synthetic-media endpoints.
+// Vectors and case IDs are preserved; migration to the product surface is
+// deferred per fallback (b) — see the PR body disposition manifest.
+test.skip(true, 'EL TWO-5795: demo/player retirement — migration deferred, vectors preserved');
+
 import { cc0Track } from '../../../e2e/helpers/cc0-fixture.js';
 
 /**

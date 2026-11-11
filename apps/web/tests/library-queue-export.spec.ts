@@ -2,8 +2,9 @@ import { expect, test, type Download, type Locator, type Page } from '@playwrigh
 import { createQueue, formatQueueM3U, formatQueueText } from '../src/lib/player/queue.js';
 
 /**
- * Protected acceptance bank: export the authenticated /library queue, not
- * /demo/player. The paired implementation must not edit this file.
+ * Protected acceptance bank: export the authenticated /library queue (the
+ * retired /demo/player route is gone since EL TWO-5795). The paired
+ * implementation must not edit this file.
  *
  * Breaks caught: exporting library/display order instead of arranged queue
  * order; filtering exports by current/checked/visible rows; stale cached

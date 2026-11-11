@@ -3,8 +3,9 @@ import { expect, test, type Page } from '@playwright/test';
 /**
  * Builder-owned pin: the /library Shuffle upcoming binding.
  *
- * The acceptance shuffle suite drives /demo/player only, and /library is the
- * only production host of the shared PlayerQueue panel — so dropping the
+ * The acceptance shuffle suite was hosted on the retired /demo/player only,
+ * and /library is the only production host of the shared PlayerQueue panel —
+ * so dropping the
  * `onshuffle` prop (or replacing it with a no-op) stayed green. This spec
  * pins that binding on /library itself: the button is enabled with two
  * upcoming tracks, and one click permutes only the upcoming suffix while the
