@@ -4,8 +4,9 @@
 //! (`dispatch::make_job_id`) with `UNIQUE(user_id, idempotency_key)`
 //! as the replay guard. The admission route writes `queued` when a job
 //! is accepted; the consumer moves it to `done`/`failed` exactly once
-//! at terminal settlement. `running` is reserved for a future
-//! lease/heartbeat and is never written by either path today.
+//! at terminal settlement. The separate generation adapter's trusted
+//! `start_durable_attempt_acquisition` can atomically start an admitted job
+//! with its durable receipt; no Queue caller is wired to that API yet.
 //!
 //! Both statements select through the standard `writer_fence` (the
 //! owner's `users` row `FOR SHARE` while `deleting_at IS NULL`, ADR
