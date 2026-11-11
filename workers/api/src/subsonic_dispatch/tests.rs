@@ -2,11 +2,18 @@
 //! about caller-visible Subsonic behaviour of [`ProductionStore`] and the
 //! error/stream helpers — no database, no worker types.
 
-use super::{build_snapshot, ProductionStore, FLAC_CONTENT_TYPE, FLAC_SUFFIX};
+use super::{
+    auth_error_response, build_snapshot, compat_session_id, issuance_refusal_response,
+    merged_query_params, parse_error_response, rejects_transcode, transcode_refusal_response,
+    upstream_refusal_response, ProductionStore, FLAC_CONTENT_TYPE, FLAC_SUFFIX,
+};
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::ledger::STREAM_BYTES_PER_SEC;
+use crate::subsonic_auth::AuthError;
+use crate::subsonic_http::CredentialParseError;
 use nntune_subsonic::auth::Identity;
-use nntune_subsonic::library::{Library, UserAccount, NOW};
+use nntune_subsonic::endpoints::Params;
+use nntune_subsonic::library::{Library, Playlist, StarKind, UserAccount, NOW};
 
 const ALBUM_A: &str = "11111111-1111-4111-8111-111111111111";
 const ALBUM_B: &str = "22222222-2222-4222-8222-222222222222";
@@ -186,4 +193,213 @@ fn store_never_serves_fixture_bytes_or_rights_flagged_art() {
     assert!(store.cover(ALBUM_A).is_none());
     assert!(store.avatar("mel").is_none());
     assert!(store.lyrics("a", "b").is_none());
+}
+
+#[test]
+fn per_user_state_fails_closed_without_a_history_store() {
+    let mut store = store();
+    let identity = Identity {
+        username: "mel".to_string(),
+        email: "mel@example.com".to_string(),
+        is_admin: false,
+    };
+    assert!(store.playlists(&identity).is_empty());
+    assert!(store.playlist(&identity, "anything").is_none());
+    assert_eq!(
+        store.update_playlist(&identity, "id", None, vec![], vec![]),
+        Err((
+            50,
+            "User is not authorized for the given operation.".to_string()
+        ))
+    );
+    // delete maps to error 50 through the endpoint, never a silent ok.
+    assert_eq!(
+        store.delete_playlist(&identity, "id"),
+        Err((
+            50,
+            "User is not authorized for the given operation.".to_string()
+        ))
+    );
+    assert!(!store.star(&identity, StarKind::Song, SONG_1));
+    assert!(store.starred(&identity, StarKind::Song).is_empty());
+    assert!(!store.set_rating(&identity, SONG_1, 5));
+    assert!(store.rating(&identity, SONG_1).is_none());
+    // The scrobble endpoint ignores this return; with no history table,
+    // recent stays empty while frequent keeps every album eligible
+    // (see module docs and the album_list test below).
+    assert!(!store.scrobble(&identity, SONG_1));
+    assert!(store.queue(&identity).is_none());
+    // create_playlist is infallible: id-less placeholder, never stored.
+    let created = store.create_playlist(&identity, "Evening".to_string());
+    assert_eq!(created.id, "");
+    assert_eq!(created.owner, "mel");
+    assert!(store.playlists(&identity).is_empty());
+    assert!(store.playlist(&identity, "").is_none());
+    let _: Playlist = created;
+}
+
+#[test]
+fn random_songs_is_deterministic_and_bounded() {
+    let store = store();
+    let identity = Identity {
+        username: "mel".to_string(),
+        email: String::new(),
+        is_admin: false,
+    };
+    let first = store.random_songs(&identity, 2);
+    let second = store.random_songs(&identity, 2);
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        second.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+}
+
+fn body_str(resp: &nntune_subsonic::HttpResponse) -> String {
+    String::from_utf8(resp.body.clone()).expect("utf8 body")
+}
+
+#[test]
+fn error_rendering_selects_format_and_never_leaks() {
+    let xml = parse_error_response("u=mel", CredentialParseError::DuplicateCredential);
+    assert_eq!(xml.content_type, "application/xml");
+    assert!(xml.body.starts_with(b"<?xml"));
+    let xml_text = body_str(&xml);
+    assert!(
+        xml_text.contains("code=\"0\""),
+        "parse errors are generic 0: {xml_text}"
+    );
+    assert!(
+        !xml_text.contains("mel"),
+        "no credential material: {xml_text}"
+    );
+
+    let json = auth_error_response("f=json&u=mel", AuthError::InvalidToken);
+    assert_eq!(json.content_type, "application/json");
+    assert!(body_str(&json).contains("\"code\":40"));
+
+    let jsonp = auth_error_response("f=jsonp&callback=cb&u=mel", AuthError::Unsupported);
+    assert_eq!(jsonp.content_type, "text/javascript");
+    assert!(body_str(&jsonp).starts_with("/**/cb("));
+    assert!(body_str(&jsonp).contains("\"code\":42"));
+
+    // A broken callback falls back to JSON error 10, not to the error body.
+    let bad = auth_error_response("f=jsonp&callback=not-valid&u=mel", AuthError::Unsupported);
+    assert_eq!(bad.content_type, "application/json");
+    assert!(body_str(&bad).contains("\"code\":10"));
+
+    for (err, code, fragment) in [
+        (AuthError::Conflicting, "43", "Conflicting"),
+        (AuthError::MissingSalt, "10", "missing"),
+        (AuthError::InvalidKey, "44", "Invalid API key"),
+        (AuthError::Unavailable, "0", "Internal server error"),
+    ] {
+        let resp = auth_error_response("f=json", err);
+        let text = body_str(&resp);
+        assert!(text.contains(&format!("\"code\":{code}")), "{text}");
+        assert!(text.contains(fragment), "{text}");
+    }
+}
+
+#[test]
+fn merged_params_carry_body_selected_format_into_error_documents() {
+    // The merge mirrors the shared dispatcher: query pairs first (query
+    // wins duplicates), body pairs after; non-POST and empty bodies pass
+    // the query through unchanged.
+    assert_eq!(merged_query_params("POST", "", "f=json"), "f=json");
+    assert_eq!(
+        merged_query_params("POST", "f=json", "f=jsonp&callback=cb"),
+        "f=json&f=jsonp&callback=cb"
+    );
+    assert_eq!(merged_query_params("GET", "f=json", "f=jsonp"), "f=json");
+    assert_eq!(merged_query_params("POST", "f=json", ""), "f=json");
+    assert_eq!(merged_query_params("POST", "", ""), "");
+
+    // Body-only `f=json` on a POST auth failure renders JSON, not XML —
+    // the mount passes the merged string to its error renderers.
+    let merged = merged_query_params("POST", "", "apiKey=invalid&f=json");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Body-only `f=jsonp&callback=cb` renders JSONP with the callback.
+    let merged = merged_query_params("POST", "", "apiKey=invalid&f=jsonp&callback=cb");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "text/javascript");
+    assert!(body_str(&resp).starts_with("/**/cb("));
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Query `f` still wins over body `f`: query `f=json` over body
+    // `f=jsonp` renders JSON, not JSONP.
+    let merged = merged_query_params("POST", "f=json", "apiKey=invalid&f=jsonp&callback=cb");
+    let resp = auth_error_response(&merged, AuthError::InvalidKey);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":44"));
+
+    // Parse errors likewise honour the merged format selector.
+    let merged = merged_query_params("POST", "", "f=json");
+    let resp = parse_error_response(&merged, CredentialParseError::DuplicateCredential);
+    assert_eq!(resp.content_type, "application/json");
+    assert!(body_str(&resp).contains("\"code\":0"));
+}
+
+#[test]
+fn issuance_refusals_map_status_only() {
+    for status in [402u16, 409, 429] {
+        let resp = issuance_refusal_response("f=json", status);
+        assert!(body_str(&resp).contains("\"code\":50"), "status {status}");
+    }
+    for status in [0u16, 200, 400, 500, 503] {
+        let resp = issuance_refusal_response("f=json", status);
+        assert!(body_str(&resp).contains("\"code\":0"), "status {status}");
+    }
+    // The native body ("paywall", plan names) is never echoed back.
+    let resp = issuance_refusal_response("f=json&u=secret-user", 402);
+    assert!(!body_str(&resp).contains("secret-user"));
+}
+
+#[test]
+fn upstream_refusals_map_missing_sources_to_70() {
+    for status in [404u16, 502] {
+        let resp = upstream_refusal_response("f=json", status);
+        assert!(body_str(&resp).contains("\"code\":70"), "status {status}");
+        assert!(body_str(&resp).contains("Song not found"));
+    }
+    for status in [200u16, 206, 403, 500] {
+        let resp = upstream_refusal_response("f=json", status);
+        assert!(body_str(&resp).contains("\"code\":0"), "status {status}");
+    }
+}
+
+#[test]
+fn compat_session_id_is_stable_distinct_and_bounded() {
+    let a = compat_session_id("user-1", "cred-1");
+    let b = compat_session_id("user-1", "cred-1");
+    let c = compat_session_id("user-1", "cred-2");
+    let d = compat_session_id("user-2", "cred-1");
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(a, d);
+    assert!(!a.is_empty() && a.len() <= 128);
+    assert!(
+        !a.contains("user-1") && !a.contains("cred-1"),
+        "ids are not recoverable: {a}"
+    );
+}
+
+#[test]
+fn transcode_requests_are_refused_flac_only() {
+    let rejects = |q: &str| rejects_transcode(&Params::parse(q));
+    assert!(rejects("format=mp3"));
+    assert!(rejects("format=opus"));
+    assert!(rejects("maxBitRate=128"));
+    assert!(rejects("maxBitRate=abc"), "unparseable cap fails closed");
+    assert!(!rejects(""));
+    assert!(!rejects("format=flac"));
+    assert!(!rejects("format=FLAC"));
+    assert!(!rejects("maxBitRate=0"));
+    assert!(!rejects("format=flac&maxBitRate=0"));
+    let resp = transcode_refusal_response("f=json");
+    assert!(body_str(&resp).contains("\"code\":0"));
+    assert!(body_str(&resp).contains("Transcoding is not supported"));
 }
