@@ -156,6 +156,11 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertEqual(apply.count("python3 "), 2)
         # all-pending walks manifest order and refuses on the first failure.
         self.assertIn("all-pending", apply)
+        # The evidence step runs only once apply has started: a refused
+        # dispatch (validation, checkout or verify failure) stops before
+        # the credential is reached, while a started apply that fails
+        # still records evidence.
+        self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter

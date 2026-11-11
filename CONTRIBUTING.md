@@ -163,9 +163,9 @@ labels are the durable record behind it.
   DDL has board approval on its card, the authoring agent dispatches
   `.github/workflows/migrations-staging-apply.yml` with the approved
   commit `ref`, migration `file`, `applied_by` and the board-approval
-  interaction id (it runs `.github/scripts/apply_migration.py` pinned at
-  that ref), and the PR merges only once the apply is recorded in the
-  job summary. A PR that renames a migration must rename it
+  interaction id (the ref supplies migration data only; the workflow runs
+  the trusted `.github/scripts/apply_migration.py` from `main`), and the
+  PR merges only once the apply is recorded in the job summary. A PR that renames a migration must rename it
   byte-identically and carry its `renamed_from` manifest history
   (`migrations-staging` enforces it).
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,

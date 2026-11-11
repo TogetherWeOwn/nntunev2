@@ -162,7 +162,7 @@ jobs:
           python3 -E -s trusted/.github/scripts/staging_apply.py apply --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-by "$APPLIED_BY" --mode "$APPLY_MODE" --expect-database "$EXPECT_DATABASE"
 
       - name: Record evidence in job summary
-        if: always()
+        if: always() && steps.apply.conclusion != 'skipped'
         env:
           PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
           MIGRATION_FILE: ${{ inputs.file }}
