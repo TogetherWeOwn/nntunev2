@@ -174,6 +174,13 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// MD5 hex digest (RFC 1321), for `t = md5(password + salt)` token auth.
 /// A checksum compatibility helper, not a security primitive.
+///
+/// Input sizing (reassessed at production mounting): `md5_hex` copies its
+/// input once (`to_vec`) plus at most 72 bytes of padding, so memory stays
+/// proportional to the input. Every caller bounds the input — the
+/// production token path feeds at most 768 bytes (stored secret 32-512 plus
+/// salt up to 256) — so the copy is a few hundred bytes and no hardening
+/// (streaming, hashing in place, length caps here) is needed.
 pub fn md5_hex(input: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
@@ -326,6 +333,16 @@ mod tests {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         // Verified against `md5sum` and Python `hashlib` (both agree).
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn md5_stable_at_max_bounded_input() {
+        // 768 bytes is the production token path maximum (512-byte secret +
+        // 256-byte salt); digest pinned against Python `hashlib` so the
+        // single-copy padding path cannot drift at that size.
+        let input = [b"a".repeat(512), b"b".repeat(256)].concat();
+        assert_eq!(input.len(), 768);
+        assert_eq!(md5_hex(&input), "d98cecdea4a53dfcdc8cf7773b172e1a");
     }
 
     #[test]

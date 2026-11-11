@@ -87,6 +87,25 @@ SESSION_TTL_SECS = "86400"
 # binding = "MB_DB"
 # id = "<shared mirror id, same in staging and prod>"
 
+# Stream Worker service binding (`STREAM`): the Subsonic `/rest/stream`
+# mount proxies the minted play grant privately to
+# `GET /play/{track_id}` on this Worker (see STREAM_SERVICE_BINDING in
+# src/worker_entry.rs). Deploy the stream Worker FIRST (it must exist to
+# bind); a missing binding answers Subsonic error 70 (source unavailable)
+# rather than a grant-minted stream. Staging binds
+# `nntune-stream-staging`; production binds `nntune-stream`, never the
+# reverse. In the generated staging config (deploy.yml staging-api) this
+# block is emitted only when the STREAM_SERVICE_STAGING repo variable is
+# set (deploy the staging stream Worker first, then set it); absent, the
+# block is omitted so Wrangler never rejects the API deploy for a missing
+# target — stream then answers error 70.
+# [[services]]
+# binding = "STREAM"
+# service = "nntune-stream"
+# [[env.staging.services]]
+# binding = "STREAM"
+# service = "nntune-stream-staging"
+
 # Workers Logs persistence for the structured api records (the build_sha
 # evidence is read there). Without this block the deployed Worker has
 # observability=null and persists nothing. The `staging-api` lane in
@@ -117,6 +136,9 @@ SESSION_TTL_SECS = "86400"
 # zone_name = "nntune.com"
 # [[env.staging.routes]]
 # pattern = "staging.nntune.com/healthz"
+# zone_name = "nntune.com"
+# [[env.staging.routes]]
+# pattern = "staging.nntune.com/rest/*"
 # zone_name = "nntune.com"
 
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values
@@ -160,15 +182,29 @@ SESSION_TTL_SECS = "86400"
 #   NATIVE_REST_PEPPER_BASE64       HMAC pepper for scoped native REST bearer
 #                                 credentials (ADR 0010, migration 0019),
 #                                 32+ bytes unpadded base64url. Dedicated
-#                                 keyring, separate from the planned
-#                                 SUBSONIC_INDEX_PEPPER Subsonic keyring
-#                                 (not wired in the Worker) so either surface
-#                                 rotates without forcing the other. BOTH
-#                                 pepper vars set, or neither:
-#                                 unset, issuance endpoints fail closed
-#                                 per-request and bearer routes 401 while
-#                                 every other route keeps serving; half-set
-#                                 refuses to start (fail closed).
+#                                 keyring, separate from the Subsonic
+#                                 SUBSONIC_INDEX_PEPPER keyring (below) so
+#                                 either surface rotates without forcing
+#                                 the other. BOTH pepper vars set, or
+#                                 neither: unset, issuance endpoints fail
+#                                 closed per-request and bearer routes 401
+#                                 while every other route keeps serving;
+#                                 half-set refuses to start (fail closed).
+#   SUBSONIC_INDEX_PEPPER           JSON keyring for the Subsonic
+#                                 credential index (ADR 0002 rule 2,
+#                                 migration 0037): {"current_version":N,
+#                                 "previous_version":M|null,
+#                                 "keys":{"<N>":"<base64url 32..=64 bytes>",
+#                                 "<M>":"<same>"}}. Keys are unpadded
+#                                 base64url (`nntune_api::b64::decode`);
+#                                 at most the two referenced versions may
+#                                 be present. This is a DEDICATED secret —
+#                                 never the NATIVE_REST_PEPPER value (the
+#                                 surfaces rotate independently). Absent or
+#                                 invalid, only the public Subsonic route
+#                                 serves; every authenticated /rest/* call
+#                                 answers Subsonic error 0. (Parsed pure by
+#                                 src/subsonic_config.rs; max 1024 bytes.)
 #   NATIVE_REST_PEPPER_VERSION      integer version bound to the pepper above
 #                                 (stored per row; lookup is by the exact
 #                                 composite (pepper_version, key_hmac)).
