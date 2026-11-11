@@ -2021,6 +2021,21 @@ async fn admin_ingest_delete_on(
     if !crate::admin::is_admin_role(actor_role.as_deref()) {
         return Ok(AdminIngestDeleteOutcome::ActorNotAdmin);
     }
+    // A frozen preparation plan retains the job (`ON DELETE RESTRICT` +
+    // the immutability trigger on `ingest_preparation_plans`): deleting
+    // underneath it would fail the foreign key mid-transaction and
+    // surface as a generic store error. Refuse explicitly, before
+    // anything is removed.
+    let frozen = transaction
+        .query_typed(
+            "SELECT 1 FROM ingest_preparation_plans WHERE job_id = $1 LIMIT 1",
+            &[(&job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if !frozen.is_empty() {
+        return Ok(AdminIngestDeleteOutcome::PlanFrozen);
+    }
     transaction
         .query_typed(
             "DELETE FROM ingest_originals WHERE job_id IN \

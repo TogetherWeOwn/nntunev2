@@ -472,6 +472,10 @@ pub enum AdminIngestDeleteOutcome {
     Deleted,
     Missing,
     ActorNotAdmin,
+    /// A frozen preparation plan retains the job: plans are immutable
+    /// and `ON DELETE RESTRICT`, so the job cannot be removed while a
+    /// plan exists. Nothing is deleted.
+    PlanFrozen,
 }
 
 /// View status for an admin job row: the ledger stores `queued` for an

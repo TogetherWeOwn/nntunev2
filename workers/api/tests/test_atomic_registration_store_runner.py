@@ -143,6 +143,7 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
             "postgres_admin_ingest_upload_accept_then_duplicate_converges",
             "postgres_admin_ingest_rejected_upload_stores_failed_without_original",
             "postgres_admin_ingest_delete_then_reupload_is_fresh",
+            "postgres_admin_ingest_delete_with_frozen_plan_is_refused",
             "postgres_admin_ingest_list_and_get_read_redacted_jobs",
         ):
             self.assertIn(runner.PREFIX + name, runner.EXPECTED)

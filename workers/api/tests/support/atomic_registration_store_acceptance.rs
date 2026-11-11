@@ -2762,6 +2762,80 @@ fn postgres_admin_ingest_delete_then_reupload_is_fresh() {
     });
 }
 
+struct FreezeFixtureKey([u8; 32]);
+impl crate::rotation::KekSource for FreezeFixtureKey {
+    fn kek(&self, version: u32) -> Option<&[u8; 32]> {
+        (version == 1).then_some(&self.0)
+    }
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_ingest_delete_with_frozen_plan_is_refused() {
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, _) = seed_admin_test_users(&client).await;
+        let attempt = accepted_ingest_attempt(&admin, "frozen", NOW);
+        let job_id = attempt.job_id.clone();
+        admin_ingest_upload_on(&mut client, &attempt)
+            .await
+            .expect("seed upload executes");
+
+        // Freeze a preparation plan over the job: plans are immutable
+        // and `ON DELETE RESTRICT`, so they retain the job.
+        let key = FreezeFixtureKey(
+            crate::random::secure_random_bytes::<32>().expect("key fixture randomness"),
+        );
+        let request = crate::ingest_plan::PlanRequest {
+            owner_id: &attempt.actor_user_id,
+            job_id: &attempt.job_id,
+            operation_key: "delete-retest",
+            file_index: 0,
+            original_sha256: &attempt.content_sha256_hex,
+            original_bytes: attempt.nzb_bytes as i64,
+            file_count: attempt.file_count.expect("fixture file count") as i32,
+        };
+        let payload = crate::random::secure_random_bytes::<32>().expect("plan fixture randomness");
+        assert!(
+            crate::ingest_plan::freeze_plan(
+                &mut client,
+                crate::ingest_plan::PlanMode::PreparationOnly,
+                &key,
+                1,
+                &request,
+                &payload,
+            )
+            .await
+            .expect("plan freeze executes")
+            .is_some(),
+            "the preparation plan must freeze"
+        );
+
+        // The delete is refused explicitly — not a mid-transaction
+        // foreign-key failure — and removes nothing.
+        assert_eq!(
+            admin_ingest_delete_on(&mut client, &admin, &job_id)
+                .await
+                .expect("frozen delete executes"),
+            AdminIngestDeleteOutcome::PlanFrozen
+        );
+        assert_eq!(
+            ingest_row_counts(&client, &job_id).await,
+            (1, 1),
+            "a refused delete removes nothing"
+        );
+        let plans: i64 = client
+            .query_one(
+                "SELECT count(*) FROM ingest_preparation_plans WHERE job_id = $1",
+                &[&job_id],
+            )
+            .await
+            .expect("count plan rows")
+            .get(0);
+        assert_eq!(plans, 1, "the frozen plan survives the refused delete");
+    });
+}
+
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
