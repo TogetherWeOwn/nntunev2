@@ -5829,8 +5829,8 @@ pub async fn subsonic_mount(
     use crate::subsonic_dispatch as core;
     use nntune_subsonic::endpoints::Params;
     use nntune_subsonic::envelope::code;
-    use nntune_subsonic::{Identity, UserAccount};
     use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{Identity, UserAccount};
     use nntune_subsonic::{MemStore, SubsonicApp};
 
     // 1. Public route: no credentials, no config, no database.
@@ -5843,7 +5843,11 @@ pub async fn subsonic_mount(
     let config = match config_from_env(&env) {
         Some(cfg) => cfg,
         None => {
-            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+            return respond_document(&core::render_error(
+                query,
+                code::GENERIC,
+                "Internal server error.",
+            ));
         }
     };
     let store = PgStore {
@@ -5863,17 +5867,17 @@ pub async fn subsonic_mount(
     {
         Some(k) => k,
         None => {
-            return respond_document(
-                &core::auth_error_response(query, crate::subsonic_auth::AuthError::Unavailable),
-            );
+            return respond_document(&core::auth_error_response(
+                query,
+                crate::subsonic_auth::AuthError::Unavailable,
+            ));
         }
     };
-    let form_body = (!body.is_empty()).then(|| body.as_bytes());
-    let credentials =
-        match crate::subsonic_http::parse_credentials(Some(query), form_body) {
-            Ok(c) => c,
-            Err(err) => return respond_document(&core::parse_error_response(query, err)),
-        };
+    let form_body = (!body.is_empty()).then_some(body.as_bytes());
+    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+        Ok(c) => c,
+        Err(err) => return respond_document(&core::parse_error_response(query, err)),
+    };
     let principal = match crate::subsonic_auth::authenticate(
         &store,
         &credentials,
@@ -5889,7 +5893,11 @@ pub async fn subsonic_mount(
     let (email, role) = match store.subsonic_account(principal.user_id()).await {
         Ok(Some(pair)) => pair,
         _ => {
-            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+            return respond_document(&core::render_error(
+                query,
+                code::GENERIC,
+                "Internal server error.",
+            ));
         }
     };
     let is_admin = role == "admin";
@@ -5914,7 +5922,11 @@ pub async fn subsonic_mount(
     let (artist_rows, release_rows, track_rows) = match catalogue.await {
         Ok(rows) => rows,
         Err(_) => {
-            return respond_document(&core::render_error(query, code::GENERIC, "Internal server error."));
+            return respond_document(&core::render_error(
+                query,
+                code::GENERIC,
+                "Internal server error.",
+            ));
         }
     };
     let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
@@ -5942,7 +5954,11 @@ pub async fn subsonic_mount(
             ));
         };
         if !songs.iter().any(|song| song.id == song_id) {
-            return respond_document(&core::render_error(query, code::NOT_FOUND, "Song not found."));
+            return respond_document(&core::render_error(
+                query,
+                code::NOT_FOUND,
+                "Song not found.",
+            ));
         }
         let stripe = WorkerStripeTransport {
             secret_key: config.stripe_secret_key.clone(),
@@ -5969,10 +5985,7 @@ pub async fn subsonic_mount(
             principal.user_id(),
             Some(handlers::PlayIssueBody {
                 track_id: song_id.clone(),
-                session_id: core::compat_session_id(
-                    principal.user_id(),
-                    principal.credential_id(),
-                ),
+                session_id: core::compat_session_id(principal.user_id(), principal.credential_id()),
                 play_id: None,
                 takeover: false,
             }),
@@ -5999,10 +6012,8 @@ pub async fn subsonic_mount(
         }
         let mut init = RequestInit::new();
         init.with_method(Method::Get).with_headers(headers);
-        let request = Request::new_with_init(
-            &format!("https://nntune-stream/play/{song_id}"),
-            &init,
-        )?;
+        let request =
+            Request::new_with_init(&format!("https://nntune-stream/play/{song_id}"), &init)?;
         // With the `http` feature, `fetch_request` returns
         // `http::Response<Body>`; convert back to `worker::Response` for
         // `status_code()`/`bytes()` (stream Worker reads the same way).
@@ -6039,11 +6050,7 @@ pub async fn subsonic_mount(
 
     // 4. Everything else: transport-free dispatcher over the snapshot.
     let app = SubsonicApp::production(core::ProductionStore::new(
-        identity,
-        account,
-        artists,
-        albums,
-        songs,
+        identity, account, artists, albums, songs,
     ));
     respond_document(&app.handle(method, path, query, body))
 }
