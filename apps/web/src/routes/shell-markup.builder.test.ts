@@ -28,7 +28,7 @@ function appearanceControl(body: string) {
 }
 
 describe('shared shell markup', () => {
-	it.each(['/', '/login', '/auth/magic', '/demo/player'])('keeps one appearance control and no app navigation at %s', (path) => {
+	it.each(['/', '/login', '/auth/magic'])('keeps one appearance control and no app navigation at %s', (path) => {
 		const body = markup(path);
 		appearanceControl(body);
 		expect(body).toContain('Shell child');

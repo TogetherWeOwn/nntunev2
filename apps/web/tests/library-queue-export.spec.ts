@@ -3,8 +3,9 @@ import { createQueue, formatQueueM3U, formatQueueText } from '../src/lib/player/
 import { openQueue } from './helpers/queue-host';
 
 /**
- * Protected acceptance bank: export the authenticated /library queue, not
- * /demo/player. The paired implementation must not edit this file except for
+ * Protected acceptance bank: export the authenticated /library queue (the
+ * retired /demo/player route is gone since EL TWO-5795). The paired
+ * implementation must not edit this file except for
  * the Engineering Lead's one-time, same-PR queue-host migration authorization:
  * physical ownership, scoped locators and necessary lifecycle adapters only.
  * Behavior vectors and all other acceptance protection remain unchanged;

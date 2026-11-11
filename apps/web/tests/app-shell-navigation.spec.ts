@@ -361,7 +361,7 @@ async function focusShellLink(page: Page): Promise<void> {
 	// Probe presence first (the goToAccount pattern): evaluating
 	// an absent locator inside tabUntilFocused waits out the timeout on
 	// every tab, so on public-header routes (no Primary landmark, e.g.
-	// /demo/player in v2) the fallback must be chosen up front, not after
+	// public-header routes without it in v2) the fallback must be chosen up front, not after
 	// 30 timed-out probes.
 	let reached = false;
 	if ((await libraryDestinationLink(page).count()) > 0) {
