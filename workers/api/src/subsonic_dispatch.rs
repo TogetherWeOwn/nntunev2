@@ -59,7 +59,7 @@
 //!   lease, so resume works. Uncached tracks answer 70 until the stream
 //!   Worker's deferred miss adapter serves them (upstream 404/502).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nntune_subsonic::auth::{AuthStore, Identity};
 use nntune_subsonic::endpoints::Params;
@@ -349,8 +349,15 @@ impl Library for ProductionStore {
     }
 
     fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)> {
+        // Albums with at least one member song, via a set so the filter is
+        // O(songs + albums) rather than a per-album scan of the snapshot.
+        let albums_with_songs: HashSet<&str> = self
+            .songs
+            .iter()
+            .map(|song| song.album_id.as_str())
+            .collect();
         let mut albums = self.all_albums();
-        albums.retain(|album| self.songs.iter().any(|song| song.album_id == album.id));
+        albums.retain(|album| albums_with_songs.contains(album.id.as_str()));
         match query.list_type {
             "random" => albums.sort_by(|a, b| a.id.cmp(&b.id)),
             "newest" => albums.sort_by(|a, b| catalogue_date_desc(&a.curated_at, &b.curated_at)),
