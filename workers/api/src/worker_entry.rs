@@ -4034,7 +4034,7 @@ impl Store for PgStore {
         .await
     }
 
-    /// Collection-saves state probe (migration 0037): caller-scoped
+    /// Collection-saves state probe (migration 0041): caller-scoped
     /// app read, reached only after the handler validated the target.
     async fn collection_save_state(
         &self,

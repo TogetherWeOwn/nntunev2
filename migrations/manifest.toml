@@ -199,6 +199,7 @@ target = "app"
 sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
 
 [[migration]]
-file = "0037_collection_saves.sql"
+file = "0041_collection_saves.sql"
 target = "app"
 sha256 = "61545cb91b726ec4b4e7045c953ef28670169a139a0faa222385accdfa6086a9"
+renamed_from = [{ file = "0037_collection_saves.sql", sha256 = "61545cb91b726ec4b4e7045c953ef28670169a139a0faa222385accdfa6086a9" }]

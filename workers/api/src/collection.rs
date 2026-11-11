@@ -11,7 +11,7 @@
 //!
 //! Sources:
 //! - Save rows live in the app database (`collection_saves`, migration
-//!   0037): `(user_id, kind, mbid)` primary key with `saved_at` unix
+//!   0041): `(user_id, kind, mbid)` primary key with `saved_at` unix
 //!   seconds. `kind` is `'album'` or `'artist'`, the stored `mbid` is
 //!   TEXT with no `::uuid` cast anywhere on the app side (the Rust shape
 //!   gate below binds only well-formed values).

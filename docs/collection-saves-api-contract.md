@@ -122,7 +122,7 @@ Uniform, non-distinguishing failures:
 - Bearer scope denial follows the existing gate (`forbidden` envelope)
   only after authentication, like the other scoped routes.
 
-## Storage (migration `0037_collection_saves`, app target)
+## Storage (migration `0041_collection_saves`, app target)
 
 `public.collection_saves (user_id, kind, mbid, saved_at)`, primary key
 `(user_id, kind, mbid)`, `kind ∈ {'album','artist'}`, `mbid` TEXT (stored

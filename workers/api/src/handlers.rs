@@ -4138,7 +4138,7 @@ where
 // --- Collection saves (durable saved albums + followed artists) -----------------
 //
 // The `/v1/me/library/{albums,artists}` surface is an account preference
-// ledger (migration 0037), never ingest, playback, listens or access —
+// ledger (migration 0041), never ingest, playback, listens or access —
 // wire contract in docs/collection-saves-api-contract.md. Reads share the
 // catalogue's session-or-bearer resolution; writes add the mutation
 // Origin pin for cookie sessions (a presented `library:write` bearer is
@@ -7898,7 +7898,7 @@ mod tests {
         fail_catalogue_reads: RefCell<bool>,
         /// Fail only the second read in release detail, after membership.
         fail_catalogue_release_tracks: RefCell<bool>,
-        /// Collection saves (migration 0037): keyed `(user_id, kind, mbid)`
+        /// Collection saves (migration 0041): keyed `(user_id, kind, mbid)`
         /// with the first-save unix instant, mirroring the production
         /// composite key and the replay-keeps-first-instant rule.
         collection_saves: RefCell<HashMap<(String, String, String), i64>>,
