@@ -1174,13 +1174,16 @@ pub async fn finish_verification(
 /// Confirm retention for a verified candidate: stamps
 /// `retention_checked_at` from the database clock and moves health to
 /// `usable`. Requires a current handle on a verifying round whose
-/// `verified_at` is present and whose retention stamp is still absent;
-/// anything else is incomplete evidence, never a stamp. This is the only
-/// writer of the `usable` state alongside [`promote_candidate`]'s fence;
-/// it selects nothing and changes no custody, references or budgets.
-/// After success the candidate is promotable but no longer mutable
-/// through the pending-candidate path. On CommitUnknown, retry this
-/// original handle: a fresh handle re-observes durable state.
+/// `verified_at` is present, whose retention stamp is still absent,
+/// *and* whose authenticated-content observations are `Intact` on both
+/// backbones for the current round (presence/`verified_at` alone is
+/// never content proof — see the module contract); anything else is
+/// incomplete evidence, never a stamp. This is the only writer of the
+/// `usable` state alongside [`promote_candidate`]'s fence; it changes
+/// no custody, references or budgets. After success the candidate is
+/// promotable but no longer mutable through the pending-candidate path.
+/// On CommitUnknown, retry this original handle: a fresh handle
+/// re-observes durable state.
 pub async fn confirm_retention(
     client: &mut Client,
     handle: &GenerationHandle,
@@ -1196,6 +1199,16 @@ pub async fn confirm_retention(
             .get::<_, Option<i64>>("retention_checked_at")
             .is_some()
     {
+        return Ok(MutationOutcome::Incomplete);
+    }
+    // Retention needs authenticated content on both backbones, not just
+    // presence: `load_checks` reads the current round's observations,
+    // validates each side's backbone and full-set count against custody,
+    // and only `Intact` on BOTH sides (post + verify, two distinct
+    // backbones by custody validation) qualifies. Presence-only
+    // candidates stay `verifying` — they are never usable for reuse.
+    let checks = content::load_checks(&tx, handle).await?;
+    if checks != [Some(ContentCheckState::Intact), Some(ContentCheckState::Intact)] {
         return Ok(MutationOutcome::Incomplete);
     }
     tx.execute(

@@ -266,7 +266,12 @@ pub trait StagingSink {
         window: u64,
         visit: &mut dyn FnMut(&[u8]) -> Result<(), SinkError>,
     ) -> Result<(), SinkError>;
-    fn finalize(self) -> Result<StagedDigest, SinkError>;
+    /// Commit the staged object and return its identity. Called exactly
+    /// once per successful stage, before [`FullFileOutcome::Staged`]:
+    /// a production sink completes its multipart upload and validates
+    /// the staged bytes here. The digest must match the verified layout
+    /// (byte length + SHA-256) or the stage fails.
+    fn finalize(&mut self) -> Result<StagedDigest, SinkError>;
 }
 
 /// Staging identity: the byte length plus the SHA-256 over the exact staged
@@ -882,29 +887,47 @@ where
 
     // Phase 4: judge, repair once, re-verify, stage.
     let parts = target.div_ceil(PART_BYTES) as u32;
-    let staged = |proof: StagingProof, sha256_hex: String, md5_hex: String| {
-        FullFileOutcome::Staged(StagedFile {
-            track_id: spec.track_id.to_string(),
-            file_index: spec.file_index,
-            byte_len: target,
-            sha256_hex,
-            md5_hex,
-            proof,
-            parts,
-        })
+    let staged = |sink: &mut Snk,
+                  proof: StagingProof,
+                  sha256_hex: String,
+                  md5_hex: String|
+     -> FullFileOutcome {
+        // The staged object is only committed once the sink finalizes it
+        // and its identity matches the verified layout. A failed finalize
+        // or a mismatched digest blocks the stage rather than reporting
+        // bytes that never durably landed.
+        match sink.finalize() {
+            Ok(digest) if digest.byte_len == target && digest.sha256_hex == sha256_hex => {
+                FullFileOutcome::Staged(StagedFile {
+                    track_id: spec.track_id.to_string(),
+                    file_index: spec.file_index,
+                    byte_len: target,
+                    sha256_hex,
+                    md5_hex,
+                    proof,
+                    parts,
+                })
+            }
+            _ => blocked(spec, BlockReason::SinkFailed, &recs, 0),
+        }
     };
     let Some(t) = &triage else {
         // No usable set: gap-free (gaps with no set blocked above… no —
         // gaps without a set reach here; re-check). A gapped file with no
         // triage cannot prove byte-identity.
         if gaps.is_empty() {
-            return staged(StagingProof::TransportComplete, sha256_hex, md5_hex);
+            return staged(
+                sink,
+                StagingProof::TransportComplete,
+                sha256_hex,
+                md5_hex,
+            );
         }
         return blocked(spec, BlockReason::Par2Unusable, &recs, 0);
     };
     if bad.is_empty() {
         if target == t.file_len && md5_hex == hex::encode(t.whole_md5) {
-            return staged(StagingProof::Par2Verified, sha256_hex, md5_hex);
+            return staged(sink, StagingProof::Par2Verified, sha256_hex, md5_hex);
         }
         if target != t.file_len {
             return blocked(spec, BlockReason::LengthMismatch, &recs, 0);
@@ -942,6 +965,7 @@ where
                         let (re_bad, re_md5sum, re_sha256, _) = re_walk.finish(target);
                         if re_bad.is_empty() && re_md5sum == t.whole_md5 {
                             return staged(
+                                sink,
                                 StagingProof::Par2Verified,
                                 hex::encode(re_sha256.finalize()),
                                 hex::encode(re_md5sum),
@@ -1234,6 +1258,8 @@ mod tests {
         layout: Option<Vec<u8>>,
         stream_windows: std::cell::Cell<u32>,
         last_window: std::cell::Cell<u64>,
+        finalize_calls: std::cell::Cell<u32>,
+        corrupt_digest: bool,
     }
 
     impl MemorySink {
@@ -1245,6 +1271,8 @@ mod tests {
                 layout: None,
                 stream_windows: std::cell::Cell::new(0),
                 last_window: std::cell::Cell::new(0),
+                finalize_calls: std::cell::Cell::new(0),
+                corrupt_digest: false,
             }
         }
 
@@ -1328,12 +1356,17 @@ mod tests {
             Ok(())
         }
 
-        fn finalize(self) -> Result<StagedDigest, SinkError> {
-            let layout = self.layout.ok_or(SinkError::Finalize)?;
-            Ok(StagedDigest {
+        fn finalize(&mut self) -> Result<StagedDigest, SinkError> {
+            self.finalize_calls.set(self.finalize_calls.get() + 1);
+            let layout = self.layout.clone().ok_or(SinkError::Finalize)?;
+            let mut digest = StagedDigest {
                 byte_len: layout.len() as u64,
                 sha256_hex: hex::encode(Sha256::digest(&layout)),
-            })
+            };
+            if self.corrupt_digest {
+                digest.sha256_hex = hex::encode([0xabu8; 32]);
+            }
+            Ok(digest)
         }
     }
 
@@ -1513,6 +1546,29 @@ mod tests {
             .tiers_used
             .values()
             .all(|t| t.as_slice() == [BackboneTier::Primary]));
+        assert_eq!(
+            sink.finalize_calls.get(),
+            1,
+            "the staged object is committed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_digest_mismatch_blocks_the_stage() {
+        // If the sink's committed identity does not match the verified
+        // layout, the file must not report as staged.
+        let data = fixture_bytes(4 * (64 << 10));
+        let (mut source, ids) = PostSource::new(&data, 64 << 10);
+        let mut sink = MemorySink::new();
+        sink.corrupt_digest = true;
+        let outcome = download_full_file(&spec(&ids, "content", None), &mut source, &mut sink).await;
+        match outcome {
+            FullFileOutcome::RepostBlocked(blocked) => {
+                assert_eq!(blocked.reason, BlockReason::SinkFailed);
+            }
+            other => panic!("expected RepostBlocked, got {other:?}"),
+        }
+        assert_eq!(sink.finalize_calls.get(), 1);
     }
 
     #[tokio::test]
@@ -1854,7 +1910,7 @@ mod tests {
             ) -> Result<(), SinkError> {
                 Err(SinkError::ReadStream)
             }
-            fn finalize(self) -> Result<StagedDigest, SinkError> {
+            fn finalize(&mut self) -> Result<StagedDigest, SinkError> {
                 Err(SinkError::Finalize)
             }
         }
