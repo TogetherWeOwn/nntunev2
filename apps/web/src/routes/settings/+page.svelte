@@ -38,9 +38,6 @@
 <svelte:head>
 	<title>Settings — NNTune</title>
 	<meta name="nntune:attributions:schema" content="1" />
-	{#if validationErrors.length === 0}
-		<script type="application/json" id="nntune-attribution-inventory">{@html attributionJson}</script>
-	{/if}
 </svelte:head>
 
 <main class="nt-wrap" id="main-content">
@@ -99,6 +96,10 @@
 			{/if}
 		{/if}
 	</section>
+
+	{#if validationErrors.length === 0}
+		<script type="application/json" id="nntune-attribution-inventory">{@html attributionJson}</script>
+	{/if}
 
 	{#snippet attributionEntry(entry: Attribution)}
 		<li data-attribution-id={entry.id} data-status={entry.status}>

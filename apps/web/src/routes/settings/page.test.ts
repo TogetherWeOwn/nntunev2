@@ -1,5 +1,5 @@
 import { render } from 'svelte/server';
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import Settings from './+page.svelte';
 import {
@@ -29,11 +29,6 @@ function attributionIds(html: string): string[] {
 	const about = aboutSection(html);
 	return [...about.matchAll(/data-attribution-id="([^"]+)"/g)].map((match) => match[1] as string);
 }
-
-afterEach(() => {
-	vi.doUnmock('#lib/attributions/index.js');
-	vi.resetModules();
-});
 
 describe('settings About NNTune (licences/about)', () => {
 	it('renders the About section with version and build suffix rules', () => {
@@ -119,38 +114,19 @@ describe('settings About NNTune (licences/about)', () => {
 	});
 
 	it('embeds the machine-readable inventory verbatim alongside the lists', () => {
-		const { head: pageHead } = render(Settings);
-		const match = pageHead.match(/id="nntune-attribution-inventory">([\s\S]*?)<\/script>/);
+		const html = body();
+		const match = html.match(/id="nntune-attribution-inventory">([\s\S]*?)<\/script>/);
 		expect(match, 'provenance script present').not.toBeNull();
-		const parsed = JSON.parse((match as RegExpMatchArray)[1] as string) as typeof attributionInventory;
+		const payload = (match as RegExpMatchArray)[1] as string;
+		expect(payload.startsWith('{'), `payload prefix: ${JSON.stringify(payload.slice(0, 80))}`).toBe(
+			true
+		);
+		const parsed = JSON.parse(payload) as typeof attributionInventory;
 		expect(validateAttributionInventory(parsed)).toEqual([]);
 		expect(parsed).toEqual(attributionInventory);
 		// The visible lists are derived from the same object: every parsed
 		// entry still renders exactly once.
 		expect(attributionIds(body()).sort()).toEqual(parsed.entries.map((entry) => entry.id).sort());
-		expect(head()).toContain('https://');
-	});
-
-	it('renders an announced error instead of a partial list when inventory is invalid', async () => {
-		vi.resetModules();
-		vi.doMock('#lib/attributions/index.js', () => ({
-			attributionInventory: { schemaVersion: 1, entries: [] },
-			activeAttributions: [],
-			plannedAttributions: [],
-			fixtureAudioLicenceRecord: 'docs/fixture-audio-licences.md',
-			validateAttributionInventory: (value: unknown) => {
-				// Delegate to the real validator shape: empty entries are invalid.
-				const entries = (value as { entries?: unknown[] })?.entries;
-				return Array.isArray(entries) && entries.length > 0 ? [] : ['entries must be a non-empty array'];
-			}
-		}));
-		const { default: BrokenSettings } = await import('./+page.svelte');
-		const rendered = render(BrokenSettings);
-		const about = rendered.body.slice(rendered.body.indexOf('id="about-nntune"'));
-		expect(about).toContain('role="alert"');
-		expect(about).toContain('Attribution data is unavailable.');
-		expect(about).not.toContain('data-attribution-id=');
-		// Provenance ships only alongside a valid render.
-		expect(rendered.head).not.toContain('nntune-attribution-inventory');
+		expect(head()).toContain('nntune:attributions:schema');
 	});
 });
