@@ -183,7 +183,20 @@ fn retrieved_same_recording_in_two_releases_both_survive_publication() {
     let rows = checkpoint.entries();
     assert_eq!((rows[0].release_group_ref, rows[0].duplicate_of), (1, None));
     assert_eq!((rows[1].release_group_ref, rows[1].duplicate_of), (2, None));
-    assert!(prepare_publication(&frozen, &checkpoint).is_ok());
+    let plan = prepare_publication(&frozen, &checkpoint).unwrap();
+    let survivors = plan.entries();
+    assert_eq!(
+        survivors.len(),
+        2,
+        "both release survivors must reach publication, not just classify"
+    );
+    for (index, entry) in survivors.iter().enumerate() {
+        assert_eq!(entry.audio_ordinal, index as u32 + 1);
+        assert_eq!(entry.kind, ClassKind::Verified);
+        assert_eq!((entry.medium_no, entry.track_no), (1, 1));
+    }
+    assert_eq!(survivors[0].release_group_ref, 1);
+    assert_eq!(survivors[1].release_group_ref, 2);
 }
 
 #[test]
