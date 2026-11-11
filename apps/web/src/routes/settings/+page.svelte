@@ -21,8 +21,13 @@
 	// Machine-readable provenance (present only alongside a valid render):
 	// the exact serialized inventory the lists below render from, embedded
 	// verbatim for consumers that parse the page. `<` is escaped so the
-	// payload can never close the script element early.
+	// payload can never close the script element early. The whole script
+	// element is built as one {@html} string because Svelte escapes text
+	// interpolations (including {@html}) inside <script> elements, which
+	// would HTML-escape the JSON quotes and break consumers.
 	const attributionJson = JSON.stringify(attributionInventory).replaceAll('<', '\\u003c');
+	const attributionScript =
+		`<script type="application/json" id="nntune-attribution-inventory">${attributionJson}<\/script>`;
 
 	// Link labels carry the entry name so repeated links stay distinguishable
 	// in link lists (WCAG 2.4.4); MIT/Open Font License are the official
@@ -98,7 +103,7 @@
 	</section>
 
 	{#if validationErrors.length === 0}
-		<script type="application/json" id="nntune-attribution-inventory">{@html attributionJson}</script>
+		{@html attributionScript}
 	{/if}
 
 	{#snippet attributionEntry(entry: Attribution)}

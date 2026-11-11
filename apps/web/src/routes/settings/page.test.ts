@@ -118,9 +118,12 @@ describe('settings About NNTune (licences/about)', () => {
 		const match = html.match(/id="nntune-attribution-inventory">([\s\S]*?)<\/script>/);
 		expect(match, 'provenance script present').not.toBeNull();
 		const payload = (match as RegExpMatchArray)[1] as string;
-		expect(payload.startsWith('{'), `payload prefix: ${JSON.stringify(payload.slice(0, 80))}`).toBe(
+		expect(payload.startsWith('{"'), `payload prefix: ${JSON.stringify(payload.slice(0, 80))}`).toBe(
 			true
 		);
+		// Verbatim means no HTML escaping: JSON quotes must not arrive as
+		// &quot; (Svelte escapes interpolations inside <script> elements).
+		expect(payload).not.toContain('&quot;');
 		const parsed = JSON.parse(payload) as typeof attributionInventory;
 		expect(validateAttributionInventory(parsed)).toEqual([]);
 		expect(parsed).toEqual(attributionInventory);
