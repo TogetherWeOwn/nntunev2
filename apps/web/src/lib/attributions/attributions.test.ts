@@ -91,7 +91,7 @@ describe('attribution inventory v1', () => {
 		expect(validateAttributionInventory(sparseEvidence)).toContain('entries[0].evidence must contain repository references');
 	});
 
-	it.each(['', 'not a URL', '/relative', 'http://example.org', 'javascript:alert(1)', 'https://', 'https://user:pass@example.org', ' https://example.org', 'https:example.org/license', 'https:/example.org/license', 'https:///example.org/license', 'https://\\example.org/license', 'https:////example.org/license', 'https://\\\\example.org/license'])(
+	it.each(['', 'not a URL', '/relative', 'http://example.org', 'javascript:alert(1)', 'https://', 'https://user:pass@example.org', ' https://example.org', 'https:example.org/license', 'https:/example.org/license', 'https:///example.org/license', 'https://\\example.org/license', 'https:////example.org/license', 'https://\\\\example.org/license', 'https://\t/example.org/license', 'https://\n/example.org/license', 'https://\r/example.org/license', 'https://examp\tle.org/license'])(
 		'rejects invalid provenance URL %s', (bad) => {
 			for (const field of ['sourceUrl', 'licenseUrl']) {
 				const value = clone();

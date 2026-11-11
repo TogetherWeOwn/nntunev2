@@ -32,6 +32,11 @@ function httpsUrl(value: unknown): boolean {
 	// special-URL parsing skips extra separators, so `https:///…` or
 	// `https://\…` would otherwise promote the first path segment to
 	// the hostname while the stored value still has no explicit authority.
+	// WHATWG parsing additionally strips ASCII tab/LF/CR anywhere in the
+	// input, so an embedded tab/newline would hide an empty authority
+	// from the lookahead while still parsing to the promoted hostname.
+	// Reject those characters anywhere in the stored string.
+	if (/[\t\n\r]/.test(value)) return false;
 	if (!/^https:\/\/(?![\/\\])/i.test(value)) return false;
 	try {
 		const url = new URL(value);
