@@ -1,0 +1,164 @@
+# Risk-tier map for tiered review.
+#
+# Classification: a PR's tier is the highest tier of any changed file;
+# sensitive wins on overlap; unmatched paths default to sensitive.
+# Content triggers escalate to sensitive regardless of path: new/changed
+# public endpoint or input parsing; auth/authz/session; crypto/keys;
+# secrets/credentials; permission checks; tenant isolation/personal data;
+# SQL/schema/migrations; dependency or lockfile changes; CI/workflow
+# changes; weakened test assertions, deleted tests/snapshots or lowered
+# gates in test files.
+# Review per tier: low -> QA; ordinary -> QA;
+# sensitive/unclassified -> Security -> QA.
+# QA verifies the author's risk_tier attestation and may escalate any PR.
+# This file itself is always sensitive.
+#
+# Sensitive floor (never downgraded): .github/workflows/**, this file,
+# CODEOWNERS; dependency manifests + lockfiles incl. dev deps and
+# install/build scripts; auth/session/crypto/secrets, public endpoints /
+# input parsing, tenant isolation, personal data, DB schema/migrations;
+# runtime/network/IAM config, infra and deploy/release paths;
+# AGENTS.md, .claude/**, skills/tool-permission files; every new top-level
+# path until classified (unmatched = sensitive).
+# Low: allowlisted docs copy, static non-sensitive fixtures, additive unit
+# tests (content triggers still apply; sensitive wins on overlap so tests
+# inside sensitive trees stay sensitive).
+# Ordinary: audited pure modules only, each justified in the PR body
+# (no untrusted input, sensitive output, permissions, persistence or
+# trust-boundary effect). When in doubt a path is left unlisted
+# (= sensitive). This map is deliberately small: do not broaden
+# low/ordinary to look productive.
+
+version: 1
+default_tier: sensitive # anything not matched below
+
+tiers:
+  low:
+    # Docs copy (security/ADR/ops docs are listed sensitive below and win).
+    - "docs/*.md"
+    - "docs/**/*.md"
+    # Root docs copy (governance docs listed sensitive below win).
+    - "README.md"
+    - "ROADMAP.md"
+    - "LICENSE"
+    # Static non-sensitive fixtures (grant vectors listed sensitive below win).
+    - "fixtures/subsonic/**"
+    - "fixtures/cc0/**"
+    # Static web assets (no executable code).
+    - "apps/web/static/*.svg"
+    - "apps/web/static/*.png"
+    - "apps/web/static/*.txt"
+    - "apps/web/static/fonts/**"
+    - "apps/web/static/icons/**"
+    # Additive unit tests (sensitive trees listed sensitive below win;
+    # weakened/deleted test content escalates via content triggers).
+    - "**/*.test.ts"
+    - "**/*.test.mjs"
+    - "**/test_*.py"
+    - "**/*.spec.ts"
+  ordinary:
+    # Pure numeric formatting: duration/byte display strings from numbers.
+    # No network, auth, persistence, or input-parsing of untrusted strings.
+    - "apps/web/src/lib/format.ts"
+    # Pure build-SHA validation: single-regex validator + baked value.
+    # No network, auth, persistence, or secret handling.
+    - "apps/web/src/lib/build.ts"
+  sensitive:
+    # Review policy and CI (this file is always sensitive).
+    - ".github/review-tiers.yml"
+    - ".github/workflows/**"
+    - ".github/scripts/**"
+    - ".github/pull_request_template.md"
+    - ".github/dependabot.yml"
+    - ".github/worker-toolchain.json"
+    - "**/CODEOWNERS"
+    # Governance, agent and tool-permission files.
+    - "AGENTS.md"
+    - "CONTRIBUTING.md"
+    - "REVIEW.md"
+    - "SECURITY.md"
+    - ".claude/**"
+    - "**/skills/**"
+    - "**/settings*.json"
+    # Dependency manifests, lockfiles (incl. dev deps) and install/build scripts.
+    - "**/Cargo.toml"
+    - "**/Cargo.lock"
+    - "**/package.json"
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    - "**/pnpm-workspace.yaml"
+    - "**/deny.toml"
+    - "release-please-config.json"
+    - ".gitleaks.toml"
+    - "**/Dockerfile"
+    - "**/Dockerfile.*"
+    - "**/*.sh"
+    - "**/Makefile"
+    # DB schema, migrations, tenant isolation, personal data.
+    - "migrations/**"
+    - "**/*.sql"
+    - "config/**"
+    # Runtime/network/IAM config, infra, deploy/release paths.
+    - "**/wrangler.toml"
+    - "**/wrangler.toml.*"
+    - "**/wrangler.*.toml"
+    - "ci/**"
+    - "bin/**"
+    - "scripts/**"
+    - "containers/**"
+    # Public endpoints, input parsing, auth/session/crypto/secrets.
+    - "workers/api/**"
+    - "workers/stream/**"
+    - "workers/ingest/**"
+    - "workers/youtube/**"
+    - "workers/mb/**"
+    - "workers/repair/**"
+    - "workers/transcode/**"
+    - "workers/observability/**"
+    - "crates/**"
+    - "apps/web/src/routes/**"
+    - "apps/web/src/hooks.server.ts"
+    - "apps/web/src/env.ts"
+    - "apps/web/src/app.html"
+    - "apps/web/src/lib/api/**"
+    - "apps/web/src/lib/billing/**"
+    - "apps/web/src/lib/security/**"
+    - "apps/web/src/lib/player/**"
+    - "apps/web/src/lib/library/**"
+    - "apps/web/src/lib/auth-transition.ts"
+    - "apps/web/src/lib/webauthn.ts"
+    - "apps/web/src/lib/signed-in-email.ts"
+    - "apps/web/src/lib/attributions/contract.ts"
+    - "apps/web/wrangler.toml"
+    - "apps/web/vite.config.ts"
+    - "apps/web/tsconfig.json"
+    - "apps/web/playwright.config.ts"
+    - "apps/web/tests/**"
+    - "e2e/**"
+    # Sensitive fixtures (grant vectors, credentials).
+    - "fixtures/play-grant/**"
+    - "fixtures/ingest-caller-grant/**"
+    # Sensitive docs (auth/billing/ops/security decisions, runbooks).
+    - "docs/security/**"
+    - "docs/adr/**"
+    - "docs/ops/**"
+    - "docs/database-restore-runbook.md"
+    - "docs/offsite-backup-runbook.md"
+    - "docs/runbook-observability.md"
+    - "docs/account-export-format.md"
+    - "docs/logging-standard.md"
+    - "docs/api-errors.md"
+    - "docs/api-delivery-map.md"
+    - "docs/original-source-contract.md"
+    - "docs/subsonic-client-smoke.md"
+    - "docs/youtube-backend-spike.md"
+    - "docs/m1-exit-traceability.md"
+    # Auth/session/crypto/secrets by name, anywhere (overlap wins).
+    - "**/*auth*"
+    - "**/*session*"
+    - "**/*crypto*"
+    - "**/*secret*"
+    - "**/*vault*"
+    - "**/*webauthn*"
+    - "**/*passkey*"
+    - "**/*credential*"
