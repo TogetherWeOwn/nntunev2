@@ -491,12 +491,22 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
-    for name in [
-        "session_by_id",
-        "revoke_all_sessions",
-        "revoke_all_native_credentials",
+    let credential_store: String = include_str!("../src/credential_session_store.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<String>()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for (source, name) in [
+        (store, "session_by_id"),
+        (
+            credential_store.as_str(),
+            "revoke_sessions_and_native_credentials",
+        ),
+        (credential_store.as_str(), "insert_native_credential"),
     ] {
-        let body = function_body(store, &format!("asyncfn{name}("));
+        let body = function_body(source, &format!("asyncfn{name}("));
         assert!(
             body.contains(".query_typed("),
             "{name} must run its statements unnamed via query_typed"

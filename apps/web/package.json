@@ -4,13 +4,13 @@
 	"version": "0.0.1",
 	"type": "module",
 	"scripts": {
-		"dev": "vite dev",
-		"build": "vite build",
+		"dev": "svelte-kit sync && vite dev",
+		"build": "svelte-kit sync && vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-		"test": "vitest run",
+		"test": "svelte-kit sync && vitest run",
 		"test:e2e": "playwright test",
 		"test:e2e:a11y": "playwright test tests/accessibility-axe.spec.ts"
 	},
@@ -21,11 +21,11 @@
 		"@sveltejs/kit": "^3.1.1",
 		"@sveltejs/vite-plugin-svelte": "^7.2.0",
 		"svelte": "^5.57.3",
-		"svelte-check": "^4.7.7",
+		"svelte-check": "^4.7.8",
 		"terser": "5.51.2",
 		"typescript": "^6.0.3",
-		"vite": "^8.3.5",
-		"vitest": "^5.0.5"
+		"vite": "^8.3.6",
+		"vitest": "^5.1.0"
 	},
 	"imports": {
 		"#lib": "./src/lib/index.js",
