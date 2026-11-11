@@ -24,12 +24,34 @@ function text(value: unknown): value is string {
 
 function httpsUrl(value: unknown): boolean {
 	if (!text(value) || value !== value.trim()) return false;
+	// Require an explicit `https://` authority in the stored string. A
+	// standalone `new URL` parse normalizes authority-less forms such as
+	// `https:example.org/...` to an HTTPS host, but a page using the
+	// original as an href would resolve them relative to its own URL.
+	// The negative lookahead also rejects an empty authority: WHATWG
+	// special-URL parsing skips extra separators, so `https:///…` or
+	// `https://\…` would otherwise promote the first path segment to
+	// the hostname while the stored value still has no explicit authority.
+	// WHATWG parsing additionally strips ASCII tab/LF/CR anywhere in the
+	// input, so an embedded tab/newline would hide an empty authority
+	// from the lookahead while still parsing to the promoted hostname.
+	// Reject those characters anywhere in the stored string.
+	if (/[\t\n\r]/.test(value)) return false;
+	if (!/^https:\/\/(?![\/\\])/i.test(value)) return false;
 	try {
 		const url = new URL(value);
 		return url.protocol === 'https:' && !!url.hostname && !url.username && !url.password;
 	} catch {
 		return false;
 	}
+}
+
+function textArray(value: unknown): boolean {
+	if (!Array.isArray(value) || value.length === 0) return false;
+	for (let i = 0; i < value.length; i += 1) {
+		if (!text(value[i])) return false;
+	}
+	return true;
 }
 
 /** Stable, ordered diagnostics; pure validation with no network or filesystem access. */
@@ -42,11 +64,14 @@ export function validateAttributionInventory(value: unknown): string[] {
 	}
 	const ids = new Set<string>();
 	const packages = new Set<string>();
-	value.entries.forEach((entry, index) => {
+	// Indexed loop (not forEach) so sparse holes are diagnosed instead of
+	// skipped: `new Array(1)` must fail, not pass with no diagnostics.
+	for (let index = 0; index < value.entries.length; index += 1) {
+		const entry = value.entries[index];
 		const path = `entries[${index}]`;
 		if (!object(entry)) {
 			errors.push(`${path} must be an object`);
-			return;
+			continue;
 		}
 		for (const field of ['id', 'name', 'license', 'notice', 'obligations']) {
 			if (!text(entry[field])) errors.push(`${path}.${field} is required`);
@@ -64,7 +89,7 @@ export function validateAttributionInventory(value: unknown): string[] {
 		for (const field of ['sourceUrl', 'licenseUrl']) {
 			if (!httpsUrl(entry[field])) errors.push(`${path}.${field} must be an HTTPS URL`);
 		}
-		if (!Array.isArray(entry.evidence) || !entry.evidence.length || !entry.evidence.every(text)) {
+		if (!textArray(entry.evidence)) {
 			errors.push(`${path}.evidence must contain repository references`);
 		}
 		if (entry.kind === 'package') {
@@ -79,6 +104,6 @@ export function validateAttributionInventory(value: unknown): string[] {
 		} else if (entry.package !== undefined) {
 			errors.push(`${path}.package is only valid for packages`);
 		}
-	});
+	}
 	return errors;
 }

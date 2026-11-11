@@ -57,6 +57,196 @@ NZB upload ───────────────────────
   `conflict` (nothing is enqueued then either; the failure stays readable
   via the job status).
 
+## Accepted audio manifest preparation
+
+`audio_manifest.rs` defines a private, versioned checkpoint contract for selected
+files, separate audio-only ordinals, independent artist/release grouping hints
+and hash-deduplicated staged-art descriptors. Source selectors refer to the
+retained job/hash-bound original NZB plus its file/member/audio selection, never
+an expiring URL. Structural acceptance does not verify file tags, MusicBrainz
+occurrences, image pixels or source provenance. The producer must establish those
+facts at their respective trust boundaries.
+
+`JobCheckpoint::freeze_audio_manifest` accepts the first selection only in
+`Matching`; retry and manual redrive preserve it and refuse a changed selection.
+Private storage checks its job/user binding, keeps manifest-bearing checkpoints
+without the legacy 30-day expiry, and omits the manifest from public job status
+and Debug output. Legacy checkpoints remain readable with no manifest and retain
+their existing TTL. Missing manifests must not be reconstructed from positional
+recording arrays for normalized writes.
+
+`audio_tags.rs` adds a bounded FLAC-prefix reader for untrusted Vorbis-comment
+hints and STREAMINFO duration. It accepts at most 8 MiB per call and 4096 comments,
+refuses incomplete/malformed metadata without partial hints, bounds retained text,
+and treats repeated fields as ambiguous. A malformed or repeated disc tag is
+preserved as `disc_no = 0`, so later grouping cannot confuse it with a wholly
+absent disc tag and silently supply disc 1. Comment text cannot assert a computed
+fingerprint. Picture blocks are skipped, not validated or staged. The caller's
+32 MiB whole-job prefix budget and selection binding are supplied by the
+unmounted `audio_selection.rs` component. It rechecks the original digest,
+uses the bounded parser's original file indexes, and assigns audio-only ordinals
+for direct FLAC selections; PAR2/NFO consume none. Other formats, archives and
+unknown roles refuse the whole plan instead of silently dropping possible audio.
+Its streaming extraction caps retained bytes at 8 MiB per file / 32 MiB per job,
+shrinks requests to the remaining budget, stops polling at the prefix cap, and
+retains budget-exhausted/malformed selections with empty hints. Transport errors
+and oversized/chunk-flooding adapters refuse the whole candidate.
+
+`audio_scratch.rs` supplies an unmounted direct-file runtime reader. It rechecks
+original digest, job/round and exact original-index/name-derived scratch keys,
+and requires healthy assembled records with valid hashes and bounded sizes.
+Missing/damaged inputs refuse the candidate; spooled files explicitly refuse
+until their reader is implemented. Each single ranged R2 GET binds its body to
+that same response's verification metadata, total size and exact prefix range;
+there is no HEAD/GET race or whole-object buffer. A caller-supplied total deadline
+covers headers and every body poll across all files, with deadline-first polling
+and no per-chunk rearm. Premature EOF, transport errors, range/metadata drift,
+oversize chunks and chunk floods refuse the whole candidate. The reader stops at
+the requested length and drops the cancelling body on success, refusal or timeout.
+The runtime adapter uses workers-rs ByteStream's cancel-on-drop stream; native
+fake-stream tests exercise drop behavior, not a deployed R2 cancellation claim.
+The 30-second deadline constant is available for the future runtime caller; no
+live caller constructs this reader or arms that timer yet. These helpers add no
+route, cache, manifest freeze or membership.
+
+`audio_producer.rs` composes this verified-scratch reader, bounded extraction and
+candidate grouping behind one input binding. It reuses manifest identity checks
+before any scratch I/O, preserves every selected file and effective disc, and
+returns no partial candidate on selection, transport or grouping refusal. The
+caller supplies one job-wide deadline, not a fresh deadline per file. This is an
+unmounted candidate producer, not first acceptance: its caller must still use the
+fenced database winner before copying to KV or performing mirror lookup. No
+production Matching call, timer, local occurrence plan, classification or art
+staging is enabled by this composition.
+
+`audio_acceptance.rs` adds read-first durable selection recovery. A confirmed SQL
+NULL on a present owner/job/digest-bound original alone permits lazy candidate
+production; a missing/fenced original, malformed winner or read error refuses.
+`audio_producer::accept_verified_manifest` composes that seam with verified scratch
+extraction. An existing winner returns without rereading payloads, progress or
+scratch; on a miss, atomic first acceptance may return a concurrent contender's
+winner, never our losing candidate. Both loaded and newly accepted winners are
+identity-checked before return. Legacy winners remain unchanged and unfrozen.
+The PostgreSQL adapter uses the existing bounded connector and query deadlines.
+This remains unmounted: it neither writes a checkpoint nor enables Matching,
+classification, publication or membership. Future consumers must use the returned
+winner before mirror lookup and KV persistence, and retain the write-time fence.
+
+`audio_grouping.rs` assembles a structurally validated manifest candidate only
+when extraction exactly covers that plan in order. Release-MBID hints take
+precedence over title candidates; text-only candidates partition by normalized
+album title, then album artist or common/two-thirds-dominant track artist.
+Guest suffixes are stripped only for dominance counting; conflicting artist keys
+use a job-local Various holder. Unknown albums keep separate releases. Artist
+and release references independently name their first selected-audio ordinal;
+disc tags never split a release, and original hints/entries are preserved.
+Candidate construction freezes an ordinal-indexed `effective_discs` vector before
+any dedup: a release with no disc tags uses disc 1; once any member has a disc tag,
+only each entry's own positive disc survives. Absent, malformed and nonpositive
+values then stay missing. This never supplies a track number or mirror position.
+Private parsing checks the complete vector against the frozen groups and hints;
+round trips/redrive retain it. Legacy v1 manifests without the vector stay
+readable but return no frozen discs: future position/dedup consumers must refuse
+them, not regenerate a durable winner or assume disc 1. No stored winner is
+upgraded in place.
+This implementation explicitly refuses non-ASCII grouping text rather than
+pretending Unicode lowercasing is case-folding. No runtime producer invokes this
+candidate seam.
+
+`audio_positions.rs` prepares an all-local occurrence plan from a manifest with
+frozen effective discs. Within each release it collapses equal positive pairs
+only when local identity also agrees: nonempty normalized title plus duration
+within 2 seconds or 1% (symmetric, using the larger duration), equal nonempty
+fingerprints, or equal claimed recording MBIDs. Only surviving lower ordinals
+can win; tolerance chains through discarded copies cannot bridge identities.
+Any missing or contradictory surviving pair sends the entire release to
+`(1, audio_ordinal)`. Otherwise claimed pairs survive. Every file remains in the
+plan, and losers directly reference the lowest agreeing survivor and its final
+position; the original manifest and selectors are untouched. Unfrozen legacy
+discs and non-ASCII titles refuse. A job-wide 100,000 identity-comparison cap
+refuses the whole plan rather than returning a partial result on adversarial
+same-pair input. This is local-only preparation, not a mirror classifier or
+persisted result, and must not be mixed with verified matches.
+
+`audio_classifications.rs` prepares a durable classification checkpoint for one
+accepted manifest, unmounted. Every entry is classified exactly once as
+all-local or verified mirror occurrence. A verified entry carries the recording
+and release MBIDs plus the hex SHA-256 digest of the exact mirror snapshot the
+occurrence was derived from, and its medium/track positions come only from that
+evidence; an all-local entry's positions come only from `audio_positions.rs` for
+its release group. Validated evidence must agree with any release-MBID hint in
+the manifest, and verified entries never share one release group with all-local
+entries — mixing refuses the whole checkpoint. Verified duplicates collapse on
+equal recording MBID (case-insensitive) and medium/track, with losers referencing
+the surviving lower ordinal directly. Legacy unfrozen manifests refuse; no
+winner is upgraded in place. This is preparation only: no caller stores the
+checkpoint, mints mirror evidence or enables publication. Migration 0040 adds
+a bounded immutable classification field to retained originals, and
+`audio_classifications_store` provides the same single owner/deletion-fenced
+first-acceptance update as the manifest store (first winner wins on
+concurrent deliveries) plus a digest-bound read. Both remain unmounted.
+
+`audio_classifications_acceptance.rs` composes them behind one seam, mirroring
+`audio_acceptance.rs`: a confirmed persisted checkpoint is returned without
+retrieving mirror evidence; only a confirmed miss invokes the lazy evidence
+producer, classifies from the accepted manifest, and freezes through the
+store. A fenced/missing original or read error refuses before the producer
+runs, a concurrent first classification returns the database winner rather
+than our losing candidate, and the accepted manifest and returned winner are
+both identity-checked against the job/owner/original digest before return.
+The PostgreSQL adapter uses the existing bounded connector. This remains
+unmounted: the future publication consumer must use the returned winner
+before mirror-snapshot or KV publication, and classification grants no
+membership, catalogue or playback authority.
+
+`audio_mirror_evidence.rs` retrieves mirror evidence for that
+classification seam, unmounted. For each accepted entry carrying both a
+recording-MBID and a release-MBID hint, it binds the hinted recording to
+one exact mirror snapshot — the release-recordings projection of the
+hinted release, identified by its canonical SHA-256 digest
+(`mirror_snapshot_digest`). Only a digest-verified snapshot that actually
+contains the hinted recording yields evidence, carrying the snapshot's own
+medium/track positions and digest; an unhinted entry, a missing snapshot,
+or a recording absent from the snapshot is all-local. An invalid snapshot
+(malformed MBID, non-positive position, conflicting duplicate recording,
+digest mismatch, release mismatch) refuses the whole derivation rather
+than guessing. Hinted MBIDs are claims, never proof: presence in the
+digest-bound snapshot is the evidence. No transport, KV publication or
+membership authority is enabled; the future publisher must pass snapshots
+from trusted mirror reads through this seam before classification.
+Full Unicode normalization, image validation/staging, resolved artist/release
+coalescing and durable position/classification freezing remain integration
+gates.
+
+`audio_publication.rs` plans publication from the two durable winners,
+unmounted. It joins the accepted manifest with the classification checkpoint
+only when both are bound to the same job/owner/original digest, and emits
+only the surviving entries (losing duplicates write nothing) in audio-ordinal
+order, each carrying its fixed source selector, job-local hints and
+classified medium/track positions. Any identity, count/ordinal/group
+mismatch, invalid duplicate linkage, conflicting survivor position or legacy
+unfrozen geometry refuses the whole plan with no partial output. Hinted MBIDs
+ride along as claims alongside the checkpoint positions; this seam never
+invents a recording/release identity from a hint. No SQL, KV, membership,
+catalogue or playback authority is enabled; the future normalized publisher
+must consume this plan from the database winners before any SQL or KV
+publication, and KV is never acceptance authority.
+
+This is unmounted preparation: no production caller freezes a manifest yet.
+The checkpoint guard is local; KV has no compare-and-swap. Migration 0039 adds a
+bounded immutable manifest field to retained originals. `audio_manifest_store`
+provides a single owner/deletion-fenced PostgreSQL update that serializes on the
+original row and returns the first stored winner, even when a later delivery
+proposes different tags. It checks both job and original digests, validates the
+winner again, bounds its database wait and never falls back to the candidate on
+failure. Legacy originals stay NULL. Integration must consume this winner before
+mirror lookup and KV persistence; the in-memory guard alone is insufficient.
+Tag/fingerprint extraction, the specified grouping/dedup algorithm, persisted
+classifications and trusted mirror snapshots, original-selector resolution,
+normalized SQL publication, retention cleanup and lifetime source sealing remain
+integration work. No membership, cover-art byte acquisition or caching is added.
+AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails apply.
+
 ## Security rules
 
 - `indexer_ref` is an opaque vault handle. Raw indexer/provider keys are
@@ -73,7 +263,7 @@ NZB upload ───────────────────────
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-48`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:40`). No ingest route
+  `src/lib.rs:54`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -87,7 +277,7 @@ NZB upload ───────────────────────
 model** for the admin-ingest path, not delivered outbound fetching: when
 a live transport lands, only the admin-gated ingest path may call it,
 with operator-configured URLs. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:40`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:54`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:502-654`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:399`) or
@@ -200,7 +390,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:47`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:61`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

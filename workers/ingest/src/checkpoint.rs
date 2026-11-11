@@ -70,6 +70,7 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         // cursor starts at the first input.
         transcode_inputs: Vec::new(),
         transcode_next: 0,
+        accepted_audio_manifest_v1: None,
     }
 }
 
@@ -161,25 +162,54 @@ pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
     let key =
         checkpoint_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
     let store = env.kv(STATE_KV_BINDING)?;
-    store
+    let loaded = store
         .get(&key)
         .json::<JobCheckpoint>()
         .await
-        .map_err(|e| worker::Error::RustError(e.to_string()))
+        .map_err(|_| worker::Error::RustError("checkpoint unavailable".into()))?;
+    if let Some(cp) = &loaded {
+        if cp.job_id != job_id || cp.validate_audio_manifest().is_err() {
+            return Err(worker::Error::RustError(
+                "checkpoint identity mismatch".into(),
+            ));
+        }
+    }
+    Ok(loaded)
 }
 
 pub async fn put(env: &Env, checkpoint: &JobCheckpoint) -> Result<()> {
     let key = checkpoint_key(&checkpoint.job_id)
         .ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    put_json(env, key, &serde_json::to_string(checkpoint)?).await
+    checkpoint
+        .validate_audio_manifest()
+        .map_err(|_| worker::Error::RustError("checkpoint identity mismatch".into()))?;
+    put_json(
+        env,
+        key,
+        &serde_json::to_string(checkpoint)?,
+        retention_ttl_secs(checkpoint),
+    )
+    .await
+}
+
+/// A frozen selection must survive job replay; expiring it would permit
+/// regeneration from changed tags. Legacy/verify checkpoints keep their TTL.
+/// Explicit retention cleanup belongs to the future catalogue lifecycle.
+pub fn retention_ttl_secs(checkpoint: &JobCheckpoint) -> Option<u64> {
+    checkpoint
+        .audio_manifest()
+        .is_none()
+        .then_some(CHECKPOINT_TTL_SECS)
 }
 
 /// The one KV write helper behind every key this module stores.
-async fn put_json(env: &Env, key: String, json: &str) -> Result<()> {
+async fn put_json(env: &Env, key: String, json: &str, ttl: Option<u64>) -> Result<()> {
     let store = env.kv(STATE_KV_BINDING)?;
-    store
-        .put(&key, json.to_string())?
-        .expiration_ttl(CHECKPOINT_TTL_SECS)
+    let mut write = store.put(&key, json.to_string())?;
+    if let Some(ttl) = ttl {
+        write = write.expiration_ttl(ttl);
+    }
+    write
         .execute()
         .await
         .map_err(|e| worker::Error::RustError(e.to_string()))
@@ -207,7 +237,13 @@ pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress
 pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> Result<()> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    put_json(env, key, &serde_json::to_string(progress)?).await
+    put_json(
+        env,
+        key,
+        &serde_json::to_string(progress)?,
+        Some(CHECKPOINT_TTL_SECS),
+    )
+    .await
 }
 
 fn two_spool_key(job_id: &str) -> Option<String> {

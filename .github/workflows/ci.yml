@@ -645,7 +645,14 @@ jobs:
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
+          inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests -- --list)"
+          printf '%s\n' "$inventory"
+          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 10
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test subsonic_deadlock_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test ingest_manifest_postgres
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test ingest_classifications_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
