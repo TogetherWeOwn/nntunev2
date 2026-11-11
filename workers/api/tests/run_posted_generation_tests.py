@@ -54,6 +54,7 @@ EXPECTED = {
     "posted_generation_completion::postgres_completion_promotion_race_commits_exactly_once",
     "posted_generation_completion::postgres_completion_concurrent_replacement_admissions_commit_once",
     "posted_generation_completion::postgres_completion_migration_0054_replay_preserves_multi_generation_custody",
+    "posted_generation_completion::postgres_completion_presence_only_candidate_is_not_retained",
     "posted_generation_registry_admission::postgres_admission_registered_history_uses_registry_without_scalar_physical_lookup",
     "posted_generation_registry_admission::postgres_admission_unregistered_history_is_inconsistent_not_an_arbitrary_winner",
     "posted_generation_registry_admission::postgres_admission_pending_history_replays_only_the_exact_stored_candidate",
