@@ -1413,7 +1413,8 @@ pub async fn promote_candidate(
     )
     .await
     .map_err(database_error)?;
-    // A predecessor serving reference becomes rollback; legacy pins stay.
+    // A predecessor serving incarnation is retired for a fresh-token
+    // rollback incarnation; legacy pins stay.
     // References are immutable in place, so the transition is a new
     // incarnation: delete the serving row and insert a rollback row with
     // the same owner/generation/custody and a fresh token. A delayed reader
