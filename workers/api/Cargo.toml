@@ -28,6 +28,8 @@ serde_json = "1"
 # The api Worker's HTTP entry (fetch boundary) lands in a follow-up slice;
 # this exposes the emitter the entry will use.
 nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
+# Transport-free protocol types and token checksum, also exercised natively.
+nntune-subsonic = { version = "0.1.0", path = "../../crates/nntune-subsonic" }
 # Shared SSRF address guard + test vectors (single owner with the ingest
 # fetch guards; never fork the predicate).
 nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
@@ -57,7 +59,6 @@ futures-timer = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-util = "0.3"
-nntune-subsonic = { version = "0.1.0", path = "../../crates/nntune-subsonic" }
 worker = "0.8"
 
 [features]
@@ -73,6 +74,18 @@ required-features = ["postgres-tests"]
 
 [[test]]
 name = "credential_session_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
+name = "subsonic_deadlock_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
+name = "ingest_manifest_postgres"
+required-features = ["postgres-tests"]
+
+[[test]]
+name = "ingest_classifications_postgres"
 required-features = ["postgres-tests"]
 
 [dev-dependencies]

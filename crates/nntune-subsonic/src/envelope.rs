@@ -23,6 +23,7 @@ pub mod code {
     pub const GENERIC: i64 = 0;
     pub const REQUIRED_PARAM_MISSING: i64 = 10;
     pub const WRONG_CREDENTIALS: i64 = 40;
+    pub const UNSUPPORTED_AUTH: i64 = 42;
     pub const CONFLICTING_AUTH: i64 = 43;
     pub const INVALID_API_KEY: i64 = 44;
     pub const NOT_AUTHORIZED: i64 = 50;

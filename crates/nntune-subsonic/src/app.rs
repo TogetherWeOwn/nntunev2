@@ -39,12 +39,25 @@ impl HttpResponse {
 
 pub struct SubsonicApp<S> {
     store: RefCell<S>,
+    production: bool,
 }
 
 impl<S: Library> SubsonicApp<S> {
+    /// Legacy protocol behaviour for the golden fixtures, not a production mount.
     pub fn new(store: S) -> SubsonicApp<S> {
         SubsonicApp {
             store: RefCell::new(store),
+            production: false,
+        }
+    }
+
+    /// Launch policy (ADR 0006): no password auth or offline downloads.
+    /// Production audio must be dispatched by the async worker adapter through
+    /// the shared playback gate, never through the fixture `Library::audio` seam.
+    pub fn production(store: S) -> SubsonicApp<S> {
+        SubsonicApp {
+            store: RefCell::new(store),
+            production: true,
         }
     }
 
@@ -80,11 +93,22 @@ impl<S: Library> SubsonicApp<S> {
                 let mut store = self.store.borrow_mut();
                 Self::render_endpoint(
                     &params,
-                    handle_endpoint(&mut *store, &identity, name, &params),
+                    handle_endpoint(&mut *store, &identity, name, &params, !self.production),
                 )
             }
             Route::Endpoint(name) => {
                 let params = Params::parse(&merged);
+                // Presence, not the winning value: an empty or duplicate p=
+                // must not be rescued by valid credentials in another field.
+                if self.production && !params.get_all("p").is_empty() {
+                    return Self::render(
+                        &params,
+                        &error_document(
+                            crate::envelope::code::UNSUPPORTED_AUTH,
+                            "Provided authentication mechanism not supported.",
+                        ),
+                    );
+                }
                 let get = |key: &str| params.get(key).map(|s| s.to_string());
                 let creds = Credentials::from_params(get);
                 let mut store = self.store.borrow_mut();
@@ -96,7 +120,7 @@ impl<S: Library> SubsonicApp<S> {
                 };
                 Self::render_endpoint(
                     &params,
-                    handle_endpoint(&mut *store, &identity, name, &params),
+                    handle_endpoint(&mut *store, &identity, name, &params, !self.production),
                 )
             }
         }
@@ -198,6 +222,106 @@ mod tests {
         assert!(String::from_utf8(res.body)
             .unwrap()
             .contains("status=\"ok\""));
+    }
+
+    #[test]
+    fn production_refuses_password_presence_in_query_or_form() {
+        let app = SubsonicApp::production(MemStore::seeded());
+        for password in [
+            "p=test-pass",
+            "p=enc:746573742d70617373",
+            "p=",
+            "p=&p=test-pass",
+            "%70=test-pass",
+        ] {
+            for method in ["GET", "POST"] {
+                for in_body in [false, true] {
+                    if in_body && method == "GET" {
+                        continue;
+                    }
+                    let query = if in_body {
+                        "apiKey=test-key-1&f=json".to_string()
+                    } else {
+                        format!("apiKey=test-key-1&f=json&{password}")
+                    };
+                    let body = if in_body { password } else { "" };
+                    let res = app.handle(method, "/rest/ping.view", &query, body);
+                    assert_eq!(res.status, 200);
+                    let text = String::from_utf8(res.body).unwrap();
+                    assert!(text.contains("\"code\":42"), "{method}: {text}");
+                    assert!(!text.contains("test-pass"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_keeps_key_token_and_conflict_semantics() {
+        let app = SubsonicApp::production(MemStore::seeded());
+        let salted = crate::auth::md5_hex(b"test-passabc");
+        for query in [
+            "apiKey=test-key-1".to_string(),
+            format!("u=test&t={salted}&s=abc"),
+        ] {
+            let res = get(&app, "/rest/ping", &query);
+            assert!(String::from_utf8(res.body)
+                .unwrap()
+                .contains("status=\"ok\""));
+        }
+        for (query, code) in [
+            ("apiKey=wrong", 44),
+            ("apiKey=test-key-1&u=test", 43),
+            ("u=test&t=token", 10),
+            ("u=test&t=wrong&s=abc", 40),
+        ] {
+            let res = get(&app, "/rest/ping", query);
+            assert!(String::from_utf8(res.body)
+                .unwrap()
+                .contains(&format!("code=\"{code}\"")));
+        }
+    }
+
+    #[test]
+    fn production_never_serves_fixture_audio_or_offers_downloads() {
+        let app = SubsonicApp::production(MemStore::seeded());
+        for (endpoint, code) in [("download", 0), ("stream", 70)] {
+            for method in ["GET", "POST"] {
+                let res = app.handle(
+                    method,
+                    &format!("/rest/{endpoint}.view"),
+                    "apiKey=test-key-1&f=json&id=so-1&format=mp3&maxBitRate=128",
+                    "",
+                );
+                assert_eq!(res.status, 200);
+                assert_eq!(res.content_type, JSON_CONTENT_TYPE);
+                assert!(String::from_utf8(res.body)
+                    .unwrap()
+                    .contains(&format!("\"code\":{code}")));
+            }
+        }
+        let res = get(
+            &app,
+            "/rest/getUser",
+            "apiKey=test-key-1&username=test&f=json",
+        );
+        assert!(String::from_utf8(res.body)
+            .unwrap()
+            .contains("\"downloadRole\":false"));
+        // The legacy fixture contract remains available only outside launch mode.
+        let legacy = SubsonicApp::new(MemStore::seeded());
+        let res = get(&legacy, "/rest/download", "apiKey=test-key-1&id=so-1");
+        assert_eq!(res.body, crate::library::DEMO_AUDIO);
+    }
+
+    #[test]
+    fn production_empty_mount_never_accepts_fixture_credentials() {
+        let app = SubsonicApp::production(MemStore::empty());
+        let res = get(&app, "/rest/ping", "apiKey=test-key-1&f=json");
+        assert!(String::from_utf8(res.body).unwrap().contains("\"code\":44"));
+        let res = get(&app, "/rest/getOpenSubsonicExtensions", "f=json");
+        assert!(String::from_utf8(res.body)
+            .unwrap()
+            .contains("\"status\":\"ok\""));
     }
 
     #[test]
