@@ -259,6 +259,12 @@ async fn mirror_client() -> Client {
         .expect("CI disposable database is required; never silently skip")
         .parse()
         .unwrap();
+    assert_eq!(config.get_dbname(), Some("nntune_ci"));
+    assert!(config.get_hostaddrs().is_empty(), "no address overrides");
+    assert!(
+        matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+    );
     let (client, connection) = config.connect(NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     client
