@@ -951,10 +951,11 @@ pub trait Store {
             Err(StoreError)
         }
     }
-    /// Derivation metadata for one (user, track) pair
-    /// (app and mirror metadata statements in `meter_sink`); unknown or
-    /// non-UUID tracks resolve to the all-`None` meta (the fallback
-    /// rung), never an error — only a store failure errors. Default
+    /// Derivation metadata for one user and local track ID or recording MBID
+    /// (app and mirror metadata statements in `meter_sink`). Exact local IDs
+    /// take precedence; ambiguous recording matches suppress artifact fields.
+    /// A recording without an artifact can still resolve in the mirror. Unknown
+    /// or non-UUID IDs resolve to all-`None`; store failures still error. Default
     /// `Err` fails closed like [`Store::live_subscription`] (the sink
     /// answers 500 and the DO retries; nothing meters on a guess).
     fn track_meter_meta(
