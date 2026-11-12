@@ -125,6 +125,87 @@ def validate_entries(entries):
     return entries
 
 
+def bounded_metadata_json(value):
+    """Bound canonical JSON before serializing any complete metadata object."""
+    size = 0
+    active = set()
+
+    def add(amount):
+        nonlocal size
+        size += amount
+        if size > MAX_INPUT:
+            raise HistoryError("import metadata bound exceeded")
+
+    def visit(item, depth):
+        if depth > 100:
+            raise HistoryError("import metadata nesting bound exceeded")
+        if isinstance(item, str):
+            # A JSON string needs at least one byte per character. Encode only
+            # small chunks so an oversized value cannot cause a large copy.
+            add(len(item) + 2)
+            for start in range(0, len(item), 4096):
+                chunk = item[start:start + 4096]
+                if any(0xD800 <= ord(char) <= 0xDFFF for char in chunk):
+                    raise HistoryError("import metadata contains non-scalar Unicode")
+                add(len(json.dumps(chunk, ensure_ascii=True)) - 2 - len(chunk))
+        elif isinstance(item, (dict, list)):
+            identity = id(item)
+            if identity in active:
+                raise HistoryError("import metadata contains a cycle")
+            active.add(identity)
+            add(2 + max(0, len(item) - 1))
+            if isinstance(item, dict):
+                add(len(item))  # colons
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise HistoryError("import metadata keys must be strings")
+                    visit(key, depth + 1)
+                    visit(child, depth + 1)
+            else:
+                for child in item:
+                    visit(child, depth + 1)
+            active.remove(identity)
+        else:
+            if type(item) not in (int, float, bool, type(None)):
+                raise HistoryError("import metadata is not canonical JSON")
+            if type(item) is int and item.bit_length() > MAX_INPUT * 3:
+                raise HistoryError("import metadata bound exceeded")
+            add(len(json.dumps(item, allow_nan=False)))
+
+    try:
+        visit(value, 0)
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        if isinstance(exc, HistoryError):
+            raise
+        raise HistoryError("import metadata is not canonical JSON") from exc
+
+
+def validate_fresh_import(source, candidate, baseline, sql_bytes):
+    """Compare one candidate with a separately verified source entry.
+
+    This dormant helper does not establish source authority or verify Git history;
+    callers must do both independently before treating a match as evidence.
+    """
+    source_json = bounded_metadata_json(source)
+    candidate_json = bounded_metadata_json(candidate)
+    validate_entries([source])
+    if not isinstance(baseline, list):
+        raise HistoryError("baseline must be a list of entries")
+    if len(baseline) >= MAX_FILES:
+        raise HistoryError("migration entry bound exceeded")
+    # Bound aggregate baseline data, including aliases, before copying or
+    # handing it to the shared validators which traverse those lists.
+    bounded_metadata_json(baseline)
+    validate_entries(baseline + [candidate])
+    if source_json != candidate_json:
+        raise HistoryError("import metadata differs from source")
+    if not isinstance(sql_bytes, bytes) or len(sql_bytes) > MAX_BLOB:
+        raise HistoryError("import SQL blob is invalid or oversized")
+    if hashlib.sha256(sql_bytes).hexdigest() != source["sha256"]:
+        raise HistoryError("import SQL hash differs from source")
+
+
 def read_input(path):
     try:
         with pathlib.Path(path).open("rb") as stream:

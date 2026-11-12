@@ -925,6 +925,138 @@ class WorkflowBoundary(unittest.TestCase):
         self.assertIn("  pull-requests: read", workflow)
 
 
+class FreshImportInputs(unittest.TestCase):
+    def setUp(self):
+        self.source = {
+            "file": "0042_final.sql", "target": "app",
+            "sha256": hashlib.sha256(BODY).hexdigest(),
+            "renamed_from": [{"file": "0041_old.sql", "sha256": hashlib.sha256(BODY).hexdigest()}],
+            "source_rename_history": [{
+                "parent": "1" * 40, "commit": "2" * 40,
+                "old_path": "migrations/0041_old.sql", "new_path": "migrations/0042_final.sql",
+                "old_sha256": hashlib.sha256(BODY).hexdigest(),
+                "new_sha256": hashlib.sha256(BODY).hexdigest(),
+            }],
+        }
+
+    def check(self, candidate, baseline=None, sql=BODY):
+        history.validate_fresh_import(self.source, candidate, baseline or [], sql)
+
+    def test_exact_entry_and_bytes_match(self):
+        self.check(copy.deepcopy(self.source))
+
+    def test_changed_or_missing_metadata_fails(self):
+        for key, value in (("file", "0043_other.sql"), ("target", "mirror"),
+                           ("sha256", "0" * 64), ("renamed_from", []),
+                           ("source_rename_history", []), ("extra", True)):
+            with self.subTest(key=key), self.assertRaises(history.HistoryError):
+                candidate = copy.deepcopy(self.source)
+                candidate[key] = value
+                self.check(candidate)
+
+    def test_baseline_current_alias_and_history_collisions_fail(self):
+        for name in ("0042_final.sql", "0041_old.sql"):
+            with self.subTest(name=name), self.assertRaises(history.HistoryError):
+                self.check(copy.deepcopy(self.source), [{
+                    "file": name, "target": "app", "sha256": "0" * 64,
+                }])
+        baseline = [{"file": "0040_other.sql", "target": "app", "sha256": "0" * 64,
+                     "renamed_from": [{"file": "0042_final.sql", "sha256": "0" * 64}]}]
+        with self.assertRaises(history.HistoryError):
+            self.check(copy.deepcopy(self.source), baseline)
+
+    def test_baseline_bounds_precede_copy_and_alias_traversal(self):
+        class NoCopy(list):
+            def __add__(self, other):
+                raise AssertionError("oversized baseline was copied")
+
+        with mock.patch.object(history, "MAX_FILES", 2):
+            with self.assertRaisesRegex(history.HistoryError, "entry bound"):
+                self.check(copy.deepcopy(self.source), NoCopy([{}, {}]))
+
+        class NoIteration(list):
+            def __iter__(self):
+                raise AssertionError("oversized aliases were traversed")
+
+        baseline = [{"file": "0040_other.sql", "target": "app", "sha256": "0" * 64,
+                     "renamed_from": NoIteration([None] * 1024)}]
+        with mock.patch.object(history, "MAX_INPUT", 1024):
+            with self.assertRaisesRegex(history.HistoryError, "metadata bound"):
+                self.check(copy.deepcopy(self.source), baseline)
+
+        baseline[0]["renamed_from"] = [{"file": "0039_old.sql", "sha256": "0" * 64}]
+        self.check(copy.deepcopy(self.source), baseline)
+        baseline[0]["renamed_from"][0]["file"] = self.source["file"]
+        with self.assertRaises(history.HistoryError):
+            self.check(copy.deepcopy(self.source), baseline)
+
+    def test_unicode_metadata_requires_scalar_values_and_keys(self):
+        source = copy.deepcopy(self.source)
+        source["extra"] = {"\U0001f600": "\U0001f600"}
+        history.validate_fresh_import(source, copy.deepcopy(source), [], BODY)
+        for invalid in (chr(0xD83D) + chr(0xDE00), chr(0xD83D), chr(0xDE00)):
+            for as_key in (False, True):
+                candidate = copy.deepcopy(source)
+                candidate["extra"] = {invalid: "ok"} if as_key else {"value": invalid}
+                with self.subTest(invalid=ascii(invalid), as_key=as_key):
+                    with self.assertRaisesRegex(history.HistoryError, "non-scalar Unicode"):
+                        history.validate_fresh_import(source, candidate, [], BODY)
+
+    def test_bad_sql_and_oversized_metadata_fail(self):
+        for blob in (b"different", bytearray(BODY), b"x" * (history.MAX_BLOB + 1)):
+            with self.subTest(size=len(blob)), self.assertRaises(history.HistoryError):
+                self.check(copy.deepcopy(self.source), sql=blob)
+        source = copy.deepcopy(self.source)
+        source["extra"] = "x" * (history.MAX_INPUT + 1)
+        with self.assertRaises(history.HistoryError):
+            history.validate_fresh_import(source, copy.deepcopy(source), [], BODY)
+
+    def test_metadata_limit_precedes_full_serialization(self):
+        candidate = copy.deepcopy(self.source)
+        candidate["extra"] = "x" * 2000
+        dumps = json.dumps
+        serialized = []
+
+        def record(value, *args, **kwargs):
+            serialized.append(value)
+            return dumps(value, *args, **kwargs)
+
+        with mock.patch.object(history, "MAX_INPUT", 1024), mock.patch.object(
+                history.json, "dumps", side_effect=record):
+            with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                self.check(candidate)
+        self.assertFalse(any(value is candidate for value in serialized))
+        self.assertFalse(any(value is candidate["extra"] for value in serialized))
+
+    def test_near_limit_metadata_match_and_mismatch(self):
+        source = copy.deepcopy(self.source)
+        source["extra"] = ""
+        base_size = len(json.dumps(source, sort_keys=True, separators=(",", ":")))
+        source["extra"] = "x" * (1024 - base_size)
+        candidate = copy.deepcopy(source)
+        with mock.patch.object(history, "MAX_INPUT", 1024):
+            history.validate_fresh_import(source, candidate, [], BODY)
+            candidate["extra"] = "y" + candidate["extra"][1:]
+            with self.assertRaisesRegex(history.HistoryError, "differs"):
+                history.validate_fresh_import(source, candidate, [], BODY)
+            candidate["extra"] += "x"
+            with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                history.validate_fresh_import(source, candidate, [], BODY)
+
+    def test_nested_aggregate_and_escaped_metadata_bounds(self):
+        for extra in (["x" * 300] * 4, "\\n" * 300):
+            candidate = copy.deepcopy(self.source)
+            candidate["extra"] = extra
+            with self.subTest(extra=type(extra)), mock.patch.object(history, "MAX_INPUT", 1024):
+                with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                    self.check(candidate)
+        candidate = copy.deepcopy(self.source)
+        candidate["extra"] = []
+        candidate["extra"].append(candidate["extra"])
+        with self.assertRaisesRegex(history.HistoryError, "cycle"):
+            self.check(candidate)
+
+
 class StrictInputs(unittest.TestCase):
     def test_history_schema_and_target_confusion(self):
         edge = dict(zip(history.EDGE_KEYS, ("a" * 40, "b" * 40, "migrations/0001_old.sql",
