@@ -952,7 +952,7 @@ pub trait Store {
         }
     }
     /// Derivation metadata for one (user, track) pair
-    /// (`meter_sink::track_meter_meta_statement`); unknown or
+    /// (app and mirror metadata statements in `meter_sink`); unknown or
     /// non-UUID tracks resolve to the all-`None` meta (the fallback
     /// rung), never an error — only a store failure errors. Default
     /// `Err` fails closed like [`Store::live_subscription`] (the sink

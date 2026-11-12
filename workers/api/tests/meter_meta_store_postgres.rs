@@ -1,8 +1,15 @@
-//! CI schema-only harness for independently migrated app and mirror stores.
-//! It verifies relation separation between the two migration histories.
-//! This does not exercise the production adapter or its metadata behavior.
-//! The stores are disposable and prepared by the dedicated CI step.
+//! Production metadata adapter against independently migrated app and mirror
+//! stores. CI prepares disposable databases with each real migration history;
+//! the separation test guards against cross-store relations.
+use nntune_api::handlers::{Store, StoreError};
+use nntune_api::worker_entry::catalogue_store_for_postgres_test;
+use std::cell::Cell;
+use std::rc::Rc;
 use tokio_postgres::{Client, Config, NoTls};
+
+const USER: &str = "u1";
+const LOCAL_TRACK: &str = "22222222-2222-2222-2222-222222222222";
+const SHORT_RECORDING: &str = "33333333-3333-3333-3333-333333333333";
 
 async fn connect(var: &str, dbname: &str) -> Client {
     let config: Config = std::env::var(var)
@@ -74,4 +81,100 @@ async fn migrated_stores_have_no_cross_side_relations() {
             "mirror store must not name {table}"
         );
     }
+}
+
+// Tests share the migrated databases and run concurrently. Bare conflict
+// handling covers every unique index when identical seeds race.
+async fn seed_local(app: &Client) {
+    app.batch_execute(&format!(
+        "INSERT INTO users (id, email, created_at) VALUES ('{USER}', 'u1@ci.invalid', 1700000000) \
+         ON CONFLICT DO NOTHING; \
+         INSERT INTO ingest_jobs (id, user_id, idempotency_key, status) \
+         VALUES ('job-meter-1', '{USER}', 'meter-1', 'done') ON CONFLICT DO NOTHING; \
+         INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms) \
+         VALUES ('{LOCAL_TRACK}', '{SHORT_RECORDING}', '88888888-8888-8888-8888-888888888888', 'Track', 1, 1, 60000) \
+         ON CONFLICT DO NOTHING"
+    )).await.unwrap();
+}
+
+async fn seed_media(app: &Client) {
+    let hash = "a".repeat(64);
+    app.batch_execute(&format!(
+        "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) \
+         VALUES ('{hash}', 2000000, 'ci-bucket', 'ci/key', 1700000100) ON CONFLICT DO NOTHING; \
+         INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) \
+         VALUES ('{USER}', '{LOCAL_TRACK}', 'job-meter-1', '{hash}', 'flac', 128, 1700000200) \
+         ON CONFLICT DO NOTHING"
+    )).await.unwrap();
+}
+
+fn meter_store(app: Client, mirror: Result<Client, StoreError>) -> (impl Store, Rc<Cell<usize>>) {
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, true, mirror, attempts.clone());
+    (store, attempts)
+}
+
+#[tokio::test]
+async fn local_uuid_resolves_app_and_mirror_rungs() {
+    let app = app().await;
+    seed_local(&app).await;
+    seed_media(&app).await;
+    let mirror = mirror().await;
+    mirror.batch_execute(&format!(
+        "INSERT INTO mb_recording (mbid, title, duration_ms) VALUES ('{SHORT_RECORDING}', 'Rec', 61000) ON CONFLICT DO NOTHING"
+    )).await.unwrap();
+    let (store, attempts) = meter_store(app, Ok(mirror));
+    let meta = store.track_meter_meta(USER, LOCAL_TRACK).await.unwrap();
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(meta.track_duration_ms, Some(60_000));
+    assert_eq!(meta.mb_duration_ms, Some(61_000));
+    assert_eq!(meta.bitrate_kbps, Some(128));
+    assert_eq!(meta.file_bytes, Some(2_000_000));
+}
+
+#[tokio::test]
+async fn unconfigured_mirror_degrades_without_attempt() {
+    let app = app().await;
+    seed_local(&app).await;
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
+    let meta = store.track_meter_meta(USER, LOCAL_TRACK).await.unwrap();
+    assert_eq!(attempts.get(), 0);
+    assert_eq!(meta.track_duration_ms, Some(60_000));
+    assert_eq!(meta.mb_duration_ms, None);
+}
+
+#[tokio::test]
+async fn configured_mirror_failure_never_degrades() {
+    let app = app().await;
+    seed_local(&app).await;
+    let (store, attempts) = meter_store(app, Err(StoreError));
+    assert!(store.track_meter_meta(USER, LOCAL_TRACK).await.is_err());
+    assert_eq!(attempts.get(), 1);
+}
+
+#[tokio::test]
+async fn non_uuid_needs_no_database() {
+    let app = app().await;
+    seed_local(&app).await;
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, false, Err(StoreError), attempts.clone());
+    let meta = store.track_meter_meta(USER, "track-9").await.unwrap();
+    assert_eq!(meta, nntune_api::meter_sink::TrackMeterMeta::default());
+    assert_eq!(attempts.get(), 0);
+    // The injected app client is single-use: a valid lookup proves the
+    // non-UUID short circuit did not consume it.
+    let local = store.track_meter_meta(USER, LOCAL_TRACK).await.unwrap();
+    assert_eq!(local.track_duration_ms, Some(60_000));
+}
+
+#[tokio::test]
+async fn absent_local_track_does_not_probe_mirror() {
+    let (store, attempts) = meter_store(app().await, Err(StoreError));
+    let meta = store
+        .track_meter_meta(USER, "66666666-6666-6666-6666-666666666666")
+        .await
+        .unwrap();
+    assert_eq!(meta, nntune_api::meter_sink::TrackMeterMeta::default());
+    assert_eq!(attempts.get(), 0);
 }
