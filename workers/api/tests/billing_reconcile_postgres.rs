@@ -576,6 +576,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     a.read_plan = None;
     a.read_anchor = None;
     a.row.current_period_end_unix = Some(1_700_000_000 + P);
+    a.row.cancel_at_period_end = false;
     a.row.status = "canceled".into();
     a.row.paid_through_unix = Some(100);
     a.row.paid_invoice_id = Some("in_100".into());
@@ -606,17 +607,10 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         grace: Some(10),
     };
     let expected_b = Snap {
-        user_id: "u1".into(),
-        customer: "cus_test_1".into(),
-        item: "si_test_1".into(),
-        price: PRICE.into(),
-        plan: "plus".into(),
-        status: "canceled".into(),
-        period_end: Some(1_700_000_000 + P),
-        cancel: false,
         paid_through: None,
         anchor: None,
         grace: None,
+        ..expected.clone()
     };
     assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
@@ -660,17 +654,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         "advance-null-anchor",
     ] {
         let sub = format!("sub_{case}");
-        let mut stored = fx.fold("u1", &remote(&sub, &[])).await;
-        stored.history.clear();
-        stored.row.stripe_customer_id = "cus_test_1".into();
-        stored.row.stripe_item_id = "si_test_1".into();
-        stored.row.stripe_price_id = PRICE.into();
-        stored.row.cancel_at_period_end = false;
-        stored.row.current_period_end_unix = Some(1_700_000_000 + P);
-        stored.read_plan = None;
-        stored.read_anchor = None;
-        stored.row.status = "canceled".into();
-        stored.row.plan_id = "plus".into();
+        let mut stored = a.clone();
+        stored.row.stripe_subscription_id = sub.clone();
         stored.row.paid_through_unix = if case == "first-end" { None } else { Some(100) };
         stored.row.paid_invoice_id = Some("in_old".into());
         stored.row.grace_until_unix = Some(10);
