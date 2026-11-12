@@ -482,7 +482,17 @@ fn has_ipv6_like_value(value: &str) -> bool {
     }) {
         return true;
     }
-    false
+    // Split attached assignment and list punctuation without splitting colons
+    // or dots, which are part of IPv6 and IPv4-mapped address syntax.
+    value
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | '='
+                )
+        })
+        .any(is_ipv6_token)
 }
 
 #[test]
