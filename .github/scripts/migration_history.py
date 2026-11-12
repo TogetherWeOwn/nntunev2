@@ -543,3 +543,46 @@ def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit
         audit.update(base=base, head=head, merge_base=history.merge_base,
                      commits=len(history.commits), events=len(history.events), outcome="verified")
     return result
+
+
+def verify_preserved_source(root, base, head, manifest_sha256, *, budget):
+    """Verify caller-supplied local Git history; this does not authorize imports.
+
+    This is not repository-origin authorization, bounded acquisition, or an
+    offline sandbox. Git inherits the caller's environment and configuration.
+    The caller must establish identity and authorization independently and share
+    one budget across acquisition and all verification passes. Baseline rename
+    claims cannot be established by this verifier and are rejected.
+    """
+    if not isinstance(budget, EvidenceBudget):
+        raise HistoryError("shared evidence budget required")
+    if not isinstance(manifest_sha256, str) or not SHA_RE.fullmatch(manifest_sha256):
+        raise HistoryError("invalid source manifest digest")
+    source = GitHistory(root, base, head, budget=budget)
+    if source.git("rev-parse", "--is-shallow-repository").strip() != b"false":
+        raise HistoryError("shallow source repository cannot prove complete history")
+    if source.merge_base != base:
+        raise HistoryError("source base is not an ancestor of source head")
+    baseline = source.git("show", f"{base}:migrations/manifest.toml", limit=MAX_INPUT)
+    try:
+        baseline_entries = parse_manifest(baseline.decode("utf-8"))
+    except UnicodeError as exc:
+        raise HistoryError("source baseline manifest is not UTF-8") from exc
+    if any(entry.get("renamed_from") or entry.get("source_rename_history")
+           for entry in baseline_entries):
+        raise HistoryError("unverified baseline provenance")
+    record = source.git("ls-tree", "-z", head, "--", "migrations/manifest.toml")
+    match = re.fullmatch(rb"100644 blob ([0-9a-f]{40})\tmigrations/manifest\.toml\x00", record)
+    if match is None:
+        raise HistoryError("source manifest must be a regular non-executable blob")
+    raw = source.git("cat-file", "blob", match.group(1).decode("ascii"), limit=MAX_INPUT)
+    if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise HistoryError("source manifest digest mismatch")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise HistoryError("source manifest is not UTF-8") from exc
+    entries = parse_manifest(text)
+    verify(root, base, head, text, budget=budget)
+    budget.remaining(1)
+    return entries

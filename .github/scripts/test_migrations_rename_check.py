@@ -107,6 +107,162 @@ class GitFixture(unittest.TestCase):
                 self.commit("ordinary edit")
         return self.prepare()
 
+    def source_witness(self, entries):
+        text = manifest(entries)
+        (self.root / "migrations/manifest.toml").write_text(text)
+        head = self.commit("source manifest")
+        return head, hashlib.sha256(text.encode()).hexdigest()
+
+    def test_preserved_source_reverifies_history_with_shared_budget(self):
+        entries = self.chain()
+        head, digest = self.source_witness(entries)
+        budget = history.EvidenceBudget()
+        self.assertEqual(history.verify_preserved_source(
+            self.root, self.base, head, digest, budget=budget), history.parse_manifest(manifest(entries)))
+        self.assertGreater(budget.total_output, 0)
+        with self.assertRaisesRegex(history.HistoryError, "output bound"):
+            history.verify_preserved_source(self.root, self.base, head, digest,
+                                            budget=history.EvidenceBudget(
+                                                total_output=history.MAX_TOTAL_OUTPUT))
+        with self.assertRaisesRegex(history.HistoryError, "deadline"):
+            history.verify_preserved_source(self.root, self.base, head, digest,
+                                            budget=history.EvidenceBudget(deadline=0))
+        with self.assertRaisesRegex(history.HistoryError, "digest mismatch"):
+            history.verify_preserved_source(self.root, self.base, head, "0" * 64,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_deadline_expired_during_final_validation(self):
+        self.write("0001_original.sql")
+        head, digest = self.source_witness(self.entries())
+        budget = history.EvidenceBudget()
+        monotonic = history.time.monotonic
+        original_sha = history.GitHistory.sha
+        expired = False
+
+        def sha_then_expire(git_history, commit, path):
+            nonlocal expired
+            result = original_sha(git_history, commit, path)
+            expired = True
+            return result
+
+        def clock():
+            return budget.deadline + 1 if expired else monotonic()
+
+        with mock.patch.object(history.time, "monotonic", side_effect=clock):
+            with mock.patch.object(history.GitHistory, "sha", sha_then_expire):
+                with self.assertRaisesRegex(history.HistoryError, "deadline"):
+                    history.verify_preserved_source(self.root, self.base, head, digest, budget=budget)
+        self.assertTrue(expired)
+
+    def test_preserved_source_rejects_unverified_baseline_alias(self):
+        self.write("0002_final.sql")
+        entries = self.entries()
+        entries[0]["renamed_from"] = [{"file": "0001_old.sql", "sha256": entries[0]["sha256"]}]
+        text = manifest(entries)
+        (self.root / "migrations/manifest.toml").write_text(text)
+        base = self.commit("fabricated baseline")
+        self.write("0003_later.sql")
+        head, digest = self.source_witness(entries + [self.entries()[1]])
+        with self.assertRaisesRegex(history.HistoryError, "unverified baseline provenance"):
+            history.verify_preserved_source(self.root, base, head, digest,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_charges_prior_shared_budget_use(self):
+        self.write("0001_original.sql")
+        head, digest = self.source_witness(self.entries())
+        budget = history.EvidenceBudget()
+        history.verify_preserved_source(self.root, self.base, head, digest, budget=budget)
+        self.assertGreater(budget.total_output, 0)
+        with mock.patch.object(history, "MAX_TOTAL_OUTPUT", budget.total_output):
+            with self.assertRaisesRegex(history.HistoryError, "output bound"):
+                history.verify_preserved_source(self.root, self.base, head, digest, budget=budget)
+
+    def test_preserved_source_rejects_unverified_claims_and_missing_objects(self):
+        entries = self.chain()
+        entries[0]["source_rename_history"].pop()
+        head, digest = self.source_witness(entries)
+        with self.assertRaisesRegex(history.HistoryError, "lacks source_rename_history"):
+            history.verify_preserved_source(self.root, self.base, head, digest,
+                                            budget=history.EvidenceBudget())
+        with self.assertRaises(history.HistoryError):
+            history.verify_preserved_source(self.root, self.base, "0" * 40, digest,
+                                            budget=history.EvidenceBudget())
+        with self.assertRaisesRegex(history.HistoryError, "ancestor"):
+            history.verify_preserved_source(self.root, head, self.base, digest,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_mismatched_final_sql(self):
+        self.write("0001_original.sql")
+        entries = self.entries()
+        entries[0]["sha256"] = "0" * 64
+        head, digest = self.source_witness(entries)
+        with self.assertRaisesRegex(history.HistoryError, "final migration bytes"):
+            history.verify_preserved_source(self.root, self.base, head, digest,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_shallow_repository(self):
+        self.write("0001_original.sql")
+        head, digest = self.source_witness(self.entries())
+        (self.root / ".git/shallow").write_text(self.base + "\n")
+        with self.assertRaisesRegex(history.HistoryError, "shallow source repository"):
+            history.verify_preserved_source(self.root, self.base, head, digest,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_nonregular_manifest(self):
+        path = self.root / "migrations/manifest.toml"
+        path.unlink()
+        path.symlink_to("missing")
+        head = self.commit("symlink manifest")
+        with self.assertRaisesRegex(history.HistoryError, "regular non-executable"):
+            history.verify_preserved_source(self.root, self.base, head, "0" * 64,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_executable_and_oversized_manifest(self):
+        path = self.root / "migrations/manifest.toml"
+        path.chmod(0o755)
+        executable = self.commit("executable manifest")
+        with self.assertRaisesRegex(history.HistoryError, "regular non-executable"):
+            history.verify_preserved_source(self.root, self.base, executable, "0" * 64,
+                                            budget=history.EvidenceBudget())
+        path.chmod(0o644)
+        path.write_bytes(b"#" + b"x" * history.MAX_INPUT)
+        oversized = self.commit("oversized manifest")
+        with self.assertRaisesRegex(history.HistoryError, "output bound"):
+            history.verify_preserved_source(self.root, self.base, oversized, "0" * 64,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_rejects_non_utf8_manifest(self):
+        raw = b"# invalid manifest\n\xff"
+        (self.root / "migrations/manifest.toml").write_bytes(raw)
+        head = self.commit("non-UTF-8 manifest")
+        with self.assertRaisesRegex(history.HistoryError, "not UTF-8"):
+            history.verify_preserved_source(
+                self.root, self.base, head, hashlib.sha256(raw).hexdigest(),
+                budget=history.EvidenceBudget())
+
+    def test_preserved_source_ignores_git_replacement_objects(self):
+        self.write("0001_original.sql")
+        entries = self.entries()
+        head, digest = self.source_witness(entries)
+        replacement_text = "# replacement manifest\n"
+        (self.root / "migrations/manifest.toml").write_text(replacement_text)
+        replacement = self.commit("replacement")
+        self.git("replace", head, replacement)
+        self.assertEqual(history.verify_preserved_source(
+            self.root, self.base, head, digest, budget=history.EvidenceBudget()), entries)
+        replacement_digest = hashlib.sha256(replacement_text.encode()).hexdigest()
+        with self.assertRaisesRegex(history.HistoryError, "digest mismatch"):
+            history.verify_preserved_source(self.root, self.base, head, replacement_digest,
+                                            budget=history.EvidenceBudget())
+
+    def test_preserved_source_requires_shared_budget_and_digest(self):
+        with self.assertRaisesRegex(history.HistoryError, "shared evidence budget"):
+            history.verify_preserved_source(self.root, self.base, self.base, "0" * 64,
+                                            budget=None)
+        with self.assertRaisesRegex(history.HistoryError, "invalid source manifest digest"):
+            history.verify_preserved_source(self.root, self.base, self.base, "A" * 64,
+                                            budget=history.EvidenceBudget())
+
     def test_one_hop_alias_is_genuine_and_required(self):
         self.write("0001_old.sql")
         self.commit()
