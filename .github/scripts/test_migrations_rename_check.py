@@ -131,6 +131,29 @@ class GitFixture(unittest.TestCase):
             history.verify_preserved_source(self.root, self.base, head, "0" * 64,
                                             budget=history.EvidenceBudget())
 
+    def test_preserved_source_rejects_deadline_expired_during_final_validation(self):
+        self.write("0001_original.sql")
+        head, digest = self.source_witness(self.entries())
+        budget = history.EvidenceBudget()
+        monotonic = history.time.monotonic
+        original_sha = history.GitHistory.sha
+        expired = False
+
+        def sha_then_expire(git_history, commit, path):
+            nonlocal expired
+            result = original_sha(git_history, commit, path)
+            expired = True
+            return result
+
+        def clock():
+            return budget.deadline + 1 if expired else monotonic()
+
+        with mock.patch.object(history.time, "monotonic", side_effect=clock):
+            with mock.patch.object(history.GitHistory, "sha", sha_then_expire):
+                with self.assertRaisesRegex(history.HistoryError, "deadline"):
+                    history.verify_preserved_source(self.root, self.base, head, digest, budget=budget)
+        self.assertTrue(expired)
+
     def test_preserved_source_rejects_unverified_baseline_alias(self):
         self.write("0002_final.sql")
         entries = self.entries()

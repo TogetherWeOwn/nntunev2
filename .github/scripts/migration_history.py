@@ -584,4 +584,5 @@ def verify_preserved_source(root, base, head, manifest_sha256, *, budget):
         raise HistoryError("source manifest is not UTF-8") from exc
     entries = parse_manifest(text)
     verify(root, base, head, text, budget=budget)
+    budget.remaining(1)
     return entries
