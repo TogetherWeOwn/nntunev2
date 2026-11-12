@@ -1,12 +1,22 @@
 //! Baseline reconciliation selection controls on disposable PostgreSQL.
 #![cfg(feature = "postgres-tests")]
 
-use nntune_api::billing_reconcile::{reconcile_live_select_statement, LiveRow};
+use nntune_api::billing_reconcile::{
+    insert_paid_invoice_history_statement, reconcile_live_select_statement,
+    reconcile_lock_statement, reconcile_subscription, store_reconciled_subscription_statement,
+    LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
+};
+use nntune_api::stripe::{
+    Invoice, InvoiceLine, InvoiceLinePeriod, InvoiceLines, InvoiceStatusTransitions, Subscription,
+    SubscriptionItem, SubscriptionItems,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls};
 
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const T: i64 = 1_786_032_000;
+const P: i64 = 30 * 24 * 60 * 60;
 const CUS: &str = "cus_a";
 const PRICE: &str = "price_plus_test";
 
@@ -159,12 +169,211 @@ impl Fx {
             })
     }
 
+    async fn history_rows(&self, sub: &str) -> i64 {
+        self.db
+            .query_one(
+                "SELECT count(*) FROM paid_invoice_history WHERE stripe_subscription_id = $1",
+                &[&sub],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    async fn fold(&self, user: &str, remote: &RemoteSubscription) -> ReconcileOutcome {
+        let input = ReconcileInput {
+            stripe_customer_id: Some(CUS.into()),
+            live: self.live(user).await,
+            bindings: bindings(),
+        };
+        reconcile_subscription(&input, remote, T)
+    }
+
+    async fn try_put(
+        &mut self,
+        user: &str,
+        outcome: &ReconcileOutcome,
+    ) -> Result<(), tokio_postgres::Error> {
+        let tx = self.db.transaction().await?;
+        tx.query_typed(reconcile_lock_statement(), &[(&user, Type::TEXT)])
+            .await?;
+        let stmt = tx
+            .prepare_typed(
+                store_reconciled_subscription_statement(),
+                &[
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::INT8,
+                    Type::BOOL,
+                    Type::INT8,
+                    Type::TEXT,
+                    Type::INT8,
+                    Type::TEXT,
+                    Type::TEXT,
+                ],
+            )
+            .await?;
+        let r = &outcome.row;
+        let params: [&(dyn ToSql + Sync); 14] = [
+            &user,
+            &r.stripe_subscription_id,
+            &r.stripe_customer_id,
+            &r.stripe_item_id,
+            &r.stripe_price_id,
+            &r.plan_id,
+            &r.status,
+            &r.current_period_end_unix,
+            &r.cancel_at_period_end,
+            &r.paid_through_unix,
+            &r.paid_invoice_id,
+            &r.grace_until_unix,
+            &outcome.read_anchor,
+            &outcome.read_plan,
+        ];
+        tx.query(&stmt, &params).await?;
+        let history = tx
+            .prepare_typed(
+                insert_paid_invoice_history_statement(),
+                &[
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::TEXT,
+                    Type::INT8,
+                    Type::INT8,
+                    Type::INT8,
+                    Type::TEXT,
+                    Type::INT8,
+                ],
+            )
+            .await?;
+        for h in &outcome.history {
+            tx.execute(
+                &history,
+                &[
+                    &user,
+                    &h.stripe_invoice_id,
+                    &h.stripe_subscription_id,
+                    &h.plan_id,
+                    &h.period_start_unix,
+                    &h.period_end_unix,
+                    &h.amount_cents,
+                    &h.currency,
+                    &h.paid_at_unix,
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
+        self.try_put(user, outcome)
+            .await
+            .expect("reconcile write must commit");
+    }
+
+    async fn seed_active(&mut self, user: &str, sub: &str) -> Snap {
+        let remote = remote(sub, &[invoice(sub, 1), invoice(sub, 2)]);
+        let outcome = self.fold(user, &remote).await;
+        self.put(user, &outcome).await;
+        let snap = self.snap(sub).await.expect("seeded");
+        assert_eq!(snap.status, "active");
+        assert_eq!(snap.plan, "plus");
+        assert_eq!(snap.paid_through, Some(T + 2 * P));
+        assert_eq!(
+            snap.anchor.as_deref(),
+            Some(format!("inv_{sub}_2").as_str())
+        );
+        snap
+    }
+
     async fn cleanup(&self) {
         self.db
             .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema))
             .await
             .unwrap();
     }
+}
+
+fn bindings() -> Vec<PriceBinding> {
+    vec![PriceBinding {
+        price_id: PRICE.into(),
+        plan_id: "plus".into(),
+        selectable: true,
+        livemode: false,
+    }]
+}
+
+fn invoice(sub: &str, n: i64) -> Invoice {
+    let (start, end) = (T + (n - 1) * P, T + n * P);
+    Invoice {
+        id: format!("inv_{sub}_{n}"),
+        customer: Some(CUS.into()),
+        subscription: Some(sub.into()),
+        status: "paid".into(),
+        amount_paid: 800,
+        currency: Some("usd".into()),
+        status_transitions: Some(InvoiceStatusTransitions {
+            paid_at: Some(start),
+        }),
+        lines: Some(InvoiceLines {
+            data: vec![InvoiceLine {
+                id: format!("inv_{sub}_{n}_li"),
+                amount: 800,
+                currency: Some("usd".into()),
+                price: Some(PRICE.into()),
+                period: Some(InvoiceLinePeriod {
+                    start: Some(start),
+                    end: Some(end),
+                }),
+            }],
+            has_more: false,
+        }),
+        livemode: false,
+    }
+}
+
+fn remote(sub: &str, invoices: &[Invoice]) -> RemoteSubscription {
+    RemoteSubscription {
+        subscription: Subscription {
+            id: sub.into(),
+            customer: Some(CUS.into()),
+            status: "active".into(),
+            cancel_at_period_end: false,
+            current_period_end: Some(T + 2 * P),
+            items: Some(SubscriptionItems {
+                data: vec![SubscriptionItem {
+                    id: "si_a".into(),
+                    price: Some(PRICE.into()),
+                }],
+            }),
+            livemode: false,
+        },
+        invoices: invoices.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn first_insert_and_replay_preserve_subscription_and_history() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let seeded = fx.seed_active("u1", "sub_a").await;
+    assert_eq!(fx.rows("u1").await, 1);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    let remote = remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]);
+    let replay = fx.fold("u1", &remote).await;
+    assert_eq!(replay.history.len(), 2);
+    fx.put("u1", &replay).await;
+    assert_eq!(fx.snap("sub_a").await, Some(seeded));
+    assert_eq!(fx.rows("u1").await, 1);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
 }
 
 #[tokio::test]
