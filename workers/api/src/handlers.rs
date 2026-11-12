@@ -7386,6 +7386,8 @@ mod tests {
         /// reconcile input loads whole.
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        // Displaced rows are retained without changing the per-user projection.
+        billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
         /// Claimed webhook event ids (first claim wins, mirroring
         /// `billing_webhook_events`).
@@ -7472,6 +7474,76 @@ mod tests {
         fail_catalogue_reads: RefCell<bool>,
         /// Fail only the second read in release detail, after membership.
         fail_catalogue_release_tracks: RefCell<bool>,
+    }
+
+    fn merge_billing_row(
+        existing: Option<&crate::billing_reconcile::ReconciledRow>,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> crate::billing_reconcile::ReconciledRow {
+        // Mirrors the production upsert's monotonic coverage CASE: a
+        // pass that folded an older snapshot commits without
+        // regressing confirmed `paid_through_at` (or the plan and
+        // anchor tied to it). An equal-end pass carrying an anchor
+        // relabels the plan and anchor (the defined equal-end
+        // plan-switch outcome) — but only when the stored row still
+        // matches what the pass read — so a keep committing after a
+        // relabel, or an older relabel committing after a newer one,
+        // keeps the stored ones instead of reversing the newer
+        // plan/anchor. An anchor-less tie keeps the stored ones too.
+        // The same staleness predicate guards
+        // `status` and `grace_until`: strictly older money — or the
+        // anchor-less equal-end shape only the stale fold emits — keeps
+        // the stored verbatim fields instead of writing stale ones over
+        // a fresher pass. Bindings still update verbatim; history still
+        // converges on the invoice id.
+        match existing {
+            Some(existing)
+                if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
+            {
+                let advances = outcome.row.paid_through_unix.is_some_and(|end| {
+                    existing
+                        .paid_through_unix
+                        .is_none_or(|previous| end > previous)
+                });
+                let relabels = !advances
+                && outcome.row.paid_invoice_id.is_some()
+                && matches!(
+                    (outcome.row.paid_through_unix, existing.paid_through_unix),
+                    (Some(end), Some(previous)) if end == previous
+                )
+                // Mirrors the tie arm (`subscriptions.plan_id =
+                // $14 AND subscriptions.paid_invoice_id IS NOT
+                // DISTINCT FROM $13`): only a pass whose read row
+                // is still stored relabels — a late keep, or an
+                // older relabel, committing after the row moved
+                // keeps the stored plan/anchor. `None` read plan
+                // never equals a stored plan, so an anchor-less
+                // keep never relabels either.
+                && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                && existing.paid_invoice_id == outcome.read_anchor;
+                let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                    (Some(end), Some(previous)) => {
+                        end < previous
+                            || (end == previous
+                                && outcome.row.paid_invoice_id.is_none()
+                                && existing.paid_invoice_id.is_some())
+                    }
+                    _ => false,
+                };
+                let mut row = outcome.row.clone();
+                if !advances && !relabels {
+                    row.paid_through_unix = existing.paid_through_unix;
+                    row.plan_id = existing.plan_id.clone();
+                    row.paid_invoice_id = existing.paid_invoice_id.clone();
+                }
+                if stale {
+                    row.status = existing.status.clone();
+                    row.grace_until_unix = existing.grace_until_unix;
+                }
+                row
+            }
+            _ => outcome.row.clone(),
+        }
     }
 
     impl FakeStore {
@@ -8849,71 +8921,16 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Mirrors the production upsert's monotonic coverage CASE: a
-            // pass that folded an older snapshot commits without
-            // regressing confirmed `paid_through_at` (or the plan and
-            // anchor tied to it). An equal-end pass carrying an anchor
-            // relabels the plan and anchor (the defined equal-end
-            // plan-switch outcome) — but only when the stored row still
-            // matches what the pass read — so a keep committing after a
-            // relabel, or an older relabel committing after a newer one,
-            // keeps the stored ones instead of reversing the newer
-            // plan/anchor. An anchor-less tie keeps the stored ones too.
-            // The same staleness predicate guards
-            // `status` and `grace_until`: strictly older money — or the
-            // anchor-less equal-end shape only the stale fold emits — keeps
-            // the stored verbatim fields instead of writing stale ones over
-            // a fresher pass. Bindings still update verbatim; history still
-            // converges on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
-            let merged = match rows.get(user_id) {
-                Some(existing)
-                    if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
-                {
-                    let advances = outcome.row.paid_through_unix.is_some_and(|end| {
-                        existing
-                            .paid_through_unix
-                            .is_none_or(|previous| end > previous)
-                    });
-                    let relabels = !advances
-                        && outcome.row.paid_invoice_id.is_some()
-                        && matches!(
-                            (outcome.row.paid_through_unix, existing.paid_through_unix),
-                            (Some(end), Some(previous)) if end == previous
-                        )
-                        // Mirrors the tie arm (`subscriptions.plan_id =
-                        // $14 AND subscriptions.paid_invoice_id IS NOT
-                        // DISTINCT FROM $13`): only a pass whose read row
-                        // is still stored relabels — a late keep, or an
-                        // older relabel, committing after the row moved
-                        // keeps the stored plan/anchor. `None` read plan
-                        // never equals a stored plan, so an anchor-less
-                        // keep never relabels either.
-                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
-                        && existing.paid_invoice_id == outcome.read_anchor;
-                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
-                        (Some(end), Some(previous)) => {
-                            end < previous
-                                || (end == previous
-                                    && outcome.row.paid_invoice_id.is_none()
-                                    && existing.paid_invoice_id.is_some())
-                        }
-                        _ => false,
-                    };
-                    let mut row = outcome.row.clone();
-                    if !advances && !relabels {
-                        row.paid_through_unix = existing.paid_through_unix;
-                        row.plan_id = existing.plan_id.clone();
-                        row.paid_invoice_id = existing.paid_invoice_id.clone();
-                    }
-                    if stale {
-                        row.status = existing.status.clone();
-                        row.grace_until_unix = existing.grace_until_unix;
-                    }
-                    row
+            let merged = merge_billing_row(rows.get(user_id), outcome);
+            if let Some(existing) = rows.get(user_id) {
+                if existing.stripe_subscription_id != merged.stripe_subscription_id {
+                    self.billing_shadow.borrow_mut().insert(
+                        (user_id.to_string(), existing.stripe_subscription_id.clone()),
+                        existing.clone(),
+                    );
                 }
-                _ => outcome.row.clone(),
-            };
+            }
             rows.insert(user_id.to_string(), merged);
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
@@ -11287,6 +11304,45 @@ mod tests {
             read_plan: None,
             read_anchor: None,
         }
+    }
+
+    #[test]
+    fn billing_shadow_preserves_per_user_projection() {
+        let h = stripe_harness();
+        let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
+        block_on(h.store.store_reconcile_outcome("u2", &first)).unwrap();
+
+        let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
+        replacement.row.stripe_subscription_id = "sub_other".to_string();
+        block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "terminal projection remains hidden"
+        );
+        assert_eq!(
+            live_for(&h, "u2").unwrap().stripe_subscription_id,
+            "sub_test_1"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
+        assert_eq!(displaced.status, "active");
+        assert_eq!(displaced.paid_through_unix, Some(BILLING_NOW));
+        assert_eq!(displaced.paid_invoice_id.as_deref(), Some("in_1"));
+        assert_eq!(shadow.len(), 1);
+        drop(shadow);
+
+        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
+        assert_eq!(
+            live_for(&h, "u1").unwrap().stripe_subscription_id,
+            "sub_test_1"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        assert_eq!(
+            shadow[&(String::from("u1"), String::from("sub_other"))].status,
+            "canceled"
+        );
+        assert_eq!(shadow.len(), 2);
     }
 
     #[test]
