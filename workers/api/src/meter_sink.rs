@@ -17,7 +17,8 @@
 //! play time is never an input — and written through the monotonic
 //! play-window upsert, so duplicate or stale flushes add zero.
 //! Track metadata for the derivation resolves via
-//! [`track_meter_meta_statement`]: the confirming file size prefers
+//! [`track_meter_meta_app_statement`] and [`track_meter_meta_mirror_statement`]:
+//! the confirming file size prefers
 //! the stream-reported blob length, then the cached object's
 //! `byte_size`; duration walks track → MusicBrainz recording →
 //! bitrate ([`crate::ledger::resolve_duration_ms`]).
@@ -113,20 +114,22 @@ pub enum PlayWindowOutcome {
     Fenced,
 }
 
-/// SQL for [`TrackMeterMeta`]: parameters track id as UUID text ($1)
-/// and user id ($2). At most one row (the track); the media rungs pick
-/// the caller's most recently verified media for the track. Column
-/// aliases match the struct fields. Callers only run this for
-/// UUID-shaped track ids — a non-UUID track can still be metered on
-/// the fallback rung, so residency in `tracks` is never required.
-pub fn track_meter_meta_statement() -> &'static str {
-    "SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms, \
+/// App-side metadata for an exact local track id ($1) and user ($2).
+/// The caller's newest verified media supplies the artifact rungs;
+/// `track_mbid` is the nullable key for the separate mirror lookup.
+pub fn track_meter_meta_app_statement() -> &'static str {
+    "SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid, \
      (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = $2 \
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps, \
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c \
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2 \
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes \
-     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid WHERE t.id = $1::uuid"
+     FROM tracks t WHERE t.id = $1::uuid"
+}
+
+/// Mirror-side recording duration for the recording MBID ($1).
+pub fn track_meter_meta_mirror_statement() -> &'static str {
+    "SELECT duration_ms AS mb_duration_ms FROM mb_recording WHERE mbid = $1::uuid"
 }
 
 /// True when `track_id` is shaped like the UUID `tracks.id` carries
@@ -357,19 +360,23 @@ mod tests {
     }
 
     #[test]
-    fn meta_statement_is_pinned() {
-        let sql = track_meter_meta_statement();
-        assert!(sql.contains("FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid"));
-        assert!(sql.contains("WHERE t.id = $1::uuid"));
-        assert!(sql.contains("m.user_id = $2"));
+    fn meta_statements_are_pinned() {
+        let app = track_meter_meta_app_statement();
+        assert!(!app.contains("mb_recording"));
+        assert!(app.contains("FROM tracks t WHERE t.id = $1::uuid"));
+        assert!(app.contains("m.user_id = $2"));
         for alias in [
             "track_duration_ms",
-            "mb_duration_ms",
+            "track_mbid",
             "bitrate_kbps",
             "file_bytes",
         ] {
-            assert!(sql.contains(&format!("AS {alias}")), "{alias}");
+            assert!(app.contains(&format!("AS {alias}")), "{alias}");
         }
+        let mirror = track_meter_meta_mirror_statement();
+        assert!(mirror.contains("FROM mb_recording WHERE mbid = $1::uuid"));
+        assert!(mirror.contains("AS mb_duration_ms"));
+        assert!(!mirror.contains("tracks t"));
     }
 
     #[test]
