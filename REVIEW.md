@@ -168,6 +168,14 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 ## This repository: where defects hide
 
+- **CI and deploy wiring** (`.github/workflows/ci.yml`, `deploy.yml`, `deploy-production.yml`):
+  when a PR adds or tightens a CI, deploy or gate check, or edits a workflow,
+  trace each new input, env and output to its supplying job and verify `needs:` ordering.
+  Judge merge-commit and post-merge deploy paths, not only PR-head checks; compare
+  migration, history and allowlist gates against current `main`, not the PR base.
+  For publish/artifact jobs, verify no key, token or secret material reaches an uploaded
+  artifact or public output. Report a violation as Severe only with the exact job/line and failing path.
+
 - **Provider credentials (highest stakes):** users bring their own Usenet
   provider accounts. Credentials must never be logged, cached in plaintext
   beyond their designed store, echoed in errors, or sent to unauthorized
