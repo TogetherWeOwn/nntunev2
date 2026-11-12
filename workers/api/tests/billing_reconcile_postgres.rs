@@ -378,6 +378,148 @@ async fn first_insert_and_replay_preserve_subscription_and_history() {
 }
 
 #[tokio::test]
+async fn fresh_same_subscription_controls_still_apply() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.raw("u1", "sub_old", "canceled", Some(T)).await;
+    fx.seed_active("u1", "sub_a").await;
+
+    let mut renewal_remote = remote(
+        "sub_a",
+        &[
+            invoice("sub_a", 1),
+            invoice("sub_a", 2),
+            invoice("sub_a", 3),
+        ],
+    );
+    renewal_remote.subscription.current_period_end = Some(T + 3 * P);
+    let renewal = fx.fold("u1", &renewal_remote).await;
+    fx.put("u1", &renewal).await;
+    let s = fx.snap("sub_a").await.unwrap();
+    assert_eq!(s.paid_through, Some(T + 3 * P));
+    assert_eq!(s.anchor.as_deref(), Some("inv_sub_a_3"));
+    assert_eq!((s.status.as_str(), s.grace), ("active", None));
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+
+    let mut held_remote = renewal_remote.clone();
+    held_remote.subscription.status = "paused".into();
+    held_remote.subscription.cancel_at_period_end = true;
+    held_remote.subscription.current_period_end = Some(T + 4 * P);
+    let held = fx.fold("u1", &held_remote).await;
+    fx.put("u1", &held).await;
+    let h = fx.snap("sub_a").await.unwrap();
+    assert_eq!(h.status, "paused");
+    assert!(h.cancel);
+    assert_eq!(h.period_end, Some(T + 4 * P));
+    assert_eq!(
+        (h.paid_through, h.anchor),
+        (s.paid_through, s.anchor.clone())
+    );
+
+    held_remote.subscription.status = "canceled".into();
+    held_remote.subscription.cancel_at_period_end = false;
+    let terminal = fx.fold("u1", &held_remote).await;
+    fx.put("u1", &terminal).await;
+    let t = fx.snap("sub_a").await.unwrap();
+    assert_eq!((t.status.as_str(), t.grace), ("canceled", None));
+    assert_eq!(t.paid_through, s.paid_through);
+    assert!(fx.live("u1").await.is_none());
+    fx.cleanup().await;
+}
+
+async fn divergent(fx: &Fx, sub: &str, stored: &Snap) -> ReconcileOutcome {
+    let mut o = fx
+        .fold("u1", &remote(sub, &[invoice(sub, 1), invoice(sub, 2)]))
+        .await;
+    o.row.stripe_customer_id = "cus_other".into();
+    o.row.stripe_item_id = "si_other".into();
+    o.row.stripe_price_id = "price_pro_test".into();
+    o.row.plan_id = "pro".into();
+    o.row.status = "past_due".into();
+    o.row.current_period_end_unix = Some(T + 9);
+    o.row.cancel_at_period_end = !stored.cancel;
+    o.row.grace_until_unix = Some(T + 99);
+    o.read_plan = Some(stored.plan.clone());
+    o.read_anchor = stored.anchor.clone();
+    o
+}
+
+#[tokio::test]
+async fn null_evidence_updates_status_and_bindings_but_never_coverage() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut o = divergent(&fx, "sub_a", &stored).await;
+    o.row.paid_through_unix = None;
+    o.row.paid_invoice_id = None;
+    fx.put("u1", &o).await;
+    let s = fx.snap("sub_a").await.unwrap();
+    assert_eq!(s.status, "past_due");
+    assert_eq!(s.customer, "cus_other");
+    assert_eq!(s.item, "si_other");
+    assert_eq!(s.price, "price_pro_test");
+    assert_eq!(s.period_end, Some(T + 9));
+    assert_eq!(s.cancel, !stored.cancel);
+    assert_eq!(s.grace, Some(T + 99));
+    assert_eq!(s.plan, stored.plan);
+    assert_eq!(s.paid_through, stored.paid_through);
+    assert_eq!(s.anchor, stored.anchor);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
+    let mut fx = Fx::new().await;
+    let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
+    let outside = [
+        "canceled",
+        "incomplete_expired",
+        "trialing",
+        "unknown_state",
+    ];
+    for (n, status) in live.iter().chain(outside.iter()).enumerate() {
+        let user = format!("ux{n}");
+        fx.add_user(&user).await;
+        let holder = format!("sub_holder_{n}");
+        let newcomer = format!("sub_new_{n}");
+        fx.raw(&user, &holder, status, None).await;
+        let input = ReconcileInput {
+            stripe_customer_id: Some(CUS.into()),
+            live: None,
+            bindings: bindings(),
+        };
+        let outcome =
+            reconcile_subscription(&input, &remote(&newcomer, &[invoice(&newcomer, 1)]), T);
+        let result = fx.try_put(&user, &outcome).await;
+        if live.contains(status) {
+            let error = result.expect_err(status);
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+                "holder status {status}"
+            );
+            assert!(fx.snap(&newcomer).await.is_none(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 1);
+            assert_eq!(fx.history_rows(&newcomer).await, 0, "holder {status}");
+        } else {
+            result.expect(status);
+            assert!(fx.snap(&newcomer).await.is_some(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 2);
+            assert_eq!(fx.history_rows(&newcomer).await, 1);
+        }
+    }
+    fx.add_user("other").await;
+    fx.raw("other", "sub_other", "active", None).await;
+    fx.add_user("free_user").await;
+    let outcome = fx
+        .fold("free_user", &remote("sub_free", &[invoice("sub_free", 1)]))
+        .await;
+    fx.put("free_user", &outcome).await;
+    assert!(fx.snap("sub_free").await.is_some());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn setup_snapshots_and_live_selection_are_isolated() {
     let fx = Fx::new().await;
     for user in ["u1", "u2", "u3"] {
