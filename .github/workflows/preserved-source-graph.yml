@@ -9,8 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: preserved-source-graph-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   synthetic-graph:
+    name: Synthetic graph controls
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
