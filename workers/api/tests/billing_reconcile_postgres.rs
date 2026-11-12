@@ -55,7 +55,7 @@ fn disposable_config_rejects_non_local_targets() {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Snap {
     user_id: String,
     customer: String,
