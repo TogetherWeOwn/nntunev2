@@ -551,7 +551,8 @@ def verify_preserved_source(root, base, head, manifest_sha256, *, budget):
     This is not repository-origin authorization, bounded acquisition, or an
     offline sandbox. Git inherits the caller's environment and configuration.
     The caller must establish identity and authorization independently and share
-    one budget across acquisition and all verification passes.
+    one budget across acquisition and all verification passes. Baseline rename
+    claims cannot be established by this verifier and are rejected.
     """
     if not isinstance(budget, EvidenceBudget):
         raise HistoryError("shared evidence budget required")
@@ -562,6 +563,14 @@ def verify_preserved_source(root, base, head, manifest_sha256, *, budget):
         raise HistoryError("shallow source repository cannot prove complete history")
     if source.merge_base != base:
         raise HistoryError("source base is not an ancestor of source head")
+    baseline = source.git("show", f"{base}:migrations/manifest.toml", limit=MAX_INPUT)
+    try:
+        baseline_entries = parse_manifest(baseline.decode("utf-8"))
+    except UnicodeError as exc:
+        raise HistoryError("source baseline manifest is not UTF-8") from exc
+    if any(entry.get("renamed_from") or entry.get("source_rename_history")
+           for entry in baseline_entries):
+        raise HistoryError("unverified baseline provenance")
     record = source.git("ls-tree", "-z", head, "--", "migrations/manifest.toml")
     match = re.fullmatch(rb"100644 blob ([0-9a-f]{40})\tmigrations/manifest\.toml\x00", record)
     if match is None:

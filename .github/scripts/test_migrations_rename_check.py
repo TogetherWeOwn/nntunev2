@@ -131,6 +131,19 @@ class GitFixture(unittest.TestCase):
             history.verify_preserved_source(self.root, self.base, head, "0" * 64,
                                             budget=history.EvidenceBudget())
 
+    def test_preserved_source_rejects_unverified_baseline_alias(self):
+        self.write("0002_final.sql")
+        entries = self.entries()
+        entries[0]["renamed_from"] = [{"file": "0001_old.sql", "sha256": entries[0]["sha256"]}]
+        text = manifest(entries)
+        (self.root / "migrations/manifest.toml").write_text(text)
+        base = self.commit("fabricated baseline")
+        self.write("0003_later.sql")
+        head, digest = self.source_witness(entries + [self.entries()[1]])
+        with self.assertRaisesRegex(history.HistoryError, "unverified baseline provenance"):
+            history.verify_preserved_source(self.root, base, head, digest,
+                                            budget=history.EvidenceBudget())
+
     def test_preserved_source_charges_prior_shared_budget_use(self):
         self.write("0001_original.sql")
         head, digest = self.source_witness(self.entries())
