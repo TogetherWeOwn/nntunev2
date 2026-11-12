@@ -32,8 +32,8 @@ use crate::auth::{
 };
 use crate::handlers::{
     self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
-    ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
-    QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
+    ChallengeRow, Config, Dialer, InviteBudgetReceipt, Mailer, NativeCredentialRow, PairAdmission,
+    PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -1488,6 +1488,95 @@ async fn reap_unverified_users_on(
     transaction.commit().await.map_err(|_| StoreError)
 }
 
+/// Production challenge INSERT. The optional invite-budget receipt (migration
+/// 0037) is written in the same statement as the challenge; `None` leaves both
+/// columns NULL (login, reauth and legacy challenges).
+async fn insert_challenge_on(
+    client: &impl GenericClient,
+    challenge: &PasskeyChallenge,
+    user_id: Option<&str>,
+    purpose: &str,
+    receipt: Option<&InviteBudgetReceipt>,
+) -> Result<(), StoreError> {
+    let code_hash: Option<&str> = receipt.map(|r| r.invite_code_hash.as_str());
+    let email_key: Option<&str> = receipt.map(|r| r.email_budget_key.as_str());
+    client
+        .query_typed(
+            "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose, \
+             invite_budget_code_hash, invite_budget_email_key) \
+             VALUES ($1, $2, $3, $4, $5, FALSE, $6, $7, $8)",
+            &[
+                (&challenge.id, Type::TEXT),
+                (&user_id, Type::TEXT),
+                (&challenge.rp_id, Type::TEXT),
+                (&challenge.origin, Type::TEXT),
+                (&i64_of(challenge.expires_at)?, Type::INT8),
+                (&purpose, Type::TEXT),
+                (&code_hash, Type::TEXT),
+                (&email_key, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// Production challenge SELECT. The receipt columns are both-or-neither; a
+/// half-populated pair is corrupt state and fails closed.
+async fn challenge_by_id_on(
+    client: &impl GenericClient,
+    id: &str,
+) -> Result<Option<ChallengeRow>, StoreError> {
+    let rows = client
+        .query_typed(
+            "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose, \
+             invite_budget_code_hash, invite_budget_email_key \
+             FROM auth_challenges WHERE id = $1",
+            &[(&id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: more than one row is an error.
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first()
+        .map(|r| {
+            let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
+            let expires_at = u64_of(expires_at)?;
+            let code_hash: Option<String> = r
+                .try_get("invite_budget_code_hash")
+                .map_err(|_| StoreError)?;
+            let email_key: Option<String> = r
+                .try_get("invite_budget_email_key")
+                .map_err(|_| StoreError)?;
+            let invite_budget_receipt = match (code_hash, email_key) {
+                (None, None) => None,
+                (Some(invite_code_hash), Some(email_budget_key)) => Some(InviteBudgetReceipt {
+                    invite_code_hash,
+                    email_budget_key,
+                }),
+                _ => return Err(StoreError),
+            };
+            Ok(ChallengeRow {
+                challenge: PasskeyChallenge {
+                    id: r.try_get("id").map_err(|_| StoreError)?,
+                    rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
+                    origin: r.try_get("origin").map_err(|_| StoreError)?,
+                    // The schema stores expiry only; nothing downstream
+                    // authorizes on issue time.
+                    issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
+                    expires_at,
+                    consumed: r.try_get("consumed").map_err(|_| StoreError)?,
+                },
+                user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                purpose: r.try_get("purpose").map_err(|_| StoreError)?,
+                invite_budget_receipt,
+            })
+        })
+        .transpose()
+}
+
 async fn prune_expired_challenges_on(
     client: &impl GenericClient,
     now: u64,
@@ -2293,64 +2382,23 @@ impl Store for PgStore {
         challenge: &PasskeyChallenge,
         user_id: Option<&str>,
         purpose: &str,
+        receipt: Option<&InviteBudgetReceipt>,
     ) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let client = self.connect().await?;
-        client
-            .query_typed(
-                "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose) \
-                 VALUES ($1, $2, $3, $4, $5, FALSE, $6)",
-                &[
-                    (&challenge.id, Type::TEXT),
-                    (&user_id, Type::TEXT),
-                    (&challenge.rp_id, Type::TEXT),
-                    (&challenge.origin, Type::TEXT),
-                    (&i64_of(challenge.expires_at)?, Type::INT8),
-                    (&purpose, Type::TEXT),
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                insert_challenge_on(&client, challenge, user_id, purpose, receipt).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let rows = client
-                    .query_typed(
-                        "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose \
-                 FROM auth_challenges WHERE id = $1",
-                        &[(&id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                // `query_opt`'s rule: more than one row is an error.
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                rows.first()
-                    .map(|r| {
-                        let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
-                        let expires_at = u64_of(expires_at)?;
-                        Ok(ChallengeRow {
-                            challenge: PasskeyChallenge {
-                                id: r.try_get("id").map_err(|_| StoreError)?,
-                                rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
-                                origin: r.try_get("origin").map_err(|_| StoreError)?,
-                                // The schema stores expiry only; nothing downstream
-                                // authorizes on issue time.
-                                issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
-                                expires_at,
-                                consumed: r.try_get("consumed").map_err(|_| StoreError)?,
-                            },
-                            user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                            purpose: r.try_get("purpose").map_err(|_| StoreError)?,
-                        })
-                    })
-                    .transpose()
+                challenge_by_id_on(&client, id).await
             },
             TOTAL_TIMEOUT_MS,
         )

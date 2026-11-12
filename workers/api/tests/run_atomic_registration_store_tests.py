@@ -26,6 +26,7 @@ EXPECTED = {
         "postgres_registration_challenge_loser_spends_no_later_proof",
         "postgres_registration_invite_loser_rolls_back_both_earlier_claims",
         "postgres_registration_competing_transactions_enroll_exactly_one_credential",
+        "postgres_receipted_registration_audit_failure_rolls_back_and_retries",
         "postgres_challenge_cleanup_skips_locked_expired_row_and_retries",
         "postgres_reap_before_prune_preserves_in_flight_enrollment",
         "postgres_reap_after_enrollment_rollback_cleans_expired_signup",
@@ -50,6 +51,9 @@ EXPECTED = {
         "postgres_admin_ingest_rejected_upload_stores_failed_without_original",
         "postgres_admin_ingest_delete_then_reupload_is_fresh",
         "postgres_admin_ingest_list_and_get_read_redacted_jobs",
+        "postgres_challenge_receipt_roundtrips_and_legacy_rows_stay_null",
+        "postgres_challenge_receipt_and_binding_are_immutable_once_set",
+        "postgres_challenge_receipt_delete_reinsert_after_concurrent_reap_is_fresh",
     )
 }
 EXPECTED_CONFIG = {

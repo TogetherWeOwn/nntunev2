@@ -8,18 +8,21 @@
 
 use super::{
     admin_ingest_delete_on, admin_ingest_upload_on, admin_issue_invite_on, admin_revoke_invite_on,
-    admin_set_app_setting_on, admin_set_user_role_on, complete_registration_on,
-    prune_expired_challenges_on, reap_unverified_users_on,
+    admin_set_app_setting_on, admin_set_user_role_on, challenge_by_id_on, complete_registration_on,
+    insert_challenge_on, prune_expired_challenges_on, reap_unverified_users_on,
 };
 use crate::admin_ingest::{
     AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome, FailureReason,
     IngestOriginalEnvelope, INGEST_UPLOAD_AUDIT_ACTION,
 };
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
-use crate::handlers::{AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome};
+use crate::handlers::{
+    AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, InviteBudgetReceipt,
+};
 use crate::vault::{audit_event_extended, AuditEvent};
 use std::future::Future;
 use std::time::Duration;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 const NOW: u64 = 1_700_000_000;
@@ -266,6 +269,21 @@ impl Fixture {
         }
     }
 
+    async fn seed_receipted(client: &Client) -> Self {
+        let mut fixture = Self::seed(client).await;
+        fixture.challenge.id.push_str("-receipted");
+        insert_challenge_on(
+            client,
+            &fixture.challenge,
+            Some(&fixture.credential.user_id),
+            "register",
+            Some(&receipt_for(&fixture, "enrollment")),
+        )
+        .await
+        .expect("insert a fresh challenge and receipt through production SQL");
+        fixture
+    }
+
     async fn assert_state(&self, client: &Client, expected: (bool, bool, bool, i64)) {
         let row = client
             .query_one(
@@ -370,7 +388,7 @@ fn postgres_registration_commit_consumes_optional_invite() {
 fn postgres_registration_duplicate_rolls_back_and_same_proofs_retry() {
     run_test(async {
         let mut client = connect().await;
-        let fixture = Fixture::seed(&client).await;
+        let fixture = Fixture::seed_receipted(&client).await;
         client.execute(
             "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) VALUES ($1, $2, $3, 0, $4)",
             &[&fixture.credential.cred_id_b64url, &fixture.credential.user_id, &vec![9u8], &(NOW as i64)],
@@ -527,11 +545,85 @@ fn postgres_registration_invite_loser_rolls_back_both_earlier_claims() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_receipted_registration_audit_failure_rolls_back_and_retries() {
+    run_test(async {
+        let mut client = connect().await;
+        let fixture = Fixture::seed_receipted(&client).await;
+        let receipt = receipt_for(&fixture, "enrollment");
+        // A trigger scoped to this subject is disposable and removed before
+        // retry. It cannot affect other fixtures in this isolated CI database.
+        let subject = &fixture.credential.user_id;
+        assert!(subject
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+        client
+            .batch_execute(&format!(
+            "CREATE FUNCTION pg_temp.refuse_receipt_audit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN IF NEW.subject_user_id = '{subject}' AND NEW.action = 'invite.redeemed' \
+             THEN RAISE EXCEPTION 'fixture audit failure'; END IF; RETURN NEW; END $$; \
+             CREATE TRIGGER refuse_receipt_audit BEFORE INSERT ON audit_log \
+             FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_receipt_audit();"
+        ))
+            .await
+            .expect("install fixture-scoped audit insertion fault");
+        assert!(complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await
+        .is_err());
+        fixture
+            .assert_state(&client, (false, false, false, 0))
+            .await;
+        let row = challenge_by_id_on(&client, &fixture.challenge.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.invite_budget_receipt, Some(receipt.clone()));
+        client
+            .batch_execute("DROP TRIGGER refuse_receipt_audit ON audit_log")
+            .await
+            .expect("remove disposable audit fault before retry");
+        complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await
+        .expect("same receipted proofs retry after audit failure");
+        fixture.assert_state(&client, (true, true, true, 1)).await;
+        let audits: i64 = client.query_one(
+            "SELECT count(*) FROM audit_log WHERE subject_user_id = $1 AND action = 'invite.redeemed'",
+            &[subject],
+        ).await.unwrap().get(0);
+        assert_eq!(audits, 1);
+        assert_eq!(
+            challenge_by_id_on(&client, &fixture.challenge.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .invite_budget_receipt,
+            Some(receipt)
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_registration_competing_transactions_enroll_exactly_one_credential() {
     run_test(async {
         let mut first = connect().await;
         let mut second = connect().await;
-        let fixture = Fixture::seed(&first).await;
+        let fixture = Fixture::seed_receipted(&first).await;
         let mut other_credential = fixture.credential.clone();
         other_credential.cred_id_b64url.push_str("-competitor");
         let (left, right) = futures_util::future::join(
@@ -2860,6 +2952,361 @@ fn postgres_admin_ingest_list_and_get_read_redacted_jobs() {
             .await
             .expect("absent get executes"),
             None
+        );
+    });
+}
+
+// --- Invite-budget receipts on challenges (migration 0041) ----------------
+
+fn receipt_challenge(fixture: &Fixture, suffix: &str, expires_at: u64) -> PasskeyChallenge {
+    PasskeyChallenge {
+        id: format!("{}-{suffix}", fixture.challenge.id),
+        rp_id: RP.to_string(),
+        origin: ORIGIN.to_string(),
+        issued_at: NOW - 10,
+        expires_at,
+        consumed: false,
+    }
+}
+
+fn receipt_for(fixture: &Fixture, tag: &str) -> InviteBudgetReceipt {
+    InviteBudgetReceipt {
+        invite_code_hash: format!("{}-{tag}-code", fixture.challenge.id),
+        email_budget_key: format!("{}-{tag}-email", fixture.challenge.id),
+    }
+}
+
+async fn receipt_columns(client: &Client, id: &str) -> Option<(Option<String>, Option<String>)> {
+    client
+        .query_opt(
+            "SELECT invite_budget_code_hash, invite_budget_email_key FROM auth_challenges WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .expect("observe receipt columns")
+        .map(|row| (row.get(0), row.get(1)))
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_challenge_receipt_roundtrips_and_legacy_rows_stay_null() {
+    run_test(async {
+        let mut client = connect().await;
+        let fixture = Fixture::seed(&client).await;
+        let user_id = fixture.credential.user_id.as_str();
+
+        // A challenge written before receipts existed (raw legacy INSERT).
+        let legacy = challenge_by_id_on(&client, &fixture.challenge.id)
+            .await
+            .expect("production read of legacy row")
+            .expect("legacy row exists");
+        assert_eq!(legacy.invite_budget_receipt, None);
+
+        // Production insert with a receipt round-trips exactly.
+        let with_receipt = receipt_challenge(&fixture, "receipt", NOW + 300);
+        let receipt = receipt_for(&fixture, "a");
+        insert_challenge_on(
+            &client,
+            &with_receipt,
+            Some(user_id),
+            "register",
+            Some(&receipt),
+        )
+        .await
+        .expect("production insert with receipt");
+        let row = challenge_by_id_on(&client, &with_receipt.id)
+            .await
+            .expect("production read")
+            .expect("row exists");
+        assert_eq!(row.invite_budget_receipt, Some(receipt.clone()));
+        assert_eq!(row.user_id.as_deref(), Some(user_id));
+        assert_eq!(row.purpose, "register");
+        assert!(!row.challenge.consumed);
+
+        // None leaves both columns NULL (register, login and unbound login).
+        let plain = receipt_challenge(&fixture, "plain", NOW + 300);
+        insert_challenge_on(&client, &plain, Some(user_id), "register", None)
+            .await
+            .expect("production insert without receipt");
+        let login = receipt_challenge(&fixture, "login", NOW + 300);
+        insert_challenge_on(&client, &login, None, "login", None)
+            .await
+            .expect("unbound login insert");
+        for id in [&plain.id, &login.id] {
+            assert_eq!(receipt_columns(&client, id).await, Some((None, None)));
+            assert_eq!(
+                challenge_by_id_on(&client, id)
+                    .await
+                    .expect("read")
+                    .expect("row")
+                    .invite_budget_receipt,
+                None
+            );
+        }
+
+        // Consuming the challenge (the SingleUseClaim shape) stays allowed
+        // and keeps the receipt.
+        let claimed = client
+            .execute(
+                "UPDATE auth_challenges SET consumed = TRUE WHERE id = $1 AND consumed = FALSE",
+                &[&with_receipt.id],
+            )
+            .await
+            .expect("consume receipt-bearing challenge");
+        assert_eq!(claimed, 1);
+        let row = challenge_by_id_on(&client, &with_receipt.id)
+            .await
+            .expect("read consumed")
+            .expect("row");
+        assert!(row.challenge.consumed);
+        assert_eq!(row.invite_budget_receipt, Some(receipt));
+
+        // Database shape: a receipt needs purpose register and a user.
+        for (suffix, user, purpose) in [
+            ("login-receipt", Some(user_id), "login"),
+            ("reauth-receipt", Some(user_id), "reauth"),
+            ("unbound-receipt", None, "register"),
+        ] {
+            let bad = receipt_challenge(&fixture, suffix, NOW + 300);
+            let bad_receipt = receipt_for(&fixture, suffix);
+            insert_challenge_on(&client, &bad, user, purpose, Some(&bad_receipt))
+                .await
+                .expect_err("receipt outside a bound register challenge is refused");
+            assert_eq!(receipt_columns(&client, &bad.id).await, None);
+        }
+
+        // A half-populated pair is refused by the database ...
+        let half = receipt_challenge(&fixture, "half", NOW + 300);
+        let err = client
+            .execute(
+                "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose, invite_budget_code_hash) VALUES ($1, $2, $3, $4, $5, FALSE, 'register', 'only-code')",
+                &[&half.id, &user_id, &half.rp_id, &half.origin, &(half.expires_at as i64)],
+            )
+            .await
+            .expect_err("partial pair violates the both-or-neither check");
+        assert_eq!(err.code(), Some(&SqlState::CHECK_VIOLATION));
+
+        // ... and if corrupt state ever existed, the production read fails
+        // closed. Constraint dropped only inside a rolled-back transaction.
+        let transaction = client
+            .transaction()
+            .await
+            .expect("open scratch transaction");
+        transaction
+            .batch_execute(
+                "ALTER TABLE public.auth_challenges DROP CONSTRAINT auth_challenges_invite_budget_receipt_check",
+            )
+            .await
+            .expect("drop check inside rolled-back transaction");
+        for (suffix, code, email) in [
+            ("half-code", Some("only-code"), None::<&str>),
+            ("half-email", None::<&str>, Some("only-email")),
+        ] {
+            let corrupt = receipt_challenge(&fixture, suffix, NOW + 300);
+            transaction
+                .execute(
+                    "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose, invite_budget_code_hash, invite_budget_email_key) VALUES ($1, $2, $3, $4, $5, FALSE, 'register', $6, $7)",
+                    &[&corrupt.id, &user_id, &corrupt.rp_id, &corrupt.origin, &(corrupt.expires_at as i64), &code, &email],
+                )
+                .await
+                .expect("seed corrupt half pair in scratch transaction");
+            assert!(
+                challenge_by_id_on(&transaction, &corrupt.id).await.is_err(),
+                "half-populated receipt pair fails closed"
+            );
+        }
+        transaction
+            .rollback()
+            .await
+            .expect("roll back scratch corruption");
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_challenge_receipt_and_binding_are_immutable_once_set() {
+    run_test(async {
+        let client = connect().await;
+        let fixture = Fixture::seed(&client).await;
+        let other = Fixture::seed(&client).await;
+        let user_id = fixture.credential.user_id.as_str();
+        let bound = receipt_challenge(&fixture, "bound", NOW + 300);
+        let receipt = receipt_for(&fixture, "bound");
+        insert_challenge_on(&client, &bound, Some(user_id), "register", Some(&receipt))
+            .await
+            .expect("production insert with receipt");
+
+        let other_user = other.credential.user_id.as_str();
+        let mutations = [
+            "SET invite_budget_code_hash = 'other'".to_string(),
+            "SET invite_budget_email_key = 'other'".to_string(),
+            "SET invite_budget_code_hash = NULL, invite_budget_email_key = NULL".to_string(),
+            "SET invite_budget_code_hash = NULL".to_string(),
+            "SET id = id || '-moved'".to_string(),
+            format!("SET user_id = '{other_user}'"),
+            "SET user_id = NULL".to_string(),
+            "SET purpose = 'login'".to_string(),
+            "SET rp_id = 'evil.example.com'".to_string(),
+            "SET expires_at = expires_at + 1".to_string(),
+        ];
+        for set in &mutations {
+            let err = client
+                .execute(
+                    &format!("UPDATE auth_challenges {set} WHERE id = $1"),
+                    &[&bound.id],
+                )
+                .await
+                .expect_err(set);
+            assert_eq!(err.code(), Some(&SqlState::RESTRICT_VIOLATION), "{set}");
+        }
+        let err = client
+            .execute(
+                "UPDATE auth_challenges SET origin = 'https://evil.example.com' WHERE id = $1",
+                &[&bound.id],
+            )
+            .await
+            .expect_err("origin is part of the immutable binding");
+        assert_eq!(err.code(), Some(&SqlState::RESTRICT_VIOLATION));
+
+        let row = challenge_by_id_on(&client, &bound.id)
+            .await
+            .expect("read after refused updates")
+            .expect("row survives");
+        assert_eq!(row.invite_budget_receipt, Some(receipt.clone()));
+        assert_eq!(row.user_id.as_deref(), Some(user_id));
+        assert_eq!(row.purpose, "register");
+        assert_eq!(row.challenge.expires_at, NOW + 300);
+        assert_eq!(row.challenge.origin, ORIGIN);
+        assert_eq!(row.challenge.rp_id, RP);
+
+        // A no-op rewrite of the same tuple plus consume is allowed.
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE auth_challenges SET consumed = TRUE, expires_at = expires_at WHERE id = $1",
+                    &[&bound.id],
+                )
+                .await
+                .expect("consume receipt-bearing challenge"),
+            1
+        );
+
+        // A receipt can never be attached retroactively to a null row,
+        // whether the row is a legacy one or a fresh receiptless insert.
+        let plain = receipt_challenge(&fixture, "plain", NOW + 300);
+        insert_challenge_on(&client, &plain, Some(user_id), "register", None)
+            .await
+            .expect("receiptless insert");
+        for id in [&fixture.challenge.id, &plain.id] {
+            for set in [
+                "SET invite_budget_code_hash = 'c', invite_budget_email_key = 'e'",
+                "SET invite_budget_code_hash = 'c'",
+                "SET invite_budget_email_key = 'e'",
+            ] {
+                let err = client
+                    .execute(
+                        &format!("UPDATE auth_challenges {set} WHERE id = $1"),
+                        &[id],
+                    )
+                    .await
+                    .expect_err("retroactive receipt attach is refused");
+                assert_eq!(err.code(), Some(&SqlState::RESTRICT_VIOLATION), "{set}");
+            }
+            assert_eq!(receipt_columns(&client, id).await, Some((None, None)));
+        }
+        // Null rows keep their ordinary claim semantics.
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE auth_challenges SET consumed = TRUE WHERE id = $1 AND consumed = FALSE",
+                    &[&plain.id],
+                )
+                .await
+                .expect("claim null-receipt row"),
+            1
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_challenge_receipt_delete_reinsert_after_concurrent_reap_is_fresh() {
+    run_test(async {
+        let cleanup = connect().await;
+        let mut locker = connect().await;
+        let fixture = Fixture::seed(&cleanup).await;
+        let user_id = fixture.credential.user_id.as_str();
+        let expiring = receipt_challenge(&fixture, "reaped", NOW);
+        let first = receipt_for(&fixture, "first");
+        insert_challenge_on(&cleanup, &expiring, Some(user_id), "register", Some(&first))
+            .await
+            .expect("production insert of expiring receipt row");
+
+        // A concurrent holder pins the expired row: the production prune
+        // skips it, and the receipt is unchanged.
+        let transaction = locker
+            .transaction()
+            .await
+            .expect("open competing transaction");
+        transaction
+            .query_one(
+                "SELECT id FROM auth_challenges WHERE id = $1 FOR UPDATE",
+                &[&expiring.id],
+            )
+            .await
+            .expect("hold the expired receipt row");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            prune_expired_challenges_on(&cleanup, NOW),
+        )
+        .await
+        .expect("prune must not wait for the locked row")
+        .expect("production prune under contention");
+        let row = challenge_by_id_on(&cleanup, &expiring.id)
+            .await
+            .expect("read skipped row")
+            .expect("locked row survives the first pass");
+        assert_eq!(row.invite_budget_receipt, Some(first.clone()));
+
+        transaction.commit().await.expect("release the held row");
+        prune_expired_challenges_on(&cleanup, NOW)
+            .await
+            .expect("production prune after release");
+        assert_eq!(receipt_columns(&cleanup, &expiring.id).await, None);
+
+        // The reaped id is a fresh INSERT: it may carry a different receipt
+        // (or none), and nothing from the deleted row is resurrected.
+        let second = receipt_for(&fixture, "second");
+        let mut reinserted = expiring.clone();
+        reinserted.expires_at = NOW + 300;
+        insert_challenge_on(
+            &cleanup,
+            &reinserted,
+            Some(user_id),
+            "register",
+            Some(&second),
+        )
+        .await
+        .expect("reinsert reaped id with a new receipt");
+        let row = challenge_by_id_on(&cleanup, &expiring.id)
+            .await
+            .expect("read reinserted row")
+            .expect("reinserted row");
+        assert_eq!(row.invite_budget_receipt, Some(second));
+        assert!(!row.challenge.consumed);
+        assert_eq!(row.challenge.expires_at, NOW + 300);
+
+        // Reaped and reinserted again without a receipt: stays null.
+        cleanup
+            .execute("DELETE FROM auth_challenges WHERE id = $1", &[&expiring.id])
+            .await
+            .expect("delete reinserted row");
+        insert_challenge_on(&cleanup, &reinserted, Some(user_id), "register", None)
+            .await
+            .expect("reinsert without receipt");
+        assert_eq!(
+            receipt_columns(&cleanup, &expiring.id).await,
+            Some((None, None))
         );
     });
 }
