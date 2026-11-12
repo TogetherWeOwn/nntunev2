@@ -974,6 +974,51 @@ class FreshImportInputs(unittest.TestCase):
         with self.assertRaises(history.HistoryError):
             history.validate_fresh_import(source, copy.deepcopy(source), [], BODY)
 
+    def test_metadata_limit_precedes_full_serialization(self):
+        candidate = copy.deepcopy(self.source)
+        candidate["extra"] = "x" * 2000
+        dumps = json.dumps
+        serialized = []
+
+        def record(value, *args, **kwargs):
+            serialized.append(value)
+            return dumps(value, *args, **kwargs)
+
+        with mock.patch.object(history, "MAX_INPUT", 1024), mock.patch.object(
+                history.json, "dumps", side_effect=record):
+            with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                self.check(candidate)
+        self.assertFalse(any(value is candidate for value in serialized))
+        self.assertFalse(any(value is candidate["extra"] for value in serialized))
+
+    def test_near_limit_metadata_match_and_mismatch(self):
+        source = copy.deepcopy(self.source)
+        source["extra"] = ""
+        base_size = len(json.dumps(source, sort_keys=True, separators=(",", ":")))
+        source["extra"] = "x" * (1024 - base_size)
+        candidate = copy.deepcopy(source)
+        with mock.patch.object(history, "MAX_INPUT", 1024):
+            history.validate_fresh_import(source, candidate, [], BODY)
+            candidate["extra"] = "y" + candidate["extra"][1:]
+            with self.assertRaisesRegex(history.HistoryError, "differs"):
+                history.validate_fresh_import(source, candidate, [], BODY)
+            candidate["extra"] += "x"
+            with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                history.validate_fresh_import(source, candidate, [], BODY)
+
+    def test_nested_aggregate_and_escaped_metadata_bounds(self):
+        for extra in (["x" * 300] * 4, "\\n" * 300):
+            candidate = copy.deepcopy(self.source)
+            candidate["extra"] = extra
+            with self.subTest(extra=type(extra)), mock.patch.object(history, "MAX_INPUT", 1024):
+                with self.assertRaisesRegex(history.HistoryError, "bound exceeded"):
+                    self.check(candidate)
+        candidate = copy.deepcopy(self.source)
+        candidate["extra"] = []
+        candidate["extra"].append(candidate["extra"])
+        with self.assertRaisesRegex(history.HistoryError, "cycle"):
+            self.check(candidate)
+
 
 class StrictInputs(unittest.TestCase):
     def test_history_schema_and_target_confusion(self):
