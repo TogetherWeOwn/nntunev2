@@ -284,14 +284,23 @@ mod tests {
 
     #[test]
     fn continuation_deadline_computation() {
-        assert_eq!(continuation_until(NOW, Some(180_000)), NOW + 180 + LEASE_TTL_SECS);
-        assert_eq!(continuation_until(NOW, Some(180_001)), NOW + 181 + LEASE_TTL_SECS);
+        assert_eq!(
+            continuation_until(NOW, Some(180_000)),
+            NOW + 180 + LEASE_TTL_SECS
+        );
+        assert_eq!(
+            continuation_until(NOW, Some(180_001)),
+            NOW + 181 + LEASE_TTL_SECS
+        );
         assert_eq!(continuation_until(NOW, Some(1)), NOW + 1 + LEASE_TTL_SECS);
         assert_eq!(continuation_until(NOW, None), NOW + 900);
         assert_eq!(continuation_until(NOW, Some(0)), NOW + 900);
         assert_eq!(continuation_until(u64::MAX - 1, Some(180_000)), u64::MAX);
         assert_eq!(continuation_until(u64::MAX, None), u64::MAX);
-        assert_eq!(continuation_until(NOW, Some(u64::MAX)), NOW + u64::MAX.div_ceil(1000) + LEASE_TTL_SECS);
+        assert_eq!(
+            continuation_until(NOW, Some(u64::MAX)),
+            NOW + u64::MAX.div_ceil(1000) + LEASE_TTL_SECS
+        );
     }
 
     #[test]

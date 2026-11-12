@@ -351,5 +351,8 @@ async fn unknown_id_falls_back_without_error() {
         meta.file_bytes,
     );
     assert_eq!(duration, None);
-    assert_eq!(nntune_api::playback::continuation_until(NOW, duration), NOW + 900);
+    assert_eq!(
+        nntune_api::playback::continuation_until(NOW, duration),
+        NOW + 900
+    );
 }
