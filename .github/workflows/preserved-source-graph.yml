@@ -1,0 +1,38 @@
+name: preserved-source synthetic graph
+
+# This is one qualification control, not an acquisition boundary or approval
+# to consume a preserved source. The fixture creates only local Git objects.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preserved-source-graph-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-graph:
+    name: Synthetic graph controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record tested head and Git version
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD
+          git --version
+      - name: Check workflow wiring
+        run: python3 .github/scripts/test_preserved_source_graph_workflow.py -v
+      - name: Exercise original graph and object refusal controls
+        run: >-
+          python3 .github/scripts/test_migrations_rename_check.py
+          GitFixture.test_preserved_source_requires_original_graph_and_data_objects -v

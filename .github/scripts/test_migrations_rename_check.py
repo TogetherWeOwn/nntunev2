@@ -191,6 +191,36 @@ class GitFixture(unittest.TestCase):
             history.verify_preserved_source(self.root, head, self.base, digest,
                                             budget=history.EvidenceBudget())
 
+    def test_preserved_source_requires_original_graph_and_data_objects(self):
+        self.git("checkout", "-qb", "side")
+        self.git("commit", "--allow-empty", "-qm", "side parent")
+        side = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.git("commit", "--allow-empty", "-qm", "intermediate")
+        intermediate = self.git("rev-parse", "HEAD")
+        self.git("merge", "--no-ff", "-qm", "merge", "side")
+        self.write("0001_original.sql")
+        head, digest = self.source_witness(self.entries())
+        expected = history.parse_manifest(manifest(self.entries()))
+        self.assertEqual(history.verify_preserved_source(
+            self.root, self.base, head, digest, budget=history.EvidenceBudget()), expected)
+
+        tree = self.git("rev-parse", f"{head}^{{tree}}")
+        blob = self.git("rev-parse", f"{head}:migrations/0001_original.sql")
+        # Remove one loose object at a time, restoring it before the next case.
+        # The intact graph above is the positive control for all failures.
+        for oid in (intermediate, side, tree, blob):
+            with self.subTest(missing=oid):
+                obj = self.root / ".git/objects" / oid[:2] / oid[2:]
+                data = obj.read_bytes()
+                try:
+                    obj.unlink()
+                    with self.assertRaises(history.HistoryError):
+                        history.verify_preserved_source(
+                            self.root, self.base, head, digest, budget=history.EvidenceBudget())
+                finally:
+                    obj.write_bytes(data)
+
     def test_preserved_source_rejects_mismatched_final_sql(self):
         self.write("0001_original.sql")
         entries = self.entries()
