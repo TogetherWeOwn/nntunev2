@@ -18,15 +18,18 @@ BEGIN;
 
 CREATE FUNCTION pg_temp.meter_meta(TEXT, TEXT)
 RETURNS TABLE (track_duration_ms INTEGER, track_mbid TEXT,
-               bitrate_kbps INTEGER, file_bytes BIGINT)
+               bitrate_kbps INTEGER, file_bytes BIGINT, occurrence_ambiguous BOOLEAN)
 LANGUAGE SQL AS $function$
     SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid,
      (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = $2
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     FROM tracks t WHERE t.id = $1::uuid;
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes,
+     (t.id <> $1::uuid AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = $1::uuid) > 1)
+     AS occurrence_ambiguous
+     FROM tracks t WHERE t.id = $1::uuid OR t.mbid = $1::uuid
+     ORDER BY (t.id = $1::uuid) DESC, t.id LIMIT 1;
 $function$;
 
 CREATE FUNCTION pg_temp.meter_mirror(TEXT)
@@ -43,6 +46,7 @@ DECLARE
     got_bitrate INTEGER;
     got_bytes BIGINT;
     row_count INTEGER;
+    ambiguous BOOLEAN;
 BEGIN
     INSERT INTO users (id, email, created_at)
     VALUES ('user-ms-1', 'ms-1@example.com', 1700000000),
@@ -81,7 +85,8 @@ BEGIN
            ('user-ms-2', '22222222-2222-2222-2222-222222222222', 'job_ms2', repeat('c', 64), 'flac', 320, 1700000300);
 
     -- Full ladder for user-ms-1.
-    SELECT * INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+    SELECT track_duration_ms, track_mbid, bitrate_kbps, file_bytes
+    INTO got_track_ms, got_mbid, got_bitrate, got_bytes
     FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-1');
     IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000 OR got_mbid IS DISTINCT FROM '33333333-3333-3333-3333-333333333333'
        OR got_bitrate IS DISTINCT FROM 128 OR got_bytes IS DISTINCT FROM 2000000 THEN
@@ -108,7 +113,8 @@ BEGIN
     END IF;
 
     -- A user with no media still gets the duration rungs, NULL below.
-    SELECT * INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+    SELECT track_duration_ms, track_mbid, bitrate_kbps, file_bytes
+    INTO got_track_ms, got_mbid, got_bitrate, got_bytes
     FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-3');
     IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000 OR got_mbid IS DISTINCT FROM '33333333-3333-3333-3333-333333333333'
        OR got_bitrate IS NOT NULL OR got_bytes IS NOT NULL THEN
@@ -117,12 +123,77 @@ BEGIN
     END IF;
 
     -- The bare track (NULL duration, no mbid, no media): one row, all NULL.
-    SELECT * INTO got_track_ms, got_mbid, got_bitrate, got_bytes
+    SELECT track_duration_ms, track_mbid, bitrate_kbps, file_bytes
+    INTO got_track_ms, got_mbid, got_bitrate, got_bytes
     FROM pg_temp.meter_meta('55555555-5555-5555-5555-555555555555', 'user-ms-1');
     IF NOT FOUND OR got_track_ms IS NOT NULL OR got_mbid IS NOT NULL
        OR got_bitrate IS NOT NULL OR got_bytes IS NOT NULL THEN
         RAISE EXCEPTION 'bare-track meta wrong: track=% mb=% kbps=% bytes=%',
             got_track_ms, got_mbid, got_bitrate, got_bytes;
+    END IF;
+
+    -- A unique recording resolves the artifact without ambiguity.
+    SELECT track_duration_ms, track_mbid, bitrate_kbps, file_bytes, occurrence_ambiguous
+    INTO got_track_ms, got_mbid, got_bitrate, got_bytes, ambiguous
+    FROM pg_temp.meter_meta('33333333-3333-3333-3333-333333333333', 'user-ms-1');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000
+       OR got_mbid IS DISTINCT FROM '33333333-3333-3333-3333-333333333333'
+       OR got_bitrate IS DISTINCT FROM 128 OR got_bytes IS DISTINCT FROM 2000000
+       OR ambiguous IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'unique recording metadata incorrect';
+    END IF;
+
+    -- Insert the larger occurrence first; a recording-only lookup must be
+    -- marked ambiguous irrespective of insertion order.
+    INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms)
+    VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            '44444444-4444-4444-4444-444444444444', 'Later occurrence', 1, 3, 240000),
+           ('99999999-9999-9999-9999-999999999999', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            '44444444-4444-4444-4444-444444444444', 'Earlier occurrence', 1, 4, 60000);
+    SELECT occurrence_ambiguous INTO ambiguous
+    FROM pg_temp.meter_meta('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'user-ms-1');
+    IF NOT FOUND OR ambiguous IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'shared recording was not marked ambiguous';
+    END IF;
+    SELECT track_duration_ms, occurrence_ambiguous INTO got_track_ms, ambiguous
+    FROM pg_temp.meter_meta('99999999-9999-9999-9999-999999999999', 'user-ms-1');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 60000 OR ambiguous IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'first exact occurrence did not retain its identity';
+    END IF;
+    SELECT track_duration_ms, occurrence_ambiguous INTO got_track_ms, ambiguous
+    FROM pg_temp.meter_meta('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'user-ms-1');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000 OR ambiguous IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'second exact occurrence did not retain its identity';
+    END IF;
+
+    -- A local ID takes precedence over a different track's recording MBID.
+    INSERT INTO tracks (id, mbid, release_id, title, medium_no, track_no, duration_ms)
+    VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', '22222222-2222-2222-2222-222222222222',
+            '44444444-4444-4444-4444-444444444444', 'Collision', 1, 5, 999000);
+    SELECT track_duration_ms, track_mbid, occurrence_ambiguous INTO got_track_ms, got_mbid, ambiguous
+    FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-1');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000
+       OR got_mbid IS DISTINCT FROM '33333333-3333-3333-3333-333333333333'
+       OR ambiguous IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'local ID lost to recording namespace collision';
+    END IF;
+
+    INSERT INTO mb_recording (mbid, title, duration_ms)
+    VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'Orphan recording', 61000);
+    SELECT count(*) INTO row_count
+    FROM pg_temp.meter_meta('dddddddd-dddd-dddd-dddd-dddddddddddd', 'user-ms-1');
+    IF row_count <> 0 THEN
+        RAISE EXCEPTION 'orphan recording unexpectedly matched an artifact';
+    END IF;
+    SELECT mb_duration_ms INTO got_mb_ms
+    FROM pg_temp.meter_mirror('dddddddd-dddd-dddd-dddd-dddddddddddd');
+    IF NOT FOUND OR got_mb_ms IS DISTINCT FROM 61000 THEN
+        RAISE EXCEPTION 'orphan recording mirror duration wrong: %', got_mb_ms;
+    END IF;
+    SELECT count(*) INTO row_count
+    FROM pg_temp.meter_mirror('66666666-6666-6666-6666-666666666666');
+    IF row_count <> 0 THEN
+        RAISE EXCEPTION 'unknown recording matched mirror';
     END IF;
 
     -- Unknown track: zero rows (the Rust side maps this to the

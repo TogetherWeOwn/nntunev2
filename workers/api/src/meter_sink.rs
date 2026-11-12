@@ -114,8 +114,9 @@ pub enum PlayWindowOutcome {
     Fenced,
 }
 
-/// App-side metadata for an exact local track id ($1) and user ($2).
-/// The caller's newest verified media supplies the artifact rungs;
+/// App-side metadata for a local track id or recording MBID ($1) and user ($2).
+/// Exact local ids take precedence. A recording-only match with multiple
+/// occurrences is ambiguous, so callers must suppress its artifact rungs.
 /// `track_mbid` is the nullable key for the separate mirror lookup.
 pub fn track_meter_meta_app_statement() -> &'static str {
     "SELECT t.duration_ms AS track_duration_ms, t.mbid::text AS track_mbid, \
@@ -123,8 +124,11 @@ pub fn track_meter_meta_app_statement() -> &'static str {
      ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps, \
      (SELECT c.byte_size FROM track_media m JOIN cache_objects c \
      ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2 \
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes \
-     FROM tracks t WHERE t.id = $1::uuid"
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes, \
+     (t.id <> $1::uuid AND (SELECT COUNT(*) FROM tracks t2 WHERE t2.mbid = $1::uuid) > 1) \
+     AS occurrence_ambiguous \
+     FROM tracks t WHERE t.id = $1::uuid OR t.mbid = $1::uuid \
+     ORDER BY (t.id = $1::uuid) DESC, t.id LIMIT 1"
 }
 
 /// Mirror-side recording duration for the recording MBID ($1).
@@ -365,11 +369,15 @@ mod tests {
         assert!(!app.contains("mb_recording"));
         assert!(app.contains("FROM tracks t WHERE t.id = $1::uuid"));
         assert!(app.contains("m.user_id = $2"));
+        assert!(app.contains("OR t.mbid = $1::uuid"));
+        assert!(app.contains("ORDER BY (t.id = $1::uuid) DESC, t.id LIMIT 1"));
+        assert!(app.contains("COUNT(*) FROM tracks t2 WHERE t2.mbid = $1::uuid"));
         for alias in [
             "track_duration_ms",
             "track_mbid",
             "bitrate_kbps",
             "file_bytes",
+            "occurrence_ambiguous",
         ] {
             assert!(app.contains(&format!("AS {alias}")), "{alias}");
         }

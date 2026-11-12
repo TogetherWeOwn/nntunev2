@@ -3024,19 +3024,33 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 let Some(row) = rows.first() else {
-                    return Ok(crate::meter_sink::TrackMeterMeta::default());
+                    return Ok(crate::meter_sink::TrackMeterMeta {
+                        mb_duration_ms: self.mb_duration_for(Some(track_id)).await?,
+                        ..Default::default()
+                    });
                 };
                 let u64_of_i32 = |v: Option<i32>| v.and_then(|v| u64::try_from(v).ok());
                 let u64_of_i64 = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
                 let track_mbid: Option<String> =
                     row.try_get("track_mbid").map_err(|_| StoreError)?;
+                let ambiguous: bool = row
+                    .try_get("occurrence_ambiguous")
+                    .map_err(|_| StoreError)?;
+                // A recording-only match cannot identify one of several artifacts.
+                let (track_duration_ms, bitrate_kbps, file_bytes) = if ambiguous {
+                    (None, None, None)
+                } else {
+                    (
+                        u64_of_i32(row.try_get("track_duration_ms").map_err(|_| StoreError)?),
+                        u64_of_i32(row.try_get("bitrate_kbps").map_err(|_| StoreError)?),
+                        u64_of_i64(row.try_get("file_bytes").map_err(|_| StoreError)?),
+                    )
+                };
                 Ok(crate::meter_sink::TrackMeterMeta {
-                    track_duration_ms: u64_of_i32(
-                        row.try_get("track_duration_ms").map_err(|_| StoreError)?,
-                    ),
+                    track_duration_ms,
                     mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
-                    bitrate_kbps: u64_of_i32(row.try_get("bitrate_kbps").map_err(|_| StoreError)?),
-                    file_bytes: u64_of_i64(row.try_get("file_bytes").map_err(|_| StoreError)?),
+                    bitrate_kbps,
+                    file_bytes,
                 })
             },
             TOTAL_TIMEOUT_MS,
