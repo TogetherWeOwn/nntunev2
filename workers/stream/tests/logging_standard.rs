@@ -493,6 +493,27 @@ fn has_ipv6_like_value(value: &str) -> bool {
     false
 }
 
+#[test]
+fn ipv6_value_detects_attached_delimiters() {
+    for value in [
+        "peer=2001:db8::1",
+        "peers=2001:db8::1,2001:db8::2",
+        "peer=::ffff:192.0.2.1;status=ok",
+        "https://[2001:db8::1]/path",
+        "connected to 2001:db8::1",
+    ] {
+        assert!(has_ipv6_like_value(value), "missed {value}");
+    }
+    for value in [
+        "peer=connected;status=ok",
+        "peers=2001:db8:::1,not-an-address",
+        "peer=2001:db8::1::2",
+        "https://[not-an-address]/path",
+    ] {
+        assert!(!has_ipv6_like_value(value), "unexpected IPv6 in {value}");
+    }
+}
+
 fn email_token_is_shaped(token: &str) -> bool {
     let token = token.trim().trim_matches(['.', ',', ';', ':', '!', '?']);
     let (local, domain) = match token.split_once('@') {
