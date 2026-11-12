@@ -9698,10 +9698,7 @@ mod tests {
                                 return false;
                             }
                         }
-                        if req.paid_only && invoice.status != "paid" {
-                            return false;
-                        }
-                        true
+                        !req.paid_only || invoice.status == "paid"
                     })
                     .cloned()
                     .collect())
