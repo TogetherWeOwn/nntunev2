@@ -7535,6 +7535,8 @@ mod tests {
                     row.paid_through_unix = existing.paid_through_unix;
                     row.plan_id = existing.plan_id.clone();
                     row.paid_invoice_id = existing.paid_invoice_id.clone();
+                } else if row.paid_invoice_id.is_none() {
+                    row.paid_invoice_id = existing.paid_invoice_id.clone();
                 }
                 if stale {
                     row.status = existing.status.clone();
@@ -8922,14 +8924,26 @@ mod tests {
                 return Err(StoreError);
             }
             let mut rows = self.billing_rows.borrow_mut();
-            let merged = merge_billing_row(rows.get(user_id), outcome);
-            if let Some(existing) = rows.get(user_id) {
+            let mut shadow = self.billing_shadow.borrow_mut();
+            let key = (
+                user_id.to_string(),
+                outcome.row.stripe_subscription_id.clone(),
+            );
+            let current = rows.get(user_id);
+            let stored = current
+                .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                .or_else(|| shadow.get(&key));
+            let merged = merge_billing_row(stored, outcome);
+            if let Some(existing) = current {
                 if existing.stripe_subscription_id != merged.stripe_subscription_id {
-                    self.billing_shadow.borrow_mut().insert(
+                    shadow.insert(
                         (user_id.to_string(), existing.stripe_subscription_id.clone()),
                         existing.clone(),
                     );
                 }
+            }
+            if let Some(retained) = shadow.get_mut(&key) {
+                *retained = merged.clone();
             }
             rows.insert(user_id.to_string(), merged);
             let mut history = self.invoice_history.borrow_mut();
@@ -11343,6 +11357,179 @@ mod tests {
             "canceled"
         );
         assert_eq!(shadow.len(), 2);
+    }
+
+    #[test]
+    fn billing_shadow_retains_rows_across_repeated_displacement() {
+        let h = stripe_harness();
+        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let mut b = stored_seed(PLAN_PLUS, "canceled", None, None, None);
+        b.row.stripe_subscription_id = "sub_other".to_string();
+        let mut other = a.clone();
+        other.row.stripe_subscription_id = "sub_user_2".to_string();
+        other.row.paid_through_unix = Some(999);
+        let put = |user: &str, outcome: &crate::billing_reconcile::ReconcileOutcome| {
+            block_on(h.store.store_reconcile_outcome(user, outcome)).unwrap();
+        };
+        let key = ("u1".to_string(), "sub_test_1".to_string());
+        put("u1", &a);
+        put("u2", &other);
+        put("u1", &b);
+        assert!(live_for(&h, "u1").is_none());
+        let before_rows = h.store.billing_rows.borrow().clone();
+        let before_shadow = h.store.billing_shadow.borrow().clone();
+        let before_history = h.store.invoice_history.borrow().clone();
+        *h.store.fail_billing.borrow_mut() = true;
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &a)).is_err());
+        *h.store.fail_billing.borrow_mut() = false;
+        assert_eq!(*h.store.billing_rows.borrow(), before_rows);
+        assert_eq!(*h.store.billing_shadow.borrow(), before_shadow);
+        assert_eq!(*h.store.invoice_history.borrow(), before_history);
+        let mut stale = a.clone();
+        stale.row.paid_through_unix = Some(50);
+        stale.row.status = "incomplete_expired".to_string();
+        let mut expected = stale.row.clone();
+        expected.paid_through_unix = a.row.paid_through_unix;
+        expected.paid_invoice_id = a.row.paid_invoice_id.clone();
+        expected.plan_id = a.row.plan_id.clone();
+        expected.status = a.row.status.clone();
+        expected.grace_until_unix = a.row.grace_until_unix;
+        for _ in 0..2 {
+            put("u1", &stale);
+            assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
+            assert_eq!(h.store.billing_shadow.borrow()[&key], expected);
+            assert!(live_for(&h, "u1").is_none());
+            put("u1", &b);
+            assert_eq!(h.store.billing_rows.borrow()["u1"], b.row);
+            assert_eq!(h.store.billing_shadow.borrow()[&key], expected);
+        }
+        let mut advanced = a.clone();
+        advanced.row.paid_through_unix = Some(150);
+        advanced.row.plan_id = PLAN_PRO.to_string();
+        advanced.row.paid_invoice_id = Some("in_150".to_string());
+        put("u1", &advanced);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        advanced.row.paid_through_unix = Some(200);
+        advanced.row.paid_invoice_id = Some("in_200".to_string());
+        put("u1", &advanced);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        put("u1", &b);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], b.row);
+        put("u1", &a);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        assert_eq!(h.store.billing_rows.borrow()["u2"], other.row);
+
+        // A directly seeded current row wins over a disagreeing shadow copy.
+        let mut seeded = advanced.row.clone();
+        seeded.paid_through_unix = Some(120);
+        h.store
+            .billing_rows
+            .borrow_mut()
+            .insert("u1".into(), seeded.clone());
+        put("u1", &a);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seeded);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], seeded);
+
+        // The projection filter is unchanged, but retained status changes its result.
+        for (stored_status, incoming_status, visible) in
+            [("active", "canceled", true), ("canceled", "active", false)]
+        {
+            let h = stripe_harness();
+            let stored = stored_seed(PLAN_PLUS, stored_status, Some(100), Some("in_100"), None);
+            let mut incoming = stored.clone();
+            incoming.row.status = incoming_status.into();
+            incoming.row.paid_through_unix = Some(50);
+            for outcome in [&stored, &b, &incoming] {
+                block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
+            }
+            assert_eq!(h.store.billing_rows.borrow()["u1"], stored.row);
+            assert_eq!(live_for(&h, "u1").is_some(), visible);
+        }
+    }
+
+    #[test]
+    fn billing_shadow_matches_existing_upsert_field_guards() {
+        for case in [
+            "valid",
+            "shared",
+            "read-plan",
+            "read-anchor",
+            "no-anchor",
+            "null-end",
+            "first-end",
+            "advance-null-anchor",
+        ] {
+            let h = stripe_harness();
+            let mut stored =
+                stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_old"), Some(10));
+            if case == "first-end" {
+                stored.row.paid_through_unix = None;
+            }
+            let mut replacement = stored.clone();
+            replacement.row.stripe_subscription_id = "sub_other".into();
+            replacement.row.status = "canceled".into();
+            let mut incoming = stored_seed(
+                PLAN_PRO,
+                "incomplete_expired",
+                Some(100),
+                Some("in_new"),
+                Some(20),
+            );
+            incoming.row.stripe_customer_id = "cus_new".into();
+            incoming.row.stripe_item_id = "si_new".into();
+            incoming.row.stripe_price_id = "price_new".into();
+            incoming.row.current_period_end_unix = Some(200);
+            incoming.row.cancel_at_period_end = true;
+            incoming.read_plan = Some(PLAN_PLUS.into());
+            incoming.read_anchor = Some("in_old".into());
+            match case {
+                "shared" => incoming.row.paid_invoice_id = Some("in_old".into()),
+                "read-plan" => incoming.read_plan = Some(PLAN_PRO.into()),
+                "read-anchor" => incoming.read_anchor = Some("in_wrong".into()),
+                "no-anchor" | "advance-null-anchor" => incoming.row.paid_invoice_id = None,
+                "null-end" => incoming.row.paid_through_unix = None,
+                _ => {}
+            }
+            if case == "advance-null-anchor" {
+                incoming.row.paid_through_unix = Some(150);
+            }
+            let mut expected = incoming.row.clone();
+            if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+                expected.paid_through_unix = stored.row.paid_through_unix;
+                expected.plan_id = stored.row.plan_id.clone();
+                expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
+            } else if case == "advance-null-anchor" {
+                expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
+            }
+            if case == "no-anchor" {
+                expected.status = stored.row.status.clone();
+                expected.grace_until_unix = stored.row.grace_until_unix;
+            }
+            for outcome in [&stored, &replacement, &incoming] {
+                block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
+            }
+            let key = ("u1".to_string(), "sub_test_1".to_string());
+            assert_eq!(
+                h.store.billing_rows.borrow()["u1"],
+                expected,
+                "{case} current"
+            );
+            assert_eq!(
+                h.store.billing_shadow.borrow()[&key],
+                expected,
+                "{case} retained"
+            );
+            if case == "advance-null-anchor" {
+                let fresh = stripe_harness();
+                for outcome in [&stored, &incoming] {
+                    block_on(fresh.store.store_reconcile_outcome("u1", outcome)).unwrap();
+                }
+                assert_eq!(fresh.store.billing_rows.borrow()["u1"], expected, "same-ID");
+            }
+        }
     }
 
     #[test]

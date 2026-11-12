@@ -560,3 +560,186 @@ async fn setup_snapshots_and_live_selection_are_isolated() {
     assert!(fx.live("missing").await.is_none());
     fx.cleanup().await;
 }
+
+#[tokio::test]
+async fn retained_subscription_rows_follow_existing_upsert_guards() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    // A and B are outside the live-slot index; fake displacement is not SQL selection.
+    let mut a = fx.fold("u1", &remote("sub_test_1", &[])).await;
+    a.history.clear();
+    a.row.stripe_customer_id = "cus_test_1".into();
+    a.row.stripe_item_id = "si_test_1".into();
+    a.row.stripe_price_id = PRICE.into();
+    a.row.plan_id = "plus".into();
+    a.read_plan = None;
+    a.read_anchor = None;
+    a.row.current_period_end_unix = Some(1_700_000_000 + P);
+    a.row.status = "canceled".into();
+    a.row.paid_through_unix = Some(100);
+    a.row.paid_invoice_id = Some("in_100".into());
+    a.row.grace_until_unix = Some(10);
+    let mut b = a.clone();
+    b.row.stripe_subscription_id = "sub_other".into();
+    b.row.paid_through_unix = None;
+    b.row.paid_invoice_id = None;
+    b.row.grace_until_unix = None;
+    fx.put("u1", &a).await;
+    let mut other = a.clone();
+    other.row.stripe_subscription_id = "sub_user_2".into();
+    other.row.paid_through_unix = Some(999);
+    fx.put("u2", &other).await;
+    let other = fx.snap("sub_user_2").await.unwrap();
+    fx.put("u1", &b).await;
+    let mut expected = Snap {
+        user_id: "u1".into(),
+        customer: "cus_test_1".into(),
+        item: "si_test_1".into(),
+        price: PRICE.into(),
+        plan: "plus".into(),
+        status: "canceled".into(),
+        period_end: Some(1_700_000_000 + P),
+        cancel: false,
+        paid_through: Some(100),
+        anchor: Some("in_100".into()),
+        grace: Some(10),
+    };
+    let expected_b = Snap {
+        user_id: "u1".into(),
+        customer: "cus_test_1".into(),
+        item: "si_test_1".into(),
+        price: PRICE.into(),
+        plan: "plus".into(),
+        status: "canceled".into(),
+        period_end: Some(1_700_000_000 + P),
+        cancel: false,
+        paid_through: None,
+        anchor: None,
+        grace: None,
+    };
+    assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    let mut stale = a.clone();
+    stale.row.paid_through_unix = Some(50);
+    stale.row.status = "incomplete_expired".into();
+    for _ in 0..2 {
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+        fx.put("u1", &b).await;
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+        assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    }
+    let mut advanced = a.clone();
+    advanced.row.plan_id = "pro".into();
+    for end in [150, 200] {
+        advanced.row.paid_through_unix = Some(end);
+        advanced.row.paid_invoice_id = Some(format!("in_{end}"));
+        fx.put("u1", &advanced).await;
+        expected.plan = "pro".into();
+        expected.paid_through = Some(end);
+        expected.anchor = Some(format!("in_{end}"));
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    }
+    fx.put("u1", &b).await;
+    fx.put("u1", &a).await;
+    assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    assert_eq!(fx.history_rows("sub_test_1").await, 0);
+    assert_eq!(fx.rows("u1").await, 2);
+
+    // The same named write-boundary cases are exercised by the handler test.
+    for case in [
+        "valid",
+        "shared",
+        "read-plan",
+        "read-anchor",
+        "no-anchor",
+        "null-end",
+        "first-end",
+        "advance-null-anchor",
+    ] {
+        let sub = format!("sub_{case}");
+        let mut stored = fx.fold("u1", &remote(&sub, &[])).await;
+        stored.history.clear();
+        stored.row.stripe_customer_id = "cus_test_1".into();
+        stored.row.stripe_item_id = "si_test_1".into();
+        stored.row.stripe_price_id = PRICE.into();
+        stored.row.cancel_at_period_end = false;
+        stored.row.current_period_end_unix = Some(1_700_000_000 + P);
+        stored.read_plan = None;
+        stored.read_anchor = None;
+        stored.row.status = "canceled".into();
+        stored.row.plan_id = "plus".into();
+        stored.row.paid_through_unix = if case == "first-end" { None } else { Some(100) };
+        stored.row.paid_invoice_id = Some("in_old".into());
+        stored.row.grace_until_unix = Some(10);
+        fx.put("u1", &stored).await;
+        let mut replacement = stored.clone();
+        replacement.row.stripe_subscription_id = format!("replacement_{case}");
+        fx.put("u1", &replacement).await;
+        let replacement_before = fx.snap(&replacement.row.stripe_subscription_id).await;
+
+        let mut incoming = stored.clone();
+        incoming.row.status = "incomplete_expired".into();
+        incoming.row.plan_id = "pro".into();
+        incoming.row.paid_through_unix = Some(100);
+        incoming.row.paid_invoice_id = Some("in_new".into());
+        incoming.row.grace_until_unix = Some(20);
+        incoming.row.stripe_customer_id = "cus_new".into();
+        incoming.row.stripe_item_id = "si_new".into();
+        incoming.row.stripe_price_id = "price_new".into();
+        incoming.row.current_period_end_unix = Some(200);
+        incoming.row.cancel_at_period_end = true;
+        incoming.read_plan = Some("plus".into());
+        incoming.read_anchor = Some("in_old".into());
+        match case {
+            "shared" => incoming.row.paid_invoice_id = Some("in_old".into()),
+            "read-plan" => incoming.read_plan = Some("pro".into()),
+            "read-anchor" => incoming.read_anchor = Some("in_wrong".into()),
+            "no-anchor" | "advance-null-anchor" => incoming.row.paid_invoice_id = None,
+            "null-end" => incoming.row.paid_through_unix = None,
+            _ => {}
+        }
+        if case == "advance-null-anchor" {
+            incoming.row.paid_through_unix = Some(150);
+        }
+        fx.put("u1", &incoming).await;
+        let mut expected = Snap {
+            user_id: "u1".into(),
+            customer: "cus_new".into(),
+            item: "si_new".into(),
+            price: "price_new".into(),
+            plan: "pro".into(),
+            status: "incomplete_expired".into(),
+            period_end: Some(200),
+            cancel: true,
+            paid_through: Some(100),
+            anchor: Some("in_new".into()),
+            grace: Some(20),
+        };
+        if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+            expected.plan = "plus".into();
+            expected.anchor = Some("in_old".into());
+        } else if case == "shared" || case == "advance-null-anchor" {
+            expected.anchor = Some("in_old".into());
+        }
+        if case == "no-anchor" {
+            expected.status = "canceled".into();
+            expected.grace = Some(10);
+        }
+        if case == "advance-null-anchor" {
+            expected.paid_through = Some(150);
+        }
+        assert_eq!(fx.snap(&sub).await, Some(expected), "{case}");
+        assert_eq!(
+            fx.snap(&replacement.row.stripe_subscription_id).await,
+            replacement_before,
+            "{case} replacement"
+        );
+        assert_eq!(fx.history_rows(&sub).await, 0, "{case}");
+    }
+    assert_eq!(fx.snap("sub_user_2").await, Some(other));
+    assert_eq!(fx.rows("u2").await, 1);
+    fx.cleanup().await;
+}
