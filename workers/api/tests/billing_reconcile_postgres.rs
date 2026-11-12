@@ -186,7 +186,8 @@ impl Fx {
             live: self.live(user).await,
             bindings: bindings(),
         };
-        reconcile_subscription(&input, remote, T)
+        // Observe after the second invoice is paid, before its period ends.
+        reconcile_subscription(&input, remote, T + P + 1)
     }
 
     async fn try_put(
