@@ -5,8 +5,8 @@
 -- leaves no rows; any broken expectation RAISEs and (with
 -- ON_ERROR_STOP) fails the run.
 --
--- The SELECT below mirrors the Rust statement with literals standing
--- in for the $n parameters (track id as UUID text, user id). It pins:
+-- The function below mirrors the Rust statement's $n parameters
+-- (track id as UUID text, user id). It pins:
 -- the two duration rungs read straight off tracks / mb_recording; the
 -- bitrate and file-size rungs pick the CALLER's most recently verified
 -- media row (another user's newer row must not leak in); a track with
@@ -15,6 +15,20 @@
 -- error).
 
 BEGIN;
+
+CREATE FUNCTION pg_temp.meter_meta(TEXT, TEXT)
+RETURNS TABLE (track_duration_ms INTEGER, mb_duration_ms INTEGER,
+               bitrate_kbps INTEGER, file_bytes BIGINT)
+LANGUAGE SQL AS $function$
+    SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms,
+     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = $2
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
+     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
+     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = $2
+     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
+     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid
+     WHERE t.id = $1::uuid;
+$function$;
 
 DO $$
 DECLARE
@@ -60,61 +74,34 @@ BEGIN
            ('user-ms-1', '22222222-2222-2222-2222-222222222222', 'job_ms1', repeat('b', 64), 'flac', 128, 1700000200),
            ('user-ms-2', '22222222-2222-2222-2222-222222222222', 'job_ms2', repeat('c', 64), 'flac', 320, 1700000300);
 
-    -- Full ladder for user-ms-1: the exact Rust statement, literals
-    -- inlined for $1 (track id) and $2 (user id).
-    SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms,
-     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
-     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
-     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
-     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid
-     WHERE t.id = '22222222-2222-2222-2222-222222222222'::uuid;
-    IF NOT FOUND OR got_track_ms <> 240000 OR got_mb_ms <> 241000
-       OR got_bitrate <> 128 OR got_bytes <> 2000000 THEN
+    -- Full ladder for user-ms-1.
+    SELECT * INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
+    FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-1');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000 OR got_mb_ms IS DISTINCT FROM 241000
+       OR got_bitrate IS DISTINCT FROM 128 OR got_bytes IS DISTINCT FROM 2000000 THEN
         RAISE EXCEPTION 'full-ladder meta wrong: track=% mb=% kbps=% bytes=%',
             got_track_ms, got_mb_ms, got_bitrate, got_bytes;
     END IF;
 
     -- user-ms-2 sees their own newest media.
-    SELECT (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-2'
-            ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1),
-           (SELECT c.byte_size FROM track_media m JOIN cache_objects c
-            ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-2'
-            ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1)
-    INTO got_bitrate, got_bytes
-    FROM tracks t WHERE t.id = '22222222-2222-2222-2222-222222222222'::uuid;
-    IF got_bitrate <> 320 OR got_bytes <> 3000000 THEN
+    SELECT bitrate_kbps, file_bytes INTO got_bitrate, got_bytes
+    FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-2');
+    IF NOT FOUND OR got_bitrate IS DISTINCT FROM 320 OR got_bytes IS DISTINCT FROM 3000000 THEN
         RAISE EXCEPTION 'second-user media rungs wrong: kbps=% bytes=%', got_bitrate, got_bytes;
     END IF;
 
     -- A user with no media still gets the duration rungs, NULL below.
-    SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms,
-     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-3'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
-     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
-     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-3'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
-     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid
-     WHERE t.id = '22222222-2222-2222-2222-222222222222'::uuid;
-    IF NOT FOUND OR got_track_ms <> 240000 OR got_mb_ms <> 241000
+    SELECT * INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
+    FROM pg_temp.meter_meta('22222222-2222-2222-2222-222222222222', 'user-ms-3');
+    IF NOT FOUND OR got_track_ms IS DISTINCT FROM 240000 OR got_mb_ms IS DISTINCT FROM 241000
        OR got_bitrate IS NOT NULL OR got_bytes IS NOT NULL THEN
         RAISE EXCEPTION 'no-media meta wrong: track=% mb=% kbps=% bytes=%',
             got_track_ms, got_mb_ms, got_bitrate, got_bytes;
     END IF;
 
     -- The bare track (NULL duration, no mbid, no media): one row, all NULL.
-    SELECT t.duration_ms AS track_duration_ms, r.duration_ms AS mb_duration_ms,
-     (SELECT m.bitrate FROM track_media m WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS bitrate_kbps,
-     (SELECT c.byte_size FROM track_media m JOIN cache_objects c
-     ON c.content_hash = m.content_hash WHERE m.track_id = t.id AND m.user_id = 'user-ms-1'
-     ORDER BY m.verified_at DESC, m.content_hash ASC LIMIT 1) AS file_bytes
-     INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
-     FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid
-     WHERE t.id = '55555555-5555-5555-5555-555555555555'::uuid;
+    SELECT * INTO got_track_ms, got_mb_ms, got_bitrate, got_bytes
+    FROM pg_temp.meter_meta('55555555-5555-5555-5555-555555555555', 'user-ms-1');
     IF NOT FOUND OR got_track_ms IS NOT NULL OR got_mb_ms IS NOT NULL
        OR got_bitrate IS NOT NULL OR got_bytes IS NOT NULL THEN
         RAISE EXCEPTION 'bare-track meta wrong: track=% mb=% kbps=% bytes=%',
@@ -124,8 +111,7 @@ BEGIN
     -- Unknown track: zero rows (the Rust side maps this to the
     -- all-None meta and meters on the fallback rung).
     SELECT count(*) INTO row_count
-    FROM tracks t LEFT JOIN mb_recording r ON r.mbid = t.mbid
-    WHERE t.id = '66666666-6666-6666-6666-666666666666'::uuid;
+    FROM pg_temp.meter_meta('66666666-6666-6666-6666-666666666666', 'user-ms-1');
     IF row_count <> 0 THEN
         RAISE EXCEPTION 'unknown track matched % rows', row_count;
     END IF;
