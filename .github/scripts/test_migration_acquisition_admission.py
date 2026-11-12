@@ -243,6 +243,9 @@ class SyntheticBaseSelection(GitCase):
         proposal = admission.Declaration(**original)
         selected = admission.check_synthetic_base_declaration(git, pinned_base, proposal)
         self.assertEqual(selected, proposal)
+        tree_id = self.git("rev-parse", f"{pinned_base}^{{tree}}")
+        with self.assertRaisesRegex(history.HistoryError, "invalid synthetic fixture base"):
+            admission.check_synthetic_base_declaration(git, tree_id, proposal)
         with self.assertRaises(history.HistoryError):
             admission.check_synthetic_base_declaration(git, pinned_base,
                                                        admission.Declaration(**changed))

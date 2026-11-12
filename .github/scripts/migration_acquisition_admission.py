@@ -64,6 +64,8 @@ def check_synthetic_base_declaration(git, fixture_base, proposed_declaration):
     """
     if not isinstance(fixture_base, str) or not COMMIT_RE.fullmatch(fixture_base):
         raise HistoryError("invalid synthetic fixture base")
+    if git("cat-file", "-t", fixture_base, limit=128).strip() != b"commit":
+        raise HistoryError("invalid synthetic fixture base")
     tree = git("ls-tree", "-z", fixture_base, "--", SYNTHETIC_DECLARATION_PATH,
                limit=1024)
     parts = tree.split(b"\t", 1)
