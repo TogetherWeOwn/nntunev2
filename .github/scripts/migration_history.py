@@ -145,6 +145,8 @@ def bounded_metadata_json(value):
             add(len(item) + 2)
             for start in range(0, len(item), 4096):
                 chunk = item[start:start + 4096]
+                if any(0xD800 <= ord(char) <= 0xDFFF for char in chunk):
+                    raise HistoryError("import metadata contains non-scalar Unicode")
                 add(len(json.dumps(chunk, ensure_ascii=True)) - 2 - len(chunk))
         elif isinstance(item, (dict, list)):
             identity = id(item)
@@ -190,6 +192,11 @@ def validate_fresh_import(source, candidate, baseline, sql_bytes):
     validate_entries([source])
     if not isinstance(baseline, list):
         raise HistoryError("baseline must be a list of entries")
+    if len(baseline) >= MAX_FILES:
+        raise HistoryError("migration entry bound exceeded")
+    # Bound aggregate baseline data, including aliases, before copying or
+    # handing it to the shared validators which traverse those lists.
+    bounded_metadata_json(baseline)
     validate_entries(baseline + [candidate])
     if source_json != candidate_json:
         raise HistoryError("import metadata differs from source")
