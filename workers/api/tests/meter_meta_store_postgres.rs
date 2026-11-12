@@ -10,6 +10,7 @@ use tokio_postgres::{Client, Config, NoTls};
 const USER: &str = "u1";
 const LOCAL_TRACK: &str = "22222222-2222-2222-2222-222222222222";
 const SHORT_RECORDING: &str = "33333333-3333-3333-3333-333333333333";
+const NOW: u64 = 1_700_000_000;
 
 async fn connect(var: &str, dbname: &str) -> Client {
     let config: Config = std::env::var(var)
@@ -148,14 +149,16 @@ async fn recording_mbid_resolves_artifact_and_short_mirror() {
     assert_eq!(meta.mb_duration_ms, Some(61_000));
     assert_eq!(meta.bitrate_kbps, Some(128));
     assert_eq!(meta.file_bytes, Some(2_000_000));
+    let duration = nntune_api::ledger::resolve_duration_ms(
+        meta.track_duration_ms,
+        meta.mb_duration_ms,
+        meta.bitrate_kbps,
+        meta.file_bytes,
+    );
+    assert_eq!(duration, Some(60_000));
     assert_eq!(
-        nntune_api::ledger::resolve_duration_ms(
-            meta.track_duration_ms,
-            meta.mb_duration_ms,
-            meta.bitrate_kbps,
-            meta.file_bytes,
-        ),
-        Some(60_000)
+        nntune_api::playback::continuation_until(NOW, duration),
+        NOW + 60 + nntune_api::playback::LEASE_TTL_SECS
     );
 }
 
@@ -207,14 +210,16 @@ async fn long_recording_never_falls_back_to_900() {
     assert_eq!(meta.mb_duration_ms, Some(1_500_000));
     assert_eq!(meta.bitrate_kbps, None);
     assert_eq!(meta.file_bytes, None);
+    let duration = nntune_api::ledger::resolve_duration_ms(
+        meta.track_duration_ms,
+        meta.mb_duration_ms,
+        meta.bitrate_kbps,
+        meta.file_bytes,
+    );
+    assert_eq!(duration, Some(1_500_000));
     assert_eq!(
-        nntune_api::ledger::resolve_duration_ms(
-            meta.track_duration_ms,
-            meta.mb_duration_ms,
-            meta.bitrate_kbps,
-            meta.file_bytes,
-        ),
-        Some(1_500_000)
+        nntune_api::playback::continuation_until(NOW, duration),
+        NOW + 1500 + nntune_api::playback::LEASE_TTL_SECS
     );
 }
 
@@ -254,6 +259,19 @@ async fn shared_recording_suppresses_artifacts_but_exact_occurrences_do_not() {
         assert_eq!(meta.mb_duration_ms, Some(120_000));
         assert_eq!(meta.bitrate_kbps, bitrate);
         assert_eq!(meta.file_bytes, bytes);
+        if id == recording {
+            let duration = nntune_api::ledger::resolve_duration_ms(
+                meta.track_duration_ms,
+                meta.mb_duration_ms,
+                meta.bitrate_kbps,
+                meta.file_bytes,
+            );
+            assert_eq!(duration, Some(120_000));
+            assert_eq!(
+                nntune_api::playback::continuation_until(NOW, duration),
+                NOW + 120 + nntune_api::playback::LEASE_TTL_SECS
+            );
+        }
     }
 }
 
@@ -326,4 +344,12 @@ async fn unknown_id_falls_back_without_error() {
         .unwrap();
     assert_eq!(meta, nntune_api::meter_sink::TrackMeterMeta::default());
     assert_eq!(attempts.get(), 1);
+    let duration = nntune_api::ledger::resolve_duration_ms(
+        meta.track_duration_ms,
+        meta.mb_duration_ms,
+        meta.bitrate_kbps,
+        meta.file_bytes,
+    );
+    assert_eq!(duration, None);
+    assert_eq!(nntune_api::playback::continuation_until(NOW, duration), NOW + 900);
 }

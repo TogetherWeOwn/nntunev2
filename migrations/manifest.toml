@@ -197,3 +197,11 @@ sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
 file = "0040_ingest_audio_classifications.sql"
 target = "app"
 sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
+
+[[migration]]
+file = "0041_playback_continuation_deadline.sql"
+target = "app"
+sha256 = "32a54747105ae8a3be1e0edf17c9ac8d81e2714805fb9dc89098d23f8fea50fb"
+renamed_from = [
+  { file = "0037_playback_continuation_deadline.sql", sha256 = "32a54747105ae8a3be1e0edf17c9ac8d81e2714805fb9dc89098d23f8fea50fb" },
+]

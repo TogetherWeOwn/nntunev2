@@ -186,6 +186,23 @@ VALUES ('mdl-user', 'sess-1', 'track-1', 'play-1', 1, 1761955245, 1761955200);
 
 DO $$
 BEGIN
+    -- Migration 0041 preserves the legacy insert shape with a zero deadline.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'playback_leases'
+          AND column_name = 'continuation_until' AND data_type = 'bigint'
+          AND is_nullable = 'NO' AND column_default IS NOT NULL) THEN
+        RAISE EXCEPTION 'continuation deadline column has wrong shape';
+    END IF;
+    IF (SELECT continuation_until FROM playback_leases WHERE user_id = 'mdl-user') IS DISTINCT FROM 0 THEN
+        RAISE EXCEPTION 'legacy lease insert must default continuation deadline to zero';
+    END IF;
+    BEGIN
+        UPDATE playback_leases SET continuation_until = -1 WHERE user_id = 'mdl-user';
+        RAISE EXCEPTION 'negative continuation deadline was accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
     BEGIN
         INSERT INTO playback_leases
             (user_id, session_id, track_id, play_id, epoch, expires_at,
