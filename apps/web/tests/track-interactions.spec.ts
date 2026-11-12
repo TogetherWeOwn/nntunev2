@@ -24,6 +24,46 @@ const libraryRow = (page: Page, id: string) => page.locator(`[data-testid="libra
 const queueRow = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 const menu = (page: Page) => page.getByTestId(TESTIDS.trackContextMenu);
 
+async function startFocusJournal(page: Page) {
+	await page.evaluate(() => {
+		const entries: object[] = [];
+		let sequence = 0;
+		const identity = (node: EventTarget | null) => {
+			if (node === document) return 'document';
+			if (node === window) return 'window';
+			if (!(node instanceof Element)) return 'other';
+			return node.getAttribute('data-testid') || node.tagName.toLowerCase();
+		};
+		const record = (type: string, target: EventTarget | null) => {
+			if (entries.length >= 250) return;
+			const element = target instanceof Element ? target : null;
+			entries.push({ sequence: ++sequence, time: performance.now(), type, target: identity(target),
+				active: identity(document.activeElement), menu: !!document.querySelector('[data-testid="track-context-menu"]'),
+				x: window.scrollX, y: window.scrollY, targetScroll: element && [element.scrollLeft, element.scrollTop] });
+		};
+		for (const type of ['scroll', 'pointerdown', 'mousedown', 'focusout', 'focusin', 'pointerup', 'mouseup', 'click']) {
+			window.addEventListener(type, (event) => record(type, event.target), { capture: true, passive: true });
+		}
+		new MutationObserver((records) => {
+			for (const mutation of records) for (const node of mutation.removedNodes) {
+				if (node instanceof Element && (node.matches('[data-testid="track-context-menu"]') || node.querySelector('[data-testid="track-context-menu"]'))) record('menu-removed', node);
+			}
+		}).observe(document, { childList: true, subtree: true });
+		Object.assign(window, { focusJournal: entries, focusCheckpoint: (name: string) => record(name, document.activeElement) });
+	});
+}
+
+async function focusCheckpoint(page: Page, name: string) {
+	await page.evaluate((label) => (window as unknown as { focusCheckpoint: (label: string) => void }).focusCheckpoint(label), name);
+}
+
+async function attachFocusJournal(page: Page, testInfo: import('@playwright/test').TestInfo) {
+	const journal = await page.evaluate(() => (window as unknown as { focusJournal: object[] }).focusJournal);
+	await testInfo.attach('focus-event-journal', { body: JSON.stringify(journal, null, 2), contentType: 'application/json' });
+	// CI retains test-result attachments on failure only; keep passing journals in the job log.
+	console.log(JSON.stringify({ test: testInfo.title, focusEventJournal: journal }));
+}
+
 async function queueAll(page: Page) {
 	for (const item of ITEMS) await libraryRow(page, item.id).locator('.nt-library-row').click();
 	await expect(page.getByTestId('queue-item')).toHaveCount(ITEMS.length);
@@ -67,7 +107,7 @@ test('More, right-click and keyboard menus share actions, navigation and return 
 	await expect(page.locator('audio[src]:not([src=""])')).toHaveCount(0);
 });
 
-test('Copy link is inline, restores focus and preserves whole-menu dismissal', async ({ page }) => {
+test('Copy link is inline, restores focus and preserves whole-menu dismissal', async ({ page }, testInfo) => {
 	await page.addInitScript(() => {
 		Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (url: string) => {
 			(window as unknown as { copiedLink: string }).copiedLink = url;
@@ -88,11 +128,110 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 	await page.keyboard.press('Tab');
 	await expect(menu(page)).toHaveCount(0);
 	await expect(page.locator('body')).not.toBeFocused();
-	await more.click();
-	await page.getByRole('heading', { name: 'Library', exact: true }).click();
-	await expect(menu(page)).toHaveCount(0);
-	await expect(more).toBeFocused();
+	await startFocusJournal(page);
+	try {
+		await more.click();
+		await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+		await focusCheckpoint(page, 'before-heading-click');
+		await page.getByRole('heading', { name: 'Library', exact: true }).click();
+		await focusCheckpoint(page, 'after-heading-click');
+		await expect(menu(page)).toHaveCount(0);
+		await expect(more).toBeFocused();
+	} finally {
+		await attachFocusJournal(page, testInfo);
+	}
 });
+
+for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'outside-focus', 'scroll-then-focus', 'explicit-focus', 'scroll-then-explicit-focus'] as const) {
+	test(`track menu focus contract: ${scenario}`, async ({ page }, testInfo) => {
+		await page.setViewportSize({ width: 1280, height: 1000 });
+		await seed(page);
+		// Ensure a real document scroll is available without changing the controls under test.
+		await page.evaluate(() => {
+			const spacer = document.createElement('div');
+			spacer.dataset.testid = 'focus-scroll-spacer';
+			spacer.style.height = '1200px';
+			document.body.append(spacer);
+		});
+		const more = libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+		const heading = page.getByRole('heading', { name: 'Library', exact: true });
+		const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+		await heading.scrollIntoViewIfNeeded();
+		await more.scrollIntoViewIfNeeded();
+		await startFocusJournal(page);
+		try {
+			let baseline: string | null = null;
+			let coordinates: { x: number; y: number } | null = null;
+			if (scenario === 'scroll-then-click') {
+				await page.evaluate(() => window.scrollBy(0, 40));
+				await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(40);
+				await more.evaluate((node: HTMLElement) => node.focus({ preventScroll: true }));
+				await expect(more).toBeFocused();
+				expect(await page.evaluate(() => window.scrollY)).toBe(40);
+				const box = await heading.boundingBox();
+				expect(box).not.toBeNull();
+				coordinates = { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 };
+				await focusCheckpoint(page, 'baseline-before-click');
+				await page.mouse.click(coordinates.x, coordinates.y);
+				baseline = await page.evaluate(() => document.activeElement?.getAttribute('data-testid') || document.activeElement?.tagName || null);
+				await focusCheckpoint(page, 'baseline-after-click');
+				await page.evaluate(() => window.scrollTo(0, 0));
+				await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+			}
+			await more.click();
+			await expect(menu(page)).toBeVisible();
+			await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+			await focusCheckpoint(page, 'before-stimulus');
+			const journalStart = await page.evaluate(() => (window as unknown as { focusJournal: object[] }).focusJournal.length);
+			if (scenario.startsWith('scroll-')) {
+				const before = await page.evaluate(() => window.scrollY);
+				await page.evaluate(() => window.scrollBy(0, 40));
+				await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(before + 40);
+				await expect(menu(page)).toHaveCount(0);
+				await expect(more).toBeFocused();
+				expect(await page.evaluate(() => window.scrollY)).toBe(before + 40);
+				const scrollEvents = await page.evaluate((start) => (window as unknown as { focusJournal: Array<{ type: string; target: string; menu: boolean }> }).focusJournal.slice(start), journalStart);
+				expect(scrollEvents.some((event) => event.type === 'scroll' && event.target === 'document' && event.menu)).toBe(true);
+				await focusCheckpoint(page, 'after-scroll-dismissal');
+			}
+			if (scenario === 'outside-click') {
+				const before = await page.evaluate(() => window.scrollY);
+				const box = await heading.boundingBox();
+				expect(box).not.toBeNull();
+				await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
+				await expect(menu(page)).toHaveCount(0);
+				await expect(more).toBeFocused();
+				expect(await page.evaluate(() => window.scrollY)).toBe(before);
+				const events = await page.evaluate((start) => (window as unknown as { focusJournal: Array<{ type: string; target: string }> }).focusJournal.slice(start), journalStart);
+				expect(events.filter((event) => event.type === 'scroll' || (event.type === 'focusin' && event.target !== 'track-more'))).toEqual([]);
+			} else if (scenario === 'scroll-then-click') {
+				const box = await heading.boundingBox();
+				expect(box).not.toBeNull();
+				expect({ x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 }).toEqual(coordinates);
+				await page.mouse.click(coordinates!.x, coordinates!.y);
+				expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid') || document.activeElement?.tagName || null)).toBe(baseline);
+				await expect(menu(page)).toHaveCount(0);
+			} else if (scenario.endsWith('explicit-focus')) {
+				const before = await page.evaluate(() => window.scrollY);
+				const focusStart = await page.evaluate(() => (window as unknown as { focusJournal: object[] }).focusJournal.length);
+				await refresh.evaluate((node: HTMLElement) => node.focus({ preventScroll: true }));
+				await expect(menu(page)).toHaveCount(0);
+				await expect(refresh).toBeFocused();
+				expect(await page.evaluate(() => window.scrollY)).toBe(before);
+				const events = await page.evaluate((start) => (window as unknown as { focusJournal: Array<{ type: string }> }).focusJournal.slice(start), focusStart);
+				expect(events.some((event) => event.type === 'focusin')).toBe(true);
+				expect(events.filter((event) => ['scroll', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].includes(event.type))).toEqual([]);
+			} else if (scenario.endsWith('focus')) {
+				await refresh.click();
+				await expect(menu(page)).toHaveCount(0);
+				await expect(refresh).toBeFocused();
+			}
+			await focusCheckpoint(page, 'after-stimulus');
+		} finally {
+			await attachFocusJournal(page, testInfo);
+		}
+	});
+}
 
 test('reserved playlist slots are discoverable but never activate or persist', async ({ page }) => {
 	await seed(page);
