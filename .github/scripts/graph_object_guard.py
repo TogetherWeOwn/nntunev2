@@ -14,6 +14,13 @@ import subprocess
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
+def git_environment():
+    # Git's environment can redirect repository discovery, objects and index.
+    # Keep tracing for the no-fetch assertions, but not repository overrides.
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_") or key == "GIT_TRACE2_EVENT"}
+
+
 def guard(root, commits, trusted_paths):
     if not commits or any(not SHA.fullmatch(oid) for oid in commits):
         raise ValueError("expected full commit object IDs")
@@ -25,6 +32,7 @@ def guard(root, commits, trusted_paths):
             ["git", "--no-lazy-fetch", "--no-replace-objects",
              "-c", "core.fsmonitor=false", "-C", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            env=git_environment(),
         )
         if result.returncode:
             raise ValueError("Git object guard failed: " + result.stderr.decode(errors="replace"))

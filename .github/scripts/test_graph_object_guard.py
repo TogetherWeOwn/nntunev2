@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +32,14 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "connectivity error"):
                 guard.guard(".", ["a" * 40], ["controls"])
 
+    def test_git_environment_discards_overrides_but_keeps_trace(self):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/donor", "GIT_INDEX_FILE": "/index",
+                                          "GIT_TRACE2_EVENT": "/trace"}):
+            env = guard.git_environment()
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_INDEX_FILE", env)
+        self.assertEqual(env["GIT_TRACE2_EVENT"], "/trace")
+
     def test_capability_required_in_ci(self):
         if os.environ.get("GRAPH_GUARD_REQUIRE_GIT") == "1":
             self.assertTrue(SUPPORTED, "Git must support --no-lazy-fetch")
@@ -52,7 +61,8 @@ class RealRepositoryTests(unittest.TestCase):
         self.commit = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.root), *args], text=True)
+        return subprocess.check_output(["git", "-C", str(self.root), *args], text=True,
+                                       env=guard.git_environment())
 
     def test_complete_and_dirty_checkout(self):
         guard.guard(self.root, [self.commit], ["controls"])
@@ -112,11 +122,12 @@ class RealRepositoryTests(unittest.TestCase):
     def test_replacement_cannot_hide_missing_history(self):
         blob = self.git("rev-parse", "HEAD:controls/input").strip()
         empty_tree = subprocess.check_output(
-            ["git", "-C", str(self.root), "mktree"], input="", text=True
+            ["git", "-C", str(self.root), "mktree"], input="", text=True,
+            env=guard.git_environment(),
         ).strip()
         replacement = subprocess.check_output(
             ["git", "-C", str(self.root), "commit-tree", empty_tree],
-            input="replacement\n", text=True,
+            input="replacement\n", text=True, env=guard.git_environment(),
         ).strip()
         self.git("replace", self.commit, replacement)
         self.git("config", "remote.origin.url", str(self.root / "fetch-must-not-run"))
@@ -144,6 +155,17 @@ class RealRepositoryTests(unittest.TestCase):
                     if event.get("event") == "child_start"]
         self.assertFalse(any("fetch" in argv for argv in children), children)
         self.assertFalse((self.root / ".git" / "objects" / blob[:2] / blob[2:]).exists())
+
+    def test_inherited_repository_overrides_cannot_select_donor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            donor = Path(directory) / "donor"
+            shutil.copytree(self.root, donor)
+            (self.root / ".git" / "shallow").write_text(self.commit + "\n")
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(donor / ".git"),
+                                              "GIT_WORK_TREE": str(donor)}):
+                guard.guard(donor, [self.commit], ["controls"])
+                with self.assertRaisesRegex(ValueError, "shallow"):
+                    guard.guard(self.root, [self.commit], ["controls"])
 
     def test_shallow_repository_refused(self):
         (self.root / ".git" / "shallow").write_text(self.commit + "\n")
