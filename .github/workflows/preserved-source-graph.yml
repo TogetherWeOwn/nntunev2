@@ -21,14 +21,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
-      - name: Record tested head and Git version
+      - name: Record tested merge, parents and Git version
         env:
+          EXPECTED_MERGE: ${{ github.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
+          test "$(git rev-parse HEAD^1)" = "$EXPECTED_BASE"
+          test "$(git rev-parse HEAD^2)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD HEAD^1 HEAD^2
           git --version
       - name: Check workflow wiring
         run: python3 .github/scripts/test_preserved_source_graph_workflow.py -v
