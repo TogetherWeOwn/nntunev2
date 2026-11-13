@@ -30,8 +30,7 @@ pub struct Job<'a> {
 
 /// Authenticate, then enforce the trusted grant and job using generic errors.
 pub fn authorize(
-    credential: Option<&NativeRestRecord>,
-    secret: Option<&str>,
+    bearer: (Option<&NativeRestRecord>, Option<&str>),
     peppers: &[Pepper<'_>],
     now: u64,
     grant: Option<&Grant<'_>>,
@@ -40,6 +39,7 @@ pub fn authorize(
     job: Option<(&str, &Job<'_>)>,
 ) -> Result<(), CredentialError> {
     let (environment, library_id) = scope;
+    let (credential, secret) = bearer;
     let record = credential.ok_or(CredentialError::Unauthenticated)?;
     let secret = secret.ok_or(CredentialError::Unauthenticated)?;
     // This contract expires at the deadline, unlike legacy bearer auth.
@@ -117,8 +117,7 @@ mod tests {
         };
         let check = |record: Option<&NativeRestRecord>, secret, now, grant| {
             authorize(
-                record,
-                secret,
+                (record, secret),
                 &peppers,
                 now,
                 grant,
@@ -169,8 +168,7 @@ mod tests {
         };
         let check = |action, env, library, id, job| {
             authorize(
-                Some(&record),
-                Some(SECRET),
+                (Some(&record), Some(SECRET)),
                 &peppers,
                 1,
                 Some(&grant),
