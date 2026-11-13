@@ -499,6 +499,10 @@ fn has_ipv6_like_value(value: &str) -> bool {
 fn ipv6_value_detects_attached_delimiters() {
     for value in [
         "peer=2001:db8::1",
+        "peer=2001:db8::1&status=ok",
+        "peer/2001:db8::1",
+        "2001:db8::1/64",
+        "peer:2001:db8::1",
         "peer=2001:db8::1.",
         "peer=::ffff:192.0.2.1.",
         "peers=2001:db8::1,2001:db8::2",
