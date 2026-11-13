@@ -273,7 +273,7 @@ async fn mirror_client() -> Client {
              CREATE TEMP TABLE mb_artist (mbid uuid PRIMARY KEY, name text, sort_name text, type text, country text);
              CREATE TEMP TABLE mb_release (mbid uuid PRIMARY KEY, title text, release_type text, year smallint, artist_mbid uuid);
              CREATE TEMP TABLE mb_recording (mbid uuid PRIMARY KEY, title text, duration_ms integer);
-             CREATE TEMP TABLE mb_track (release_mbid uuid, recording_mbid uuid, medium_no smallint, track_no smallint)",
+             CREATE TEMP TABLE mb_track (release_mbid uuid, recording_mbid uuid, medium_no smallint, track_no smallint, PRIMARY KEY (release_mbid, medium_no, track_no))",
         )
         .await
         .unwrap();
@@ -329,7 +329,7 @@ async fn subsonic_snapshot_returns_every_member_track() {
     mirror
         .execute(
             &format!(
-                "INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, 1 FROM unnest($1::text[]) AS g"
+                "INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, position::smallint FROM unnest($1::text[]) WITH ORDINALITY AS tracks(g, position)"
             ),
             &[&recordings],
         )
