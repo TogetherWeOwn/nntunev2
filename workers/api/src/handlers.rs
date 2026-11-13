@@ -8932,29 +8932,31 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            let mut rows = self.billing_rows.borrow_mut();
-            let mut shadow = self.billing_shadow.borrow_mut();
-            let key = (
-                user_id.to_string(),
-                outcome.row.stripe_subscription_id.clone(),
-            );
-            let current = rows.get(user_id);
-            let stored = current
-                .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
-                .or_else(|| shadow.get(&key));
-            let merged = merge_billing_row(stored, outcome);
-            if let Some(existing) = current {
-                if existing.stripe_subscription_id != merged.stripe_subscription_id {
-                    shadow.insert(
-                        (user_id.to_string(), existing.stripe_subscription_id.clone()),
-                        existing.clone(),
-                    );
+            if !outcome.explicit_stale {
+                let mut rows = self.billing_rows.borrow_mut();
+                let mut shadow = self.billing_shadow.borrow_mut();
+                let key = (
+                    user_id.to_string(),
+                    outcome.row.stripe_subscription_id.clone(),
+                );
+                let current = rows.get(user_id);
+                let stored = current
+                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .or_else(|| shadow.get(&key));
+                let merged = merge_billing_row(stored, outcome);
+                if let Some(existing) = current {
+                    if existing.stripe_subscription_id != merged.stripe_subscription_id {
+                        shadow.insert(
+                            (user_id.to_string(), existing.stripe_subscription_id.clone()),
+                            existing.clone(),
+                        );
+                    }
                 }
+                if let Some(retained) = shadow.get_mut(&key) {
+                    *retained = merged.clone();
+                }
+                rows.insert(user_id.to_string(), merged);
             }
-            if let Some(retained) = shadow.get_mut(&key) {
-                *retained = merged.clone();
-            }
-            rows.insert(user_id.to_string(), merged);
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
                 history
@@ -11224,6 +11226,7 @@ mod tests {
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            explicit_stale: false,
             // Inserts (no stored row yet), so the guard never reads this.
             read_plan: None,
             read_anchor: None,
@@ -11233,6 +11236,7 @@ mod tests {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            explicit_stale: false,
             // Read the fresh row: strictly-older money, so the stale arm
             // fires on the ends regardless.
             read_plan: Some(PLAN_PLUS.to_string()),
@@ -11319,6 +11323,7 @@ mod tests {
             },
             history: vec![],
             fail_closed: None,
+            explicit_stale: false,
             // Seeds commit as inserts (no stored row yet), so the
             // equal-end adopt arm never reads this.
             read_plan: None,
@@ -11662,6 +11667,63 @@ mod tests {
         );
         assert_eq!(live.status, "active");
         assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_explicit_stale_fold_never_changes_stored_fields() {
+        let h = stripe_harness();
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let seed = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_seed"), None);
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        let mut subscription = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS);
+        subscription.cancel_at_period_end = true;
+        subscription.current_period_end = Some(end + 100);
+        let remote = crate::billing_reconcile::RemoteSubscription {
+            subscription,
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &remote,
+            BILLING_NOW,
+        );
+        assert!(stale.explicit_stale);
+        assert_eq!(stale.history.len(), 1);
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).unwrap();
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+        assert!(h.store.invoice_history.borrow().contains_key("in_old"));
+        let fresh_remote = crate::billing_reconcile::RemoteSubscription {
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+            ..remote
+        };
+        let fresh = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &fresh_remote,
+            BILLING_NOW,
+        );
+        assert!(!fresh.explicit_stale);
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).unwrap();
+        assert!(h.store.billing_rows.borrow()["u1"].cancel_at_period_end);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"].current_period_end_unix,
+            Some(end + 100)
+        );
     }
 
     #[test]
