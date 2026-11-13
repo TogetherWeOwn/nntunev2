@@ -354,7 +354,6 @@ async fn subsonic_snapshot_rejects_a_capped_query_result() {
 async fn subsonic_snapshot_rejects_capped_artist_and_release_pages() {
     const SECOND_ARTIST: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
     const SECOND_RELEASE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
-
     // Two artists exercise the first query; one artist and two releases
     // reach the second query without hitting the artist boundary first.
     for distinct_artists in [true, false] {
