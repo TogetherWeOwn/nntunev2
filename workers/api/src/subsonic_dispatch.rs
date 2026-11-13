@@ -233,6 +233,7 @@ pub fn build_snapshot(
     out_songs.sort_by(|a, b| {
         a.album_id
             .cmp(&b.album_id)
+            .then_with(|| a.disc.cmp(&b.disc))
             .then_with(|| a.track.cmp(&b.track))
             .then_with(|| a.id.cmp(&b.id))
     });
@@ -267,9 +268,7 @@ fn not_authorized() -> (i64, String) {
 }
 
 fn catalogue_date_desc(left: &Option<String>, right: &Option<String>) -> std::cmp::Ordering {
-    left.as_ref()
-        .map(std::cmp::Reverse)
-        .cmp(&right.as_ref().map(std::cmp::Reverse))
+    right.cmp(left)
 }
 
 impl Library for ProductionStore {
@@ -360,7 +359,9 @@ impl Library for ProductionStore {
         albums.retain(|album| albums_with_songs.contains(album.id.as_str()));
         match query.list_type {
             "random" => albums.sort_by(|a, b| a.id.cmp(&b.id)),
-            "newest" => albums.sort_by(|a, b| catalogue_date_desc(&a.curated_at, &b.curated_at)),
+            "newest" => albums.sort_by(|a, b| {
+                catalogue_date_desc(&a.curated_at, &b.curated_at).then_with(|| a.id.cmp(&b.id))
+            }),
             "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
             "alphabeticalByArtist" => albums.sort_by(|a, b| {
                 a.artist_sort_name
@@ -375,6 +376,7 @@ impl Library for ProductionStore {
                 albums.sort_by(|a, b| {
                     catalogue_date_desc(&a.release_date, &b.release_date)
                         .then_with(|| catalogue_date_desc(&a.curated_at, &b.curated_at))
+                        .then_with(|| a.id.cmp(&b.id))
                 });
             }
             kind => {
@@ -405,12 +407,24 @@ impl Library for ProductionStore {
             .filter(|s| s.album_id == album_id)
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.track.cmp(&b.track).then(a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            a.disc
+                .cmp(&b.disc)
+                .then(a.track.cmp(&b.track))
+                .then(a.id.cmp(&b.id))
+        });
         out
     }
 
     fn song(&self, id: &str) -> Option<Song> {
-        self.songs.iter().find(|s| s.id == id).cloned()
+        // Recording IDs do not identify occurrences. Until the playback
+        // contract supports occurrence IDs, never select an arbitrary match.
+        let mut matches = self.songs.iter().filter(|s| s.id == id);
+        let song = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(song.clone())
     }
 
     fn all_songs(&self) -> Vec<Song> {
