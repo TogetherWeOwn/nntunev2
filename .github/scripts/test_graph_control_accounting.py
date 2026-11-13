@@ -2,6 +2,8 @@
 
 import contextlib
 import io
+from pathlib import Path
+import subprocess
 import unittest
 from unittest import mock
 
@@ -32,6 +34,19 @@ class Samples(unittest.TestCase):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_ci_fails_if_either_suite_fails(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows/ci.yml"
+        line = next(line.strip() for line in workflow.read_text().splitlines()
+                    if "python3 .github/scripts/test_graph_qualification_context.py" in line)
+        for failing in ("test_graph_qualification_context.py", "test_graph_control_accounting.py"):
+            script = ('python3() { case "$1" in *"$FAIL_TEST") return 1;; esac; }\n'
+                      + line + '\nprintf "continued\\n"\n')
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, env={"FAIL_TEST": failing})
+            with self.subTest(failing=failing):
+                self.assertNotEqual(0, result.returncode)
+                self.assertNotIn("continued", result.stdout)
+
     def test_default_controls_execute(self):
         counts = accounting.run_controls()
         self.assertEqual(set(accounting.CONTROLS), set(counts))
