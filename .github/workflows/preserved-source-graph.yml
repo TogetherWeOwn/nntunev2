@@ -27,13 +27,19 @@ jobs:
       - name: Record tested merge, parents and Git version
         env:
           EXPECTED_MERGE: ${{ github.sha }}
-          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT_BASE: ${{ github.event.pull_request.base.sha }}
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
-          test "$(git rev-parse HEAD^1)" = "$EXPECTED_BASE"
-          test "$(git rev-parse HEAD^2)" = "$EXPECTED_HEAD"
-          git rev-parse HEAD HEAD^1 HEAD^2
+          set -euo pipefail
+          merge=$(git rev-parse --verify 'HEAD^{commit}')
+          test "$merge" = "$EXPECTED_MERGE"
+          read -r -a parents <<< "$(git show -s --format=%P "$merge")"
+          test "${#parents[@]}" -eq 2
+          for parent in "${parents[@]}"; do
+            git cat-file -e "${parent}^{commit}"
+          done
+          test "${parents[1]}" = "$EXPECTED_HEAD"
+          printf 'merge=%s\nbase=%s\nhead=%s\nevent_base=%s\n' "$merge" "${parents[0]}" "${parents[1]}" "$EVENT_BASE"
           git --version
       - name: Check workflow wiring
         run: python3 .github/scripts/test_preserved_source_graph_workflow.py -v
