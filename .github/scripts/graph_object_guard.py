@@ -21,7 +21,8 @@ def guard(root, commits, trusted_paths):
 
     def git(*args):
         result = subprocess.run(
-            ["git", "--no-lazy-fetch", "--no-replace-objects", "-C", str(root), *args],
+            ["git", "--no-lazy-fetch", "--no-replace-objects",
+             "-c", "core.fsmonitor=false", "-C", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         if result.returncode:

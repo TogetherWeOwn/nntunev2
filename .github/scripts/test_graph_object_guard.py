@@ -60,6 +60,18 @@ class RealRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
 
+    def test_fsmonitor_cannot_hide_dirty_trusted_input(self):
+        hook = self.root / ".git" / "fake-fsmonitor"
+        hook.write_text('#!/bin/sh\nprintf "token\\0"\n')
+        hook.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(hook))
+        self.git("status", "--porcelain")
+        self.git("status", "--porcelain")
+        (self.root / "controls" / "input").write_text("changed contents\n")
+        self.assertEqual(self.git("status", "--porcelain", "--", "controls"), "")
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [self.commit], ["controls"])
+
     def test_suppressed_dirty_trusted_inputs_refused(self):
         for flag, undo in [("--assume-unchanged", "--no-assume-unchanged"),
                            ("--skip-worktree", "--no-skip-worktree")]:
