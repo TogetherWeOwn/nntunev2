@@ -50,11 +50,13 @@ the stream Worker decrypts authenticated chunks for ranged playback and keeps
 metering. This is not end-user end-to-end encryption: authorized Workers can
 decrypt. Upload checksums cover ciphertext; plaintext and keys stay out of logs.
 
-These are requirements, not delivered features. Crypto-dependent delivery is
-deferred; the current crypto design is unaccepted. Bounded design repair and
-the independent session/idempotency contract may proceed, but implementation
-requires Security, Applied Cryptography and QA acceptance of the exact revised
-design. No plaintext fallback or hidden valid-playback/library cap is allowed.
+These are requirements, not delivered features. The earlier assurance-target
+and planning-input deferral basis is resolved; the revised crypto design still
+requires independent Security, Applied Cryptography and QA acceptance before
+implementation. Delivery resumes in dependency order only after that acceptance
+and verified producer outputs. Design revision and the independent
+session/idempotency contract may proceed. No plaintext fallback or hidden
+valid-playback/library cap is allowed.
 Migration stays staged, using disposable buckets until the provider is
 production-ready. Retain legacy readers and inventory, coexistence, restore
 and rollback obligations until the accepted replacement is ready. The replacing

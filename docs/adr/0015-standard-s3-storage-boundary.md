@@ -77,21 +77,27 @@ own that whole concern, and NNTune will talk to it as an ordinary S3 client.
 
 - The owner has settled intake, plaintext dedupe and mandatory client-side
   encryption. They are requirements, not optional app E2E or pending questions.
-  Crypto-dependent delivery is deferred and the current crypto design is
-  unaccepted. This ADR grants neither design acceptance nor implementation.
-- Bounded design repair may evaluate construction-appropriate failure-only
-  assurance without lifetime budgets for known-genuine successful reads or
-  unwraps. A nonrollback authority is not an admission prerequisite for a
-  budget that no longer exists; any bound that relies on failure continuity
-  must still justify resets, rollback, concurrent overshoot and repeated
-  attacks across restores. Security retains its numerical target and necessary
-  controls; this is not an accepted construction or a security waiver.
+  The earlier assurance-target and planning-input deferral basis is resolved;
+  the revised design remains subject to exact-revision specialist acceptance.
+  This ADR grants neither design acceptance nor implementation.
+- Owner-set assurance inputs are integrity advantage <= 2^-57 and
+  confidentiality advantage <= 2^-60, with failure-only accounting summed
+  across the fleet (v = genuine authentication failures + 1). Plan for at most
+  1,000,000 stored objects (conservatively bounded by 2^20) and a five-year
+  key-safety horizon; successful reads and unwraps consume no failure budget.
+  Permanently quarantine an object at its lifetime authentication-failure
+  limit, recording that state durably; repair re-encrypts under a fresh key,
+  not a reset of the old key's allowance. The revised design must quantify
+  fleet exposure, concurrent overshoot and DB-restore/repeated-attack overshoot
+  at these inputs, without requiring a nonrollback service. These are design
+  requirements, not a claim of proven bounds or an accepted construction.
 - The independent scoped session/idempotency contract and truthful
   documentation may continue. Crypto implementation and downstream reactivation
   require independent Security, Applied Cryptography and QA acceptance of the
   exact repaired design, plus verified producer outputs and restored dependencies.
 - No plaintext fallback, hidden valid-playback/library cap or forced
-  re-encryption is authorized. Preserve legacy readers and inventory,
+  re-encryption merely to reset budgets is authorized. Quarantined-object
+  repair still requires a fresh key. Preserve legacy readers and inventory,
   coexistence/disposition, restore and rollback obligations until the accepted
   replacement satisfies its activation and release gates.
 - This documentation changes no code, credentials, provider resources or
