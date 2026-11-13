@@ -19,7 +19,7 @@ def guard(root, commits, trusted_paths):
 
     def git(*args):
         result = subprocess.run(
-            ["git", "--no-lazy-fetch", "-C", str(root), *args],
+            ["git", "--no-lazy-fetch", "--no-replace-objects", "-C", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         if result.returncode:
@@ -28,6 +28,9 @@ def guard(root, commits, trusted_paths):
 
     if git("rev-parse", "--is-shallow-repository").strip() != b"false":
         raise ValueError("shallow repository")
+    entries = git("ls-files", "-v", "-z", "--", *trusted_paths)
+    if any(entry[:2] != b"H " for entry in entries.split(b"\0") if entry):
+        raise ValueError("suppressed or unmerged trusted inputs")
     if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
            "--", *trusted_paths):
         raise ValueError("dirty trusted inputs")

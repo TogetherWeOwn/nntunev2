@@ -24,7 +24,7 @@ class GuardTests(unittest.TestCase):
                 guard.guard(".", ["a" * 40], ["controls"])
 
     def test_connectivity_error_fails_closed(self):
-        outputs = [b"false\n", b"", b"commit\n", b"objects\n"]
+        outputs = [b"false\n", b"H controls/input\0", b"", b"commit\n", b"objects\n"]
         results = [subprocess.CompletedProcess([], 0, output, b"") for output in outputs]
         results.append(subprocess.CompletedProcess([], 1, b"", b"connectivity error"))
         with mock.patch.object(guard.subprocess, "run", side_effect=results):
@@ -59,6 +59,39 @@ class RealRepositoryTests(unittest.TestCase):
         (self.root / "controls" / "input").write_text("changed\n")
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
+
+    def test_suppressed_dirty_trusted_inputs_refused(self):
+        for flag, undo in [("--assume-unchanged", "--no-assume-unchanged"),
+                           ("--skip-worktree", "--no-skip-worktree")]:
+            with self.subTest(flag=flag):
+                self.git("update-index", flag, "controls/input")
+                (self.root / "controls" / "input").write_text("changed\n")
+                self.assertEqual(self.git("status", "--porcelain", "--", "controls"), "")
+                with self.assertRaisesRegex(ValueError, "suppressed or unmerged"):
+                    guard.guard(self.root, [self.commit], ["controls"])
+                self.git("update-index", undo, "controls/input")
+                (self.root / "controls" / "input").write_text("trusted\n")
+
+    def test_replacement_cannot_hide_missing_history(self):
+        blob = self.git("rev-parse", "HEAD:controls/input").strip()
+        empty_tree = subprocess.check_output(
+            ["git", "-C", str(self.root), "mktree"], input="", text=True
+        ).strip()
+        replacement = subprocess.check_output(
+            ["git", "-C", str(self.root), "commit-tree", empty_tree],
+            input="replacement\n", text=True,
+        ).strip()
+        self.git("replace", self.commit, replacement)
+        self.git("config", "remote.origin.url", str(self.root / "fetch-must-not-run"))
+        self.git("config", "remote.origin.promisor", "true")
+        (self.root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        trace = self.root / "replacement-trace.json"
+        with mock.patch.dict(os.environ, {"GIT_TRACE2_EVENT": str(trace)}):
+            with self.assertRaisesRegex(ValueError, "missing reachable object"):
+                guard.guard(self.root, [self.commit], ["controls"])
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertFalse(any("fetch" in event.get("argv", []) for event in events
+                             if event.get("event") == "child_start"))
 
     def test_missing_promisor_blob_refused_without_fetch(self):
         blob = self.git("rev-parse", "HEAD:controls/input").strip()
