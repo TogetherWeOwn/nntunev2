@@ -492,7 +492,7 @@ fn has_ipv6_like_value(value: &str) -> bool {
                     ',' | ';' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | '='
                 )
         })
-        .any(is_ipv6_token)
+        .any(|token| is_ipv6_token(token.trim_matches('.')))
 }
 
 #[test]
@@ -512,6 +512,7 @@ fn ipv6_value_detects_attached_delimiters() {
         "peer=connected;status=ok",
         "peers=2001:db8:::1,not-an-address",
         "peer=2001:db8::1::2",
+        "peer=::ffff:192.0.2.999.",
         "https://[not-an-address]/path",
     ] {
         assert!(!has_ipv6_like_value(value), "unexpected IPv6 in {value}");
