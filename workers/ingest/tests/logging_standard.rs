@@ -474,15 +474,12 @@ fn has_ipv6_like_value(value: &str) -> bool {
     }
     // Detect unbracketed addresses embedded in delimited text,
     // e.g. `connected to 2001:db8::1`.
-    if value.split(|c: char| c.is_whitespace()).any(|token| {
+    value.split(|c: char| c.is_whitespace()).any(|token| {
         let token = token.trim().trim_matches([
             '.', ',', ';', '!', '?', '"', '\'', '(', ')', '[', ']', '<', '>', '=',
         ]);
         !token.is_empty() && is_ipv6_token(token)
-    }) {
-        return true;
-    }
-    false
+    })
 }
 
 fn email_token_is_shaped(token: &str) -> bool {

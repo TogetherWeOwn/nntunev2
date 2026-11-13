@@ -651,10 +651,14 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 3
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 7
           printf '%s\n' "$inventory_billing" | grep -Fx 'disposable_config_rejects_non_local_targets: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'setup_snapshots_and_live_selection_are_isolated: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'first_insert_and_replay_preserve_subscription_and_history: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'fresh_same_subscription_controls_still_apply: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'null_evidence_updates_status_and_bindings_but_never_coverage: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'insertion_conflicts_only_while_another_subscription_holds_the_slot: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'retained_subscription_rows_follow_existing_upsert_guards: test'
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres
           inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests -- --list)"
           printf '%s\n' "$inventory"

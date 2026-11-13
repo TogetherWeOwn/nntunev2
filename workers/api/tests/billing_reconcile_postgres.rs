@@ -55,7 +55,7 @@ fn disposable_config_rejects_non_local_targets() {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Snap {
     user_id: String,
     customer: String,
@@ -378,6 +378,148 @@ async fn first_insert_and_replay_preserve_subscription_and_history() {
 }
 
 #[tokio::test]
+async fn fresh_same_subscription_controls_still_apply() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.raw("u1", "sub_old", "canceled", Some(T)).await;
+    fx.seed_active("u1", "sub_a").await;
+
+    let mut renewal_remote = remote(
+        "sub_a",
+        &[
+            invoice("sub_a", 1),
+            invoice("sub_a", 2),
+            invoice("sub_a", 3),
+        ],
+    );
+    renewal_remote.subscription.current_period_end = Some(T + 3 * P);
+    let renewal = fx.fold("u1", &renewal_remote).await;
+    fx.put("u1", &renewal).await;
+    let s = fx.snap("sub_a").await.unwrap();
+    assert_eq!(s.paid_through, Some(T + 3 * P));
+    assert_eq!(s.anchor.as_deref(), Some("inv_sub_a_3"));
+    assert_eq!((s.status.as_str(), s.grace), ("active", None));
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+
+    let mut held_remote = renewal_remote.clone();
+    held_remote.subscription.status = "paused".into();
+    held_remote.subscription.cancel_at_period_end = true;
+    held_remote.subscription.current_period_end = Some(T + 4 * P);
+    let held = fx.fold("u1", &held_remote).await;
+    fx.put("u1", &held).await;
+    let h = fx.snap("sub_a").await.unwrap();
+    assert_eq!(h.status, "paused");
+    assert!(h.cancel);
+    assert_eq!(h.period_end, Some(T + 4 * P));
+    assert_eq!(
+        (h.paid_through, h.anchor),
+        (s.paid_through, s.anchor.clone())
+    );
+
+    held_remote.subscription.status = "canceled".into();
+    held_remote.subscription.cancel_at_period_end = false;
+    let terminal = fx.fold("u1", &held_remote).await;
+    fx.put("u1", &terminal).await;
+    let t = fx.snap("sub_a").await.unwrap();
+    assert_eq!((t.status.as_str(), t.grace), ("canceled", None));
+    assert_eq!(t.paid_through, s.paid_through);
+    assert!(fx.live("u1").await.is_none());
+    fx.cleanup().await;
+}
+
+async fn divergent(fx: &Fx, sub: &str, stored: &Snap) -> ReconcileOutcome {
+    let mut o = fx
+        .fold("u1", &remote(sub, &[invoice(sub, 1), invoice(sub, 2)]))
+        .await;
+    o.row.stripe_customer_id = "cus_other".into();
+    o.row.stripe_item_id = "si_other".into();
+    o.row.stripe_price_id = "price_pro_test".into();
+    o.row.plan_id = "pro".into();
+    o.row.status = "past_due".into();
+    o.row.current_period_end_unix = Some(T + 9);
+    o.row.cancel_at_period_end = !stored.cancel;
+    o.row.grace_until_unix = Some(T + 99);
+    o.read_plan = Some(stored.plan.clone());
+    o.read_anchor = stored.anchor.clone();
+    o
+}
+
+#[tokio::test]
+async fn null_evidence_updates_status_and_bindings_but_never_coverage() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut o = divergent(&fx, "sub_a", &stored).await;
+    o.row.paid_through_unix = None;
+    o.row.paid_invoice_id = None;
+    fx.put("u1", &o).await;
+    let s = fx.snap("sub_a").await.unwrap();
+    assert_eq!(s.status, "past_due");
+    assert_eq!(s.customer, "cus_other");
+    assert_eq!(s.item, "si_other");
+    assert_eq!(s.price, "price_pro_test");
+    assert_eq!(s.period_end, Some(T + 9));
+    assert_eq!(s.cancel, !stored.cancel);
+    assert_eq!(s.grace, Some(T + 99));
+    assert_eq!(s.plan, stored.plan);
+    assert_eq!(s.paid_through, stored.paid_through);
+    assert_eq!(s.anchor, stored.anchor);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
+    let mut fx = Fx::new().await;
+    let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
+    let outside = [
+        "canceled",
+        "incomplete_expired",
+        "trialing",
+        "unknown_state",
+    ];
+    for (n, status) in live.iter().chain(outside.iter()).enumerate() {
+        let user = format!("ux{n}");
+        fx.add_user(&user).await;
+        let holder = format!("sub_holder_{n}");
+        let newcomer = format!("sub_new_{n}");
+        fx.raw(&user, &holder, status, None).await;
+        let input = ReconcileInput {
+            stripe_customer_id: Some(CUS.into()),
+            live: None,
+            bindings: bindings(),
+        };
+        let outcome =
+            reconcile_subscription(&input, &remote(&newcomer, &[invoice(&newcomer, 1)]), T);
+        let result = fx.try_put(&user, &outcome).await;
+        if live.contains(status) {
+            let error = result.expect_err(status);
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+                "holder status {status}"
+            );
+            assert!(fx.snap(&newcomer).await.is_none(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 1);
+            assert_eq!(fx.history_rows(&newcomer).await, 0, "holder {status}");
+        } else {
+            result.expect(status);
+            assert!(fx.snap(&newcomer).await.is_some(), "holder {status}");
+            assert_eq!(fx.rows(&user).await, 2);
+            assert_eq!(fx.history_rows(&newcomer).await, 1);
+        }
+    }
+    fx.add_user("other").await;
+    fx.raw("other", "sub_other", "active", None).await;
+    fx.add_user("free_user").await;
+    let outcome = fx
+        .fold("free_user", &remote("sub_free", &[invoice("sub_free", 1)]))
+        .await;
+    fx.put("free_user", &outcome).await;
+    assert!(fx.snap("sub_free").await.is_some());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn setup_snapshots_and_live_selection_are_isolated() {
     let fx = Fx::new().await;
     for user in ["u1", "u2", "u3"] {
@@ -416,5 +558,173 @@ async fn setup_snapshots_and_live_selection_are_isolated() {
     assert_eq!(other.paid_through_unix, Some(T + 60));
     assert!(fx.live("u3").await.is_none());
     assert!(fx.live("missing").await.is_none());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn retained_subscription_rows_follow_existing_upsert_guards() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    // A and B are outside the live-slot index; fake displacement is not SQL selection.
+    let mut a = fx.fold("u1", &remote("sub_test_1", &[])).await;
+    a.history.clear();
+    a.row.stripe_customer_id = "cus_test_1".into();
+    a.row.stripe_item_id = "si_test_1".into();
+    a.row.stripe_price_id = PRICE.into();
+    a.row.plan_id = "plus".into();
+    a.read_plan = None;
+    a.read_anchor = None;
+    a.row.current_period_end_unix = Some(1_700_000_000 + P);
+    a.row.cancel_at_period_end = false;
+    a.row.status = "canceled".into();
+    a.row.paid_through_unix = Some(100);
+    a.row.paid_invoice_id = Some("in_100".into());
+    a.row.grace_until_unix = Some(10);
+    let mut b = a.clone();
+    b.row.stripe_subscription_id = "sub_other".into();
+    b.row.paid_through_unix = None;
+    b.row.paid_invoice_id = None;
+    b.row.grace_until_unix = None;
+    fx.put("u1", &a).await;
+    let mut other = a.clone();
+    other.row.stripe_subscription_id = "sub_user_2".into();
+    other.row.paid_through_unix = Some(999);
+    fx.put("u2", &other).await;
+    let other = fx.snap("sub_user_2").await.unwrap();
+    fx.put("u1", &b).await;
+    let mut expected = Snap {
+        user_id: "u1".into(),
+        customer: "cus_test_1".into(),
+        item: "si_test_1".into(),
+        price: PRICE.into(),
+        plan: "plus".into(),
+        status: "canceled".into(),
+        period_end: Some(1_700_000_000 + P),
+        cancel: false,
+        paid_through: Some(100),
+        anchor: Some("in_100".into()),
+        grace: Some(10),
+    };
+    let expected_b = Snap {
+        paid_through: None,
+        anchor: None,
+        grace: None,
+        ..expected.clone()
+    };
+    assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    let mut stale = a.clone();
+    stale.row.paid_through_unix = Some(50);
+    stale.row.status = "incomplete_expired".into();
+    for _ in 0..2 {
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+        fx.put("u1", &b).await;
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+        assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    }
+    let mut advanced = a.clone();
+    advanced.row.plan_id = "pro".into();
+    for end in [150, 200] {
+        advanced.row.paid_through_unix = Some(end);
+        advanced.row.paid_invoice_id = Some(format!("in_{end}"));
+        fx.put("u1", &advanced).await;
+        expected.plan = "pro".into();
+        expected.paid_through = Some(end);
+        expected.anchor = Some(format!("in_{end}"));
+        assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    }
+    fx.put("u1", &b).await;
+    fx.put("u1", &a).await;
+    assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
+    assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
+    assert_eq!(fx.history_rows("sub_test_1").await, 0);
+    assert_eq!(fx.rows("u1").await, 2);
+
+    // The same named write-boundary cases are exercised by the handler test.
+    for case in [
+        "valid",
+        "shared",
+        "read-plan",
+        "read-anchor",
+        "no-anchor",
+        "null-end",
+        "first-end",
+        "advance-null-anchor",
+    ] {
+        let sub = format!("sub_{case}");
+        let mut stored = a.clone();
+        stored.row.stripe_subscription_id = sub.clone();
+        stored.row.paid_through_unix = if case == "first-end" { None } else { Some(100) };
+        stored.row.paid_invoice_id = Some("in_old".into());
+        stored.row.grace_until_unix = Some(10);
+        fx.put("u1", &stored).await;
+        let mut replacement = stored.clone();
+        replacement.row.stripe_subscription_id = format!("replacement_{case}");
+        fx.put("u1", &replacement).await;
+        let replacement_before = fx.snap(&replacement.row.stripe_subscription_id).await;
+
+        let mut incoming = stored.clone();
+        incoming.row.status = "incomplete_expired".into();
+        incoming.row.plan_id = "pro".into();
+        incoming.row.paid_through_unix = Some(100);
+        incoming.row.paid_invoice_id = Some("in_new".into());
+        incoming.row.grace_until_unix = Some(20);
+        incoming.row.stripe_customer_id = "cus_new".into();
+        incoming.row.stripe_item_id = "si_new".into();
+        incoming.row.stripe_price_id = "price_new".into();
+        incoming.row.current_period_end_unix = Some(200);
+        incoming.row.cancel_at_period_end = true;
+        incoming.read_plan = Some("plus".into());
+        incoming.read_anchor = Some("in_old".into());
+        match case {
+            "shared" => incoming.row.paid_invoice_id = Some("in_old".into()),
+            "read-plan" => incoming.read_plan = Some("pro".into()),
+            "read-anchor" => incoming.read_anchor = Some("in_wrong".into()),
+            "no-anchor" | "advance-null-anchor" => incoming.row.paid_invoice_id = None,
+            "null-end" => incoming.row.paid_through_unix = None,
+            _ => {}
+        }
+        if case == "advance-null-anchor" {
+            incoming.row.paid_through_unix = Some(150);
+        }
+        fx.put("u1", &incoming).await;
+        let mut expected = Snap {
+            user_id: "u1".into(),
+            customer: "cus_new".into(),
+            item: "si_new".into(),
+            price: "price_new".into(),
+            plan: "pro".into(),
+            status: "incomplete_expired".into(),
+            period_end: Some(200),
+            cancel: true,
+            paid_through: Some(100),
+            anchor: Some("in_new".into()),
+            grace: Some(20),
+        };
+        if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+            expected.plan = "plus".into();
+            expected.anchor = Some("in_old".into());
+        } else if case == "shared" || case == "advance-null-anchor" {
+            expected.anchor = Some("in_old".into());
+        }
+        if case == "no-anchor" {
+            expected.status = "canceled".into();
+            expected.grace = Some(10);
+        }
+        if case == "advance-null-anchor" {
+            expected.paid_through = Some(150);
+        }
+        assert_eq!(fx.snap(&sub).await, Some(expected), "{case}");
+        assert_eq!(
+            fx.snap(&replacement.row.stripe_subscription_id).await,
+            replacement_before,
+            "{case} replacement"
+        );
+        assert_eq!(fx.history_rows(&sub).await, 0, "{case}");
+    }
+    assert_eq!(fx.snap("sub_user_2").await, Some(other));
+    assert_eq!(fx.rows("u2").await, 1);
     fx.cleanup().await;
 }
