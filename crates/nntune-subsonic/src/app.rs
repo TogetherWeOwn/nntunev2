@@ -176,8 +176,58 @@ pub fn unreadable_body_response(query: &str) -> HttpResponse {
     body_error_response(query, "Unable to read request body.")
 }
 
+/// Extract only error-envelope selectors, with a fixed work and allocation budget.
+/// If either source exceeds the scan budget, fall back to XML rather than
+/// trusting a prefix that could hide an earlier selector in the query.
+/// Oversized selector values remain present but invalid, preserving first-wins.
+pub fn bounded_error_params(query: &str, body: &str) -> String {
+    const MAX_SOURCE: usize = 256 * 1024;
+    const MAX_PAIRS: usize = 1024;
+    let mut format = None;
+    let mut callback = None;
+    for source in [query, body] {
+        if source.len() > MAX_SOURCE {
+            return String::new();
+        }
+        let mut count = 0;
+        for part in source.split('&').filter(|part| !part.is_empty()) {
+            count += 1;
+            if count > MAX_PAIRS {
+                return String::new();
+            }
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            // An encoded selector name is at most three bytes per ASCII byte.
+            if key.len() > 24 {
+                continue;
+            }
+            match crate::endpoints::decode(key).as_str() {
+                "f" if format.is_none() => {
+                    format = Some(if value.len() <= 15 { value } else { "" });
+                }
+                "callback" if callback.is_none() => {
+                    callback = Some(if value.len() <= 384 { value } else { "" });
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut result = String::new();
+    if let Some(value) = format {
+        result.push_str("f=");
+        result.push_str(value);
+    }
+    if let Some(value) = callback {
+        if !result.is_empty() {
+            result.push('&');
+        }
+        result.push_str("callback=");
+        result.push_str(value);
+    }
+    result
+}
+
 fn body_error_response(query: &str, message: &str) -> HttpResponse {
-    let params = Params::parse(query);
+    let params = Params::parse(&bounded_error_params(query, ""));
     let doc = error_document(crate::envelope::code::REQUIRED_PARAM_MISSING, message);
     match params.get("f") {
         Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(&doc)),
@@ -196,6 +246,32 @@ mod tests {
 
     fn get(app: &SubsonicApp<MemStore>, path: &str, query: &str) -> HttpResponse {
         app.handle("GET", path, query, "")
+    }
+
+    #[test]
+    fn body_fault_selection_is_bounded_and_first_wins() {
+        assert_eq!(
+            unreadable_body_response("%66=json").content_type,
+            JSON_CONTENT_TYPE
+        );
+        assert_eq!(
+            oversized_body_response("f=xml&f=json").content_type,
+            XML_CONTENT_TYPE
+        );
+        assert_eq!(
+            unreadable_body_response(&format!("f=json&x={}", "a".repeat(256 * 1024))).content_type,
+            XML_CONTENT_TYPE
+        );
+        assert_eq!(
+            unreadable_body_response(&format!("f=json&{}", vec!["x"; 1024].join("&"))).content_type,
+            XML_CONTENT_TYPE
+        );
+        let response =
+            unreadable_body_response(&format!("f=jsonp&callback={}&callback=ok", "a".repeat(385)));
+        assert_eq!(response.content_type, JSON_CONTENT_TYPE);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("\"code\":10"));
     }
 
     #[test]

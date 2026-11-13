@@ -51,7 +51,7 @@ impl Params {
     }
 }
 
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     // Percent-decode over raw bytes, then UTF-8 (lossy): multi-byte UTF-8
     // stays intact (`Bj%C3%B6rk` -> `Björk`) and a stray `%` never panics
     // (byte indexing is always safe; `&str` slicing is not).
