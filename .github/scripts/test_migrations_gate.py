@@ -123,6 +123,20 @@ class TestMigrationViolations(MigrationsGateTestCase):
             self.run_gate(), "duplicate-number", "0001_second.sql"
         )
 
+    def test_duplicate_number_across_app_and_mirror_is_reported(self):
+        self.write_migration("0041_app.sql")
+        self.write_migration("0041_mirror.sql")
+        self.write_manifest(
+            [
+                self.manifest_entry("0041_app.sql", target="app"),
+                self.manifest_entry("0041_mirror.sql", target="mirror"),
+            ]
+        )
+
+        self.assert_violation(
+            self.run_gate(), "duplicate-number", "0041_mirror.sql"
+        )
+
     def test_duplicate_entry_is_reported_once(self):
         self.write_migration("0001_first.sql")
         entry = self.manifest_entry("0001_first.sql")

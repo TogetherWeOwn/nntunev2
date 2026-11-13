@@ -94,6 +94,7 @@ pub struct ProductionStore {
     artists: Vec<Artist>,
     albums: Vec<Album>,
     songs: Vec<Song>,
+    tracks: Vec<TrackDbRow>,
     /// Request time (epoch millis), captured at the mount. Reported as
     /// the artists index's `lastModified`: the member reads carry no
     /// per-artist modification signal, so the honest freshness marker is
@@ -109,6 +110,7 @@ impl ProductionStore {
         artists: Vec<Artist>,
         albums: Vec<Album>,
         songs: Vec<Song>,
+        tracks: Vec<TrackDbRow>,
         now_millis: i64,
     ) -> Self {
         Self {
@@ -117,8 +119,31 @@ impl ProductionStore {
             artists,
             albums,
             songs,
+            tracks,
             now_millis,
         }
+    }
+
+    /// Resolve a legacy recording ID only when its raw member occurrence is
+    /// unique and has supported positions. This does not authorize playback.
+    pub fn resolve_song(&self, id: &str) -> Option<Song> {
+        let mut tracks = self.tracks.iter().filter(|t| t.recording_mbid == id);
+        let track = tracks.next()?;
+        if tracks.next().is_some() {
+            return None;
+        }
+        let disc = track.medium_no.filter(|n| *n > 0)?;
+        let position = track.track_no.filter(|n| *n > 0)?;
+        let mut songs = self.songs.iter().filter(|song| song.id == id);
+        let song = songs.next()?;
+        if songs.next().is_some()
+            || song.album_id != track.release_mbid
+            || song.disc != i64::from(disc)
+            || song.track != i64::from(position)
+        {
+            return None;
+        }
+        Some(song.clone())
     }
 }
 
@@ -233,6 +258,7 @@ pub fn build_snapshot(
     out_songs.sort_by(|a, b| {
         a.album_id
             .cmp(&b.album_id)
+            .then_with(|| a.disc.cmp(&b.disc))
             .then_with(|| a.track.cmp(&b.track))
             .then_with(|| a.id.cmp(&b.id))
     });
@@ -267,9 +293,7 @@ fn not_authorized() -> (i64, String) {
 }
 
 fn catalogue_date_desc(left: &Option<String>, right: &Option<String>) -> std::cmp::Ordering {
-    left.as_ref()
-        .map(std::cmp::Reverse)
-        .cmp(&right.as_ref().map(std::cmp::Reverse))
+    right.cmp(left)
 }
 
 impl Library for ProductionStore {
@@ -360,7 +384,9 @@ impl Library for ProductionStore {
         albums.retain(|album| albums_with_songs.contains(album.id.as_str()));
         match query.list_type {
             "random" => albums.sort_by(|a, b| a.id.cmp(&b.id)),
-            "newest" => albums.sort_by(|a, b| catalogue_date_desc(&a.curated_at, &b.curated_at)),
+            "newest" => albums.sort_by(|a, b| {
+                catalogue_date_desc(&a.curated_at, &b.curated_at).then_with(|| a.id.cmp(&b.id))
+            }),
             "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
             "alphabeticalByArtist" => albums.sort_by(|a, b| {
                 a.artist_sort_name
@@ -375,6 +401,7 @@ impl Library for ProductionStore {
                 albums.sort_by(|a, b| {
                     catalogue_date_desc(&a.release_date, &b.release_date)
                         .then_with(|| catalogue_date_desc(&a.curated_at, &b.curated_at))
+                        .then_with(|| a.id.cmp(&b.id))
                 });
             }
             kind => {
@@ -405,12 +432,17 @@ impl Library for ProductionStore {
             .filter(|s| s.album_id == album_id)
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.track.cmp(&b.track).then(a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            a.disc
+                .cmp(&b.disc)
+                .then(a.track.cmp(&b.track))
+                .then(a.id.cmp(&b.id))
+        });
         out
     }
 
     fn song(&self, id: &str) -> Option<Song> {
-        self.songs.iter().find(|s| s.id == id).cloned()
+        self.resolve_song(id)
     }
 
     fn all_songs(&self) -> Vec<Song> {

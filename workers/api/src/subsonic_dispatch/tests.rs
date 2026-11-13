@@ -102,8 +102,41 @@ fn store() -> ProductionStore {
         artists,
         albums,
         songs,
+        tracks,
         TEST_NOW_MILLIS,
     )
+}
+
+#[test]
+fn production_dispatch_refuses_unpersisted_mutations_after_auth() {
+    let app = nntune_subsonic::SubsonicApp::production(store());
+    for (endpoint, args) in [
+        ("createPlaylist", "name=Mix&songId=so-1"),
+        ("updatePlaylist", "playlistId=pl-1&name=Mix"),
+        ("deletePlaylist", "id=pl-1"),
+        ("scrobble", "id=so-1"),
+        ("star", "id=so-1"),
+        ("unstar", "id=so-1"),
+        ("setRating", "id=so-1&rating=5"),
+        ("savePlayQueue", "id=so-1"),
+        ("refreshPodcasts", ""),
+        (
+            "createPodcastChannel",
+            "url=https%3A%2F%2Fexample.com%2Ffeed",
+        ),
+        ("deletePodcastChannel", "id=pc-1"),
+    ] {
+        for method in ["GET", "POST"] {
+            let path = format!("/rest/{endpoint}.view");
+            let response = app.handle(method, &path, &format!("apiKey=key&f=json&{args}"), "");
+            let text = String::from_utf8(response.body).unwrap();
+            assert!(text.contains("\"status\":\"failed\""), "{endpoint}: {text}");
+            assert!(text.contains("\"code\":0"), "{endpoint}: {text}");
+            let unauth = app.handle(method, &path, "f=json", "");
+            let text = String::from_utf8(unauth.body).unwrap();
+            assert!(text.contains("\"code\":40"), "{endpoint}: {text}");
+        }
+    }
 }
 
 fn mel() -> Identity {
@@ -167,7 +200,7 @@ fn snapshot_ordering_is_deterministic() {
         b1.iter().map(|a| &a.id).collect::<Vec<_>>(),
         b2.iter().map(|a| &a.id).collect::<Vec<_>>()
     );
-    // Songs sort by album, track, id — Album A's tracks come first.
+    // Songs sort by album, disc, track, id — Album A's tracks come first.
     assert_eq!(s1.first().map(|s| s.id.as_str()), Some(SONG_1));
     assert_eq!(s2.first().map(|s| s.id.as_str()), Some(SONG_1));
     // Albums sort by name.
@@ -177,6 +210,127 @@ fn snapshot_ordering_is_deterministic() {
         a1.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
         vec![ARTIST_Z, ARTIST_A]
     );
+}
+
+#[test]
+fn songs_sort_by_disc_track_and_id_in_snapshot_and_album() {
+    let tracks = vec![
+        track_row(ALBUM_A, "a", "disc 2", None, Some(2), Some(1)),
+        track_row(ALBUM_A, "z", "disc 1 track 2", None, Some(1), Some(2)),
+        track_row(ALBUM_A, "y", "disc 1 track 1", None, Some(1), Some(1)),
+        track_row(ALBUM_A, "b", "missing track", None, None, None),
+        track_row(ALBUM_A, "c", "duplicate position", None, Some(1), Some(1)),
+    ];
+    let (_, _, songs) = build_snapshot(&[], &[], &tracks);
+    let ids = |songs: &[nntune_subsonic::library::Song]| {
+        songs.iter().map(|song| song.id.clone()).collect::<Vec<_>>()
+    };
+    let expected = vec!["b", "c", "y", "z", "a"];
+    assert_eq!(ids(&songs), expected);
+    let mut store = store();
+    store.songs = songs.into_iter().rev().collect();
+    assert_eq!(ids(&store.songs_for_album(ALBUM_A)), expected);
+}
+
+#[test]
+fn album_list2_dates_put_known_first_and_break_ties_by_id() {
+    let mut store = store();
+    let template_album = store.albums[0].clone();
+    let template_song = store.songs[0].clone();
+    store.albums.clear();
+    store.songs.clear();
+    for (id, release, curated) in [
+        ("z", None, None),
+        ("b", Some("2022"), Some("2020")),
+        ("a", Some("2022"), Some("2020")),
+        ("c", Some("2021"), Some("2023")),
+        ("d", None, Some("2021")),
+    ] {
+        let mut album = template_album.clone();
+        album.id = id.into();
+        album.year = Some(2001);
+        album.release_date = release.map(str::to_string);
+        album.curated_at = curated.map(str::to_string);
+        store.albums.push(album);
+        let mut song = template_song.clone();
+        song.album_id = id.into();
+        store.songs.push(song);
+    }
+    let identity = mel();
+    let ids = |kind| {
+        store
+            .album_list2(query(&identity, kind))
+            .unwrap()
+            .into_iter()
+            .map(|album| album.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids("newest"), vec!["c", "d", "a", "b", "z"]);
+    assert_eq!(ids("byYear"), vec!["a", "b", "c", "d", "z"]);
+    let mut filtered = query(&identity, "byYear");
+    filtered.from_year = Some(2002);
+    filtered.to_year = Some(2003);
+    assert!(store.album_list2(filtered).unwrap().is_empty());
+    for album in &mut store.albums {
+        album.release_date = None;
+        album.curated_at = None;
+    }
+    let ids = store
+        .album_list2(query(&identity, "byYear"))
+        .unwrap()
+        .into_iter()
+        .map(|album| album.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["a", "b", "c", "d", "z"]);
+    let newest = store
+        .album_list2(query(&identity, "newest"))
+        .unwrap()
+        .into_iter()
+        .map(|album| album.id)
+        .collect::<Vec<_>>();
+    assert_eq!(newest, ids);
+}
+
+#[test]
+fn ambiguous_recording_lookup_fails_closed() {
+    let mut store = store();
+    let original = store.song(SONG_1).unwrap();
+    let mut repeated = original.clone();
+    repeated.track = 3;
+    store.songs.push(repeated);
+    assert!(store.song(SONG_1).is_none());
+    store.songs.pop();
+    let mut other_release = original;
+    other_release.album_id = ALBUM_B.into();
+    store.songs.push(other_release);
+    assert!(store.song(SONG_1).is_none());
+    assert!(store.song(SONG_2).is_some());
+    assert!(store.song("unknown").is_none());
+}
+
+#[test]
+fn lookup_requires_unique_raw_positive_positions() {
+    let mut store = store();
+    assert!(store.resolve_song(SONG_1).is_some());
+    assert!(store.resolve_song(SONG_3).is_none());
+    for (disc, track) in [
+        (None, Some(1)),
+        (Some(1), None),
+        (Some(0), Some(1)),
+        (Some(1), Some(0)),
+        (Some(-1), Some(1)),
+        (Some(1), Some(-1)),
+    ] {
+        store.tracks[0].medium_no = disc;
+        store.tracks[0].track_no = track;
+        assert!(store.resolve_song(SONG_1).is_none());
+    }
+    store.tracks[0].medium_no = Some(1);
+    store.tracks[0].track_no = Some(1);
+    let mut duplicate = store.tracks[0].clone();
+    duplicate.release_mbid = ALBUM_B.into();
+    store.tracks.push(duplicate);
+    assert!(store.resolve_song(SONG_1).is_none());
 }
 
 #[test]

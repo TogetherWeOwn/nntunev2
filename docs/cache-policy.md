@@ -8,7 +8,24 @@ configs must use them verbatim. This document creates no buckets,
 renames nothing, and binds nothing — it pins how long entries live and
 which buckets a Worker may never consume.
 
-## Buckets
+> Target note (2026-11-13): [ADR 0015](adr/0015-standard-s3-storage-boundary.md)
+> approves a direction where the storage provider owns caching and NNTune reads
+> media through a read-only standard S3 GET. This policy describes the merged
+> implementation and is unchanged until that migration lands.
+
+## S3 media target (not provisioned)
+
+The old archive R2 reservation is not the target storage contract. Media uses
+one S3 bucket per environment, with endpoint, hostname and bucket names from
+configuration (for example `nntune-staging` and `nntune-prod`, not fixed names).
+The ingest role has `rw` access; the metered stream Worker has `ro` access and
+proxies ranged GETs. Provider caching, retention and repair stay behind S3;
+there is no new app-side popularity-cache requirement. Use disposable buckets
+only until provider production-readiness. No bucket, binding, TTL or existing
+reservation guard changes through this document. Artwork rights and existing
+non-media metadata caching are unchanged.
+
+## Historical implementation buckets
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|

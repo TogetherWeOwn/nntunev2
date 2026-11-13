@@ -8,11 +8,12 @@ future intentions. It is not a feature-availability or delivery-status tracker.
 ## Vision
 
 Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,
-admin-curated catalogue: playback is fetched through service-owned backend
-provider accounts (ADR 0014), and tracks proven popular by real plays are
-served from a shared R2 popularity cache (ADR 0013). We provide the music
-experience on top: search, streaming and library management. There are no
-user provider accounts to connect and no offline downloads.
+admin-curated catalogue. The approved storage direction is a plain S3 client:
+media comes from a configured S3-compatible provider, which owns storage-side
+accounts, encryption, caching and repair ([ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md)).
+The existing NNTP implementation has not yet migrated. We provide search,
+streaming and library management; there are no user provider accounts to
+connect and no offline downloads.
 
 ## Plans
 
@@ -25,7 +26,7 @@ metering primitives below are built to support them from day one.
 | Concern | Choice |
 |---|---|
 | Backend | **Rust** (`workers-rs` → `wasm32`) for backend Workers, including Durable Objects; the staging Tail alert Worker (`workers/observability`) is JavaScript |
-| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native; the engine is [velmora](https://github.com/TogetherWeOwn/velmora), pinned by git `rev` |
+| Shared core | `crates/nntune-core`: transitional NNTP re-export shim for [velmora](https://github.com/TogetherWeOwn/velmora), currently pinned by git `rev`. Remove the shim only after its last caller is gone; the approved target ([ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md)) is a plain standard S3 client, not yet migrated |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
 | Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
 | Object cache | **R2** for audio / artwork cache |
