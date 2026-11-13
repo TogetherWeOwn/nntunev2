@@ -31,8 +31,10 @@ own that whole concern, and NNTune will talk to it as an ordinary S3 client.
    reads may be slower than cached ones.
 6. **Locator:** a track's media is addressed by `{bucket, key, etag, size}`.
    The ETag is an opaque value from the store, never a content hash. A
-   successful PUT (HTTP 200) must precede the atomic pointer switch to the
-   new object.
+   successful object PUT (HTTP 200) must precede the atomic pointer switch
+   to the new object. For multipart uploads, require successfully validated
+   completion of the whole object, not merely a successful part PUT or an
+   HTTP 200 completion response containing an embedded error.
 7. **Schema:** forward-expand `s3_bucket`, `s3_key`, `s3_etag` and `s3_size`
    alongside the existing `nzb_ref_*` columns; contract (drop the old
    columns) only in a later step once nothing reads them.
