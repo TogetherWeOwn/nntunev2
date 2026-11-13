@@ -1,5 +1,25 @@
 # NNTune v2 agent notes
 
+## Documentation map (repo-only, resumable from this checkout)
+
+- Product direction, approved vs proposed scope and non-goals:
+  [ROADMAP.md](ROADMAP.md) (entry point; use it first for scope).
+- Active milestone requirements and acceptance criteria:
+  [docs/specs/](docs/specs/README.md) (M1 exit) and
+  [docs/m1-exit-traceability.md](docs/m1-exit-traceability.md).
+- Approved approach with implemented vs remaining and verification
+  routes: [docs/plans/](docs/plans/README.md).
+- Material owner decisions with provenance:
+  [docs/decisions/](docs/decisions/README.md).
+- Deploy, rollback and recovery procedures:
+  [docs/runbooks/](docs/runbooks/README.md) and [docs/ops.md](docs/ops.md).
+- Dated current source snapshot and next unfinished step:
+  [docs/handoff.md](docs/handoff.md).
+- Technical decisions: [docs/adr/](docs/adr/README.md).
+
+Assignment and live-status tracking stays in the task tracker; the
+repo docs above carry the durable knowledge.
+
 ## CI and verification location
 
 Full test suites and CI gates run on GitHub Actions, never as local
@@ -138,7 +158,9 @@ feature — never as an audio source.
   Privacy Policy wherever the embed is offered.
 
 The pre-existing extraction spike under `workers/youtube/` predates
-these rules and is awaiting retirement. The CI gate allow-lists that
+these rules and is awaiting retirement (kept, flag-off — see
+[docs/decisions/0001-youtube-embed-first.md](docs/decisions/0001-youtube-embed-first.md)).
+The CI gate allow-lists that
 path (and its design note) for the extraction rule only, temporarily.
 Do not extend the spike, and do not copy its approach into new code.
 
