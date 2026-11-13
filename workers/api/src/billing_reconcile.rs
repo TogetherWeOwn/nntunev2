@@ -686,7 +686,8 @@ fn stale_snapshot(
         },
         history,
         fail_closed: None,
-        explicit_stale: true,
+        // Only the target subscription's own proof may suppress its write.
+        explicit_stale: kept.stripe_subscription_id == sub.id,
         read_plan: Some(kept.plan_id.clone()),
         read_anchor: kept.paid_invoice_id.clone(),
     }

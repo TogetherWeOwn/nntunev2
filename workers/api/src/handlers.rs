@@ -8944,6 +8944,22 @@ mod tests {
                     .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
                     .or_else(|| shadow.get(&key));
                 let merged = merge_billing_row(stored, outcome);
+                // Mirrors `uq_subscriptions_live_slot`: a different live
+                // subscription holding the slot aborts the write before any
+                // row or history mutation.
+                let live = |status: &str| {
+                    matches!(
+                        status,
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+                };
+                if current.is_some_and(|row| {
+                    row.stripe_subscription_id != merged.stripe_subscription_id
+                        && live(&row.status)
+                        && live(&merged.status)
+                }) {
+                    return Err(StoreError);
+                }
                 if let Some(existing) = current {
                     if existing.stripe_subscription_id != merged.stripe_subscription_id {
                         shadow.insert(
@@ -11328,6 +11344,93 @@ mod tests {
             // equal-end adopt arm never reads this.
             read_plan: None,
             read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_live_slot_conflict_rolls_back_checkout_and_webhook_reconcile() {
+        // Anchored live A holds the slot; a paid B (A's anchor absent from
+        // its invoices) resolves to any live status. The store must fail
+        // with its normal error before row or history mutation, so the
+        // checkout does not succeed and the webhook is retried.
+        let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
+        for a_status in live {
+            for b_status in live {
+                for webhook in [false, true] {
+                    let h = stripe_harness();
+                    seed_billing_user(&h, "u1");
+                    let end = BILLING_NOW + BILLING_PERIOD;
+                    let a = stored_seed(PLAN_PLUS, a_status, Some(end), Some("in_a"), None);
+                    h.store.billing_rows.borrow_mut().insert("u1".into(), a.row);
+                    block_on(h.store.create_checkout_operation(
+                        "op_b",
+                        "u1",
+                        PRICE_PLUS,
+                        Some("cus_test_1"),
+                    ))
+                    .expect("op insert");
+                    block_on(h.store.update_checkout_operation(
+                        "op_b",
+                        "submitted",
+                        PRICE_PLUS,
+                        Some("cs_b"),
+                    ))
+                    .expect("mark submitted");
+                    let session = test_session(
+                        "cs_b",
+                        "complete",
+                        "paid",
+                        Some("cus_test_1"),
+                        Some("sub_b"),
+                        Some("op_b"),
+                    );
+                    h.stripe
+                        .sessions
+                        .borrow_mut()
+                        .insert("cs_b".into(), session);
+                    h.stripe.subscriptions.borrow_mut().insert(
+                        "sub_b".into(),
+                        test_subscription("sub_b", "cus_test_1", b_status, PRICE_PLUS),
+                    );
+                    let invoice = test_invoice(
+                        "in_b",
+                        "cus_test_1",
+                        "sub_b",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end + BILLING_PERIOD,
+                        BILLING_NOW + 60,
+                    );
+                    h.stripe
+                        .invoices
+                        .borrow_mut()
+                        .insert("in_b".into(), invoice);
+                    let rows = h.store.billing_rows.borrow().clone();
+                    let shadow = h.store.billing_shadow.borrow().clone();
+                    let history = h.store.invoice_history.borrow().clone();
+                    let case = format!("{a_status}/{b_status}/webhook={webhook}");
+                    if webhook {
+                        let body = checkout_completed_body("evt_b", "cs_b", false);
+                        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+                        assert_eq!(resp.status, 500, "{case}");
+                        assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
+                    } else {
+                        // `ensure_checkout_session` refuses a live A before
+                        // reaching its completed-session branch, so drive
+                        // that branch's shared driver directly.
+                        let result = block_on(reconcile_checkout_session(&h.ctx(), "cs_b"));
+                        assert_eq!(result, Err(()), "{case}");
+                    }
+                    let op = block_on(h.store.checkout_operation_by_id("op_b"))
+                        .expect("op lookup")
+                        .expect("op stored");
+                    assert_eq!(op.state, "submitted", "{case}: not succeeded");
+                    assert_eq!(*h.store.billing_rows.borrow(), rows, "{case}");
+                    assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
+                    assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
+                    assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
+                }
+            }
         }
     }
 

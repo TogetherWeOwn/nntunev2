@@ -617,6 +617,31 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
 }
 
 #[tokio::test]
+async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let a = fx.seed_active("u1", "sub_a").await;
+    let live = fx.live("u1").await.expect("anchored live A");
+    assert_eq!(live.stripe_subscription_id, "sub_a");
+    assert_eq!(live.paid_invoice_id, a.anchor);
+    let b = remote("sub_b", &[invoice("sub_b", 1), invoice("sub_b", 2)]);
+    assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
+    let outcome = fx.fold("u1", &b).await;
+    assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
+    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(a));
+    assert!(fx.snap("sub_b").await.is_none());
+    assert_eq!(fx.rows("u1").await, 1);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert_eq!(fx.history_rows("sub_b").await, 0);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn setup_snapshots_and_live_selection_are_isolated() {
     let fx = Fx::new().await;
     for user in ["u1", "u2", "u3"] {
