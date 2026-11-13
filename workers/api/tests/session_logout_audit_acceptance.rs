@@ -137,6 +137,7 @@ impl handlers::Store for FakeStore {
         challenge: &auth::PasskeyChallenge,
         user_id: Option<&str>,
         purpose: &str,
+        receipt: Option<&handlers::InviteBudgetReceipt>,
     ) -> Result<(), handlers::StoreError> {
         self.challenges.borrow_mut().insert(
             challenge.id.clone(),
@@ -144,6 +145,7 @@ impl handlers::Store for FakeStore {
                 challenge: challenge.clone(),
                 user_id: user_id.map(str::to_string),
                 purpose: purpose.to_string(),
+                invite_budget_receipt: receipt.cloned(),
             },
         );
         Ok(())
