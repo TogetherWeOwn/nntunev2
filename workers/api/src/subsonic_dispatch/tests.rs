@@ -128,6 +128,21 @@ fn query<'a>(identity: &'a Identity, list_type: &'a str) -> AlbumListQuery<'a> {
 }
 
 #[test]
+fn production_dispatch_refuses_stream_for_existing_and_unknown_songs() {
+    let app = nntune_subsonic::SubsonicApp::production(store());
+    for id in [SONG_1, "unknown"] {
+        let response = app.handle(
+            "GET",
+            "/rest/stream.view",
+            &format!("apiKey=already-authenticated&id={id}&f=json"),
+            "",
+        );
+        assert_eq!(response.content_type, "application/json");
+        assert!(body_str(&response).contains("\"code\":70"));
+    }
+}
+
+#[test]
 fn snapshot_maps_flac_size_duration_and_year() {
     let (artists, releases, tracks) = fixture_rows();
     let (_, albums, songs) = build_snapshot(&artists, &releases, &tracks);

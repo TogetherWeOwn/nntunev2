@@ -718,9 +718,10 @@ struct CatalogueTestMirror {
 /// `catalogue_store_for_postgres_test`).
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub trait SubsonicSnapshotCatalogueStore {
-    async fn subsonic_snapshot_catalogue(
+    async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
+        cap: i64,
     ) -> Result<
         (
             Vec<crate::catalogue::ArtistDbRow>,
@@ -729,10 +730,7 @@ pub trait SubsonicSnapshotCatalogueStore {
         ),
         StoreError,
     >;
-}
 
-#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-impl SubsonicSnapshotCatalogueStore for PgStore {
     async fn subsonic_snapshot_catalogue(
         &self,
         user_id: &str,
@@ -744,7 +742,26 @@ impl SubsonicSnapshotCatalogueStore for PgStore {
         ),
         StoreError,
     > {
-        self.subsonic_member_catalogue(user_id).await
+        self.subsonic_snapshot_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)
+            .await
+    }
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl SubsonicSnapshotCatalogueStore for PgStore {
+    async fn subsonic_snapshot_catalogue_with_cap(
+        &self,
+        user_id: &str,
+        cap: i64,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        self.subsonic_member_catalogue_with_cap(user_id, cap).await
     }
 }
 
@@ -871,6 +888,22 @@ impl PgStore {
         ),
         StoreError,
     > {
+        self.subsonic_member_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)
+            .await
+    }
+
+    async fn subsonic_member_catalogue_with_cap(
+        &self,
+        user_id: &str,
+        cap: i64,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
         Self::bounded(
             async {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
@@ -914,13 +947,11 @@ impl PgStore {
                 let artist_rows = mirror
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
-                        &[
-                            (&member_releases, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
-                        ],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(artist_rows.len(), cap)?;
                 let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
                     .iter()
                     .map(catalogue_artist_from_row)
@@ -928,13 +959,11 @@ impl PgStore {
                 let release_rows = mirror
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
-                        &[
-                            (&member_releases, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
-                        ],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(release_rows.len(), cap)?;
                 let release_rows: Vec<crate::catalogue::ReleaseDbRow> = release_rows
                     .iter()
                     .map(catalogue_release_from_row)
@@ -947,11 +976,12 @@ impl PgStore {
                         &[
                             (&pair_releases, Type::TEXT_ARRAY),
                             (&pair_recordings, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                            (&cap, Type::INT8),
                         ],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(track_rows.len(), cap)?;
                 let track_rows: Vec<crate::catalogue::TrackDbRow> = track_rows
                     .iter()
                     .map(catalogue_track_from_row)
@@ -5994,8 +6024,155 @@ fn emit_record(
 /// truncate every library past the first page and make those songs
 /// unstreamable; the snapshot reads the whole member collection under this
 /// far larger but still bounded cap (rows are in-memory only).
-#[allow(dead_code)] // Used by the mount in the next slice.
 const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
+
+// A full page may have been truncated. Refuse it rather than serve a
+// potentially incomplete catalogue; the check precedes membership filtering.
+fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError> {
+    if cap <= 0 || len >= cap as usize {
+        Err(StoreError)
+    } else {
+        Ok(())
+    }
+}
+
+async fn after_auth<A, T, E, F, S, R>(auth: A, snapshot: F) -> Result<R, E>
+where
+    A: std::future::Future<Output = Result<T, E>>,
+    F: FnOnce(T) -> S,
+    S: std::future::Future<Output = Result<R, E>>,
+{
+    snapshot(auth.await?).await
+}
+
+fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
+    let mut response = Response::from_bytes(res.body.clone())?.with_status(res.status);
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+/// Authenticate before constructing the member-scoped dispatch store.
+/// Playback remains unavailable until an occurrence has a trusted binding
+/// to an application track; the dispatcher never receives audio bytes.
+pub async fn subsonic_mount(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    env: Env,
+    trace_id: Option<String>,
+) -> WorkerResult<Response> {
+    use crate::subsonic_dispatch as core;
+    use nntune_subsonic::envelope::code;
+    use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{Identity, MemStore, SubsonicApp, UserAccount};
+
+    if matches!(route(path), Route::PublicEndpoint(_)) {
+        let app = SubsonicApp::production(MemStore::empty());
+        return respond_document(&app.handle(method, path, query, body));
+    }
+    let merged = core::merged_query_params(method, query, body);
+    let config = match config_from_env(&env) {
+        Some(config) => config,
+        None => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let keyring = match config
+        .subsonic_index
+        .as_ref()
+        .and_then(|cfg| cfg.keyring().ok())
+    {
+        Some(keyring) => keyring,
+        None => {
+            return respond_document(&core::auth_error_response(
+                &merged,
+                crate::subsonic_auth::AuthError::Unavailable,
+            ))
+        }
+    };
+    let form_body = (!body.is_empty()).then_some(body.as_bytes());
+    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+        Ok(credentials) => credentials,
+        Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
+    };
+    let store = PgStore {
+        env: Some(env.clone()),
+        trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
+        mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_mirror: None,
+    };
+    let now_millis = worker::Date::now().as_millis();
+    let auth = async {
+        crate::subsonic_auth::authenticate(
+            &store,
+            &credentials,
+            &keyring,
+            &config,
+            now_millis / 1000,
+        )
+        .await
+        .map_err(|err| core::auth_error_response(&merged, err))
+    };
+    let (principal, (artist_rows, release_rows, track_rows)) = match after_auth(auth, |principal| {
+        let store = &store;
+        let merged = &merged;
+        async move {
+            let rows = store
+                .subsonic_member_catalogue(principal.user_id())
+                .await
+                .map_err(|_| core::render_error(merged, code::GENERIC, "Internal server error."))?;
+            Ok((principal, rows))
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return respond_document(&response),
+    };
+    let (email, role) = match store.subsonic_account(principal.user_id()).await {
+        Ok(Some(pair)) => pair,
+        _ => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let is_admin = role == "admin";
+    let identity = Identity {
+        username: principal.username().to_string(),
+        email: email.clone(),
+        is_admin,
+    };
+    let account = UserAccount {
+        email,
+        is_admin,
+        is_manager: role == "manager",
+    };
+    let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
+    let app = SubsonicApp::production(core::ProductionStore::new(
+        identity,
+        account,
+        artists,
+        albums,
+        songs,
+        track_rows,
+        now_millis as i64,
+    ));
+    respond_document(&app.handle(method, path, query, body))
+}
 
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
@@ -6186,6 +6363,35 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_snapshot_page_fails_closed() {
+        let cap = SUBSONIC_SNAPSHOT_CAP as usize;
+        assert!(require_complete_snapshot_page(0, SUBSONIC_SNAPSHOT_CAP).is_ok());
+        assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
+        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
+        assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_completed_authentication() {
+        let calls = std::cell::Cell::new(0);
+        let rejected = after_auth(async { Err::<u8, _>("denied") }, |_| {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(rejected, Err("denied"));
+        assert_eq!(calls.get(), 0);
+        let calls_ref = &calls;
+        let accepted = after_auth(async { Ok::<_, &str>(42) }, |user| async move {
+            calls_ref.set(calls_ref.get() + 1);
+            Ok(user)
+        })
+        .await;
+        assert_eq!(accepted, Ok(42));
+        assert_eq!(calls.get(), 1);
+    }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
