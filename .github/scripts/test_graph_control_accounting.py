@@ -32,6 +32,13 @@ class Samples(unittest.TestCase):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_default_controls_execute(self):
+        counts = accounting.run_controls()
+        self.assertEqual(set(accounting.CONTROLS), set(counts))
+        for result in counts.values():
+            self.assertGreater(result["matched"], 0)
+            self.assertEqual(result["matched"], result["executed"])
+
     def run_sample(self, method):
         suite = unittest.TestSuite([Samples(method)])
         with mock.patch.object(accounting.unittest.defaultTestLoader, "loadTestsFromName", return_value=suite):
