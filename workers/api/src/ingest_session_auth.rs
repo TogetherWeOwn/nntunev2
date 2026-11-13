@@ -162,7 +162,7 @@ mod tests {
             library_id: "library",
             actions: &[Action::Status],
         };
-        let mut job = Job {
+        let job = Job {
             id: "job",
             owner_id: "owner",
             environment: "test",
@@ -192,8 +192,11 @@ mod tests {
         ] {
             assert_eq!(check(action, env, library, id, &job), forbidden);
         }
-        job.owner_id = "other";
-        let wrong_owner = check(Action::Status, "test", "library", "job", &job);
+        let other_job = Job {
+            owner_id: "other",
+            ..job
+        };
+        let wrong_owner = check(Action::Status, "test", "library", "job", &other_job);
         assert_eq!(wrong_owner, forbidden);
     }
 }
