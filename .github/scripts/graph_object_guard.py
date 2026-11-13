@@ -33,7 +33,7 @@ def guard(root, commits, trusted_paths):
     def git(*args):
         result = subprocess.run(
             ["git", "--no-lazy-fetch", "--no-replace-objects",
-             "-c", "core.fsmonitor=false", "-C", str(root),
+             "-c", "core.fsmonitor=false", "-c", "core.ignoreCase=false", "-C", str(root),
              "--work-tree", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             env=git_environment(),

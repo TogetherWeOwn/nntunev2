@@ -71,6 +71,14 @@ class RealRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
 
+    def test_casefold_config_cannot_hide_untracked_input(self):
+        self.git("config", "core.ignoreCase", "true")
+        guard.guard(self.root, [self.commit], ["controls"])
+        (self.root / "controls" / "INPUT").write_text("untracked\n")
+        self.assertEqual((self.root / "controls" / "input").read_text(), "trusted\n")
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [self.commit], ["controls"])
+
     def test_configured_worktree_cannot_hide_untracked_input(self):
         with tempfile.TemporaryDirectory() as directory:
             donor = Path(directory) / "donor"
