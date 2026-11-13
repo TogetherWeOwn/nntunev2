@@ -115,8 +115,8 @@ pub struct LiveRow {
 }
 
 /// Everything reconciliation needs from the store: the account's Stripe
-/// customer (if bound yet), the live subscription row (if any), and the
-/// full `plan_prices` map (a handful of rows; loaded whole so unknown
+/// customer (if bound yet), the live subscription row (or explicitly targeted
+/// row), and the full `plan_prices` map (a handful of rows; loaded whole so unknown
 /// prices fail closed against complete data, never a partial cache).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReconcileInput {
