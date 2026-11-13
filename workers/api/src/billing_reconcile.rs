@@ -115,8 +115,8 @@ pub struct LiveRow {
 }
 
 /// Everything reconciliation needs from the store: the account's Stripe
-/// customer (if bound yet), the live subscription row (if any), and the
-/// full `plan_prices` map (a handful of rows; loaded whole so unknown
+/// customer (if bound yet), the live subscription row (or explicitly targeted
+/// row), and the full `plan_prices` map (a handful of rows; loaded whole so unknown
 /// prices fail closed against complete data, never a partial cache).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReconcileInput {
@@ -910,6 +910,12 @@ pub fn price_bindings_select_statement() -> &'static str {
 /// in `reconcile_subscription`, never here.
 pub fn reconcile_live_select_statement() -> &'static str {
     "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, paid_invoice_id, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
+}
+
+/// Parameters: user_id, stripe_subscription_id. Select the exact stored row,
+/// including statuses outside the live-slot predicate.
+pub fn reconcile_target_select_statement() -> &'static str {
+    "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, paid_invoice_id, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND stripe_subscription_id = $2"
 }
 
 /// Parameters: event_id. First claim wins (`true`); duplicates ack 200

@@ -1278,11 +1278,12 @@ pub trait Store {
         async move { Ok(()) }
     }
     /// The reconciliation input for one user: bound Stripe customer, live
-    /// subscription row, and the full `plan_prices` map. Default `Err`
-    /// (fail closed): without local state nothing advances.
+    /// or explicitly targeted subscription row, and the full `plan_prices`
+    /// map. Default `Err` (fail closed): without local state nothing advances.
     fn load_reconcile_input(
         &self,
         _user_id: &str,
+        _target_subscription_id: Option<&str>,
     ) -> impl Future<Output = Result<crate::billing_reconcile::ReconcileInput, StoreError>> {
         async move { Err(StoreError) }
     }
@@ -5980,7 +5981,7 @@ where
         .map_err(|_| ())?;
     let input = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -6331,7 +6332,7 @@ where
 {
     let fresh = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?
         .stripe_customer_id;
@@ -6572,7 +6573,7 @@ where
 {
     let input = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
     // Plan ids come only from `plan_prices`: an unmapped, unselectable,
@@ -6834,7 +6835,7 @@ where
 {
     Ok(ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?
         .stripe_customer_id)
@@ -8870,30 +8871,38 @@ mod tests {
         async fn load_reconcile_input(
             &self,
             user_id: &str,
+            target_subscription_id: Option<&str>,
         ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            let live = self.billing_rows.borrow().get(user_id).map(|row| {
-                crate::billing_reconcile::LiveRow {
-                    stripe_subscription_id: row.stripe_subscription_id.clone(),
-                    stripe_customer_id: row.stripe_customer_id.clone(),
-                    stripe_item_id: row.stripe_item_id.clone(),
-                    stripe_price_id: row.stripe_price_id.clone(),
-                    plan_id: row.plan_id.clone(),
-                    status: row.status.clone(),
-                    paid_through_unix: row.paid_through_unix,
-                    paid_invoice_id: row.paid_invoice_id.clone(),
-                    grace_until_unix: row.grace_until_unix,
-                }
-            });
-            // A `trialing` or terminal row sits outside the live slot: the
-            // production predicate excludes it, so the fake does too.
-            let live = live.filter(|row| {
-                matches!(
-                    row.status.as_str(),
-                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
-                )
+            let current = self.billing_rows.borrow().get(user_id).cloned();
+            let selected = match target_subscription_id {
+                Some(target) => current
+                    .filter(|row| row.stripe_subscription_id == target)
+                    .or_else(|| {
+                        self.billing_shadow
+                            .borrow()
+                            .get(&(user_id.to_string(), target.to_string()))
+                            .cloned()
+                    }),
+                None => current.filter(|row| {
+                    matches!(
+                        row.status.as_str(),
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+                }),
+            };
+            let live = selected.map(|row| crate::billing_reconcile::LiveRow {
+                stripe_subscription_id: row.stripe_subscription_id.clone(),
+                stripe_customer_id: row.stripe_customer_id.clone(),
+                stripe_item_id: row.stripe_item_id.clone(),
+                stripe_price_id: row.stripe_price_id.clone(),
+                plan_id: row.plan_id.clone(),
+                status: row.status.clone(),
+                paid_through_unix: row.paid_through_unix,
+                paid_invoice_id: row.paid_invoice_id.clone(),
+                grace_until_unix: row.grace_until_unix,
             });
             Ok(crate::billing_reconcile::ReconcileInput {
                 stripe_customer_id: self.billing_customers.borrow().get(user_id).cloned(),
@@ -10030,7 +10039,7 @@ mod tests {
     }
 
     fn live_for(h: &Harness, user_id: &str) -> Option<crate::billing_reconcile::LiveRow> {
-        block_on(h.store.load_reconcile_input(user_id))
+        block_on(h.store.load_reconcile_input(user_id, None))
             .ok()
             .and_then(|input| input.live)
     }
@@ -11357,6 +11366,60 @@ mod tests {
     }
 
     #[test]
+    fn billing_target_selector_preserves_none_and_isolates_user_and_id() {
+        let h = stripe_harness();
+        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let mut b = stored_seed(PLAN_PLUS, "active", Some(200), Some("in_200"), None);
+        b.row.stripe_subscription_id = "sub_other".into();
+        let mut stale = a.clone();
+        stale.row.paid_through_unix = Some(50);
+        for row in [&a, &b, &stale, &b] {
+            block_on(h.store.store_reconcile_outcome("u1", row)).unwrap();
+        }
+        let select = |user, target| {
+            block_on(h.store.load_reconcile_input(user, target))
+                .unwrap()
+                .live
+        };
+        let retained = select("u1", Some("sub_test_1")).unwrap();
+        assert_eq!(retained.status, "canceled");
+        assert_eq!(retained.paid_through_unix, Some(100));
+        assert_eq!(retained.paid_invoice_id.as_deref(), Some("in_100"));
+        assert_eq!(retained.grace_until_unix, Some(10));
+        assert_eq!(
+            select("u1", None).unwrap().stripe_subscription_id,
+            "sub_other"
+        );
+        assert_eq!(select("u1", Some("sub_other")).unwrap().status, "active");
+        assert!(select("u2", Some("sub_test_1")).is_none());
+        assert!(select("u1", Some("missing")).is_none());
+        let mut other = a.clone();
+        other.row.paid_through_unix = Some(999);
+        block_on(h.store.store_reconcile_outcome("u2", &other)).unwrap();
+        assert_eq!(
+            select("u2", Some("sub_test_1")).unwrap().paid_through_unix,
+            Some(999)
+        );
+        let mut current = b.row.clone();
+        current.paid_through_unix = Some(123);
+        h.store
+            .billing_rows
+            .borrow_mut()
+            .insert("u1".into(), current);
+        h.store
+            .billing_shadow
+            .borrow_mut()
+            .insert(("u1".into(), "sub_other".into()), b.row.clone());
+        assert_eq!(
+            select("u1", Some("sub_other")).unwrap().paid_through_unix,
+            Some(123)
+        );
+        *h.store.fail_billing.borrow_mut() = true;
+        assert!(block_on(h.store.load_reconcile_input("u1", Some("sub_test_1"))).is_err());
+        assert!(block_on(h.store.load_reconcile_input("u1", None)).is_err());
+    }
+
+    #[test]
     fn billing_shadow_retains_rows_across_repeated_displacement() {
         let h = stripe_harness();
         let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
@@ -11955,7 +12018,7 @@ mod tests {
                 BILLING_NOW,
             );
             invoice.lines.as_mut().expect("lines").data = order.map(|i| lines[i].clone()).to_vec();
-            let input = block_on(h.store.load_reconcile_input("u1")).expect("input loads");
+            let input = block_on(h.store.load_reconcile_input("u1", None)).expect("input loads");
             let outcome = crate::billing_reconcile::reconcile_subscription(
                 &input,
                 &crate::billing_reconcile::RemoteSubscription {

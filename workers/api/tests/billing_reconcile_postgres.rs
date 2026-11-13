@@ -3,8 +3,9 @@
 
 use nntune_api::billing_reconcile::{
     insert_paid_invoice_history_statement, reconcile_live_select_statement,
-    reconcile_lock_statement, reconcile_subscription, store_reconciled_subscription_statement,
-    LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
+    reconcile_lock_statement, reconcile_subscription, reconcile_target_select_statement,
+    store_reconciled_subscription_statement, LiveRow, PriceBinding, ReconcileInput,
+    ReconcileOutcome, RemoteSubscription,
 };
 use nntune_api::stripe::{
     Invoice, InvoiceLine, InvoiceLinePeriod, InvoiceLines, InvoiceStatusTransitions, Subscription,
@@ -152,21 +153,33 @@ impl Fx {
     }
 
     async fn live(&self, user: &str) -> Option<LiveRow> {
-        self.db
-            .query_opt(reconcile_live_select_statement(), &[&user])
-            .await
-            .unwrap()
-            .map(|r| LiveRow {
-                stripe_subscription_id: r.get("stripe_subscription_id"),
-                stripe_customer_id: r.get("stripe_customer_id"),
-                stripe_item_id: r.get("stripe_subscription_item_id"),
-                stripe_price_id: r.get("stripe_price_id"),
-                plan_id: r.get("plan_id"),
-                status: r.get("status"),
-                paid_through_unix: r.get("paid_through_unix"),
-                paid_invoice_id: r.get("paid_invoice_id"),
-                grace_until_unix: r.get("grace_until_unix"),
-            })
+        self.select(user, None).await
+    }
+
+    async fn select(&self, user: &str, target: Option<&str>) -> Option<LiveRow> {
+        let row = match target {
+            Some(target) => {
+                self.db
+                    .query_opt(reconcile_target_select_statement(), &[&user, &target])
+                    .await
+            }
+            None => {
+                self.db
+                    .query_opt(reconcile_live_select_statement(), &[&user])
+                    .await
+            }
+        };
+        row.unwrap().map(|r| LiveRow {
+            stripe_subscription_id: r.get("stripe_subscription_id"),
+            stripe_customer_id: r.get("stripe_customer_id"),
+            stripe_item_id: r.get("stripe_subscription_item_id"),
+            stripe_price_id: r.get("stripe_price_id"),
+            plan_id: r.get("plan_id"),
+            status: r.get("status"),
+            paid_through_unix: r.get("paid_through_unix"),
+            paid_invoice_id: r.get("paid_invoice_id"),
+            grace_until_unix: r.get("grace_until_unix"),
+        })
     }
 
     async fn history_rows(&self, sub: &str) -> i64 {
@@ -558,6 +571,59 @@ async fn setup_snapshots_and_live_selection_are_isolated() {
     assert_eq!(other.paid_through_unix, Some(T + 60));
     assert!(fx.live("u3").await.is_none());
     assert!(fx.live("missing").await.is_none());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn target_selector_reads_archived_rows_without_changing_live_selection() {
+    let fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    fx.raw("u1", "live", "active", Some(200)).await;
+    for status in ["canceled", "incomplete_expired", "trialing", "unknown"] {
+        fx.raw("u1", status, status, Some(100)).await;
+        fx.db.execute("UPDATE subscriptions SET grace_until = to_timestamp(75) WHERE stripe_subscription_id = $1", &[&status]).await.unwrap();
+        let before = fx.snap(status).await;
+        let selected = fx.select("u1", Some(status)).await.unwrap();
+        assert_eq!(selected.stripe_customer_id, CUS);
+        assert_eq!(selected.stripe_item_id, "si_raw");
+        assert_eq!(selected.stripe_price_id, PRICE);
+        assert_eq!(selected.plan_id, "plus");
+        assert_eq!(selected.stripe_subscription_id, status);
+        assert_eq!(selected.status, status);
+        assert_eq!(selected.paid_through_unix, Some(100));
+        assert_eq!(
+            selected.paid_invoice_id.as_deref(),
+            Some(format!("inv_raw_{status}").as_str())
+        );
+        assert_eq!(selected.grace_until_unix, Some(75));
+        assert_eq!(fx.snap(status).await, before);
+        assert!(fx.select("u2", Some(status)).await.is_none());
+        assert_eq!(fx.history_rows(status).await, 0);
+    }
+    assert_eq!(
+        fx.select("u1", None).await.unwrap().stripe_subscription_id,
+        "live"
+    );
+    assert_eq!(
+        fx.select("u1", Some("live")).await.unwrap(),
+        fx.live("u1").await.unwrap()
+    );
+    assert!(fx.select("u1", Some("missing")).await.is_none());
+    assert!(fx.select("missing", Some("live")).await.is_none());
+    fx.raw("u2", "terminal", "canceled", None).await;
+    assert!(fx.live("u2").await.is_none());
+    assert_eq!(fx.rows("u1").await, 5);
+    assert_eq!(fx.rows("u2").await, 1);
+    for (i, status) in ["incomplete", "active", "past_due", "unpaid", "paused"]
+        .iter()
+        .enumerate()
+    {
+        let user = format!("live_user_{i}");
+        fx.add_user(&user).await;
+        fx.raw(&user, &format!("live_{i}"), status, None).await;
+        assert_eq!(fx.live(&user).await.unwrap().status, *status);
+    }
     fx.cleanup().await;
 }
 

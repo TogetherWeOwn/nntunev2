@@ -4077,6 +4077,7 @@ impl Store for PgStore {
     async fn load_reconcile_input(
         &self,
         user_id: &str,
+        target_subscription_id: Option<&str>,
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
         Self::bounded(
             async {
@@ -4101,13 +4102,25 @@ impl Store for PgStore {
                     })
                     .transpose()?
                     .flatten();
-                let live_rows = client
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_live_select_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
+                let live_rows = match target_subscription_id {
+                    Some(target) => {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::reconcile_target_select_statement(),
+                                &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::reconcile_live_select_statement(),
+                                &[(&user_id, Type::TEXT)],
+                            )
+                            .await
+                    }
+                }
+                .map_err(|_| failed())?;
                 if live_rows.len() > 1 {
                     return Err(StoreError);
                 }
