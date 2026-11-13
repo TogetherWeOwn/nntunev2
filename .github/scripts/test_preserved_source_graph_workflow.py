@@ -16,7 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 class TestPreservedSourceGraphWorkflow(unittest.TestCase):
     def test_head_and_graph_control_are_wired(self):
         text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
-        self.assertIn("  pull_request:\n", text)
+        self.assertIn(
+            "  pull_request:\n"
+            "    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]\n",
+            text,
+        )
         self.assertNotIn("pull_request_target:", text)
         self.assertIn("permissions:\n  contents: read\n", text)
         jobs = split_jobs(text)
