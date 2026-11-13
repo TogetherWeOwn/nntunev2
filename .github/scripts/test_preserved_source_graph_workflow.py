@@ -1,5 +1,6 @@
 """Check the synthetic graph workflow's intended execution boundary."""
 
+import os
 import shutil
 import subprocess
 import sys
@@ -35,17 +36,64 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
         self.assertEqual("${{ github.sha }}", step_field(checkout, "ref"))
         self.assertEqual("2", step_field(checkout, "fetch-depth"))
         self.assertEqual("false", step_field(checkout, "persist-credentials"))
-        for name, expression, rev in (
-            ("MERGE", "github.sha", "HEAD"),
-            ("BASE", "github.event.pull_request.base.sha", "HEAD^1"),
-            ("HEAD", "github.event.pull_request.head.sha", "HEAD^2"),
+        for name, expression in (
+            ("EXPECTED_MERGE", "github.sha"),
+            ("EVENT_BASE", "github.event.pull_request.base.sha"),
+            ("EXPECTED_HEAD", "github.event.pull_request.head.sha"),
         ):
-            self.assertIn(f"EXPECTED_{name}: ${{{{ {expression} }}}}", identity)
-            self.assertIn(f'test "$(git rev-parse {rev})" = "$EXPECTED_{name}"', identity)
+            self.assertIn(f"{name}: ${{{{ {expression} }}}}", identity)
         self.assertIn("git --version", identity)
         self.assertIn("GitFixture.test_preserved_source_requires_original_graph_and_data_objects", graph)
         self.assertNotIn("continue-on-error:", job)
         self.assertNotIn("if:", job)
+
+    def test_identity_uses_actual_merge_parents(self):
+        text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
+        identity = split_steps(split_jobs(text)["synthetic-graph"])[1]
+        script = identity.split("        run: |\n", 1)[1]
+        script = "\n".join(line.removeprefix("          ") for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def git(*args):
+                return subprocess.run(["git", "-C", str(root), *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "user.name", "Graph Fixture")
+            git("commit", "--allow-empty", "-qm", "event base")
+            stale = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "feature")
+            git("commit", "--allow-empty", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("commit", "--allow-empty", "-qm", "actual base")
+            base = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "-qm", "merge", head)
+            merge = git("rev-parse", "HEAD")
+
+            def run(expected_merge=merge, expected_head=head, event_base=stale):
+                env = {**os.environ, "EXPECTED_MERGE": expected_merge,
+                       "EXPECTED_HEAD": expected_head, "EVENT_BASE": event_base}
+                return subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root,
+                                      env=env, capture_output=True, text=True)
+
+            for event_base in (stale, base):
+                result = run(event_base=event_base)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn(f"base={base}\n", result.stdout)
+                self.assertIn(f"event_base={event_base}\n", result.stdout)
+                self.assertIn(f"head={head}\n", result.stdout)
+                self.assertIn("git version", result.stdout)
+            self.assertNotEqual(0, run(expected_merge=base).returncode)
+            self.assertNotEqual(0, run(expected_head=base).returncode)
+            git("checkout", "-q", "main^1")
+            self.assertNotEqual(0, run(expected_merge=base).returncode)
+            git("checkout", "-q", "main")
+            # Remove only the fixture's loose first-parent object, not its reference.
+            (root / ".git/objects" / base[:2] / base[2:]).unlink()
+            self.assertNotEqual(0, run().returncode)
 
     def test_merge_with_old_head_runs_base_controls_against_head_code(self):
         with tempfile.TemporaryDirectory() as tmp:
