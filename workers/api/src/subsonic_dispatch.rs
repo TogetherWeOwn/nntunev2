@@ -663,12 +663,12 @@ pub fn compat_session_id(user_id: &str, credential_id: &str) -> String {
 }
 
 // True when the request asks for transcoding this FLAC-only surface cannot
-// honour: a `format` other than `flac` (case-insensitive), or a positive
-// `maxBitRate` cap. `maxBitRate=0` means "no cap" in Subsonic, and an
-// absent parameter means original bytes, so both pass through.
+// honour: a `format` other than `flac` or `raw` (case-insensitive), or a
+// positive `maxBitRate` cap. `raw` requests original bytes; `maxBitRate=0`
+// means "no cap", and an absent parameter also passes through.
 pub fn rejects_transcode(params: &Params) -> bool {
     if let Some(format) = params.get("format") {
-        if !format.eq_ignore_ascii_case(FLAC_SUFFIX) {
+        if !format.eq_ignore_ascii_case(FLAC_SUFFIX) && !format.eq_ignore_ascii_case("raw") {
             return true;
         }
     }

@@ -463,6 +463,11 @@ fn transcode_requests_are_refused_flac_only() {
     assert!(!rejects(""));
     assert!(!rejects("format=flac"));
     assert!(!rejects("format=FLAC"));
+    assert!(!rejects("format=raw"));
+    assert!(!rejects("format=RAW"));
+    assert!(!rejects("format=RaW&maxBitRate=0"));
+    assert!(rejects("format=raw&maxBitRate=128"));
+    assert!(rejects("format=RAW&maxBitRate=abc"));
     assert!(!rejects("maxBitRate=0"));
     assert!(!rejects("format=flac&maxBitRate=0"));
     let resp = transcode_refusal_response("f=json");
