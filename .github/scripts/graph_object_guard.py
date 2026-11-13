@@ -81,6 +81,11 @@ def guard(root, commits, trusted_paths):
             raise ValueError("unsupported trusted input type")
         path = Path(root) / os.fsdecode(name)
         try:
+            for parent in path.relative_to(root).parents:
+                if parent == Path("."):
+                    continue
+                if not stat.S_ISDIR((root / parent).lstat().st_mode):
+                    raise ValueError("unsupported trusted input type")
             actual_mode = path.lstat().st_mode
             if not stat.S_ISREG(actual_mode):
                 raise ValueError("unsupported trusted input type")

@@ -107,6 +107,16 @@ class RealRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [commit], ["controls"])
 
+    def test_trusted_file_under_symlinked_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            donor = Path(directory) / "controls"
+            shutil.copytree(self.root / "controls", donor)
+            guard.guard(self.root, [self.commit], ["controls/input"])
+            shutil.rmtree(self.root / "controls")
+            (self.root / "controls").symlink_to(donor, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "unsupported trusted input type"):
+                guard.guard(self.root, [self.commit], ["controls/input"])
+
     def test_unmatched_trusted_path_is_refused(self):
         with self.assertRaisesRegex(ValueError, "no tracked files"):
             guard.guard(self.root, [self.commit], ["controls", "absent"])
