@@ -2,6 +2,11 @@
 
 Status: accepted (with `crates/nntune-core` initial PR).
 
+Note (2026-11-13): the approved target direction in
+[ADR 0015](0015-standard-s3-storage-boundary.md) moves NNTP ownership to the
+storage provider and eventually removes NNTP code from NNTune. This record is
+unchanged history and describes the merged implementation until that happens.
+
 ## Context
 
 All backend Workers are Rust (`workers-rs` → wasm32), sharing

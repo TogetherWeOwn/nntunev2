@@ -1,6 +1,6 @@
 # NNTune v2 roadmap
 
-Last reviewed: **2026-11-09 (UTC)**
+Last reviewed: **2026-11-13 (UTC)**
 
 Maintained by the project maintainers. For questions or suggestions, open a
 [GitHub issue](https://github.com/TogetherWeOwn/nntunev2/issues).
@@ -32,6 +32,15 @@ The initial scope is one concurrent stream per user and private playlists.
 The staging subscription journey uses payment test mode; it does not activate
 paid billing. Public availability and live billing require separate decisions
 and release validation, not publication of this roadmap.
+
+## Storage direction
+
+The approved target is for NNTune to be a plain standard S3 client: an
+endpoint, one bucket per environment and access keys, with a storage provider
+owning Usenet access, encryption, caching, repair and retention. This is an
+intention, not delivered: the merged implementation is unchanged and migration
+will be staged, using disposable buckets until the provider is production-ready.
+See [ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md).
 
 ## Direction
 

@@ -1,12 +1,18 @@
 # ADR 0013: Shared popularity cache (supersedes the per-user grant layer of ADR 0003)
 
-- **Status:** Accepted design; implementation and independent review gates remain.
+- **Status:** Superseded by [ADR 0015](0015-standard-s3-storage-boundary.md)
+  (2026-11-13); retained as historical design, not new cache-build authority.
 - **Date:** 2026-11-03
 - **Supersedes:** the per-user authorization and accounting layer of
   ADR 0003 (`user_cache_grants`, own-provider byte proof, per-user cache
   budgets/retention/priority) and the cache columns of the ADR 0004 plan
   matrix. ADR 0003's shared content-addressed storage, R2 bucket map and
   publication/sweep race rules are retained and restated where they change.
+
+- **Amended by:** [ADR 0015](0015-standard-s3-storage-boundary.md) (approved
+  target, 2026-11-13): the provider is to own caching, so the NNTP miss path
+  and cache fills here are targeted for replacement by a read-only S3 GET.
+  This record stays as history of the merged design; nothing is migrated yet.
 
 ## Context
 
