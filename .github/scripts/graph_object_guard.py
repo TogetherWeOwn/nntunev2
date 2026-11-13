@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 
 
@@ -27,10 +28,13 @@ def guard(root, commits, trusted_paths):
     if not trusted_paths or any(not p or p.startswith("-") for p in trusted_paths):
         raise ValueError("expected trusted input paths")
 
+    root = Path(root).resolve()
+
     def git(*args):
         result = subprocess.run(
             ["git", "--no-lazy-fetch", "--no-replace-objects",
-             "-c", "core.fsmonitor=false", "-C", str(root), *args],
+             "-c", "core.fsmonitor=false", "-C", str(root),
+             "--work-tree", str(root), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             env=git_environment(),
         )
@@ -51,8 +55,13 @@ def guard(root, commits, trusted_paths):
             raise ValueError("trusted input path has no tracked files")
         if any(entry[:2] != b"H " for entry in entries.split(b"\0") if entry):
             raise ValueError("suppressed or unmerged trusted inputs")
-    if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-           "--", *trusted_paths):
+    # Inspect the index and untracked paths without status refreshing the index:
+    # status can execute repository-configured clean filters.
+    if (git("diff", "--cached", "--name-only", "--no-ext-diff", "--no-textconv",
+            "HEAD", "--", *trusted_paths)
+            or git("ls-files", "--others", "--exclude-standard", "-z", "--", *trusted_paths)
+            or git("ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                   "--", *trusted_paths)):
         raise ValueError("dirty trusted inputs")
     for oid in commits:
         if git("cat-file", "-t", oid).strip() != b"commit":
@@ -62,7 +71,7 @@ def guard(root, commits, trusted_paths):
         raise ValueError("missing reachable object")
     git("fsck", "--connectivity-only", "--no-reflogs", *commits)
 
-    # Git status applies clean filters; compare the actual bytes to the index.
+    # Compare raw bytes and executable identity to the index without filters.
     for entry in git("ls-files", "--stage", "-z", "--", *trusted_paths).split(b"\0"):
         if not entry:
             continue
@@ -72,8 +81,11 @@ def guard(root, commits, trusted_paths):
             raise ValueError("unsupported trusted input type")
         path = Path(root) / os.fsdecode(name)
         try:
-            if path.is_symlink():
+            actual_mode = path.lstat().st_mode
+            if not stat.S_ISREG(actual_mode):
                 raise ValueError("unsupported trusted input type")
+            if bool(actual_mode & stat.S_IXUSR) != (mode == b"100755"):
+                raise ValueError("dirty trusted inputs")
             content = path.read_bytes()
         except OSError as error:
             raise ValueError("cannot read trusted input") from error

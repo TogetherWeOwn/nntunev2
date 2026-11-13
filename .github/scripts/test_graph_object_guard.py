@@ -25,7 +25,8 @@ class GuardTests(unittest.TestCase):
                 guard.guard(".", ["a" * 40], ["controls"])
 
     def test_connectivity_error_fails_closed(self):
-        outputs = [b"false\n", b".git/info/grafts\n", b"H controls/input\0", b"", b"commit\n", b"objects\n"]
+        outputs = [b"false\n", b".git/info/grafts\n", b"H controls/input\0", b"", b"", b"",
+                   b"commit\n", b"objects\n"]
         results = [subprocess.CompletedProcess([], 0, output, b"") for output in outputs]
         results.append(subprocess.CompletedProcess([], 1, b"", b"connectivity error"))
         with mock.patch.object(guard.subprocess, "run", side_effect=results):
@@ -69,6 +70,42 @@ class RealRepositoryTests(unittest.TestCase):
         (self.root / "controls" / "input").write_text("changed\n")
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
+
+    def test_configured_worktree_cannot_hide_untracked_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            donor = Path(directory) / "donor"
+            shutil.copytree(self.root / "controls", donor / "controls")
+            guard.guard(self.root, [self.commit], ["controls"])
+            self.git("config", "core.worktree", str(donor))
+            (self.root / "controls" / "extra").write_text("untracked\n")
+            with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+                guard.guard(self.root, [self.commit], ["controls"])
+
+    def test_inspection_does_not_run_clean_filter(self):
+        (self.root / ".gitattributes").write_text("controls/input filter=marker\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "attributes")
+        commit = self.git("rev-parse", "HEAD").strip()
+        marker = self.root / "marker"
+        self.git("config", "filter.marker.clean", f"touch '{marker}'; cat")
+        guard.guard(self.root, [commit], ["controls"])
+        (self.root / "controls" / "input").write_text("changed contents\n")
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [commit], ["controls"])
+        self.assertFalse(marker.exists())
+
+    def test_executable_identity_ignores_filemode_config(self):
+        executable = self.root / "controls" / "script"
+        executable.write_text("script\n")
+        executable.chmod(0o755)
+        self.git("add", "controls/script")
+        self.git("commit", "-qm", "executable")
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.git("config", "core.filemode", "false")
+        guard.guard(self.root, [commit], ["controls"])
+        executable.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [commit], ["controls"])
 
     def test_unmatched_trusted_path_is_refused(self):
         with self.assertRaisesRegex(ValueError, "no tracked files"):
