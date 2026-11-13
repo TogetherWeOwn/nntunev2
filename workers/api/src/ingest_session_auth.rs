@@ -35,11 +35,11 @@ pub fn authorize(
     peppers: &[Pepper<'_>],
     now: u64,
     grant: Option<&Grant<'_>>,
-    environment: &str,
-    library_id: &str,
+    scope: (&str, &str),
     action: Action,
     job: Option<(&str, &Job<'_>)>,
 ) -> Result<(), CredentialError> {
+    let (environment, library_id) = scope;
     let record = credential.ok_or(CredentialError::Unauthenticated)?;
     let secret = secret.ok_or(CredentialError::Unauthenticated)?;
     // This contract expires at the deadline, unlike legacy bearer auth.
@@ -122,8 +122,7 @@ mod tests {
                 &peppers,
                 now,
                 grant,
-                "test",
-                "library",
+                ("test", "library"),
                 Action::Create,
                 None,
             )
@@ -175,8 +174,7 @@ mod tests {
                 &peppers,
                 1,
                 Some(&grant),
-                env,
-                library,
+                (env, library),
                 action,
                 Some((id, job)),
             )
