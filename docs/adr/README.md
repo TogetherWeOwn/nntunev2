@@ -17,6 +17,7 @@
 | 0012 | [Compliant YouTube video and Brainz data](0012-compliant-youtube-video-and-brainz-data.md) |
 | 0013 | [Shared popularity cache](0013-shared-popularity-cache.md) |
 | 0014 | [Backend provider account pool](0014-backend-provider-pool.md) |
+| 0015 | [Standard S3 storage boundary](0015-standard-s3-storage-boundary.md) |
 
 ## Numbering and precedence
 
