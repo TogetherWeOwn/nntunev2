@@ -201,4 +201,4 @@ sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
 [[migration]]
 file = "0041_cc0_genre.sql"
 target = "mirror"
-sha256 = "f5f44b16635b2d71652ec89b7bc9cb0804a7a0fdda83ede96a078793e07f6c79"
+sha256 = "bada2a0d607632dccb5b66a6bfca72a198f204d42e8ff8dd08f1e4b3a0134140"

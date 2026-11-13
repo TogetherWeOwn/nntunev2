@@ -1,7 +1,7 @@
 -- Additive mirror schema for CC0 genre identifiers and curated roll-ups.
 -- This migration does not enable ingestion or schedule refreshes.
-SET search_path = public, pg_catalog;
 BEGIN;
+SET search_path = public, pg_catalog;
 
 CREATE TABLE IF NOT EXISTS public.genre (
     qid TEXT PRIMARY KEY CHECK (qid ~ '^Q[1-9][0-9]{0,19}$'),
