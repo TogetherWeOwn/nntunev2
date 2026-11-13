@@ -912,6 +912,12 @@ pub fn reconcile_live_select_statement() -> &'static str {
     "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, paid_invoice_id, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
 }
 
+/// Parameters: user_id, stripe_subscription_id. Select the exact stored row,
+/// including statuses outside the live-slot predicate.
+pub fn reconcile_target_select_statement() -> &'static str {
+    "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, paid_invoice_id, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND stripe_subscription_id = $2"
+}
+
 /// Parameters: event_id. First claim wins (`true`); duplicates ack 200
 /// with no state change. Retried deliveries converge here, before any
 /// Stripe call or state write.
