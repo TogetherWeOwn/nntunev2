@@ -1187,6 +1187,20 @@ fn catalogue_library_release_from_row(
     })
 }
 
+/// Map one `account_taste` row to the preference row. Every caller
+/// selects the full column list (`taste_get`, `likes_list`,
+/// `taste_list`).
+fn taste_row_from_row(row: &tokio_postgres::Row) -> Result<crate::taste::TasteDbRow, StoreError> {
+    Ok(crate::taste::TasteDbRow {
+        kind: row.try_get("kind").map_err(|_| StoreError)?,
+        target_id: row.try_get("target_id").map_err(|_| StoreError)?,
+        signal: row.try_get("signal").map_err(|_| StoreError)?,
+        snooze_until: row.try_get("snooze_until").map_err(|_| StoreError)?,
+        created_at: row.try_get("created_at").map_err(|_| StoreError)?,
+        updated_at: row.try_get("updated_at").map_err(|_| StoreError)?,
+    })
+}
+
 /// Map an `mb_artist` row to the catalogue row (`country` is `CHAR(2)`,
 /// cast to text in SQL like the mirror worker's lookup).
 fn catalogue_artist_from_row(
@@ -2921,8 +2935,66 @@ impl Store for PgStore {
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                let rows = client
+                let play_key =
+                    crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
+                        .map_err(|_| StoreError)?;
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                let eligible = transaction
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if eligible.is_empty() {
+                    return Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: 0,
+                    });
+                }
+                // Separate statements after the lock give READ COMMITTED a fresh
+                // snapshot. Privacy and the lease commit together, or neither does.
+                let private = transaction
+                    .query_typed(
+                        crate::taste::private_session_active_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if !private.is_empty() {
+                    transaction
+                        .query_typed(
+                            crate::taste::private_play_mark_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&play_key, Type::TEXT),
+                                (&i64_of(now)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    if transaction
+                        .query_typed(
+                            crate::taste::private_play_probe_statement(),
+                            &[(&user_id, Type::TEXT), (&play_key, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?
+                        .is_empty()
+                    {
+                        return Err(StoreError);
+                    }
+                }
+                let rows = transaction
                     .query_typed(
                         crate::playback::playback_lease_acquire_statement(),
                         &[
@@ -2941,19 +3013,28 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 match rows.first() {
-                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
-                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
-                    }),
-                    // Zero rows: another session holds a live lease.
-                    // Read it (same connection, same budget) so the
-                    // 429 carries its real remaining TTL. A vanished
-                    // row (deleted mid-race) reads as retry-now.
+                    Some(row) => {
+                        let epoch = u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?;
+                        transaction.commit().await.map_err(|_| StoreError)?;
+                        Ok(crate::playback::LeaseAcquire::Acquired { epoch })
+                    }
+                    // No grant: dropping the transaction also rolls back an
+                    // unused privacy mark, without compensating holder writes.
                     None => {
-                        let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
-                                Some(row) => row.retry_after_secs(now),
-                                None => 0,
-                            };
+                        let held = transaction
+                            .query_typed(
+                                crate::playback::playback_lease_select_statement(),
+                                &[(&user_id, Type::TEXT)],
+                            )
+                            .await
+                            .map_err(|_| StoreError)?;
+                        let retry_after_secs = match held.first() {
+                            Some(row) => {
+                                u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?
+                                    .saturating_sub(now)
+                            }
+                            None => 0,
+                        };
                         Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
                     }
                 }
@@ -3999,6 +4080,421 @@ impl Store for PgStore {
                         self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
                     })?;
                 rows.iter().map(catalogue_release_track_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn catalogue_member_target(
+        &self,
+        user_id: &str,
+        kind: crate::taste::TargetKind,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Unnamed via `query_typed` (Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
+                        crate::taste::member_target_statement(kind),
+                        &[(&user_id, Type::TEXT), (&target_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_upsert(
+        &self,
+        user_id: &str,
+        kind: crate::taste::TargetKind,
+        target_id: &str,
+        signal: crate::taste::TasteSignal,
+        snooze_until: Option<u64>,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let snooze_until = snooze_until.map(i64_of).transpose()?;
+                let affected = client
+                    .query_typed(
+                        crate::taste::taste_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target_id, Type::TEXT),
+                            (&signal.as_str(), Type::TEXT),
+                            (&snooze_until, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_upsert"))?;
+                if affected.len() > 1 {
+                    return Err(StoreError);
+                }
+                Ok(affected.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_get(
+        &self,
+        user_id: &str,
+        kind: crate::taste::TargetKind,
+        target_id: &str,
+    ) -> Result<Option<crate::taste::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::taste::taste_get_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target_id, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_get"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(taste_row_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn like_delete(
+        &self,
+        user_id: &str,
+        kind: crate::taste::TargetKind,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let affected = client
+                    .query_typed(
+                        crate::taste::like_delete_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target_id, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.like_delete"))?;
+                if affected.len() > 1 {
+                    return Err(StoreError);
+                }
+                Ok(affected.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_delete(
+        &self,
+        user_id: &str,
+        kind: crate::taste::TargetKind,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let affected = client
+                    .query_typed(
+                        crate::taste::taste_delete_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target_id, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_delete"))?;
+                if affected.len() > 1 {
+                    return Err(StoreError);
+                }
+                Ok(affected.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn likes_list(&self, user_id: &str) -> Result<Vec<crate::taste::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::taste::likes_list_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&crate::taste::TASTE_MAX_LIST, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.likes_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_list(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<Vec<crate::taste::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::taste::taste_list_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                            (&crate::taste::TASTE_MAX_LIST, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn history_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::taste::HistoryDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::taste::history_list_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&crate::taste::HISTORY_MAX_LIST, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.history_list"))?;
+                // `play_id_from_key` parses the persisted key
+                // server-side; a malformed stored key is skipped
+                // rather than half-served.
+                rows.iter()
+                    .filter_map(|row| {
+                        let key: String = row.try_get("idempotency_key").ok()?;
+                        let play_id = crate::taste::play_id_from_key(&key)?;
+                        Some(Ok(crate::taste::HistoryDbRow {
+                            play_id,
+                            track_id: match row.try_get("track_id") {
+                                Ok(value) => value,
+                                Err(_) => return Some(Err(StoreError)),
+                            },
+                            played_at: match row.try_get("recorded_at") {
+                                Ok(value) => value,
+                                Err(_) => return Some(Err(StoreError)),
+                            },
+                            stream_seconds: match row.try_get("stream_seconds") {
+                                Ok(value) => value,
+                                Err(_) => return Some(Err(StoreError)),
+                            },
+                        }))
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_session_upsert(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .is_empty()
+                {
+                    return Ok(false);
+                }
+                let affected = transaction
+                    .query_typed(
+                        crate::taste::private_session_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_session_upsert")
+                    })?;
+                if affected.len() > 1 {
+                    return Err(StoreError);
+                }
+                transaction.commit().await.map_err(|_| StoreError)?;
+                Ok(affected.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_session_delete(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::taste::private_issuance_fence_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .is_empty()
+                {
+                    return Ok(());
+                }
+                transaction
+                    .query_typed(
+                        crate::taste::private_session_delete_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_session_delete")
+                    })?;
+                transaction.commit().await.map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::taste::private_session_active_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_session_active")
+                    })?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_play_mark(
+        &self,
+        user_id: &str,
+        play_key: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let affected = client
+                    .query_typed(
+                        crate::taste::private_play_mark_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&play_key, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_play_mark")
+                    })?;
+                if affected.len() > 1 {
+                    return Err(StoreError);
+                }
+                // Zero rows is ambiguous like the ledger upsert: a
+                // convergent re-mark (`ON CONFLICT DO NOTHING` on the
+                // same key) and a fenced write are indistinguishable
+                // without a probe — disambiguate on the mark itself.
+                if affected.len() == 1 {
+                    return Ok(true);
+                }
+                let rows = client
+                    .query_typed(
+                        crate::taste::private_play_probe_statement(),
+                        &[(&user_id, Type::TEXT), (&play_key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_play_mark")
+                    })?;
+                Ok(!rows.is_empty())
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5740,6 +6236,13 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if bare
+        .strip_prefix("/v1/me/likes/track/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        // Single-segment like targets only, same posture as the other
+        // dynamic templates.
+        "/v1/me/likes/track/{target_id}".to_string()
     } else {
         "unknown".to_string()
     }

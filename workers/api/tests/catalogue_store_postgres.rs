@@ -7,6 +7,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/taste_store_cases.rs"]
+mod taste_store_cases;
+
 const RELEASE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RECORDING: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OTHER_RELEASE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";

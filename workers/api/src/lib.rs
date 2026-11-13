@@ -46,6 +46,7 @@ pub mod subsonic_config;
 pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
+pub mod taste;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;

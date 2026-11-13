@@ -197,3 +197,9 @@ sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
 file = "0040_ingest_audio_classifications.sql"
 target = "app"
 sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
+
+[[migration]]
+file = "0041_account_taste_and_privacy.sql"
+target = "app"
+sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
+renamed_from = [{ file = "0037_account_taste_and_privacy.sql", sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219" }]

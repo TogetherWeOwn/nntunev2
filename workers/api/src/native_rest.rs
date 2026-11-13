@@ -490,6 +490,12 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" || path == "/v1/indexers" {
                 return SessionOnly;
             }
+            // Preference slice reads (migration 0041): session-only
+            // like the rest of `/v1/me` — API keys never see taste,
+            // likes, or play history.
+            if path == "/v1/me/likes" || path == "/v1/me/taste" || path == "/v1/me/history" {
+                return SessionOnly;
+            }
             // Billing/usage display reads: session-only like checkout —
             // API keys never see plan, usage, or subscription state.
             if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
@@ -573,6 +579,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/me/likes/import"
             {
                 return SessionOnly;
             }
@@ -608,6 +615,15 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" {
                 return SessionOnly;
             }
+            // Preference slice writes: the likes item shape (one
+            // segment), the taste upsert, and the private-session
+            // toggle are session-only like `/v1/me` itself.
+            if one_segment_after("/v1/me/likes/track/", path)
+                || path == "/v1/me/taste"
+                || path == "/v1/me/private-session"
+            {
+                return SessionOnly;
+            }
             // Admin writes (migration 0028): one setting key, or one
             // user's role. Deeper shapes deny here, before any spend.
             if one_segment_after("/v1/admin/settings/", path) {
@@ -638,6 +654,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return SessionOnly;
             }
             if path == "/v1/account" {
+                return SessionOnly;
+            }
+            if path == "/v1/me/taste" || one_segment_after("/v1/me/likes/track/", path) {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {
