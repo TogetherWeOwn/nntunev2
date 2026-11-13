@@ -1,7 +1,8 @@
 """Fail closed unless a checkout and the requested history are locally complete.
 
 This is an inert building block: callers must supply trusted object IDs and paths.
-It does not fetch, construct a graph, or authorize qualification.
+Trusted inputs must be clean and committed. It does not fetch, construct a graph,
+or authorize qualification.
 """
 
 import hashlib
@@ -57,8 +58,8 @@ def guard(root, commits, trusted_paths):
             raise ValueError("suppressed or unmerged trusted inputs")
     # Inspect the index and untracked paths without status refreshing the index:
     # status can execute repository-configured clean filters.
-    if (git("diff", "--cached", "--name-only", "--no-ext-diff", "--no-textconv",
-            "HEAD", "--", *trusted_paths)
+    if (git("diff", "--cached", "--ita-visible-in-index", "--name-only",
+            "--no-ext-diff", "--no-textconv", "HEAD", "--", *trusted_paths)
             or git("ls-files", "--others", "--exclude-standard", "-z", "--", *trusted_paths)
             or git("ls-files", "--others", "--ignored", "--exclude-standard", "-z",
                    "--", *trusted_paths)):

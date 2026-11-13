@@ -71,6 +71,13 @@ class RealRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
 
+    def test_intent_to_add_trusted_input_is_refused(self):
+        guard.guard(self.root, [self.commit], ["controls"])
+        (self.root / "controls" / "extra").write_bytes(b"")
+        self.git("add", "-N", "controls/extra")
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [self.commit], ["controls"])
+
     def test_casefold_config_cannot_hide_untracked_input(self):
         self.git("config", "core.ignoreCase", "true")
         guard.guard(self.root, [self.commit], ["controls"])
