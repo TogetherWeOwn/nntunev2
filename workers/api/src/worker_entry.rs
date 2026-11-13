@@ -6651,6 +6651,17 @@ mod tests {
                 .split_once("\n    async fn ")
                 .expect("a following method must bound it")
                 .0;
+            let method = if operation == "subsonic_member_catalogue" {
+                assert!(method.contains(
+                    "self.subsonic_member_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)"
+                ));
+                let (_, helper) = production
+                    .split_once("async fn subsonic_member_catalogue_with_cap(")
+                    .unwrap();
+                helper.split_once("\n    async fn ").unwrap().0
+            } else {
+                method
+            };
             assert_eq!(kind, "statement_failed", "unexpected db failure kind");
             let site = format!("self.statement_failed(\"{event}\")");
             assert!(method.contains(&site), "{operation} must emit {event}");
