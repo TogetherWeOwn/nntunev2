@@ -50,11 +50,16 @@ the stream Worker decrypts authenticated chunks for ranged playback and keeps
 metering. This is not end-user end-to-end encryption: authorized Workers can
 decrypt. Upload checksums cover ciphertext; plaintext and keys stay out of logs.
 
-These are requirements, not delivered features. The exact crypto format,
-library, limits and key lifecycle require Security and Applied Cryptography
-approval before implementation. Migration stays staged, using disposable
-buckets until the provider is production-ready. The replacing ingest delivery
-must retire the obsolete NZB fetch/verify/repair path, not leave it as a fallback.
+These are requirements, not delivered features. Crypto-dependent delivery is
+deferred; the current crypto design is unaccepted. Bounded design repair and
+the independent session/idempotency contract may proceed, but implementation
+requires Security, Applied Cryptography and QA acceptance of the exact revised
+design. No plaintext fallback or hidden valid-playback/library cap is allowed.
+Migration stays staged, using disposable buckets until the provider is
+production-ready. Retain legacy readers and inventory, coexistence, restore
+and rollback obligations until the accepted replacement is ready. The replacing
+ingest delivery must retire the obsolete NZB fetch/verify/repair path, not
+leave it as a fallback.
 See [ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md).
 
 ## Direction

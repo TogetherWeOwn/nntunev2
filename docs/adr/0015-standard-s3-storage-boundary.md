@@ -77,7 +77,23 @@ own that whole concern, and NNTune will talk to it as an ordinary S3 client.
 
 - The owner has settled intake, plaintext dedupe and mandatory client-side
   encryption. They are requirements, not optional app E2E or pending questions.
-  Crypto design approval is still a prerequisite, not granted by this ADR.
+  Crypto-dependent delivery is deferred and the current crypto design is
+  unaccepted. This ADR grants neither design acceptance nor implementation.
+- Bounded design repair may evaluate construction-appropriate failure-only
+  assurance without lifetime budgets for known-genuine successful reads or
+  unwraps. A nonrollback authority is not an admission prerequisite for a
+  budget that no longer exists; any bound that relies on failure continuity
+  must still justify resets, rollback, concurrent overshoot and repeated
+  attacks across restores. Security retains its numerical target and necessary
+  controls; this is not an accepted construction or a security waiver.
+- The independent scoped session/idempotency contract and truthful
+  documentation may continue. Crypto implementation and downstream reactivation
+  require independent Security, Applied Cryptography and QA acceptance of the
+  exact repaired design, plus verified producer outputs and restored dependencies.
+- No plaintext fallback, hidden valid-playback/library cap or forced
+  re-encryption is authorized. Preserve legacy readers and inventory,
+  coexistence/disposition, restore and rollback obligations until the accepted
+  replacement satisfies its activation and release gates.
 - This documentation changes no code, credentials, provider resources or
   runtime state and authorizes no spend or deployment. Merged implementation
   stays in place until the reviewed replacement delivery retires it.
