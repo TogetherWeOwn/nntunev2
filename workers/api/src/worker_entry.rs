@@ -712,6 +712,42 @@ struct CatalogueTestMirror {
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
+/// Test-only seam for the Subsonic mount's snapshot read: the postgres
+/// harness drives the production `PgStore::subsonic_member_catalogue`
+/// through the injected connections (see
+/// `catalogue_store_for_postgres_test`).
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub trait SubsonicSnapshotCatalogueStore {
+    async fn subsonic_snapshot_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    >;
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl SubsonicSnapshotCatalogueStore for PgStore {
+    async fn subsonic_snapshot_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        self.subsonic_member_catalogue(user_id).await
+    }
+}
+
 /// Inject connection acquisition only; execute the production catalogue SQL,
 /// decoders, early returns and error propagation against disposable PostgreSQL.
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -720,7 +756,7 @@ pub fn catalogue_store_for_postgres_test(
     mirror_configured: bool,
     mirror: Result<tokio_postgres::Client, StoreError>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
-) -> impl Store {
+) -> impl Store + SubsonicSnapshotCatalogueStore {
     PgStore {
         env: None,
         trace_id: "postgres-catalogue-test".into(),
@@ -781,6 +817,152 @@ impl PgStore {
         timeout_ms: u64,
     ) -> Result<T, StoreError> {
         with_deadline(operation, timeout_ms, StoreError).await
+    }
+
+    /// One account row for the Subsonic mount's identity: email drives
+    /// `getLicense`, role drives the `getUser` admin/manager flags. A
+    /// single query keeps one Hyperdrive connect per request.
+    async fn subsonic_account(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT email, role FROM users WHERE id = $1",
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_account")
+                    })?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| {
+                        Ok::<(String, String), StoreError>((
+                            row.try_get("email").map_err(|_| StoreError)?,
+                            row.try_get("role").map_err(|_| StoreError)?,
+                        ))
+                    })
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Member catalogue for the Subsonic mount's per-request snapshot:
+    /// one membership probe feeds all three mirror reads, bound by
+    /// `SUBSONIC_SNAPSHOT_CAP` instead of the native page size.
+    async fn subsonic_member_catalogue(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        Self::bounded(
+            async {
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let client = self.connect().await?;
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_releases_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRow> = member
+                    .iter()
+                    .map(catalogue_member_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_releases = crate::catalogue::member_release_mbids(&member);
+                let pairs = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_track_pairs_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?;
+                let pairs: Vec<crate::catalogue::MembershipTrackPairRow> = pairs
+                    .iter()
+                    .map(catalogue_member_pair_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_pairs = crate::catalogue::member_pair_arrays(&pairs);
+                if member_releases.is_empty() && member_pairs.is_empty() {
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
+                }
+                self.require_mirror()?;
+                let mirror = self.connect_mirror().await?;
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.subsonic_member_catalogue");
+                let artist_rows = mirror
+                    .query_typed(
+                        crate::catalogue::artists_list_statement(),
+                        &[
+                            (&member_releases, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
+                    .iter()
+                    .map(catalogue_artist_from_row)
+                    .collect::<Result<_, _>>()?;
+                let release_rows = mirror
+                    .query_typed(
+                        crate::catalogue::releases_list_statement(),
+                        &[
+                            (&member_releases, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let release_rows: Vec<crate::catalogue::ReleaseDbRow> = release_rows
+                    .iter()
+                    .map(catalogue_release_from_row)
+                    .collect::<Result<_, _>>()?;
+                let (pair_releases, pair_recordings) =
+                    crate::catalogue::member_pair_columns(&member_pairs);
+                let track_rows = mirror
+                    .query_typed(
+                        crate::catalogue::tracks_list_statement(),
+                        &[
+                            (&pair_releases, Type::TEXT_ARRAY),
+                            (&pair_recordings, Type::TEXT_ARRAY),
+                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| statement_failed())?;
+                let track_rows: Vec<crate::catalogue::TrackDbRow> = track_rows
+                    .iter()
+                    .map(catalogue_track_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok((
+                    artist_rows,
+                    release_rows,
+                    crate::catalogue::retain_member_track_occurrences(track_rows, &member_pairs),
+                ))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
@@ -5805,6 +5987,13 @@ fn emit_record(
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
+/// Member-collection cap for the Subsonic mount's per-request snapshot.
+/// The native paged reads bind `CATALOGUE_MAX_PAGE_SIZE` (50), which would
+/// truncate every library past the first page and make those songs
+/// unstreamable; the snapshot reads the whole member collection under this
+/// far larger but still bounded cap (rows are in-memory only).
+const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -6021,7 +6210,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 23] = [
+    const DB_FAILURE_EVENTS: [&str; 25] = [
         "api.db.mirror_unconfigured",
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
@@ -6045,6 +6234,8 @@ mod tests {
         "api.db.statement_failed.create_checkout_operation",
         "api.db.statement_failed.checkout_operation_by_id",
         "api.db.statement_failed.update_checkout_operation",
+        "api.db.statement_failed.subsonic_account",
+        "api.db.statement_failed.subsonic_member_catalogue",
     ];
 
     #[test]

@@ -2,7 +2,7 @@
 //! CI's disposable PostgreSQL owns the app rows; no mirror service is required.
 use nntune_api::catalogue::{assemble_library_rows, LibraryPageRow};
 use nntune_api::handlers::{Store, StoreError};
-use nntune_api::worker_entry::catalogue_store_for_postgres_test;
+use nntune_api::worker_entry::{catalogue_store_for_postgres_test, SubsonicSnapshotCatalogueStore};
 use std::cell::Cell;
 use std::rc::Rc;
 use tokio_postgres::{Client, Config, NoTls};
@@ -246,4 +246,101 @@ async fn release_membership_hides_nonmembers_before_mirror_state() {
             assert_eq!(attempts.get(), 0);
         }
     }
+}
+
+const SNAPSHOT_ARTIST: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const SNAPSHOT_RELEASE: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+/// Mirror-cluster client for the snapshot read: the `mb_*` temp tables the
+/// production mirror statements query, on a second disposable connection
+/// (temp tables are per-session, so app and mirror stay separate).
+async fn mirror_client() -> Client {
+    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
+        .expect("CI disposable database is required; never silently skip")
+        .parse()
+        .unwrap();
+    assert_eq!(config.get_dbname(), Some("nntune_ci"));
+    assert!(config.get_hostaddrs().is_empty(), "no address overrides");
+    assert!(
+        matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+    );
+    let (client, connection) = config.connect(NoTls).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap() });
+    client
+        .batch_execute(
+            "SET statement_timeout = '3s'; SET search_path = pg_temp;
+             CREATE TEMP TABLE mb_artist (mbid uuid PRIMARY KEY, name text, sort_name text, type text, country text);
+             CREATE TEMP TABLE mb_release (mbid uuid PRIMARY KEY, title text, release_type text, year smallint, artist_mbid uuid);
+             CREATE TEMP TABLE mb_recording (mbid uuid PRIMARY KEY, title text, duration_ms integer);
+             CREATE TEMP TABLE mb_track (release_mbid uuid, recording_mbid uuid, medium_no smallint, track_no smallint)",
+        )
+        .await
+        .unwrap();
+    client
+}
+
+/// More member tracks than the native `CATALOGUE_MAX_PAGE_SIZE` (50): the
+/// Subsonic snapshot read must return all of them, so a regression back to
+/// the paged reads fails this test instead of silently dropping the 51st
+/// song from the stream membership gate.
+#[tokio::test]
+async fn subsonic_snapshot_returns_every_member_track() {
+    let recordings: Vec<String> = (1..=51u32)
+        .map(|g| format!("{g:08x}-0000-4000-8000-{g:012x}"))
+        .collect();
+    let app = client(false).await;
+    app.execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'job-51', $1, $2)",
+        &[&SNAPSHOT_RELEASE, &recordings],
+    )
+    .await
+    .unwrap();
+    let mirror = mirror_client().await;
+    // Scalar MBIDs go in as SQL literals (synthetic constants): binding a
+    // `&str` to a `$1::uuid` slot fails tokio-postgres's type check, so the
+    // production code binds text arrays (`query_typed`, `Type::TEXT_ARRAY`)
+    // instead.
+    mirror
+        .execute(
+            &format!(
+                "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}'::uuid, 'Artist A', 'A, Artist', 'Person', 'US')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            &format!(
+                "INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}'::uuid, 'Album 51', 'Album', 2001, '{SNAPSHOT_ARTIST}'::uuid)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            "INSERT INTO mb_recording SELECT g::uuid, 'Song ' || g, 200000 FROM unnest($1::text[]) AS g",
+            &[&recordings],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            &format!(
+                "INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, 1 FROM unnest($1::text[]) AS g"
+            ),
+            &[&recordings],
+        )
+        .await
+        .unwrap();
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+    let (artists, releases, tracks) = store.subsonic_snapshot_catalogue("u1").await.unwrap();
+    assert_eq!(artists.len(), 1);
+    assert_eq!(releases.len(), 1);
+    assert_eq!(tracks.len(), 51, "the 50-row native page must not truncate");
+    assert!(tracks.iter().any(|t| t.recording_mbid == recordings[50]));
+    assert_eq!(attempts.get(), 1, "one mirror connection for three reads");
 }
