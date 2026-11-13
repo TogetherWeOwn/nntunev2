@@ -491,8 +491,17 @@ fn has_ipv6_like_value(value: &str) -> bool {
                     c,
                     ',' | ';' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | '='
                 )
+                || matches!(c, '/' | '&')
         })
-        .any(|token| is_ipv6_token(token.trim_matches('.')))
+        .any(|token| {
+            let token = token.trim_matches('.');
+            is_ipv6_token(token)
+                || token.split_once(':').is_some_and(|(label, address)| {
+                    label.bytes().all(|b| b.is_ascii_alphabetic())
+                        && label.bytes().any(|b| !b.is_ascii_hexdigit())
+                        && is_ipv6_token(address)
+                })
+        })
 }
 
 #[test]
