@@ -60,6 +60,22 @@ class RealRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
             guard.guard(self.root, [self.commit], ["controls"])
 
+    def test_unmatched_trusted_path_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "no tracked files"):
+            guard.guard(self.root, [self.commit], ["controls", "absent"])
+
+    def test_clean_filter_cannot_hide_dirty_trusted_bytes(self):
+        self.git("config", "filter.normalize.clean", "sed s/evil/good/g")
+        (self.root / ".gitattributes").write_text("controls/input filter=normalize\n")
+        (self.root / "controls" / "input").write_text("good\n")
+        self.git("add", ".gitattributes", "controls/input")
+        self.git("commit", "-qm", "configure filter")
+        commit = self.git("rev-parse", "HEAD").strip()
+        (self.root / "controls" / "input").write_text("evil\n")
+        self.assertEqual(self.git("status", "--porcelain", "--", "controls"), "")
+        with self.assertRaisesRegex(ValueError, "dirty trusted inputs"):
+            guard.guard(self.root, [commit], ["controls"])
+
     def test_fsmonitor_cannot_hide_dirty_trusted_input(self):
         hook = self.root / ".git" / "fake-fsmonitor"
         hook.write_text('#!/bin/sh\nprintf "token\\0"\n')
