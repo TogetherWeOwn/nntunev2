@@ -102,6 +102,7 @@ fn store() -> ProductionStore {
         artists,
         albums,
         songs,
+        tracks,
         TEST_NOW_MILLIS,
     )
 }
@@ -273,6 +274,31 @@ fn ambiguous_recording_lookup_fails_closed() {
     assert!(store.song(SONG_1).is_none());
     assert!(store.song(SONG_2).is_some());
     assert!(store.song("unknown").is_none());
+}
+
+#[test]
+fn lookup_requires_unique_raw_positive_positions() {
+    let mut store = store();
+    assert!(store.resolve_song(SONG_1).is_some());
+    assert!(store.resolve_song(SONG_3).is_none());
+    for (disc, track) in [
+        (None, Some(1)),
+        (Some(1), None),
+        (Some(0), Some(1)),
+        (Some(1), Some(0)),
+        (Some(-1), Some(1)),
+        (Some(1), Some(-1)),
+    ] {
+        store.tracks[0].medium_no = disc;
+        store.tracks[0].track_no = track;
+        assert!(store.resolve_song(SONG_1).is_none());
+    }
+    store.tracks[0].medium_no = Some(1);
+    store.tracks[0].track_no = Some(1);
+    let mut duplicate = store.tracks[0].clone();
+    duplicate.release_mbid = ALBUM_B.into();
+    store.tracks.push(duplicate);
+    assert!(store.resolve_song(SONG_1).is_none());
 }
 
 #[test]

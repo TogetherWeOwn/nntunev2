@@ -94,6 +94,7 @@ pub struct ProductionStore {
     artists: Vec<Artist>,
     albums: Vec<Album>,
     songs: Vec<Song>,
+    tracks: Vec<TrackDbRow>,
     /// Request time (epoch millis), captured at the mount. Reported as
     /// the artists index's `lastModified`: the member reads carry no
     /// per-artist modification signal, so the honest freshness marker is
@@ -109,6 +110,7 @@ impl ProductionStore {
         artists: Vec<Artist>,
         albums: Vec<Album>,
         songs: Vec<Song>,
+        tracks: Vec<TrackDbRow>,
         now_millis: i64,
     ) -> Self {
         Self {
@@ -117,8 +119,31 @@ impl ProductionStore {
             artists,
             albums,
             songs,
+            tracks,
             now_millis,
         }
+    }
+
+    /// Resolve a legacy recording ID only when its raw member occurrence is
+    /// unique and has supported positions. This does not authorize playback.
+    pub fn resolve_song(&self, id: &str) -> Option<Song> {
+        let mut tracks = self.tracks.iter().filter(|t| t.recording_mbid == id);
+        let track = tracks.next()?;
+        if tracks.next().is_some() {
+            return None;
+        }
+        let disc = track.medium_no.filter(|n| *n > 0)?;
+        let position = track.track_no.filter(|n| *n > 0)?;
+        let mut songs = self.songs.iter().filter(|song| song.id == id);
+        let song = songs.next()?;
+        if songs.next().is_some()
+            || song.album_id != track.release_mbid
+            || song.disc != i64::from(disc)
+            || song.track != i64::from(position)
+        {
+            return None;
+        }
+        Some(song.clone())
     }
 }
 
@@ -417,14 +442,7 @@ impl Library for ProductionStore {
     }
 
     fn song(&self, id: &str) -> Option<Song> {
-        // Recording IDs do not identify occurrences. Until the playback
-        // contract supports occurrence IDs, never select an arbitrary match.
-        let mut matches = self.songs.iter().filter(|s| s.id == id);
-        let song = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        Some(song.clone())
+        self.resolve_song(id)
     }
 
     fn all_songs(&self) -> Vec<Song> {
