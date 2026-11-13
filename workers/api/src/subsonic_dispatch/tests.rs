@@ -369,13 +369,11 @@ fn error_rendering_selects_format_and_never_leaks() {
 
 #[test]
 fn merged_params_carry_body_selected_format_into_error_documents() {
-    // The merge mirrors the shared dispatcher: query pairs first (query
-    // wins duplicates), body pairs after; non-POST and empty bodies pass
-    // the query through unchanged.
+    // Only selectors survive, with query values winning duplicates.
     assert_eq!(merged_query_params("POST", "", "f=json"), "f=json");
     assert_eq!(
         merged_query_params("POST", "f=json", "f=jsonp&callback=cb"),
-        "f=json&f=jsonp&callback=cb"
+        "f=json&callback=cb"
     );
     assert_eq!(merged_query_params("GET", "f=json", "f=jsonp"), "f=json");
     assert_eq!(merged_query_params("POST", "f=json", ""), "f=json");
@@ -407,6 +405,47 @@ fn merged_params_carry_body_selected_format_into_error_documents() {
     let resp = parse_error_response(&merged, CredentialParseError::DuplicateCredential);
     assert_eq!(resp.content_type, "application/json");
     assert!(body_str(&resp).contains("\"code\":0"));
+}
+
+#[test]
+fn rejected_parameters_have_bounded_error_rendering() {
+    use crate::subsonic_http::{parse_credentials, MAX_PARAMS_PER_SOURCE, MAX_SOURCE_BYTES};
+
+    for (query, error) in [
+        (
+            format!("f=json&x={}", "a".repeat(MAX_SOURCE_BYTES)),
+            CredentialParseError::SourceTooLarge,
+        ),
+        (
+            format!("f=json&{}", vec!["x=1"; MAX_PARAMS_PER_SOURCE].join("&")),
+            CredentialParseError::TooManyParams,
+        ),
+    ] {
+        assert_eq!(parse_credentials(Some(&query), None).unwrap_err(), error);
+        assert_eq!(
+            merged_query_params("POST", &query, "f=jsonp&callback=cb"),
+            ""
+        );
+        assert_eq!(
+            parse_error_response(&query, error).content_type,
+            "application/xml"
+        );
+    }
+    let long = "a".repeat(129);
+    let merged = merged_query_params("POST", "f=jsonp", &format!("callback={long}&callback=cb"));
+    let response = parse_error_response(&merged, CredentialParseError::MalformedEncoding);
+    assert_eq!(response.content_type, "application/json");
+    assert!(body_str(&response).contains("\"code\":10"));
+    let merged = merged_query_params("POST", "%66=jsonp&callback=%63b", "f=json&callback=other");
+    assert_eq!(
+        parse_error_response(&merged, CredentialParseError::MalformedEncoding).content_type,
+        "text/javascript"
+    );
+    let malformed = parse_error_response(
+        "f=jsonp&callback=%zz",
+        CredentialParseError::MalformedEncoding,
+    );
+    assert_eq!(malformed.content_type, "application/json");
 }
 
 #[test]
