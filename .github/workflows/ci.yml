@@ -624,6 +624,7 @@ jobs:
       - run: bash workers/api/tests/run_migration_tests.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+          GENRE_TEST_DISPOSABLE: nntune-genre-ci
       - name: Exercise exact staging schema SQL and verdict mutants on disposable PostgreSQL
         run: python3 .github/scripts/test_staging_api_schema_postgres.py
         env:
