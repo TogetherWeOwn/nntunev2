@@ -4,6 +4,8 @@ This is an inert building block: callers must supply trusted object IDs and path
 It does not fetch, construct a graph, or authorize qualification.
 """
 
+import os
+from pathlib import Path
 import re
 import subprocess
 
@@ -28,6 +30,11 @@ def guard(root, commits, trusted_paths):
 
     if git("rev-parse", "--is-shallow-repository").strip() != b"false":
         raise ValueError("shallow repository")
+    graft_path = Path(os.fsdecode(git("rev-parse", "--git-path", "info/grafts").removesuffix(b"\n")))
+    if not graft_path.is_absolute():
+        graft_path = Path(root) / graft_path
+    if os.path.lexists(graft_path):
+        raise ValueError("Git grafts can hide history")
     entries = git("ls-files", "-v", "-z", "--", *trusted_paths)
     if any(entry[:2] != b"H " for entry in entries.split(b"\0") if entry):
         raise ValueError("suppressed or unmerged trusted inputs")

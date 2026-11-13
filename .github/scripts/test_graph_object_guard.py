@@ -24,7 +24,7 @@ class GuardTests(unittest.TestCase):
                 guard.guard(".", ["a" * 40], ["controls"])
 
     def test_connectivity_error_fails_closed(self):
-        outputs = [b"false\n", b"H controls/input\0", b"", b"commit\n", b"objects\n"]
+        outputs = [b"false\n", b".git/info/grafts\n", b"H controls/input\0", b"", b"commit\n", b"objects\n"]
         results = [subprocess.CompletedProcess([], 0, output, b"") for output in outputs]
         results.append(subprocess.CompletedProcess([], 1, b"", b"connectivity error"))
         with mock.patch.object(guard.subprocess, "run", side_effect=results):
@@ -71,6 +71,15 @@ class RealRepositoryTests(unittest.TestCase):
                     guard.guard(self.root, [self.commit], ["controls"])
                 self.git("update-index", undo, "controls/input")
                 (self.root / "controls" / "input").write_text("trusted\n")
+
+    def test_grafts_cannot_hide_missing_history(self):
+        (self.root / "controls" / "input").write_text("second\n")
+        self.git("commit", "-qam", "second")
+        child = self.git("rev-parse", "HEAD").strip()
+        (self.root / ".git" / "info" / "grafts").write_text(child + "\n")
+        (self.root / ".git" / "objects" / self.commit[:2] / self.commit[2:]).unlink()
+        with self.assertRaisesRegex(ValueError, "grafts can hide history"):
+            guard.guard(self.root, [child], ["controls"])
 
     def test_replacement_cannot_hide_missing_history(self):
         blob = self.git("rev-parse", "HEAD:controls/input").strip()
