@@ -822,6 +822,7 @@ impl PgStore {
     /// One account row for the Subsonic mount's identity: email drives
     /// `getLicense`, role drives the `getUser` admin/manager flags. A
     /// single query keeps one Hyperdrive connect per request.
+    #[allow(dead_code)] // Used by the mount in the next slice.
     async fn subsonic_account(
         &self,
         user_id: &str,
@@ -858,6 +859,7 @@ impl PgStore {
     /// Member catalogue for the Subsonic mount's per-request snapshot:
     /// one membership probe feeds all three mirror reads, bound by
     /// `SUBSONIC_SNAPSHOT_CAP` instead of the native page size.
+    #[allow(dead_code)] // Used by the mount in the next slice.
     async fn subsonic_member_catalogue(
         &self,
         user_id: &str,
@@ -5992,6 +5994,7 @@ fn emit_record(
 /// truncate every library past the first page and make those songs
 /// unstreamable; the snapshot reads the whole member collection under this
 /// far larger but still bounded cap (rows are in-memory only).
+#[allow(dead_code)] // Used by the mount in the next slice.
 const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
 
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
