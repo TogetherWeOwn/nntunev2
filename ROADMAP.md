@@ -36,10 +36,25 @@ and release validation, not publication of this roadmap.
 ## Storage direction
 
 The approved target is for NNTune to be a plain standard S3 client: an
-endpoint, one bucket per environment and access keys, with a storage provider
-owning Usenet access, encryption, caching, repair and retention. This is an
-intention, not delivered: the merged implementation is unchanged and migration
-will be staged, using disposable buckets until the provider is production-ready.
+endpoint, one bucket per environment and least-privilege access keys. The
+provider owns storage-side Usenet access, at-rest encryption, caching, repair
+and retention; NNTune has no NZB, NNTP or Usenet awareness in that target.
+
+Curated audio files are owner-supplied through an authenticated programmatic
+ingest API for scripts, external services and apps, with scoped credentials,
+idempotency keys and multipart/presigned transfer of ciphertext only. NNTune
+keeps an application-side plaintext SHA256-to-object-key dedupe map and encrypts
+every upload before S3, whatever the provider. Mandatory client-side envelope
+encryption uses a Worker-secret key-encryption key and seekable chunked AEAD;
+the stream Worker decrypts authenticated chunks for ranged playback and keeps
+metering. This is not end-user end-to-end encryption: authorized Workers can
+decrypt. Upload checksums cover ciphertext; plaintext and keys stay out of logs.
+
+These are requirements, not delivered features. The exact crypto format,
+library, limits and key lifecycle require Security and Applied Cryptography
+approval before implementation. Migration stays staged, using disposable
+buckets until the provider is production-ready. The replacing ingest delivery
+must retire the obsolete NZB fetch/verify/repair path, not leave it as a fallback.
 See [ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md).
 
 ## Direction
