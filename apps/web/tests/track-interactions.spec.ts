@@ -108,6 +108,7 @@ test('More, right-click and keyboard menus share actions, navigation and return 
 });
 
 test('Copy link is inline, restores focus and preserves whole-menu dismissal', async ({ page }, testInfo) => {
+	await page.setViewportSize({ width: 1280, height: 1800 });
 	await page.addInitScript(() => {
 		Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (url: string) => {
 			(window as unknown as { copiedLink: string }).copiedLink = url;
@@ -128,13 +129,19 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 	await page.keyboard.press('Tab');
 	await expect(menu(page)).toHaveCount(0);
 	await expect(page.locator('body')).not.toBeFocused();
+	const heading = page.getByRole('heading', { name: 'Library', exact: true });
+	await heading.scrollIntoViewIfNeeded();
+	await more.scrollIntoViewIfNeeded();
 	await startFocusJournal(page);
 	try {
 		await more.click();
 		await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+		await expect(heading).toBeInViewport({ ratio: 1 });
 		await focusCheckpoint(page, 'before-heading-click');
-		await page.getByRole('heading', { name: 'Library', exact: true }).click();
+		await heading.click();
 		await focusCheckpoint(page, 'after-heading-click');
+		const events = await page.evaluate(() => (window as unknown as { focusJournal: Array<{ type: string; target: string; menu: boolean }> }).focusJournal);
+		expect(events.some((event) => event.type === 'pointerdown' && event.target === 'h1' && event.menu)).toBe(true);
 		await expect(menu(page)).toHaveCount(0);
 		await expect(more).toBeFocused();
 	} finally {
