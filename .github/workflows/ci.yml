@@ -451,6 +451,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_root_traversal.py
           python3 .github/scripts/test_migrations_rename_check.py
           python3 .github/scripts/test_graph_qualification_context.py
+          GRAPH_GUARD_REQUIRE_GIT=1 python3 .github/scripts/test_graph_object_guard.py
           python3 .github/scripts/test_migration_snapshot.py
           python3 .github/scripts/test_migration_acquisition_admission.py
           python3 .github/scripts/test_apply_migration.py
