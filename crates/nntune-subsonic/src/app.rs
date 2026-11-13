@@ -118,6 +118,32 @@ impl<S: Library> SubsonicApp<S> {
                         return Self::render(&params, &error_document(error_code, &message));
                     }
                 };
+                // These operations have no persistent production backing yet. Do
+                // not acknowledge writes (including podcast no-ops) as saved.
+                if self.production
+                    && matches!(
+                        name,
+                        "createPlaylist"
+                            | "updatePlaylist"
+                            | "deletePlaylist"
+                            | "scrobble"
+                            | "star"
+                            | "unstar"
+                            | "setRating"
+                            | "savePlayQueue"
+                            | "refreshPodcasts"
+                            | "createPodcastChannel"
+                            | "deletePodcastChannel"
+                    )
+                {
+                    return Self::render(
+                        &params,
+                        &error_document(
+                            crate::envelope::code::GENERIC,
+                            "This operation is not supported by this server.",
+                        ),
+                    );
+                }
                 Self::render_endpoint(
                     &params,
                     handle_endpoint(&mut *store, &identity, name, &params, !self.production),

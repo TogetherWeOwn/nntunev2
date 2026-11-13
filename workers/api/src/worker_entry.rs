@@ -718,9 +718,10 @@ struct CatalogueTestMirror {
 /// `catalogue_store_for_postgres_test`).
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub trait SubsonicSnapshotCatalogueStore {
-    async fn subsonic_snapshot_catalogue(
+    async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
+        cap: i64,
     ) -> Result<
         (
             Vec<crate::catalogue::ArtistDbRow>,
@@ -729,10 +730,7 @@ pub trait SubsonicSnapshotCatalogueStore {
         ),
         StoreError,
     >;
-}
 
-#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-impl SubsonicSnapshotCatalogueStore for PgStore {
     async fn subsonic_snapshot_catalogue(
         &self,
         user_id: &str,
@@ -744,7 +742,26 @@ impl SubsonicSnapshotCatalogueStore for PgStore {
         ),
         StoreError,
     > {
-        self.subsonic_member_catalogue(user_id).await
+        self.subsonic_snapshot_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)
+            .await
+    }
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl SubsonicSnapshotCatalogueStore for PgStore {
+    async fn subsonic_snapshot_catalogue_with_cap(
+        &self,
+        user_id: &str,
+        cap: i64,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
+        self.subsonic_member_catalogue_with_cap(user_id, cap).await
     }
 }
 
@@ -871,6 +888,22 @@ impl PgStore {
         ),
         StoreError,
     > {
+        self.subsonic_member_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)
+            .await
+    }
+
+    async fn subsonic_member_catalogue_with_cap(
+        &self,
+        user_id: &str,
+        cap: i64,
+    ) -> Result<
+        (
+            Vec<crate::catalogue::ArtistDbRow>,
+            Vec<crate::catalogue::ReleaseDbRow>,
+            Vec<crate::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    > {
         Self::bounded(
             async {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
@@ -914,13 +947,11 @@ impl PgStore {
                 let artist_rows = mirror
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
-                        &[
-                            (&member_releases, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
-                        ],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(artist_rows.len(), cap)?;
                 let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
                     .iter()
                     .map(catalogue_artist_from_row)
@@ -928,13 +959,11 @@ impl PgStore {
                 let release_rows = mirror
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
-                        &[
-                            (&member_releases, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
-                        ],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(release_rows.len(), cap)?;
                 let release_rows: Vec<crate::catalogue::ReleaseDbRow> = release_rows
                     .iter()
                     .map(catalogue_release_from_row)
@@ -947,11 +976,12 @@ impl PgStore {
                         &[
                             (&pair_releases, Type::TEXT_ARRAY),
                             (&pair_recordings, Type::TEXT_ARRAY),
-                            (&SUBSONIC_SNAPSHOT_CAP, Type::INT8),
+                            (&cap, Type::INT8),
                         ],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
+                require_complete_snapshot_page(track_rows.len(), cap)?;
                 let track_rows: Vec<crate::catalogue::TrackDbRow> = track_rows
                     .iter()
                     .map(catalogue_track_from_row)
@@ -5997,6 +6027,16 @@ fn emit_record(
 #[allow(dead_code)] // Used by the mount in the next slice.
 const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
 
+// A full page may have been truncated. Refuse it rather than serve a
+// potentially incomplete catalogue; the check precedes membership filtering.
+fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError> {
+    if cap <= 0 || len >= cap as usize {
+        Err(StoreError)
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -6186,6 +6226,15 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_snapshot_page_fails_closed() {
+        let cap = SUBSONIC_SNAPSHOT_CAP as usize;
+        assert!(require_complete_snapshot_page(0, SUBSONIC_SNAPSHOT_CAP).is_ok());
+        assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
+        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
+        assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
@@ -6445,6 +6494,17 @@ mod tests {
                 .split_once("\n    async fn ")
                 .expect("a following method must bound it")
                 .0;
+            let method = if operation == "subsonic_member_catalogue" {
+                assert!(method.contains(
+                    "self.subsonic_member_catalogue_with_cap(user_id, SUBSONIC_SNAPSHOT_CAP)"
+                ));
+                let (_, helper) = production
+                    .split_once("async fn subsonic_member_catalogue_with_cap(")
+                    .unwrap();
+                helper.split_once("\n    async fn ").unwrap().0
+            } else {
+                method
+            };
             assert_eq!(kind, "statement_failed", "unexpected db failure kind");
             let site = format!("self.statement_failed(\"{event}\")");
             assert!(method.contains(&site), "{operation} must emit {event}");
