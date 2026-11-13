@@ -141,6 +141,29 @@ class InputAdmission(unittest.TestCase):
             self.assertEqual(loaded[-1]["end"], len(expected.splitlines()),
                              f"{table} count must come from the pinned publication")
 
+    def core_fixture_publication(self):
+        dump = self.root / "core-dump"
+        shutil.copytree(HERE.parent / "fixtures" / "mbdump", dump)
+        env = {"PATH": os.defpath, "HOME": str(self.root / "home"),
+               "TMPDIR": str(self.root / "tmp"), "DUMP_TS": "2025-02-03T04:05:06Z"}
+        result = subprocess.run([str(HERE.parents[1] / "etl.sh"), str(dump)], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dump / "curated"
+
+    def test_core_relationship_fixture_reaches_importer_without_cover_edges(self):
+        publication = self.core_fixture_publication()
+        expected = (HERE.parent / "expected" / "mbdump-recording_music_video.tsv").read_text()
+        self.assertEqual((publication / "mbdump-recording_music_video.tsv").read_text(), expected)
+        self.assert_success(self.run_import(directory=publication))
+        self.assert_loaded_publication(self.events("chunks"), publication)
+
+    def test_missing_core_relationship_projection_is_refused_before_writes(self):
+        publication = self.core_fixture_publication()
+        (publication / "mbdump-recording_music_video.tsv").unlink()
+        before = self.state()
+        self.assert_refused_without_writes(self.run_import(directory=publication), before)
+
     def publication_switch(self, point):
         self.config["switch"] = point
         result = self.run_import()
