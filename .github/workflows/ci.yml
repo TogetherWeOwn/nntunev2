@@ -452,6 +452,7 @@ jobs:
           python3 .github/scripts/test_migrations_rename_check.py
           python3 .github/scripts/test_graph_qualification_context.py && python3 .github/scripts/test_graph_control_accounting.py || exit $?
           GRAPH_GUARD_REQUIRE_GIT=1 python3 .github/scripts/test_graph_object_guard.py
+          GRAPH_GUARD_REQUIRE_GIT=1 python3 .github/scripts/test_graph_integration_identity.py
           python3 .github/scripts/test_migration_snapshot.py
           python3 .github/scripts/test_migration_acquisition_admission.py
           python3 .github/scripts/test_apply_migration.py
@@ -569,6 +570,8 @@ jobs:
         run: python3 -I containers/genre-mirror/tests/test_taxonomy.py
       - name: Run offline genre graph traversal tests
         run: python3 -I containers/genre-mirror/tests/test_graph.py
+      - name: Run offline genre root resolution tests
+        run: python3 -I containers/genre-mirror/tests/test_roots.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
@@ -657,8 +660,12 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 9
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 13
           printf '%s\n' "$inventory_billing" | grep -Fx 'equal_end_selection_persists_and_allows_fresh_update: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'foreign_remote_without_live_anchor_rolls_back_on_unique_violation: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'explicit_stale_suppresses_every_update_whatever_the_evidence_end: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'stale_and_fresh_commit_orders_converge: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'flagged_null_evidence_suppresses_subscription_write: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'disposable_config_rejects_non_local_targets: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'setup_snapshots_and_live_selection_are_isolated: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'first_insert_and_replay_preserve_subscription_and_history: test'
