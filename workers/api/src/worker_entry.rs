@@ -6070,7 +6070,10 @@ pub async fn subsonic_mount(
     use nntune_subsonic::routes::{route, Route};
     use nntune_subsonic::{Identity, MemStore, SubsonicApp, UserAccount};
 
-    if matches!(route(path), Route::PublicEndpoint(_)) {
+    if matches!(
+        route(path),
+        Route::PublicEndpoint(_) | Route::Hls | Route::Unknown | Route::Unsupported(_)
+    ) {
         let app = SubsonicApp::production(MemStore::empty());
         return respond_document(&app.handle(method, path, query, body));
     }
