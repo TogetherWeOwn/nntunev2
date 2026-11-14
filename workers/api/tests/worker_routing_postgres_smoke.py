@@ -271,7 +271,7 @@ def main(argv=None):
         if created:
             try:
                 psql(s, s["admin"], f"DROP DATABASE IF EXISTS {db} WITH (FORCE)")
-            except Failure as err:
+            except (Failure, subprocess.TimeoutExpired) as err:
                 print(f"FAIL: cleanup could not drop {db}: {redact(str(err))}", file=sys.stderr)
                 failed = True
         try:

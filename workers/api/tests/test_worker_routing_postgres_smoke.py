@@ -50,23 +50,27 @@ class Helpers(unittest.TestCase):
             with self.assertRaises(smoke.Failure):
                 smoke.check_ping(status, "application/json", body)
 
-    def test_cleanup_failure_fails_main(self):
+    def test_cleanup_failures_fail_main(self):
         settings = smoke.pg_settings(ENV)
-        with patch.object(smoke, "prerequisites", return_value=(settings, Path("wrangler"), SHA)), \
-             patch.object(smoke.tempfile, "mkdtemp", return_value="/tmp/fake"), \
-             patch.object(smoke, "psql"), patch.object(smoke, "app_migrations", return_value=[]), \
-             patch.object(Path, "write_text"), patch.object(Path, "read_text", return_value=""), \
-             patch.object(Path, "mkdir"), \
-             patch.object(smoke.socket, "socket") as sock, patch("builtins.open"), \
-             patch.object(smoke.subprocess, "Popen") as popen, patch.object(smoke.process_group, "shutdown_process_group"), \
-             patch.object(smoke, "http", return_value=(200, "", "")), patch.object(smoke, "smoke") as run_smoke, \
-             patch.object(smoke.shutil, "rmtree", side_effect=PermissionError("denied")) as remove, \
-             patch.object(smoke.sys, "stderr"):
-            sock.return_value.__enter__.return_value.getsockname.return_value = ("localhost", 1234)
-            popen.return_value.poll.return_value = None
-            self.assertEqual(smoke.main([]), 1)
-            run_smoke.assert_called_once()
-            remove.assert_called_once()
+        for drop_error, remove_error in ((None, PermissionError("denied")),
+                                         (smoke.subprocess.TimeoutExpired("psql", 300), None)):
+            with self.subTest(drop_error=drop_error, remove_error=remove_error), \
+                 patch.object(smoke, "prerequisites", return_value=(settings, Path("wrangler"), SHA)), \
+                 patch.object(smoke.tempfile, "mkdtemp", return_value="/tmp/fake"), \
+                 patch.object(smoke, "psql", side_effect=[None, None, drop_error]), \
+                 patch.object(smoke, "app_migrations", return_value=[]), \
+                 patch.object(Path, "write_text"), patch.object(Path, "read_text", return_value=""), \
+                 patch.object(Path, "mkdir"), \
+                 patch.object(smoke.socket, "socket") as sock, patch("builtins.open"), \
+                 patch.object(smoke.subprocess, "Popen") as popen, patch.object(smoke.process_group, "shutdown_process_group"), \
+                 patch.object(smoke, "http", return_value=(200, "", "")), patch.object(smoke, "smoke") as run_smoke, \
+                 patch.object(smoke.shutil, "rmtree", side_effect=remove_error) as remove, \
+                 patch.object(smoke.sys, "stderr"):
+                sock.return_value.__enter__.return_value.getsockname.return_value = ("localhost", 1234)
+                popen.return_value.poll.return_value = None
+                self.assertEqual(smoke.main([]), 1)
+                run_smoke.assert_called_once()
+                remove.assert_called_once_with(Path("/tmp/fake"))
 
     def test_migrations_exist(self):
         for name in smoke.app_migrations():
