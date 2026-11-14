@@ -1012,14 +1012,52 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let fx = Fx::new().await;
-    fx.add_user("lock_owner").await;
-    fx.raw("lock_owner", "sub_lock", "active", None).await;
     let url = std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap();
     let config = disposable_config(&url).unwrap();
+    let schema = format!(
+        "billing_test_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let (db, connection) = timeout(Duration::from_secs(5), config.connect(NoTls))
+        .await
+        .expect("fixture connection timed out")
+        .expect("fixture connection failed");
+    let driver = tokio::spawn(connection);
+    let setup = timeout(Duration::from_secs(5), async {
+        db.batch_execute(&format!("BEGIN; CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}; SET LOCAL statement_timeout = '4s'; SET LOCAL transaction_timeout = '10s'")).await?;
+        for migration in [
+            include_str!("../../../migrations/0002_auth_vault.sql"),
+            include_str!("../../../migrations/0021_billing_schema.sql"),
+            include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
+            include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+        ] {
+            db.batch_execute(migration).await?;
+        }
+        db.execute("INSERT INTO users (id,email,created_at) VALUES ('lock_owner','lock_owner@example.test',$1)", &[&T]).await?;
+        db.execute("INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES ('lock_owner','sub_lock',$1,'si_raw',$2,'plus','active')", &[&CUS, &PRICE]).await?;
+        db.batch_execute(&format!("SET search_path TO {schema}; COMMIT")).await
+    }).await;
+    if !matches!(setup, Ok(Ok(()))) {
+        // Close an uncertain transaction before trying to remove a possibly committed schema.
+        drop(db);
+        driver.abort();
+        let cleanup = timeout(Duration::from_secs(5), async {
+            let (cleanup_db, cleanup_connection) = config.connect(NoTls).await?;
+            let cleanup_driver = tokio::spawn(cleanup_connection);
+            let result = cleanup_db
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
+            cleanup_driver.abort();
+            result
+        })
+        .await;
+        panic!("fixture setup failed: {setup:?}; cleanup: {cleanup:?}");
+    }
+    let fx = Fx { db, schema };
     let schema = &fx.schema;
     let mut pending = None;
-    let mut drivers = Vec::new();
+    let mut drivers = vec![driver];
 
     let result: Result<(), String> = async {
         let (writer, writer_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "writer connection timed out".to_string())?.map_err(|e| e.to_string())?;
