@@ -6025,7 +6025,6 @@ fn emit_record(
 /// truncate every library past the first page and make those songs
 /// unstreamable; the snapshot reads the whole member collection under this
 /// far larger but still bounded cap (rows are in-memory only).
-#[allow(dead_code)] // Used by the mount in the next slice.
 const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
 
 // A full page may have been truncated. Refuse it rather than serve a
@@ -6036,6 +6035,158 @@ fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError
     } else {
         Ok(())
     }
+}
+
+async fn after_auth<A, T, E, F, S, R>(auth: A, snapshot: F) -> Result<R, E>
+where
+    A: std::future::Future<Output = Result<T, E>>,
+    F: FnOnce(T) -> S,
+    S: std::future::Future<Output = Result<R, E>>,
+{
+    snapshot(auth.await?).await
+}
+
+fn pre_auth_subsonic_response(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> Option<nntune_subsonic::HttpResponse> {
+    use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{MemStore, SubsonicApp};
+
+    matches!(
+        route(path),
+        Route::PublicEndpoint(_) | Route::Hls | Route::Unknown | Route::Unsupported(_)
+    )
+    .then(|| SubsonicApp::production(MemStore::empty()).handle(method, path, query, body))
+}
+
+fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
+    let mut response = Response::from_bytes(res.body.clone())?.with_status(res.status);
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+/// Authenticate before constructing the member-scoped dispatch store.
+/// Playback remains unavailable until an occurrence has a trusted binding
+/// to an application track; the dispatcher never receives audio bytes.
+pub async fn subsonic_mount(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    env: Env,
+    trace_id: Option<String>,
+) -> WorkerResult<Response> {
+    use crate::subsonic_dispatch as core;
+    use nntune_subsonic::envelope::code;
+    use nntune_subsonic::{Identity, SubsonicApp, UserAccount};
+
+    if let Some(response) = pre_auth_subsonic_response(method, path, query, body) {
+        return respond_document(&response);
+    }
+    let merged = core::merged_query_params(method, query, body);
+    let config = match config_from_env(&env) {
+        Some(config) => config,
+        None => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let keyring = match config
+        .subsonic_index
+        .as_ref()
+        .and_then(|cfg| cfg.keyring().ok())
+    {
+        Some(keyring) => keyring,
+        None => {
+            return respond_document(&core::auth_error_response(
+                &merged,
+                crate::subsonic_auth::AuthError::Unavailable,
+            ))
+        }
+    };
+    let form_body = (!body.is_empty()).then_some(body.as_bytes());
+    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+        Ok(credentials) => credentials,
+        Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
+    };
+    let store = PgStore {
+        env: Some(env.clone()),
+        trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
+        mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_mirror: None,
+    };
+    let now_millis = worker::Date::now().as_millis();
+    let auth = async {
+        crate::subsonic_auth::authenticate(
+            &store,
+            &credentials,
+            &keyring,
+            &config,
+            now_millis / 1000,
+        )
+        .await
+        .map_err(|err| core::auth_error_response(&merged, err))
+    };
+    let (principal, (artist_rows, release_rows, track_rows)) = match after_auth(auth, |principal| {
+        let store = &store;
+        let merged = &merged;
+        async move {
+            let rows = store
+                .subsonic_member_catalogue(principal.user_id())
+                .await
+                .map_err(|_| core::render_error(merged, code::GENERIC, "Internal server error."))?;
+            Ok((principal, rows))
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return respond_document(&response),
+    };
+    let (email, role) = match store.subsonic_account(principal.user_id()).await {
+        Ok(Some(pair)) => pair,
+        _ => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let is_admin = role == "admin";
+    let identity = Identity {
+        username: principal.username().to_string(),
+        email: email.clone(),
+        is_admin,
+    };
+    let account = UserAccount {
+        email,
+        is_admin,
+        is_manager: role == "manager",
+    };
+    let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
+    let app = SubsonicApp::production(core::ProductionStore::new(
+        identity,
+        account,
+        artists,
+        albums,
+        songs,
+        track_rows,
+        now_millis as i64,
+    ));
+    respond_document(&app.handle(method, path, query, body))
 }
 
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
@@ -6235,6 +6386,63 @@ mod tests {
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
+
+    #[test]
+    fn mount_routes_terminal_paths_before_authentication() {
+        for (path, status, body) in [
+            ("/rest/hls.m3u8", 410, "Gone"),
+            ("/rest/not-a-route.view", 404, "Not Found"),
+            ("/rest/jukeboxControl.view", 200, "not supported"),
+        ] {
+            let response = pre_auth_subsonic_response("GET", path, "f=json", "").unwrap();
+            assert_eq!(response.status, status, "{path}");
+            assert!(String::from_utf8(response.body).unwrap().contains(body));
+        }
+        for endpoint in [
+            "ping",
+            "createPlaylist",
+            "updatePlaylist",
+            "deletePlaylist",
+            "scrobble",
+            "star",
+            "unstar",
+            "setRating",
+            "savePlayQueue",
+            "refreshPodcasts",
+            "createPodcastChannel",
+            "deletePodcastChannel",
+        ] {
+            let path = format!("/rest/{endpoint}.view");
+            assert!(pre_auth_subsonic_response("GET", &path, "f=json", "").is_none());
+        }
+        assert!(pre_auth_subsonic_response(
+            "GET",
+            "/rest/getOpenSubsonicExtensions.view",
+            "f=json",
+            ""
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_completed_authentication() {
+        let calls = std::cell::Cell::new(0);
+        let rejected = after_auth(async { Err::<u8, _>("denied") }, |_| {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(rejected, Err("denied"));
+        assert_eq!(calls.get(), 0);
+        let calls_ref = &calls;
+        let accepted = after_auth(async { Ok::<_, &str>(42) }, |user| async move {
+            calls_ref.set(calls_ref.get() + 1);
+            Ok(user)
+        })
+        .await;
+        assert_eq!(accepted, Ok(42));
+        assert_eq!(calls.get(), 1);
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
