@@ -107,6 +107,38 @@ fn store() -> ProductionStore {
     )
 }
 
+#[test]
+fn production_dispatch_refuses_unpersisted_mutations_after_auth() {
+    let app = nntune_subsonic::SubsonicApp::production(store());
+    for (endpoint, args) in [
+        ("createPlaylist", "name=Mix&songId=so-1"),
+        ("updatePlaylist", "playlistId=pl-1&name=Mix"),
+        ("deletePlaylist", "id=pl-1"),
+        ("scrobble", "id=so-1"),
+        ("star", "id=so-1"),
+        ("unstar", "id=so-1"),
+        ("setRating", "id=so-1&rating=5"),
+        ("savePlayQueue", "id=so-1"),
+        ("refreshPodcasts", ""),
+        (
+            "createPodcastChannel",
+            "url=https%3A%2F%2Fexample.com%2Ffeed",
+        ),
+        ("deletePodcastChannel", "id=pc-1"),
+    ] {
+        for method in ["GET", "POST"] {
+            let path = format!("/rest/{endpoint}.view");
+            let response = app.handle(method, &path, &format!("apiKey=key&f=json&{args}"), "");
+            let text = String::from_utf8(response.body).unwrap();
+            assert!(text.contains("\"status\":\"failed\""), "{endpoint}: {text}");
+            assert!(text.contains("\"code\":0"), "{endpoint}: {text}");
+            let unauth = app.handle(method, &path, "f=json", "");
+            let text = String::from_utf8(unauth.body).unwrap();
+            assert!(text.contains("\"code\":40"), "{endpoint}: {text}");
+        }
+    }
+}
+
 fn mel() -> Identity {
     Identity {
         username: "mel".to_string(),

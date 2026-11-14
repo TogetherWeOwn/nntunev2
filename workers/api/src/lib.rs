@@ -22,6 +22,7 @@ pub mod credential_session_store;
 mod field_envelope;
 pub mod handlers;
 pub mod ingest_grant;
+pub mod ingest_session_auth;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;

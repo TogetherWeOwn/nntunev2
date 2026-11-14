@@ -6045,6 +6045,22 @@ where
     snapshot(auth.await?).await
 }
 
+fn pre_auth_subsonic_response(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> Option<nntune_subsonic::HttpResponse> {
+    use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{MemStore, SubsonicApp};
+
+    matches!(
+        route(path),
+        Route::PublicEndpoint(_) | Route::Hls | Route::Unknown | Route::Unsupported(_)
+    )
+    .then(|| SubsonicApp::production(MemStore::empty()).handle(method, path, query, body))
+}
+
 fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", &res.content_type)?;
@@ -6067,15 +6083,10 @@ pub async fn subsonic_mount(
 ) -> WorkerResult<Response> {
     use crate::subsonic_dispatch as core;
     use nntune_subsonic::envelope::code;
-    use nntune_subsonic::routes::{route, Route};
-    use nntune_subsonic::{Identity, MemStore, SubsonicApp, UserAccount};
+    use nntune_subsonic::{Identity, SubsonicApp, UserAccount};
 
-    if matches!(
-        route(path),
-        Route::PublicEndpoint(_) | Route::Hls | Route::Unknown | Route::Unsupported(_)
-    ) {
-        let app = SubsonicApp::production(MemStore::empty());
-        return respond_document(&app.handle(method, path, query, body));
+    if let Some(response) = pre_auth_subsonic_response(method, path, query, body) {
+        return respond_document(&response);
     }
     let merged = core::merged_query_params(method, query, body);
     let config = match config_from_env(&env) {
@@ -6374,6 +6385,43 @@ mod tests {
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
+
+    #[test]
+    fn mount_routes_terminal_paths_before_authentication() {
+        for (path, status, body) in [
+            ("/rest/hls.m3u8", 410, "Gone"),
+            ("/rest/not-a-route.view", 404, "Not Found"),
+            ("/rest/jukeboxControl.view", 200, "not supported"),
+        ] {
+            let response = pre_auth_subsonic_response("GET", path, "f=json", "").unwrap();
+            assert_eq!(response.status, status, "{path}");
+            assert!(String::from_utf8(response.body).unwrap().contains(body));
+        }
+        for endpoint in [
+            "ping",
+            "createPlaylist",
+            "updatePlaylist",
+            "deletePlaylist",
+            "scrobble",
+            "star",
+            "unstar",
+            "setRating",
+            "savePlayQueue",
+            "refreshPodcasts",
+            "createPodcastChannel",
+            "deletePodcastChannel",
+        ] {
+            let path = format!("/rest/{endpoint}.view");
+            assert!(pre_auth_subsonic_response("GET", &path, "f=json", "").is_none());
+        }
+        assert!(pre_auth_subsonic_response(
+            "GET",
+            "/rest/getOpenSubsonicExtensions.view",
+            "f=json",
+            ""
+        )
+        .is_some());
     }
 
     #[tokio::test]

@@ -450,7 +450,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_renamed_from.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
           python3 .github/scripts/test_migrations_rename_check.py
-          python3 .github/scripts/test_graph_qualification_context.py
+          python3 .github/scripts/test_graph_qualification_context.py && python3 .github/scripts/test_graph_control_accounting.py || exit $?
           python3 .github/scripts/test_migration_snapshot.py
           python3 .github/scripts/test_migration_acquisition_admission.py
           python3 .github/scripts/test_apply_migration.py
@@ -564,6 +564,8 @@ jobs:
         run: python3 containers/mb-import/tests/test_stream_extract.py
       - name: Run offline CC0 genre-extract contract tests
         run: python3 -I containers/genre-extract/tests/test_extract.py
+      - name: Run offline genre taxonomy validation tests
+        run: python3 -I containers/genre-mirror/tests/test_taxonomy.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
