@@ -46,6 +46,8 @@ pub use velmora::{
     transports, yenc, Error, Result,
 };
 
+pub mod digest_context;
+pub mod digest_geometry;
 pub mod media_envelope;
 pub mod media_layout;
 pub mod origin_sealer;
