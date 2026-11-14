@@ -229,11 +229,12 @@ impl Fx {
                     Type::INT8,
                     Type::TEXT,
                     Type::TEXT,
+                    Type::BOOL,
                 ],
             )
             .await?;
         let r = &outcome.row;
-        let params: [&(dyn ToSql + Sync); 14] = [
+        let params: [&(dyn ToSql + Sync); 15] = [
             &user,
             &r.stripe_subscription_id,
             &r.stripe_customer_id,
@@ -248,6 +249,7 @@ impl Fx {
             &r.grace_until_unix,
             &outcome.read_anchor,
             &outcome.read_plan,
+            &outcome.explicit_stale,
         ];
         tx.query(&stmt, &params).await?;
         let history = tx
@@ -481,6 +483,88 @@ async fn null_evidence_updates_status_and_bindings_but_never_coverage() {
 }
 
 #[tokio::test]
+async fn explicit_stale_suppresses_every_update_whatever_the_evidence_end() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut stale = fx
+        .fold("u1", &remote("sub_a", &[invoice("sub_a", 1)]))
+        .await;
+    assert!(stale.explicit_stale);
+    let mut history = stale.history[0].clone();
+    history.stripe_invoice_id = "inv_new_history".into();
+    stale.history.push(history);
+    let different = divergent(&fx, "sub_a", &stored).await;
+    stale.row = different.row;
+    for end in [Some(T), stored.paid_through, Some(T + 4 * P), None] {
+        stale.row.paid_through_unix = end;
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()), "{end:?}");
+        assert_eq!(fx.history_rows("sub_a").await, 3);
+    }
+    // Suppression also prevents an insert when the target does not exist.
+    stale.row.stripe_subscription_id = "sub_missing".into();
+    stale.history.clear();
+    fx.put("u1", &stale).await;
+    assert!(fx.snap("sub_missing").await.is_none());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn flagged_null_evidence_suppresses_subscription_write() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut stale = fx.fold("u1", &remote("sub_a", &[])).await;
+    assert!(stale.explicit_stale);
+    stale.row = divergent(&fx, "sub_a", &stored).await.row;
+    stale.row.paid_through_unix = None;
+    stale.row.paid_invoice_id = None;
+    fx.put("u1", &stale).await;
+    assert_eq!(fx.snap("sub_a").await, Some(stored));
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn stale_and_fresh_commit_orders_converge() {
+    let mut fx = Fx::new().await;
+    let mut results = Vec::new();
+    for user in ["u1", "u2"] {
+        fx.add_user(user).await;
+        let sub = format!("sub_{user}");
+        fx.seed_active(user, &sub).await;
+        let stale = fx.fold(user, &remote(&sub, &[invoice(&sub, 1)])).await;
+        let mut renewal = remote(
+            &sub,
+            &[invoice(&sub, 1), invoice(&sub, 2), invoice(&sub, 3)],
+        );
+        renewal.subscription.current_period_end = Some(T + 3 * P);
+        let fresh = fx.fold(user, &renewal).await;
+        assert!(stale.explicit_stale);
+        assert!(!fresh.explicit_stale);
+        if user == "u1" {
+            fx.put(user, &stale).await;
+            fx.put(user, &fresh).await;
+        } else {
+            fx.put(user, &fresh).await;
+            fx.put(user, &stale).await;
+        }
+        let result = fx.snap(&sub).await.unwrap();
+        assert_eq!(result.paid_through, Some(T + 3 * P));
+        assert_eq!(result.anchor, Some(format!("inv_{sub}_3")));
+        assert_eq!(result.period_end, Some(T + 3 * P));
+        assert_eq!(fx.history_rows(&sub).await, 3);
+        results.push(Snap {
+            user_id: String::new(),
+            anchor: None,
+            ..result
+        });
+    }
+    assert_eq!(results[0], results[1]);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
     let mut fx = Fx::new().await;
     let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
@@ -529,6 +613,31 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
         .await;
     fx.put("free_user", &outcome).await;
     assert!(fx.snap("sub_free").await.is_some());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let a = fx.seed_active("u1", "sub_a").await;
+    let live = fx.live("u1").await.expect("anchored live A");
+    assert_eq!(live.stripe_subscription_id, "sub_a");
+    assert_eq!(live.paid_invoice_id, a.anchor);
+    let b = remote("sub_b", &[invoice("sub_b", 1), invoice("sub_b", 2)]);
+    assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
+    let outcome = fx.fold("u1", &b).await;
+    assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
+    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(a));
+    assert!(fx.snap("sub_b").await.is_none());
+    assert_eq!(fx.rows("u1").await, 1);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert_eq!(fx.history_rows("sub_b").await, 0);
     fx.cleanup().await;
 }
 
