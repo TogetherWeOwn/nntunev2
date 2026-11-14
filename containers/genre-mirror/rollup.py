@@ -61,8 +61,11 @@ def resolve(genres, parents, memberships, config):
         entries = [("flag", flag) for flag in flags]
         if qid in universe and not selected:
             actions = resolver.actions.get(qid, {}) if qid in present else {}
+            removed = bool(actions.get("remove") and
+                           set(roots.resolve(qid)[0]) & actions["remove"])
             reason = ("excluded" if "exclude" in actions else
                       "unknown_genre" if qid not in present else
+                      "removed" if removed else
                       "no_parents" if qid not in parent_lists else "no_root_reached")
             entries.append(("reason", reason))
         diagnostics.extend({"genre_qid": qid, kind: code}

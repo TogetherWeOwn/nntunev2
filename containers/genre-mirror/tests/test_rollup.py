@@ -71,6 +71,21 @@ class RollupTests(unittest.TestCase):
         self.assertEqual(result["artist_roots"], [])
         self.assertIn({"genre_qid": "Q3", "reason": "no_root_reached"}, result["diagnostics"])
 
+    def test_remove_diagnostic_requires_an_actually_removed_root(self):
+        genres, parents, config = fixture()
+        config["overrides"].extend([
+            {"genre_qid": "Q3", "action": "remove", "roots": ["narrow"], "reason": "fixture"},
+            {"genre_qid": "Q1", "action": "remove", "roots": ["narrow"], "reason": "fixture"},
+        ])
+        result = resolve(genres, parents, [membership("a", "Q3", "wikidata")], config)
+        self.assertEqual(result["artist_roots"], [])
+        self.assertIn({"genre_qid": "Q3", "reason": "removed"}, result["diagnostics"])
+        self.assertNotIn({"genre_qid": "Q3", "reason": "no_root_reached"}, result["diagnostics"])
+        config["traversal_barriers"] = ["Q3"]
+        result = resolve(genres, parents, [], config)
+        self.assertIn({"genre_qid": "Q3", "reason": "no_root_reached"}, result["diagnostics"])
+        self.assertNotIn({"genre_qid": "Q3", "reason": "removed"}, result["diagnostics"])
+
     def test_invalid_rows_and_config_rejected(self):
         genres, parents, config = fixture()
         with self.assertRaises(ValueError):
