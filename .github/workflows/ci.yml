@@ -319,6 +319,8 @@ jobs:
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
       - name: Test offline playable-artist root coverage (synthetic only)
         run: python3 scripts/test_genre_root_coverage.py
+      - name: Test bounded process-group cleanup
+        run: python3 workers/api/tests/test_process_group.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
