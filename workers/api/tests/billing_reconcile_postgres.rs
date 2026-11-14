@@ -1061,7 +1061,8 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
     let mut pending = None;
     let mut drivers = vec![driver];
 
-    let result: Result<(), String> = async {
+    // Keep all phases below the holder's five-second idle timeout.
+    let result: Result<(), String> = timeout(Duration::from_secs(4), async {
         let (writer, writer_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "writer connection timed out".to_string())?.map_err(|e| e.to_string())?;
         drivers.push(tokio::spawn(writer_connection));
         let (reader, reader_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "reader connection timed out".to_string())?.map_err(|e| e.to_string())?;
@@ -1127,23 +1128,25 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         let count = timeout(Duration::from_secs(5), &mut *task).await.map_err(|_| "writer completion timed out".to_string())?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
         if count != 1 { return Err(format!("writer affected {count} rows")); }
         Ok(())
-    }.await;
+    }).await.unwrap_or_else(|_| Err("contention phases timed out".into()));
 
     if let Some(task) = pending {
         task.abort();
     }
     let _ = timeout(Duration::from_secs(5), fx.db.batch_execute("ROLLBACK")).await;
-    let cleanup = timeout(
-        Duration::from_secs(5),
-        fx.db.batch_execute(&format!(
-            "DROP SCHEMA {} CASCADE; DROP ROLE {role}; DROP ROLE {read_role}",
-            fx.schema
-        )),
-    )
-    .await;
+    let Fx { db, schema } = fx;
+    drop(db);
     for driver in drivers {
         driver.abort();
     }
+    // The holder can have been terminated by a server timeout; do not reuse it.
+    let cleanup = timeout(Duration::from_secs(5), async {
+        let (cleanup_db, cleanup_connection) = config.connect(NoTls).await?;
+        let cleanup_driver = tokio::spawn(cleanup_connection);
+        let result = cleanup_db.batch_execute(&format!("SET statement_timeout = '4s'; DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {role}; DROP ROLE IF EXISTS {read_role}")).await;
+        cleanup_driver.abort();
+        result
+    }).await;
     assert!(
         matches!(cleanup, Ok(Ok(()))),
         "fixture cleanup failed: {cleanup:?}; contention phases: {result:?}"
