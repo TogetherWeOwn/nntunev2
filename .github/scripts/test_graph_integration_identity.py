@@ -61,6 +61,11 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("core.fsmonitor=false", args)
         self.assertEqual(args[args.index("core.fsmonitor=false") - 1], "-c")
 
+    def test_git_reads_non_ascii_config_keys(self):
+        result = subprocess.CompletedProcess([], 0, stdout="branch.révision.remote\0".encode(), stderr=b"")
+        with mock.patch.object(identity.subprocess, "run", return_value=result):
+            self.assertEqual(identity._git(".", "config", "--list"), "branch.révision.remote\0")
+
     def test_ci_requires_git_capability(self):
         if os.environ.get("GRAPH_GUARD_REQUIRE_GIT") == "1":
             self.assertTrue(SUPPORTED, "Git must support --no-lazy-fetch")
@@ -69,6 +74,12 @@ class IdentityTests(unittest.TestCase):
 @unittest.skipUnless(SUPPORTED, "Git lacks --no-lazy-fetch")
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
+        env = graph_object_guard.git_environment()
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        for module in (identity, graph_object_guard):
+            patcher = mock.patch.object(module, "git_environment", return_value=env)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

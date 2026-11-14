@@ -21,7 +21,7 @@ def _git(root, *args, input_data=None):
     )
     if result.returncode:
         raise ValueError("integration Git command failed: " + result.stderr.decode(errors="replace"))
-    return result.stdout.decode("ascii").strip()
+    return result.stdout.decode("utf-8", errors="surrogateescape").strip()
 
 
 def verify(root, base, head, tree, merge):
