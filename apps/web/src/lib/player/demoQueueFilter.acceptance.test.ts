@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 /**
  * DEMOFIND — test-only acceptance handoff, test/demo-queue-filter-acceptance.
- * Protected test bank: this file and tests/demo-queue-filter.acceptance.spec.ts.
- * Builder-owned implementation (NOT protected tests): queueFilter.ts,
- * PlayerQueue.svelte, and ../../routes/demo/player/+page.svelte. Extract one
- * matchesQueueQuery(track, query) export from queueFilter.ts and have BOTH
- * consumers use it. Do not alter PlayerQueue behavior or its existing suites.
+ * Protected test bank: this file (the demo browser companion
+ * tests/demo-queue-filter.acceptance.spec.ts retired with the `/demo/player`
+ * route per EL ruling TWO-5795; the pure-matcher vectors here are kept as
+ * product coverage). Builder-owned implementation (NOT protected tests):
+ * queueFilter.ts, PlayerQueue.svelte. Extract one
+ * matchesQueueQuery(track, query) export from queueFilter.ts and have the
+ * product consumer use it. Do not alter PlayerQueue behavior or its existing suites.
  *
  * Offline setup: pnpm --dir apps/web install --offline --frozen-lockfile --prod=false
  * Focused RED/GREEN: pnpm --dir apps/web exec vitest run src/lib/player/demoQueueFilter.acceptance.test.ts

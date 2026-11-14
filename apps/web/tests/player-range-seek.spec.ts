@@ -1,4 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+// EL TWO-5795 (demo/player retirement): this spec is hosted on the retired
+// `/demo/player` surface and the deleted `/api/demo/*` synthetic-media endpoints.
+// Vectors and case IDs are preserved; migration to the product surface is
+// deferred per fallback (b) — see the PR body disposition manifest.
+test.skip(true, 'EL TWO-5795: demo/player retirement — migration deferred, vectors preserved');
+
 
 /**
  * Browser pins for Range seeking on the deterministic demo audio route.

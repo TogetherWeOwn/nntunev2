@@ -490,7 +490,8 @@ test('[QSTAR-09] queue toggles replace one announcement and mutate nothing else'
 	).toHaveCount(0);
 });
 
-test('[QSTAR-10] demo inline queue rows carry no star toggle', async ({ page }) => {
+// EL TWO-5795: retired with the `/demo/player` route (vector preserved).
+test.skip('[QSTAR-10] demo inline queue rows carry no star toggle', async ({ page }) => {
 	// Control, not RED: demo catalogue ids never resolve in library
 	// favorites, so the slice must not star there. Passes pre- and post-.
 	await page.route('**/api/demo/audio**', (route) =>

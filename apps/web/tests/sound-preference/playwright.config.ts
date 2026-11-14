@@ -15,7 +15,7 @@ export default defineConfig({
 	webServer: {
 		cwd,
 		command: `pnpm build && pnpm preview --host 127.0.0.1 --port ${port} --strictPort`,
-		url: `http://127.0.0.1:${port}/demo/player`,
+		url: `http://127.0.0.1:${port}/library`,
 		reuseExistingServer: false,
 		timeout: 180_000
 	}
