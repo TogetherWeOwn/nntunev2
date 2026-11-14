@@ -11495,6 +11495,7 @@ mod tests {
             ("active", false, false, false),
             ("active", false, true, true),
             ("canceled", false, false, true),
+            ("canceled", true, false, true),
             ("canceled", true, true, true),
         ] {
             let h = stripe_harness();
