@@ -20,7 +20,7 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("build", cfg)
 
     def test_fail_closed_settings(self):
-        for env in ({}, {**ENV, "NNTUNE_SMOKE_PG_HOST": "10.0.0.5"},
+        for env in ({}, {**ENV, "NNTUNE_SMOKE_PG_HOST": "example.com"},
                     {**ENV, "NNTUNE_SMOKE_PG_ADMIN_DB": "x;drop"}):
             with self.assertRaises(smoke.Failure):
                 smoke.pg_settings(env)
