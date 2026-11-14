@@ -6,11 +6,9 @@ Runs the prebuilt bundle (workers/api/build/worker/shim.mjs) under the locked
 created in (and dropped from) the service, migrated from migrations/manifest.toml.
 Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
 inserted auth_challenges row back), plus non-/rest and /rest routing controls.
-/rest is asserted against the inert main baseline; the two observed tables
-must not gain rows. This is NOT Subsonic activation proof. Missing prerequisites fail.
-By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
-into the same disposable database and /rest must stay inert against it (--no-fixture skips;
---mirror-fixture also applies the mirror-target migrations and seeds mb_* rows).
+The synthetic Subsonic fixture exercises the mounted route with disposable data.
+--mirror-fixture applies the mirror-target migrations and seeds mb_* rows.
+This does not prove production Hyperdrive behavior. Missing prerequisites fail.
 
 Env: NNTUNE_SMOKE_PG_PASSWORD (required), _HOST (loopback, 127.0.0.1), _PORT (5432),
 _USER (postgres), _ADMIN_DB (nntune_ci). Needs node and a host psql client.
@@ -188,28 +186,48 @@ def prerequisites(args):
     return s, wrangler, sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "0123456789abcdef0123456789abcdef01234567"
 
 
-def fixture_inert(base, q, fx, mirror):
-    """Seeded rows exist, and no fixture scenario reaches them while /rest is inert."""
-    want = {"users": 6, "subsonic_credentials": 6, "subscriptions": 5, "library": 3}
-    for table, n in {**want, **({"mb_track": 1} if mirror else {})}.items():
-        got = q(f"SELECT count(*) FROM {table}")
-        check(got.isdigit() and int(got) >= n, f"fixture seed: {table} has {got}, want >= {n}")
-    before = q(fixture.snapshot_sql())
-    for sc in fixture.SCENARIOS:
-        st, ct, b = http("POST" if sc.mutates else "GET", base + fixture.request_path(fx, sc),
-                         b"" if sc.mutates else None)
-        key = fx.keys[sc.who]
-        check(st < 500, f"fixture {sc.name} ({sc.kind}): server error {st}")
-        check(not ct.lower().startswith(("audio/", "application/octet-stream")), f"fixture {sc.name}: media served")
-        check(key not in b, f"fixture {sc.name}: credential echoed")
-        if sc.inert in ("no auth, failed", "failed"):
-            check_ping(st, ct, b)
-        elif sc.inert == "text 404":
-            check(classify(st, ct, b) == "subsonic-text-404", f"fixture {sc.name}: expected 404")
-        elif sc.inert == "gone":
-            check(st == 410 and b.strip() == "Gone", f"fixture {sc.name}: expected 410 Gone")
-    check(q(fixture.snapshot_sql()) == before, "inert /rest changed fixture-observed tables")
-    print(f"ok: {len(fixture.SCENARIOS)} synthetic fixture scenarios inert, no row changes", flush=True)
+def fixture_mounted(base, q, fx, mirror):
+    """Exercise authentication and membership through the actual Worker mount."""
+    scenarios = {sc.name: sc for sc in fixture.SCENARIOS}
+
+    def request(name):
+        sc = scenarios[name]
+        st, ct, body = http("POST" if sc.mutates else "GET", base + fixture.request_path(fx, sc),
+                            b"" if sc.mutates else None)
+        check(fx.keys[sc.who] not in body, f"fixture {name}: credential echoed")
+        check(classify(st, ct, body) == "subsonic-envelope", f"fixture {name}: expected envelope")
+        return json.loads(body)["subsonic-response"]
+
+    check(request("ok-ping").get("status") == "ok", "valid key did not authenticate ping")
+    for name in ("wrong-key", "revoked-key", "deleting-user", "mixed-u-and-key"):
+        check(request(name).get("status") == "failed", f"fixture {name}: expected auth refusal")
+    for name in ("unknown-op", "hls"):
+        sc = scenarios[name]
+        st, ct, body = http("GET", base + fixture.request_path(fx, sc))
+        check(fx.keys[sc.who] not in body, f"fixture {name}: credential echoed")
+        if name == "hls":
+            check(st == 410 and body.strip() == "Gone", "HLS must be gone before auth")
+        else:
+            check(classify(st, ct, body) == "subsonic-text-404", "unknown route must be 404")
+    if not mirror:
+        check(request("visible-album").get("status") == "failed", "missing mirror must fail closed")
+        print("ok: authenticated ping and catalogue refusal without mirror", flush=True)
+        return
+    visible = request("visible-album")
+    check(visible.get("status") == "ok" and visible.get("album", {}).get("id") == fixture.REL,
+          "member album missing")
+    check(request("other-album").get("status") == "failed", "private album leaked")
+    business_tables = ("library", "playlists", "stream_play_ledger")
+    snapshot = "SELECT " + " || '/' || ".join(
+        f"coalesce((SELECT md5(string_agg(t::text, '|' ORDER BY t::text)) FROM {table} t), '-')"
+        for table in business_tables)
+    before = q(snapshot)
+    for name in ("scrobble", "star", "playlist", "stream", "stream-denied", "download-terminal"):
+        check(request(name).get("status") == "failed", f"fixture {name}: expected refusal")
+    check(q(snapshot) == before, "refused operations changed observed business state")
+    used = q("SELECT last_used_at IS NOT NULL FROM subsonic_credentials WHERE user_id = 'ci-fixture-active'")
+    check(used == "t", "successful authentication did not update last_used_at")
+    print("ok: mounted synthetic authentication, membership and refusal cases", flush=True)
 
 
 def smoke(base, s, db, fx=None, mirror=False):
@@ -245,7 +263,7 @@ def smoke(base, s, db, fx=None, mirror=False):
     check(after == snap, "current main /rest changed observed table counts")
     print("ok: /rest claimed by the Subsonic adapter; observed table counts unchanged", flush=True)
     if fx:
-        fixture_inert(base, q, fx, mirror)
+        fixture_mounted(base, q, fx, mirror)
 
 
 def main(argv=None):

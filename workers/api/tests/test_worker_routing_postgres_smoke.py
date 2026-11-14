@@ -100,16 +100,12 @@ class Helpers(unittest.TestCase):
         self.assertIn("FROM stream_play_ledger t", sql)
         self.assertNotIn("FROM usage_ledger t", sql)
 
-    def test_fixture_inert_rejects_successful_authenticated_ping(self):
+    def test_mounted_fixture_rejects_failed_authenticated_ping(self):
         fx = smoke.fixture.build()
-        def query(sql):
-            if sql.startswith("SELECT count(*)"):
-                return "10"
-            return "snapshot"
         with patch.object(smoke, "http", return_value=(200, "application/json",
-                '{"subsonic-response":{"status":"ok"}}')):
+                '{"subsonic-response":{"status":"failed"}}')):
             with self.assertRaises(smoke.Failure):
-                smoke.fixture_inert("http://localhost", query, fx, True)
+                smoke.fixture_mounted("http://localhost", lambda sql: "", fx, False)
 
     def test_mirror_fixture_binds_mb_db_to_the_disposable_database(self):
         conn = smoke.conn_string(smoke.pg_settings(ENV), "nntune_smoke_ab")

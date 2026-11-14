@@ -1707,6 +1707,7 @@ jobs:
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
+          python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
       - name: Upload Worker build logs

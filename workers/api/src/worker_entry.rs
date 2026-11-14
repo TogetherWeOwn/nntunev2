@@ -6046,6 +6046,22 @@ where
     snapshot(auth.await?).await
 }
 
+async fn catalogue_for_route<F, S, R, E>(path: &str, load: F) -> Result<R, E>
+where
+    F: FnOnce() -> S,
+    S: std::future::Future<Output = Result<R, E>>,
+    R: Default,
+{
+    if matches!(
+        nntune_subsonic::routes::route(path),
+        nntune_subsonic::routes::Route::Endpoint("ping")
+    ) {
+        Ok(R::default())
+    } else {
+        load().await
+    }
+}
+
 fn pre_auth_subsonic_response(
     method: &str,
     path: &str,
@@ -6143,10 +6159,15 @@ pub async fn subsonic_mount(
         let store = &store;
         let merged = &merged;
         async move {
-            let rows = store
-                .subsonic_member_catalogue(principal.user_id())
-                .await
-                .map_err(|_| core::render_error(merged, code::GENERIC, "Internal server error."))?;
+            let rows = catalogue_for_route(path, || async {
+                store
+                    .subsonic_member_catalogue(principal.user_id())
+                    .await
+                    .map_err(|_| {
+                        core::render_error(merged, code::GENERIC, "Internal server error.")
+                    })
+            })
+            .await?;
             Ok((principal, rows))
         }
     })
@@ -6443,6 +6464,29 @@ mod tests {
         .await;
         assert_eq!(accepted, Ok(42));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_ping_does_not_load_catalogue() {
+        for path in ["/rest/ping", "/rest/ping.view"] {
+            let result = after_auth(async { Ok::<_, &str>(42) }, |user| async move {
+                catalogue_for_route(path, || async { Err::<Vec<()>, _>("mirror unavailable") })
+                    .await
+                    .map(|rows| (user, rows))
+            })
+            .await;
+            assert_eq!(result, Ok((42, vec![])));
+        }
+        let denied = after_auth(async { Err::<u8, _>("denied") }, |_| async {
+            catalogue_for_route("/rest/ping", || async { Ok::<Vec<()>, &str>(vec![]) }).await
+        })
+        .await;
+        assert_eq!(denied, Err("denied"));
+        let catalogue = catalogue_for_route("/rest/getArtists.view", || async {
+            Err::<Vec<()>, _>("mirror unavailable")
+        })
+        .await;
+        assert_eq!(catalogue, Err("mirror unavailable"));
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
