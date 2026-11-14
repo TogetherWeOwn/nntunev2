@@ -48,6 +48,19 @@ class RootTests(unittest.TestCase):
                                root("c", 3, "Q5", "Q6")])
         self.assertEqual(r.resolve("Q7"), (["a", "b", "c"], False, False))
 
+    def test_projected_cycle_containing_mutual_pair_keeps_all(self):
+        parents = {"Q1": ["Q3"], "Q4": ["Q2", "Q5"], "Q6": ["Q2"],
+                   "Q9": ["Q1", "Q4", "Q6"]}
+        r = resolver(parents, [root("a", 1, "Q1", "Q2"), root("b", 2, "Q3", "Q4"),
+                               root("c", 3, "Q5", "Q6")])
+        self.assertEqual(r.resolve("Q9"), (["a", "b", "c"], False, False))
+
+    def test_capped_anchor_precomputation_does_not_prove_dominance(self):
+        parents = {"Q1": ["Q2"], "Q2": ["Q3"], "Q3": ["Q1"],
+                   "Q9": ["Q1", "Q2", "Q3"]}
+        r = resolver(parents, [root("a", 1, "Q1"), root("b", 2, "Q2")], depth=1)
+        self.assertEqual(r.resolve("Q9"), (["a", "b"], True, True))
+
     def test_barrier_and_cap_preserve_only_reached_roots(self):
         parents = {"Q9": ["Q1", "Q2"], "Q2": ["Q3"]}
         configured = [root("a", 1, "Q1"), root("b", 2, "Q3")]

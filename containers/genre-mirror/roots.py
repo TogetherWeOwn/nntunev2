@@ -14,40 +14,40 @@ class Roots:
             anchor: root["root_id"] for root in active for anchor in root["anchors"]
         }
         reaches = {}
+        self.anchors_capped = False
         for root in active:
             found = set()
             for anchor in root["anchors"]:
-                visited, _, _ = graph.reach(anchor)
+                visited, capped, _ = graph.reach(anchor)
+                self.anchors_capped |= capped
                 found.update(self.anchor_root[node] for node in visited if node in self.anchor_root)
             reaches[root["root_id"]] = found
 
-        narrower = {
-            rid: {other for other in reaches[rid]
-                  if other != rid and rid not in reaches[other]}
-            for rid in reaches
-        }
-        # Multiple anchors may project an acyclic genre graph into a root cycle.
-        # Roots in that cycle are incomparable, so do not discard all of them.
+        # Compute cycles over the full projected relation, including mutual
+        # edges. Multiple anchors can join otherwise separate paths into a cycle.
         closure = {}
-        for rid in narrower:
-            seen, pending = set(), list(narrower[rid])
+        for rid in reaches:
+            seen, pending = set(), list(reaches[rid])
             while pending:
                 other = pending.pop()
                 if other not in seen:
                     seen.add(other)
-                    pending.extend(narrower[other])
+                    pending.extend(reaches[other])
             closure[rid] = seen
+        # A capped anchor can hide an edge anywhere in a projected cycle.
+        # Preserve candidates rather than treating missing edges as proof.
         self.narrower = {
-            rid: {other for other in broader if rid not in closure[other]}
-            for rid, broader in narrower.items()
+            rid: {other for other in broader
+                  if not self.anchors_capped and other != rid and rid not in closure[other]}
+            for rid, broader in reaches.items()
         }
 
     def resolve(self, genre_qid):
-        """Return sorted root IDs, traversal-capped status, and cycle status."""
+        """Return sorted roots, any anchor/query cap, and query cycle status."""
         visited, capped, cycle = self.graph.reach(genre_qid)
         candidates = {self.anchor_root[node] for node in visited if node in self.anchor_root}
         reduced = {
             broader for broader in candidates
             if not any(broader in self.narrower[narrower] for narrower in candidates)
         }
-        return sorted(reduced, key=self.sort_order.__getitem__), capped, cycle
+        return sorted(reduced, key=self.sort_order.__getitem__), capped or self.anchors_capped, cycle
