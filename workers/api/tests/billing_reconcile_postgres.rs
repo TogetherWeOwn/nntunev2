@@ -1077,11 +1077,15 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
             .err().and_then(|e| e.code().cloned())
             .filter(|code| code == &tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
             .ok_or_else(|| "lock denial was not insufficient_privilege".to_string())?;
+        // Commit the DML probe first so its row and table locks cannot mask exclusion.
+        fx.db.batch_execute(&format!("BEGIN; SET LOCAL ROLE {role}; SET LOCAL statement_timeout = '3s'")).await.map_err(|e| e.to_string())?;
+        let updated = fx.db.execute(&format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = false WHERE stripe_subscription_id = 'sub_lock'"), &[]).await.map_err(|e| e.to_string())?;
+        if updated != 1 { return Err(format!("restricted update affected {updated} rows")); }
+        fx.db.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
         let (holder_pid, writer_pid, holder) = timeout(Duration::from_secs(5), async {
             fx.db.batch_execute(&format!("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL ROLE {role}; SET LOCAL lock_timeout = '2s'; SET LOCAL idle_in_transaction_session_timeout = '5s'; SET LOCAL transaction_timeout = '15s'; SET LOCAL statement_timeout = '4s'")).await?;
             fx.db.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await?;
             fx.db.query_one(&format!("SELECT count(*) FROM {schema}.subscriptions"), &[]).await?;
-            fx.db.execute(&format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = false WHERE stripe_subscription_id = 'sub_lock'"), &[]).await?;
             writer.batch_execute("SET statement_timeout = '10s'").await?;
             let holder = fx.db.query_one("SELECT pg_backend_pid(), current_user::text, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'), current_setting('transaction_timeout')", &[]).await?;
             let holder_pid: i32 = holder.get(0);
