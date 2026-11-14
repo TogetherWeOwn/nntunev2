@@ -6039,6 +6039,33 @@ fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError
 }
 
 #[allow(dead_code)] // Used by the mount in the next slice.
+async fn after_auth<A, T, E, F, S, R>(auth: A, snapshot: F) -> Result<R, E>
+where
+    A: std::future::Future<Output = Result<T, E>>,
+    F: FnOnce(T) -> S,
+    S: std::future::Future<Output = Result<R, E>>,
+{
+    snapshot(auth.await?).await
+}
+
+#[allow(dead_code)] // Used by the mount in the next slice.
+async fn catalogue_for_route<F, S, R, E>(path: &str, load: F) -> Result<R, E>
+where
+    F: FnOnce() -> S,
+    S: std::future::Future<Output = Result<R, E>>,
+    R: Default,
+{
+    if matches!(
+        nntune_subsonic::routes::route(path),
+        nntune_subsonic::routes::Route::Endpoint("ping")
+    ) {
+        Ok(R::default())
+    } else {
+        load().await
+    }
+}
+
+#[allow(dead_code)] // Used by the mount in the next slice.
 fn pre_auth_subsonic_response(
     method: &str,
     path: &str,
@@ -6299,6 +6326,49 @@ mod tests {
             ""
         )
         .is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_completed_authentication() {
+        let calls = std::cell::Cell::new(0);
+        let rejected = after_auth(async { Err::<u8, _>("denied") }, |_| {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(rejected, Err("denied"));
+        assert_eq!(calls.get(), 0);
+        let calls_ref = &calls;
+        let accepted = after_auth(async { Ok::<_, &str>(42) }, |user| async move {
+            calls_ref.set(calls_ref.get() + 1);
+            Ok(user)
+        })
+        .await;
+        assert_eq!(accepted, Ok(42));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_ping_does_not_load_catalogue() {
+        for path in ["/rest/ping", "/rest/ping.view"] {
+            let result = after_auth(async { Ok::<_, &str>(42) }, |user| async move {
+                catalogue_for_route(path, || async { Err::<Vec<()>, _>("mirror unavailable") })
+                    .await
+                    .map(|rows| (user, rows))
+            })
+            .await;
+            assert_eq!(result, Ok((42, vec![])));
+        }
+        let denied = after_auth(async { Err::<u8, _>("denied") }, |_| async {
+            catalogue_for_route("/rest/ping", || async { Ok::<Vec<()>, &str>(vec![]) }).await
+        })
+        .await;
+        assert_eq!(denied, Err("denied"));
+        let catalogue = catalogue_for_route("/rest/getArtists.view", || async {
+            Err::<Vec<()>, _>("mirror unavailable")
+        })
+        .await;
+        assert_eq!(catalogue, Err("mirror unavailable"));
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
