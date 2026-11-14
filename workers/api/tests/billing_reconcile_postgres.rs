@@ -1038,10 +1038,11 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         pending = Some(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
         let task = pending.as_mut().unwrap();
         timeout(Duration::from_secs(5), async {
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&holder_pid, &writer_pid];
             loop {
                 tokio::select! {
                     result = &mut *task => return Err(format!("writer finished before observed block: {result:?}")),
-                    result = reader.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &[&holder_pid, &writer_pid]) => {
+                    result = reader.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &params) => {
                         if result.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
                     }
                 }
