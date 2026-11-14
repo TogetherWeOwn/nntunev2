@@ -69,7 +69,9 @@ CREATE TABLE IF NOT EXISTS public.private_plays (
     play_key  TEXT NOT NULL UNIQUE
               CHECK (char_length(play_key) BETWEEN 1 AND 1159)
               CHECK (play_key ~ '^play:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$')
-              CHECK (split_part(play_key, ':', 2) = user_id),
+              CHECK (split_part(play_key, ':', 2) = user_id)
+              CHECK (octet_length(split_part(play_key, ':', 3)) BETWEEN 1 AND 512)
+              CHECK (octet_length(split_part(play_key, ':', 4)) BETWEEN 1 AND 512),
     marked_at BIGINT NOT NULL CHECK (marked_at >= 0 AND marked_at <= 253402300799),
     PRIMARY KEY (user_id, play_key)
 );

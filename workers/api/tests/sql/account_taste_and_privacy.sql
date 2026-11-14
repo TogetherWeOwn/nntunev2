@@ -23,6 +23,12 @@ INSERT INTO public.account_taste VALUES
 INSERT INTO public.private_sessions VALUES ('taste-a', 'session', 0), ('taste-b', 'session', 253402300799);
 INSERT INTO public.private_plays VALUES ('taste-a', 'play:taste-a:track:one', 0),
                                        ('taste-b', 'play:taste-b:track:one', 253402300799);
+-- Exercise both component boundaries and the largest canonical key.
+INSERT INTO public.users (id, email, created_at) VALUES (repeat('u', 128), 'taste-max@example.com', 1);
+INSERT INTO public.private_plays VALUES
+    ('taste-a', 'play:taste-a:' || repeat('t', 512) || ':p', 1),
+    ('taste-a', 'play:taste-a:t:' || repeat('p', 512), 1),
+    (repeat('u', 128), 'play:' || repeat('u', 128) || ':' || repeat('t', 512) || ':' || repeat('p', 512), 1);
 
 -- Each statement changes one relevant invariant; check violations cannot mask FK/unique failures.
 SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
@@ -44,6 +50,8 @@ SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','',1)$q$),
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:track:bad!',1)$q$),
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-b:track:two',1)$q$),
+    ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:' || repeat('t',513) || ':p',1)$q$),
+    ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:t:' || repeat('p',513),1)$q$),
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:track:' || repeat('x',1141),1)$q$),
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:track:two',-1)$q$),
     ($q$INSERT INTO public.private_plays VALUES ('taste-a','play:taste-a:track:two',253402300800)$q$)
