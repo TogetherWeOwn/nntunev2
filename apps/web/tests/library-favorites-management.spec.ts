@@ -1,4 +1,7 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, type JSHandle, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+import { tabTo } from './support/tab-to';
+import { test, observedQueue, expectMobileQueue, returnToMobileLibrary, metadataManagementState, mobileQueueTransport } from './helpers/favorites-mobile';
 
 /**
  * Acceptance-owned, paired with favorites-management-acceptance.test.ts.
@@ -23,6 +26,18 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * All network is intercepted at the context boundary; synthetic fixtures only.
  * Playback evidence is queue/current/transport plus native media-call/state
  * invariance, not a claim of real streaming or audible playback.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required. Only FM-B12 at 390px additionally permits a one-time
+ * test-only read observer for absent queue DOM; all other cases use production
+ * DOM evidence. A further bounded amendment for these two metadata-only mobile
+ * variants replaces absent native-control fields with exact transport/media
+ * zero counts, initialized unchanged media-call probes and real enabled Next
+ * inventory before/after. Playable transport is proved in a separate bank.
+ * No behavior, focus or literal no-network assertion is waived.
  */
 const ITEMS = [
 	{ id: 'manage-zulu', title: 'Zulu Song', artist: 'Beta' },
@@ -38,7 +53,8 @@ const ACCOUNT = 'management-account';
 const KEY = `${BASE}.${ACCOUNT}`;
 const SEEDED = ['manage-mike', 'manage-zulu', 'hidden-library-id'];
 type Reply = { items: unknown; status: number; hold?: Promise<void> };
-type Harness = { reply: Reply; requests: string[]; errors: string[] };
+type Harness = { reply: Reply; requests: string[]; errors: string[]; mobileObserver?: boolean;
+	mobileOwner?: JSHandle; mobileBaseline?: Awaited<ReturnType<typeof observedQueue>> };
 
 function row(page: Page, id: string): Locator {
 	return page.locator(`[data-testid="library-item"][data-id="${id}"]`);
@@ -137,13 +153,14 @@ async function setup(page: Page, initial = SEEDED, options: { initialReadFailure
 	return { reply, requests, errors };
 }
 
-async function open(page: Page) {
-	await page.goto('/library');
+async function open(page: Page, libraryUrl = '/library') {
+	await page.goto(libraryUrl);
 	await expectRows(page, ALL);
 }
 
-async function queueState(page: Page) {
-	return page.evaluate(() => {
+async function queueState(page: Page, observe = false) {
+	const observed = observe ? await observedQueue(page) : null;
+	const dom = await page.evaluate(() => {
 		const rows = [...document.querySelectorAll('[data-testid="queue-item"]')];
 		const current = rows.findIndex((item) => item.getAttribute('aria-current') === 'true');
 		return {
@@ -159,10 +176,19 @@ async function queueState(page: Page) {
 			calls: Reflect.get(window, '__managementMedia')
 		};
 	});
+	if (!observed) return dom;
+	const { transports, ...retained } = dom;
+	return { ...retained, ids: observed.ids, currentIndex: observed.currentIndex, currentId: observed.currentId,
+		now: observed.selectedTitle, transportMount: await metadataManagementState(page) };
+
 }
 async function seedQueue(page: Page) {
 	for (const id of ['manage-mike', 'manage-zulu', 'manage-alpha']) await row(page, id).click();
+	await openQueue(page);
 	await page.getByRole('button', { name: 'Move Alpha Song up', exact: true }).click();
+	await expect(page.getByTestId('player-next')).toHaveCount(1);
+	await expect(page.getByTestId('player-next')).toBeVisible();
+	await expect(page.getByTestId('player-next')).toBeEnabled();
 	await page.getByTestId('player-next').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 	const state = await queueState(page);
@@ -174,12 +200,17 @@ async function settle(page: Page) {
 	await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 async function localAction(page: Page, harness: Harness, action: () => Promise<unknown>) {
-	const before = await queueState(page);
+	const before = await queueState(page, harness.mobileObserver);
 	const requests = [...harness.requests];
 	await action();
 	await settle(page);
-	expect(await queueState(page), 'favorite management must preserve exact queue/order/current/index/transport/media intent').toEqual(before);
+	expect(await queueState(page, harness.mobileObserver), 'favorite management must preserve exact queue/order/current/index/transport/media intent').toEqual(before);
 	expect(harness.requests, 'favorite management must issue no request, including GET refreshes').toEqual(requests);
+	if (harness.mobileObserver) {
+		expect(harness.mobileOwner, 'same owner must be pinned before management').toBeTruthy();
+		expect(await harness.mobileOwner!.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+		expect(await observedQueue(page)).toEqual(harness.mobileBaseline);
+	}
 	expect(harness.errors).toEqual([]);
 }
 async function clearPrompt(page: Page, h: Harness) {
@@ -225,21 +256,6 @@ async function fault(page: Page, operation: 'getItem' | 'setItem') {
 async function restore(page: Page) {
 	await page.evaluate(() => Reflect.get(window, '__managementRestoreStorage')());
 }
-async function tabTo(page: Page, target: Locator) {
-	await expect(target).toBeVisible();
-	for (let i = 0; i < 80; i += 1) {
-		if (await target.evaluate((node) => node === document.activeElement)) break;
-		await page.keyboard.press('Tab');
-	}
-	await expect(target, 'control must be reachable by Tab').toBeFocused();
-	const visibleFocus = await target.evaluate((node) => {
-		const css = getComputedStyle(node);
-		return node.matches(':focus-visible') && (
-			(css.outlineStyle !== 'none' && parseFloat(css.outlineWidth) > 0) || css.boxShadow !== 'none'
-		);
-	});
-	expect(visibleFocus, 'keyboard focus needs a visible outline or focus ring').toBe(true);
-}
 
 test.beforeEach(async ({ context }) => {
 	await context.route('**/*', (route) => {
@@ -254,7 +270,7 @@ test.beforeEach(async ({ context }) => {
 
 test.afterEach(async ({ page }, info) => {
 	if (!page.isClosed()) {
-		await info.attach('favorites-management-runtime', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+		await info.attach(info.attachments.some((attachment) => attachment.name === 'favorites-management-runtime') ? 'post-management-queue-runtime' : 'favorites-management-runtime', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
 	}
 });
 
@@ -438,6 +454,7 @@ test('[FM-B07] unavailable initial favorite reads leave a usable empty view and 
 	const h = await setup(page, SEEDED, { initialReadFailure: true });
 	await open(page);
 	await expectShelf(page, []);
+	await openQueue(page);
 	await localAction(page, h, () => star(page, 'manage-alpha').click());
 	await localAction(page, h, () => mode(page, 'Favorites only'));
 	await expectRows(page, ['manage-alpha']);
@@ -452,6 +469,7 @@ test('[FM-B08] reload resets to All tracks without persisting a new schema or lo
 	const h = await setup(page);
 	await open(page);
 	const keys = await page.evaluate(() => ({ local: Object.keys(localStorage).sort(), session: Object.keys(sessionStorage).sort() }));
+	await openQueue(page);
 	await localAction(page, h, () => mode(page, 'Favorites only'));
 	await expectRows(page, ['manage-zulu', 'manage-mike']);
 	expect(await page.evaluate(() => ({ local: Object.keys(localStorage).sort(), session: Object.keys(sessionStorage).sort() }))).toEqual(keys);
@@ -511,6 +529,7 @@ test('[FM-B10] loading/error/retry and a genuinely empty library keep their exis
 	h.reply.status = 200;
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expectRows(page, ALL);
+	await openQueue(page);
 	await localAction(page, h, () => mode(page, 'Favorites only'));
 	h.reply.items = [];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
@@ -552,12 +571,24 @@ test('[FM-B11] auth transition purges pending management state/old IDs and reset
 
 for (const colorScheme of ['light', 'dark'] as const) {
 	for (const width of [390, 1280]) {
-		test(`[FM-B12:${colorScheme}:${width}] keyboard filter/unstar/confirmation remains visible and queue-safe`, async ({ page }) => {
+		test(`[FM-B12:${colorScheme}:${width}] keyboard filter/unstar/confirmation remains visible and queue-safe`, async ({ page, observeMobileLibrary }) => {
 			await page.setViewportSize({ width, height: 844 });
 			await page.emulateMedia({ colorScheme });
 			const h = await setup(page);
-			await open(page);
+			await open(page, width === 390 ? await observeMobileLibrary() : '/library');
 			await seedQueue(page);
+			const expected = { ids: ['manage-mike', 'manage-alpha', 'manage-zulu'], currentIndex: 1, currentId: 'manage-alpha', selectedTitle: 'Alpha Song' };
+			const owner = width === 390 ? await expectMobileQueue(page, expected) : null;
+			const transportInventory = owner ? await mobileQueueTransport(page) : null;
+			if (owner) {
+				await test.info().attach('pre-management-queue', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+				await returnToMobileLibrary(page);
+				h.mobileObserver = true;
+				h.mobileOwner = owner;
+				h.mobileBaseline = expected;
+			}
+			const before = await queueState(page, h.mobileObserver);
+			const requests = [...h.requests];
 			await tabTo(page, view(page));
 			await localAction(page, h, async () => {
 				await page.keyboard.press('ArrowDown');
@@ -582,6 +613,18 @@ for (const colorScheme of ['light', 'dark'] as const) {
 			await count(page, 0);
 			await expectActionFeedback(page, /cleared/i);
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'management must not create horizontal overflow').toBe(true);
+			if (owner) {
+				expect(await queueState(page, true)).toEqual(before);
+				expect(h.requests).toEqual(requests);
+				expect(await owner.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+				await test.info().attach('favorites-management-runtime', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+				const navigationStart = h.requests.length;
+				await expectMobileQueue(page, expected);
+				expect(await mobileQueueTransport(page)).toEqual(transportInventory);
+				await test.info().attach('queue-transport-inventory', { body: JSON.stringify(transportInventory), contentType: 'application/json' });
+				expect(await owner.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+				expect(h.requests.slice(navigationStart).every((request) => request.startsWith('GET '))).toBe(true);
+			}
 		});
 	}
 }

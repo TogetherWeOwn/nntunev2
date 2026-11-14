@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Queue announcement hygiene on /library (QUEUE-MANAGE follow-up).
@@ -12,6 +13,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * Harness note (same as the neighbouring library specs): `/library` is
  * client-fetched (`ssr = false`), so the click-driven contract is pinned
  * here with a route-mocked `/api/library`.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -66,6 +73,7 @@ async function seedQueue(
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 }
@@ -186,6 +194,7 @@ test('same-tab auth transition clears a move announcement before the next sessio
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await moveAlphaUp(page);
 
 	await page.evaluate(() =>

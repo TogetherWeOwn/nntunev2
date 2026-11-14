@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host.js';
 
 /**
  * Builder-owned supplement to the protected `queue-row-share.spec.ts`.
@@ -54,6 +55,8 @@ async function openLibrary(
 	await expect(page.getByTestId('library-item')).toHaveCount(
 		(options.items ?? ITEMS) instanceof Array ? ((options.items ?? ITEMS) as unknown[]).length : 0
 	);
+	// The persistent Queue is user-opened; retain every share/lifecycle assertion.
+	await openQueue(page);
 	return payload;
 }
 

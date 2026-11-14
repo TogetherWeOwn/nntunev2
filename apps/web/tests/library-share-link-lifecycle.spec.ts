@@ -1,4 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ */
 
 // Supplemental regression coverage; the independently authored acceptance bank
 // stays unchanged. All library and media inputs are synthetic and local.
@@ -35,6 +44,7 @@ async function openLink(page: Page, { waitForMetadata = false } = {}) {
 	await page.goto('/library?track=coral&t=90');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expect(page.getByTestId('audio-player')).toHaveCount(1);
+	await openQueue(page);
 	await expect(page.locator('[data-testid="queue-item"][aria-current="true"]')).toHaveAttribute(
 		'data-track-id',
 		'coral'
@@ -79,6 +89,7 @@ for (const navigateAfterFailure of [false, true]) {
 		available = true;
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+		await openQueue(page);
 		await expect(page.locator('[data-testid="queue-item"][aria-current="true"]')).toHaveAttribute(
 			'data-track-id', 'coral'
 		);

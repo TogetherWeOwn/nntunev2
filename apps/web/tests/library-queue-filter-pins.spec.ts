@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned companion to the protected queue-filter acceptance spec
@@ -21,6 +22,12 @@ import { expect, test, type Page } from '@playwright/test';
  * Run: CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test \
  *        tests/library-queue-filter-pins.spec.ts --workers=1
  * Port 4173 must be free (never reuse another worktree's preview).
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -69,6 +76,7 @@ async function seed(page: Page) {
 			.locator(`[data-testid="library-item"][data-id="${item.id}"] button.nt-library-row`)
 			.dispatchEvent('click');
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await page.getByTestId('player-next').click();
 	await expect(current(page)).toHaveAttribute('data-track-id', 'pin-ember');

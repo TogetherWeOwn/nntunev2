@@ -1,9 +1,16 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned regression coverage, safe for the Builder to extend.
  * Supplements library-queue-star.spec.ts without editing that protected bank.
  * Pins exact action labels, replacement announcements and rendered touch size.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const TRACKS = [
 	{ id: 'queue-star-regression-zulu', title: 'Zulu Song' },
@@ -23,6 +30,7 @@ async function seedQueue(page: Page): Promise<void> {
 	for (const track of TRACKS) {
 		await page.locator(`[data-testid="library-item"][data-id="${track.id}"]`).click();
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(TRACKS.length);
 }
 

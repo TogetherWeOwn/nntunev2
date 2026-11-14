@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the builder makes this file pass without editing it.
@@ -20,6 +21,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * Breaks caught: in-place sort, locale/secondary-key drift, selection by view
  * index, queue reordering/current reset, persisted mode, sort-triggered fetch,
  * lost mode on refresh, retained-content/auth-isolation regressions.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -149,6 +156,7 @@ test('LORD-00 control: API order and gesture-order queue work before ordering', 
 	await expect(row(page, 'id-fallback')).toContainText('id-fallback');
 	await row(page, 'order-zulu').click();
 	await row(page, 'order-astral').click();
+	await openQueue(page);
 	await expectQueue(page, ['order-zulu', 'order-astral'], 'order-zulu', 'Zulu Song');
 	expect(api.requests()).toBe(1);
 });
@@ -223,6 +231,7 @@ test('LORD-04 queue: all modes preserve a non-first current item; selection uses
 	await row(page, 'order-zulu').click();
 	await row(page, 'order-astral').click();
 	await row(page, 'order-tie-a').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	const queued = ['order-zulu', 'order-astral', 'order-tie-a'];
 	await expectQueue(page, queued, 'order-astral', '🎵 Music');
@@ -277,6 +286,7 @@ test('LORD-06 retention: failed refresh keeps the sorted snapshot and untouched 
 	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
 	await expectView(page, ARTIST);
 	await expectMode(page, 'Artist A–Z');
+	await openQueue(page);
 	await expectQueue(page, ['order-zulu'], 'order-zulu', 'Zulu Song');
 	expect(api.requests()).toBe(2);
 	await chooseOrder(page, 'Title A–Z');
@@ -300,6 +310,7 @@ test('LORD-07 states: loading/error/empty retain their semantics; retry keeps a 
 	release();
 	await expect(page.getByRole('alert')).toBeVisible();
 	await expect(page.getByTestId('library-item')).toHaveCount(0);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 
 	const reply: LibraryReply = { items: ITEMS };
@@ -310,7 +321,7 @@ test('LORD-07 states: loading/error/empty retain their semantics; retry keeps a 
 	await chooseOrder(page, 'Title A–Z');
 	reply.items = [];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await expect(page.getByRole('status')).toContainText(/library is empty/i);
+	await expect(page.getByRole('main').getByRole('status')).toContainText(/library is empty/i);
 	// User NZB import retired: the empty state carries no import link.
 	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
 	await expect(page.getByTestId('library-item')).toHaveCount(0);
@@ -329,6 +340,7 @@ test('LORD-08 auth: sorting does not retain the previous account selection or qu
 	await row(page, 'order-zulu').click();
 	await chooseOrder(page, 'Title A–Z');
 	await row(page, 'order-accent-a').click();
+	await openQueue(page);
 	await expectQueue(page, ['order-zulu', 'order-accent-a'], 'order-zulu', 'Zulu Song');
 	await authTransition(page);
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);

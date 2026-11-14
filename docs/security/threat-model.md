@@ -253,12 +253,16 @@ V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
 gets a card with exact head, never a bare comment.
 
-## 10. Demo-media surfaces (no auth by design)
+## 10. Demo-media surfaces (retired)
 
-`apps/web` serves `/demo/player` and `/api/demo/{audio,artwork}` (plus
-`/api/demo/` 404-probe paths used only as broken-image fixtures) with
-explicitly no auth. This is intentional, not an auth gap, and holds ONLY
-while every bullet below stays true:
+RETIRED: `/demo/player` and `/api/demo/{audio,artwork}` (plus the
+`/api/demo/` 404-probe paths used only as broken-image fixtures) were removed
+when the demo player route graduated to the product player surface (EL
+ruling TWO-5795, bundle recovery on PR #952). Synthetic demo media is
+retired with the route; there are no sessionless media endpoints in the
+product. The historical no-auth rationale below is kept for audit context
+only — it describes a surface that no longer exists and must not be
+reintroduced without a fresh threat-model review.
 
 - Synthetic bytes only: the audio handler serves deterministic PCM WAV
   bytes synthesized in `demoMedia.ts` (`?track=<id>` selects among

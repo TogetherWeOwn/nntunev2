@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned supplement: the range-anchor reset when a refresh snapshot
@@ -13,6 +14,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Pins selection outcome (checked rows, count text) only — never the live
  * region — so it survives either single-announcer reconciliation.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -145,6 +152,7 @@ for (const gesture of ['click', 'space'] as const) {
 
 		await checkbox(page, 'row-mike').click();
 		const endpoint = checkbox(page, 'row-alpha');
+		await openQueue(page);
 		if (gesture === 'click') {
 			await endpoint.click({ modifiers: ['Shift'] });
 		} else {

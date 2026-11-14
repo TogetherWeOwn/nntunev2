@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: range-select displayed library tracks with Shift+click.
@@ -66,6 +67,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * side effects of ranges, grid-role refactor, touch-specific gestures (the
  * native checkbox carries touch), server playlists, saved selections,
  * cross-device state, backend search, audio transport, deployed streaming.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -231,6 +238,7 @@ test('[RNG-B-00] control: the library renders fixture rows in API order', async 
 	await seedLibrary(page);
 
 	expect(await renderedIds(page)).toEqual(API_ORDER);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(selectionCount(page)).toHaveText('0 selected');
 	await expect(appendButton(page)).toBeDisabled();
@@ -550,6 +558,7 @@ test('[RNG-B-13] range application queues, stars, fetches and persists nothing',
 
 	// Pre-existing queue, favorite and ordering the range must leave alone.
 	await row(page, 'row-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	const star = starButton(page, 'row-bravo');

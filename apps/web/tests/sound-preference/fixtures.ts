@@ -127,7 +127,7 @@ export async function openPlayer(page: Page, options: Options = {}) {
 			});
 		}
 	}, { options, key: SOUND_KEY, other: OTHER_KEY });
-	await page.goto(options.url ?? '/demo/player');
+	await page.goto(options.url ?? '/library');
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	// Existing mount-only hook is a hydration barrier, not a new source stub.
 	await page.waitForFunction(() =>

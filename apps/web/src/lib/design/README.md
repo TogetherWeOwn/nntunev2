@@ -70,9 +70,16 @@ glyphs, status dots and the liked heart. Hosts render through `Icon`:
   standalone icons only: inside an already-named button or link the icon
   stays decorative, otherwise screen readers announce the action twice.
 
-Script budget: the three icon files compile to at most 8 KiB of
-uncompressed, minified client JavaScript (`icons.test.ts` enforces it
-with the pinned Svelte/TypeScript compilers and Terser). Each module is
+The player imports only `TRANSPORT_ICON_PATHS` and uses the same SVG
+renderer extracted into `IconSvg.svelte`. This keeps unused stencils out
+of the active bundle without deleting any named icon. The internal
+renderer accepts trusted kit stencil constants only, never user content;
+its sizing and accessibility attributes are identical to `Icon`.
+
+Script budget: all four icon files compile to at most 8 KiB of
+uncompressed, minified client JavaScript (`icons.test.ts` retains the
+original gate; `icons-renderer.builder.test.ts` includes the extracted
+renderer with the pinned Svelte/TypeScript compilers and Terser). Each module is
 measured independently with all exports retained, including component
 runtime imports, but not the shared Svelte runtime already in the app.
 No gzip or route tree-shaking discount is applied. Deferred stencils for

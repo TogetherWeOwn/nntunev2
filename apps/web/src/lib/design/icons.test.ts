@@ -38,8 +38,8 @@ async function scriptBytes(source: string, filename: string): Promise<number> {
 }
 
 describe('icon subset: manifest', () => {
-	it('ships the R1/R2 set: 49 names, each with stencil data', () => {
-		expect(ICON_NAMES).toHaveLength(49);
+	it('ships the R1/R2 set: 50 names, each with stencil data', () => {
+		expect(ICON_NAMES).toHaveLength(50);
 		for (const name of ICON_NAMES) {
 			expect(ICON_PATHS[name], `${name} has stencil data`).toMatch(/\S/);
 		}

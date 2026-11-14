@@ -24,7 +24,7 @@ Largest client files from the historical 314,730 B baseline (raw bytes):
 | File | Bytes | What it is |
 | --- | ---: | --- |
 | `nodes/9.*.js` | 61,957 | `/library` page |
-| `nodes/8.*.js` | 52,459 | `/demo/player` page |
+| `nodes/8.*.js` | 52,459 | `/demo/player` page (retired: route removed, EL TWO-5795) |
 | `chunks/CN88kLYU.js` | 42,171 | Svelte runtime (shared, unavoidable) |
 | `chunks/BBY8yOdC.js` | 41,850 | Code shared between the player surfaces |
 | `nodes/12.*.js` | 18,699 | `/onboarding/byop` page |
@@ -69,10 +69,9 @@ sets no `manualChunks`.
 
 ## Order of work when headroom runs low
 
-1. Move the `/library` and `/demo/player` surfaces' interaction-only
-   panels (queue management extras, recently-played actions) behind
-   dynamic imports; they are the two largest route chunks (114 KB
-   combined).
+1. Move the `/library` surface's interaction-only panels (queue management
+   extras, recently-played actions) behind dynamic imports; it remains the
+   largest route chunk. (`/demo/player` was retired — see the table above.)
 2. Split the BYOP onboarding wizard steps so only the active step is
    eager (18.7 KB today).
 3. Audit the shared player chunk: keep playback-critical code eager,

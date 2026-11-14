@@ -51,7 +51,7 @@ def check_fixture_step_bindings(job_id, job):
     steps = re.split(r"(?m)(?=^      - )", job)[1:]
     command = (
         "cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets"
-        if job_id == "rust-ingest" else "pnpm test:e2e"
+        if job_id == "rust-ingest" else "pnpm test:e2e --reporter=dot,./tests/reporters/runtime-inventory.ts"
     )
     selectors = (
         rf"^      - name: {re.escape(FETCH_STEP)}$",

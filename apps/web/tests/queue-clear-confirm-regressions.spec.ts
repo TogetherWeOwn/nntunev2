@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned regressions for destructive queue consent. Keep the original
@@ -15,6 +16,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   pnpm exec playwright test tests/queue-clear-confirm-regressions.spec.ts --workers=1
  *   pnpm check
  * Product fixes and full feature GREEN remain the paired Builder's work.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 type Item = { id: string; title: string; artist?: string; streamUrl?: string };
@@ -54,6 +61,7 @@ async function library(page: Page, items: Item[] = ITEMS): Promise<void> {
 
 async function enqueue(page: Page, items: Item[] = ITEMS): Promise<void> {
 	for (const track of items) await item(page, track.id).click();
+	await openQueue(page);
 	await expect.poll(() => order(page)).toEqual(items.map((track) => track.id));
 }
 

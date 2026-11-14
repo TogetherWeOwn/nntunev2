@@ -183,6 +183,25 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 	await page.route('**/api/library', (route) =>
 		route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 	);
+	// EL TWO-5795 media-mock migration: PLAYABLE_ITEMS formerly fetched the
+	// deleted /api/demo/audio; serve a local silent WAV so playback advances
+	// without any synthetic-media server. Inert for non-playing tests.
+	await page.route('**/shell-audio/**', (route) => {
+		const wav = Buffer.alloc(44 + 16_000);
+		wav.write('RIFF', 0);
+		wav.writeUInt32LE(36 + 16_000, 4);
+		wav.write('WAVEfmt ', 8);
+		wav.writeUInt32LE(16, 16);
+		wav.writeUInt16LE(1, 20);
+		wav.writeUInt16LE(1, 22);
+		wav.writeUInt32LE(8_000, 24);
+		wav.writeUInt32LE(16_000, 28);
+		wav.writeUInt16LE(2, 32);
+		wav.writeUInt16LE(16, 34);
+		wav.write('data', 36);
+		wav.writeUInt32LE(16_000, 40);
+		return route.fulfill({ status: 200, contentType: 'audio/wav', body: wav });
+	});
 }
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
@@ -361,7 +380,7 @@ async function focusShellLink(page: Page): Promise<void> {
 	// Probe presence first (the goToAccount pattern): evaluating
 	// an absent locator inside tabUntilFocused waits out the timeout on
 	// every tab, so on public-header routes (no Primary landmark, e.g.
-	// /demo/player in v2) the fallback must be chosen up front, not after
+	// public-header routes without it in v2) the fallback must be chosen up front, not after
 	// 30 timed-out probes.
 	let reached = false;
 	if ((await libraryDestinationLink(page).count()) > 0) {
@@ -842,38 +861,6 @@ test('[NAV-14] paywall upgrade navigation keeps the shell and a sane focus targe
 	await expectCurrentDestination(page, '/pricing after upgrade', null);
 });
 
-// Until player graduation (see NAV-15 v2): the demo player carries the
-// shortcut contract. Superseded by NAV-15 v2 at the player-bar activation.
-test('[NAV-15] existing player shortcuts keep working with the shell present', async ({
-	page
-}) => {
-	await page.goto('/demo/player');
-	await expect(
-		page.getByTestId('queue-item'),
-		'expected the 3-track demo queue. Builder: leave the demo player alone.'
-	).toHaveCount(3);
-	await expectShellChrome(page, '/demo/player');
-
-	// A focused shell link is not a typing target: global transport keys stay live.
-	await focusShellLink(page);
-	await page.keyboard.press('n');
-	await expect(
-		page.getByTestId('now-playing'),
-		'expected "n" to advance the demo track with a shell link focused. ' +
-			'Builder: shell links must not capture or break global player keys.'
-	).toContainText('Second Signal');
-
-	await page.keyboard.press('?');
-	const shortcuts = page.getByTestId('shortcuts-dialog');
-	await expect(
-		shortcuts,
-		'expected "?" to open the shortcuts dialog with a shell link focused. ' +
-			'Builder: keep the ? binding live outside inputs and modals.'
-	).toBeVisible();
-	await page.keyboard.press('Escape');
-	await expect(shortcuts).toBeHidden();
-});
-
 // ════════════════════════════════════════════════════════════════════════
 // v2 contract — the app-shell redesign (design spec v1).
 //
@@ -892,8 +879,10 @@ const PLAYABLE_ITEMS = [1, 2, 3].map((index) => ({
 	artist: 'Shell Band',
 	// Both stream-url spellings: the fixture only needs the field the
 	// graduated player reads; the other is ignored extra JSON.
-	streamUrl: '/api/demo/audio',
-	stream_url: '/api/demo/audio'
+	// EL TWO-5795: pointed at the route-mocked WAV in NAV-03b after the
+	// synthetic-media endpoints were retired with the demo route.
+	streamUrl: '/shell-audio/shell.wav',
+	stream_url: '/shell-audio/shell.wav'
 }));
 
 /** Describe the currently focused element for tab-order recording. */
@@ -1067,7 +1056,7 @@ test('[NAV-02d v2] nested paths match by pathname boundary', async ({ page }) =>
 });
 
 // [gate: player bar]
-test.fixme('[NAV-03b v2] playback state survives client-side navigation', async ({ page }) => {
+test('[NAV-03b v2] playback state survives client-side navigation', async ({ page }) => {
 	await mockLibrary(page, 200, PLAYABLE_ITEMS);
 	await page.goto('/library');
 	await page.getByTestId('library-item').first().click();
@@ -1272,7 +1261,7 @@ test('[NAV-06 v2 390px] tab-bar links show a visible focus ring', async ({ page 
 });
 
 // [gate: player bar]
-test.fixme('[NAV-06 v2 1280px] transport buttons show a visible focus ring', async ({ page }, testInfo) => {
+test('[NAV-06 v2 1280px] transport buttons show a visible focus ring', async ({ page }, testInfo) => {
 	await page.setViewportSize({ width: 1280, height: 800 });
 	await mockLibrary(page, 200, PLAYABLE_ITEMS);
 	await page.goto('/library');
@@ -1395,7 +1384,7 @@ test('[NAV-10 v2] no demo links and no playback promises in either shell', async
 });
 
 // [gate: player bar]
-test.fixme('[NAV-15 v2] player shortcuts work on the real player with the shell present', async ({
+test('[NAV-15 v2] player shortcuts work on the real player with the shell present', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, PLAYABLE_ITEMS);
@@ -1582,7 +1571,7 @@ test('[NAV-18 v2] native links plus design-token styling, design route-table all
 });
 
 // [gate: player bar]
-test.fixme('[NAV-19 v2] player bar exposes the custom-transport hooks', async ({ page }) => {
+test('[NAV-19 v2] player bar exposes the custom-transport hooks', async ({ page }) => {
 	await mockLibrary(page, 200, PLAYABLE_ITEMS);
 	await page.goto('/library');
 	await page.getByTestId('library-item').first().click();

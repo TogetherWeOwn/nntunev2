@@ -1,4 +1,10 @@
 import { expect, test } from '@playwright/test';
+// EL TWO-5795 (demo/player retirement): this spec is hosted on the retired
+// `/demo/player` surface and the deleted `/api/demo/*` synthetic-media endpoints.
+// Vectors and case IDs are preserved; migration to the product surface is
+// deferred per fallback (b) — see the PR body disposition manifest.
+test.skip(true, 'EL TWO-5795: demo/player retirement — migration deferred, vectors preserved');
+
 import {
 	SOUND_KEY, OTHER_KEY, saved35, openPlayer, media, preference, playCount,
 	volumeControl, muteControl, frames, expectSound, pressMute

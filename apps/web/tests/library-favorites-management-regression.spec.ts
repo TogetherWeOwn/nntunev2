@@ -1,4 +1,20 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+import { test, observedQueue, expectMobileQueue, returnToMobileLibrary, metadataManagementState, installManagementMediaProbe, mobileQueueTransport } from './helpers/favorites-mobile';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required. The two mobile FM-R01 variants additionally have a
+ * one-time test-only read observer exception for absent queue DOM; all local
+ * actions, focus and literal no-network comparisons remain protected. For
+ * these two metadata-only variants only, a further technical amendment uses
+ * explicit zero-count native transport/media state, initialized unchanged call
+ * counters and real visible enabled Next inventory before/after. The separate
+ * playable bank remains required; absence is never an enabled-control claim.
+ */
 
 // Builder-owned review regressions; the paired acceptance bank stays unchanged.
 const ITEMS = [
@@ -11,7 +27,7 @@ const libraryRow = (page: Page, id: string) => page.locator(`[data-testid="libra
 const shelfUnstar = (page: Page, id: string) => page.locator(`[data-testid="favorite-item"][data-id="${id}"]`).getByRole('button', { name: /^Unstar / });
 const view = (page: Page) => page.getByRole('combobox', { name: 'Show', exact: true });
 
-async function setup(page: Page, initial = ITEMS.map((item) => item.id)) {
+async function setup(page: Page, initial = ITEMS.map((item) => item.id), libraryUrl = '/library') {
 	const requests: string[] = [];
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));
@@ -37,15 +53,20 @@ async function setup(page: Page, initial = ITEMS.map((item) => item.id)) {
 		if (reply.hold) await reply.hold;
 		await route.fulfill({ status: reply.status, json: reply.items });
 	});
-	await page.goto('/library');
+	await page.goto(libraryUrl);
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
 	for (const item of ITEMS) await libraryRow(page, item.id).getByRole('button', { name: item.title, exact: true }).click();
+	await openQueue(page);
+	await expect(page.getByTestId('player-next')).toHaveCount(1);
+	await expect(page.getByTestId('player-next')).toBeVisible();
+	await expect(page.getByTestId('player-next')).toBeEnabled();
 	await page.getByTestId('player-next').click();
 	return { reply, requests, errors };
 }
 
-async function queueState(page: Page) {
-	return page.evaluate(() => ({
+async function queueState(page: Page, observe = false) {
+	const observed = observe ? await observedQueue(page) : null;
+	const dom = await page.evaluate(() => ({
 		rows: [...document.querySelectorAll('[data-testid="queue-item"]')].map((node) => ({
 			id: node.getAttribute('data-track-id'), current: node.getAttribute('aria-current')
 		})),
@@ -55,28 +76,54 @@ async function queueState(page: Page) {
 			src: (node as HTMLMediaElement).currentSrc, paused: (node as HTMLMediaElement).paused
 		}))
 	}));
+	if (!observed) return dom;
+	const { nextDisabled, ...retained } = dom;
+	return { ...retained, rows: observed.ids.map((id, index) => ({ id, current: index === observed.currentIndex ? 'true' : null })),
+		now: observed.selectedTitle, currentIndex: observed.currentIndex, currentId: observed.currentId,
+		transportMount: await metadataManagementState(page) };
 }
 
 for (const colorScheme of ['light', 'dark'] as const) {
-	test(`[FM-R01:${colorScheme}] keyboard main-row unstar and zero-match reset retain focus without queue/network edits`, async ({ page }) => {
+	test(`[FM-R01:${colorScheme}] keyboard main-row unstar and zero-match reset retain focus without queue/network edits`, async ({ page, observeMobileLibrary }) => {
 		await page.setViewportSize({ width: 390, height: 844 });
 		await page.emulateMedia({ colorScheme });
-		const h = await setup(page);
-		const before = await queueState(page);
+		await installManagementMediaProbe(page);
+		const h = await setup(page, undefined, await observeMobileLibrary());
+		const expected = { ids: ['focus-alpha', 'focus-bravo', 'focus-charlie'], currentIndex: 1, currentId: 'focus-bravo', selectedTitle: 'Bravo Song' };
+		const owner = await expectMobileQueue(page, expected);
+		const transportInventory = await mobileQueueTransport(page);
+		await test.info().attach('pre-management-queue', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+		await returnToMobileLibrary(page);
+		const before = await queueState(page, true);
+		let previous = before;
 		const requests = [...h.requests];
+		const unchanged = async () => {
+			await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+			expect(await owner.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+			const current = await queueState(page, true);
+			expect(current).toEqual(before);
+			expect(current).toEqual(previous);
+			expect(await observedQueue(page)).toEqual(expected);
+			previous = current;
+			expect(h.requests).toEqual(requests);
+		};
 		// All-tracks starring keeps its mounted button focused.
 		const alpha = libraryRow(page, 'focus-alpha').getByRole('button', { name: 'Unstar Alpha Song', exact: true });
 		await alpha.focus();
 		await page.keyboard.press('Space');
 		await expect(libraryRow(page, 'focus-alpha').getByRole('button', { name: 'Star Alpha Song', exact: true })).toBeFocused();
+		await unchanged();
 		await page.keyboard.press('Space');
+		await unchanged();
 		await view(page).selectOption('favorites');
+		await unchanged();
 		for (const [index, item] of ITEMS.entries()) {
 			const button = libraryRow(page, item.id).getByRole('button', { name: `Unstar ${item.title}`, exact: true });
 			await button.focus();
 			await page.keyboard.press(index % 2 === 0 ? 'Space' : 'Enter');
 			await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length - index - 1);
 			await expect(view(page)).toBeFocused();
+			await unchanged();
 		}
 		const reset = page.getByRole('button', { name: 'Show all tracks', exact: true });
 		await reset.focus();
@@ -85,9 +132,17 @@ for (const colorScheme of ['light', 'dark'] as const) {
 		await expect(view(page)).toHaveValue('all');
 		await expect(view(page)).toBeFocused();
 		expect(await view(page).evaluate((node) => node.matches(':focus-visible'))).toBe(true);
-		expect(await queueState(page)).toEqual(before);
-		expect(h.requests).toEqual(requests);
+		await unchanged();
 		expect(h.errors).toEqual([]);
+		await test.info().attach('management-runtime', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+		expect(h.requests).toEqual(requests);
+		const navigationStart = h.requests.length;
+		await expectMobileQueue(page, expected);
+		expect(await mobileQueueTransport(page)).toEqual(transportInventory);
+		await test.info().attach('queue-transport-inventory', { body: JSON.stringify(transportInventory), contentType: 'application/json' });
+		await test.info().attach('post-management-queue', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
+		expect(await owner.evaluate((binding) => binding === window.__favoritesQueueOwner)).toBe(true);
+		expect(h.requests.slice(navigationStart).every((request) => request.startsWith('GET '))).toBe(true);
 	});
 }
 

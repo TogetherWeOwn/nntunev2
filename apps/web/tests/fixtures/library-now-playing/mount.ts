@@ -1,16 +1,21 @@
 import { mount, tick } from 'svelte';
-import Library from '../../../src/routes/library/+page.svelte';
+import Fixture from './Fixture.svelte';
 import { moveTrack, restoreQueue, selectTrack, type QueueState, type Track } from '../../../src/lib/player/queue.js';
 import '../../../src/app.css';
 
-/** Test-only bridge; the Vite pre-transform exports the route's existing setter. */
-const library = mount(Library, { target: document.getElementById('app')! }) as unknown as {
-	acceptanceReplaceQueue(state: QueueState): void;
+/**
+ * Engineering Lead authorized a one-time same-PR migration from library-local
+ * native controls to the approved persistent custom transport. The bounded
+ * executor exception covers this input bridge only; other Builder edits remain
+ * prohibited. The Vite transform exports only the route's existing queue setter.
+ */
+const library = mount(Fixture, { target: document.getElementById('app')! }) as unknown as {
+	acceptanceReplaceQueue(state: QueueState): boolean;
 };
 let state: QueueState = { tracks: [], currentIndex: -1 };
 async function replace(next: QueueState) {
 	state = next;
-	library.acceptanceReplaceQueue(next);
+	if (!library.acceptanceReplaceQueue(next)) throw new Error('library child not mounted');
 	await tick();
 }
 

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned direction extension. Builder must not edit this file or the
@@ -8,6 +9,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * locale drift, persisted order, sort-triggered I/O, cache/favorite/queue changes,
  * selection by view index, focus loss, and discarded direction on refresh.
  * Add displayed is absent at this baseline; no bulk-action feature is invented.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const ITEMS = [
 	{ id: 'dir-zulu', title: 'Zulu Song', artist: ' beta ' },
@@ -128,6 +135,7 @@ test('DORD-00 control: real page, queue, cache, favorites and existing ascending
 	const api = await openLibrary(page);
 	await row(page, 'dir-zulu').click();
 	await row(page, 'dir-astral').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	await expectQueue(page, ['dir-zulu', 'dir-astral'], 'dir-astral', '🎵 Music');
 	await expect.poll(() => queued(page, 'dir-zulu')).toBe(true);
@@ -227,6 +235,7 @@ test('DORD-04 direction preserves favorites, queue current/membership, badges an
 	expect(favoriteIds).toHaveLength(2);
 	await row(page, 'dir-zulu').click();
 	await row(page, 'dir-astral').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	for (const { label, ids } of MODES) {
 		await choose(page, label);
@@ -269,6 +278,7 @@ test('DORD-05 recomputation: refresh retains descending; failure keeps rows, mod
 	// A successful refresh drops queued ids missing from the new snapshot
 	// (pinned refresh-reconcile contract), so re-queue from the fresh rows
 	// before exercising failed-refresh retention.
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await row(page, 'fresh-zulu').click();
 	await expectQueue(page, ['fresh-zulu'], 'fresh-zulu', 'Zulu');
@@ -303,6 +313,7 @@ test('DORD-06 empty/singleton recomputation keeps the chosen direction for the n
 	reply.items = ITEMS;
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expectView(page, TITLE_DESC);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });
 
@@ -311,6 +322,7 @@ test('DORD-07 auth transition after descending clears previous-account rows and 
 	await openLibrary(page, reply);
 	await choose(page, 'Artist Z–A');
 	await row(page, 'dir-tie-a').click();
+	await openQueue(page);
 	await expectQueue(page, ['dir-tie-a'], 'dir-tie-a', 'ALPHA');
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');

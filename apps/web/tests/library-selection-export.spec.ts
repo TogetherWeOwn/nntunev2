@@ -1,6 +1,7 @@
 import { expect, test, type Download, type Locator, type Page } from '@playwright/test';
 import { mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Test-Author owned RED acceptance for SELECTEXPORT: export the selected
@@ -62,6 +63,12 @@ import { dirname } from 'node:path';
  * Focused command (repo root, deterministic, offline):
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test \
  *     tests/library-selection-export.spec.ts --workers=1 --retries=0
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Loaded (API) order is z/a/m/b/d on purpose: activation order in these
@@ -474,6 +481,7 @@ test('[SELECTEXPORT-02] copy writes activation order, not loaded, display, order
 	// ordering (d/m/z), loaded order of the subset (z/m/d).
 	await row(page, 'sel-a').click();
 	await row(page, 'sel-z').click();
+	await openQueue(page);
 	await expect.poll(() => queueOrder(page)).toEqual(['sel-a', 'sel-z']);
 	await orderControl(page).selectOption('title');
 	await chooseShow(page, 'Selected only');
@@ -580,6 +588,7 @@ test('[SELECTEXPORT-05] exporting mutates neither selection, favorites, queue, p
 
 	await row(page, 'sel-a').click();
 	await row(page, 'sel-z').click();
+	await openQueue(page);
 	await expect.poll(() => queueOrder(page)).toEqual(['sel-a', 'sel-z']);
 	await row(page, 'sel-d').getByRole('button', { name: 'Star Delta Song', exact: true }).click();
 	await expect.poll(() => favoriteIds(page)).toEqual(['sel-d']);

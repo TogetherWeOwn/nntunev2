@@ -1,11 +1,11 @@
 import { mount, tick, unmount } from 'svelte';
-import Library from '../../../src/routes/library/+page.svelte';
+import Host from './Host.svelte';
 import type { QueueState } from '../../../src/lib/player/queue.js';
 import '../../../src/app.css';
 
-// Test-only input seam, identical to the native-now-playing fixture pattern.
-// The pre-transform exports the existing replaceQueue, never title logic.
-const library = mount(Library, { target: document.getElementById('app')! }) as unknown as {
+// The one-time same-PR owner-wiring exception mounts the real session and queue.
+// All other acceptance protection remains; the input exports no title logic.
+const library = mount(Host, { target: document.getElementById('app')! }) as unknown as {
 	acceptanceReplaceQueue(state: QueueState): void;
 };
 

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { closeQueue, openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: star or unstar a queued library track without leaving the queue.
@@ -71,6 +72,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * assertion (no star control on queue rows); QSTAR-10 passes as the demo
  * negative control. The Builder consumes these tests in one combined ready
  * PR; never merge the RED test bank by itself.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Fixture titles/artists deliberately avoid the words "star", "favorite",
@@ -134,6 +141,7 @@ async function seedQueue(page: Page): Promise<void> {
 	await row(page, 'qstar-mike').click();
 	await row(page, 'qstar-zulu').click();
 	await row(page, 'qstar-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 }
@@ -183,6 +191,7 @@ test('[QSTAR-01] every library queue row carries one per-track star toggle', asy
 	page
 }) => {
 	await seedLibrary(page);
+	await openQueue(page);
 
 	// Empty queue: no rows, no toggles (negative setup, not feature evidence).
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
@@ -315,6 +324,7 @@ test('[QSTAR-04] queue and shelf toggles share one favorites source across reloa
 	// A queue-starred favorite survives reload and still shows on the row.
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await openQueue(page);
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 	await row(page, 'qstar-alpha').click();
 	const afterReload = queueStar(page, 'qstar-alpha');
@@ -383,6 +393,7 @@ test('[QSTAR-06] corrupt favorites storage falls back to unstarred without break
 		{ contextKey: AUTH_CONTEXT_KEY, scopedKey: `${FAVORITES_KEY_BASE}.test-queuestar-corrupt` }
 	);
 	await seedLibrary(page);
+	await openQueue(page);
 
 	await expect(page.getByTestId('favorites-empty')).toBeVisible();
 	await row(page, 'qstar-mike').click();
@@ -436,12 +447,16 @@ test.describe('narrow-screen touch', () => {
 		await toggle.tap();
 
 		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await closeQueue(page, { url: /\/library(\?|$)/, heading: 'Library' });
 		await expect(page.getByTestId('favorite-item')).toHaveCount(1);
+		await openQueue(page);
 		await expect(page.getByTestId('queue-announcement')).toContainText(/\bstarred\b/i);
 
 		await toggle.tap();
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		await closeQueue(page, { url: /\/library(\?|$)/, heading: 'Library' });
 		await expect(page.getByTestId('favorite-item')).toHaveCount(0);
+		await openQueue(page);
 		await expect(page.getByTestId('queue-announcement')).toContainText(/\bunstarred\b/i);
 
 		expect(await queueIds(page)).toEqual(['qstar-mike', 'qstar-zulu', 'qstar-alpha']);
@@ -490,7 +505,8 @@ test('[QSTAR-09] queue toggles replace one announcement and mutate nothing else'
 	).toHaveCount(0);
 });
 
-test('[QSTAR-10] demo inline queue rows carry no star toggle', async ({ page }) => {
+// EL TWO-5795: retired with the `/demo/player` route (vector preserved).
+test.skip('[QSTAR-10] demo inline queue rows carry no star toggle', async ({ page }) => {
 	// Control, not RED: demo catalogue ids never resolve in library
 	// favorites, so the slice must not star there. Passes pre- and post-.
 	await page.route('**/api/demo/audio**', (route) =>

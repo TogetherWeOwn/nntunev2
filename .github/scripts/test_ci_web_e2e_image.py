@@ -55,7 +55,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
         self.assertIsNone(step_field(verify, "working-directory"))
         self.assertIsNone(step_field(suite, "working-directory"))
         self.assertTrue(any(step_field(s, "run") == "pnpm install --frozen-lockfile" for s in steps))
-        self.assertEqual(step_field(suite, "run"), "pnpm test:e2e")
+        self.assertEqual(step_field(suite, "run"), "pnpm test:e2e --reporter=dot,./tests/reporters/runtime-inventory.ts")
         self.assertEqual(step_field(verify, "shell"), "bash")
         self.assertEqual(step_field(verify, "timeout-minutes"), "1")
         self.assertLess(steps.index(verify), steps.index(suite))

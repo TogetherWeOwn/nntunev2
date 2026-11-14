@@ -1,9 +1,15 @@
 import { expect, test, type Download, type Locator, type Page } from '@playwright/test';
 import { createQueue, formatQueueM3U, formatQueueText } from '../src/lib/player/queue.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
- * Protected acceptance bank: export the authenticated /library queue, not
- * /demo/player. The paired implementation must not edit this file.
+ * Protected acceptance bank: export the authenticated /library queue (the
+ * retired /demo/player route is gone since EL TWO-5795). The paired
+ * implementation must not edit this file except for
+ * the Engineering Lead's one-time, same-PR queue-host migration authorization:
+ * physical ownership, scoped locators and necessary lifecycle adapters only.
+ * Behavior vectors and all other acceptance protection remain unchanged;
+ * independent equivalence review is required.
  *
  * Breaks caught: exporting library/display order instead of arranged queue
  * order; filtering exports by current/checked/visible rows; stale cached
@@ -12,7 +18,8 @@ import { createQueue, formatQueueM3U, formatQueueText } from '../src/lib/player/
  * (including an away-and-back edit); export-induced queue/media changes;
  * unreachable or undersized controls; assertive export announcements.
  *
- * Page contract (all hooks scoped to main): native buttons named exactly
+ * Queue controls follow the live queue-panel; the decoder and playable identity
+ * have one persistent layout owner. Native export buttons are named exactly
  * "Copy queue as text" and "Download queue (.m3u)"; queue-export-status
  * (polite), queue-export-fallback (labeled readonly input/textarea), and
  * queue-export-instructions (manual-copy gesture). Empty queues may hide
@@ -25,6 +32,12 @@ import { createQueue, formatQueueM3U, formatQueueText } from '../src/lib/player/
  * All APIs and media are synthetic; no production/staging access or login.
  * A successful /api/library response models the authenticated library session,
  * following the neighbouring library route tests. No demo route is visited.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -54,14 +67,17 @@ type ProbedWindow = Window & { __libraryQueueExport: Probe };
 function main(page: Page) {
 	return page.getByRole('main');
 }
+function queueView(page: Page) {
+	return page.getByTestId('queue-panel');
+}
 function status(page: Page) {
-	return main(page).getByTestId('queue-export-status');
+	return queueView(page).getByTestId('queue-export-status');
 }
 function fallback(page: Page) {
-	return main(page).getByTestId('queue-export-fallback');
+	return queueView(page).getByTestId('queue-export-fallback');
 }
 function queueRow(page: Page, id: string) {
-	return main(page).locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
+	return queueView(page).locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 }
 function moveAlpha(page: Page, direction: 'up' | 'down') {
 	return queueRow(page, 'export-alpha').getByRole('button', {
@@ -69,10 +85,10 @@ function moveAlpha(page: Page, direction: 'up' | 'down') {
 	});
 }
 function clearQueue(page: Page) {
-	return main(page).getByRole('button', { name: 'Clear queue', exact: true });
+	return queueView(page).getByRole('button', { name: 'Clear queue', exact: true });
 }
 async function order(page: Page) {
-	return main(page).getByTestId('queue-item').evaluateAll((rows) =>
+	return queueView(page).getByTestId('queue-item').evaluateAll((rows) =>
 		rows.map((row) => row.getAttribute('data-track-id'))
 	);
 }
@@ -121,17 +137,20 @@ async function openLibrary(page: Page, clipboard: ClipboardMode = 'fulfilled', s
 	await expect(main(page).getByTestId('library-item')).toHaveCount(ITEMS.length);
 	if (seed) {
 		for (const id of INITIAL_IDS) await addTrack(page, id);
-		await expect(main(page).getByTestId('queue-item')).toHaveCount(3);
+		await openQueue(page);
+		await expect(queueView(page).getByTestId('queue-item')).toHaveCount(3);
 		expect(await order(page)).toEqual(INITIAL_IDS);
 		await expect(queueRow(page, 'export-mike')).toHaveAttribute('aria-current', 'true');
-		await expect(main(page).getByTestId('audio-player')).toHaveCount(1);
-	}
+		await expect(page.getByTestId('audio-player')).toHaveCount(1);
+		await expect(page.getByTestId('player-bar')).toHaveCount(1);
+		await expect(page.getByTestId('player-bar').getByTestId('now-playing')).toContainText('Míke Tune');
+	} else await openQueue(page);
 	return downloads;
 }
 
 async function actions(page: Page) {
-	const copy = main(page).getByRole('button', { name: COPY_NAME, exact: true });
-	const download = main(page).getByRole('button', { name: DOWNLOAD_NAME, exact: true });
+	const copy = queueView(page).getByRole('button', { name: COPY_NAME, exact: true });
+	const download = queueView(page).getByRole('button', { name: DOWNLOAD_NAME, exact: true });
 	await expect(copy, 'library export missing: add Copy queue as text to the non-empty library queue').toBeVisible();
 	await expect(download, 'library export missing: add Download queue (.m3u) to the non-empty library queue').toBeVisible();
 	for (const button of [copy, download]) {
@@ -183,22 +202,24 @@ async function expectPolite(page: Page) {
 	expect(attributes.assertive).toBe(false);
 	// Svelte's page-wide announcer is outside main and is not an export region.
 	await expect(main(page).locator('[aria-live="assertive"], [role="alert"]')).toHaveCount(0);
+	await expect(queueView(page).locator('[aria-live="assertive"], [role="alert"]')).toHaveCount(0);
 }
 
 /** Snapshot real observable state, not the formatters or a fake queue. */
 async function snapshot(page: Page) {
 	return main(page).evaluate((element) => {
-		const audio = element.querySelector<HTMLAudioElement>('[data-testid="audio-player"]');
+		// The real per-layout decoder and identity outlive the Library main.
+		const audio = document.querySelector<HTMLAudioElement>('[data-testid="audio-player"]');
 		const dump = (storage: Storage) => Object.fromEntries(
 			Array.from({ length: storage.length }, (_, i) => storage.key(i)!)
 				.sort().map((key) => [key, storage.getItem(key)])
 		);
 		return {
-			queue: Array.from(element.querySelectorAll('[data-testid="queue-item"]')).map((row) => ({
+			queue: Array.from(document.querySelector('[data-testid="queue-panel"]')!.querySelectorAll('[data-testid="queue-item"]')).map((row) => ({
 				id: row.getAttribute('data-track-id'), current: row.getAttribute('aria-current')
 			})),
 			checked: Array.from(element.querySelectorAll<HTMLInputElement>('[data-testid="library-item"] input[type="checkbox"]')).map((input) => input.checked),
-			nowPlaying: element.querySelector('[data-testid="now-playing"]')?.textContent,
+			nowPlaying: document.querySelector('[data-testid="player-bar"] [data-testid="now-playing"]')?.textContent,
 			media: { ...(window as unknown as ProbedWindow).__libraryQueueExport.media },
 			audio: audio && { src: audio.getAttribute('src'), time: audio.currentTime, rate: audio.playbackRate, paused: audio.paused },
 			local: dump(localStorage), session: dump(sessionStorage)
@@ -253,8 +274,8 @@ test('copy exports exactly the shared text in arranged order, not library, check
 	const downloads = await openLibrary(page);
 	await arrange(page);
 	await main(page).getByRole('checkbox', { name: 'Select Alpha 🌊', exact: true }).check();
-	await main(page).getByLabel('Filter queue', { exact: true }).fill('Alpha');
-	await expect(main(page).getByTestId('queue-item')).toHaveCount(1);
+	await queueView(page).getByLabel('Filter queue', { exact: true }).fill('Alpha');
+	await expect(queueView(page).getByTestId('queue-item')).toHaveCount(1);
 	const { copy } = await actions(page);
 	expect(await writes(page), 'no write from load, arrangement, selection or filtering').toEqual([]);
 	expect(downloads).toEqual([]);
@@ -271,7 +292,7 @@ test('copy exports exactly the shared text in arranged order, not library, check
 test('download body is exactly shared M3U for the arranged whole queue and feedback only claims initiation', async ({ page }) => {
 	await openLibrary(page);
 	await arrange(page);
-	await main(page).getByLabel('Filter queue', { exact: true }).fill('Alpha');
+	await queueView(page).getByLabel('Filter queue', { exact: true }).fill('Alpha');
 	const { download } = await actions(page);
 	expect(formatQueueM3U(exportState(ARRANGED_IDS))).toBe(ARRANGED_M3U);
 	expect(await downloadedBody(page, download)).toBe(ARRANGED_M3U);
@@ -305,18 +326,18 @@ for (const emptyAt of ['initial', 'after clear'] as const) {
 			// Guard the new feature first: pre-feature main is RED, not a vacuous pass.
 			await actions(page);
 			await clearQueue(page).click();
-			await main(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+			await queueView(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 		}
-		await expect(main(page).getByTestId('queue-item')).toHaveCount(0);
+		await expect(queueView(page).getByTestId('queue-item')).toHaveCount(0);
 		for (const name of [COPY_NAME, DOWNLOAD_NAME]) {
-			const button = main(page).getByRole('button', { name, exact: true });
+			const button = queueView(page).getByRole('button', { name, exact: true });
 			if (await button.count()) {
 				await expect(button).toBeDisabled();
 				// Native disabled controls must also reject synthetic activation.
 				await button.evaluate((element: HTMLButtonElement) => element.click());
 			}
 		}
-		const reason = main(page).getByTestId('now-playing');
+		const reason = queueView(page).getByTestId('now-playing');
 		await expect(reason).toBeVisible();
 		await expect(reason).toContainText(/queue\s+is\s+empty/i);
 		await expectNoSuccess(page);
@@ -344,7 +365,7 @@ for (const mode of ['missing', 'rejected'] as const) {
 		expect(await fallback(page).inputValue()).toBe(ARRANGED_TEXT);
 		await expect(status(page)).toContainText(/clipboard unavailable/i);
 		await expectNoSuccess(page);
-		const instructions = main(page).getByTestId('queue-export-instructions');
+		const instructions = queueView(page).getByTestId('queue-export-instructions');
 		await expect(instructions).toBeVisible();
 		await expect(instructions).toContainText(/copy/i);
 		await expect(instructions).toContainText(/ctrl|cmd|⌘|right.click|long.press|keyboard/i);
@@ -367,8 +388,15 @@ test('copy and download leave queue order, current track, checked selection, pla
 	await arrange(page);
 	const { copy, download } = await actions(page);
 	await main(page).getByRole('checkbox', { name: 'Select Alpha 🌊', exact: true }).check();
-	const audio = main(page).getByTestId('audio-player');
-	await audio.evaluate((element: HTMLAudioElement) => { element.currentTime = 37.25; element.playbackRate = 1.5; });
+	const audio = page.getByTestId('audio-player');
+	await audio.evaluate(async (element: HTMLAudioElement) => {
+		// The persistent transport saves native ratechange before the export
+		// measurement window. Do not mistake this queued event for export I/O.
+		const changed = new Promise<void>((resolve) => element.addEventListener('ratechange', () => resolve(), { once: true }));
+		element.currentTime = 37.25;
+		element.playbackRate = 1.5;
+		await changed;
+	});
 	const before = await snapshot(page);
 	const mediaNode = await audio.elementHandle();
 	await copy.click();
@@ -397,7 +425,7 @@ for (const edit of ['reorder', 'clear', 'away and back', 'remove', 'append', 'se
 			let expectedIds: string[] = INITIAL_IDS;
 			if (edit === 'clear') {
 				await clearQueue(page).click();
-				await main(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+				await queueView(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 				expectedIds = ['export-alpha']; // Added again only after the stale completion.
 			} else if (edit === 'append') {
 				await addTrack(page, 'export-alpha');
@@ -420,14 +448,14 @@ for (const edit of ['reorder', 'clear', 'away and back', 'remove', 'append', 'se
 			const beforeCompletion = await snapshot(page);
 			const feedback = {
 				status: await status(page).allTextContents(),
-				instructions: await main(page).getByTestId('queue-export-instructions').allTextContents()
+				instructions: await queueView(page).getByTestId('queue-export-instructions').allTextContents()
 			};
 			await settle(page, outcome);
 			await expectNoSuccess(page);
 			await expect(fallback(page)).toHaveCount(0);
 			expect({
 				status: await status(page).allTextContents(),
-				instructions: await main(page).getByTestId('queue-export-instructions').allTextContents()
+				instructions: await queueView(page).getByTestId('queue-export-instructions').allTextContents()
 			}, 'superseded completion must not publish success, failure or manual-copy feedback').toEqual(feedback);
 			expect(await snapshot(page)).toEqual(beforeCompletion);
 			if (edit === 'clear') await addTrack(page, 'export-alpha');

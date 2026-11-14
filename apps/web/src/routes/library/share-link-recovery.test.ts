@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
+import { createTrackListExport } from '#lib/player/trackListExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { loadRecentFinds } from '#lib/library/recent-finds.js';
@@ -8,6 +9,7 @@ import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/ord
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
+import { createPlayerFacade, liftPlayerProjections } from './player-harness.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
@@ -29,20 +31,27 @@ function pageScript(search: string) {
 	// Presentation projections are lazy in Svelte and unused by these handlers.
 	// Do not eagerly evaluate them as plain JavaScript: unrelated view imports
 	// added by a base merge must not become dependencies of this state machine.
-	const body = parsed.statements.filter((statement) => {
+	// Player-backed cells (`$derived($player...)`) are kept and fed by a real
+	// facade; every other lazy projection stays out as described above.
+	const facade = createPlayerFacade();
+	const lifted = liftPlayerProjections(parsed, parsed.statements.filter((statement) => {
 		if (ts.isImportDeclaration(statement)) return false;
 		if (!ts.isVariableStatement(statement)) return true;
 		return !statement.declarationList.declarations.some((declaration) => {
 			const value = declaration.initializer;
 			return value && ts.isCallExpression(value) &&
 				(value.expression.getText(parsed) === '$derived' ||
-				 value.expression.getText(parsed) === '$derived.by');
+				 value.expression.getText(parsed) === '$derived.by') &&
+				!value.getText(parsed).includes('$player');
 		});
-	}).map((statement) => statement.getText(parsed)).join('\n');
-	const compiled = ts.transpileModule(body, {
+	}));
+	const compiled = ts.transpileModule(`let $player = __facade.get();\n${lifted.body}\n${lifted.sync}`, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
+		createTrackListExport,
+		formatQueueText: queueFunctions.formatQueueText,
+		formatQueueM3U: queueFunctions.formatQueueM3U,
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
@@ -52,6 +61,9 @@ function pageScript(search: string) {
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
+		usePlayerSession: () => facade,
+		__facade: facade,
+		$effect: () => {},
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
@@ -64,7 +76,7 @@ function pageScript(search: string) {
 		return {
 			refresh, applyShareLink, resetShareAtAuthBoundary, selectTrack,
 			applyPendingShareSeek,
-			setAudio: (element) => { audioEl = element; },
+			setAudio: (element) => { __facade.attach(element); },
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek, loadError })
 		};
 	`)(...Object.values(bindings)) as {

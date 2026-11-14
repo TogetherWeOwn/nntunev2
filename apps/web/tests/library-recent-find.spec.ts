@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the paired build makes this file pass without editing it.
@@ -72,6 +73,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Focused command (from apps/web, deterministic, offline):
  *   pnpm exec playwright test tests/library-recent-find.spec.ts
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -259,6 +266,7 @@ test('[RF-00] control: shipped find, API order and queueing work before recents 
 	const api = await mockLibrary(page);
 	await openLibrary(page);
 	const field = await requireFind(page);
+	await openQueue(page);
 	await field.fill('harbor');
 	await expectRows(page, ['rec-alpha', 'rec-beta']);
 	await clearSearch(page).click();
@@ -582,6 +590,7 @@ test('[RF-09] recents never fetch, queue, star, select or persist beyond their o
 		.locator('[data-testid="library-item"][data-id="rec-beta"]')
 		.getByRole('button', { name: /star|favorite/i })
 		.click();
+	await openQueue(page);
 	await page.getByRole('checkbox', { name: 'Select Beta Song', exact: true }).check();
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);

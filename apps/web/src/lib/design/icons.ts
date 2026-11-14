@@ -13,6 +13,7 @@ export const ICON_NAMES = [
 	'pause',
 	'skip-back',
 	'skip-forward',
+	'restart',
 	'shuffle',
 	'repeat',
 	'repeat-1',
@@ -67,19 +68,31 @@ const F = ' fill="currentColor" stroke="none"';
 const HEART =
 	'<path d="M12 20.5C7 16.5 3 13.2 3 9.3 3 6.4 5.2 4.5 7.7 4.5c1.7 0 3.3.9 4.3 2.4 1-1.5 2.6-2.4 4.3-2.4 2.5 0 4.7 1.9 4.7 4.8 0 3.9-4 7.2-9 11.2z"/>';
 
-export const ICON_PATHS: Record<IconName, string> = {
+/** Existing player stencils, independently importable without the full manifest. */
+export const TRANSPORT_ICON_PATHS = {
 	play: `<path d="M7 4.5v15l13-7.5z"${F}/>`,
 	pause: `<rect x="6" y="5" width="4" height="14" rx="1"${F}/><rect x="14" y="5" width="4" height="14" rx="1"${F}/>`,
 	'skip-back': `<path d="M5 5h2.5v14H5z"${F}/><path d="M19 5v14L9.5 12z"${F}/>`,
 	'skip-forward': `<path d="M16.5 5H19v14h-2.5z"${F}/><path d="M5 5v14l9.5-7z"${F}/>`,
+	restart: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
 	shuffle:
 		'<path d="M3 6h2c5 0 9 12 14 12h2"/><path d="m18 15 3 3-3 3"/><path d="M3 18h2c5 0 9-12 14-12h2"/><path d="m18 3 3 3-3 3"/>',
 	repeat:
 		'<path d="m17 2 4 4-4 4"/><path d="M3 11V10a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
 	'repeat-1':
 		'<path d="m17 2 4 4-4 4"/><path d="M3 11V10a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/>',
+	'volume-2': `${SPK}<path d="M15.5 9.5a4 4 0 0 1 0 5"/><path d="M18 7a7.5 7.5 0 0 1 0 10"/>`,
+	'volume-x': `${SPK}<path d="m16 9.5 5 5M21 9.5l-5 5"/>`
+} satisfies Partial<Record<IconName, string>>;
+
+export const FAVORITE_ICON_PATHS = {
 	heart: HEART,
-	'heart-filled': HEART.replace('<path', `<path${F}`),
+	'heart-filled': HEART.replace('<path', `<path${F}`)
+} satisfies Partial<Record<IconName, string>>;
+
+export const ICON_PATHS: Record<IconName, string> = {
+	...TRANSPORT_ICON_PATHS,
+	...FAVORITE_ICON_PATHS,
 	plus: '<path d="M12 5v14M5 12h14"/>',
 	check: '<path d="m4.5 12.5 5 5 10-11"/>',
 	x: '<path d="M6 6l12 12M18 6 6 18"/>',
@@ -101,8 +114,6 @@ export const ICON_PATHS: Record<IconName, string> = {
 		'<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2.2"/><circle cx="15" cy="12" r="2.2"/><circle cx="8" cy="17" r="2.2"/>',
 	bell: '<path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6"/><path d="M10 20a2 2 0 0 0 4 0"/>',
 	'volume-1': `${SPK}<path d="M15.5 9.5a4 4 0 0 1 0 5"/>`,
-	'volume-2': `${SPK}<path d="M15.5 9.5a4 4 0 0 1 0 5"/><path d="M18 7a7.5 7.5 0 0 1 0 10"/>`,
-	'volume-x': `${SPK}<path d="m16 9.5 5 5M21 9.5l-5 5"/>`,
 	'list-video': `<path d="M9.5 6h11M9.5 10.5h11M9.5 15h11M9.5 19.5h11"/><path d="M3.5 4.8v4.4L7.5 7z"${F}/>`,
 	lyrics: '<path d="M4 6h16M4 10h16M4 14h10M4 18h7"/>',
 	maximize: '<path d="M8 3.5H3.5V8M16 3.5h4.5V8M8 20.5H3.5V16M16 20.5h4.5V16"/>',

@@ -3,12 +3,19 @@ import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/queue-direct-selection/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned supplement; the protected direct-selection bank stays unchanged.
  * Catches visible-index callbacks, missing identity validation before a render
  * flush, and missing connectivity validation during native click dispatch.
  * Mounts the real component through the existing parent; no handler substitutes.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
 	componentOrigin: [async ({}, use) => {
@@ -81,6 +88,7 @@ test('filtered library selection keeps the selected identity and complete arrang
 	for (const id of ['reg-mike', 'reg-zulu', 'reg-alpha']) {
 		await page.locator(`[data-testid="library-item"][data-id="${id}"] button.nt-library-row`).click();
 	}
+	await openQueue(page);
 	await expect(current(page)).toHaveAttribute('data-track-id', 'reg-mike');
 	await page.getByRole('searchbox', { name: 'Filter queue', exact: true }).fill('Alpha');
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);

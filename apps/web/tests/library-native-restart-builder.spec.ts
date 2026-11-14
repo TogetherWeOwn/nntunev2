@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned supplements for the library native restart control.
@@ -13,6 +14,12 @@ import { expect, test, type Page } from '@playwright/test';
  * Same harness shape as the protected bank: the
  * real `/library` route with `/api/library` fulfilled in-test and
  * `/test-audio/**` held pending. No real decoder, no network media.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 test.setTimeout(30_000);
@@ -94,6 +101,7 @@ test('selecting another queue row clears the restart outcome and availability', 
 	await openLibrary(page);
 	await restartCoral(page);
 
+	await openQueue(page);
 	await queueRow(page, 'rb-pine').getByRole('button', { name: 'Select Pine Morning' }).click();
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
 
@@ -105,6 +113,7 @@ test('removing the current queue row clears the restart outcome and availability
 	await openLibrary(page);
 	await restartCoral(page);
 
+	await openQueue(page);
 	await queueRow(page, 'rb-coral').getByRole('button', { name: 'Remove Coral Night from queue' }).click();
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
 
@@ -180,7 +189,7 @@ for (const outcome of ['Restarted', 'Already at the start of', 'Could not restar
 			Array.from(el.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) !== previous,
 			previousText
 		)).toBe(true);
-		await expect(page.locator('main [data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
+		await expect(page.getByRole('region', { name: 'Player', exact: true }).locator('[data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
 		await previousText.dispose();
 	});
 }

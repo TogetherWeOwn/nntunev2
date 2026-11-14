@@ -1428,17 +1428,31 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - id: client-build
+        run: pnpm build
       # Client-JS bundle budget: fail when the built client output exceeds
       # the budget pinned in check_web_bundle_budget.py. Runs in
       # this job so the fresh `pnpm build` output is present; the checker is
       # fail-closed when the output dir is missing. Absolute script paths
       # because this job defaults to working-directory apps/web. Keep this
       # job id in ci-ok's needs (already there via web-build).
-      - name: Enforce client-JS bundle budget
-        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"
       - name: Bundle-budget self-tests (pass + breach fixtures)
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
+      - name: Enforce client-JS bundle budget
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"
+      # Retain only public client JS and its route manifest, including on a
+      # budget breach. No server output, source maps or environment files.
+      - name: Retain client bundle for size diagnosis
+        if: ${{ !cancelled() && steps.client-build.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-client-bundle
+          path: |
+            apps/web/.svelte-kit/output/client/**/*.js
+            apps/web/.svelte-kit/output/client/.vite/manifest.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
   web-e2e:
     name: web-e2e
@@ -1532,7 +1546,7 @@ jobs:
           echo "CC0 fixture fetched and sha256-verified against the manifest:"
           sha256sum "$fetched"
       - name: Run apps/web Playwright suite
-        run: pnpm test:e2e
+        run: pnpm test:e2e --reporter=dot,./tests/reporters/runtime-inventory.ts
         env:
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
@@ -1543,6 +1557,14 @@ jobs:
         with:
           name: web-e2e-report
           path: apps/web/test-results/
+          retention-days: 7
+      - name: Upload runtime test inventory
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e-runtime-inventory
+          path: apps/web/test-results/runtime-inventory.json
+          if-no-files-found: error
           retention-days: 7
 
   # Axe accessibility gate: every existing route must report zero serious or

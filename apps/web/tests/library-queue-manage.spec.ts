@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: queue management UI on /library (QUEUE-MANAGE, M2).
@@ -52,6 +53,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * correction, and auth purge. The refresh test here pins only that an
  * *edited* queue keeps its order and current track across a same-id
  * refresh.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -111,6 +118,7 @@ async function seedQueue(page: Page): Promise<void> {
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 }
@@ -260,6 +268,7 @@ test('edited order and current track survive a background library refresh', asyn
 	await row(page, 'row-mike').click();
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 
 	// Edit first: reorder, then remove. Current stays mike throughout.
