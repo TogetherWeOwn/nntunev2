@@ -508,7 +508,12 @@ pub fn reconcile_subscription(
             paid_at_unix: paid_at,
         });
         if let Some(end) = item_end {
-            if new_end.is_none_or(|current| end > current) {
+            if new_end.is_none_or(|current| {
+                end > current
+                    || (end == current
+                        && (paid_at, invoice.id.as_str())
+                            > (anchor_paid_at.unwrap(), anchor_invoice.as_deref().unwrap()))
+            }) {
                 new_end = Some(end);
                 anchor_invoice = Some(invoice.id.clone());
                 anchor_paid_at = Some(paid_at);
@@ -1188,6 +1193,29 @@ mod tests {
         assert_eq!(row.period_end_unix, NOW + 30 * 86_400);
         assert_eq!((row.amount_cents, row.currency.as_str()), (800, "usd"));
         assert_eq!(row.paid_at_unix, NOW);
+    }
+
+    #[test]
+    fn equal_end_selects_latest_payment_then_invoice_id_in_either_order() {
+        for (first_paid, second_paid, expected) in [(NOW, NOW + 1, "in_a"), (NOW, NOW, "in_z")] {
+            for reverse in [false, true] {
+                let mut invoices = vec![
+                    paid_invoice("in_z", PRICE_PLUS, NOW - 100, NOW + 100, first_paid),
+                    paid_invoice("in_a", PRICE_PLUS, NOW - 100, NOW + 100, second_paid),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                let remote = RemoteSubscription {
+                    subscription: subscription("active", PRICE_PLUS),
+                    invoices,
+                };
+                let outcome = reconcile_subscription(&fresh(), &remote, NOW);
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(outcome.row.paid_through_unix, Some(NOW + 100));
+                assert_eq!(outcome.history.len(), 2);
+            }
+        }
     }
 
     // --- Monotonicity: duplicates and older invoices never regress --------------

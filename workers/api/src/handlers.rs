@@ -11593,6 +11593,89 @@ mod tests {
     }
 
     #[test]
+    fn billing_equal_end_selection_and_fresh_update_through_store() {
+        for (tied_payment, expected) in [(false, "in_a"), (true, "in_z")] {
+            for reverse in [false, true] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                let end = BILLING_NOW + BILLING_PERIOD;
+                let seed = test_invoice(
+                    "in_seed",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW - BILLING_PERIOD,
+                    BILLING_NOW,
+                    BILLING_NOW - 100,
+                );
+                let mut invoices = vec![
+                    test_invoice(
+                        "in_z",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW,
+                    ),
+                    test_invoice(
+                        "in_a",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW + i64::from(!tied_payment),
+                    ),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                invoices.insert(0, seed);
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(
+                        PLAN_PLUS,
+                        "active",
+                        Some(BILLING_NOW),
+                        Some("in_seed"),
+                        None,
+                    ),
+                ))
+                .unwrap();
+                let mut remote = crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "active",
+                        PRICE_PLUS,
+                    ),
+                    invoices,
+                };
+                let input = block_on(h.store.load_reconcile_input("u1", None)).unwrap();
+                let outcome =
+                    crate::billing_reconcile::reconcile_subscription(&input, &remote, BILLING_NOW);
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                block_on(h.store.store_reconcile_outcome("u1", &outcome)).unwrap();
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+
+                remote.subscription.status = "past_due".into();
+                let input = block_on(h.store.load_reconcile_input("u1", None)).unwrap();
+                let outcome =
+                    crate::billing_reconcile::reconcile_subscription(&input, &remote, BILLING_NOW);
+                block_on(h.store.store_reconcile_outcome("u1", &outcome)).unwrap();
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.status, "past_due");
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+                assert_eq!(h.store.invoice_history.borrow().len(), 3);
+            }
+        }
+    }
+
+    #[test]
     fn billing_equal_end_plan_switch_persists_through_store() {
         // The pure fold relabels on an equal-end plan switch, and the
         // production upsert's plan/anchor CASEs must persist that relabel:

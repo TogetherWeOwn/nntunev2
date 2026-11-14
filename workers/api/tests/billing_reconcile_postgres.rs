@@ -374,6 +374,55 @@ fn remote(sub: &str, invoices: &[Invoice]) -> RemoteSubscription {
 }
 
 #[tokio::test]
+async fn equal_end_selection_persists_and_allows_fresh_update() {
+    let mut fx = Fx::new().await;
+    for (case, tied_payment) in [("paid", false), ("id", true)] {
+        for reverse in [false, true] {
+            let user = format!("u_{case}_{reverse}");
+            let sub = format!("sub_{case}_{reverse}");
+            fx.add_user(&user).await;
+            let seed = invoice(&sub, 1);
+            let initial = fx.fold(&user, &remote(&sub, &[seed.clone()])).await;
+            fx.put(&user, &initial).await;
+
+            let mut older = invoice(&sub, 2);
+            older.id = format!("inv_{sub}_z");
+            let mut newer = older.clone();
+            newer.id = format!("inv_{sub}_a");
+            if !tied_payment {
+                newer.status_transitions.as_mut().unwrap().paid_at = Some(T + P + 1);
+            }
+            let expected = if tied_payment { &older.id } else { &newer.id };
+            let mut candidates = vec![older.clone(), newer.clone()];
+            if reverse {
+                candidates.reverse();
+            }
+            let mut invoices = vec![seed];
+            invoices.extend(candidates);
+            let snapshot = remote(&sub, &invoices);
+            let outcome = fx.fold(&user, &snapshot).await;
+            assert_eq!(outcome.row.paid_invoice_id.as_ref(), Some(expected));
+            fx.put(&user, &outcome).await;
+            let stored = fx.snap(&sub).await.unwrap();
+            assert_eq!(stored.anchor.as_ref(), Some(expected));
+            assert_eq!(stored.paid_through, Some(T + 2 * P));
+            assert_eq!(fx.history_rows(&sub).await, 3);
+
+            let mut fresh = snapshot;
+            fresh.subscription.status = "past_due".into();
+            let outcome = fx.fold(&user, &fresh).await;
+            fx.put(&user, &outcome).await;
+            let updated = fx.snap(&sub).await.unwrap();
+            assert_eq!(updated.status, "past_due");
+            assert_eq!(updated.anchor.as_ref(), Some(expected));
+            assert_eq!(updated.paid_through, Some(T + 2 * P));
+            assert_eq!(fx.history_rows(&sub).await, 3);
+        }
+    }
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn first_insert_and_replay_preserve_subscription_and_history() {
     let mut fx = Fx::new().await;
     fx.add_user("u1").await;
