@@ -1641,6 +1641,19 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: nntune_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nntune_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1688,6 +1701,12 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      - name: Exercise Worker routing with disposable PostgreSQL
+        run: |
+          python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
+          python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service
+        env:
+          NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
