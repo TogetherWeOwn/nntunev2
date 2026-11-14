@@ -33,6 +33,13 @@ class Helpers(unittest.TestCase):
         self.assertEqual(c(200, "application/json", '{"subsonic-response":{}}'), "subsonic-envelope")
         self.assertEqual(c(404, "application/json", '{"code":"not_found"}'), smoke.NOT_FOUND)
         self.assertEqual(c(500, "application/json", '{"error":"internal error"}'), "other")
+        for status in (200, 500):
+            self.assertEqual(c(status, "application/json", '{"code":"not_found"}'), "other")
+        for body in ('{"error":"subsonic-response unavailable"}',
+                     '{"subsonic-response":null}', '{"subsonic-response":[]}',
+                     '[{"subsonic-response":{}}]', 'subsonic-response'):
+            self.assertEqual(c(200, "application/json", body), "other")
+        self.assertEqual(c(500, "application/json", '{"subsonic-response":{}}'), "other")
 
     def test_migrations_exist(self):
         for name in smoke.app_migrations():

@@ -97,13 +97,16 @@ def app_migrations():
 def classify(status, ctype, body):
     if status == 404 and ctype.split(";")[0].strip().lower() == "text/plain" and body.strip() == "Not Found":
         return "subsonic-text-404"
-    if status == 200 and "subsonic-response" in body:
-        return "subsonic-envelope"
     try:
         doc = json.loads(body)
     except ValueError:
         return "other"
-    return NOT_FOUND if isinstance(doc, dict) and doc.get("code") == "not_found" else "other"
+    if isinstance(doc, dict):
+        if status == 200 and isinstance(doc.get("subsonic-response"), dict):
+            return "subsonic-envelope"
+        if status == 404 and doc.get("code") == "not_found":
+            return NOT_FOUND
+    return "other"
 
 
 def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
