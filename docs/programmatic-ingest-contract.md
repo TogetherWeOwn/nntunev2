@@ -59,8 +59,9 @@ per-piece and total ciphertext lengths and transfer caps, and how framing
 affects those lengths; ciphertext counts must not be compared directly with a
 plaintext declaration. At the receiving or storage boundary, use trusted
 observed byte counts to enforce each piece and the total ciphertext transfer;
-terminate transfers as soon as an agreed cap is exceeded and reject completion
-if a piece or total is truncated or differs from its agreed length. If a
+terminate transfers as soon as an agreed per-piece or total ciphertext length
+or transfer cap is exceeded, and reject completion if a piece or total is
+truncated or differs from its agreed length. If a
 plaintext length is declared, verify the observed plaintext length against it
 before publication. Bind each piece/checkpoint
 to environment, library, session, generation, offset, request fingerprint,
