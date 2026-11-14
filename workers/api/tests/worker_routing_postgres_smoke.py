@@ -205,8 +205,10 @@ def fixture_mounted(base, q, fx, mirror):
               f"fixture {name}: expected error {code}")
 
     check(request("ok-ping").get("status") == "ok", "valid key did not authenticate ping")
-    for name in ("wrong-key", "revoked-key", "deleting-user", "malformed-key", "oversize-key"):
+    for name in ("wrong-key", "revoked-key", "deleting-user", "malformed-key"):
         refused(name, 44)
+    # The credential parser rejects an oversized value before authentication.
+    refused("oversize-key", 0)
     refused("mixed-u-and-key", 43)
     st, ct, body = http("GET", base + "/rest/ping.view?f=json&apiKey=%ZZ")
     check(classify(st, ct, body) == "subsonic-envelope" and
