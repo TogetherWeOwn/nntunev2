@@ -36,6 +36,12 @@ class CohortTests(unittest.TestCase):
             with self.subTest(raw=raw[:40]), self.assertRaises(ValueError):
                 cohort.admit_cohort(raw)
 
+    def test_rejects_duplicate_json_key_in_valid_cohort(self):
+        raw = fixture().replace(b'"dataset_kind": "synthetic"',
+                                b'"dataset_kind": "synthetic", "dataset_kind": "synthetic"')
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            cohort.admit_cohort(raw)
+
     def test_rejects_bad_declarations_and_shapes(self):
         for raw in (fixture(dataset_kind="actual-export"), fixture(dataset_kind="other"),
                     fixture(schema="other"), fixture(extra=True), b"[]", b"{}",
