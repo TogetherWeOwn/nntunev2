@@ -664,7 +664,8 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 12
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 13
+          printf '%s\n' "$inventory_billing" | grep -Fx 'equal_end_selection_persists_and_allows_fresh_update: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'foreign_remote_without_live_anchor_rolls_back_on_unique_violation: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'explicit_stale_suppresses_every_update_whatever_the_evidence_end: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'stale_and_fresh_commit_orders_converge: test'

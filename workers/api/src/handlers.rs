@@ -11701,6 +11701,100 @@ mod tests {
     }
 
     #[test]
+    fn billing_equal_end_selection_and_fresh_update_through_store() {
+        for (tied_payment, expected) in [(false, "in_a"), (true, "in_z")] {
+            for reverse in [false, true] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                let end = BILLING_NOW + BILLING_PERIOD;
+                let seed = test_invoice(
+                    "in_seed",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW - BILLING_PERIOD,
+                    BILLING_NOW,
+                    BILLING_NOW - 100,
+                );
+                let mut invoices = vec![
+                    test_invoice(
+                        "in_z",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW,
+                    ),
+                    test_invoice(
+                        "in_a",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW + i64::from(!tied_payment),
+                    ),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                // Assign values to existing fake-map slots in iteration order so
+                // the actual caller receives both listings without changing the fake.
+                {
+                    let mut listed = h.stripe.invoices.borrow_mut();
+                    listed.insert("slot_a".into(), invoices[0].clone());
+                    listed.insert("slot_b".into(), invoices[1].clone());
+                    listed.insert("in_seed".into(), seed);
+                    let slots: Vec<_> = listed
+                        .keys()
+                        .filter(|k| k.starts_with("slot_"))
+                        .cloned()
+                        .collect();
+                    for (slot, invoice) in slots.into_iter().zip(invoices) {
+                        *listed.get_mut(&slot).unwrap() = invoice;
+                    }
+                }
+                h.stripe.subscriptions.borrow_mut().insert(
+                    "sub_test_1".into(),
+                    test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+                );
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(
+                        PLAN_PLUS,
+                        "active",
+                        Some(BILLING_NOW),
+                        Some("in_seed"),
+                        None,
+                    ),
+                ))
+                .unwrap();
+                let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("caller reconciles");
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .get_mut("sub_test_1")
+                    .unwrap()
+                    .status = "past_due".into();
+                block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("fresh caller update");
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.status, "past_due");
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+                assert_eq!(h.store.invoice_history.borrow().len(), 3);
+            }
+        }
+    }
+
+    #[test]
     fn billing_equal_end_plan_switch_persists_through_store() {
         // The pure fold relabels on an equal-end plan switch, and the
         // production upsert's plan/anchor CASEs must persist that relabel:
