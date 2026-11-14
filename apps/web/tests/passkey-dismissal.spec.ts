@@ -15,7 +15,7 @@ import { expect, test, type Page } from '@playwright/test';
  */
 
 const SIGNUP_GENERIC =
-	"That didn't work — re-enter the code (and invite code, if you have one) from the email and try again. If it keeps failing, start over to get a fresh code.";
+	"That didn't work — re-enter the code from the email and try again. If it keeps failing, start over to get a fresh code.";
 const LOGIN_GENERIC = 'Sign-in failed. Try again or use an email link.';
 const DISMISSAL = 'You dismissed the passkey prompt';
 

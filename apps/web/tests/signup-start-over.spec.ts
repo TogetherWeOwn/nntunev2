@@ -26,7 +26,7 @@ import { expect, test, type Page } from '@playwright/test';
  */
 
 const SIGNUP_GENERIC =
-	"That didn't work — re-enter the code (and invite code, if you have one) from the email and try again. If it keeps failing, start over to get a fresh code.";
+	"That didn't work — re-enter the code from the email and try again. If it keeps failing, start over to get a fresh code.";
 const DISMISSAL = 'You dismissed the passkey prompt';
 // Valid base64 (the client decodes the challenge into creation options):
 // 'first' then 'second'.
@@ -108,12 +108,21 @@ interface SignupTraffic {
 }
 
 /** Start answers a fresh challenge per call (first, then second, ...). */
-async function routeSignup(page: Page, { finishStatus = 200 } = {}): Promise<SignupTraffic> {
+async function routeSignup(page: Page, { finishStatus = 200, rejectedInvite = '' } = {}): Promise<SignupTraffic> {
 	const traffic: SignupTraffic = { startPosts: 0, startBodies: [], finishPosts: 0, finishBodies: [] };
 	const challenges = [FIRST_CHALLENGE, SECOND_CHALLENGE];
 	await page.route('**/v1/auth/passkey/register/start', async (route) => {
 		traffic.startPosts += 1;
-		traffic.startBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+		const body = route.request().postDataJSON() as Record<string, unknown>;
+		traffic.startBodies.push(body);
+		if (rejectedInvite && body.invite_code === rejectedInvite) {
+			await route.fulfill({
+				status: 401,
+				contentType: 'application/json',
+				body: JSON.stringify({ error: 'check your email and try again' })
+			});
+			return;
+		}
 		const challenge = challenges[Math.min(traffic.startPosts - 1, challenges.length - 1)];
 		await route.fulfill({
 			status: 200,
@@ -143,12 +152,73 @@ function startOver(page: Page) {
 	return page.getByRole('button', { name: /start over/i });
 }
 
-async function reachSignupCodeStep(page: Page, email = 'alice@example.com'): Promise<void> {
+async function reachSignupCodeStep(page: Page, email = 'alice@example.com', invite = ''): Promise<void> {
 	await page.goto('/signup');
 	await page.getByTestId('signup-email').fill(email);
+	await page.getByLabel(/invite code/i).fill(invite);
 	await page.getByTestId('signup-submit').click();
 	await expect(page.getByLabel('Email code')).toBeVisible();
 }
+
+for (const invite of ['unknown-invite', 'expired-invite', 'spent-invite']) {
+	test(`signup: ${invite} fails at start with the generic error before inbox proof`, async ({ page }) => {
+		await installCreateDouble(page);
+		const traffic = await routeSignup(page, { rejectedInvite: invite });
+		await page.goto('/signup');
+		await page.getByTestId('signup-email').fill('alice@example.com');
+		const field = page.getByLabel(/invite code/i);
+		await field.fill(` ${invite} `);
+		await page.getByTestId('signup-submit').click();
+
+		await expect(page.getByRole('alert')).toHaveText('Something went wrong. Try again.');
+		await expect(field).toHaveAttribute('aria-invalid', 'true');
+		await expect(field).toHaveAttribute('aria-describedby', 'signup-email-error');
+		await expect(field).toBeEnabled();
+		await expect(field).toHaveValue(` ${invite} `);
+		await expect(page.getByLabel('Email code')).toHaveCount(0);
+		expect(traffic.startBodies).toEqual([{ email: 'alice@example.com', invite_code: invite }]);
+		expect(traffic.finishPosts).toBe(0);
+		expect(await createCalls(page)).toBe(0);
+
+		// Correcting the invite retries start, not finish or the authenticator.
+		await field.fill('valid-invite');
+		await page.getByTestId('signup-submit').click();
+		await expect(page.getByLabel('Email code')).toBeFocused();
+		expect(traffic.startBodies[1]).toEqual({ email: 'alice@example.com', invite_code: 'valid-invite' });
+		expect(traffic.finishPosts).toBe(0);
+	});
+}
+
+test('signup: the same trimmed invite reaches start and finish after passkey dismissal', async ({ page }) => {
+	await installCreateDouble(page, { rejectNames: { 1: 'NotAllowedError' } });
+	const traffic = await routeSignup(page);
+	await reachSignupCodeStep(page, 'alice@example.com', ' fixture-invite ');
+	await expect(page.getByLabel(/invite code/i)).toHaveCount(0);
+	await page.getByLabel('Email code').fill('fixture-code');
+	const finish = page.getByRole('button', { name: /finish creating account/i });
+	await finish.click();
+	await expect(page.getByRole('alert')).toContainText(DISMISSAL);
+	expect(traffic.finishPosts).toBe(0);
+	await finish.click();
+	await page.waitForURL('/account/billing');
+	expect(traffic.startBodies).toEqual([{ email: 'alice@example.com', invite_code: 'fixture-invite' }]);
+	expect(traffic.finishBodies).toHaveLength(1);
+	expect(traffic.finishBodies[0]).toMatchObject({
+		challenge: FIRST_CHALLENGE, magic_token: 'fixture-code', invite_code: 'fixture-invite'
+	});
+});
+
+test('signup: a whitespace-only optional invite is omitted at start and finish', async ({ page }) => {
+	await installCreateDouble(page);
+	const traffic = await routeSignup(page);
+	await reachSignupCodeStep(page, 'alice@example.com', '   ');
+	await page.getByLabel('Email code').fill('fixture-code');
+	await page.getByRole('button', { name: /finish creating account/i }).click();
+	await page.waitForURL('/account/billing');
+	expect(traffic.startBodies).toEqual([{ email: 'alice@example.com' }]);
+	expect(traffic.finishBodies).toHaveLength(1);
+	expect(traffic.finishBodies[0]).not.toHaveProperty('invite_code');
+});
 
 test('signup: Start over from code-sent sends nothing; the next start finishes with the fresh challenge', async ({
 	page
@@ -156,11 +226,11 @@ test('signup: Start over from code-sent sends nothing; the next start finishes w
 	await installCreateDouble(page);
 	const traffic = await routeSignup(page);
 
-	await reachSignupCodeStep(page, 'alice@example.com');
+	await reachSignupCodeStep(page, 'alice@example.com', 'stale-invite');
 	// Code-sent offers the reset before any code is submitted.
 	await expect(startOver(page)).toBeVisible();
 	await page.getByLabel('Email code').fill('stale-code');
-	await page.getByLabel(/invite code/i).fill('stale-invite');
+	expect(traffic.startBodies[0]).toEqual({ email: 'alice@example.com', invite_code: 'stale-invite' });
 
 	await startOver(page).click();
 
@@ -180,13 +250,14 @@ test('signup: Start over from code-sent sends nothing; the next start finishes w
 	// A subsequent explicit start obtains a new challenge; both typed
 	// codes were cleared by the reset.
 	await email.fill('alice.corrected@example.com');
+	await expect(page.getByLabel(/invite code/i)).toHaveValue('');
 	await page.getByTestId('signup-submit').click();
 	const code = page.getByLabel('Email code');
 	await expect(code).toBeVisible();
 	await expect(code).toHaveValue('');
-	await expect(page.getByLabel(/invite code/i)).toHaveValue('');
+	await expect(page.getByLabel(/invite code/i)).toHaveCount(0);
 	expect(traffic.startPosts).toBe(2);
-	expect(traffic.startBodies[1]).toMatchObject({ email: 'alice.corrected@example.com' });
+	expect(traffic.startBodies[1]).toEqual({ email: 'alice.corrected@example.com' });
 
 	await code.fill('fresh-code');
 	await page.getByRole('button', { name: /finish creating account/i }).click();

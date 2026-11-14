@@ -42,7 +42,7 @@ const observed = new WeakMap<Page, { calls: BoundaryCall[]; unhandled: string[] 
 const EMAIL = 'alice@example.com';
 const LOGIN_ERROR = 'Sign-in failed. Try again or use an email link.';
 const SIGNUP_ERROR =
-	"That didn't work — re-enter the code (and invite code, if you have one) from the email and try again. If it keeps failing, start over to get a fresh code.";
+	"That didn't work — re-enter the code from the email and try again. If it keeps failing, start over to get a fresh code.";
 const AUTH_PATHS = {
 	login: '/v1/auth/passkey/login',
 	signup: '/v1/auth/passkey/register',
@@ -380,17 +380,20 @@ test('signup: keyboard start focuses the code and associates the emailed-code gu
 
 test('signup: keyboard Start over restores email focus and clears codes without a request', async ({ page }) => {
 	await installHarness(page, { journey: 'signup' });
-	await codeStep(page);
-	await page.getByLabel('Email code').fill('discarded-code');
+	await page.goto('/signup');
+	await emailField(page, 'signup').fill(EMAIL);
 	await page.getByLabel(/invite code/i).fill('discarded-invite');
+	await startButton(page, 'signup').click();
+	await page.getByLabel('Email code').fill('discarded-code');
 	await page.getByRole('button', { name: /start over/i }).focus();
 	await page.keyboard.press('Enter');
 	await expect(emailField(page, 'signup')).toBeVisible();
 	await expect.soft(emailField(page, 'signup')).toBeFocused();
 	expect((await calls(page)).map(({ stage }) => stage)).toEqual(['start']);
+	await expect(page.getByLabel(/invite code/i)).toHaveValue('');
 	await startButton(page, 'signup').click();
 	await expect(page.getByLabel('Email code')).toHaveValue('');
-	await expect(page.getByLabel(/invite code/i)).toHaveValue('');
+	await expect(page.getByLabel(/invite code/i)).toHaveCount(0);
 });
 
 test('signup: a start error is associated with the email field without enumerating accounts', async ({ page }) => {

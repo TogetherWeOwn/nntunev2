@@ -343,13 +343,17 @@ export class ApiClient {
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
+	async registerStart(
+		email: string,
+		signal?: AbortSignal,
+		inviteCode?: string
+	): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email }),
+				body: JSON.stringify({ email, ...(inviteCode ? { invite_code: inviteCode } : {}) }),
 				signal
 			}
 		);
