@@ -17,7 +17,7 @@ fn context(root: u8, plaintext_len: u64) -> EnvelopeContext {
     {
         *id = [value; 16];
         id[6] = 0x40 | (value & 0x0f);
-        id[8] = 0x80 | (value & 0x3f);
+        id[8] = 0x80 | (value & 0x0f);
     }
     let header = decode(concat!(
         "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
