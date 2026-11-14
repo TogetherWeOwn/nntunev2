@@ -11,6 +11,7 @@ import unittest
 MIRROR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(MIRROR))
 from extract_receipts import FILES, MAX_ROWS, verify_receipts
+from synthetic_resolver import resolve_fixture_extract
 
 EXTRACT = MIRROR.parent / "genre-extract" / "extract.py"
 FIXTURE = MIRROR.parent / "genre-extract" / "tests" / "fixtures" / "synthetic.json"
@@ -89,6 +90,35 @@ class ReceiptTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     verify_receipts(self.directory)
                 self.manifest["outputs"][name][field] = old
+
+    def test_fixture_extract_resolves_only_cohort_members(self):
+        artist = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        cohort = json.dumps({"schema": "nntune.genre-artists.v1", "dataset_kind": "synthetic",
+                             "artist_mbids": [artist.upper()],
+                             "playable_artist_mbids": [artist]}).encode()
+        config = {"taxonomy_version": 1, "traversal_barriers": [],
+                  "limits": {"max_depth": 8, "max_nodes": 20, "broad_multi_threshold": 1},
+                  "roots": [{"root_id": "root", "display_name": "Root", "sort_order": 1,
+                             "anchors": ["Q100"]}], "overrides": []}
+        result = resolve_fixture_extract(cohort, self.directory, config)
+        self.assertEqual(result["manifest_sha256"], hashlib.sha256(self.path.read_bytes()).hexdigest())
+        self.assertEqual(result["resolution"]["artist_roots"],
+                         [{"artist_mbid": artist, "root_id": "root"}])
+        self.assertEqual(result, resolve_fixture_extract(cohort, self.directory, config))
+        with self.assertRaises(ValueError):
+            resolve_fixture_extract(b"{}", self.directory, config)
+
+        # A matching self-declared receipt is not proof of fixture provenance.
+        name = "artist_genres.jsonl"
+        path = self.directory / name
+        raw = path.read_bytes().replace(b"Q101", b"Q103")
+        path.write_bytes(raw)
+        self.manifest["outputs"][name] = {"sha256": hashlib.sha256(raw).hexdigest(),
+                                          "bytes": len(raw), "rows": raw.count(b"\n")}
+        self.write_manifest()
+        verify_receipts(self.directory)
+        with self.assertRaisesRegex(ValueError, "not the repository synthetic fixture"):
+            resolve_fixture_extract(cohort, self.directory, config)
 
     def test_rejects_missing_and_symlinked_files(self):
         path = self.directory / FILES[0]
