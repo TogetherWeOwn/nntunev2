@@ -49,6 +49,13 @@ def construct(root, base, head, trusted_paths):
     require_sha(head)
     if not trusted_paths:
         raise ValueError("expected trusted input paths")
+    # Attributes may select configured commands during merge or checkout. Reject
+    # the effective configuration before invoking either operation.
+    keys = _git(root, "config", "--null", "--name-only", "--list").split("\0")
+    if any(key.lower().startswith("filter.") or key.lower() == "merge.default"
+           or (key.lower().startswith("merge.") and key.lower().endswith(".driver"))
+           for key in keys):
+        raise ValueError("configured merge drivers or filters are unsupported")
     guard(root, [base, head], [*trusted_paths, "."])
     tree = _git(root, "merge-tree", "--write-tree", base, head)
     require_sha(tree)

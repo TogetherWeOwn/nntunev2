@@ -20,10 +20,19 @@ class IdentityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             identity.construct(".", "main", "b" * 40, ["control"])
         with mock.patch.object(identity, "guard", side_effect=ValueError("missing")):
-            with mock.patch.object(identity, "_git") as git:
+            with mock.patch.object(identity, "_git", return_value="core.bare") as git:
                 with self.assertRaisesRegex(ValueError, "missing"):
                     identity.construct(".", "a" * 40, "b" * 40, ["control"])
-                git.assert_not_called()
+                self.assertEqual(git.call_count, 1)
+
+    def test_unsafe_git_configuration_is_rejected_before_guard(self):
+        for key in ("merge.custom.driver", "merge.default", "filter.foo.smudge",
+                    "filter.foo.clean", "filter.foo.process"):
+            with self.subTest(key=key), mock.patch.object(identity, "_git", return_value=key):
+                with mock.patch.object(identity, "guard") as guard:
+                    with self.assertRaisesRegex(ValueError, "unsupported"):
+                        identity.construct(".", "a" * 40, "b" * 40, ["control"])
+                    guard.assert_not_called()
 
     def test_readback_rejects_tree_parent_and_checkout_mismatches(self):
         base, head, tree, merge = (c * 40 for c in "abcm")
@@ -120,6 +129,19 @@ class IntegrationTests(unittest.TestCase):
             self.git("config", "core.fsmonitor", str(hook))
             identity.construct(self.root, self.base, self.head, ["control"])
             self.assertFalse(marker.exists())
+
+    def test_included_external_commands_are_refused(self):
+        for section in ("merge.custom.driver", "filter.custom.smudge"):
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as other:
+                marker = Path(other) / "called"
+                config = Path(other) / "included-config"
+                self.git("config", "--file", str(config), section, f"touch {marker}")
+                self.git("config", "include.path", str(config))
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    identity.construct(self.root, self.base, self.head, ["control"])
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.head)
+                self.git("config", "--unset", "include.path")
 
     def test_conflict_stops_without_checkout(self):
         self.git("checkout", "-q", "--detach", self.base)
