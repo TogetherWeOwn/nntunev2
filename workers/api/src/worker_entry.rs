@@ -4468,6 +4468,7 @@ impl Store for PgStore {
                             (&row.grace_until_unix, Type::INT8),
                             (&outcome.read_anchor, Type::TEXT),
                             (&outcome.read_plan, Type::TEXT),
+                            (&outcome.explicit_stale, Type::BOOL),
                         ],
                     )
                     .await

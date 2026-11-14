@@ -194,6 +194,8 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
+    /// Explicit stale proof suppresses the subscription write, not history.
+    pub explicit_stale: bool,
     /// The plan the pass read (the stored plan at fold time) and the
     /// anchor it read (the stored anchor at fold time): the write's
     /// equal-end adopt arm requires the stored row to still match both, so
@@ -377,6 +379,7 @@ pub fn reconcile_subscription(
             },
             history: Vec::new(),
             fail_closed: None,
+            explicit_stale: false,
             read_plan: previous.map(|row| row.plan_id.clone()),
             read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
         };
@@ -403,6 +406,7 @@ pub fn reconcile_subscription(
             },
             history: Vec::new(),
             fail_closed: None,
+            explicit_stale: false,
             read_plan: previous.map(|row| row.plan_id.clone()),
             read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
         };
@@ -508,7 +512,12 @@ pub fn reconcile_subscription(
             paid_at_unix: paid_at,
         });
         if let Some(end) = item_end {
-            if new_end.is_none_or(|current| end > current) {
+            if new_end.is_none_or(|current| {
+                end > current
+                    || (end == current
+                        && (paid_at, invoice.id.as_str())
+                            > (anchor_paid_at.unwrap(), anchor_invoice.as_deref().unwrap()))
+            }) {
                 new_end = Some(end);
                 anchor_invoice = Some(invoice.id.clone());
                 anchor_paid_at = Some(paid_at);
@@ -651,6 +660,7 @@ pub fn reconcile_subscription(
         },
         history,
         fail_closed: None,
+        explicit_stale: false,
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: stored_anchor,
     }
@@ -681,6 +691,8 @@ fn stale_snapshot(
         },
         history,
         fail_closed: None,
+        // Only the target subscription's own proof may suppress its write.
+        explicit_stale: kept.stripe_subscription_id == sub.id,
         read_plan: Some(kept.plan_id.clone()),
         read_anchor: kept.paid_invoice_id.clone(),
     }
@@ -733,6 +745,7 @@ fn fail_closed(
         },
         history: Vec::new(),
         fail_closed: Some(reason),
+        explicit_stale: false,
         read_plan: previous.map(|row| row.plan_id.clone()),
         read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }
@@ -1010,8 +1023,10 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// even when the stale-reading pass commits second — falling back to
 /// the stored end when its snapshot holds no item-plan money at all, so
 /// the anchor-less equal-end shape still presents non-NULL evidence).
-/// Item bindings, period end and cancel still update verbatim.
-/// Full staleness predicate (mirrored in both CASEs): EXCLUDED money is
+/// The same predicate suppresses the entire conflicting update, including
+/// bindings, period and cancellation, independently of explicit stale proof.
+/// Explicit stale proof also suppresses inserts; history is inserted independently.
+/// Full staleness predicate: EXCLUDED money is
 /// non-NULL, stored money is non-NULL, and EXCLUDED ends strictly before
 /// stored — or EXCLUDED ties stored while carrying no anchor against an
 /// anchored stored row. The fold only emits that anchor-less equal-end
@@ -1031,9 +1046,10 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
 /// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL ·
 /// $13 read paid_invoice_id-or-NULL (the stored anchor at fold time) ·
-/// $14 read plan_id-or-NULL (the stored plan at fold time).
+/// $14 read plan_id-or-NULL (the stored plan at fold time) ·
+/// $15 explicit stale proof (boolean).
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) SELECT $1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint) WHERE NOT $15::boolean ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END WHERE (EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL))) IS NOT TRUE"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
@@ -1188,6 +1204,29 @@ mod tests {
         assert_eq!(row.period_end_unix, NOW + 30 * 86_400);
         assert_eq!((row.amount_cents, row.currency.as_str()), (800, "usd"));
         assert_eq!(row.paid_at_unix, NOW);
+    }
+
+    #[test]
+    fn equal_end_selects_latest_payment_then_invoice_id_in_either_order() {
+        for (first_paid, second_paid, expected) in [(NOW, NOW + 1, "in_a"), (NOW, NOW, "in_z")] {
+            for reverse in [false, true] {
+                let mut invoices = vec![
+                    paid_invoice("in_z", PRICE_PLUS, NOW - 100, NOW + 100, first_paid),
+                    paid_invoice("in_a", PRICE_PLUS, NOW - 100, NOW + 100, second_paid),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                let remote = RemoteSubscription {
+                    subscription: subscription("active", PRICE_PLUS),
+                    invoices,
+                };
+                let outcome = reconcile_subscription(&fresh(), &remote, NOW);
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(outcome.row.paid_through_unix, Some(NOW + 100));
+                assert_eq!(outcome.history.len(), 2);
+            }
+        }
     }
 
     // --- Monotonicity: duplicates and older invoices never regress --------------

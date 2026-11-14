@@ -7494,9 +7494,8 @@ mod tests {
         // The same staleness predicate guards
         // `status` and `grace_until`: strictly older money — or the
         // anchor-less equal-end shape only the stale fold emits — keeps
-        // the stored verbatim fields instead of writing stale ones over
-        // a fresher pass. Bindings still update verbatim; history still
-        // converges on the invoice id.
+        // the entire stored row instead of writing stale fields over
+        // a fresher pass. History still converges on the invoice id.
         match existing {
             Some(existing)
                 if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
@@ -7531,6 +7530,9 @@ mod tests {
                     }
                     _ => false,
                 };
+                if stale {
+                    return existing.clone();
+                }
                 let mut row = outcome.row.clone();
                 if !advances && !relabels {
                     row.paid_through_unix = existing.paid_through_unix;
@@ -7538,10 +7540,6 @@ mod tests {
                     row.paid_invoice_id = existing.paid_invoice_id.clone();
                 } else if row.paid_invoice_id.is_none() {
                     row.paid_invoice_id = existing.paid_invoice_id.clone();
-                }
-                if stale {
-                    row.status = existing.status.clone();
-                    row.grace_until_unix = existing.grace_until_unix;
                 }
                 row
             }
@@ -8932,29 +8930,61 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            let mut rows = self.billing_rows.borrow_mut();
-            let mut shadow = self.billing_shadow.borrow_mut();
-            let key = (
-                user_id.to_string(),
-                outcome.row.stripe_subscription_id.clone(),
-            );
-            let current = rows.get(user_id);
-            let stored = current
-                .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
-                .or_else(|| shadow.get(&key));
-            let merged = merge_billing_row(stored, outcome);
-            if let Some(existing) = current {
-                if existing.stripe_subscription_id != merged.stripe_subscription_id {
-                    shadow.insert(
-                        (user_id.to_string(), existing.stripe_subscription_id.clone()),
-                        existing.clone(),
-                    );
+            let sub = &outcome.row.stripe_subscription_id;
+            if self
+                .billing_rows
+                .borrow()
+                .iter()
+                .any(|(owner, row)| owner != user_id && &row.stripe_subscription_id == sub)
+                || self
+                    .billing_shadow
+                    .borrow()
+                    .keys()
+                    .any(|(owner, id)| owner != user_id && id == sub)
+            {
+                return Err(StoreError);
+            }
+            if !outcome.explicit_stale {
+                let mut rows = self.billing_rows.borrow_mut();
+                let mut shadow = self.billing_shadow.borrow_mut();
+                let key = (
+                    user_id.to_string(),
+                    outcome.row.stripe_subscription_id.clone(),
+                );
+                let current = rows.get(user_id);
+                let stored = current
+                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .or_else(|| shadow.get(&key));
+                let merged = merge_billing_row(stored, outcome);
+                // Mirrors `uq_subscriptions_live_slot`: a different live
+                // subscription holding the slot aborts the write before any
+                // row or history mutation.
+                let live = |status: &str| {
+                    matches!(
+                        status,
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+                };
+                if current.is_some_and(|row| {
+                    row.stripe_subscription_id != merged.stripe_subscription_id
+                        && live(&row.status)
+                        && live(&merged.status)
+                }) {
+                    return Err(StoreError);
                 }
+                if let Some(existing) = current {
+                    if existing.stripe_subscription_id != merged.stripe_subscription_id {
+                        shadow.insert(
+                            (user_id.to_string(), existing.stripe_subscription_id.clone()),
+                            existing.clone(),
+                        );
+                    }
+                }
+                if let Some(retained) = shadow.get_mut(&key) {
+                    *retained = merged.clone();
+                }
+                rows.insert(user_id.to_string(), merged);
             }
-            if let Some(retained) = shadow.get_mut(&key) {
-                *retained = merged.clone();
-            }
-            rows.insert(user_id.to_string(), merged);
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
                 history
@@ -11224,21 +11254,34 @@ mod tests {
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            explicit_stale: false,
             // Inserts (no stored row yet), so the guard never reads this.
             read_plan: None,
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
-        let stale = crate::billing_reconcile::ReconcileOutcome {
+        let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            explicit_stale: false,
             // Read the fresh row: strictly-older money, so the stale arm
             // fires on the ends regardless.
             read_plan: Some(PLAN_PLUS.to_string()),
             read_anchor: Some("in_test_2".to_string()),
         };
+        stale.row.stripe_customer_id = "cus_delayed".into();
+        stale.row.stripe_item_id = "si_delayed".into();
+        stale.row.stripe_price_id = PRICE_PRO.into();
+        stale.row.plan_id = PLAN_PRO.into();
+        stale.row.current_period_end_unix = Some(BILLING_NOW - 1);
+        stale.row.cancel_at_period_end = true;
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
+        stale.row.paid_through_unix = fresh.row.paid_through_unix;
+        stale.row.paid_invoice_id = None;
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("tie stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(
             live.paid_through_unix,
@@ -11267,6 +11310,12 @@ mod tests {
             2,
             "both paid invoices keep their history rows"
         );
+        let mut next = stale.clone();
+        next.row.paid_through_unix = Some(BILLING_NOW + 2 * BILLING_PERIOD);
+        next.row.paid_invoice_id = Some("in_next".into());
+        next.history.clear();
+        block_on(h.store.store_reconcile_outcome("u1", &next)).expect("fresh update stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], next.row);
     }
 
     /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
@@ -11319,6 +11368,7 @@ mod tests {
             },
             history: vec![],
             fail_closed: None,
+            explicit_stale: false,
             // Seeds commit as inserts (no stored row yet), so the
             // equal-end adopt arm never reads this.
             read_plan: None,
@@ -11327,11 +11377,100 @@ mod tests {
     }
 
     #[test]
+    fn billing_live_slot_conflict_rolls_back_checkout_and_webhook_reconcile() {
+        // Anchored live A holds the slot; a paid B (A's anchor absent from
+        // its invoices) resolves to any live status. The store must fail
+        // with its normal error before row or history mutation, so the
+        // checkout does not succeed and the webhook is retried.
+        let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
+        for a_status in live {
+            for b_status in live {
+                for webhook in [false, true] {
+                    let h = stripe_harness();
+                    seed_billing_user(&h, "u1");
+                    let end = BILLING_NOW + BILLING_PERIOD;
+                    let a = stored_seed(PLAN_PLUS, a_status, Some(end), Some("in_a"), None);
+                    h.store.billing_rows.borrow_mut().insert("u1".into(), a.row);
+                    block_on(h.store.create_checkout_operation(
+                        "op_b",
+                        "u1",
+                        PRICE_PLUS,
+                        Some("cus_test_1"),
+                    ))
+                    .expect("op insert");
+                    block_on(h.store.update_checkout_operation(
+                        "op_b",
+                        "submitted",
+                        PRICE_PLUS,
+                        Some("cs_b"),
+                    ))
+                    .expect("mark submitted");
+                    let session = test_session(
+                        "cs_b",
+                        "complete",
+                        "paid",
+                        Some("cus_test_1"),
+                        Some("sub_b"),
+                        Some("op_b"),
+                    );
+                    h.stripe
+                        .sessions
+                        .borrow_mut()
+                        .insert("cs_b".into(), session);
+                    h.stripe.subscriptions.borrow_mut().insert(
+                        "sub_b".into(),
+                        test_subscription("sub_b", "cus_test_1", b_status, PRICE_PLUS),
+                    );
+                    let invoice = test_invoice(
+                        "in_b",
+                        "cus_test_1",
+                        "sub_b",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end + BILLING_PERIOD,
+                        BILLING_NOW + 60,
+                    );
+                    h.stripe
+                        .invoices
+                        .borrow_mut()
+                        .insert("in_b".into(), invoice);
+                    let rows = h.store.billing_rows.borrow().clone();
+                    let shadow = h.store.billing_shadow.borrow().clone();
+                    let history = h.store.invoice_history.borrow().clone();
+                    let case = format!("{a_status}/{b_status}/webhook={webhook}");
+                    if webhook {
+                        let body = checkout_completed_body("evt_b", "cs_b", false);
+                        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+                        assert_eq!(resp.status, 500, "{case}");
+                        assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
+                    } else {
+                        // `ensure_checkout_session` refuses a live A before
+                        // reaching its completed-session branch, so drive
+                        // that branch's shared driver directly.
+                        let result = block_on(reconcile_checkout_session(&h.ctx(), "cs_b"));
+                        assert_eq!(result, Err(()), "{case}");
+                    }
+                    let op = block_on(h.store.checkout_operation_by_id("op_b"))
+                        .expect("op lookup")
+                        .expect("op stored");
+                    assert_eq!(op.state, "submitted", "{case}: not succeeded");
+                    assert_eq!(*h.store.billing_rows.borrow(), rows, "{case}");
+                    assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
+                    assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
+                    assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn billing_shadow_preserves_per_user_projection() {
         let h = stripe_harness();
         let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
         block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
-        block_on(h.store.store_reconcile_outcome("u2", &first)).unwrap();
+        let mut second = first.clone();
+        second.row.stripe_subscription_id = "sub_second".into();
+        block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
 
         let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
         replacement.row.stripe_subscription_id = "sub_other".to_string();
@@ -11342,7 +11481,7 @@ mod tests {
         );
         assert_eq!(
             live_for(&h, "u2").unwrap().stripe_subscription_id,
-            "sub_test_1"
+            "sub_second"
         );
         let shadow = h.store.billing_shadow.borrow();
         let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
@@ -11363,6 +11502,152 @@ mod tests {
             "canceled"
         );
         assert_eq!(shadow.len(), 2);
+    }
+
+    #[test]
+    fn billing_fake_rejects_foreign_identity_without_mutation() {
+        for (owner_status, shadow_only, holder, incoming_history) in [
+            ("active", false, false, false),
+            ("active", false, true, true),
+            ("canceled", false, false, true),
+            ("canceled", true, false, true),
+            ("canceled", true, true, true),
+        ] {
+            let h = stripe_harness();
+            let mut owner = stored_seed(PLAN_PLUS, owner_status, Some(100), Some("in_a"), None);
+            owner
+                .history
+                .push(crate::billing_reconcile::PaidInvoiceRow {
+                    stripe_invoice_id: "in_a".into(),
+                    stripe_subscription_id: "sub_test_1".into(),
+                    plan_id: PLAN_PLUS.into(),
+                    period_start_unix: 0,
+                    period_end_unix: 100,
+                    amount_cents: 1_000,
+                    currency: "usd".into(),
+                    paid_at_unix: 1,
+                });
+            block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
+            if shadow_only {
+                let mut replacement = stored_seed(PLAN_PLUS, "active", None, None, None);
+                replacement.row.stripe_subscription_id = "sub_replacement".into();
+                block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+            }
+            if holder {
+                let mut own = stored_seed(PLAN_PLUS, "active", None, None, None);
+                own.row.stripe_subscription_id = "sub_holder".into();
+                block_on(h.store.store_reconcile_outcome("u2", &own)).unwrap();
+            }
+            let mut incoming = owner.clone();
+            incoming.row.status = "active".into();
+            incoming.row.plan_id = PLAN_PRO.into();
+            incoming.row.paid_through_unix = Some(200);
+            if incoming_history {
+                incoming.history[0].stripe_invoice_id = "in_foreign".into();
+                incoming.history[0].period_end_unix = 200;
+            } else {
+                incoming.history.clear();
+            }
+            let rows = h.store.billing_rows.borrow().clone();
+            let shadow = h.store.billing_shadow.borrow().clone();
+            let history = h.store.invoice_history.borrow().clone();
+            let projections = (live_for(&h, "u1"), live_for(&h, "u2"));
+            for _ in 0..2 {
+                assert!(block_on(h.store.store_reconcile_outcome("u2", &incoming)).is_err());
+                assert_eq!(*h.store.billing_rows.borrow(), rows);
+                assert_eq!(*h.store.billing_shadow.borrow(), shadow);
+                assert_eq!(*h.store.invoice_history.borrow(), history);
+                assert_eq!((live_for(&h, "u1"), live_for(&h, "u2")), projections);
+            }
+        }
+    }
+
+    #[test]
+    fn billing_webhook_foreign_owner_retries_after_attribution_repair() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        seed_billing_user(&h, "u2");
+        deliver_first_period(&h, "evt_original");
+        let owner_before = h.store.billing_rows.borrow()["u1"].clone();
+        let history_before = h.store.invoice_history.borrow().clone();
+        block_on(h.store.create_checkout_operation(
+            "op_collision",
+            "u2",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("incoming op");
+        block_on(h.store.update_checkout_operation(
+            "op_collision",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_collision"),
+        ))
+        .expect("submitted op");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_collision".into(),
+            test_session(
+                "cs_collision",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_collision"),
+            ),
+        );
+        let body = checkout_completed_body("evt_collision", "cs_collision", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert!(live_for(&h, "u2").is_none());
+        let op = block_on(h.store.checkout_operation_by_id("op_collision"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(op.state, "succeeded");
+        assert!(!h.store.webhook_events.borrow().contains("evt_collision"));
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(ensure_checkout_session(
+                    &h.ctx(),
+                    "u2",
+                    PRICE_PLUS,
+                    "https://example.com/ok",
+                    "https://example.com/cancel",
+                    None,
+                )),
+                Err(EnsureCheckoutError::Failed)
+            );
+            assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+            assert_ne!(
+                block_on(h.store.checkout_operation_by_id("op_collision"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "succeeded"
+            );
+            assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+            assert_eq!(*h.store.invoice_history.borrow(), history_before);
+            assert!(live_for(&h, "u2").is_none());
+        }
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_collision")
+            .unwrap()
+            .user_id = "u1".into();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert_eq!(
+            block_on(h.store.checkout_operation_by_id("op_collision"))
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
     }
 
     #[test]
@@ -11394,10 +11679,12 @@ mod tests {
         assert!(select("u2", Some("sub_test_1")).is_none());
         assert!(select("u1", Some("missing")).is_none());
         let mut other = a.clone();
+        other.row.stripe_subscription_id = "sub_u2".into();
         other.row.paid_through_unix = Some(999);
         block_on(h.store.store_reconcile_outcome("u2", &other)).unwrap();
+        assert!(select("u2", Some("sub_test_1")).is_none());
         assert_eq!(
-            select("u2", Some("sub_test_1")).unwrap().paid_through_unix,
+            select("u2", Some("sub_u2")).unwrap().paid_through_unix,
             Some(999)
         );
         let mut current = b.row.clone();
@@ -11448,12 +11735,12 @@ mod tests {
         let mut stale = a.clone();
         stale.row.paid_through_unix = Some(50);
         stale.row.status = "incomplete_expired".to_string();
-        let mut expected = stale.row.clone();
-        expected.paid_through_unix = a.row.paid_through_unix;
-        expected.paid_invoice_id = a.row.paid_invoice_id.clone();
-        expected.plan_id = a.row.plan_id.clone();
-        expected.status = a.row.status.clone();
-        expected.grace_until_unix = a.row.grace_until_unix;
+        stale.row.stripe_customer_id = "cus_stale".into();
+        stale.row.stripe_item_id = "si_stale".into();
+        stale.row.stripe_price_id = "price_stale".into();
+        stale.row.current_period_end_unix = Some(50);
+        stale.row.cancel_at_period_end = true;
+        let expected = a.row.clone();
         for _ in 0..2 {
             put("u1", &stale);
             assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
@@ -11565,8 +11852,7 @@ mod tests {
                 expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
             }
             if case == "no-anchor" {
-                expected.status = stored.row.status.clone();
-                expected.grace_until_unix = stored.row.grace_until_unix;
+                expected = stored.row.clone();
             }
             for outcome in [&stored, &replacement, &incoming] {
                 block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
@@ -11588,6 +11874,100 @@ mod tests {
                     block_on(fresh.store.store_reconcile_outcome("u1", outcome)).unwrap();
                 }
                 assert_eq!(fresh.store.billing_rows.borrow()["u1"], expected, "same-ID");
+            }
+        }
+    }
+
+    #[test]
+    fn billing_equal_end_selection_and_fresh_update_through_store() {
+        for (tied_payment, expected) in [(false, "in_a"), (true, "in_z")] {
+            for reverse in [false, true] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                let end = BILLING_NOW + BILLING_PERIOD;
+                let seed = test_invoice(
+                    "in_seed",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW - BILLING_PERIOD,
+                    BILLING_NOW,
+                    BILLING_NOW - 100,
+                );
+                let mut invoices = vec![
+                    test_invoice(
+                        "in_z",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW,
+                    ),
+                    test_invoice(
+                        "in_a",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW + i64::from(!tied_payment),
+                    ),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                // Assign values to existing fake-map slots in iteration order so
+                // the actual caller receives both listings without changing the fake.
+                {
+                    let mut listed = h.stripe.invoices.borrow_mut();
+                    listed.insert("slot_a".into(), invoices[0].clone());
+                    listed.insert("slot_b".into(), invoices[1].clone());
+                    listed.insert("in_seed".into(), seed);
+                    let slots: Vec<_> = listed
+                        .keys()
+                        .filter(|k| k.starts_with("slot_"))
+                        .cloned()
+                        .collect();
+                    for (slot, invoice) in slots.into_iter().zip(invoices) {
+                        *listed.get_mut(&slot).unwrap() = invoice;
+                    }
+                }
+                h.stripe.subscriptions.borrow_mut().insert(
+                    "sub_test_1".into(),
+                    test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+                );
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(
+                        PLAN_PLUS,
+                        "active",
+                        Some(BILLING_NOW),
+                        Some("in_seed"),
+                        None,
+                    ),
+                ))
+                .unwrap();
+                let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("caller reconciles");
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .get_mut("sub_test_1")
+                    .unwrap()
+                    .status = "past_due".into();
+                block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("fresh caller update");
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.status, "past_due");
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+                assert_eq!(h.store.invoice_history.borrow().len(), 3);
             }
         }
     }
@@ -11662,6 +12042,63 @@ mod tests {
         );
         assert_eq!(live.status, "active");
         assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_explicit_stale_fold_never_changes_stored_fields() {
+        let h = stripe_harness();
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let seed = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_seed"), None);
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        let mut subscription = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS);
+        subscription.cancel_at_period_end = true;
+        subscription.current_period_end = Some(end + 100);
+        let remote = crate::billing_reconcile::RemoteSubscription {
+            subscription,
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &remote,
+            BILLING_NOW,
+        );
+        assert!(stale.explicit_stale);
+        assert_eq!(stale.history.len(), 1);
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).unwrap();
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+        assert!(h.store.invoice_history.borrow().contains_key("in_old"));
+        let fresh_remote = crate::billing_reconcile::RemoteSubscription {
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+            ..remote
+        };
+        let fresh = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &fresh_remote,
+            BILLING_NOW,
+        );
+        assert!(!fresh.explicit_stale);
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).unwrap();
+        assert!(h.store.billing_rows.borrow()["u1"].cancel_at_period_end);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"].current_period_end_unix,
+            Some(end + 100)
+        );
     }
 
     #[test]

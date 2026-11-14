@@ -229,11 +229,12 @@ impl Fx {
                     Type::INT8,
                     Type::TEXT,
                     Type::TEXT,
+                    Type::BOOL,
                 ],
             )
             .await?;
         let r = &outcome.row;
-        let params: [&(dyn ToSql + Sync); 14] = [
+        let params: [&(dyn ToSql + Sync); 15] = [
             &user,
             &r.stripe_subscription_id,
             &r.stripe_customer_id,
@@ -248,6 +249,7 @@ impl Fx {
             &r.grace_until_unix,
             &outcome.read_anchor,
             &outcome.read_plan,
+            &outcome.explicit_stale,
         ];
         tx.query(&stmt, &params).await?;
         let history = tx
@@ -374,6 +376,55 @@ fn remote(sub: &str, invoices: &[Invoice]) -> RemoteSubscription {
 }
 
 #[tokio::test]
+async fn equal_end_selection_persists_and_allows_fresh_update() {
+    let mut fx = Fx::new().await;
+    for (case, tied_payment) in [("paid", false), ("id", true)] {
+        for reverse in [false, true] {
+            let user = format!("u_{case}_{reverse}");
+            let sub = format!("sub_{case}_{reverse}");
+            fx.add_user(&user).await;
+            let seed = invoice(&sub, 1);
+            let initial = fx.fold(&user, &remote(&sub, &[seed.clone()])).await;
+            fx.put(&user, &initial).await;
+
+            let mut older = invoice(&sub, 2);
+            older.id = format!("inv_{sub}_z");
+            let mut newer = older.clone();
+            newer.id = format!("inv_{sub}_a");
+            if !tied_payment {
+                newer.status_transitions.as_mut().unwrap().paid_at = Some(T + P + 1);
+            }
+            let expected = if tied_payment { &older.id } else { &newer.id };
+            let mut candidates = vec![older.clone(), newer.clone()];
+            if reverse {
+                candidates.reverse();
+            }
+            let mut invoices = vec![seed];
+            invoices.extend(candidates);
+            let snapshot = remote(&sub, &invoices);
+            let outcome = fx.fold(&user, &snapshot).await;
+            assert_eq!(outcome.row.paid_invoice_id.as_ref(), Some(expected));
+            fx.put(&user, &outcome).await;
+            let stored = fx.snap(&sub).await.unwrap();
+            assert_eq!(stored.anchor.as_ref(), Some(expected));
+            assert_eq!(stored.paid_through, Some(T + 2 * P));
+            assert_eq!(fx.history_rows(&sub).await, 3);
+
+            let mut fresh = snapshot;
+            fresh.subscription.status = "past_due".into();
+            let outcome = fx.fold(&user, &fresh).await;
+            fx.put(&user, &outcome).await;
+            let updated = fx.snap(&sub).await.unwrap();
+            assert_eq!(updated.status, "past_due");
+            assert_eq!(updated.anchor.as_ref(), Some(expected));
+            assert_eq!(updated.paid_through, Some(T + 2 * P));
+            assert_eq!(fx.history_rows(&sub).await, 3);
+        }
+    }
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn first_insert_and_replay_preserve_subscription_and_history() {
     let mut fx = Fx::new().await;
     fx.add_user("u1").await;
@@ -481,6 +532,135 @@ async fn null_evidence_updates_status_and_bindings_but_never_coverage() {
 }
 
 #[tokio::test]
+async fn predicate_stale_without_the_flag_keeps_bindings_and_mutable_fields() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    for (end, anchor) in [(T + P, Some("inv_old")), (T + 2 * P, None)] {
+        let mut stale = divergent(&fx, "sub_a", &stored).await;
+        stale.row.paid_through_unix = Some(end);
+        stale.row.paid_invoice_id = anchor.map(str::to_string);
+        assert!(!stale.explicit_stale);
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()), "end {end}");
+    }
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancellation_follows_the_fresh_pass_and_binding_is_stable_under_stale() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut remote = remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]);
+    remote.subscription.cancel_at_period_end = true;
+    let cancel = fx.fold("u1", &remote).await;
+    assert!(!cancel.explicit_stale);
+    fx.put("u1", &cancel).await;
+    let mut expected = stored.clone();
+    expected.cancel = true;
+    assert_eq!(fx.snap("sub_a").await, Some(expected.clone()));
+
+    let mut stale = divergent(&fx, "sub_a", &expected).await;
+    stale.row.paid_through_unix = Some(T + P);
+    assert!(!stale.explicit_stale);
+    fx.put("u1", &stale).await;
+    assert_eq!(fx.snap("sub_a").await, Some(expected.clone()));
+
+    remote.subscription.cancel_at_period_end = false;
+    let clear = fx.fold("u1", &remote).await;
+    assert!(!clear.explicit_stale);
+    fx.put("u1", &clear).await;
+    expected.cancel = false;
+    assert_eq!(fx.snap("sub_a").await, Some(expected));
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn explicit_stale_suppresses_every_update_whatever_the_evidence_end() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut stale = fx
+        .fold("u1", &remote("sub_a", &[invoice("sub_a", 1)]))
+        .await;
+    assert!(stale.explicit_stale);
+    let mut history = stale.history[0].clone();
+    history.stripe_invoice_id = "inv_new_history".into();
+    stale.history.push(history);
+    let different = divergent(&fx, "sub_a", &stored).await;
+    stale.row = different.row;
+    for end in [Some(T), stored.paid_through, Some(T + 4 * P), None] {
+        stale.row.paid_through_unix = end;
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()), "{end:?}");
+        assert_eq!(fx.history_rows("sub_a").await, 3);
+    }
+    // Suppression also prevents an insert when the target does not exist.
+    stale.row.stripe_subscription_id = "sub_missing".into();
+    stale.history.clear();
+    fx.put("u1", &stale).await;
+    assert!(fx.snap("sub_missing").await.is_none());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn flagged_null_evidence_suppresses_subscription_write() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut stale = fx.fold("u1", &remote("sub_a", &[])).await;
+    assert!(stale.explicit_stale);
+    stale.row = divergent(&fx, "sub_a", &stored).await.row;
+    stale.row.paid_through_unix = None;
+    stale.row.paid_invoice_id = None;
+    fx.put("u1", &stale).await;
+    assert_eq!(fx.snap("sub_a").await, Some(stored));
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn stale_and_fresh_commit_orders_converge() {
+    let mut fx = Fx::new().await;
+    let mut results = Vec::new();
+    for user in ["u1", "u2"] {
+        fx.add_user(user).await;
+        let sub = format!("sub_{user}");
+        fx.seed_active(user, &sub).await;
+        let stale = fx.fold(user, &remote(&sub, &[invoice(&sub, 1)])).await;
+        let mut renewal = remote(
+            &sub,
+            &[invoice(&sub, 1), invoice(&sub, 2), invoice(&sub, 3)],
+        );
+        renewal.subscription.current_period_end = Some(T + 3 * P);
+        let fresh = fx.fold(user, &renewal).await;
+        assert!(stale.explicit_stale);
+        assert!(!fresh.explicit_stale);
+        if user == "u1" {
+            fx.put(user, &stale).await;
+            fx.put(user, &fresh).await;
+        } else {
+            fx.put(user, &fresh).await;
+            fx.put(user, &stale).await;
+        }
+        let result = fx.snap(&sub).await.unwrap();
+        assert_eq!(result.paid_through, Some(T + 3 * P));
+        assert_eq!(result.anchor, Some(format!("inv_{sub}_3")));
+        assert_eq!(result.period_end, Some(T + 3 * P));
+        assert_eq!(fx.history_rows(&sub).await, 3);
+        results.push(Snap {
+            user_id: String::new(),
+            anchor: None,
+            ..result
+        });
+    }
+    assert_eq!(results[0], results[1]);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
     let mut fx = Fx::new().await;
     let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
@@ -529,6 +709,31 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
         .await;
     fx.put("free_user", &outcome).await;
     assert!(fx.snap("sub_free").await.is_some());
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let a = fx.seed_active("u1", "sub_a").await;
+    let live = fx.live("u1").await.expect("anchored live A");
+    assert_eq!(live.stripe_subscription_id, "sub_a");
+    assert_eq!(live.paid_invoice_id, a.anchor);
+    let b = remote("sub_b", &[invoice("sub_b", 1), invoice("sub_b", 2)]);
+    assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
+    let outcome = fx.fold("u1", &b).await;
+    assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
+    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(a));
+    assert!(fx.snap("sub_b").await.is_none());
+    assert_eq!(fx.rows("u1").await, 1);
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert_eq!(fx.history_rows("sub_b").await, 0);
     fx.cleanup().await;
 }
 
@@ -683,6 +888,11 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     let mut stale = a.clone();
     stale.row.paid_through_unix = Some(50);
     stale.row.status = "incomplete_expired".into();
+    stale.row.stripe_customer_id = "cus_stale".into();
+    stale.row.stripe_item_id = "si_stale".into();
+    stale.row.stripe_price_id = "price_stale".into();
+    stale.row.current_period_end_unix = Some(50);
+    stale.row.cancel_at_period_end = true;
     for _ in 0..2 {
         fx.put("u1", &stale).await;
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
@@ -755,6 +965,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         if case == "advance-null-anchor" {
             incoming.row.paid_through_unix = Some(150);
         }
+        let stored_before = fx.snap(&sub).await.unwrap();
         fx.put("u1", &incoming).await;
         let mut expected = Snap {
             user_id: "u1".into(),
@@ -776,8 +987,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             expected.anchor = Some("in_old".into());
         }
         if case == "no-anchor" {
-            expected.status = "canceled".into();
-            expected.grace = Some(10);
+            expected = stored_before;
         }
         if case == "advance-null-anchor" {
             expected.paid_through = Some(150);
