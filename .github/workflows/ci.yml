@@ -319,6 +319,8 @@ jobs:
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
       - name: Test offline playable-artist root coverage (synthetic only)
         run: python3 scripts/test_genre_root_coverage.py
+      - name: Test bounded process-group cleanup
+        run: python3 workers/api/tests/test_process_group.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -572,6 +574,8 @@ jobs:
         run: python3 -I containers/genre-mirror/tests/test_graph.py
       - name: Run offline genre root resolution tests
         run: python3 -I containers/genre-mirror/tests/test_roots.py
+      - name: Run offline genre override tests
+        run: python3 -I containers/genre-mirror/tests/test_overrides.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
@@ -660,9 +664,10 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 14
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 15
           printf '%s\n' "$inventory_billing" | grep -Fx 'predicate_stale_without_the_flag_keeps_bindings_and_mutable_fields: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'cancellation_follows_the_fresh_pass_and_binding_is_stable_under_stale: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'equal_end_selection_persists_and_allows_fresh_update: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'foreign_remote_without_live_anchor_rolls_back_on_unique_violation: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'explicit_stale_suppresses_every_update_whatever_the_evidence_end: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'stale_and_fresh_commit_orders_converge: test'
