@@ -11631,7 +11631,26 @@ mod tests {
                 if reverse {
                     invoices.reverse();
                 }
-                invoices.insert(0, seed);
+                // Assign values to existing fake-map slots in iteration order so
+                // the actual caller receives both listings without changing the fake.
+                {
+                    let mut listed = h.stripe.invoices.borrow_mut();
+                    listed.insert("slot_a".into(), invoices[0].clone());
+                    listed.insert("slot_b".into(), invoices[1].clone());
+                    listed.insert("in_seed".into(), seed);
+                    let slots: Vec<_> = listed
+                        .keys()
+                        .filter(|k| k.starts_with("slot_"))
+                        .cloned()
+                        .collect();
+                    for (slot, invoice) in slots.into_iter().zip(invoices) {
+                        *listed.get_mut(&slot).unwrap() = invoice;
+                    }
+                }
+                h.stripe.subscriptions.borrow_mut().insert(
+                    "sub_test_1".into(),
+                    test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+                );
                 block_on(h.store.store_reconcile_outcome(
                     "u1",
                     &stored_seed(
@@ -11643,29 +11662,21 @@ mod tests {
                     ),
                 ))
                 .unwrap();
-                let mut remote = crate::billing_reconcile::RemoteSubscription {
-                    subscription: test_subscription(
-                        "sub_test_1",
-                        "cus_test_1",
-                        "active",
-                        PRICE_PLUS,
-                    ),
-                    invoices,
-                };
-                let input = block_on(h.store.load_reconcile_input("u1", None)).unwrap();
-                let outcome =
-                    crate::billing_reconcile::reconcile_subscription(&input, &remote, BILLING_NOW);
+                let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("caller reconciles");
                 assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
-                block_on(h.store.store_reconcile_outcome("u1", &outcome)).unwrap();
                 let live = live_for(&h, "u1").unwrap();
                 assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
                 assert_eq!(live.paid_through_unix, Some(end));
 
-                remote.subscription.status = "past_due".into();
-                let input = block_on(h.store.load_reconcile_input("u1", None)).unwrap();
-                let outcome =
-                    crate::billing_reconcile::reconcile_subscription(&input, &remote, BILLING_NOW);
-                block_on(h.store.store_reconcile_outcome("u1", &outcome)).unwrap();
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .get_mut("sub_test_1")
+                    .unwrap()
+                    .status = "past_due".into();
+                block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("fresh caller update");
                 let live = live_for(&h, "u1").unwrap();
                 assert_eq!(live.status, "past_due");
                 assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
