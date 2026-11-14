@@ -8,6 +8,9 @@ Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
 inserted auth_challenges row back), plus non-/rest and /rest routing controls.
 /rest is asserted against the inert main baseline; the two observed tables
 must not gain rows. This is NOT Subsonic activation proof. Missing prerequisites fail.
+By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
+into the same disposable database and /rest must stay inert against it (--no-fixture skips;
+--mirror-fixture also applies the mirror-target migrations and seeds mb_* rows).
 
 Env: NNTUNE_SMOKE_PG_PASSWORD (required), _HOST (loopback, 127.0.0.1), _PORT (5432),
 _USER (postgres), _ADMIN_DB (nntune_ci). Needs node and a host psql client.
@@ -21,6 +24,10 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("process_group", Path(__file__).resolve().with_name("process_group.py"))
 process_group = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(process_group)
+
+spec = importlib.util.spec_from_file_location("fixture", Path(__file__).resolve().with_name("synthetic_subsonic_fixture.py"))
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
 
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
@@ -63,7 +70,7 @@ def conn_string(s, db):
     return f"postgresql://{s['user']}:{pw}@{s['host']}:{s['port']}/{db}?sslmode=disable"
 
 
-def wrangler_toml(conn, sha):
+def wrangler_toml(conn, sha, mirror=False):
     check(re.fullmatch(r"[0-9a-f]{40}", sha), "build sha must be 40 lowercase hex")
     check('"' not in conn and "\\" not in conn and '"' not in str(BUNDLE), "unsupported characters")
     return f'''name = "nntune-api-routing-smoke"
@@ -81,12 +88,19 @@ HYPERDRIVE_CACHING_DISABLED = "1"
 binding = "HYPERDRIVE"
 id = "00000000000000000000000000000000"
 localConnectionString = "{conn}"
-'''
+''' + (f'''
+# Mirror fixture only: MB_DB targets the same disposable database as HYPERDRIVE.
+[[hyperdrive]]
+binding = "MB_DB"
+id = "11111111111111111111111111111111"
+localConnectionString = "{conn}"
+''' if mirror else "")
 
 
-def dev_vars():
+def dev_vars(fx=None):
+    extra = f"SUBSONIC_INDEX_PEPPER='{fixture.pepper_secret(fx)}'\n" if fx else ""
     return (f"SESSION_SECRET_BASE64={b64(secrets.token_bytes(32))}\n"
-            f"VAULT_KEK_BASE64={b64(secrets.token_bytes(32))}\nVAULT_KEK_VERSION=1\n")
+            f"VAULT_KEK_BASE64={b64(secrets.token_bytes(32))}\nVAULT_KEK_VERSION=1\n" + extra)
 
 
 def app_migrations():
@@ -174,7 +188,31 @@ def prerequisites(args):
     return s, wrangler, sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "0123456789abcdef0123456789abcdef01234567"
 
 
-def smoke(base, s, db):
+def fixture_inert(base, q, fx, mirror):
+    """Seeded rows exist, and no fixture scenario reaches them while /rest is inert."""
+    want = {"users": 6, "subsonic_credentials": 6, "subscriptions": 5, "library": 3}
+    for table, n in {**want, **({"mb_track": 1} if mirror else {})}.items():
+        got = q(f"SELECT count(*) FROM {table}")
+        check(got.isdigit() and int(got) >= n, f"fixture seed: {table} has {got}, want >= {n}")
+    before = q(fixture.snapshot_sql())
+    for sc in fixture.SCENARIOS:
+        st, ct, b = http("POST" if sc.mutates else "GET", base + fixture.request_path(fx, sc),
+                         b"" if sc.mutates else None)
+        key = fx.keys[sc.who]
+        check(st < 500, f"fixture {sc.name} ({sc.kind}): server error {st}")
+        check(not ct.lower().startswith(("audio/", "application/octet-stream")), f"fixture {sc.name}: media served")
+        check(key not in b, f"fixture {sc.name}: credential echoed")
+        if sc.inert in ("no auth, failed", "failed"):
+            check_ping(st, ct, b)
+        elif sc.inert == "text 404":
+            check(classify(st, ct, b) == "subsonic-text-404", f"fixture {sc.name}: expected 404")
+        elif sc.inert == "gone":
+            check(st == 410 and b.strip() == "Gone", f"fixture {sc.name}: expected 410 Gone")
+    check(q(fixture.snapshot_sql()) == before, "inert /rest changed fixture-observed tables")
+    print(f"ok: {len(fixture.SCENARIOS)} synthetic fixture scenarios inert, no row changes", flush=True)
+
+
+def smoke(base, s, db, fx=None, mirror=False):
     q = lambda sql, **v: psql(s, db, stdin=sql, tuples=True, **v)
     status, _, body = http("GET", base + "/healthz")
     check(status == 200 and json.loads(body).get("ok") is True, f"healthz: {status} {body[:160]}")
@@ -206,23 +244,37 @@ def smoke(base, s, db):
     after = q("SELECT (SELECT count(*) FROM auth_challenges) || '/' || (SELECT count(*) FROM auth_rate_limit_slots)")
     check(after == snap, "current main /rest changed observed table counts")
     print("ok: /rest claimed by the Subsonic adapter; observed table counts unchanged", flush=True)
+    if fx:
+        fixture_inert(base, q, fx, mirror)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--wrangler")
+    ap.add_argument("--no-fixture", action="store_true", help="skip the synthetic Subsonic fixture")
+    ap.add_argument("--mirror-fixture", action="store_true", help="also seed mirror-target tables")
     ap.add_argument("--postgres-service", action="store_true", help="accepted; service mode is the only mode")
     try:
-        s, wrangler, sha = prerequisites(ap.parse_args(argv))
+        args = ap.parse_args(argv)
+        check(not (args.no_fixture and args.mirror_fixture), "--mirror-fixture needs the fixture")
+        s, wrangler, sha = prerequisites(args)
     except Failure as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1
+    fx = None if args.no_fixture else fixture.build()
     db = f"nntune_smoke_{secrets.token_hex(6)}"
     tmp = Path(tempfile.mkdtemp(prefix="nntune-routing-smoke-"))
     proc = None
     created = False
     failed = False
-    redact = lambda t: t.replace(conn_string(s, db), "<db-url>").replace(s["password"], "<redacted>")
+    secrets_out = [conn_string(s, db), s["password"]]
+    if fx:
+        secrets_out += [fixture.pepper_secret(fx), fixture.b64(fx.pepper)] + list(fx.keys.values())
+
+    def redact(text):
+        for v in secrets_out:
+            text = text.replace(v, "<redacted>")
+        return text
     try:
         psql(s, s["admin"], "SELECT 1")
         psql(s, s["admin"], f"CREATE DATABASE {db}")
@@ -230,8 +282,13 @@ def main(argv=None):
         for name in app_migrations():
             print(f"migrate app: {name}", flush=True)
             psql(s, db, stdin=(ROOT / "migrations" / name).read_text())
-        (tmp / "wrangler.toml").write_text(wrangler_toml(conn_string(s, db), sha))
-        (tmp / ".dev.vars").write_text(dev_vars())
+        if fx:
+            for name in (fixture.mirror_files() if args.mirror_fixture else ()):
+                psql(s, db, stdin=(ROOT / "migrations" / name).read_text())
+            psql(s, db, stdin=fixture.seed_sql(fx, args.mirror_fixture))
+            print("seeded synthetic Subsonic fixture", flush=True)
+        (tmp / "wrangler.toml").write_text(wrangler_toml(conn_string(s, db), sha, bool(fx and args.mirror_fixture)))
+        (tmp / ".dev.vars").write_text(dev_vars(fx))
         (tmp / "home").mkdir()
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -257,7 +314,7 @@ def main(argv=None):
                 continue
             check(st == 200, f"/healthz answered {st} {b[:160]!r}\n" + tail())
             break
-        smoke(base, s, db)
+        smoke(base, s, db, fx, args.mirror_fixture)
     except Failure as err:
         print(f"FAIL: {redact(str(err))}", file=sys.stderr)
         failed = True

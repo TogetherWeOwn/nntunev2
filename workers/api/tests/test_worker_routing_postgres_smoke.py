@@ -57,7 +57,7 @@ class Helpers(unittest.TestCase):
             with self.subTest(drop_error=drop_error, remove_error=remove_error), \
                  patch.object(smoke, "prerequisites", return_value=(settings, Path("wrangler"), SHA)), \
                  patch.object(smoke.tempfile, "mkdtemp", return_value="/tmp/fake"), \
-                 patch.object(smoke, "psql", side_effect=[None, None, drop_error]), \
+                 patch.object(smoke, "psql", side_effect=[None, None, None, drop_error]), \
                  patch.object(smoke, "app_migrations", return_value=[]), \
                  patch.object(Path, "write_text"), patch.object(Path, "read_text", return_value=""), \
                  patch.object(Path, "mkdir"), \
@@ -71,6 +71,65 @@ class Helpers(unittest.TestCase):
                 self.assertEqual(smoke.main([]), 1)
                 run_smoke.assert_called_once()
                 remove.assert_called_once_with(Path("/tmp/fake"))
+
+    def test_fixture_is_synthetic_disposable_and_inert(self):
+        fx = smoke.fixture.build()
+        sql = smoke.fixture.seed_sql(fx, mirror=True)
+        self.assertEqual(sql.count("INSERT INTO users"), 6)
+        self.assertEqual(sql.count("INSERT INTO subsonic_credentials"), 6)
+        self.assertIn("deleting_at", sql)
+        self.assertIn("mb_track", sql)
+        self.assertIn(smoke.fixture.OTHER_REL, sql)
+        self.assertNotEqual(smoke.fixture.REL, smoke.fixture.OTHER_REL)
+        self.assertNotIn("mb_track", smoke.fixture.seed_sql(fx))
+        for secret in fx.keys.values():
+            self.assertNotIn(secret, sql)  # only the peppered HMAC is stored
+        self.assertEqual(len(set(fx.keys.values())), len(fx.keys))
+        self.assertTrue(all(v.startswith("ci-synthetic-") or v.startswith("not a") for v in fx.keys.values()))
+        self.assertRegex(smoke.fixture.key_hmac(fx, "active"), r"^[0-9a-f]{64}$")
+        self.assertNotEqual(smoke.fixture.key_hmac(fx, "active"), smoke.fixture.key_hmac(fx, "revoked"))
+        self.assertIn("SUBSONIC_INDEX_PEPPER=", smoke.dev_vars(fx))
+        self.assertNotIn("SUBSONIC_INDEX_PEPPER", smoke.dev_vars())
+        self.assertEqual({sc.kind for sc in smoke.fixture.SCENARIOS},
+                         {"verify", "denial", "terminal", "mutation", "stream", "failure"})
+        for sc in smoke.fixture.SCENARIOS:
+            self.assertTrue(smoke.fixture.request_path(fx, sc).startswith("/rest/"), sc.name)
+
+    def test_snapshot_uses_current_play_ledger(self):
+        sql = smoke.fixture.snapshot_sql()
+        self.assertIn("FROM stream_play_ledger t", sql)
+        self.assertNotIn("FROM usage_ledger t", sql)
+
+    def test_fixture_inert_rejects_successful_authenticated_ping(self):
+        fx = smoke.fixture.build()
+        def query(sql):
+            if sql.startswith("SELECT count(*)"):
+                return "10"
+            return "snapshot"
+        with patch.object(smoke, "http", return_value=(200, "application/json",
+                '{"subsonic-response":{"status":"ok"}}')):
+            with self.assertRaises(smoke.Failure):
+                smoke.fixture_inert("http://localhost", query, fx, True)
+
+    def test_mirror_fixture_binds_mb_db_to_the_disposable_database(self):
+        conn = smoke.conn_string(smoke.pg_settings(ENV), "nntune_smoke_ab")
+        names = lambda m: [h["binding"] for h in tomllib.loads(smoke.wrangler_toml(conn, SHA, m))["hyperdrive"]]
+        self.assertEqual(names(False), ["HYPERDRIVE"])
+        self.assertEqual(names(True), ["HYPERDRIVE", "MB_DB"])
+
+    def test_mirror_files_match_manifest_mirror_targets(self):
+        with open(smoke.MANIFEST, "rb") as fh:
+            mirror = [m["file"] for m in tomllib.load(fh)["migration"] if m["target"] == "mirror"]
+        self.assertEqual(list(smoke.fixture.mirror_files()), mirror)
+
+    def test_fixture_refuses_unsafe_flags_and_external_targets(self):
+        with patch.object(smoke, "prerequisites") as pre, patch.object(smoke.sys, "stderr"):
+            self.assertEqual(smoke.main(["--no-fixture", "--mirror-fixture"]), 1)
+            pre.assert_not_called()
+        with patch.dict(smoke.os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                                           "DATABASE_URL": "postgresql://x"}):
+            with self.assertRaises(smoke.Failure):
+                smoke.prerequisites(type("A", (), {"wrangler": None})())
 
     def test_migrations_exist(self):
         for name in smoke.app_migrations():
