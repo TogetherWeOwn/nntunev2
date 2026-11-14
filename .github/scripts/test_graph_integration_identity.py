@@ -44,6 +44,14 @@ class IdentityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     identity.verify(".", base, head, tree, merge)
 
+    def test_git_disables_configured_fsmonitor(self):
+        result = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        with mock.patch.object(identity.subprocess, "run", return_value=result) as run:
+            identity._git(".", "checkout", "--detach", "a" * 40)
+        args = run.call_args.args[0]
+        self.assertIn("core.fsmonitor=false", args)
+        self.assertEqual(args[args.index("core.fsmonitor=false") - 1], "-c")
+
     def test_ci_requires_git_capability(self):
         if os.environ.get("GRAPH_GUARD_REQUIRE_GIT") == "1":
             self.assertTrue(SUPPORTED, "Git must support --no-lazy-fetch")
@@ -102,6 +110,16 @@ class IntegrationTests(unittest.TestCase):
             identity.construct(self.root, base, self.head, ["control"])
             self.assertEqual((self.root / "base-only").read_text(), "base\n")
             self.assertFalse((Path(other) / "base-only").exists())
+
+    def test_configured_fsmonitor_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as other:
+            marker = Path(other) / "called"
+            hook = self.root / ".git" / "fsmonitor-test"
+            hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            hook.chmod(0o755)
+            self.git("config", "core.fsmonitor", str(hook))
+            identity.construct(self.root, self.base, self.head, ["control"])
+            self.assertFalse(marker.exists())
 
     def test_conflict_stops_without_checkout(self):
         self.git("checkout", "-q", "--detach", self.base)

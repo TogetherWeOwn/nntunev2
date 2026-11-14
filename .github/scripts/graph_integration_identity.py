@@ -14,7 +14,8 @@ from graph_qualification_context import require_sha
 def _git(root, *args, input_data=None):
     result = subprocess.run(
         ["git", "--no-lazy-fetch", "--no-replace-objects", "-C", str(root),
-         "--work-tree", str(root), "-c", "core.hooksPath=/dev/null", *args],
+         "--work-tree", str(root), "-c", "core.hooksPath=/dev/null",
+         "-c", "core.fsmonitor=false", *args],
         input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=git_environment(), check=False,
     )
