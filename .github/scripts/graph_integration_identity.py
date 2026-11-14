@@ -14,7 +14,7 @@ from graph_qualification_context import require_sha
 def _git(root, *args, input_data=None):
     result = subprocess.run(
         ["git", "--no-lazy-fetch", "--no-replace-objects", "-C", str(root),
-         "-c", "core.hooksPath=/dev/null", *args],
+         "--work-tree", str(root), "-c", "core.hooksPath=/dev/null", *args],
         input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=git_environment(), check=False,
     )
@@ -38,6 +38,7 @@ def verify(root, base, head, tree, merge):
         raise ValueError("checkout is not the integration commit")
     if _git(root, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD":
         raise ValueError("checkout is not detached")
+    guard(root, [merge], ["."])
 
 
 def construct(root, base, head, trusted_paths):
@@ -45,7 +46,9 @@ def construct(root, base, head, trusted_paths):
     root = Path(root).resolve()
     require_sha(base)
     require_sha(head)
-    guard(root, [base, head], trusted_paths)
+    if not trusted_paths:
+        raise ValueError("expected trusted input paths")
+    guard(root, [base, head], [*trusted_paths, "."])
     tree = _git(root, "merge-tree", "--write-tree", base, head)
     require_sha(tree)
     merge = _git(root, "-c", "user.name=Graph integration",

@@ -80,6 +80,29 @@ class IntegrationTests(unittest.TestCase):
                          self.base + " " + self.head)
         identity.verify(self.root, self.base, self.head, tree, merge)
 
+    def test_dirty_noncontrol_file_is_refused_before_and_after_checkout(self):
+        (self.root / "common").write_text("dirty\n")
+        with self.assertRaises(ValueError):
+            identity.construct(self.root, self.base, self.head, ["control"])
+        self.git("checkout", "--", "common")
+        tree, merge = identity.construct(self.root, self.base, self.head, ["control"])
+        (self.root / "common").write_text("dirty\n")
+        with self.assertRaises(ValueError):
+            identity.verify(self.root, self.base, self.head, tree, merge)
+
+    def test_configured_worktree_cannot_redirect_checkout(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        (self.root / "base-only").write_text("base\n")
+        self.git("add", "base-only")
+        self.git("commit", "-qm", "base change")
+        base = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "--detach", self.head)
+        with tempfile.TemporaryDirectory() as other:
+            self.git("config", "core.worktree", other)
+            identity.construct(self.root, base, self.head, ["control"])
+            self.assertEqual((self.root / "base-only").read_text(), "base\n")
+            self.assertFalse((Path(other) / "base-only").exists())
+
     def test_conflict_stops_without_checkout(self):
         self.git("checkout", "-q", "--detach", self.base)
         (self.root / "common").write_text("conflicting\n")
