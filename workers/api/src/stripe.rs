@@ -194,6 +194,33 @@ pub fn create_checkout_session_request(
     }
 }
 
+/// Construct a portal session request without dispatching it. All three
+/// values must be nonblank; callers remain responsible for selecting an
+/// appropriate configuration, customer binding and trusted return URL.
+/// No idempotency key: each request creates a fresh hosted session.
+pub fn create_billing_portal_session_request(
+    customer_id: &str,
+    configuration_id: &str,
+    return_url: &str,
+) -> Option<StripeRequest> {
+    if [customer_id, configuration_id, return_url]
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+    Some(StripeRequest {
+        method: "POST",
+        path: "/v1/billing_portal/sessions".to_string(),
+        idempotency_key: None,
+        body: form_encode(&[
+            ("customer", customer_id),
+            ("configuration", configuration_id),
+            ("return_url", return_url),
+        ]),
+    })
+}
+
 /// `GET /v1/checkout/sessions/{id}`.
 pub fn retrieve_checkout_session_request(session_id: &str) -> StripeRequest {
     StripeRequest {
@@ -975,6 +1002,32 @@ mod tests {
             "subscription_data%5Bmetadata%5D%5Bbilling_operation_id%5D=op-9",
         ] {
             assert!(req.body.contains(pinned), "missing {pinned}: {}", req.body);
+        }
+    }
+
+    #[test]
+    fn portal_session_request_pins_explicit_configuration_and_form() {
+        let req = create_billing_portal_session_request(
+            "cus_123",
+            "bpc_456",
+            "https://example.com/account/billing?from=a+b&next=/home",
+        )
+        .expect("required values present");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/billing_portal/sessions");
+        assert_eq!(req.idempotency_key, None);
+        assert_eq!(
+            req.body,
+            "customer=cus_123&configuration=bpc_456&return_url=https%3A%2F%2Fexample.com%2Faccount%2Fbilling%3Ffrom%3Da%2Bb%26next%3D%2Fhome"
+        );
+    }
+
+    #[test]
+    fn portal_session_request_rejects_blank_required_values() {
+        for blank in ["", " ", "\t\n"] {
+            assert!(create_billing_portal_session_request(blank, "bpc_1", "url").is_none());
+            assert!(create_billing_portal_session_request("cus_1", blank, "url").is_none());
+            assert!(create_billing_portal_session_request("cus_1", "bpc_1", blank).is_none());
         }
     }
 
