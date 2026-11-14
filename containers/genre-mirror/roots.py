@@ -14,13 +14,17 @@ class Roots:
             anchor: root["root_id"] for root in active for anchor in root["anchors"]
         }
         reaches = {}
+        anchor_reaches = {}
         self.anchors_capped = False
         for root in active:
             found = set()
             for anchor in root["anchors"]:
                 visited, capped, _ = graph.reach(anchor)
                 self.anchors_capped |= capped
-                found.update(self.anchor_root[node] for node in visited if node in self.anchor_root)
+                anchor_reaches[anchor] = {
+                    self.anchor_root[node] for node in visited if node in self.anchor_root
+                }
+                found.update(anchor_reaches[anchor])
             reaches[root["root_id"]] = found
 
         # Compute cycles over the full projected relation, including mutual
@@ -37,9 +41,10 @@ class Roots:
         # A capped anchor can hide an edge anywhere in a projected cycle.
         # Preserve candidates rather than treating missing edges as proof.
         self.narrower = {
-            rid: {other for other in broader
-                  if not self.anchors_capped and other != rid and rid not in closure[other]}
-            for rid, broader in reaches.items()
+            anchor: {other for other in broader
+                     if not self.anchors_capped and other != self.anchor_root[anchor]
+                     and self.anchor_root[anchor] not in closure[other]}
+            for anchor, broader in anchor_reaches.items()
         }
 
     def resolve(self, genre_qid):
@@ -48,6 +53,7 @@ class Roots:
         candidates = {self.anchor_root[node] for node in visited if node in self.anchor_root}
         reduced = {
             broader for broader in candidates
-            if not any(broader in self.narrower[narrower] for narrower in candidates)
+            if not any(broader in self.narrower[anchor]
+                       for anchor in visited if anchor in self.narrower)
         }
         return sorted(reduced, key=self.sort_order.__getitem__), capped or self.anchors_capped, cycle

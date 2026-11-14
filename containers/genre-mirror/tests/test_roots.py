@@ -36,6 +36,12 @@ class RootTests(unittest.TestCase):
         self.assertEqual(r.resolve("Q1"), (["broad"], False, False))
         self.assertEqual(r.resolve("Q8"), ([], False, False))
 
+    def test_unvisited_anchor_does_not_prune_broader_root(self):
+        r = resolver({"Q1": ["Q3"], "Q9": ["Q2", "Q3"], "Q8": ["Q1"]},
+                     [root("a", 1, "Q1", "Q2"), root("b", 2, "Q3")])
+        self.assertEqual(r.resolve("Q9"), (["a", "b"], False, False))
+        self.assertEqual(r.resolve("Q8"), (["a"], False, False))
+
     def test_mutual_cycle_keeps_both_and_reports_cycle(self):
         r = resolver({"Q1": ["Q2"], "Q2": ["Q1"], "Q3": ["Q1"]},
                      [root("a", 1, "Q1"), root("b", 2, "Q2")])
