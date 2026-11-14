@@ -248,6 +248,37 @@ async fn release_membership_hides_nonmembers_before_mirror_state() {
     }
 }
 
+#[tokio::test]
+async fn subsonic_snapshot_fails_closed_when_member_mirror_is_unavailable() {
+    for configured in [false, true] {
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(
+            client(true).await,
+            configured,
+            Err(StoreError),
+            attempts.clone(),
+        );
+        assert!(store.subsonic_snapshot_catalogue("u1").await.is_err());
+        assert_eq!(attempts.get(), usize::from(configured));
+    }
+}
+
+#[tokio::test]
+async fn subsonic_snapshot_empty_membership_does_not_connect_to_mirror() {
+    for configured in [false, true] {
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            configured,
+            Err(StoreError),
+            attempts.clone(),
+        );
+        let (artists, releases, tracks) = store.subsonic_snapshot_catalogue("u1").await.unwrap();
+        assert!(artists.is_empty() && releases.is_empty() && tracks.is_empty());
+        assert_eq!(attempts.get(), 0);
+    }
+}
+
 const SNAPSHOT_ARTIST: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SNAPSHOT_RELEASE: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
@@ -278,6 +309,91 @@ async fn mirror_client() -> Client {
         .await
         .unwrap();
     client
+}
+
+#[tokio::test]
+async fn subsonic_snapshot_rejects_a_capped_query_result() {
+    for cap in [2, 3] {
+        let recordings = vec![
+            "00000001-0000-4000-8000-000000000001".to_string(),
+            "00000002-0000-4000-8000-000000000002".to_string(),
+        ];
+        let app = client(false).await;
+        app.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'boundary', $1, $2)",
+            &[&SNAPSHOT_RELEASE, &recordings],
+        )
+        .await
+        .unwrap();
+        let mirror = mirror_client().await;
+        mirror.batch_execute(&format!(
+            "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Artist', 'Person', 'US');
+             INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');"
+        )).await.unwrap();
+        mirror.execute(
+            "INSERT INTO mb_recording SELECT g::uuid, 'Song', 200000 FROM unnest($1::text[]) AS g",
+            &[&recordings],
+        ).await.unwrap();
+        mirror.execute(
+            &format!("INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, position::smallint FROM unnest($1::text[]) WITH ORDINALITY AS tracks(g, position)"),
+            &[&recordings],
+        ).await.unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+        let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+        if cap == 2 {
+            assert!(result.is_err(), "a full SQL page must fail closed");
+        } else {
+            assert_eq!(result.unwrap().2.len(), 2, "a partial page is complete");
+        }
+        assert_eq!(attempts.get(), 1);
+    }
+}
+
+#[tokio::test]
+async fn subsonic_snapshot_rejects_capped_artist_and_release_pages() {
+    const SECOND_ARTIST: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const SECOND_RELEASE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    // Two artists exercise the first query; one artist and two releases
+    // reach the second query without hitting the artist boundary first.
+    for distinct_artists in [true, false] {
+        for cap in [2, 3] {
+            let app = client(false).await;
+            for release in [SNAPSHOT_RELEASE, SECOND_RELEASE] {
+                app.execute(
+                    "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', $1, $1, ARRAY[]::text[])",
+                    &[&release],
+                )
+                .await
+                .unwrap();
+            }
+            let mirror = mirror_client().await;
+            let second_artist = if distinct_artists {
+                SECOND_ARTIST
+            } else {
+                SNAPSHOT_ARTIST
+            };
+            mirror.batch_execute(&format!(
+                "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'First', 'First', 'Person', 'US'), ('{SECOND_ARTIST}', 'Second', 'Second', 'Person', 'US');
+                 INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'First', 'Album', 2001, '{SNAPSHOT_ARTIST}'), ('{SECOND_RELEASE}', 'Second', 'Album', 2002, '{second_artist}');"
+            )).await.unwrap();
+            let attempts = Rc::new(Cell::new(0));
+            let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+            let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+            if cap == 2 {
+                assert!(
+                    result.is_err(),
+                    "a full artist or release page must fail closed"
+                );
+            } else {
+                let (artists, releases, tracks) = result.unwrap();
+                assert_eq!(artists.len(), if distinct_artists { 2 } else { 1 });
+                assert_eq!(releases.len(), 2);
+                assert!(tracks.is_empty());
+            }
+            assert_eq!(attempts.get(), 1);
+        }
+    }
 }
 
 /// More member tracks than the native `CATALOGUE_MAX_PAGE_SIZE` (50): the
