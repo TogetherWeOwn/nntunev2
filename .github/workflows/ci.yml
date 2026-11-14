@@ -564,6 +564,8 @@ jobs:
         run: python3 containers/mb-import/tests/test_stream_extract.py
       - name: Run offline CC0 genre-extract contract tests
         run: python3 -I containers/genre-extract/tests/test_extract.py
+      - name: Run offline genre taxonomy validation tests
+        run: python3 -I containers/genre-mirror/tests/test_taxonomy.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
