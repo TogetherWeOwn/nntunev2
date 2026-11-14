@@ -47,6 +47,7 @@ pub use velmora::{
 };
 
 pub mod media_layout;
+pub mod origin_sealer;
 
 pub mod original_source;
 pub mod transcode;
