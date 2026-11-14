@@ -95,6 +95,11 @@ class Helpers(unittest.TestCase):
         for sc in smoke.fixture.SCENARIOS:
             self.assertTrue(smoke.fixture.request_path(fx, sc).startswith("/rest/"), sc.name)
 
+    def test_snapshot_uses_current_play_ledger(self):
+        sql = smoke.fixture.snapshot_sql()
+        self.assertIn("FROM stream_play_ledger t", sql)
+        self.assertNotIn("FROM usage_ledger t", sql)
+
     def test_fixture_inert_rejects_successful_authenticated_ping(self):
         fx = smoke.fixture.build()
         def query(sql):

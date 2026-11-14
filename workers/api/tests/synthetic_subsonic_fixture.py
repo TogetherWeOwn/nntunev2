@@ -36,7 +36,7 @@ USERS = {"active": ("active", "live", "ok"), "grace": ("past_due", "live", "ok")
          "revoked": ("active", "revoked", "ok"), "deleting": ("active", "live", "deleting")}
 # Tables whose row text must not change while the route is inert.
 OBSERVED = ("users", "subscriptions", "subsonic_credentials", "library", "playlists", "genres",
-            "usage_ledger", "sessions", "auth_challenges")
+            "stream_play_ledger", "sessions", "auth_challenges")
 Fixture = namedtuple("Fixture", "pepper keys")
 Scenario = namedtuple("Scenario", "name kind who path mutates inert active")
 # who: fixture user whose key is sent, or a literal credential shape.
