@@ -51,9 +51,9 @@ def synthetic_refresh_sql(cohort_bytes, memberships, config):
     """Return deterministic SQL bytes for the fixed synthetic fixture only.
 
     Memberships may select a subset of the fixture. The refresh owns every
-    fixture pair: it deletes all fixture wikidata rows and fixture genre
-    roll-ups, then reinserts only the selected ones, so a smaller selection
-    removes previously selected fixture memberships. Nothing else is deleted.
+    fixture pair: it deletes all fixture wikidata rows, genre roll-ups and
+    overrides, then inserts the current selection and configuration. Nothing
+    outside those fixture keys is deleted.
     """
     if (type(memberships) is not list or len(memberships) > len(FIXTURE_PAIRS)
             or any(type(row) is not dict for row in memberships)
@@ -63,8 +63,9 @@ def synthetic_refresh_sql(cohort_bytes, memberships, config):
     parents = [{"genre_qid": c, "parent_qid": p} for c, p in FIXTURE_PARENTS]
     result = resolve_synthetic(cohort_bytes, genres, parents, memberships, config)
     admitted = {q for q, _, _ in FIXTURE_GENRES}
-    if not {row["genre_qid"] for row in result["genre_rollup"]} <= admitted:
-        raise ValueError("roll-up genre outside fixture genres")
+    if (not {row["genre_qid"] for row in result["genre_rollup"]} <= admitted
+            or not {row["genre_qid"] for row in config["overrides"]} <= admitted):
+        raise ValueError("roll-up or override genre outside fixture genres")
     config = _canonical(config)
     genre_rows = [{"genre_qid": q, "label": label} for q, label, _ in FIXTURE_GENRES]
     selected = sorted({(row["artist_mbid"].lower(), row["genre_qid"]) for row in memberships})
@@ -91,6 +92,8 @@ def synthetic_refresh_sql(cohort_bytes, memberships, config):
            + _rows(genre_rows, "genre_qid text") + ");\n"
            "INSERT INTO public.genre_rollup(genre_qid,root_id) SELECT genre_qid,root_id FROM "
            + _rows(result["genre_rollup"], "genre_qid text, root_id text") + ";\n"
+           "DELETE FROM public.genre_override WHERE genre_qid IN (SELECT genre_qid FROM "
+           + _rows(genre_rows, "genre_qid text") + ");\n"
            "INSERT INTO public.genre_override(genre_qid,action,roots,reason) "
            "SELECT genre_qid,action,roots,reason FROM "
            + _rows(overrides, "genre_qid text, action text, roots text[], reason text")

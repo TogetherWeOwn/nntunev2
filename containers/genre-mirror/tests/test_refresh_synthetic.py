@@ -72,7 +72,20 @@ class RefreshSyntheticTests(unittest.TestCase):
             self.assertIn(row["genre_qid"], delete)
         insert = text.split("INSERT INTO public.artist_genre")[1].split(";\n")[0]
         self.assertNotIn(self.rows[1]["genre_qid"], insert.split("jsonb_to_recordset")[1])
-        self.assertEqual(text.count("DELETE FROM"), 2)
+        self.assertEqual(text.count("DELETE FROM"), 3)
+
+    def test_overrides_replace_owned_fixture_scope(self):
+        for overrides in ([{"genre_qid": "Q101", "action": "replace", "roots": ["alpha"],
+                            "reason": "fixture"}], []):
+            cfg = config()
+            cfg["overrides"] = overrides
+            text = self.render(cfg=cfg).decode()
+            delete = text.split("DELETE FROM public.genre_override")[1].split(";\n")[0]
+            self.assertIn('"genre_qid":"Q101"', delete)
+            self.assertLess(text.index("DELETE FROM public.genre_override"),
+                            text.index("INSERT INTO public.genre_override"))
+            insert = text.split("INSERT INTO public.genre_override")[1].split(";\n")[0]
+            self.assertNotIn('"action":"exclude"', insert)
 
     def test_rejects_malformed_and_non_fixture_input(self):
         bad = [[{**self.rows[0], "genre_qid": "Q999"}], [{**self.rows[0], "source": "wikidata"}],
@@ -81,7 +94,9 @@ class RefreshSyntheticTests(unittest.TestCase):
         for rows in bad:
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 self.render(rows)
-        for cfg in ({}, [], None):
+        outside = config()
+        outside["overrides"].append({"genre_qid": "Q999", "action": "exclude", "reason": "fixture"})
+        for cfg in ({}, [], None, outside):
             with self.subTest(cfg=cfg), self.assertRaises(ValueError):
                 self.render(cfg=cfg)
         with patch.object(refresh_synthetic, "MAX_SQL_BYTES", 10), self.assertRaises(ValueError):
