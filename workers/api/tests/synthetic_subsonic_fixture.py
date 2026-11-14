@@ -4,12 +4,11 @@ GitHub Actions only: it is seeded into the run-scoped database that the smoke
 creates and drops, never into an operator, staging or production database.
 Every secret is generated per run from `secrets`, is not a real credential,
 and is never printed. Nothing here activates, mounts or enables a route: the
-fixture is data plus a scenario table, and the smoke asserts /rest stays inert.
+fixture is data plus a scenario table used by the mounted Worker smoke.
 
-Activation verification usage: in a later mount PR run the disposable Actions
-harness with --mirror-fixture and replace the inert assertions with checks of
-actual status, content type, envelope and catalogue contents. For the draft mount,
-a valid key and intact mirror should allow ping and member catalogue reads;
+Activation verification uses the disposable Actions harness with --mirror-fixture
+and checks status, content type, envelope and catalogue contents. A valid key and
+intact mirror should allow ping and member catalogue reads;
 a wrong or revoked key should fail authentication. Repeat ping with MB_DB absent
 to exercise catalogue failure after successful auth. Unknown routes, HLS and
 unsupported operations have terminal responses before auth; mutation endpoints
@@ -48,6 +47,7 @@ SCENARIOS = (
     Scenario("deleting-user", "denial", "deleting", "ping.view", False, "failed", "failed code 44"),
     Scenario("visible-album", "verify", "active", f"getAlbum.view&id={REL}", False, "failed", "member album"),
     Scenario("other-album", "denial", "active", f"getAlbum.view&id={OTHER_REL}", False, "failed", "not found"),
+    Scenario("owner-album-denied", "denial", "nonmember", f"getAlbum.view&id={REL}", False, "failed", "not found"),
     Scenario("nonmember", "denial", "nonmember", "getArtists.view", False, "failed", "UNVERIFIED: library-derived"),
     Scenario("terminal-sub", "terminal", "terminal", "getArtists.view", False, "failed", "UNVERIFIED: billing gate?"),
     Scenario("grace-sub", "terminal", "grace", "getArtists.view", False, "failed", "UNVERIFIED: billing gate?"),
@@ -102,9 +102,8 @@ def seed_sql(fx, mirror=False):
             out.append("INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, "
                        "stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES "
                        f"('{uid}', 'sub_ci_{name}', 'cus_ci_{name}', 'si_ci_{name}', 'price_ci', 'plus', '{sub}');")
-    # Shared catalogue (NULL owner), one member-owned row, one other-owner row for isolation checks.
-    for key, owner, release, recording in (("shared", "NULL", REL, REC),
-                                           ("active", "'ci-fixture-active'", REL, REC),
+    # Distinct owner-only releases prove membership isolation in both directions.
+    for key, owner, release, recording in (("active", "'ci-fixture-active'", REL, REC),
                                            ("other", "'ci-fixture-nonmember'", OTHER_REL, OTHER_REC)):
         out.append("INSERT INTO library (idempotency_key, job_id, user_id, release_mbid, recording_mbids) VALUES "
                    f"('ci-fixture-{key}', 'ci-job-{key}', {owner}, '{release}', ARRAY['{recording}']);")

@@ -196,11 +196,23 @@ def fixture_mounted(base, q, fx, mirror):
                             b"" if sc.mutates else None)
         check(fx.keys[sc.who] not in body, f"fixture {name}: credential echoed")
         check(classify(st, ct, body) == "subsonic-envelope", f"fixture {name}: expected envelope")
+        check(ct.split(";")[0].strip().lower() == "application/json", f"fixture {name}: expected JSON content type")
         return json.loads(body)["subsonic-response"]
 
+    def refused(name, code):
+        response = request(name)
+        check(response.get("status") == "failed" and response.get("error", {}).get("code") == code,
+              f"fixture {name}: expected error {code}")
+
     check(request("ok-ping").get("status") == "ok", "valid key did not authenticate ping")
-    for name in ("wrong-key", "revoked-key", "deleting-user", "mixed-u-and-key"):
-        check(request(name).get("status") == "failed", f"fixture {name}: expected auth refusal")
+    for name in ("wrong-key", "revoked-key", "deleting-user", "malformed-key", "oversize-key"):
+        refused(name, 44)
+    refused("mixed-u-and-key", 43)
+    st, ct, body = http("GET", base + "/rest/ping.view?f=json&apiKey=%ZZ")
+    check(classify(st, ct, body) == "subsonic-envelope" and
+          ct.split(";")[0].strip().lower() == "application/json" and
+          json.loads(body)["subsonic-response"].get("status") == "failed",
+          "malformed percent encoding must fail without a server error")
     for name in ("unknown-op", "hls"):
         sc = scenarios[name]
         st, ct, body = http("GET", base + fixture.request_path(fx, sc))
@@ -210,20 +222,27 @@ def fixture_mounted(base, q, fx, mirror):
         else:
             check(classify(st, ct, body) == "subsonic-text-404", "unknown route must be 404")
     if not mirror:
-        check(request("visible-album").get("status") == "failed", "missing mirror must fail closed")
+        refused("visible-album", 0)
         print("ok: authenticated ping and catalogue refusal without mirror", flush=True)
         return
     visible = request("visible-album")
     check(visible.get("status") == "ok" and visible.get("album", {}).get("id") == fixture.REL,
           "member album missing")
-    check(request("other-album").get("status") == "failed", "private album leaked")
+    songs = visible.get("album", {}).get("song", [])
+    check([song.get("id") for song in songs] == [fixture.REC], "member album recording mismatch")
+    refused("other-album", 70)
+    refused("owner-album-denied", 70)
+    for name in ("nonmember", "terminal-sub", "grace-sub"):
+        check(request(name).get("status") == "ok", f"fixture {name}: expected catalogue access")
     business_tables = ("library", "playlists", "stream_play_ledger")
     snapshot = "SELECT " + " || '/' || ".join(
         f"coalesce((SELECT md5(string_agg(t::text, '|' ORDER BY t::text)) FROM {table} t), '-')"
         for table in business_tables)
     before = q(snapshot)
-    for name in ("scrobble", "star", "playlist", "stream", "stream-denied", "download-terminal"):
-        check(request(name).get("status") == "failed", f"fixture {name}: expected refusal")
+    for name in ("scrobble", "star", "playlist", "download-terminal"):
+        refused(name, 0)
+    for name in ("stream", "stream-denied"):
+        refused(name, 70)
     check(q(snapshot) == before, "refused operations changed observed business state")
     used = q("SELECT last_used_at IS NOT NULL FROM subsonic_credentials WHERE user_id = 'ci-fixture-active'")
     check(used == "t", "successful authentication did not update last_used_at")
