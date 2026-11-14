@@ -172,6 +172,46 @@ mod tests {
             .fingerprint(),
             Err(RequestError::InvalidMetadata)
         ));
+        assert!(matches!(
+            Request {
+                artist: "",
+                ..request()
+            }
+            .fingerprint(),
+            Err(RequestError::InvalidMetadata)
+        ));
+        let half = "x".repeat(MAX_REQUEST_METADATA_BYTES / 2);
+        let over_half = "x".repeat(MAX_REQUEST_METADATA_BYTES / 2 + 1);
+        assert!(Request {
+            title: &half,
+            artist: &half,
+            ..request()
+        }
+        .fingerprint()
+        .is_ok());
+        assert!(matches!(
+            Request {
+                title: &half,
+                artist: &over_half,
+                ..request()
+            }
+            .fingerprint(),
+            Err(RequestError::InvalidMetadata)
+        ));
         assert_eq!(format!("{:?}", RequestError::Conflict), "Conflict");
+    }
+
+    #[test]
+    fn keys_are_bounded_ascii_graphic() {
+        let fingerprint = request().fingerprint().unwrap();
+        let limit = "k".repeat(MAX_KEY_BYTES);
+        let over_limit = "k".repeat(MAX_KEY_BYTES + 1);
+        assert_eq!(replay(&limit, &fingerprint, None), Ok(None));
+        for key in [over_limit.as_str(), "has space", "has\ncontrol"] {
+            assert_eq!(
+                replay(key, &fingerprint, None),
+                Err(RequestError::InvalidKey)
+            );
+        }
     }
 }
