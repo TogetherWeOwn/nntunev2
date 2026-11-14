@@ -574,6 +574,8 @@ jobs:
         run: python3 -I containers/genre-mirror/tests/test_roots.py
       - name: Run offline genre override tests
         run: python3 -I containers/genre-mirror/tests/test_overrides.py
+      - name: Run offline genre and artist rollup tests
+        run: python3 -I containers/genre-mirror/tests/test_rollup.py
       - name: Run R2 snapshot spike golden-set port tests
         run: python3 workers/mb/spike/test_golden.py
       - name: Run R2 snapshot spike recall and baseline framing tests
