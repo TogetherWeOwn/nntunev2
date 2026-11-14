@@ -8932,6 +8932,20 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            let sub = &outcome.row.stripe_subscription_id;
+            if self
+                .billing_rows
+                .borrow()
+                .iter()
+                .any(|(owner, row)| owner != user_id && &row.stripe_subscription_id == sub)
+                || self
+                    .billing_shadow
+                    .borrow()
+                    .keys()
+                    .any(|(owner, id)| owner != user_id && id == sub)
+            {
+                return Err(StoreError);
+            }
             if !outcome.explicit_stale {
                 let mut rows = self.billing_rows.borrow_mut();
                 let mut shadow = self.billing_shadow.borrow_mut();
@@ -11439,7 +11453,9 @@ mod tests {
         let h = stripe_harness();
         let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
         block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
-        block_on(h.store.store_reconcile_outcome("u2", &first)).unwrap();
+        let mut second = first.clone();
+        second.row.stripe_subscription_id = "sub_second".into();
+        block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
 
         let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
         replacement.row.stripe_subscription_id = "sub_other".to_string();
@@ -11450,7 +11466,7 @@ mod tests {
         );
         assert_eq!(
             live_for(&h, "u2").unwrap().stripe_subscription_id,
-            "sub_test_1"
+            "sub_second"
         );
         let shadow = h.store.billing_shadow.borrow();
         let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
@@ -11471,6 +11487,152 @@ mod tests {
             "canceled"
         );
         assert_eq!(shadow.len(), 2);
+    }
+
+    #[test]
+    fn billing_fake_rejects_foreign_identity_without_mutation() {
+        for (owner_status, shadow_only, holder, incoming_history) in [
+            ("active", false, false, false),
+            ("active", false, true, true),
+            ("canceled", false, false, true),
+            ("canceled", true, false, true),
+            ("canceled", true, true, true),
+        ] {
+            let h = stripe_harness();
+            let mut owner = stored_seed(PLAN_PLUS, owner_status, Some(100), Some("in_a"), None);
+            owner
+                .history
+                .push(crate::billing_reconcile::PaidInvoiceRow {
+                    stripe_invoice_id: "in_a".into(),
+                    stripe_subscription_id: "sub_test_1".into(),
+                    plan_id: PLAN_PLUS.into(),
+                    period_start_unix: 0,
+                    period_end_unix: 100,
+                    amount_cents: 1_000,
+                    currency: "usd".into(),
+                    paid_at_unix: 1,
+                });
+            block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
+            if shadow_only {
+                let mut replacement = stored_seed(PLAN_PLUS, "active", None, None, None);
+                replacement.row.stripe_subscription_id = "sub_replacement".into();
+                block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+            }
+            if holder {
+                let mut own = stored_seed(PLAN_PLUS, "active", None, None, None);
+                own.row.stripe_subscription_id = "sub_holder".into();
+                block_on(h.store.store_reconcile_outcome("u2", &own)).unwrap();
+            }
+            let mut incoming = owner.clone();
+            incoming.row.status = "active".into();
+            incoming.row.plan_id = PLAN_PRO.into();
+            incoming.row.paid_through_unix = Some(200);
+            if incoming_history {
+                incoming.history[0].stripe_invoice_id = "in_foreign".into();
+                incoming.history[0].period_end_unix = 200;
+            } else {
+                incoming.history.clear();
+            }
+            let rows = h.store.billing_rows.borrow().clone();
+            let shadow = h.store.billing_shadow.borrow().clone();
+            let history = h.store.invoice_history.borrow().clone();
+            let projections = (live_for(&h, "u1"), live_for(&h, "u2"));
+            for _ in 0..2 {
+                assert!(block_on(h.store.store_reconcile_outcome("u2", &incoming)).is_err());
+                assert_eq!(*h.store.billing_rows.borrow(), rows);
+                assert_eq!(*h.store.billing_shadow.borrow(), shadow);
+                assert_eq!(*h.store.invoice_history.borrow(), history);
+                assert_eq!((live_for(&h, "u1"), live_for(&h, "u2")), projections);
+            }
+        }
+    }
+
+    #[test]
+    fn billing_webhook_foreign_owner_retries_after_attribution_repair() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        seed_billing_user(&h, "u2");
+        deliver_first_period(&h, "evt_original");
+        let owner_before = h.store.billing_rows.borrow()["u1"].clone();
+        let history_before = h.store.invoice_history.borrow().clone();
+        block_on(h.store.create_checkout_operation(
+            "op_collision",
+            "u2",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("incoming op");
+        block_on(h.store.update_checkout_operation(
+            "op_collision",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_collision"),
+        ))
+        .expect("submitted op");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_collision".into(),
+            test_session(
+                "cs_collision",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_collision"),
+            ),
+        );
+        let body = checkout_completed_body("evt_collision", "cs_collision", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert!(live_for(&h, "u2").is_none());
+        let op = block_on(h.store.checkout_operation_by_id("op_collision"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(op.state, "succeeded");
+        assert!(!h.store.webhook_events.borrow().contains("evt_collision"));
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(ensure_checkout_session(
+                    &h.ctx(),
+                    "u2",
+                    PRICE_PLUS,
+                    "https://example.com/ok",
+                    "https://example.com/cancel",
+                    None,
+                )),
+                Err(EnsureCheckoutError::Failed)
+            );
+            assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+            assert_ne!(
+                block_on(h.store.checkout_operation_by_id("op_collision"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "succeeded"
+            );
+            assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+            assert_eq!(*h.store.invoice_history.borrow(), history_before);
+            assert!(live_for(&h, "u2").is_none());
+        }
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_collision")
+            .unwrap()
+            .user_id = "u1".into();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert_eq!(
+            block_on(h.store.checkout_operation_by_id("op_collision"))
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
     }
 
     #[test]
@@ -11502,10 +11664,12 @@ mod tests {
         assert!(select("u2", Some("sub_test_1")).is_none());
         assert!(select("u1", Some("missing")).is_none());
         let mut other = a.clone();
+        other.row.stripe_subscription_id = "sub_u2".into();
         other.row.paid_through_unix = Some(999);
         block_on(h.store.store_reconcile_outcome("u2", &other)).unwrap();
+        assert!(select("u2", Some("sub_test_1")).is_none());
         assert_eq!(
-            select("u2", Some("sub_test_1")).unwrap().paid_through_unix,
+            select("u2", Some("sub_u2")).unwrap().paid_through_unix,
             Some(999)
         );
         let mut current = b.row.clone();
