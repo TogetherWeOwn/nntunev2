@@ -6038,6 +6038,33 @@ fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError
     }
 }
 
+#[allow(dead_code)] // Used by the mount in the next slice.
+fn pre_auth_subsonic_response(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> Option<nntune_subsonic::HttpResponse> {
+    use nntune_subsonic::routes::{route, Route};
+    use nntune_subsonic::{MemStore, SubsonicApp};
+
+    matches!(
+        route(path),
+        Route::PublicEndpoint(_) | Route::Hls | Route::Unknown | Route::Unsupported(_)
+    )
+    .then(|| SubsonicApp::production(MemStore::empty()).handle(method, path, query, body))
+}
+
+#[allow(dead_code)] // Used by the mount in the next slice.
+fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
+    let mut response = Response::from_bytes(res.body.clone())?.with_status(res.status);
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -6235,6 +6262,43 @@ mod tests {
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
+
+    #[test]
+    fn mount_routes_terminal_paths_before_authentication() {
+        for (path, status, body) in [
+            ("/rest/hls.m3u8", 410, "Gone"),
+            ("/rest/not-a-route.view", 404, "Not Found"),
+            ("/rest/jukeboxControl.view", 200, "not supported"),
+        ] {
+            let response = pre_auth_subsonic_response("GET", path, "f=json", "").unwrap();
+            assert_eq!(response.status, status, "{path}");
+            assert!(String::from_utf8(response.body).unwrap().contains(body));
+        }
+        for endpoint in [
+            "ping",
+            "createPlaylist",
+            "updatePlaylist",
+            "deletePlaylist",
+            "scrobble",
+            "star",
+            "unstar",
+            "setRating",
+            "savePlayQueue",
+            "refreshPodcasts",
+            "createPodcastChannel",
+            "deletePodcastChannel",
+        ] {
+            let path = format!("/rest/{endpoint}.view");
+            assert!(pre_auth_subsonic_response("GET", &path, "f=json", "").is_none());
+        }
+        assert!(pre_auth_subsonic_response(
+            "GET",
+            "/rest/getOpenSubsonicExtensions.view",
+            "f=json",
+            ""
+        )
+        .is_some());
     }
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
