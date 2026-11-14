@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-const MAX_METADATA_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_METADATA_BYTES: usize = 16 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 128;
 
@@ -39,8 +39,8 @@ impl Request<'_> {
             || fields
                 .iter()
                 .flatten()
-                .any(|s| s.len() > MAX_METADATA_BYTES)
-            || fields.iter().flatten().map(|s| s.len()).sum::<usize>() > MAX_METADATA_BYTES
+                .any(|s| s.len() > MAX_REQUEST_METADATA_BYTES)
+            || fields.iter().flatten().map(|s| s.len()).sum::<usize>() > MAX_REQUEST_METADATA_BYTES
         {
             return Err(RequestError::InvalidMetadata);
         }
@@ -155,7 +155,7 @@ mod tests {
         }
         .fingerprint()
         .is_ok());
-        let long = "x".repeat(MAX_METADATA_BYTES + 1);
+        let long = "x".repeat(MAX_REQUEST_METADATA_BYTES + 1);
         assert!(matches!(
             Request {
                 title: &long,
