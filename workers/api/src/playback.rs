@@ -123,6 +123,18 @@ pub struct LeaseRow {
     pub expires_at: u64,
 }
 
+/// Continuation deadline for a play acquired at `now`: a known positive
+/// duration rounds up to whole seconds plus [`LEASE_TTL_SECS`] of slack;
+/// an unknown or zero duration falls back to the grant TTL cap.
+/// Saturating, so it never wraps.
+pub fn continuation_until(now: u64, duration_ms: Option<u64>) -> u64 {
+    let window = match duration_ms {
+        Some(ms) if ms > 0 => ms.div_ceil(1000).saturating_add(LEASE_TTL_SECS),
+        _ => crate::play_grant::MAX_GRANT_TTL,
+    };
+    now.saturating_add(window)
+}
+
 impl LeaseRow {
     /// True while the lease has not expired at `now` (strict: at the
     /// expiry instant it is already free for other sessions, matching
@@ -268,6 +280,27 @@ mod tests {
         // player's lease. Pinning both values pins the ratio.
         assert_eq!(LEASE_TTL_SECS, 45);
         assert_eq!(HEARTBEAT_INTERVAL_SECS, 15);
+    }
+
+    #[test]
+    fn continuation_deadline_computation() {
+        assert_eq!(
+            continuation_until(NOW, Some(180_000)),
+            NOW + 180 + LEASE_TTL_SECS
+        );
+        assert_eq!(
+            continuation_until(NOW, Some(180_001)),
+            NOW + 181 + LEASE_TTL_SECS
+        );
+        assert_eq!(continuation_until(NOW, Some(1)), NOW + 1 + LEASE_TTL_SECS);
+        assert_eq!(continuation_until(NOW, None), NOW + 900);
+        assert_eq!(continuation_until(NOW, Some(0)), NOW + 900);
+        assert_eq!(continuation_until(u64::MAX - 1, Some(180_000)), u64::MAX);
+        assert_eq!(continuation_until(u64::MAX, None), u64::MAX);
+        assert_eq!(
+            continuation_until(NOW, Some(u64::MAX)),
+            NOW + u64::MAX.div_ceil(1000) + LEASE_TTL_SECS
+        );
     }
 
     #[test]
