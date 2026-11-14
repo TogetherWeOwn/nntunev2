@@ -104,7 +104,7 @@ pub fn wrap_scheme2(
     let cipher = cipher(root, &prefix)?;
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&[0; 12]),
+            &Nonce::from([0; 12]),
             Payload {
                 msg: key,
                 aad: &aad(&prefix),
@@ -134,7 +134,7 @@ pub fn unwrap_scheme2(
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(
-                Nonce::from_slice(&[0; 12]),
+                &Nonce::from([0; 12]),
                 Payload {
                     msg: &record[182..],
                     aad: &aad(&prefix),
