@@ -1004,3 +1004,68 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     assert_eq!(fx.rows("u2").await, 1);
     fx.cleanup().await;
 }
+
+// The fixture relation is migrated in a private, generated schema. These
+// clients never lock or write the public production-named relation.
+#[tokio::test]
+async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let fx = Fx::new().await;
+    fx.add_user("lock_owner").await;
+    fx.raw("lock_owner", "sub_lock", "active", None).await;
+    let url = std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap();
+    let config = disposable_config(&url).unwrap();
+    let schema = &fx.schema;
+    let mut pending = None;
+    let mut drivers = Vec::new();
+
+    let result: Result<(), String> = async {
+        let (writer, writer_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "writer connection timed out".to_string())?.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(writer_connection));
+        let (reader, reader_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "reader connection timed out".to_string())?.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(reader_connection));
+        let (holder_pid, writer_pid) = timeout(Duration::from_secs(5), async {
+            fx.db.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout = '15s'; SET LOCAL transaction_timeout = '15s'; SET LOCAL statement_timeout = '4s'").await?;
+            fx.db.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await?;
+            writer.batch_execute("SET statement_timeout = '10s'").await?;
+            let holder_pid: i32 = fx.db.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            Ok::<_, tokio_postgres::Error>((holder_pid, writer_pid))
+        }).await.map_err(|_| "lock setup timed out".to_string())?.map_err(|e| e.to_string())?;
+        let sql = format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = true WHERE stripe_subscription_id = 'sub_lock'");
+        pending = Some(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
+        let task = pending.as_mut().unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut *task => return Err(format!("writer finished before observed block: {result:?}")),
+                    result = reader.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &[&holder_pid, &writer_pid]) => {
+                        if result.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        }).await.map_err(|_| "writer blocking observation timed out".to_string())??;
+        let row = timeout(Duration::from_secs(5), reader.query_one(&format!("SELECT cancel_at_period_end FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub_lock'"), &[])).await.map_err(|_| "plain read timed out".to_string())?.map_err(|e| e.to_string())?;
+        if row.get::<_, bool>(0) { return Err("writer changed row before lock release".into()); }
+        timeout(Duration::from_secs(5), fx.db.batch_execute("COMMIT")).await.map_err(|_| "commit timed out".to_string())?.map_err(|e| e.to_string())?;
+        let count = timeout(Duration::from_secs(5), &mut *task).await.map_err(|_| "writer completion timed out".to_string())?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        if count != 1 { return Err(format!("writer affected {count} rows")); }
+        Ok(())
+    }.await;
+
+    if let Some(task) = pending {
+        task.abort();
+    }
+    let _ = timeout(Duration::from_secs(5), fx.db.batch_execute("ROLLBACK")).await;
+    for driver in drivers {
+        driver.abort();
+    }
+    timeout(Duration::from_secs(5), fx.cleanup())
+        .await
+        .expect("fixture cleanup timed out");
+    result.expect("contention phases failed");
+}
