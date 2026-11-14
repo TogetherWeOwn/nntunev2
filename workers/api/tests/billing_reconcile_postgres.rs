@@ -1100,11 +1100,18 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         task.abort();
     }
     let _ = timeout(Duration::from_secs(5), fx.db.batch_execute("ROLLBACK")).await;
+    let cleanup = timeout(
+        Duration::from_secs(5),
+        fx.db
+            .batch_execute(&format!("DROP SCHEMA {} CASCADE", fx.schema)),
+    )
+    .await;
     for driver in drivers {
         driver.abort();
     }
-    timeout(Duration::from_secs(5), fx.cleanup())
-        .await
-        .expect("fixture cleanup timed out");
+    assert!(
+        matches!(cleanup, Ok(Ok(()))),
+        "fixture cleanup failed: {cleanup:?}; contention phases: {result:?}"
+    );
     result.expect("contention phases failed");
 }
