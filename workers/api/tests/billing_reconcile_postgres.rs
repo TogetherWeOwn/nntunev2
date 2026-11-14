@@ -1019,6 +1019,8 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         std::process::id(),
         SCHEMA.fetch_add(1, Ordering::Relaxed)
     );
+    let role = format!("{schema}_dml");
+    let read_role = format!("{schema}_read");
     let (db, connection) = timeout(Duration::from_secs(5), config.connect(NoTls))
         .await
         .expect("fixture connection timed out")
@@ -1036,7 +1038,7 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         }
         db.execute("INSERT INTO users (id,email,created_at) VALUES ('lock_owner','lock_owner@example.test',$1)", &[&T]).await?;
         db.execute("INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES ('lock_owner','sub_lock',$1,'si_raw',$2,'plus','active')", &[&CUS, &PRICE]).await?;
-        db.batch_execute(&format!("SET search_path TO {schema}; COMMIT")).await
+        db.batch_execute(&format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; CREATE ROLE {read_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; GRANT USAGE ON SCHEMA {schema} TO {role}, {read_role}; GRANT SELECT, INSERT, UPDATE, DELETE ON {schema}.subscriptions TO {role}; GRANT SELECT ON {schema}.subscriptions TO {read_role}; SET search_path TO {schema}; COMMIT")).await
     }).await;
     if !matches!(setup, Ok(Ok(()))) {
         // Close an uncertain transaction before trying to remove a possibly committed schema.
@@ -1046,7 +1048,7 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
             let (cleanup_db, cleanup_connection) = config.connect(NoTls).await?;
             let cleanup_driver = tokio::spawn(cleanup_connection);
             let result = cleanup_db
-                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {role}; DROP ROLE IF EXISTS {read_role}"))
                 .await;
             cleanup_driver.abort();
             result
@@ -1064,14 +1066,45 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         drivers.push(tokio::spawn(writer_connection));
         let (reader, reader_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "reader connection timed out".to_string())?.map_err(|e| e.to_string())?;
         drivers.push(tokio::spawn(reader_connection));
-        let (holder_pid, writer_pid) = timeout(Duration::from_secs(5), async {
-            fx.db.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout = '15s'; SET LOCAL transaction_timeout = '15s'; SET LOCAL statement_timeout = '4s'").await?;
+        timeout(Duration::from_secs(5), async {
+            writer.batch_execute(&format!("BEGIN; SET LOCAL ROLE {read_role}; SET LOCAL statement_timeout = '4s'")).await?;
+            writer.query_one(&format!("SELECT count(*) FROM {schema}.subscriptions"), &[]).await?;
+            let denied = writer.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await;
+            writer.batch_execute("ROLLBACK").await?;
+            Ok::<_, tokio_postgres::Error>(denied)
+        }).await.map_err(|_| "permission check timed out".to_string())?.map_err(|e| e.to_string())?
+            .err().and_then(|e| e.code().cloned())
+            .filter(|code| code == &tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+            .ok_or_else(|| "lock denial was not insufficient_privilege".to_string())?;
+        let (holder_pid, writer_pid, holder) = timeout(Duration::from_secs(5), async {
+            fx.db.batch_execute(&format!("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL ROLE {role}; SET LOCAL lock_timeout = '2s'; SET LOCAL idle_in_transaction_session_timeout = '5s'; SET LOCAL transaction_timeout = '15s'; SET LOCAL statement_timeout = '4s'")).await?;
             fx.db.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await?;
+            fx.db.query_one(&format!("SELECT count(*) FROM {schema}.subscriptions"), &[]).await?;
+            fx.db.execute(&format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = false WHERE stripe_subscription_id = 'sub_lock'"), &[]).await?;
             writer.batch_execute("SET statement_timeout = '10s'").await?;
-            let holder_pid: i32 = fx.db.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let holder = fx.db.query_one("SELECT pg_backend_pid(), current_user::text, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'), current_setting('transaction_timeout')", &[]).await?;
+            let holder_pid: i32 = holder.get(0);
             let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
-            Ok::<_, tokio_postgres::Error>((holder_pid, writer_pid))
+            Ok::<_, tokio_postgres::Error>((holder_pid, writer_pid, holder))
         }).await.map_err(|_| "lock setup timed out".to_string())?.map_err(|e| e.to_string())?;
+        if holder.get::<_, String>(1) != role || holder.get::<_, bool>(2)
+            || holder.get::<_, String>(3) != "2s" || holder.get::<_, String>(4) != "4s"
+            || holder.get::<_, String>(5) != "5s" || holder.get::<_, String>(6) != "15s" {
+            return Err("restricted backend role or transaction-local settings differ".into());
+        }
+        let (baseline, after, timeout_error, same_backend) = timeout(Duration::from_secs(4), async {
+            let baseline: String = writer.query_one("SHOW lock_timeout", &[]).await?.get(0);
+            writer.batch_execute(&format!("BEGIN; SET LOCAL ROLE {role}; SET LOCAL lock_timeout = '250ms'; SET LOCAL statement_timeout = '3s'; SET LOCAL transaction_timeout = '4s'")).await?;
+            let pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let error = writer.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await;
+            writer.batch_execute("ROLLBACK").await?;
+            let after: String = writer.query_one("SHOW lock_timeout", &[]).await?.get(0);
+            let after_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            Ok::<_, tokio_postgres::Error>((baseline, after, error, pid == writer_pid && pid == after_pid))
+        }).await.map_err(|_| "bounded lock wait timed out externally".to_string())?.map_err(|e| e.to_string())?;
+        if !same_backend || baseline != after { return Err("transaction settings or backend were not restored".into()); }
+        let timeout_error = timeout_error.err().ok_or_else(|| "contended lock unexpectedly succeeded".to_string())?;
+        if timeout_error.code() != Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) { return Err(format!("unexpected lock error: {timeout_error}")); }
         let sql = format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = true WHERE stripe_subscription_id = 'sub_lock'");
         pending = Some(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
         let task = pending.as_mut().unwrap();
@@ -1102,8 +1135,10 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
     let _ = timeout(Duration::from_secs(5), fx.db.batch_execute("ROLLBACK")).await;
     let cleanup = timeout(
         Duration::from_secs(5),
-        fx.db
-            .batch_execute(&format!("DROP SCHEMA {} CASCADE", fx.schema)),
+        fx.db.batch_execute(&format!(
+            "DROP SCHEMA {} CASCADE; DROP ROLE {role}; DROP ROLE {read_role}",
+            fx.schema
+        )),
     )
     .await;
     for driver in drivers {
