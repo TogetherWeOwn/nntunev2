@@ -483,6 +483,53 @@ async fn null_evidence_updates_status_and_bindings_but_never_coverage() {
 }
 
 #[tokio::test]
+async fn predicate_stale_without_the_flag_keeps_bindings_and_mutable_fields() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    for (end, anchor) in [(T + P, Some("inv_old")), (T + 2 * P, None)] {
+        let mut stale = divergent(&fx, "sub_a", &stored).await;
+        stale.row.paid_through_unix = Some(end);
+        stale.row.paid_invoice_id = anchor.map(str::to_string);
+        assert!(!stale.explicit_stale);
+        fx.put("u1", &stale).await;
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()), "end {end}");
+    }
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancellation_follows_the_fresh_pass_and_binding_is_stable_under_stale() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let stored = fx.seed_active("u1", "sub_a").await;
+    let mut remote = remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]);
+    remote.subscription.cancel_at_period_end = true;
+    let cancel = fx.fold("u1", &remote).await;
+    assert!(!cancel.explicit_stale);
+    fx.put("u1", &cancel).await;
+    let mut expected = stored.clone();
+    expected.cancel = true;
+    assert_eq!(fx.snap("sub_a").await, Some(expected.clone()));
+
+    let mut stale = divergent(&fx, "sub_a", &expected).await;
+    stale.row.paid_through_unix = Some(T + P);
+    assert!(!stale.explicit_stale);
+    fx.put("u1", &stale).await;
+    assert_eq!(fx.snap("sub_a").await, Some(expected.clone()));
+
+    remote.subscription.cancel_at_period_end = false;
+    let clear = fx.fold("u1", &remote).await;
+    assert!(!clear.explicit_stale);
+    fx.put("u1", &clear).await;
+    expected.cancel = false;
+    assert_eq!(fx.snap("sub_a").await, Some(expected));
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn explicit_stale_suppresses_every_update_whatever_the_evidence_end() {
     let mut fx = Fx::new().await;
     fx.add_user("u1").await;
@@ -792,6 +839,11 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     let mut stale = a.clone();
     stale.row.paid_through_unix = Some(50);
     stale.row.status = "incomplete_expired".into();
+    stale.row.stripe_customer_id = "cus_stale".into();
+    stale.row.stripe_item_id = "si_stale".into();
+    stale.row.stripe_price_id = "price_stale".into();
+    stale.row.current_period_end_unix = Some(50);
+    stale.row.cancel_at_period_end = true;
     for _ in 0..2 {
         fx.put("u1", &stale).await;
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
@@ -864,6 +916,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         if case == "advance-null-anchor" {
             incoming.row.paid_through_unix = Some(150);
         }
+        let stored_before = fx.snap(&sub).await.unwrap();
         fx.put("u1", &incoming).await;
         let mut expected = Snap {
             user_id: "u1".into(),
@@ -885,8 +938,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             expected.anchor = Some("in_old".into());
         }
         if case == "no-anchor" {
-            expected.status = "canceled".into();
-            expected.grace = Some(10);
+            expected = stored_before;
         }
         if case == "advance-null-anchor" {
             expected.paid_through = Some(150);
