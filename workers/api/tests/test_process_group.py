@@ -75,18 +75,28 @@ class ProcessGroupTests(unittest.TestCase):
         ):
             process_group.shutdown_process_group(self.process)
 
-    def test_rejects_unsafe_group_and_unbounded_timeouts(self):
+    def test_rejects_caller_group(self):
         with (
             patch.object(process_group.os, "getpgrp", return_value=self.process.pid),
             patch.object(process_group.os, "killpg") as kill,
+            self.assertRaises(ValueError),
         ):
-            with self.assertRaises(ValueError):
-                process_group.shutdown_process_group(self.process)
-            with self.assertRaises(ValueError):
-                process_group.shutdown_process_group(
-                    self.process, term_timeout=float("inf")
-                )
+            process_group.shutdown_process_group(self.process)
         kill.assert_not_called()
+
+    def test_rejects_invalid_timeouts_before_signalling(self):
+        with (
+            patch.object(process_group.os, "getpgrp", return_value=99),
+            patch.object(process_group.os, "killpg") as kill,
+        ):
+            for parameter in ("term_timeout", "kill_timeout"):
+                for value in (-1, float("inf"), float("nan")):
+                    with self.subTest(parameter=parameter, value=value):
+                        with self.assertRaises(ValueError):
+                            process_group.shutdown_process_group(
+                                self.process, **{parameter: value}
+                            )
+                        kill.assert_not_called()
 
 
 if __name__ == "__main__":
