@@ -54,10 +54,13 @@ class ReceiptTests(unittest.TestCase):
             verify_receipts(self.directory)
 
     def test_rejects_duplicate_keys_and_nonfinite_numbers(self):
-        for raw in (b'{"schema":1,"schema":2}', b'{"schema":NaN}'):
-            self.path.write_bytes(raw)
-            with self.assertRaises(ValueError):
-                verify_receipts(self.directory)
+        valid = json.dumps(self.manifest)
+        for prefix, error in (('"schema":"unknown",', "duplicate JSON key"),
+                              ('"extra":NaN,', "non-finite JSON")):
+            with self.subTest(error=error):
+                self.path.write_text("{" + prefix + valid[1:], encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error):
+                    verify_receipts(self.directory)
 
     def test_rejects_tampering_and_invalid_receipts(self):
         name = "genres.jsonl"
