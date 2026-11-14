@@ -1704,7 +1704,7 @@ jobs:
       - name: Exercise Worker routing with disposable PostgreSQL
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
-          python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service
+          python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
       - name: Upload Worker build logs
