@@ -7494,9 +7494,8 @@ mod tests {
         // The same staleness predicate guards
         // `status` and `grace_until`: strictly older money — or the
         // anchor-less equal-end shape only the stale fold emits — keeps
-        // the stored verbatim fields instead of writing stale ones over
-        // a fresher pass. Bindings still update verbatim; history still
-        // converges on the invoice id.
+        // the entire stored row instead of writing stale fields over
+        // a fresher pass. History still converges on the invoice id.
         match existing {
             Some(existing)
                 if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
@@ -7531,6 +7530,9 @@ mod tests {
                     }
                     _ => false,
                 };
+                if stale {
+                    return existing.clone();
+                }
                 let mut row = outcome.row.clone();
                 if !advances && !relabels {
                     row.paid_through_unix = existing.paid_through_unix;
@@ -7538,10 +7540,6 @@ mod tests {
                     row.paid_invoice_id = existing.paid_invoice_id.clone();
                 } else if row.paid_invoice_id.is_none() {
                     row.paid_invoice_id = existing.paid_invoice_id.clone();
-                }
-                if stale {
-                    row.status = existing.status.clone();
-                    row.grace_until_unix = existing.grace_until_unix;
                 }
                 row
             }
@@ -11262,7 +11260,7 @@ mod tests {
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
-        let stale = crate::billing_reconcile::ReconcileOutcome {
+        let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
@@ -11272,7 +11270,18 @@ mod tests {
             read_plan: Some(PLAN_PLUS.to_string()),
             read_anchor: Some("in_test_2".to_string()),
         };
+        stale.row.stripe_customer_id = "cus_delayed".into();
+        stale.row.stripe_item_id = "si_delayed".into();
+        stale.row.stripe_price_id = PRICE_PRO.into();
+        stale.row.plan_id = PLAN_PRO.into();
+        stale.row.current_period_end_unix = Some(BILLING_NOW - 1);
+        stale.row.cancel_at_period_end = true;
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
+        stale.row.paid_through_unix = fresh.row.paid_through_unix;
+        stale.row.paid_invoice_id = None;
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("tie stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(
             live.paid_through_unix,
@@ -11301,6 +11310,12 @@ mod tests {
             2,
             "both paid invoices keep their history rows"
         );
+        let mut next = stale.clone();
+        next.row.paid_through_unix = Some(BILLING_NOW + 2 * BILLING_PERIOD);
+        next.row.paid_invoice_id = Some("in_next".into());
+        next.history.clear();
+        block_on(h.store.store_reconcile_outcome("u1", &next)).expect("fresh update stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], next.row);
     }
 
     /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
@@ -11720,12 +11735,12 @@ mod tests {
         let mut stale = a.clone();
         stale.row.paid_through_unix = Some(50);
         stale.row.status = "incomplete_expired".to_string();
-        let mut expected = stale.row.clone();
-        expected.paid_through_unix = a.row.paid_through_unix;
-        expected.paid_invoice_id = a.row.paid_invoice_id.clone();
-        expected.plan_id = a.row.plan_id.clone();
-        expected.status = a.row.status.clone();
-        expected.grace_until_unix = a.row.grace_until_unix;
+        stale.row.stripe_customer_id = "cus_stale".into();
+        stale.row.stripe_item_id = "si_stale".into();
+        stale.row.stripe_price_id = "price_stale".into();
+        stale.row.current_period_end_unix = Some(50);
+        stale.row.cancel_at_period_end = true;
+        let expected = a.row.clone();
         for _ in 0..2 {
             put("u1", &stale);
             assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
@@ -11837,8 +11852,7 @@ mod tests {
                 expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
             }
             if case == "no-anchor" {
-                expected.status = stored.row.status.clone();
-                expected.grace_until_unix = stored.row.grace_until_unix;
+                expected = stored.row.clone();
             }
             for outcome in [&stored, &replacement, &incoming] {
                 block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
