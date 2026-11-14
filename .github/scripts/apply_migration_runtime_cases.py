@@ -10,10 +10,9 @@ endpoint is contacted; credentials come from ``env`` only.
 
 Covered:
 
-- the five frozen mirror migrations, applied in manifest order with the
+- the frozen mirror migrations, applied in manifest order with the
   repository manifest, match an independent raw ``psql`` apply of the
-  same files (catalog fingerprint) and re-running all five changes
-  nothing;
+  same files (catalog fingerprint) and re-running them changes nothing;
 - real concurrent CLI applies of one non-idempotent file produce one
   effect and one receipt;
 - injected receipt-insert and SQL failures leave the independently
@@ -63,6 +62,8 @@ MIRROR_FILES = [
      "62ceb24df9c5ea7032fc3cf4e48e5e10f87d909639fa469ed79b4dfcd92009d6"),
     ("0030_mb_mirror_w6b.sql",
      "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"),
+    ("0041_cc0_genre.sql",
+     "bada2a0d607632dccb5b66a6bfca72a198f204d42e8ff8dd08f1e4b3a0134140"),
 ]
 
 ADVISORY_KEY = 7271901
@@ -334,7 +335,7 @@ def assert_frozen_mirror(manifest):
         assert hashlib.sha256(data).hexdigest() == sha, f"{name} bytes changed"
 
 
-def case_mirror_five(env):
+def case_mirror_ordered(env):
     assert_frozen_mirror(REAL_MANIFEST)
 
     with fresh_database(env, "nntune_rt_mirror_ref") as (ref_env, _ref_url):
@@ -385,13 +386,13 @@ def case_mirror_five(env):
                              "--expect-database", database])
             assert proc.returncode == 0 and "already recorded" in proc.stdout, name
         assert receipt_rows(menv) == before_rows, "re-run changed the ledger"
-        assert count(menv, "public.schema_migrations") == "5"
+        assert count(menv, "public.schema_migrations") == str(len(MIRROR_FILES))
         assert catalog_fingerprint(menv) == before_fp == reference
         assert mirror_seed(menv) == reference_seed, "re-run changed deterministic seed"
         assert _base().scalar(menv,
             "SELECT row_to_json(s)::text FROM public.mb_import_state s ORDER BY id;") \
             == before_seed, "re-run changed seed rows (including generated timestamp)"
-    log("mirror-five-ordered-and-idempotent")
+    log("mirror-ordered-and-idempotent")
 
 
 def case_concurrent(env):
@@ -902,7 +903,7 @@ def case_noop_acl(env):
 def run(env, test_env):
     """Entry point; ``test_env`` (the suite's database) is not reused."""
     assert test_env.get("PGDATABASE") != env.get("PGDATABASE")
-    for case in (case_mirror_five, case_concurrent, case_injected_failures,
+    for case in (case_mirror_ordered, case_concurrent, case_injected_failures,
                  case_controlled_session, case_application_namespace,
                  case_wrong_expected_database,
                  case_timeout_and_unknown_commit, case_wrappers, case_noop_acl):
