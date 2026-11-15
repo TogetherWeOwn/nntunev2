@@ -109,16 +109,18 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
 
 #[tokio::test]
 async fn member_target_queries_isolate_caller_and_kind() {
-    use nntune_api::catalogue::member_target_statement;
-    use nntune_api::target_identity::{canonical_target_id, TargetKind};
-    let app = client(false).await;
-    app.batch_execute(
-        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
-         ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
-         (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
-         ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff']),
-         ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[])"
-    ).await.unwrap();
+    use nntune_api::target_identity::TargetKind;
+    async fn seeded() -> Client {
+        let app = client(false).await;
+        app.batch_execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
+             ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
+             (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
+             ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff']),
+             ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[])"
+        ).await.unwrap();
+        app
+    }
     for (kind, target, expected) in [
         (TargetKind::Track, "Job_Own", true),
         (TargetKind::Track, "job_own", false),
@@ -169,24 +171,44 @@ async fn member_target_queries_isolate_caller_and_kind() {
         (TargetKind::Track, "x' OR true --", false),
         (TargetKind::Release, "x' OR true --", false),
     ] {
-        let target = match kind {
-            TargetKind::Track => target.to_owned(),
-            TargetKind::Release => canonical_target_id(target),
-        };
-        let rows = app
-            .query(member_target_statement(kind), &[&"u1", &target])
-            .await
-            .unwrap();
-        assert_eq!(!rows.is_empty(), expected, "{kind:?} {target}");
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(
+            seeded().await,
+            false,
+            Err(StoreError),
+            attempts.clone(),
+        );
+        assert_eq!(
+            store
+                .catalogue_member_target("u1", kind, target)
+                .await
+                .unwrap(),
+            expected,
+            "{kind:?} {target}"
+        );
+        assert_eq!(attempts.get(), 0);
     }
-    let rows = app
-        .query(
-            member_target_statement(TargetKind::Track),
-            &[&"u1' OR true --", &"Job_Own"],
-        )
+    let store = catalogue_store_for_postgres_test(
+        seeded().await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    assert!(
+        !store
+            .catalogue_member_target("u1' OR true --", TargetKind::Track, "Job_Own")
+            .await
+            .unwrap(),
+        "owner must also be bound"
+    );
+    let app = seeded().await;
+    app.batch_execute("DROP TABLE library").await.unwrap();
+    let store =
+        catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+    assert!(store
+        .catalogue_member_target("u1", TargetKind::Track, "Job_Own")
         .await
-        .unwrap();
-    assert!(rows.is_empty(), "owner must also be bound");
+        .is_err());
 }
 
 #[tokio::test]

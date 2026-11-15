@@ -2454,6 +2454,38 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn catalogue_member_target(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let target = match kind {
+                    crate::target_identity::TargetKind::Track => target.to_owned(),
+                    crate::target_identity::TargetKind::Release => {
+                        if !crate::catalogue::is_catalogue_mbid(target) {
+                            return Ok(false);
+                        }
+                        crate::target_identity::canonical_target_id(target)
+                    }
+                };
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::catalogue::member_target_statement(kind),
+                        &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
