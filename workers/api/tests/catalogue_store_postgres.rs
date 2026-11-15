@@ -790,3 +790,109 @@ async fn synthetic_fixture_round_trips_complete_catalogue() {
     }
     assert_eq!(attempts, 1);
 }
+
+#[tokio::test]
+async fn snapshot_membership_sentinels_reject_before_mirror() {
+    for pair_mode in [false, true] {
+        for count in [3_u32, 4, 5] {
+            let ids: Vec<String> = (1..=count).map(|n| synthetic_uuid(1, n)).collect();
+            let app = client(false).await;
+            if pair_mode {
+                app.execute(
+                    "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'pairs', $1, $2)",
+                    &[&SNAPSHOT_RELEASE, &ids],
+                ).await.unwrap();
+            } else {
+                app.execute(
+                    "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) SELECT 'u1', r, r, ARRAY[]::text[] FROM unnest($1::text[]) AS r",
+                    &[&ids],
+                ).await.unwrap();
+            }
+            let (result, attempts) = snapshot_of(app, mirror_client().await, 2).await;
+            assert_eq!(result.is_ok(), count < 4, "pair={pair_mode}, count={count}");
+            if count >= 4 {
+                assert_eq!(attempts, 0);
+            }
+        }
+    }
+    let app = client(false).await;
+    let malformed: Vec<String> = (0..4).map(|n| format!("invalid-{n}")).collect();
+    app.execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'flood', $1, $2)",
+        &[&SNAPSHOT_RELEASE, &malformed],
+    ).await.unwrap();
+    let (result, attempts) = snapshot_of(app, mirror_client().await, 2).await;
+    assert!(
+        result.is_err(),
+        "malformed pairs must count before filtering"
+    );
+    assert_eq!(attempts, 0);
+    for cap in [0, -1, i64::MAX] {
+        let (result, attempts) = snapshot_of(client(false).await, mirror_client().await, cap).await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 0);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_overlong_membership_ids_keep_valid_neighbours() {
+    let (app, mirror) = sized_fixture(1, SHORT, "a").await;
+    let long = "x".repeat(5000);
+    app.execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'long-release', $1, ARRAY[$2]), ('u1', 'long-recording', $3, ARRAY[$1])",
+        &[&long, &synthetic_uuid(2, 1), &synthetic_uuid(1, 1)],
+    ).await.unwrap();
+    let (result, attempts) = snapshot_of(app, mirror, 100).await;
+    let (artists, releases, tracks) = result.unwrap();
+    assert_eq!((artists.len(), releases.len(), tracks.len()), (1, 1, 1));
+    assert_eq!(tracks[0].recording_mbid, synthetic_uuid(2, 1));
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn snapshot_membership_queries_share_one_committed_snapshot() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("nntune_member_{}_{}", std::process::id(), nonce);
+    let writer = shared_connection(&schema).await.unwrap();
+    create_shared_app(&writer, &schema).await.unwrap();
+    let result: Result<(), String> = async {
+        writer.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'original', $1, ARRAY[$2])",
+            &[&SNAPSHOT_RELEASE, &RECORDING],
+        ).await.map_err(|e| e.to_string())?;
+        let reader = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let mirror = mirror_client().await;
+        mirror.batch_execute(&format!(
+            "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Sort', 'Person', 'US');
+             INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+             INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+             INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+        )).await.map_err(|e| e.to_string())?;
+        let mutation = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(reader, true, Ok(mirror), attempts);
+        store.set_membership_hook(Box::new(move || Box::pin(async move {
+            mutation.execute("UPDATE library SET recording_mbids = ARRAY[]::text[]", &[])
+                .await.map_err(|_| StoreError)?;
+            Ok(())
+        })));
+        let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10)
+            .await.map_err(|_| "snapshot failed".to_owned())?;
+        let committed: Vec<String> = writer.query_one("SELECT recording_mbids FROM library", &[])
+            .await.map_err(|e| e.to_string())?.get(0);
+        if !committed.is_empty() || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+            || releases[0].mbid != SNAPSHOT_RELEASE || tracks[0].recording_mbid != RECORDING {
+            return Err("membership snapshot mixed old and new states".into());
+        }
+        Ok(())
+    }.await;
+    writer
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    result.unwrap();
+}
