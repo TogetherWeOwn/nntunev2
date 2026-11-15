@@ -246,6 +246,12 @@ async fn preference_collections_are_bounded_scoped_and_fail_closed() {
         .any(|r| r.kind == "track" && r.target_id == "Job-501"));
     assert_eq!(rows[0].created_at, 502);
     assert!(!rows.iter().any(|r| r.target_id == "Job-1"));
+    let store = catalogue_store_for_postgres_test(
+        seeded().await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
     assert!(store
         .likes_list("collection-owner' OR true --")
         .await
