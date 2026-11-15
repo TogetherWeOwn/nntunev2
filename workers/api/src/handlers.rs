@@ -1553,6 +1553,21 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<crate::preference_rows::TasteDbRow>, StoreError>> {
         async { Err(StoreError) }
     }
+    /// List bounded collections for the authenticated owner; handlers must retain
+    /// the deleting-account read fence before calling these inert methods.
+    fn likes_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn taste_list(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Write a resolved identity using server-supplied owner and time. Missing or
     /// deleting accounts and storage failures return an error, never success.
     fn taste_upsert(
@@ -8765,6 +8780,48 @@ mod tests {
                 .borrow()
                 .get(&(user_id.into(), kind.as_str().into(), target.into()))
                 .cloned())
+        }
+        async fn likes_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows: Vec<_> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((owner, _, _), row)| owner == user_id && row.signal == "love")
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            rows.truncate(500);
+            Ok(rows)
+        }
+        async fn taste_list(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            let now = i64::try_from(now).map_err(|_| StoreError)?;
+            let mut rows: Vec<_> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((owner, _, _), row)| {
+                    owner == user_id
+                        && (row.signal != "snooze"
+                            || row.snooze_until.is_some_and(|until| until > now))
+                })
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            rows.truncate(500);
+            Ok(rows)
         }
         async fn catalogue_member_target(
             &self,
@@ -22919,6 +22976,57 @@ mod tests {
         }
         *store.fail_catalogue_reads.borrow_mut() = true;
         assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
+    }
+
+    #[test]
+    fn fake_preference_collections_are_bounded_and_scoped() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for i in 1..=501 {
+            block_on(s.taste_upsert("u1", Track, &format!("Job-{i}"), Love, None, i)).unwrap();
+        }
+        for (owner, kind, id, signal, until, now) in [
+            ("u1", Release, "Job-501", Love, None, 502),
+            ("u1", Track, "job-501", Dislike, None, 503),
+            ("u1", Track, "hide", Hide, None, 504),
+            ("u1", Track, "ban", Ban, None, 505),
+            ("u1", Track, "past", Snooze, Some(99), 506),
+            ("u1", Track, "equal", Snooze, Some(100), 507),
+            ("u1", Track, "future", Snooze, Some(101), 508),
+            ("u2", Track, "private", Love, None, 999),
+        ] {
+            block_on(s.taste_upsert(owner, kind, id, signal, until, now)).unwrap();
+        }
+        let likes = block_on(s.likes_list("u1")).unwrap();
+        let taste = block_on(s.taste_list("u1", 100)).unwrap();
+        assert_eq!((likes.len(), taste.len()), (500, 500));
+        assert!(likes.windows(2).all(|r| r[0].created_at >= r[1].created_at));
+        assert!(taste.windows(2).all(|r| r[0].updated_at >= r[1].updated_at));
+        assert!(likes
+            .iter()
+            .all(|r| r.signal == "love" && r.target_id != "private"));
+        assert!(likes
+            .iter()
+            .any(|r| r.kind == "release" && r.target_id == "Job-501"));
+        assert!(likes
+            .iter()
+            .any(|r| r.kind == "track" && r.target_id == "Job-501"));
+        for id in ["job-501", "hide", "ban", "future"] {
+            assert!(taste.iter().any(|r| r.target_id == id));
+        }
+        for id in ["past", "equal", "private"] {
+            assert!(!taste.iter().any(|r| r.target_id == id));
+        }
+        assert!(block_on(s.likes_list("missing")).unwrap().is_empty());
+        assert!(block_on(s.taste_list("missing", 100)).unwrap().is_empty());
+        assert!(block_on(s.taste_list("u1", u64::MAX)).is_err());
+        *s.fail_taste_read.borrow_mut() = true;
+        assert!(block_on(s.likes_list("u1")).is_err());
+        assert!(block_on(s.taste_list("u1", 100)).is_err());
     }
 
     #[test]
