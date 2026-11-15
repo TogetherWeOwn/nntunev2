@@ -6092,6 +6092,130 @@ fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Respons
     Ok(response)
 }
 
+/// Authenticate before constructing the member-scoped dispatch store.
+/// Playback remains unavailable until an occurrence has a trusted binding
+/// to an application track; the dispatcher never receives audio bytes.
+#[allow(dead_code)] // The adapter remains unmounted until the activation slice.
+pub async fn subsonic_mount(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    env: Env,
+    trace_id: Option<String>,
+) -> WorkerResult<Response> {
+    use crate::subsonic_dispatch as core;
+    use nntune_subsonic::envelope::code;
+    use nntune_subsonic::{Identity, SubsonicApp, UserAccount};
+
+    if let Some(response) = pre_auth_subsonic_response(method, path, query, body) {
+        return respond_document(&response);
+    }
+    let merged = core::merged_query_params(method, query, body);
+    let config = match config_from_env(&env) {
+        Some(config) => config,
+        None => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let keyring = match config
+        .subsonic_index
+        .as_ref()
+        .and_then(|cfg| cfg.keyring().ok())
+    {
+        Some(keyring) => keyring,
+        None => {
+            return respond_document(&core::auth_error_response(
+                &merged,
+                crate::subsonic_auth::AuthError::Unavailable,
+            ))
+        }
+    };
+    let form_body = (!body.is_empty()).then_some(body.as_bytes());
+    let credentials = match crate::subsonic_http::parse_credentials(Some(query), form_body) {
+        Ok(credentials) => credentials,
+        Err(err) => return respond_document(&core::parse_error_response(&merged, err)),
+    };
+    let store = PgStore {
+        env: Some(env.clone()),
+        trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
+        mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_mirror: None,
+    };
+    let now_millis = worker::Date::now().as_millis();
+    let auth = async {
+        crate::subsonic_auth::authenticate(
+            &store,
+            &credentials,
+            &keyring,
+            &config,
+            now_millis / 1000,
+        )
+        .await
+        .map_err(|err| core::auth_error_response(&merged, err))
+    };
+    let (principal, (artist_rows, release_rows, track_rows)) = match after_auth(auth, |principal| {
+        let store = &store;
+        let merged = &merged;
+        async move {
+            let rows = catalogue_for_route(path, || async {
+                store
+                    .subsonic_member_catalogue(principal.user_id())
+                    .await
+                    .map_err(|_| {
+                        core::render_error(merged, code::GENERIC, "Internal server error.")
+                    })
+            })
+            .await?;
+            Ok((principal, rows))
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return respond_document(&response),
+    };
+    let (email, role) = match store.subsonic_account(principal.user_id()).await {
+        Ok(Some(pair)) => pair,
+        _ => {
+            return respond_document(&core::render_error(
+                &merged,
+                code::GENERIC,
+                "Internal server error.",
+            ))
+        }
+    };
+    let is_admin = role == "admin";
+    let identity = Identity {
+        username: principal.username().to_string(),
+        email: email.clone(),
+        is_admin,
+    };
+    let account = UserAccount {
+        email,
+        is_admin,
+        is_manager: role == "manager",
+    };
+    let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
+    let app = SubsonicApp::production(core::ProductionStore::new(
+        identity,
+        account,
+        artists,
+        albums,
+        songs,
+        track_rows,
+        now_millis as i64,
+    ));
+    respond_document(&app.handle(method, path, query, body))
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
