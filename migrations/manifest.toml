@@ -197,3 +197,16 @@ sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
 file = "0040_ingest_audio_classifications.sql"
 target = "app"
 sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
+
+[[migration]]
+file = "0041_account_taste_and_privacy.sql"
+target = "app"
+sha256 = "378c0932a25758f4b50282bab112220bc090a5b0ff01707a9b6e432adb40374e"
+
+[[migration.source_rename_history]]
+parent = "eca22a03b3d5809d1c623b7d4398d53220d10570"
+commit = "4d977b054c81f138c8593e3270fefb8c7469ac27"
+old_path = "migrations/0037_account_taste_and_privacy.sql"
+new_path = "migrations/0041_account_taste_and_privacy.sql"
+old_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
+new_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
