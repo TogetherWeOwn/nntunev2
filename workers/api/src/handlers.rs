@@ -1553,6 +1553,36 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<crate::preference_rows::TasteDbRow>, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Write a resolved identity using server-supplied owner and time. Missing or
+    /// deleting accounts and storage failures return an error, never success.
+    fn taste_upsert(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+        _signal: crate::taste_signal::TasteSignal,
+        _snooze_until: Option<u64>,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::preference_rows::TasteDbRow, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Delete only love, or any signal respectively. Missing accounts fail closed.
+    fn like_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn taste_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Probe own-or-shared membership. Tracks retain the original spelling;
     /// release targets are canonicalized before binding. Unsupported stores fail closed.
     fn catalogue_member_target(
@@ -7336,6 +7366,7 @@ mod tests {
     struct FakeStore {
         taste_rows: RefCell<HashMap<(String, String, String), crate::preference_rows::TasteDbRow>>,
         fail_taste_read: RefCell<bool>,
+        fail_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
@@ -7571,6 +7602,33 @@ mod tests {
     }
 
     impl FakeStore {
+        fn delete_preference(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            love_only: bool,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || user_id.contains('\0')
+                || target.contains('\0')
+            {
+                return Err(StoreError);
+            }
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows
+                .get(&key)
+                .is_some_and(|row| !love_only || row.signal == "love")
+            {
+                rows.remove(&key);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
         /// Member releases for a fake user, mirroring the production
         /// membership read: distinct well-formed release MBIDs from the
         /// fake ledger, sorted for a stable page.
@@ -7626,6 +7684,22 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn like_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, true)
+        }
+        async fn taste_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, false)
+        }
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -8632,6 +8706,50 @@ mod tests {
                 row.last_used_at = Some(now);
             }
             Ok(())
+        }
+        async fn taste_upsert(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            signal: crate::taste_signal::TasteSignal,
+            snooze_until: Option<u64>,
+            now: u64,
+        ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+            use crate::taste_signal::TasteSignal;
+            const MAX_TIME: u64 = 253_402_300_799;
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !(1..=128).contains(&user_id.chars().count())
+                || !(1..=512).contains(&target.chars().count())
+                || user_id.contains('\0')
+                || target.contains('\0')
+                || now > MAX_TIME
+                || snooze_until.is_some_and(|t| t > MAX_TIME)
+                || (signal == TasteSignal::Snooze) != snooze_until.is_some()
+            {
+                return Err(StoreError);
+            }
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            let created_at = rows.get(&key).map_or(now as i64, |row| {
+                if signal == TasteSignal::Love && row.signal != "love" {
+                    now as i64
+                } else {
+                    row.created_at
+                }
+            });
+            let row = crate::preference_rows::TasteDbRow {
+                kind: kind.as_str().into(),
+                target_id: target.into(),
+                signal: signal.as_str().into(),
+                snooze_until: snooze_until.map(|t| t as i64),
+                created_at,
+                updated_at: now as i64,
+            };
+            rows.insert(key, row.clone());
+            Ok(row)
         }
         async fn taste_get(
             &self,
@@ -22801,6 +22919,101 @@ mod tests {
         }
         *store.fail_catalogue_reads.borrow_mut() = true;
         assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
+    }
+
+    #[test]
+    fn fake_taste_upsert_replays_and_fails_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        let store = &h.store;
+        let write = |kind, signal, until, now| {
+            block_on(store.taste_upsert("u1", kind, "Job_A", signal, until, now))
+        };
+        assert_eq!(write(Track, Love, None, 10).unwrap().created_at, 10);
+        assert_eq!(write(Track, Love, None, 20).unwrap().created_at, 10);
+        assert_eq!(
+            write(Track, Snooze, Some(25), 21).unwrap().snooze_until,
+            Some(25)
+        );
+        let row = write(Track, Love, None, 30).unwrap();
+        assert_eq!(
+            (row.created_at, row.updated_at, row.snooze_until),
+            (30, 30, None)
+        );
+        write(Release, Love, None, 40).unwrap();
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row.clone())
+        );
+        assert!(block_on(store.taste_upsert("missing", Track, "Job_A", Love, None, 50)).is_err());
+        assert!(write(Track, Snooze, None, 50).is_err());
+        *store.fail_taste_write.borrow_mut() = true;
+        assert!(write(Track, Love, None, 50).is_err());
+        *store.fail_taste_write.borrow_mut() = false;
+        store.deleting_users.borrow_mut().insert("u1".into());
+        assert!(write(Track, Love, None, 50).is_err());
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row)
+        );
+    }
+
+    #[test]
+    fn fake_preference_deletes_are_scoped_and_fenced() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for (id, signal, until) in [
+            ("love", Love, None),
+            ("dislike", Dislike, None),
+            ("hide", Hide, None),
+            ("ban", Ban, None),
+            ("snooze", Snooze, Some(2)),
+        ] {
+            block_on(s.taste_upsert("u1", Track, id, signal, until, 3)).unwrap();
+            assert_eq!(
+                block_on(s.like_delete("u1", Track, id)).unwrap(),
+                signal == Love
+            );
+            assert_eq!(
+                block_on(s.taste_get("u1", Track, id)).unwrap().is_some(),
+                signal != Love
+            );
+            assert_eq!(
+                block_on(s.taste_delete("u1", Track, id)).unwrap(),
+                signal != Love
+            );
+            assert!(!block_on(s.taste_delete("u1", Track, id)).unwrap());
+        }
+        for (user, kind, target) in [
+            ("u1", Track, "Job_A"),
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            block_on(s.taste_upsert(user, kind, target, Love, None, 3)).unwrap();
+        }
+        assert!(block_on(s.like_delete("u1", Track, "Job_A")).unwrap());
+        for (user, kind, target) in [
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            assert!(block_on(s.taste_get(user, kind, target)).unwrap().is_some());
+        }
+        assert!(block_on(s.taste_delete("missing", Track, "Job_A")).is_err());
+        s.deleting_users.borrow_mut().insert("u2".into());
+        assert!(block_on(s.taste_delete("u2", Track, "Job_A")).is_err());
+        *s.fail_taste_write.borrow_mut() = true;
+        assert!(block_on(s.like_delete("u1", Track, "job_a")).is_err());
+        assert!(block_on(s.taste_get("u2", Track, "Job_A"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

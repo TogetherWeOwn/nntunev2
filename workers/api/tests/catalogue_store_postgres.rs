@@ -291,6 +291,371 @@ async fn taste_get_reads_only_exact_owner_kind_and_identity() {
 }
 
 #[tokio::test]
+async fn taste_upsert_replays_and_fails_closed() {
+    use nntune_api::target_identity::TargetKind::{Release, Track};
+    use nntune_api::taste_signal::TasteSignal::{Ban, Love, Snooze};
+    // Each injection supplies one connection to the production method.
+    for (existing, kind, signal, until, now, created, expiry) in [
+        (None, Track, Love, None, 10, 10, None),
+        (
+            Some(("love", None::<i64>, 10_i64)),
+            Track,
+            Love,
+            None,
+            20,
+            10,
+            None,
+        ),
+        (
+            Some(("snooze", Some(50), 10)),
+            Track,
+            Love,
+            None,
+            30,
+            30,
+            None,
+        ),
+        (
+            Some(("snooze", Some(25), 10)),
+            Track,
+            Love,
+            None,
+            30,
+            30,
+            None,
+        ),
+        (
+            Some(("snooze", Some(25), 10)),
+            Track,
+            Snooze,
+            Some(50),
+            30,
+            10,
+            Some(50),
+        ),
+        (Some(("love", None, 10)), Track, Ban, None, 30, 10, None),
+        (Some(("love", None, 10)), Release, Ban, None, 30, 30, None),
+    ] {
+        let app = client(false).await;
+        app.batch_execute("BEGIN; INSERT INTO public.users (id,email,created_at) VALUES ('taste-writer','taste-writer@example.invalid',1)").await.unwrap();
+        if let Some((old, old_until, old_created)) = existing {
+            app.execute(
+                "INSERT INTO public.account_taste VALUES ($1,'track',$2,$3,$4,$5,$5)",
+                &[&"taste-writer", &"Job_A", &old, &old_until, &old_created],
+            )
+            .await
+            .unwrap();
+        }
+        let store =
+            catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let row = store
+            .taste_upsert("taste-writer", kind, "Job_A", signal, until, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                row.kind.as_str(),
+                row.target_id.as_str(),
+                row.signal.as_str(),
+                row.snooze_until,
+                row.created_at,
+                row.updated_at
+            ),
+            (
+                kind.as_str(),
+                "Job_A",
+                signal.as_str(),
+                expiry,
+                created,
+                now as i64
+            )
+        );
+    }
+    for (user, invalid) in [
+        ("missing", false),
+        ("taste-deleting", false),
+        ("taste-writer", true),
+    ] {
+        let app = client(false).await;
+        app.batch_execute("BEGIN; INSERT INTO public.users (id,email,created_at) VALUES ('taste-writer','taste-writer@example.invalid',1), ('taste-deleting','taste-deleting@example.invalid',1); UPDATE public.users SET deleting_at = now() WHERE id = 'taste-deleting'").await.unwrap();
+        let store =
+            catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+        assert!(store
+            .taste_upsert(
+                user,
+                Track,
+                "Job_A",
+                if invalid { Snooze } else { Love },
+                None,
+                70
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn preference_deletes_are_scoped_idempotent_and_fenced() {
+    use nntune_api::target_identity::TargetKind::{Release, Track};
+    let observer = client(false).await;
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('delete-a','delete-a@example.invalid',1), ('delete-b','delete-b@example.invalid',1), ('delete-pending','delete-pending@example.invalid',1); UPDATE public.users SET deleting_at = now() WHERE id = 'delete-pending'; INSERT INTO public.account_taste VALUES ('delete-a','track','love','love',NULL,1,1), ('delete-a','track','dislike','dislike',NULL,1,1), ('delete-a','track','hide','hide',NULL,1,1), ('delete-a','track','ban','ban',NULL,1,1), ('delete-a','track','snooze','snooze',2,1,1), ('delete-a','track','Job_A','love',NULL,1,1), ('delete-a','track','job_a','love',NULL,1,1), ('delete-a','release','Job_A','love',NULL,1,1), ('delete-b','track','Job_A','love',NULL,1,1), ('delete-pending','track','Job_A','love',NULL,1,1)").await.unwrap();
+    let mut results = Vec::new();
+    for id in [
+        "love", "dislike", "hide", "ban", "snooze", "missing", "love",
+    ] {
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        results.push(store.like_delete("delete-a", Track, id).await.unwrap());
+    }
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let cleared = store
+        .taste_delete("delete-a", Track, "snooze")
+        .await
+        .unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let repeat = store
+        .taste_delete("delete-a", Track, "snooze")
+        .await
+        .unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let isolated = store
+        .taste_delete("delete-a", Track, "Job_A")
+        .await
+        .unwrap();
+    let mut errors = Vec::new();
+    for owner in ["missing", "delete-pending"] {
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        errors.push(store.taste_delete(owner, Track, "Job_A").await.is_err());
+    }
+    let failed = client(false).await;
+    failed.batch_execute("BEGIN").await.unwrap();
+    assert!(failed.batch_execute("SELECT 1/0").await.is_err());
+    let store =
+        catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let db_error = store.like_delete("delete-b", Track, "Job_A").await.is_err();
+    let rows = observer.query("SELECT user_id, kind, target_id, signal FROM public.account_taste WHERE user_id IN ('delete-a','delete-b','delete-pending') ORDER BY user_id, kind, target_id", &[]).await.unwrap();
+    let states: Vec<(String, String, String, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    observer
+        .batch_execute(
+            "DELETE FROM public.users WHERE id IN ('delete-a','delete-b','delete-pending')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(results, [true, false, false, false, false, false, false]);
+    assert!(cleared && !repeat && isolated && errors.into_iter().all(|x| x) && db_error);
+    let expected = [
+        ("delete-a", "release", "Job_A", "love"),
+        ("delete-a", "track", "ban", "ban"),
+        ("delete-a", "track", "dislike", "dislike"),
+        ("delete-a", "track", "hide", "hide"),
+        ("delete-a", "track", "job_a", "love"),
+        ("delete-b", "track", "Job_A", "love"),
+        ("delete-pending", "track", "Job_A", "love"),
+    ];
+    assert_eq!(
+        states,
+        expected.map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d.into()))
+    );
+}
+
+#[tokio::test]
+async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use nntune_api::taste_signal::TasteSignal::{Ban, Snooze};
+    let observer = client(false).await;
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-iso-a','taste-iso-a@example.invalid',1), ('taste-iso-b','taste-iso-b@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-iso-a','track','job','love',NULL,1,1), ('taste-iso-b','track','job','love',NULL,2,2)").await.unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let changed = store
+        .taste_upsert("taste-iso-a", Track, "job", Ban, None, 3)
+        .await;
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let rejected = store
+        .taste_upsert("taste-iso-a", Track, "job", Snooze, None, 4)
+        .await;
+    let rows = observer.query("SELECT user_id, signal, updated_at FROM public.account_taste WHERE user_id IN ('taste-iso-a','taste-iso-b') ORDER BY user_id", &[]).await.unwrap();
+    let states: Vec<(String, String, i64)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id IN ('taste-iso-a','taste-iso-b')")
+        .await
+        .unwrap();
+    assert!(changed.is_ok());
+    assert!(rejected.is_err());
+    assert_eq!(
+        states,
+        vec![
+            ("taste-iso-a".into(), "ban".into(), 3),
+            ("taste-iso-b".into(), "love".into(), 2)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn taste_upsert_waits_for_deletion_fence() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use nntune_api::taste_signal::TasteSignal::Ban;
+    use std::time::Duration;
+    let observer = client(false).await;
+    let locker = client(false).await;
+    let writer = client(false).await;
+    let writer_pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-race','taste-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-race','track','old','love',NULL,1,1)").await.unwrap();
+    locker
+        .batch_execute("BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let store =
+        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let write = store.taste_upsert("taste-race", Track, "old", Ban, None, 10);
+    let release = async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                        &[&writer_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        locker.batch_execute("COMMIT").await.unwrap();
+        observed
+    };
+    let (result, observed) = tokio::join!(write, release);
+    let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = 'taste-race' AND target_id = 'old'", &[]).await.unwrap();
+    let state: (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let remaining: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM public.account_taste WHERE user_id = 'taste-race'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(observed, "writer must wait on the deleting account");
+    assert!(result.is_err());
+    assert_eq!(state, ("love".into(), 1, 1));
+    assert_eq!(remaining, 0, "account deletion cascades existing taste");
+}
+
+#[tokio::test]
+async fn preference_delete_waits_for_deletion_fence() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use std::time::Duration;
+    let observer = client(false).await;
+    let locker = client(false).await;
+    let writer = client(false).await;
+    let pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('delete-race','delete-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('delete-race','track','old','love',NULL,1,1)").await.unwrap();
+    locker
+        .batch_execute(
+            "BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'delete-race'",
+        )
+        .await
+        .unwrap();
+    let store =
+        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let delete = store.like_delete("delete-race", Track, "old");
+    let release = async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                        &[&pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        locker.batch_execute("COMMIT").await.unwrap();
+        observed
+    };
+    let (result, observed) = tokio::join!(delete, release);
+    let count: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM public.account_taste WHERE user_id = 'delete-race'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id = 'delete-race'")
+        .await
+        .unwrap();
+    assert!(observed, "delete must wait on the account fence");
+    assert!(result.is_err());
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
     let rows = store.catalogue_library("u1").await.unwrap();
@@ -926,6 +1291,222 @@ async fn snapshot_overlong_membership_ids_keep_valid_neighbours() {
     assert_eq!((artists.len(), releases.len(), tracks.len()), (1, 1, 1));
     assert_eq!(tracks[0].recording_mbid, synthetic_uuid(2, 1));
     assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn snapshot_mirror_field_octet_boundaries() {
+    let cases: [fn(i32) -> FieldLens; 4] = [
+        |n| FieldLens {
+            artist_name: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            sort_name: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            release_title: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            track_title: n,
+            ..SHORT
+        },
+    ];
+    for (filler, ok, bad) in [("a", 1024, 1025), ("é", 512, 513)] {
+        for (index, make) in cases.iter().enumerate() {
+            let (app, mirror) = sized_fixture(1, make(ok), filler).await;
+            let (result, _) = snapshot_of(app, mirror, 100).await;
+            let (artists, releases, tracks) = result.unwrap();
+            assert_eq!((artists.len(), releases.len(), tracks.len()), (1, 1, 1));
+            let value = match index {
+                0 => &artists[0].name,
+                1 => &artists[0].sort_name,
+                2 => &releases[0].title,
+                _ => &tracks[0].title,
+            };
+            assert_eq!(*value, filler.repeat(ok as usize));
+            let (app, mirror) = sized_fixture(1, make(bad), filler).await;
+            let (result, _) = snapshot_of(app, mirror, 100).await;
+            assert!(result.is_err(), "field {index} with {filler:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_mirror_aggregate_boundaries() {
+    // 245 * (36 + 1 + 6 + 2 + 1024) + (36 + 1 + 6 + 2 + 194) = 262144.
+    for (last_length, accepted) in [(194_i32, true), (195, false)] {
+        let (app, mirror) = sized_fixture(
+            246,
+            FieldLens {
+                sort_name: 1024,
+                ..SHORT
+            },
+            "a",
+        )
+        .await;
+        mirror
+            .execute(
+                "UPDATE mb_artist SET sort_name = repeat('a', $1) WHERE mbid = $2::text::uuid",
+                &[&last_length, &synthetic_uuid(1, 246)],
+            )
+            .await
+            .unwrap();
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        if accepted {
+            let (artists, releases, tracks) = result.unwrap();
+            assert_eq!(
+                (artists.len(), releases.len(), tracks.len()),
+                (246, 246, 246)
+            );
+            assert!(artists
+                .iter()
+                .any(|artist| artist.sort_name == "a".repeat(194)));
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    for lens in [
+        FieldLens {
+            artist_name: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            sort_name: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            release_title: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            track_title: 1024,
+            ..SHORT
+        },
+    ] {
+        let (app, mirror) = sized_fixture(200, lens, "a").await;
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        let (artists, releases, tracks) = result.unwrap();
+        assert_eq!(
+            (artists.len(), releases.len(), tracks.len()),
+            (200, 200, 200)
+        );
+        let (app, mirror) = sized_fixture(257, lens, "a").await;
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        assert!(result.is_err());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_preflight_fetches_keep_the_admitted_snapshot() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    for (phase, update, select) in [
+        (
+            "artist",
+            "UPDATE mb_artist SET name = repeat('x', 6)",
+            "SELECT name FROM mb_artist",
+        ),
+        (
+            "release",
+            "UPDATE mb_release SET title = repeat('x', 6)",
+            "SELECT title FROM mb_release",
+        ),
+        (
+            "track",
+            "UPDATE mb_recording SET title = repeat('x', 6)",
+            "SELECT title FROM mb_recording",
+        ),
+    ] {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("nntune_preflight_{}_{}", std::process::id(), nonce);
+        let writer = shared_connection(&schema).await.unwrap();
+        create_shared_mirror(&writer, &schema).await.unwrap();
+        let result: Result<(), String> = async {
+            writer.batch_execute(&format!(
+                "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Sort', 'Person', 'US');
+                 INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+                 INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+                 INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+            )).await.map_err(|e| e.to_string())?;
+            let app = client(false).await;
+            app.execute("INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'original', $1, ARRAY[$2])", &[&SNAPSHOT_RELEASE, &RECORDING]).await.map_err(|e| e.to_string())?;
+            let reader = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+            let mutation = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+            let store = catalogue_store_for_postgres_test(app, true, Ok(reader), Rc::new(Cell::new(0)));
+            store.set_preflight_hook(phase, Box::new(move || Box::pin(async move {
+                mutation.batch_execute(update).await.map_err(|_| StoreError)?;
+                Ok(())
+            })));
+            let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10).await.map_err(|_| format!("{phase}: snapshot failed"))?;
+            let changed: String = writer.query_one(select, &[]).await.map_err(|e| e.to_string())?.get(0);
+            if changed != "xxxxxx" || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+                || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "Artist"
+                || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
+                || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
+                return Err(format!("{phase}: writer or snapshot mismatch"));
+            }
+            Ok(())
+        }.await;
+        writer
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn snapshot_mirror_queries_share_one_committed_snapshot() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("nntune_mirror_{}_{}", std::process::id(), nonce);
+    let writer = shared_connection(&schema).await.unwrap();
+    create_shared_mirror(&writer, &schema).await.unwrap();
+    let result: Result<(), String> = async {
+        writer.batch_execute(&format!(
+            "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Sort', 'Person', 'US');
+             INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+             INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+             INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+        )).await.map_err(|e| e.to_string())?;
+        let app = client(false).await;
+        app.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'original', $1, ARRAY[$2])",
+            &[&SNAPSHOT_RELEASE, &RECORDING],
+        ).await.map_err(|e| e.to_string())?;
+        let reader = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let mutation = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(app, true, Ok(reader), Rc::new(Cell::new(0)));
+        store.set_mirror_hook(Box::new(move || Box::pin(async move {
+            mutation.batch_execute("UPDATE mb_release SET title = 'Changed'; UPDATE mb_recording SET title = 'Changed'")
+                .await.map_err(|_| StoreError)?;
+            Ok(())
+        })));
+        let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10)
+            .await.map_err(|_| "snapshot failed".to_owned())?;
+        let release_title: String = writer.query_one("SELECT title FROM mb_release", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let track_title: String = writer.query_one("SELECT title FROM mb_recording", &[]).await.map_err(|e| e.to_string())?.get(0);
+        if release_title != "Changed" || track_title != "Changed"
+            || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+            || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "Artist"
+            || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
+            || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
+            return Err("mirror snapshot mixed old and new states".into());
+        }
+        Ok(())
+    }.await;
+    writer
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]

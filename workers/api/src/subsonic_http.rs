@@ -37,6 +37,10 @@ pub const MAX_KEY_BYTES: usize = 256;
 /// Maximum raw (still encoded) bytes of one credential value.
 pub const MAX_CREDENTIAL_VALUE_BYTES: usize = 1024;
 
+/// Staging admission limits for each raw parameter source.
+pub const STAGING_SOURCE_BYTES: usize = 8 * 1024;
+pub const STAGING_PARAMS_PER_SOURCE: usize = 64;
+
 /// Payload-free failure classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialParseError {
@@ -90,6 +94,39 @@ impl Slot {
             _ => None,
         }
     }
+}
+
+/// Validate both staging sources before decoding or merging either one.
+/// This does not bound transport collection or enforce mount admission; callers
+/// must do both separately. It does not replace credential parsing and its
+/// duplicate, encoding, and value limits.
+pub fn validate_staging_sources(
+    query: Option<&str>,
+    form_body: Option<&[u8]>,
+) -> Result<(), CredentialParseError> {
+    for raw in [query.map(str::as_bytes), form_body].into_iter().flatten() {
+        if raw.len() > STAGING_SOURCE_BYTES {
+            return Err(CredentialParseError::SourceTooLarge);
+        }
+        let mut count = 0;
+        for pair in raw
+            .split(|byte| *byte == b'&')
+            .filter(|pair| !pair.is_empty())
+        {
+            count += 1;
+            if count > STAGING_PARAMS_PER_SOURCE {
+                return Err(CredentialParseError::TooManyParams);
+            }
+            let key_len = pair
+                .iter()
+                .position(|byte| *byte == b'=')
+                .unwrap_or(pair.len());
+            if key_len > MAX_KEY_BYTES {
+                return Err(CredentialParseError::KeyTooLong);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse credentials from an optional raw query string (without the leading
@@ -377,6 +414,85 @@ mod tests {
         );
         // Long non-credential values are fine.
         assert!(q(&format!("id={long}")).is_ok());
+    }
+
+    #[test]
+    fn staging_preflight_bounds_each_source_before_decoding() {
+        let exact = format!("x={}", "a".repeat(STAGING_SOURCE_BYTES - 2));
+        let over = format!("{exact}a");
+        assert_eq!(
+            validate_staging_sources(Some(&exact), Some(exact.as_bytes())),
+            Ok(())
+        );
+        assert_eq!(
+            validate_staging_sources(Some(&over), None),
+            Err(CredentialParseError::SourceTooLarge)
+        );
+        assert_eq!(
+            validate_staging_sources(None, Some(over.as_bytes())),
+            Err(CredentialParseError::SourceTooLarge)
+        );
+
+        let exact_params = vec!["x=1"; STAGING_PARAMS_PER_SOURCE].join("&");
+        let over_params = format!("{exact_params}&x=1");
+        assert_eq!(
+            validate_staging_sources(Some(&exact_params), Some(exact_params.as_bytes())),
+            Ok(())
+        );
+        assert_eq!(
+            validate_staging_sources(Some(&over_params), None),
+            Err(CredentialParseError::TooManyParams)
+        );
+        assert_eq!(
+            validate_staging_sources(None, Some(over_params.as_bytes())),
+            Err(CredentialParseError::TooManyParams)
+        );
+        assert_eq!(
+            validate_staging_sources(Some(&"k".repeat(MAX_KEY_BYTES)), None),
+            Ok(())
+        );
+        assert_eq!(
+            validate_staging_sources(Some(&"k".repeat(MAX_KEY_BYTES + 1)), None),
+            Err(CredentialParseError::KeyTooLong)
+        );
+        let key = "k".repeat(MAX_KEY_BYTES);
+        let long_key = format!("{key}k=1");
+        assert_eq!(validate_staging_sources(None, Some(key.as_bytes())), Ok(()));
+        assert_eq!(
+            validate_staging_sources(None, Some(long_key.as_bytes())),
+            Err(CredentialParseError::KeyTooLong)
+        );
+        assert_eq!(
+            validate_staging_sources(Some(&format!("&&{exact_params}&&")), None),
+            Ok(())
+        );
+        // The second source is checked before a caller attempts credential decoding.
+        assert_eq!(
+            validate_staging_sources(Some("u=%zz"), Some(over.as_bytes())),
+            Err(CredentialParseError::SourceTooLarge)
+        );
+    }
+
+    #[test]
+    fn staging_preflight_preserves_credential_parser_rules() {
+        for (query, form, error) in [
+            ("u=a", "u=b", CredentialParseError::DuplicateCredential),
+            ("u=%zz", "", CredentialParseError::MalformedEncoding),
+        ] {
+            assert_eq!(
+                validate_staging_sources(Some(query), Some(form.as_bytes())),
+                Ok(())
+            );
+            assert_eq!(
+                parse_credentials(Some(query), Some(form.as_bytes())).unwrap_err(),
+                error
+            );
+        }
+        let value = format!("p={}", "x".repeat(MAX_CREDENTIAL_VALUE_BYTES + 1));
+        assert_eq!(validate_staging_sources(Some(&value), None), Ok(()));
+        assert_eq!(q(&value).unwrap_err(), CredentialParseError::ValueTooLong);
+        let non_staging = format!("x={}", "a".repeat(STAGING_SOURCE_BYTES));
+        assert!(q(&non_staging).is_ok());
     }
 
     #[test]

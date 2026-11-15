@@ -282,8 +282,23 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         );
     }
     for piece in &pieces {
-        assert_bounded(piece, method_name(piece));
+        let name = method_name(piece);
+        if matches!(name, "like_delete" | "taste_delete") {
+            let love_only = name == "like_delete";
+            let body = function_body(piece, name);
+            assert_eq!(
+                body,
+                format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
+                "{name} must delegate its entire operation to the bounded helper"
+            );
+        } else {
+            assert_bounded(piece, name);
+        }
     }
+    assert_bounded(
+        function_body(&source, "asyncfndelete_preference("),
+        "delete_preference",
+    );
 }
 
 #[test]

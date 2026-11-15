@@ -5,6 +5,18 @@ pub fn taste_get_statement() -> &'static str {
     "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND kind = $2 AND target_id = $3"
 }
 
+/// Upsert under the account deletion fence, preserving a replayed love's timestamp.
+/// Adapted from the preference writer in PR #982.
+pub fn taste_upsert_statement() -> &'static str {
+    "INSERT INTO public.account_taste (user_id, kind, target_id, signal, snooze_until, created_at, updated_at) SELECT $1, $2, $3, $4, $5, $6, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, kind, target_id) DO UPDATE SET signal = EXCLUDED.signal, snooze_until = EXCLUDED.snooze_until, created_at = CASE WHEN EXCLUDED.signal = 'love' AND account_taste.signal <> 'love' THEN EXCLUDED.created_at ELSE account_taste.created_at END, updated_at = EXCLUDED.updated_at RETURNING kind, target_id, signal, snooze_until, created_at, updated_at"
+}
+
+/// Delete an exact row while holding the same account fence as the writer.
+/// The final row distinguishes an absent account from an absent preference.
+pub fn taste_delete_statement() -> &'static str {
+    "WITH writer_fence AS MATERIALIZED (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE), deleted AS (DELETE FROM public.account_taste AS taste USING writer_fence WHERE taste.user_id = writer_fence.id AND taste.kind = $2 AND taste.target_id = $3 AND (NOT $4 OR taste.signal = 'love') RETURNING 1) SELECT EXISTS (SELECT 1 FROM deleted) FROM writer_fence"
+}
+
 /// A taste row as returned by a store; its fields are not validated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TasteDbRow {
