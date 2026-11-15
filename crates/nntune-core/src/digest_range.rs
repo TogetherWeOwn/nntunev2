@@ -3,12 +3,12 @@
 //! This does not authorize serving or load provider data. The caller supplies
 //! each complete page and chunk in order; a failed chunk releases no plaintext.
 
-use crate::digest_chunk::{open_chunk, ChunkError};
+pub use crate::digest_chunk::OpenPart;
+use crate::digest_chunk::{open_chunk_part, ChunkError};
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_geometry::RangeGeometry;
 use crate::digest_verifier::PageError;
 use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader};
-use zeroize::Zeroizing;
 
 #[cfg(test)]
 #[path = "digest_range_tests.rs"]
@@ -24,24 +24,12 @@ pub enum RangeError {
     Authentication,
 }
 
-/// A single authenticated portion. The entire opened chunk is zeroized on drop.
-pub struct OpenPart {
-    bytes: Zeroizing<Vec<u8>>,
-    start: usize,
-    end: usize,
-}
-
-impl OpenPart {
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[self.start..self.end]
-    }
-}
-
 /// Sequential range cursor, retaining no page or plaintext between calls.
 pub struct DigestRange<'a> {
     manifest: &'a OriginManifest,
     key: &'a FileKey,
     plan: RangeGeometry,
+    range: std::ops::Range<u64>,
     next: u32,
     last: Option<u32>,
     failed: bool,
@@ -69,6 +57,7 @@ impl<'a> DigestRange<'a> {
             manifest,
             key,
             plan,
+            range: start..end,
             next,
             last,
             failed: false,
@@ -113,28 +102,27 @@ impl<'a> DigestRange<'a> {
         if self.failed || index != self.next || index > last {
             return Err(RangeError::InvalidChunk);
         }
-        let selection = self.plan.chunk(index).ok_or(RangeError::InvalidChunk)?;
-        let bytes = open_chunk(self.manifest, self.key, index, page, sealed, wire_header).map_err(
-            |error| match error {
-                ChunkError::Header => RangeError::Header,
-                ChunkError::Page(error) => RangeError::Page(error),
-                ChunkError::InvalidChunk => RangeError::InvalidChunk,
-                ChunkError::DigestMismatch => RangeError::DigestMismatch,
-                ChunkError::Authentication => RangeError::Authentication,
-            },
-        )?;
-        if selection.end > bytes.len() {
-            return Err(RangeError::InvalidChunk);
-        }
+        let part = open_chunk_part(
+            self.manifest,
+            self.key,
+            self.range.clone(),
+            index,
+            page,
+            sealed,
+            wire_header,
+        )
+        .map_err(|error| match error {
+            ChunkError::Header => RangeError::Header,
+            ChunkError::Page(error) => RangeError::Page(error),
+            ChunkError::InvalidChunk => RangeError::InvalidChunk,
+            ChunkError::DigestMismatch => RangeError::DigestMismatch,
+            ChunkError::Authentication => RangeError::Authentication,
+        })?;
         if index == last {
             self.last = None;
         } else {
             self.next += 1;
         }
-        Ok(OpenPart {
-            bytes,
-            start: selection.start,
-            end: selection.end,
-        })
+        Ok(part)
     }
 }
