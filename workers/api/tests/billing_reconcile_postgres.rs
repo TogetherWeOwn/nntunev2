@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/billing_contention.rs"]
+mod billing_contention;
+
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const T: i64 = 1_786_032_000;
 const P: i64 = 30 * 24 * 60 * 60;
@@ -1202,31 +1205,28 @@ async fn snapshot_fixture(force_early_completion: bool) -> Result<(), String> {
             let before = reader.query_opt(&format!("SELECT user_id FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub'"), &[]).await.map_err(|e| e.to_string())?;
             if before.is_some() { return Err("uncommitted writer was visible".into()); }
             let sql = if force_early_completion { "INVALID LOCK".to_string() } else { format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE") };
+            let (phase_tx, phase_rx) = billing_contention::phase();
             pending.push(tokio::spawn(async move {
+                let _ = phase_tx.send(());
                 let result = reader.batch_execute(&sql).await;
                 (reader, result)
             }));
+            billing_contention::reached(phase_rx).await?;
             let task = pending.last_mut().unwrap();
-            let finished_early = timeout(Duration::from_secs(3), async {
-                if force_early_completion {
+            if force_early_completion {
+                timeout(Duration::from_secs(3), async {
                     while !task.is_finished() { tokio::task::yield_now().await; }
+                }).await.map_err(|_| "early completion timed out".to_string())?;
+            }
+            let relation = format!("{schema}.subscriptions");
+            let wait = billing_contention::relation_wait(
+                &observer, task, writer_pid, reader_pid, &relation, "ShareRowExclusiveLock",
+            ).await;
+            if let Err(error) = wait {
+                if error == "lock finished before wait barrier" {
+                    pending.pop(); // The helper consumed this handle's output.
                 }
-                loop {
-                    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&writer_pid, &reader_pid];
-                    tokio::select! {
-                        biased;
-                        _ = &mut *task => return Ok(true),
-                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", params) => {
-                            if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                }
-                Ok::<bool, String>(false)
-            }).await.map_err(|_| "lock wait barrier timed out".to_string())??;
-            if finished_early {
-                pending.pop(); // The select consumed this handle's output.
-                return Err("lock finished before wait barrier".into());
+                return Err(error);
             }
             writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
             let completed = timeout(Duration::from_secs(5), pending.last_mut().unwrap()).await.map_err(|_| "lock did not resume".to_string())?;
