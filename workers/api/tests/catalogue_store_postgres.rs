@@ -116,11 +116,14 @@ async fn member_target_queries_isolate_caller_and_kind() {
         "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
          ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
          (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
-         ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff'])"
+         ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff']),
+         ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[])"
     ).await.unwrap();
     for (kind, target, expected) in [
         (TargetKind::Track, "Job_Own", true),
         (TargetKind::Track, "job_own", false),
+        (TargetKind::Track, "11111111-1111-1111-1111-AAAAAAAAAAAA", true),
+        (TargetKind::Track, "11111111-1111-1111-1111-aaaaaaaaaaaa", false),
         (TargetKind::Track, "OPAQUE-INVALID", false),
         (TargetKind::Track, "Job_Shared", true),
         (TargetKind::Track, "Job_Private", false),
@@ -138,7 +141,10 @@ async fn member_target_queries_isolate_caller_and_kind() {
         (TargetKind::Track, "x' OR true --", false),
         (TargetKind::Release, "x' OR true --", false),
     ] {
-        let target = canonical_target_id(target);
+        let target = match kind {
+            TargetKind::Track => target.to_owned(),
+            TargetKind::Release => canonical_target_id(target),
+        };
         let rows = app.query(member_target_statement(kind), &[&"u1", &target]).await.unwrap();
         assert_eq!(!rows.is_empty(), expected, "{kind:?} {target}");
     }
