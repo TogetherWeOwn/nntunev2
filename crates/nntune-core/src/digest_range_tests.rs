@@ -1,7 +1,7 @@
 use super::*;
-use crate::digest_test_fixture::{fixture, id, Fixture};
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
+use crate::digest_test_fixture::{fixture, id, Fixture};
 use crate::media::Sealer;
 use crate::rng::FillRandom;
 use sha2::{Digest, Sha256};
