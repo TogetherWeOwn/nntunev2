@@ -1,13 +1,12 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * Acceptance-owned: continue with production changes, not edits to this file.
- * Contract-first browser half for per-entry history management. Existing hooks
- * are reused; NEW actions are located by accessible name INSIDE the existing
- * recent row, not by a new controller/path/test-id convention. Names must
- * communicate Add to queue versus Forget, and the row supplies track context.
- * Feedback wording is flexible: one nonempty polite region in the history
- * section, action-only (not mount/play/seek), added versus already queued.
+ * Acceptance-owned: only acceptance-owner-authorized amendments may change this bank.
+ * Contract-first browser coverage for history Forget, with Replay and Clear retained.
+ * Actions use accessible names inside the existing row; Forget names identify the
+ * affected entry. Feedback is one nonempty polite region for explicit Forget,
+ * not mount/play/seek. History-row Add is retired and its absence is checked in
+ * the companion browser suite.
  *
  * Unknown history IDs may be filtered (existing policy) or shown unavailable;
  * either way explain unavailable history without ever substituting a track.
@@ -20,9 +19,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * Synthetic media events are not evidence of real streams, audio output, OS
  * media controls, or OS IME. This suite adds no operational API or CLI.
  *
- * Breaks caught: Replay accidentally reused for Add; duplicate add; mutation
- * of order/current/time/source/history; by-index forget; stale-ID substitution;
- * storage rollback; resume deletion; focus loss; duplicate live messages;
+ * Breaks caught: mutation of queue/current/time/source during Forget;
+ * by-index forget; stale-ID substitution; storage rollback; resume deletion;
+ * focus loss; duplicate live messages;
  * inaccessible/overlapping narrow-screen actions; cross-tab propagation.
  */
 const HISTORY = 'nntune:demo-recently-played:v1';
@@ -47,9 +46,6 @@ type Probe = {
 
 function row(page: Page, id: string): Locator {
 	return page.getByTestId('recent-item').filter({ has: page.locator(`[data-testid="recent-played-at-${id}"]`) });
-}
-function add(page: Page, id: string): Locator {
-	return row(page, id).getByRole('button', { name: /add.*queue/i });
 }
 function forget(page: Page, id: string): Locator {
 	return row(page, id).getByRole('button', { name: /forget/i });
@@ -77,10 +73,6 @@ async function feedback(page: Page, meaning: RegExp): Promise<void> {
 	await expect(section(page).locator('[role="alert"], [aria-live="assertive"]')).toHaveCount(0);
 }
 
-async function addedFeedback(page: Page): Promise<void> {
-	await feedback(page, /(?:added|queued)/i);
-	expect((await liveMessages(page))[0]).not.toMatch(/already|unavailable|failed/i);
-}
 
 async function open(page: Page, options: {
 	history?: Entry[];
@@ -207,37 +199,6 @@ async function transport(page: Page) {
 	}, RESUME);
 }
 
-for (const intent of ['selected', 'playing', 'paused'] as const) {
-	test(`RM-B-01-${intent} enqueue missing track once without transport/history mutation`, async ({ page }) => {
-		await open(page, { intent });
-		const before = await transport(page);
-		const history = await entries(page);
-		await expect(add(page, 'second-signal'), 'separate accessible Add to queue action').toBeVisible();
-		await add(page, 'second-signal').click();
-		await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		expect(await transport(page)).toEqual(before);
-		expect(await entries(page)).toEqual(history);
-		await addedFeedback(page);
-		// A second activation must be possible and report an honest no-op.
-		await add(page, 'second-signal').click();
-		await feedback(page, /already/i);
-		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		expect(await transport(page)).toEqual(before);
-		expect(await entries(page)).toEqual(history);
-	});
-}
-
-test('RM-B-02 already queued current ID is an explained no-op, never Replay', async ({ page }) => {
-	await open(page, { intent: 'playing' });
-	const before = await transport(page);
-	const history = await entries(page);
-	await expect(add(page, 'demo-track')).toBeVisible();
-	await add(page, 'demo-track').click();
-	await feedback(page, /already/i);
-	expect(await transport(page)).toEqual(before);
-	expect(await entries(page)).toEqual(history);
-	expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
-});
 
 for (const target of ['second-signal', 'demo-track', 'third-light']) {
 	test(`RM-B-03-${target} forget only chosen history ID, not queue/current/resume`, async ({ page }) => {
@@ -310,25 +271,23 @@ test('RM-B-06 Clear after one forget persists empty without clearing queue or re
 });
 
 for (const blocked of ['writes', 'all'] as const) {
-	test(`RM-B-07-${blocked} blocked session storage cannot undo current-visit forget or enqueue`, async ({ page }) => {
+	test(`RM-B-07-${blocked} blocked session storage cannot undo current-visit forget`, async ({ page }) => {
 		await open(page, { intent: 'playing' });
 		const before = await transport(page);
 		const history = await entries(page);
+		const persisted = await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY);
 		await page.evaluate((mode) => {
 			(window as unknown as { __recentManagement: Probe }).__recentManagement.blocked = mode;
 		}, blocked);
 		await expect(forget(page, 'third-light')).toBeVisible();
 		await forget(page, 'third-light').click();
 		await expect.poll(() => ids(page, 'recent-item')).toEqual(history.filter((entry) => entry.trackId !== 'third-light').map((entry) => entry.trackId));
-		await add(page, 'second-signal').click();
-		await addedFeedback(page);
-		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		await add(page, 'second-signal').click();
-		await feedback(page, /already/i);
 		expect(await transport(page)).toEqual(before);
 		expect(await ids(page, 'recent-item')).toEqual(history.filter((entry) => entry.trackId !== 'third-light').map((entry) => entry.trackId));
 		// Quota/read denial is real: persisted bytes remain unchanged.
 		expect(await entries(page)).toEqual(history);
+		expect(await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY)).toBe(persisted);
+		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
 	});
 }
 
@@ -339,35 +298,30 @@ test('RM-B-08 unrecognized stable ID is explained and never resolves to another 
 	const before = await transport(page);
 	const history = await entries(page);
 	await expect(section(page)).toContainText(/unavailable|unrecognized|unknown|no longer available|not available/i);
-	const unavailable = row(page, 'second-signal-missing');
-	if (await unavailable.count()) {
-		const action = unavailable.getByRole('button', { name: /add.*queue/i });
-		if (await action.count() && await action.isEnabled()) {
-			await action.click();
-			await feedback(page, /unavailable|unknown|not found|not available/i);
-		}
-	}
 	expect(await transport(page)).toEqual(before);
 	expect(await entries(page)).toEqual(history);
 	expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
 });
 
-test('RM-B-09 no action feedback on load/play/time; enqueue remains session-only on reload', async ({ page }) => {
+test('RM-B-09 no feedback on load/play/time; forget remains session-only on reload', async ({ page }) => {
 	await open(page, { intent: 'playing' });
 	expect(await liveMessages(page)).toEqual([]);
-	await expect(add(page, 'second-signal')).toBeVisible();
-	await add(page, 'second-signal').focus();
+	const history = (await entries(page)).filter((entry) => entry.trackId !== 'second-signal');
+	await expect(forget(page, 'second-signal')).toBeVisible();
+	await forget(page, 'second-signal').focus();
 	await page.keyboard.press('Enter');
-	await addedFeedback(page);
+	await feedback(page, /forgot/i);
 	const messages = await liveMessages(page);
 	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
 		el.currentTime = 33;
 		el.dispatchEvent(new Event('timeupdate'));
 	});
 	expect(await liveMessages(page)).toEqual(messages);
-	const history = await entries(page);
+	expect(await entries(page)).toEqual(history);
+	await expect.poll(() => ids(page, 'recent-item')).toEqual(history.map((entry) => entry.trackId));
 	await page.reload();
-	await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
+	await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
+	await expect.poll(() => ids(page, 'recent-item')).toEqual(history.map((entry) => entry.trackId));
 	expect(await entries(page)).toEqual(history);
 	expect(await liveMessages(page)).toEqual([]);
 	// Session state must not subscribe to another tab's storage events.
@@ -375,6 +329,7 @@ test('RM-B-09 no action feedback on load/play/time; enqueue remains session-only
 		key, newValue: '[]', storageArea: localStorage
 	})), { key: HISTORY });
 	expect(await entries(page)).toEqual(history);
+	expect(await ids(page, 'recent-item')).toEqual(history.map((entry) => entry.trackId));
 });
 
 test('RM-B-11 forget stays in this tab, never writes account/local history or syncs another tab', async ({ page }) => {
@@ -401,10 +356,9 @@ for (const colorScheme of ['light', 'dark'] as const) {
 		try {
 			await open(page);
 			const before = await transport(page);
-			await expect(add(page, 'second-signal')).toBeVisible();
 			await expect(forget(page, 'second-signal')).toBeVisible();
 			await expect(page.getByTestId('recent-replay-second-signal')).toBeVisible();
-			for (const control of [add(page, 'second-signal'), forget(page, 'second-signal')]) {
+			for (const control of [forget(page, 'second-signal')]) {
 				await control.scrollIntoViewIfNeeded();
 				const box = await control.boundingBox();
 				expect(box).not.toBeNull();
@@ -413,8 +367,6 @@ for (const colorScheme of ['light', 'dark'] as const) {
 				expect(box!.width).toBeGreaterThanOrEqual(24);
 				expect(box!.height).toBeGreaterThanOrEqual(24);
 			}
-			await add(page, 'second-signal').tap();
-			await addedFeedback(page);
 			await forget(page, 'second-signal').tap();
 			await expect(row(page, 'second-signal')).toHaveCount(0);
 			expect(await transport(page)).toEqual(before);

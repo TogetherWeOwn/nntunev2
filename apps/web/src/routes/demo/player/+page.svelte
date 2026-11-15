@@ -709,28 +709,6 @@
 		selectAt(index);
 	}
 
-	/**
-	 * Append a history entry to the queue without touching playback: no
-	 * play, seek, source change or restart, and no history rewrite. Uses
-	 * the shared addTrack semantics (append only if missing), so a repeat
-	 * activation is an explained no-op. Unknown ids never resolve to
-	 * another track.
-	 */
-	function enqueueRecent(trackId: string): void {
-		const deck = DEMO_TRACKS.find((track) => track.id === trackId);
-		if (!deck) {
-			recentFeedback = 'That history entry is unavailable.';
-			return;
-		}
-		if (queue.tracks.some((track) => track.id === trackId)) {
-			recentFeedback = `${deck.title} is already in the queue.`;
-			return;
-		}
-		queue = addTrack(queue, deck);
-		if (status === 'empty') status = 'selected';
-		recentFeedback = `Added ${deck.title} to the queue.`;
-	}
-
 	/** Forget one history entry: queue, current media and resume are untouched. */
 	function forgetRecent(row: RecentRow, removedIndex: number): void {
 		if (!recentStore) return;
@@ -2129,13 +2107,6 @@
 								onclick={() => replayRecent(row.trackId)}
 							>
 								Replay {row.title}
-							</button>
-							<button
-								type="button"
-								aria-label={`Add ${row.title} to queue`}
-								onclick={() => enqueueRecent(row.trackId)}
-							>
-								Add to queue
 							</button>
 						{/if}
 						<button
