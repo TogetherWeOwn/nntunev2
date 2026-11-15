@@ -50,6 +50,7 @@ pub mod digest_context;
 pub mod digest_enrollment;
 pub mod digest_geometry;
 pub mod digest_page;
+pub mod digest_verifier;
 pub mod media_envelope;
 pub mod media_layout;
 pub mod origin_sealer;

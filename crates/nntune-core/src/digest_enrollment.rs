@@ -18,11 +18,31 @@ fn invalid() -> crate::Error {
 /// provider bytes or caller-supplied hashes, and do not authorize serving.
 #[allow(dead_code)] // Consumed by the independent verifier in the next slice.
 pub struct OriginManifest {
-    pub(crate) geometry: DigestGeometry,
-    pub(crate) map_id: [u8; 16],
-    pub(crate) context: [u8; 32],
-    pub(crate) header: [u8; 48],
-    pub(crate) rows: Vec<[u8; 32]>,
+    geometry: DigestGeometry,
+    map_id: [u8; 16],
+    context: [u8; 32],
+    header: [u8; 48],
+    rows: Vec<[u8; 32]>,
+}
+
+impl OriginManifest {
+    pub(crate) fn geometry(&self) -> DigestGeometry {
+        self.geometry
+    }
+    pub(crate) fn map_id(&self) -> &[u8; 16] {
+        &self.map_id
+    }
+    pub(crate) fn context(&self) -> &[u8; 32] {
+        &self.context
+    }
+    pub(crate) fn row(&self, index: usize) -> Option<&[u8; 32]> {
+        self.rows.get(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_test_row(&mut self, index: usize, hash: [u8; 32]) {
+        self.rows[index] = hash;
+    }
 }
 
 /// Owns the sequential sealer and buffers at most one page of chunk digests.
