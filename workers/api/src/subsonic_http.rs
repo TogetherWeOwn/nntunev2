@@ -28,6 +28,9 @@ use std::fmt;
 
 use nntune_subsonic::auth::Credentials;
 
+mod staging_body;
+pub use staging_body::{StagingBody, StagingBodyError};
+
 /// Maximum raw bytes accepted per source (query or form body).
 pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// Maximum `&`-separated non-empty parameters per source.
