@@ -108,6 +108,45 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
 }
 
 #[tokio::test]
+async fn member_target_queries_isolate_caller_and_kind() {
+    use nntune_api::catalogue::member_target_statement;
+    use nntune_api::target_identity::{canonical_target_id, TargetKind};
+    let app = client(false).await;
+    app.batch_execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
+         ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
+         (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
+         ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff'])"
+    ).await.unwrap();
+    for (kind, target, expected) in [
+        (TargetKind::Track, "Job_Own", true),
+        (TargetKind::Track, "job_own", false),
+        (TargetKind::Track, "OPAQUE-INVALID", false),
+        (TargetKind::Track, "Job_Shared", true),
+        (TargetKind::Track, "Job_Private", false),
+        (TargetKind::Track, "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB", true),
+        (TargetKind::Track, "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", true),
+        (TargetKind::Track, "ffffffff-ffff-4fff-8fff-ffffffffffff", false),
+        (TargetKind::Track, RELEASE, false),
+        (TargetKind::Release, "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", true),
+        (TargetKind::Release, OTHER_RELEASE, true),
+        (TargetKind::Release, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", false),
+        (TargetKind::Release, RECORDING, false),
+        (TargetKind::Release, "Job_Own", false),
+        (TargetKind::Track, "missing", false),
+        (TargetKind::Release, "missing", false),
+        (TargetKind::Track, "x' OR true --", false),
+        (TargetKind::Release, "x' OR true --", false),
+    ] {
+        let target = canonical_target_id(target);
+        let rows = app.query(member_target_statement(kind), &[&"u1", &target]).await.unwrap();
+        assert_eq!(!rows.is_empty(), expected, "{kind:?} {target}");
+    }
+    let rows = app.query(member_target_statement(TargetKind::Track), &[&"u1' OR true --", &"Job_Own"]).await.unwrap();
+    assert!(rows.is_empty(), "owner must also be bound");
+}
+
+#[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
     let rows = store.catalogue_library("u1").await.unwrap();
