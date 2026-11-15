@@ -395,6 +395,97 @@ async fn taste_upsert_replays_and_fails_closed() {
 }
 
 #[tokio::test]
+async fn preference_deletes_are_scoped_idempotent_and_fenced() {
+    use nntune_api::target_identity::TargetKind::{Release, Track};
+    let observer = client(false).await;
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('delete-a','delete-a@example.invalid',1), ('delete-b','delete-b@example.invalid',1), ('delete-pending','delete-pending@example.invalid',1); UPDATE public.users SET deleting_at = now() WHERE id = 'delete-pending'; INSERT INTO public.account_taste VALUES ('delete-a','track','love','love',NULL,1,1), ('delete-a','track','dislike','dislike',NULL,1,1), ('delete-a','track','hide','hide',NULL,1,1), ('delete-a','track','ban','ban',NULL,1,1), ('delete-a','track','snooze','snooze',2,1,1), ('delete-a','track','Job_A','love',NULL,1,1), ('delete-a','track','job_a','love',NULL,1,1), ('delete-a','release','Job_A','love',NULL,1,1), ('delete-b','track','Job_A','love',NULL,1,1), ('delete-pending','track','Job_A','love',NULL,1,1)").await.unwrap();
+    let mut results = Vec::new();
+    for id in [
+        "love", "dislike", "hide", "ban", "snooze", "missing", "love",
+    ] {
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        results.push(store.like_delete("delete-a", Track, id).await.unwrap());
+    }
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let cleared = store
+        .taste_delete("delete-a", Track, "snooze")
+        .await
+        .unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let repeat = store
+        .taste_delete("delete-a", Track, "snooze")
+        .await
+        .unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let isolated = store
+        .taste_delete("delete-a", Track, "Job_A")
+        .await
+        .unwrap();
+    let mut errors = Vec::new();
+    for owner in ["missing", "delete-pending"] {
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        errors.push(store.taste_delete(owner, Track, "Job_A").await.is_err());
+    }
+    let failed = client(false).await;
+    failed.batch_execute("BEGIN").await.unwrap();
+    assert!(failed.batch_execute("SELECT 1/0").await.is_err());
+    let store =
+        catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let db_error = store.like_delete("delete-b", Track, "Job_A").await.is_err();
+    let rows = observer.query("SELECT user_id, kind, target_id, signal FROM public.account_taste WHERE user_id IN ('delete-a','delete-b','delete-pending') ORDER BY user_id, kind, target_id", &[]).await.unwrap();
+    let states: Vec<(String, String, String, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    observer
+        .batch_execute(
+            "DELETE FROM public.users WHERE id IN ('delete-a','delete-b','delete-pending')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(results, [true, false, false, false, false, false, false]);
+    assert!(cleared && !repeat && isolated && errors.into_iter().all(|x| x) && db_error);
+    let expected = [
+        ("delete-a", "release", "Job_A", "love"),
+        ("delete-a", "track", "ban", "ban"),
+        ("delete-a", "track", "dislike", "dislike"),
+        ("delete-a", "track", "hide", "hide"),
+        ("delete-a", "track", "job_a", "love"),
+        ("delete-b", "track", "Job_A", "love"),
+        ("delete-pending", "track", "Job_A", "love"),
+    ];
+    assert_eq!(
+        states,
+        expected.map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d.into()))
+    );
+}
+
+#[tokio::test]
 async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::{Ban, Snooze};
@@ -500,6 +591,68 @@ async fn taste_upsert_waits_for_deletion_fence() {
     assert!(result.is_err());
     assert_eq!(state, ("love".into(), 1, 1));
     assert_eq!(remaining, 0, "account deletion cascades existing taste");
+}
+
+#[tokio::test]
+async fn preference_delete_waits_for_deletion_fence() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use std::time::Duration;
+    let observer = client(false).await;
+    let locker = client(false).await;
+    let writer = client(false).await;
+    let pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('delete-race','delete-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('delete-race','track','old','love',NULL,1,1)").await.unwrap();
+    locker
+        .batch_execute(
+            "BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'delete-race'",
+        )
+        .await
+        .unwrap();
+    let store =
+        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let delete = store.like_delete("delete-race", Track, "old");
+    let release = async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                        &[&pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        locker.batch_execute("COMMIT").await.unwrap();
+        observed
+    };
+    let (result, observed) = tokio::join!(delete, release);
+    let count: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM public.account_taste WHERE user_id = 'delete-race'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id = 'delete-race'")
+        .await
+        .unwrap();
+    assert!(observed, "delete must wait on the account fence");
+    assert!(result.is_err());
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
