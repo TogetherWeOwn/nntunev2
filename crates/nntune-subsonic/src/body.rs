@@ -18,7 +18,7 @@ pub enum BodyFault {
 }
 
 fn exceeds_cap(current: usize, incoming: usize, cap: usize) -> bool {
-    current.checked_add(incoming).map_or(true, |len| len > cap)
+    current.checked_add(incoming).is_none_or(|len| len > cap)
 }
 
 #[cfg(test)]
