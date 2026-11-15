@@ -22,6 +22,7 @@ pub mod billing;
 pub mod billing_reconcile;
 pub mod billing_store_classification;
 pub mod billing_sweep;
+pub mod billing_transaction_sql;
 pub mod catalogue;
 pub mod credential_session_store;
 mod field_envelope;
