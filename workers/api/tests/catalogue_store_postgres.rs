@@ -960,17 +960,17 @@ async fn snapshot_preflight_fetches_keep_the_admitted_snapshot() {
     for (phase, update, select) in [
         (
             "artist",
-            "UPDATE mb_artist SET name = repeat('x', 1025)",
+            "UPDATE mb_artist SET name = repeat('x', 6)",
             "SELECT name FROM mb_artist",
         ),
         (
             "release",
-            "UPDATE mb_release SET title = repeat('x', 1025)",
+            "UPDATE mb_release SET title = repeat('x', 6)",
             "SELECT title FROM mb_release",
         ),
         (
             "track",
-            "UPDATE mb_recording SET title = repeat('x', 1025)",
+            "UPDATE mb_recording SET title = repeat('x', 6)",
             "SELECT title FROM mb_recording",
         ),
     ] {
@@ -999,7 +999,7 @@ async fn snapshot_preflight_fetches_keep_the_admitted_snapshot() {
             })));
             let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10).await.map_err(|_| format!("{phase}: snapshot failed"))?;
             let changed: String = writer.query_one(select, &[]).await.map_err(|e| e.to_string())?.get(0);
-            if changed.len() != 1025 || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+            if changed.len() != 6 || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
                 || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "Artist"
                 || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
                 || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
