@@ -15,6 +15,46 @@ pub enum ChunkError {
     Authentication,
 }
 
+/// An authenticated chunk with a bounded view; its entire buffer is zeroized on drop.
+pub struct OpenPart {
+    bytes: Zeroizing<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl OpenPart {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[self.start..self.end]
+    }
+}
+
+/// Authenticate a complete chunk before exposing the portion selected by a range.
+/// This is source-only and does not enforce ordering or authorize serving.
+pub fn open_chunk_part(
+    manifest: &OriginManifest,
+    key: &FileKey,
+    range: std::ops::Range<u64>,
+    index: u32,
+    page: &[u8],
+    sealed: Vec<u8>,
+    wire_header: Option<&[u8]>,
+) -> Result<OpenPart, ChunkError> {
+    let selection = manifest
+        .geometry()
+        .range(range.start, range.end)
+        .and_then(|plan| plan.chunk(index))
+        .ok_or(ChunkError::InvalidChunk)?;
+    let bytes = open_chunk(manifest, key, index, page, sealed, wire_header)?;
+    if selection.start > selection.end || selection.end > bytes.len() {
+        return Err(ChunkError::InvalidChunk);
+    }
+    Ok(OpenPart {
+        bytes,
+        start: selection.start,
+        end: selection.end,
+    })
+}
+
 /// Verify the enrolled header and page, then authenticate one complete chunk.
 /// Chunk zero additionally requires the exact wire header. No plaintext escapes
 /// on failure; successful plaintext is zeroized when dropped.
