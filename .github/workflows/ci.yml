@@ -1464,11 +1464,20 @@ jobs:
           echo "CC0 fixture fetched and sha256-verified against the manifest:"
           sha256sum "$fetched"
       - name: Run apps/web Playwright suite
-        run: pnpm test:e2e
+        run: pnpm test:e2e --reporter=dot,html
         env:
+          PLAYWRIGHT_HTML_OPEN: never
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
           NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
+      - name: Upload Playwright report
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e-html-report
+          path: apps/web/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
