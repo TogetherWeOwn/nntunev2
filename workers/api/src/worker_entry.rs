@@ -2621,6 +2621,28 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn taste_list(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_list_statement(),
+                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn like_delete(
         &self,
         user_id: &str,

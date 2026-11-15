@@ -212,6 +212,76 @@ async fn member_target_queries_isolate_caller_and_kind() {
 }
 
 #[tokio::test]
+async fn taste_collection_is_bounded_scoped_and_fails_closed() {
+    async fn seeded() -> Client {
+        let app = client(false).await;
+        app.batch_execute("BEGIN;
+            INSERT INTO public.users (id,email,created_at) VALUES ('collection-owner','collection-owner@example.invalid',1), ('collection-other','collection-other@example.invalid',1);
+            INSERT INTO public.account_taste SELECT 'collection-owner', 'track', 'Job-' || i, 'love', NULL, i, i FROM generate_series(1, 501) i;
+            INSERT INTO public.account_taste VALUES
+                ('collection-owner','release','Job-501','love',NULL,502,502),
+                ('collection-owner','track','job-501','dislike',NULL,503,503),
+                ('collection-owner','track','hide','hide',NULL,504,504),
+                ('collection-owner','track','ban','ban',NULL,505,505),
+                ('collection-owner','track','past','snooze',99,506,506),
+                ('collection-owner','track','equal','snooze',100,507,507),
+                ('collection-owner','track','future','snooze',101,508,508),
+                ('collection-other','track','private','love',NULL,999,999)").await.unwrap();
+        app
+    }
+    let store = catalogue_store_for_postgres_test(
+        seeded().await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let rows = store.taste_list("collection-owner", 100).await.unwrap();
+    assert_eq!(rows.len(), 500);
+    assert!(rows.windows(2).all(|p| p[0].updated_at >= p[1].updated_at));
+    for kind in ["track", "release"] {
+        assert!(rows
+            .iter()
+            .any(|r| r.kind == kind && r.target_id == "Job-501" && r.signal == "love"));
+    }
+    for (id, signal) in [
+        ("job-501", "dislike"),
+        ("hide", "hide"),
+        ("ban", "ban"),
+        ("future", "snooze"),
+    ] {
+        assert!(rows.iter().any(|r| r.target_id == id && r.signal == signal));
+    }
+    for id in ["past", "equal", "private", "Job-1"] {
+        assert!(!rows.iter().any(|r| r.target_id == id));
+    }
+    assert_eq!(rows[0].snooze_until, Some(101));
+    for owner in ["absent", "collection-owner' OR true --"] {
+        let store = catalogue_store_for_postgres_test(
+            client(false).await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        assert!(store.taste_list(owner, 100).await.unwrap().is_empty());
+    }
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    assert!(store
+        .taste_list("collection-owner", u64::MAX)
+        .await
+        .is_err());
+    let app = seeded().await;
+    assert!(app.batch_execute("SELECT 1/0").await.is_err());
+    let store =
+        catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+    assert!(store.taste_list("collection-owner", 100).await.is_err());
+}
+
+#[tokio::test]
 async fn taste_get_reads_only_exact_owner_kind_and_identity() {
     use nntune_api::preference_rows::TasteDbRow;
     use nntune_api::target_identity::TargetKind::{Release, Track};
