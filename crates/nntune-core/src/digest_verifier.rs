@@ -167,9 +167,16 @@ mod tests {
         let mut builder = DigestEnrollment::new(1, [id(1); 5], id(2)).unwrap();
         let page = builder.seal_chunk(&[9]).unwrap().page.unwrap();
         let mut manifest = builder.finish().ok().unwrap();
-        for offset in [0, 8, 10, 12, 18, 20, 28, 60, 68, 76, 80, 84, 88, 90] {
+        for offset in [
+            0, 8, 9, 10, 11, 12, 18, 20, 28, 60, 68, 76, 80, 84, 88, 89, 90, 91,
+        ] {
             let mut bad = page.clone();
             bad[offset] ^= 0x80;
+            manifest.replace_test_row(0, page_hash(&page).unwrap());
+            assert!(matches!(
+                manifest.verify_page(0, &bad),
+                Err(PageError::HashMismatch)
+            ));
             manifest.replace_test_row(0, page_hash(&bad).unwrap());
             assert!(
                 matches!(
@@ -227,6 +234,24 @@ mod tests {
     }
 
     #[test]
+    fn verifies_one_byte_final_chunk_on_second_page() {
+        use crate::digest_page::encode_page;
+
+        let geometry = DigestGeometry::new(256 * 65_536 + 1).unwrap();
+        let map = id(2);
+        let context = [3; 32];
+        let bytes = encode_page(geometry, &map, &context, 1, &[[7; 32]]).unwrap();
+        let rows = vec![[0; 32], page_hash(&bytes).unwrap()];
+        let manifest = OriginManifest::synthetic_test_manifest(geometry, map, context, rows);
+        let page = manifest.verify_page(1, &bytes).ok().unwrap();
+        let last = page.expectation(256).unwrap();
+        assert_eq!((last.sealed_len(), last.final_chunk()), (17, true));
+        assert_eq!(last.digest(), &[7; 32]);
+        assert!(page.expectation(255).is_none());
+        assert!(page.expectation(257).is_none());
+    }
+
+    #[test]
     fn rejects_cross_map_and_matching_hash_truncated_page() {
         let mut first = DigestEnrollment::new(65_537, [id(1); 5], id(2)).unwrap();
         first.seal_chunk(&vec![1; 65_536]).unwrap();
@@ -245,6 +270,11 @@ mod tests {
             Err(PageError::InvalidGrammar)
         ));
         let truncated = &page[..124];
+        manifest.replace_test_row(0, page_hash(&page).unwrap());
+        assert!(matches!(
+            manifest.verify_page(0, truncated),
+            Err(PageError::HashMismatch)
+        ));
         manifest.replace_test_row(0, page_hash(truncated).unwrap());
         assert!(matches!(
             manifest.verify_page(0, truncated),
