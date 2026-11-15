@@ -711,6 +711,8 @@ struct CatalogueTestMirror {
     client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
     membership_hook: std::cell::RefCell<Option<MembershipTestHook>>,
+    mirror_hook: std::cell::RefCell<Option<MembershipTestHook>>,
+    preflight_hook: std::cell::RefCell<Option<(&'static str, MembershipTestHook)>>,
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -724,6 +726,8 @@ pub type MembershipTestHook =
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub trait SubsonicSnapshotCatalogueStore {
     fn set_membership_hook(&self, hook: MembershipTestHook);
+    fn set_mirror_hook(&self, hook: MembershipTestHook);
+    fn set_preflight_hook(&self, phase: &'static str, hook: MembershipTestHook);
 
     async fn subsonic_snapshot_catalogue_with_cap(
         &self,
@@ -756,6 +760,24 @@ pub trait SubsonicSnapshotCatalogueStore {
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 impl SubsonicSnapshotCatalogueStore for PgStore {
+    fn set_preflight_hook(&self, phase: &'static str, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .preflight_hook
+            .borrow_mut() = Some((phase, hook));
+    }
+
+    fn set_mirror_hook(&self, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .mirror_hook
+            .borrow_mut() = Some(hook);
+    }
+
     fn set_membership_hook(&self, hook: MembershipTestHook) {
         *self
             .test_mirror
@@ -803,6 +825,8 @@ pub fn catalogue_store_for_postgres_test(
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
             membership_hook: std::cell::RefCell::new(None),
+            mirror_hook: std::cell::RefCell::new(None),
+            preflight_hook: std::cell::RefCell::new(None),
         }),
     }
 }
@@ -982,10 +1006,24 @@ impl PgStore {
                     return Ok((Vec::new(), Vec::new(), Vec::new()));
                 }
                 self.require_mirror()?;
-                let mirror = self.connect_mirror().await?;
+                let mut mirror = self.connect_mirror().await?;
+                let tx = mirror.build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true).start().await.map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await.map_err(|_| StoreError)?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.subsonic_member_catalogue");
-                let artist_rows = mirror
+                let artist_preflight = subsonic_text_preflight(
+                    crate::catalogue::artists_list_statement(),
+                    &["mbid", "name", "sort_name", "type", "country"],
+                );
+                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("artist").await?;
+                let artist_rows = tx
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
                         &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
@@ -993,11 +1031,25 @@ impl PgStore {
                     .await
                     .map_err(|_| statement_failed())?;
                 require_complete_snapshot_page(artist_rows.len(), cap)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                {
+                    let hook = self.test_mirror.as_ref().and_then(|m| m.mirror_hook.borrow_mut().take());
+                    if let Some(hook) = hook { hook().await?; }
+                }
                 let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
                     .iter()
                     .map(catalogue_artist_from_row)
                     .collect::<Result<_, _>>()?;
-                let release_rows = mirror
+                let release_preflight = subsonic_text_preflight(
+                    crate::catalogue::releases_list_statement(),
+                    &["mbid", "title", "release_type", "artist_mbid", "artist_name"],
+                );
+                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("release").await?;
+                let release_rows = tx
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
                         &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
@@ -1011,7 +1063,16 @@ impl PgStore {
                     .collect::<Result<_, _>>()?;
                 let (pair_releases, pair_recordings) =
                     crate::catalogue::member_pair_columns(&member_pairs);
-                let track_rows = mirror
+                let track_preflight = subsonic_text_preflight(
+                    crate::catalogue::tracks_list_statement(),
+                    &["release_mbid", "recording_mbid", "title", "release_title", "artist_mbid", "artist_name"],
+                );
+                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("track").await?;
+                let track_rows = tx
                     .query_typed(
                         crate::catalogue::tracks_list_statement(),
                         &[
@@ -1027,6 +1088,7 @@ impl PgStore {
                     .iter()
                     .map(catalogue_track_from_row)
                     .collect::<Result<_, _>>()?;
+                tx.commit().await.map_err(|_| StoreError)?;
                 Ok((
                     artist_rows,
                     release_rows,
@@ -1036,6 +1098,25 @@ impl PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    async fn run_preflight_hook(&self, phase: &'static str) -> Result<(), StoreError> {
+        let hook = self.test_mirror.as_ref().and_then(|mirror| {
+            let mut slot = mirror.preflight_hook.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(selected, _)| *selected == phase)
+            {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            hook().await?;
+        }
+        Ok(())
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
@@ -6180,6 +6261,26 @@ fn emit_record(
 /// far larger but still bounded cap (rows are in-memory only).
 #[allow(dead_code)] // Used by the mount in the next slice.
 const SUBSONIC_SNAPSHOT_CAP: i64 = 1_024;
+
+// Only static, developer-owned column names and statements may be passed.
+// Numeric aggregation avoids overflow even for pathological stored values.
+fn subsonic_text_preflight(statement: &str, columns: &[&str]) -> String {
+    let lengths: Vec<String> = columns
+        .iter()
+        .map(|column| format!("COALESCE(octet_length({column}), 0)::bigint"))
+        .collect();
+    let per_field = lengths
+        .iter()
+        .map(|length| format!("{length} <= 1024"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let row_bytes = lengths.join(" + ");
+    format!(
+        "SELECT COALESCE(bool_and({per_field}), true) AND \
+         COALESCE(sum(({row_bytes})::numeric), 0) <= 262144 \
+         FROM ({statement}) AS snapshot_rows"
+    )
+}
 
 // A full page may have been truncated. Refuse it rather than serve a
 // potentially incomplete catalogue; the check precedes membership filtering.

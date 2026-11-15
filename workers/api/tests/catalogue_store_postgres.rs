@@ -1141,6 +1141,222 @@ async fn snapshot_overlong_membership_ids_keep_valid_neighbours() {
 }
 
 #[tokio::test]
+async fn snapshot_mirror_field_octet_boundaries() {
+    let cases: [fn(i32) -> FieldLens; 4] = [
+        |n| FieldLens {
+            artist_name: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            sort_name: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            release_title: n,
+            ..SHORT
+        },
+        |n| FieldLens {
+            track_title: n,
+            ..SHORT
+        },
+    ];
+    for (filler, ok, bad) in [("a", 1024, 1025), ("é", 512, 513)] {
+        for (index, make) in cases.iter().enumerate() {
+            let (app, mirror) = sized_fixture(1, make(ok), filler).await;
+            let (result, _) = snapshot_of(app, mirror, 100).await;
+            let (artists, releases, tracks) = result.unwrap();
+            assert_eq!((artists.len(), releases.len(), tracks.len()), (1, 1, 1));
+            let value = match index {
+                0 => &artists[0].name,
+                1 => &artists[0].sort_name,
+                2 => &releases[0].title,
+                _ => &tracks[0].title,
+            };
+            assert_eq!(*value, filler.repeat(ok as usize));
+            let (app, mirror) = sized_fixture(1, make(bad), filler).await;
+            let (result, _) = snapshot_of(app, mirror, 100).await;
+            assert!(result.is_err(), "field {index} with {filler:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_mirror_aggregate_boundaries() {
+    // 245 * (36 + 1 + 6 + 2 + 1024) + (36 + 1 + 6 + 2 + 194) = 262144.
+    for (last_length, accepted) in [(194_i32, true), (195, false)] {
+        let (app, mirror) = sized_fixture(
+            246,
+            FieldLens {
+                sort_name: 1024,
+                ..SHORT
+            },
+            "a",
+        )
+        .await;
+        mirror
+            .execute(
+                "UPDATE mb_artist SET sort_name = repeat('a', $1) WHERE mbid = $2::text::uuid",
+                &[&last_length, &synthetic_uuid(1, 246)],
+            )
+            .await
+            .unwrap();
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        if accepted {
+            let (artists, releases, tracks) = result.unwrap();
+            assert_eq!(
+                (artists.len(), releases.len(), tracks.len()),
+                (246, 246, 246)
+            );
+            assert!(artists
+                .iter()
+                .any(|artist| artist.sort_name == "a".repeat(194)));
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    for lens in [
+        FieldLens {
+            artist_name: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            sort_name: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            release_title: 1024,
+            ..SHORT
+        },
+        FieldLens {
+            track_title: 1024,
+            ..SHORT
+        },
+    ] {
+        let (app, mirror) = sized_fixture(200, lens, "a").await;
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        let (artists, releases, tracks) = result.unwrap();
+        assert_eq!(
+            (artists.len(), releases.len(), tracks.len()),
+            (200, 200, 200)
+        );
+        let (app, mirror) = sized_fixture(257, lens, "a").await;
+        let (result, _) = snapshot_of(app, mirror, 1000).await;
+        assert!(result.is_err());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_preflight_fetches_keep_the_admitted_snapshot() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    for (phase, update, select) in [
+        (
+            "artist",
+            "UPDATE mb_artist SET name = repeat('x', 6)",
+            "SELECT name FROM mb_artist",
+        ),
+        (
+            "release",
+            "UPDATE mb_release SET title = repeat('x', 6)",
+            "SELECT title FROM mb_release",
+        ),
+        (
+            "track",
+            "UPDATE mb_recording SET title = repeat('x', 6)",
+            "SELECT title FROM mb_recording",
+        ),
+    ] {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("nntune_preflight_{}_{}", std::process::id(), nonce);
+        let writer = shared_connection(&schema).await.unwrap();
+        create_shared_mirror(&writer, &schema).await.unwrap();
+        let result: Result<(), String> = async {
+            writer.batch_execute(&format!(
+                "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Sort', 'Person', 'US');
+                 INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+                 INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+                 INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+            )).await.map_err(|e| e.to_string())?;
+            let app = client(false).await;
+            app.execute("INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'original', $1, ARRAY[$2])", &[&SNAPSHOT_RELEASE, &RECORDING]).await.map_err(|e| e.to_string())?;
+            let reader = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+            let mutation = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+            let store = catalogue_store_for_postgres_test(app, true, Ok(reader), Rc::new(Cell::new(0)));
+            store.set_preflight_hook(phase, Box::new(move || Box::pin(async move {
+                mutation.batch_execute(update).await.map_err(|_| StoreError)?;
+                Ok(())
+            })));
+            let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10).await.map_err(|_| format!("{phase}: snapshot failed"))?;
+            let changed: String = writer.query_one(select, &[]).await.map_err(|e| e.to_string())?.get(0);
+            if changed != "xxxxxx" || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+                || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "Artist"
+                || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
+                || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
+                return Err(format!("{phase}: writer or snapshot mismatch"));
+            }
+            Ok(())
+        }.await;
+        writer
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn snapshot_mirror_queries_share_one_committed_snapshot() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("nntune_mirror_{}_{}", std::process::id(), nonce);
+    let writer = shared_connection(&schema).await.unwrap();
+    create_shared_mirror(&writer, &schema).await.unwrap();
+    let result: Result<(), String> = async {
+        writer.batch_execute(&format!(
+            "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Sort', 'Person', 'US');
+             INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+             INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+             INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+        )).await.map_err(|e| e.to_string())?;
+        let app = client(false).await;
+        app.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'original', $1, ARRAY[$2])",
+            &[&SNAPSHOT_RELEASE, &RECORDING],
+        ).await.map_err(|e| e.to_string())?;
+        let reader = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let mutation = shared_connection(&schema).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(app, true, Ok(reader), Rc::new(Cell::new(0)));
+        store.set_mirror_hook(Box::new(move || Box::pin(async move {
+            mutation.batch_execute("UPDATE mb_release SET title = 'Changed'; UPDATE mb_recording SET title = 'Changed'")
+                .await.map_err(|_| StoreError)?;
+            Ok(())
+        })));
+        let (artists, releases, tracks) = store.subsonic_snapshot_catalogue_with_cap("u1", 10)
+            .await.map_err(|_| "snapshot failed".to_owned())?;
+        let release_title: String = writer.query_one("SELECT title FROM mb_release", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let track_title: String = writer.query_one("SELECT title FROM mb_recording", &[]).await.map_err(|e| e.to_string())?.get(0);
+        if release_title != "Changed" || track_title != "Changed"
+            || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+            || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "Artist"
+            || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
+            || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
+            return Err("mirror snapshot mixed old and new states".into());
+        }
+        Ok(())
+    }.await;
+    writer
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_membership_queries_share_one_committed_snapshot() {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nonce = SystemTime::now()
