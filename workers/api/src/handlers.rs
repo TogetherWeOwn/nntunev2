@@ -1561,13 +1561,6 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
         async { Err(StoreError) }
     }
-    fn taste_list(
-        &self,
-        _user_id: &str,
-        _now: u64,
-    ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
-        async { Err(StoreError) }
-    }
     /// Write a resolved identity using server-supplied owner and time. Missing or
     /// deleting accounts and storage failures return an error, never success.
     fn taste_upsert(
@@ -8795,31 +8788,7 @@ mod tests {
                 .filter(|((owner, _, _), row)| owner == user_id && row.signal == "love")
                 .map(|(_, row)| row.clone())
                 .collect();
-            rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            rows.truncate(500);
-            Ok(rows)
-        }
-        async fn taste_list(
-            &self,
-            user_id: &str,
-            now: u64,
-        ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
-            if *self.fail_taste_read.borrow() {
-                return Err(StoreError);
-            }
-            let now = i64::try_from(now).map_err(|_| StoreError)?;
-            let mut rows: Vec<_> = self
-                .taste_rows
-                .borrow()
-                .iter()
-                .filter(|((owner, _, _), row)| {
-                    owner == user_id
-                        && (row.signal != "snooze"
-                            || row.snooze_until.is_some_and(|until| until > now))
-                })
-                .map(|(_, row)| row.clone())
-                .collect();
-            rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
             rows.truncate(500);
             Ok(rows)
         }
@@ -23002,10 +22971,8 @@ mod tests {
             block_on(s.taste_upsert(owner, kind, id, signal, until, now)).unwrap();
         }
         let likes = block_on(s.likes_list("u1")).unwrap();
-        let taste = block_on(s.taste_list("u1", 100)).unwrap();
-        assert_eq!((likes.len(), taste.len()), (500, 500));
+        assert_eq!(likes.len(), 500);
         assert!(likes.windows(2).all(|r| r[0].created_at >= r[1].created_at));
-        assert!(taste.windows(2).all(|r| r[0].updated_at >= r[1].updated_at));
         assert!(likes
             .iter()
             .all(|r| r.signal == "love" && r.target_id != "private"));
@@ -23015,18 +22982,9 @@ mod tests {
         assert!(likes
             .iter()
             .any(|r| r.kind == "track" && r.target_id == "Job-501"));
-        for id in ["job-501", "hide", "ban", "future"] {
-            assert!(taste.iter().any(|r| r.target_id == id));
-        }
-        for id in ["past", "equal", "private"] {
-            assert!(!taste.iter().any(|r| r.target_id == id));
-        }
         assert!(block_on(s.likes_list("missing")).unwrap().is_empty());
-        assert!(block_on(s.taste_list("missing", 100)).unwrap().is_empty());
-        assert!(block_on(s.taste_list("u1", u64::MAX)).is_err());
         *s.fail_taste_read.borrow_mut() = true;
         assert!(block_on(s.likes_list("u1")).is_err());
-        assert!(block_on(s.taste_list("u1", 100)).is_err());
     }
 
     #[test]

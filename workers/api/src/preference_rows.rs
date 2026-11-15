@@ -5,13 +5,9 @@ pub fn taste_get_statement() -> &'static str {
     "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND kind = $2 AND target_id = $3"
 }
 
-/// Bounded owner-scoped collections; the time parameter is supplied by the server.
+/// Bounded owner-scoped likes collection.
 pub fn likes_list_statement() -> &'static str {
     "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND signal = 'love' ORDER BY created_at DESC LIMIT 500"
-}
-
-pub fn taste_list_statement() -> &'static str {
-    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND (signal <> 'snooze' OR snooze_until > $2) ORDER BY updated_at DESC LIMIT 500"
 }
 
 /// Upsert under the account deletion fence, preserving a replayed love's timestamp.
