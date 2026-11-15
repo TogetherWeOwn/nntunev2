@@ -215,6 +215,35 @@ mod tests {
     }
 
     #[test]
+    fn verifies_empty_restore_expectation() {
+        use crate::digest_page::encode_page;
+
+        let geometry = DigestGeometry::new(0).unwrap();
+        let map = id(2);
+        let context = [3; 32];
+        let bytes = encode_page(geometry, &map, &context, 0, &[[7; 32]]).unwrap();
+        let manifest = OriginManifest::synthetic_test_manifest(
+            geometry,
+            map,
+            context,
+            vec![page_hash(&bytes).unwrap()],
+        );
+        let page = manifest.verify_page(0, &bytes).ok().unwrap();
+        let expected = page.expectation(0).unwrap();
+        assert_eq!(
+            (
+                expected.index(),
+                expected.sealed_len(),
+                expected.final_chunk()
+            ),
+            (0, 16, true)
+        );
+        assert_eq!(expected.digest(), &[7; 32]);
+        assert!(page.expectation(1).is_none());
+        assert!(DigestEnrollment::new(0, [id(1); 5], map).is_err());
+    }
+
+    #[test]
     fn verifies_maximum_geometry_final_page_without_object_allocation() {
         use crate::digest_page::encode_page;
 

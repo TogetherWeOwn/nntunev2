@@ -16,6 +16,21 @@ fn invalid() -> crate::Error {
 
 /// Complete sealer-origin evidence. Its private fields cannot be hydrated from
 /// provider bytes or caller-supplied hashes, and do not authorize serving.
+///
+/// Provider rows cannot be substituted into an existing manifest:
+/// ```compile_fail
+/// use nntune_core::digest_enrollment::OriginManifest;
+/// fn replace(manifest: &mut OriginManifest, provider_hash: [u8; 32]) {
+///     manifest.rows[0] = provider_hash;
+/// }
+/// ```
+/// Nor can arbitrary provider hashes be appended to an enrollment:
+/// ```compile_fail
+/// use nntune_core::digest_enrollment::DigestEnrollment;
+/// fn enroll(builder: &mut DigestEnrollment, provider_hash: [u8; 32]) {
+///     builder.rows.push(provider_hash);
+/// }
+/// ```
 #[allow(dead_code)] // Consumed by the independent verifier in the next slice.
 pub struct OriginManifest {
     geometry: DigestGeometry,
@@ -232,6 +247,20 @@ mod tests {
             for (row, page) in manifest.rows.iter().zip(&pages) {
                 assert_eq!(*row, page_hash(page).unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn finish_rejects_missing_and_extra_rows() {
+        for extra in [false, true] {
+            let mut builder = DigestEnrollment::new(1, [id(1); 5], id(2)).unwrap();
+            builder.seal_chunk(&[1]).unwrap();
+            if extra {
+                builder.rows.push(builder.rows[0]);
+            } else {
+                builder.rows.clear();
+            }
+            assert!(builder.finish().is_err());
         }
     }
 
