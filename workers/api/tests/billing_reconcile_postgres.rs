@@ -1157,3 +1157,131 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
     );
     result.expect("contention phases failed");
 }
+
+// These are server-side expiry controls on a disposable relation, not proof of
+// production pooling, role privileges, version support, or driver cancellation.
+#[tokio::test]
+async fn abandoned_table_lock_expires_and_rollback_cleans_local_settings() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let schema = format!(
+        "billing_expiry_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut drivers = Vec::new();
+    let mut pending = Vec::new();
+    let result: Result<(), String> = timeout(Duration::from_secs(30), async {
+        let (observer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        observer.batch_execute(&format!("SET statement_timeout = '4s'; CREATE SCHEMA {schema}; CREATE TABLE {schema}.subscriptions (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO {schema}.subscriptions VALUES (1, 0)")).await.map_err(|e| e.to_string())?;
+
+        // Acknowledged rollback on a surviving connection is distinct from expiry.
+        let baseline: String = observer.query_one("SHOW lock_timeout", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let pid: i32 = observer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        observer.batch_execute(&format!("BEGIN; SET LOCAL lock_timeout = '1s'; LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE; UPDATE {schema}.subscriptions SET value = 99; ROLLBACK")).await.map_err(|e| e.to_string())?;
+        let row = observer.query_one(&format!("SELECT pg_backend_pid(), current_setting('lock_timeout'), (SELECT value FROM {schema}.subscriptions WHERE id = 1), EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND relation = '{schema}.subscriptions'::regclass AND mode = 'ShareRowExclusiveLock')"), &[]).await.map_err(|e| e.to_string())?;
+        if row.get::<_, i32>(0) != pid || row.get::<_, String>(1) != baseline || row.get::<_, i32>(2) != 0 || row.get::<_, bool>(3) {
+            return Err("acknowledged rollback did not restore settings, data, and lock state".into());
+        }
+
+        for expiry in ["transaction", "idle"] {
+            let (holder, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            writer.batch_execute("SET statement_timeout = '8s'").await.map_err(|e| e.to_string())?;
+            let holder_pid: i32 = holder.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let settings = if expiry == "transaction" {
+                "SET LOCAL transaction_timeout = '3s'; SET LOCAL idle_in_transaction_session_timeout = '0'"
+            } else {
+                "SET LOCAL transaction_timeout = '10s'; SET LOCAL idle_in_transaction_session_timeout = '3s'"
+            };
+            holder.batch_execute(&format!("BEGIN ISOLATION LEVEL READ COMMITTED; {settings}; SET LOCAL statement_timeout = '8s'; LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE; UPDATE {schema}.subscriptions SET value = 10 WHERE id = 1")).await.map_err(|e| e.to_string())?;
+            let sql = format!("UPDATE {schema}.subscriptions SET value = value + 1 WHERE id = 1");
+            pending.push(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
+            let task = pending.last_mut().unwrap();
+            // Observe the actual wait before allowing the server timeout to end it.
+            let relation = format!("{schema}.subscriptions");
+            let params: [&(dyn ToSql + Sync); 3] = [&holder_pid, &writer_pid, &relation];
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut *task => return Err(format!("{expiry} writer finished before wait barrier: {result:?}")),
+                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2)) AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $3::text::regclass AND mode = 'ShareRowExclusiveLock' AND granted)", &params) => {
+                            if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), String>(())
+            }).await.map_err(|_| format!("{expiry} wait barrier timed out"))??;
+            let expiry_error = if expiry == "transaction" {
+                // Keep the client alive even if the statement unexpectedly succeeds.
+                let (send, receive) = tokio::sync::oneshot::channel();
+                pending.push(tokio::spawn(async move {
+                    let result = holder.batch_execute("SELECT pg_sleep(6)").await;
+                    let code = result.err().and_then(|e| e.code().map(|c| c.code().to_owned()));
+                    let _ = send.send(code);
+                    std::future::pending::<()>().await;
+                    drop(holder);
+                    Ok::<u64, tokio_postgres::Error>(0)
+                }));
+                Some(receive)
+            } else {
+                // Keep the client alive but issue no command while the idle timer runs.
+                pending.push(tokio::spawn(async move { std::future::pending::<()>().await; drop(holder); Ok::<u64, tokio_postgres::Error>(0) }));
+                None
+            };
+            let writer_index = pending.len() - 2;
+            let task = &mut pending[writer_index];
+            let count = timeout(Duration::from_secs(8), task).await.map_err(|_| format!("{expiry} writer did not resume"))?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            if count != 1 { return Err(format!("{expiry} writer affected {count} rows")); }
+            if let Some(receive) = expiry_error {
+                let code = timeout(Duration::from_secs(5), receive).await.map_err(|_| "transaction expiry error timed out".to_string())?.map_err(|e| e.to_string())?;
+                if code.as_deref() != Some("25P04") { return Err(format!("unexpected transaction expiry SQLSTATE: {code:?}")); }
+            }
+            // Backend exit can trail lock release. Observe it separately, within a bound.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let row = observer.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1), EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1)", &[&holder_pid]).await.map_err(|e| e.to_string())?;
+                    if !row.get::<_, bool>(0) && !row.get::<_, bool>(1) { break; }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), String>(())
+            }).await.map_err(|_| format!("{expiry} backend exit timed out"))??;
+            let value: i32 = observer.query_one(&format!("SELECT value FROM {schema}.subscriptions WHERE id = 1"), &[]).await.map_err(|e| e.to_string())?.get(0);
+            let expected = if expiry == "transaction" { 1 } else { 2 };
+            if value != expected { return Err(format!("{expiry} rollback state incorrect")); }
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("expiry phases timed out".into()));
+
+    for task in pending {
+        if !task.is_finished() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    let cleanup = timeout(Duration::from_secs(5), async {
+        let (db, connection) = config.connect(NoTls).await?;
+        let driver = tokio::spawn(connection);
+        let result = db.batch_execute(&format!("SET lock_timeout = '3s'; SET statement_timeout = '4s'; DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        drop(db);
+        driver.abort();
+        let _ = driver.await;
+        result
+    }).await;
+    assert!(
+        matches!(cleanup, Ok(Ok(()))),
+        "fixture cleanup failed: {cleanup:?}; phases: {result:?}"
+    );
+    result.expect("expiry phases failed");
+}
