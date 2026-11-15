@@ -16,13 +16,64 @@ fn invalid() -> crate::Error {
 
 /// Complete sealer-origin evidence. Its private fields cannot be hydrated from
 /// provider bytes or caller-supplied hashes, and do not authorize serving.
+///
+/// Provider rows cannot be substituted into an existing manifest:
+/// ```compile_fail
+/// use nntune_core::digest_enrollment::OriginManifest;
+/// fn replace(manifest: &mut OriginManifest, provider_hash: [u8; 32]) {
+///     manifest.rows[0] = provider_hash;
+/// }
+/// ```
+/// Nor can arbitrary provider hashes be appended to an enrollment:
+/// ```compile_fail
+/// use nntune_core::digest_enrollment::DigestEnrollment;
+/// fn enroll(builder: &mut DigestEnrollment, provider_hash: [u8; 32]) {
+///     builder.rows.push(provider_hash);
+/// }
+/// ```
 #[allow(dead_code)] // Consumed by the independent verifier in the next slice.
 pub struct OriginManifest {
-    pub(crate) geometry: DigestGeometry,
-    pub(crate) map_id: [u8; 16],
-    pub(crate) context: [u8; 32],
-    pub(crate) header: [u8; 48],
-    pub(crate) rows: Vec<[u8; 32]>,
+    geometry: DigestGeometry,
+    map_id: [u8; 16],
+    context: [u8; 32],
+    header: [u8; 48],
+    rows: Vec<[u8; 32]>,
+}
+
+impl OriginManifest {
+    pub(crate) fn geometry(&self) -> DigestGeometry {
+        self.geometry
+    }
+    pub(crate) fn map_id(&self) -> &[u8; 16] {
+        &self.map_id
+    }
+    pub(crate) fn context(&self) -> &[u8; 32] {
+        &self.context
+    }
+    pub(crate) fn row(&self, index: usize) -> Option<&[u8; 32]> {
+        self.rows.get(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_test_manifest(
+        geometry: DigestGeometry,
+        map_id: [u8; 16],
+        context: [u8; 32],
+        rows: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            geometry,
+            map_id,
+            context,
+            header: [0; 48],
+            rows,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_test_row(&mut self, index: usize, hash: [u8; 32]) {
+        self.rows[index] = hash;
+    }
 }
 
 /// Owns the sequential sealer and buffers at most one page of chunk digests.
@@ -196,6 +247,20 @@ mod tests {
             for (row, page) in manifest.rows.iter().zip(&pages) {
                 assert_eq!(*row, page_hash(page).unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn finish_rejects_missing_and_extra_rows() {
+        for extra in [false, true] {
+            let mut builder = DigestEnrollment::new(1, [id(1); 5], id(2)).unwrap();
+            builder.seal_chunk(&[1]).unwrap();
+            if extra {
+                builder.rows.push(builder.rows[0]);
+            } else {
+                builder.rows.clear();
+            }
+            assert!(builder.finish().is_err());
         }
     }
 
