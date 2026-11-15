@@ -31,13 +31,15 @@ pub async fn relation_wait<T: Send + 'static>(
     mode: &str,
 ) -> Result<(), String> {
     timeout(PHASE_TIMEOUT, async {
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&blocker_pid, &waiter_pid, &relation, &mode];
         loop {
             tokio::select! {
                 biased;
                 _ = &mut *task => return Err("lock finished before wait barrier".to_string()),
                 row = observer.query_one(
                     "SELECT $1 = ANY(pg_blocking_pids($2)) AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = $2 AND relation = to_regclass($3) AND mode = $4 AND NOT granted)",
-                    &[&blocker_pid, &waiter_pid, &relation, &mode],
+                    params,
                 ) => {
                     if row.map_err(|e| e.to_string())?.get::<_, bool>(0) {
                         return Ok(());
