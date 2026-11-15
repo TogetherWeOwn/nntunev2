@@ -1542,6 +1542,17 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
     }
+    /// Read a resolved target exactly, including expired snoozes. Callers must
+    /// canonicalize known MBIDs and preserve opaque job IDs, including UUID-shaped
+    /// ones. Presentation filters expired snoozes.
+    fn taste_get(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<Option<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Probe own-or-shared membership. Tracks retain the original spelling;
     /// release targets are canonicalized before binding. Unsupported stores fail closed.
     fn catalogue_member_target(
@@ -7323,6 +7334,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeStore {
+        taste_rows: RefCell<HashMap<(String, String, String), crate::preference_rows::TasteDbRow>>,
+        fail_taste_read: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
@@ -8619,6 +8632,21 @@ mod tests {
                 row.last_used_at = Some(now);
             }
             Ok(())
+        }
+        async fn taste_get(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .taste_rows
+                .borrow()
+                .get(&(user_id.into(), kind.as_str().into(), target.into()))
+                .cloned())
         }
         async fn catalogue_member_target(
             &self,
@@ -22773,6 +22801,38 @@ mod tests {
         }
         *store.fail_catalogue_reads.borrow_mut() = true;
         assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
+    }
+
+    #[test]
+    fn fake_taste_get_is_scoped_and_fails_closed() {
+        use crate::preference_rows::TasteDbRow;
+        use crate::target_identity::TargetKind::{Release, Track};
+        let store = FakeStore::default();
+        let row = TasteDbRow {
+            kind: "track".into(),
+            target_id: "Job_A".into(),
+            signal: "snooze".into(),
+            snooze_until: Some(5),
+            created_at: 1,
+            updated_at: 2,
+        };
+        store
+            .taste_rows
+            .borrow_mut()
+            .insert(("u1".into(), "track".into(), "Job_A".into()), row.clone());
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row)
+        );
+        for (user, kind, id) in [
+            ("other", Track, "Job_A"),
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+        ] {
+            assert_eq!(block_on(store.taste_get(user, kind, id)).unwrap(), None);
+        }
+        *store.fail_taste_read.borrow_mut() = true;
+        assert!(block_on(store.taste_get("u1", Track, "Job_A")).is_err());
     }
 
     fn seed_catalogue(h: &Harness) {

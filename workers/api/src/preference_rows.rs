@@ -1,5 +1,10 @@
 //! Inert store-facing preference and history row representations.
 
+/// Read the exact resolved identity; callers filter expired snoozes when presenting taste.
+pub fn taste_get_statement() -> &'static str {
+    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND kind = $2 AND target_id = $3"
+}
+
 /// A taste row as returned by a store; its fields are not validated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TasteDbRow {
