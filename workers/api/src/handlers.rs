@@ -1542,6 +1542,16 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
     }
+    /// Probe own-or-shared membership. Tracks retain the original spelling;
+    /// release targets are canonicalized before binding. Unsupported stores fail closed.
+    fn catalogue_member_target(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Catalogue slice-1 reads: the per-user ingest library plus
     /// the shared mirror collections. Read-only: implementations must not
     /// create users, ledger rows, or mirror entries. Owner scoping lives in
@@ -8609,6 +8619,40 @@ mod tests {
                 row.last_used_at = Some(now);
             }
             Ok(())
+        }
+        async fn catalogue_member_target(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            use crate::target_identity::TargetKind;
+            if kind == TargetKind::Release && !crate::catalogue::is_catalogue_mbid(target) {
+                return Ok(false);
+            }
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            let rows = self.catalogue_library.borrow();
+            // The empty key represents shared library rows in this fake.
+            Ok([user_id, ""]
+                .into_iter()
+                .filter_map(|key| rows.get(key))
+                .flatten()
+                .any(|row| match kind {
+                    TargetKind::Track => {
+                        row.job_id == target
+                            || (crate::catalogue::is_catalogue_mbid(target)
+                                && row
+                                    .recording_mbids
+                                    .iter()
+                                    .any(|id| id.eq_ignore_ascii_case(target)))
+                    }
+                    TargetKind::Release => row
+                        .release_mbid
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(target)),
+                }))
         }
         async fn catalogue_library(
             &self,
@@ -22686,6 +22730,49 @@ mod tests {
             artist_mbid: None,
             artist_name: None,
         }
+    }
+
+    #[test]
+    fn fake_member_target_matches_visibility_kind_and_errors() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        let store = FakeStore::default();
+        let uuid_job = "11111111-1111-1111-1111-AAAAAAAAAAAA";
+        let mut own = matched_library_row(uuid_job, CAT_REC_A, 1);
+        own.recording_mbids.push("opaque-invalid".into());
+        own.recording_mbids
+            .push("BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB".into());
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("u1".into(), vec![own]);
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Shared")]);
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("other".into(), vec![unmatched_library_row("Private")]);
+        for (kind, target, expected) in [
+            (Track, uuid_job, true),
+            (Track, "11111111-1111-1111-1111-aaaaaaaaaaaa", false),
+            (Track, "Shared", true),
+            (Track, "Private", false),
+            (Track, "missing", false),
+            (Track, "OPAQUE-INVALID", false),
+            (Track, CAT_REC_A, true),
+            (Track, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", true),
+            (Track, CAT_RELEASE, false),
+            (Release, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", true),
+            (Release, CAT_REC_A, false),
+        ] {
+            assert_eq!(
+                block_on(store.catalogue_member_target("u1", kind, target)).unwrap(),
+                expected
+            );
+        }
+        *store.fail_catalogue_reads.borrow_mut() = true;
+        assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
     }
 
     fn seed_catalogue(h: &Harness) {
