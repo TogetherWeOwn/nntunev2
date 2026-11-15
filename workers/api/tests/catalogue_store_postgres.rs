@@ -631,6 +631,115 @@ async fn snapshot_of(
     (result, attempts.get())
 }
 
+async fn shared_connection(schema: &str) -> Result<Client, tokio_postgres::Error> {
+    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
+        .expect("CI disposable database is required; never silently skip")
+        .parse()
+        .unwrap();
+    assert_eq!(config.get_dbname(), Some("nntune_ci"));
+    assert!(config.get_hostaddrs().is_empty(), "no address overrides");
+    assert!(
+        matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+    );
+    let (client, connection) = config.connect(NoTls).await?;
+    tokio::spawn(async move { connection.await.unwrap() });
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout = '3s'; SET search_path = {schema}, pg_catalog"
+        ))
+        .await?;
+    Ok(client)
+}
+
+async fn create_shared_app(client: &Client, schema: &str) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute(&format!(
+        "CREATE SCHEMA {schema}; CREATE TABLE {schema}.library \
+         (user_id text, job_id text, release_mbid text, recording_mbids text[], idempotency_key text PRIMARY KEY DEFAULT gen_random_uuid()::text)"
+    )).await
+}
+
+async fn create_shared_mirror(client: &Client, schema: &str) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute(&format!(
+        "CREATE SCHEMA {schema};
+         CREATE TABLE {schema}.mb_artist (mbid uuid PRIMARY KEY, name text, sort_name text, type text, country text);
+         CREATE TABLE {schema}.mb_release (mbid uuid PRIMARY KEY, title text, release_type text, year smallint, artist_mbid uuid);
+         CREATE TABLE {schema}.mb_recording (mbid uuid PRIMARY KEY, title text, duration_ms integer);
+         CREATE TABLE {schema}.mb_track (release_mbid uuid, recording_mbid uuid, medium_no smallint, track_no smallint, PRIMARY KEY (release_mbid, medium_no, track_no))"
+    )).await
+}
+
+#[tokio::test]
+async fn shared_fixture_writer_commit_is_visible_to_snapshot_reader() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Only generated identifiers are interpolated into DDL and search paths.
+    let prefix = format!(
+        "nntune_t_{}_{}_{}",
+        std::process::id(),
+        nonce,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let app_schema = format!("{prefix}_a");
+    let mirror_schema = format!("{prefix}_m");
+    let app_writer = shared_connection(&app_schema).await.unwrap();
+    let mirror_writer = shared_connection(&mirror_schema).await.unwrap();
+    let mut app_created = false;
+    let mut mirror_created = false;
+    let result: Result<(), String> = async {
+        create_shared_app(&app_writer, &app_schema).await.map_err(|e| e.to_string())?;
+        app_created = true;
+        create_shared_mirror(&mirror_writer, &mirror_schema).await.map_err(|e| e.to_string())?;
+        mirror_created = true;
+        app_writer.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'shared', $1, ARRAY[$2])",
+            &[&SNAPSHOT_RELEASE, &RECORDING],
+        ).await.map_err(|e| e.to_string())?;
+        mirror_writer.batch_execute(&format!(
+            "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Before', 'Sort', 'Person', 'US');
+             INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');
+             INSERT INTO mb_recording VALUES ('{RECORDING}', 'Song', 1000);
+             INSERT INTO mb_track VALUES ('{SNAPSHOT_RELEASE}', '{RECORDING}', 1, 1)"
+        )).await.map_err(|e| e.to_string())?;
+        // This independent autocommit update finishes before the reader connects.
+        mirror_writer.execute("UPDATE mb_artist SET name = 'After'", &[]).await.map_err(|e| e.to_string())?;
+        let app = shared_connection(&app_schema).await.map_err(|e| e.to_string())?;
+        let mirror = shared_connection(&mirror_schema).await.map_err(|e| e.to_string())?;
+        let visible: String = mirror.query_one("SELECT name FROM mb_artist", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let (snapshot, attempts) = snapshot_of(app, mirror, 10).await;
+        let (artists, releases, tracks) = snapshot.map_err(|_| "snapshot failed".to_owned())?;
+        if visible != "After" || attempts != 1 || artists.len() != 1 || releases.len() != 1 || tracks.len() != 1
+            || artists[0].mbid != SNAPSHOT_ARTIST || artists[0].name != "After"
+            || releases[0].mbid != SNAPSHOT_RELEASE || releases[0].title != "Album"
+            || tracks[0].release_mbid != SNAPSHOT_RELEASE || tracks[0].recording_mbid != RECORDING || tracks[0].title != "Song" {
+            return Err("shared fixture returned incomplete or incorrect values".to_owned());
+        }
+        Ok(())
+    }.await;
+    let app_cleanup = if app_created {
+        app_writer
+            .batch_execute(&format!("DROP SCHEMA {app_schema} CASCADE"))
+            .await
+    } else {
+        Ok(())
+    };
+    let mirror_cleanup = if mirror_created {
+        mirror_writer
+            .batch_execute(&format!("DROP SCHEMA {mirror_schema} CASCADE"))
+            .await
+    } else {
+        Ok(())
+    };
+    app_cleanup.unwrap();
+    mirror_cleanup.unwrap();
+    result.unwrap();
+}
+
 #[tokio::test]
 async fn synthetic_fixture_round_trips_complete_catalogue() {
     let (app, mirror) = sized_fixture(2, SHORT, "x").await;
