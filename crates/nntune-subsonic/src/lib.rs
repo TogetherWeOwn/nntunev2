@@ -8,6 +8,7 @@
 pub mod app;
 pub mod auth;
 pub mod body;
+pub mod capped_render;
 pub mod endpoints;
 pub mod envelope;
 pub mod library;
