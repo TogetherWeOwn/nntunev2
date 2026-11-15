@@ -5,8 +5,8 @@
 
 pub use crate::digest_chunk::OpenPart;
 use crate::digest_chunk::{open_chunk_part, ChunkError};
+use crate::digest_cursor::{CursorError, RangeCursor};
 use crate::digest_enrollment::OriginManifest;
-use crate::digest_geometry::RangeGeometry;
 use crate::digest_verifier::PageError;
 use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader};
 
@@ -28,11 +28,8 @@ pub enum RangeError {
 pub struct DigestRange<'a> {
     manifest: &'a OriginManifest,
     key: &'a FileKey,
-    plan: RangeGeometry,
+    cursor: RangeCursor,
     range: std::ops::Range<u64>,
-    next: u32,
-    last: Option<u32>,
-    failed: bool,
 }
 
 impl<'a> DigestRange<'a> {
@@ -50,29 +47,19 @@ impl<'a> DigestRange<'a> {
         let header = Header::from_bytes(manifest.header_bytes());
         VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, key, &header)
             .map_err(|_| RangeError::Header)?;
-        let (next, last) = plan
-            .chunks()
-            .map_or((0, None), |(first, last)| (first, Some(last)));
         Ok(Self {
             manifest,
             key,
-            plan,
+            cursor: RangeCursor::new(plan),
             range: start..end,
-            next,
-            last,
-            failed: false,
         })
     }
 
     /// The next chunk and page indices, or `None` after completion/failure.
     pub fn next_indices(&self) -> Option<(u32, u32)> {
-        if self.failed || self.last.is_none() {
-            None
-        } else {
-            self.plan
-                .chunk(self.next)
-                .map(|chunk| (chunk.index, chunk.page))
-        }
+        self.cursor
+            .next_chunk()
+            .map(|chunk| (chunk.index, chunk.page))
     }
 
     /// Verify and open exactly the next chunk. Chunk zero requires its wire header.
@@ -84,45 +71,26 @@ impl<'a> DigestRange<'a> {
         sealed: Vec<u8>,
         wire_header: Option<&[u8]>,
     ) -> Result<OpenPart, RangeError> {
-        let result = self.open_one(index, page, sealed, wire_header);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-
-    fn open_one(
-        &mut self,
-        index: u32,
-        page: &[u8],
-        sealed: Vec<u8>,
-        wire_header: Option<&[u8]>,
-    ) -> Result<OpenPart, RangeError> {
-        let last = self.last.ok_or(RangeError::InvalidChunk)?;
-        if self.failed || index != self.next || index > last {
-            return Err(RangeError::InvalidChunk);
-        }
-        let part = open_chunk_part(
-            self.manifest,
-            self.key,
-            self.range.clone(),
-            index,
-            page,
-            sealed,
-            wire_header,
-        )
-        .map_err(|error| match error {
-            ChunkError::Header => RangeError::Header,
-            ChunkError::Page(error) => RangeError::Page(error),
-            ChunkError::InvalidChunk => RangeError::InvalidChunk,
-            ChunkError::DigestMismatch => RangeError::DigestMismatch,
-            ChunkError::Authentication => RangeError::Authentication,
-        })?;
-        if index == last {
-            self.last = None;
-        } else {
-            self.next += 1;
-        }
-        Ok(part)
+        self.cursor
+            .advance(index, || {
+                open_chunk_part(
+                    self.manifest,
+                    self.key,
+                    self.range.clone(),
+                    index,
+                    page,
+                    sealed,
+                    wire_header,
+                )
+            })
+            .map_err(|error| match error {
+                CursorError::InvalidChunk | CursorError::Operation(ChunkError::InvalidChunk) => {
+                    RangeError::InvalidChunk
+                }
+                CursorError::Operation(ChunkError::Header) => RangeError::Header,
+                CursorError::Operation(ChunkError::Page(error)) => RangeError::Page(error),
+                CursorError::Operation(ChunkError::DigestMismatch) => RangeError::DigestMismatch,
+                CursorError::Operation(ChunkError::Authentication) => RangeError::Authentication,
+            })
     }
 }
