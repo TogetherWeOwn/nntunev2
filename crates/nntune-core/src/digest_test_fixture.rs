@@ -1,5 +1,9 @@
 use crate::digest_enrollment::{DigestEnrollment, OriginManifest};
-use crate::media::FileKey;
+use crate::digest_geometry::DigestGeometry;
+use crate::digest_page::{encode_page, page_hash};
+use crate::media::{FileKey, Profile, Sealer};
+use crate::rng::FillRandom;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn id(n: u8) -> [u8; 16] {
     let mut id = [n; 16];
@@ -35,6 +39,45 @@ pub(crate) fn fixture(plaintext: &[u8]) -> Fixture {
         header,
         chunks,
         pages,
+    }
+}
+
+struct Fixed;
+impl FillRandom for Fixed {
+    fn fill_bytes(&mut self, dest: &mut [u8]) -> crate::Result<()> {
+        dest.fill(9);
+        Ok(())
+    }
+}
+
+/// Synthetic evidence for empty objects or deliberately incorrect finality.
+/// It does not represent an enrolled origin and is only available to tests.
+pub(crate) fn synthetic_single_chunk(length: u64, final_chunk: bool) -> Fixture {
+    assert!(length <= 65_536);
+    let key = FileKey::from_bytes([5; 32]);
+    let mut sealer = Sealer::random(&Profile::nntune(), &key, &mut Fixed).unwrap();
+    let header = sealer.header().to_bytes();
+    let sealed = sealer
+        .seal_chunk(&vec![7; length as usize], final_chunk)
+        .unwrap();
+    let geometry = DigestGeometry::new(length).unwrap();
+    let map = id(2);
+    let context = [3; 32];
+    let digest = <[u8; 32]>::from(Sha256::digest(&sealed));
+    let page = encode_page(geometry, &map, &context, 0, &[digest]).unwrap();
+    let mut manifest = OriginManifest::synthetic_test_manifest(
+        geometry,
+        map,
+        context,
+        vec![page_hash(&page).unwrap()],
+    );
+    manifest.set_test_header(header);
+    Fixture {
+        manifest,
+        key,
+        header,
+        chunks: vec![sealed],
+        pages: vec![page],
     }
 }
 

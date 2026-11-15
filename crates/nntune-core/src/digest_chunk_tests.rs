@@ -1,9 +1,5 @@
 use super::*;
-use crate::digest_geometry::DigestGeometry;
-use crate::digest_page::{encode_page, page_hash};
-use crate::digest_test_fixture::{fixture, id};
-use crate::media::Sealer;
-use crate::rng::FillRandom;
+use crate::digest_test_fixture::{fixture, synthetic_single_chunk, Fixture};
 
 #[test]
 fn opens_chunks_and_rejects_untrusted_inputs() {
@@ -127,45 +123,28 @@ fn opens_only_selected_authenticated_bytes() {
     ));
 }
 
-struct Fixed;
-impl FillRandom for Fixed {
-    fn fill_bytes(&mut self, dest: &mut [u8]) -> crate::Result<()> {
-        dest.fill(9);
-        Ok(())
-    }
-}
-
 #[test]
 fn empty_final_is_authenticated_and_wrong_finality_fails() {
     for (length, final_chunk) in [(0_u64, true), (65_536, false)] {
-        let key = FileKey::from_bytes([5; 32]);
-        let mut sealer = Sealer::random(&Profile::nntune(), &key, &mut Fixed).unwrap();
-        let header = sealer.header().to_bytes();
-        let sealed = sealer
-            .seal_chunk(&vec![7; length as usize], final_chunk)
-            .unwrap();
-        let geometry = DigestGeometry::new(length).unwrap();
-        let map = id(2);
-        let context = [3; 32];
-        let digest = <[u8; 32]>::from(Sha256::digest(&sealed));
-        let page = encode_page(geometry, &map, &context, 0, &[digest]).unwrap();
-        let mut manifest = OriginManifest::synthetic_test_manifest(
-            geometry,
-            map,
-            context,
-            vec![page_hash(&page).unwrap()],
-        );
-        manifest.set_test_header(header);
+        let Fixture {
+            manifest,
+            key,
+            header,
+            chunks,
+            pages,
+        } = synthetic_single_chunk(length, final_chunk);
+        let sealed = chunks[0].clone();
+        let page = &pages[0];
         let part = open_chunk_part(
             &manifest,
             &key,
             0..length,
             0,
-            &page,
+            page,
             sealed.clone(),
             Some(&header),
         );
-        let result = open_chunk(&manifest, &key, 0, &page, sealed, Some(&header));
+        let result = open_chunk(&manifest, &key, 0, page, sealed, Some(&header));
         if final_chunk {
             assert!(result.unwrap().is_empty());
             assert!(part.unwrap().as_slice().is_empty());
