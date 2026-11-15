@@ -8794,7 +8794,7 @@ mod tests {
                 })
                 .map(|(_, row)| row.clone())
                 .collect();
-            rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
             rows.truncate(500);
             Ok(rows)
         }
