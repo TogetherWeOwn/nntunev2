@@ -294,6 +294,79 @@ mod tests {
     }
 
     #[test]
+    fn nested_values_match_existing_wire_formats() {
+        let docs = [
+            Value::Null,
+            Value::List(vec![Value::Null, Value::List(vec![Value::Int(7)])]),
+            Value::map(vec![
+                ("empty", Value::List(vec![Value::Null])),
+                ("value", Value::Bool(false)),
+                (
+                    "child",
+                    Value::map(vec![("value", Value::str_value("<&\"é"))]),
+                ),
+                (
+                    "items",
+                    Value::List(vec![Value::Bool(true), Value::Int(i64::MIN)]),
+                ),
+            ]),
+        ];
+        for doc in &docs {
+            for (format, expected) in [
+                (Format::Json, render_json(doc)),
+                (
+                    Format::Jsonp("ns.cb[0]"),
+                    render_jsonp(doc, Some("ns.cb[0]")).0,
+                ),
+                (Format::Xml, render_xml(doc)),
+            ] {
+                let len = encoded_len(doc, format, usize::MAX).unwrap();
+                assert_eq!(len, expected.len());
+                let mut short = vec![0x55; len - 1];
+                assert_eq!(
+                    render_into(doc, format, &mut short),
+                    Err(RenderError::TooLarge)
+                );
+                assert!(short.iter().all(|&byte| byte == 0x55));
+                let mut extra = vec![0x55; len + 1];
+                assert_eq!(render_into(doc, format, &mut extra), Ok(len));
+                assert_eq!(&extra[..len], expected);
+                assert_eq!(extra[len], 0x55);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_inputs_are_rejected_before_writing() {
+        let doc = Value::map(vec![(
+            "item",
+            Value::List(vec![Value::List(vec![Value::Int(1)])]),
+        )]);
+        let mut out = [0x55; 256];
+        assert_eq!(
+            encoded_len(&doc, Format::Xml, usize::MAX),
+            Err(RenderError::TooLarge)
+        );
+        assert_eq!(
+            render_into(&doc, Format::Xml, &mut out),
+            Err(RenderError::TooLarge)
+        );
+        for callback in ["", "cb()", "foo[0]bar", "foo[\"unterminated]"] {
+            assert_eq!(
+                render_into(&doc, Format::Jsonp(callback), &mut out),
+                Err(RenderError::InvalidCallback)
+            );
+        }
+        assert!(out.iter().all(|&byte| byte == 0x55));
+        // Nested lists are valid in JSON even though the legacy XML renderer
+        // cannot represent a list nested directly in a map's list.
+        assert_eq!(
+            encoded_len(&doc, Format::Json, usize::MAX),
+            Ok(render_json(&doc).len())
+        );
+    }
+
+    #[test]
     fn checked_count_overflow_is_rejected() {
         let mut sink = Sink {
             bytes: None,
