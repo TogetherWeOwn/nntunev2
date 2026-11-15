@@ -1197,9 +1197,10 @@ async fn table_exclusion_classifies_after_writer_commit_or_rollback() {
             let task = pending.last_mut().unwrap();
             timeout(Duration::from_secs(3), async {
                 loop {
+                    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&writer_pid, &reader_pid];
                     tokio::select! {
                         _ = &mut *task => return Err("lock finished before wait barrier".into()),
-                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &[&writer_pid, &reader_pid]) => {
+                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", params) => {
                             if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
                         }
                     }
