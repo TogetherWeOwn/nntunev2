@@ -710,7 +710,12 @@ struct PgStore {
 struct CatalogueTestMirror {
     client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    membership_hook: std::cell::RefCell<Option<MembershipTestHook>>,
 }
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub type MembershipTestHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = Result<(), StoreError>>>>>;
 
 /// Test-only seam for the Subsonic mount's snapshot read: the postgres
 /// harness drives the production `PgStore::subsonic_member_catalogue`
@@ -718,6 +723,8 @@ struct CatalogueTestMirror {
 /// `catalogue_store_for_postgres_test`).
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub trait SubsonicSnapshotCatalogueStore {
+    fn set_membership_hook(&self, hook: MembershipTestHook);
+
     async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
@@ -749,6 +756,15 @@ pub trait SubsonicSnapshotCatalogueStore {
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 impl SubsonicSnapshotCatalogueStore for PgStore {
+    fn set_membership_hook(&self, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .membership_hook
+            .borrow_mut() = Some(hook);
+    }
+
     async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
@@ -786,6 +802,7 @@ pub fn catalogue_store_for_postgres_test(
         test_mirror: Some(CatalogueTestMirror {
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
+            membership_hook: std::cell::RefCell::new(None),
         }),
     }
 }
@@ -908,34 +925,58 @@ impl PgStore {
             async {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
-                let client = self.connect().await?;
-                let member = client
+                let membership_cap = cap.checked_mul(2).filter(|n| *n > 0).ok_or(StoreError)?;
+                let mut client = self.connect().await?;
+                let tx = client.build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true).start().await.map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await.map_err(|_| StoreError)?;
+                let releases_sql = format!(
+                    "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
+                    crate::catalogue::catalogue_member_releases_statement()
+                );
+                let member = tx
                     .query_typed(
-                        crate::catalogue::catalogue_member_releases_statement(),
-                        &[(&user_id, Type::TEXT)],
+                        &releases_sql,
+                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
                     })?;
+                require_complete_snapshot_page(member.len(), membership_cap)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                {
+                    let hook = self.test_mirror.as_ref().and_then(|m| m.membership_hook.borrow_mut().take());
+                    if let Some(hook) = hook { hook().await?; }
+                }
                 let member: Vec<crate::catalogue::MembershipReleaseRow> = member
                     .iter()
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
-                let pairs = client
+                let pairs_sql = format!(
+                    "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid, \
+                     CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END AS recording_mbid \
+                     FROM ({}) AS membership LIMIT $2",
+                    crate::catalogue::catalogue_member_track_pairs_statement()
+                );
+                let pairs = tx
                     .query_typed(
-                        crate::catalogue::catalogue_member_track_pairs_statement(),
-                        &[(&user_id, Type::TEXT)],
+                        &pairs_sql,
+                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
                     })?;
+                require_complete_snapshot_page(pairs.len(), membership_cap)?;
                 let pairs: Vec<crate::catalogue::MembershipTrackPairRow> = pairs
                     .iter()
                     .map(catalogue_member_pair_from_row)
                     .collect::<Result<_, _>>()?;
+                tx.commit().await.map_err(|_| StoreError)?;
                 let member_pairs = crate::catalogue::member_pair_arrays(&pairs);
                 if member_releases.is_empty() && member_pairs.is_empty() {
                     return Ok((Vec::new(), Vec::new(), Vec::new()));
@@ -6026,7 +6067,7 @@ fn emit_record(
 /// unstreamable; the snapshot reads the whole member collection under this
 /// far larger but still bounded cap (rows are in-memory only).
 #[allow(dead_code)] // Used by the mount in the next slice.
-const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
+const SUBSONIC_SNAPSHOT_CAP: i64 = 1_024;
 
 // A full page may have been truncated. Refuse it rather than serve a
 // potentially incomplete catalogue; the check precedes membership filtering.
