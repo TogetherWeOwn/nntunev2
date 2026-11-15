@@ -1197,7 +1197,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "velmora"
 version = "0.1.0"
-source = "git+https://github.com/TogetherWeOwn/velmora?rev=a0a9694dca3244f4bdd2e890395d3735a198ce90#a0a9694dca3244f4bdd2e890395d3735a198ce90"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f#92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f"
 dependencies = [
  "chacha20poly1305",
  "crc32fast",
@@ -1226,12 +1226,12 @@ dependencies = [
 [[package]]
 name = "velmora-ssrf-guard"
 version = "0.1.0"
-source = "git+https://github.com/TogetherWeOwn/velmora?rev=a0a9694dca3244f4bdd2e890395d3735a198ce90#a0a9694dca3244f4bdd2e890395d3735a198ce90"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f#92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f"
 
 [[package]]
 name = "velmora-test-nntp"
 version = "0.1.0"
-source = "git+https://github.com/TogetherWeOwn/velmora?rev=a0a9694dca3244f4bdd2e890395d3735a198ce90#a0a9694dca3244f4bdd2e890395d3735a198ce90"
+source = "git+https://github.com/TogetherWeOwn/velmora?rev=92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f#92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f"
 dependencies = [
  "tokio",
 ]
