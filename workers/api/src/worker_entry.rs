@@ -877,6 +877,38 @@ impl PgStore {
         with_deadline(operation, timeout_ms, StoreError).await
     }
 
+    async fn delete_preference(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        love_only: bool,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_delete_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&love_only, Type::BOOL),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_delete"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     /// One account row for the Subsonic mount's identity: email drives
     /// `getLicense`, role drives the `getUser` admin/manager flags. A
     /// single query keeps one Hyperdrive connect per request.
@@ -2589,6 +2621,24 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn like_delete(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_preference(user_id, kind, target, true).await
+    }
+
+    async fn taste_delete(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_preference(user_id, kind, target, false).await
+    }
+
     async fn taste_upsert(
         &self,
         user_id: &str,

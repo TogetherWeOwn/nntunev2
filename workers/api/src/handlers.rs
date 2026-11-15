@@ -1566,6 +1566,23 @@ pub trait Store {
     ) -> impl Future<Output = Result<crate::preference_rows::TasteDbRow, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Delete only love, or any signal respectively. Missing accounts fail closed.
+    fn like_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn taste_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Probe own-or-shared membership. Tracks retain the original spelling;
     /// release targets are canonicalized before binding. Unsupported stores fail closed.
     fn catalogue_member_target(
@@ -7585,6 +7602,33 @@ mod tests {
     }
 
     impl FakeStore {
+        fn delete_preference(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            love_only: bool,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || user_id.contains('\0')
+                || target.contains('\0')
+            {
+                return Err(StoreError);
+            }
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows
+                .get(&key)
+                .is_some_and(|row| !love_only || row.signal == "love")
+            {
+                rows.remove(&key);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
         /// Member releases for a fake user, mirroring the production
         /// membership read: distinct well-formed release MBIDs from the
         /// fake ledger, sorted for a stable page.
@@ -7640,6 +7684,22 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn like_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, true)
+        }
+        async fn taste_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, false)
+        }
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -22898,6 +22958,62 @@ mod tests {
             block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
             Some(row)
         );
+    }
+
+    #[test]
+    fn fake_preference_deletes_are_scoped_and_fenced() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for (id, signal, until) in [
+            ("love", Love, None),
+            ("dislike", Dislike, None),
+            ("hide", Hide, None),
+            ("ban", Ban, None),
+            ("snooze", Snooze, Some(2)),
+        ] {
+            block_on(s.taste_upsert("u1", Track, id, signal, until, 3)).unwrap();
+            assert_eq!(
+                block_on(s.like_delete("u1", Track, id)).unwrap(),
+                signal == Love
+            );
+            assert_eq!(
+                block_on(s.taste_get("u1", Track, id)).unwrap().is_some(),
+                signal != Love
+            );
+            assert_eq!(
+                block_on(s.taste_delete("u1", Track, id)).unwrap(),
+                signal != Love
+            );
+            assert!(!block_on(s.taste_delete("u1", Track, id)).unwrap());
+        }
+        for (user, kind, target) in [
+            ("u1", Track, "Job_A"),
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            block_on(s.taste_upsert(user, kind, target, Love, None, 3)).unwrap();
+        }
+        assert!(block_on(s.like_delete("u1", Track, "Job_A")).unwrap());
+        for (user, kind, target) in [
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            assert!(block_on(s.taste_get(user, kind, target)).unwrap().is_some());
+        }
+        assert!(block_on(s.taste_delete("missing", Track, "Job_A")).is_err());
+        s.deleting_users.borrow_mut().insert("u2".into());
+        assert!(block_on(s.taste_delete("u2", Track, "Job_A")).is_err());
+        *s.fail_taste_write.borrow_mut() = true;
+        assert!(block_on(s.like_delete("u1", Track, "job_a")).is_err());
+        assert!(block_on(s.taste_get("u2", Track, "Job_A"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
