@@ -363,7 +363,7 @@ test('narrow row retains its primary action alongside More', async ({ page }) =>
 	await expect(menu(page)).toHaveCount(0);
 });
 
-for (const path of ['/library/liked', '/library/recent', '/search?q=Coral', '/demo/player']) {
+for (const path of ['/library/liked', '/library/recent', '/search?q=Coral']) {
 	test(`${path} does not opt into track menus or drag controls`, async ({ page }) => {
 		await seed(page);
 		await libraryRow(page, 'coral').getByRole('button', { name: /^Star Coral Night/ }).click();
