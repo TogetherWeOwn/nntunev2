@@ -40,6 +40,22 @@ impl OriginManifest {
     }
 
     #[cfg(test)]
+    pub(crate) fn synthetic_test_manifest(
+        geometry: DigestGeometry,
+        map_id: [u8; 16],
+        context: [u8; 32],
+        rows: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            geometry,
+            map_id,
+            context,
+            header: [0; 48],
+            rows,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_test_row(&mut self, index: usize, hash: [u8; 32]) {
         self.rows[index] = hash;
     }

@@ -208,6 +208,25 @@ mod tests {
     }
 
     #[test]
+    fn verifies_maximum_geometry_final_page_without_object_allocation() {
+        use crate::digest_page::encode_page;
+
+        let geometry = DigestGeometry::new(1 << 33).unwrap();
+        let map = id(2);
+        let context = [3; 32];
+        let bytes = encode_page(geometry, &map, &context, 511, &[[7; 32]; 256]).unwrap();
+        let mut rows = vec![[0; 32]; 512];
+        rows[511] = page_hash(&bytes).unwrap();
+        let manifest = OriginManifest::synthetic_test_manifest(geometry, map, context, rows);
+        let page = manifest.verify_page(511, &bytes).ok().unwrap();
+        let last = page.expectation(131_071).unwrap();
+        assert_eq!((last.sealed_len(), last.final_chunk()), (65_552, true));
+        assert_eq!(last.digest(), &[7; 32]);
+        assert!(page.expectation(130_815).is_none());
+        assert!(page.expectation(131_072).is_none());
+    }
+
+    #[test]
     fn rejects_cross_map_and_matching_hash_truncated_page() {
         let mut first = DigestEnrollment::new(65_537, [id(1); 5], id(2)).unwrap();
         first.seal_chunk(&vec![1; 65_536]).unwrap();
