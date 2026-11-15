@@ -1,5 +1,5 @@
 use super::*;
-use crate::digest_enrollment::DigestEnrollment;
+use crate::digest_test_fixture::{fixture, id, Fixture};
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
 use crate::media::Sealer;
@@ -46,43 +46,6 @@ fn empty_final_and_wrong_finality() {
     }
 }
 
-fn id(n: u8) -> [u8; 16] {
-    let mut id = [n; 16];
-    id[6] = 0x40;
-    id[8] = 0x80;
-    id
-}
-
-struct Fixture {
-    manifest: OriginManifest,
-    key: FileKey,
-    header: [u8; 48],
-    chunks: Vec<Vec<u8>>,
-    pages: Vec<Vec<u8>>,
-}
-
-fn fixture(length: usize) -> Fixture {
-    let mut builder = DigestEnrollment::new(length as u64, [id(1); 5], id(2)).unwrap();
-    let key = FileKey::from_bytes(*builder.key().expose_secret());
-    let header = builder.header().to_bytes();
-    let mut chunks = Vec::new();
-    let mut pages = Vec::new();
-    for part in vec![42; length].chunks(65_536) {
-        let result = builder.seal_chunk(part).unwrap();
-        chunks.push(result.bytes);
-        if let Some(page) = result.page {
-            pages.push(page);
-        }
-    }
-    Fixture {
-        manifest: builder.finish().unwrap(),
-        key,
-        header,
-        chunks,
-        pages,
-    }
-}
-
 #[test]
 fn opens_cross_chunk_range_and_rejects_wrong_order() {
     let Fixture {
@@ -91,7 +54,7 @@ fn opens_cross_chunk_range_and_rejects_wrong_order() {
         header,
         chunks,
         pages,
-    } = fixture(65_537);
+    } = fixture(&vec![42; 65_537]);
     let mut cursor = DigestRange::new(&manifest, &key, 65_535, 65_537).unwrap();
     assert_eq!(cursor.next_indices(), Some((0, 0)));
     assert_eq!(
@@ -130,7 +93,7 @@ fn opens_across_page_boundary() {
         chunks,
         pages,
         ..
-    } = fixture(boundary + 1);
+    } = fixture(&vec![42; boundary + 1]);
     let mut cursor =
         DigestRange::new(&manifest, &key, boundary as u64 - 1, boundary as u64 + 1).unwrap();
     assert_eq!(cursor.next_indices(), Some((255, 0)));
@@ -160,7 +123,7 @@ fn mismatch_truncation_and_header_failure_release_nothing() {
         header,
         chunks,
         pages,
-    } = fixture(1);
+    } = fixture(&[42]);
     let mut changed = chunks[0].clone();
     changed[0] ^= 1;
     let mut cursor = DigestRange::new(&manifest, &key, 0, 1).unwrap();

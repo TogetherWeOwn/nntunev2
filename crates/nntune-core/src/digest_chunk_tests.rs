@@ -1,35 +1,30 @@
 use super::*;
-use crate::digest_enrollment::DigestEnrollment;
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
+use crate::digest_test_fixture::{fixture, id};
 use crate::media::Sealer;
 use crate::rng::FillRandom;
 
-fn id(n: u8) -> [u8; 16] {
-    let mut id = [n; 16];
-    id[6] = 0x40;
-    id[8] = 0x80;
-    id
-}
-
 #[test]
 fn opens_chunks_and_rejects_untrusted_inputs() {
-    let mut builder = DigestEnrollment::new(65_537, [id(1); 5], id(2)).unwrap();
-    let key = FileKey::from_bytes(*builder.key().expose_secret());
-    let header = builder.header().to_bytes();
-    let first = builder.seal_chunk(&vec![7; 65_536]).unwrap().bytes;
-    let last = builder.seal_chunk(&[9]).unwrap();
-    let page = last.page.unwrap();
-    let manifest = builder.finish().ok().unwrap();
+    let mut plaintext = vec![7; 65_537];
+    plaintext[65_536] = 9;
+    let fixture = fixture(&plaintext);
+    let manifest = fixture.manifest;
+    let key = fixture.key;
+    let header = fixture.header;
+    let first = fixture.chunks[0].clone();
+    let last = fixture.chunks[1].clone();
+    let page = fixture.pages[0].clone();
     assert_eq!(
         &**open_chunk(&manifest, &key, 0, &page, first.clone(), Some(&header)).unwrap(),
         &vec![7; 65_536]
     );
     assert_eq!(
-        &**open_chunk(&manifest, &key, 1, &page, last.bytes.clone(), None).unwrap(),
+        &**open_chunk(&manifest, &key, 1, &page, last.clone(), None).unwrap(),
         &[9]
     );
-    let mut changed = last.bytes.clone();
+    let mut changed = last.clone();
     changed[0] ^= 1;
     assert!(matches!(
         open_chunk(&manifest, &key, 1, &page, changed, None),
@@ -39,7 +34,7 @@ fn opens_chunks_and_rejects_untrusted_inputs() {
         open_chunk(&manifest, &key, 1, &page, vec![0; 16], None),
         Err(ChunkError::InvalidChunk)
     ));
-    assert!(open_chunk(&manifest, &key, 2, &page, last.bytes.clone(), None).is_err());
+    assert!(open_chunk(&manifest, &key, 2, &page, last.clone(), None).is_err());
     let mut bad = page.clone();
     bad[92] ^= 1;
     assert!(matches!(
@@ -62,7 +57,7 @@ fn opens_chunks_and_rejects_untrusted_inputs() {
             &FileKey::from_bytes([0; 32]),
             1,
             &page,
-            last.bytes,
+            last,
             None
         ),
         Err(ChunkError::Header)
