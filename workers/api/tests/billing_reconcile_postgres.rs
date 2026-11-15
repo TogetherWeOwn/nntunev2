@@ -1004,3 +1004,114 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     assert_eq!(fx.rows("u2").await, 1);
     fx.cleanup().await;
 }
+
+// The fixture relation is migrated in a private, generated schema. These
+// clients never lock or write the public production-named relation.
+#[tokio::test]
+async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let url = std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap();
+    let config = disposable_config(&url).unwrap();
+    let schema = format!(
+        "billing_test_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let (db, connection) = timeout(Duration::from_secs(5), config.connect(NoTls))
+        .await
+        .expect("fixture connection timed out")
+        .expect("fixture connection failed");
+    let driver = tokio::spawn(connection);
+    let setup = timeout(Duration::from_secs(5), async {
+        db.batch_execute(&format!("BEGIN; CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}; SET LOCAL statement_timeout = '4s'; SET LOCAL transaction_timeout = '10s'")).await?;
+        for migration in [
+            include_str!("../../../migrations/0002_auth_vault.sql"),
+            include_str!("../../../migrations/0021_billing_schema.sql"),
+            include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
+            include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+        ] {
+            db.batch_execute(migration).await?;
+        }
+        db.execute("INSERT INTO users (id,email,created_at) VALUES ('lock_owner','lock_owner@example.test',$1)", &[&T]).await?;
+        db.execute("INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES ('lock_owner','sub_lock',$1,'si_raw',$2,'plus','active')", &[&CUS, &PRICE]).await?;
+        db.batch_execute(&format!("SET search_path TO {schema}; COMMIT")).await
+    }).await;
+    if !matches!(setup, Ok(Ok(()))) {
+        // Close an uncertain transaction before trying to remove a possibly committed schema.
+        drop(db);
+        driver.abort();
+        let cleanup = timeout(Duration::from_secs(5), async {
+            let (cleanup_db, cleanup_connection) = config.connect(NoTls).await?;
+            let cleanup_driver = tokio::spawn(cleanup_connection);
+            let result = cleanup_db
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
+            cleanup_driver.abort();
+            result
+        })
+        .await;
+        panic!("fixture setup failed: {setup:?}; cleanup: {cleanup:?}");
+    }
+    let fx = Fx { db, schema };
+    let schema = &fx.schema;
+    let mut pending = None;
+    let mut drivers = vec![driver];
+
+    let result: Result<(), String> = async {
+        let (writer, writer_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "writer connection timed out".to_string())?.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(writer_connection));
+        let (reader, reader_connection) = timeout(Duration::from_secs(5), config.connect(NoTls)).await.map_err(|_| "reader connection timed out".to_string())?.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(reader_connection));
+        let (holder_pid, writer_pid) = timeout(Duration::from_secs(5), async {
+            fx.db.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout = '15s'; SET LOCAL transaction_timeout = '15s'; SET LOCAL statement_timeout = '4s'").await?;
+            fx.db.batch_execute(&format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE")).await?;
+            writer.batch_execute("SET statement_timeout = '10s'").await?;
+            let holder_pid: i32 = fx.db.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            Ok::<_, tokio_postgres::Error>((holder_pid, writer_pid))
+        }).await.map_err(|_| "lock setup timed out".to_string())?.map_err(|e| e.to_string())?;
+        let sql = format!("UPDATE {schema}.subscriptions SET cancel_at_period_end = true WHERE stripe_subscription_id = 'sub_lock'");
+        pending = Some(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
+        let task = pending.as_mut().unwrap();
+        timeout(Duration::from_secs(5), async {
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&holder_pid, &writer_pid];
+            loop {
+                tokio::select! {
+                    result = &mut *task => return Err(format!("writer finished before observed block: {result:?}")),
+                    result = reader.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &params) => {
+                        if result.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        }).await.map_err(|_| "writer blocking observation timed out".to_string())??;
+        let row = timeout(Duration::from_secs(5), reader.query_one(&format!("SELECT cancel_at_period_end FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub_lock'"), &[])).await.map_err(|_| "plain read timed out".to_string())?.map_err(|e| e.to_string())?;
+        if row.get::<_, bool>(0) { return Err("writer changed row before lock release".into()); }
+        timeout(Duration::from_secs(5), fx.db.batch_execute("COMMIT")).await.map_err(|_| "commit timed out".to_string())?.map_err(|e| e.to_string())?;
+        let count = timeout(Duration::from_secs(5), &mut *task).await.map_err(|_| "writer completion timed out".to_string())?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        if count != 1 { return Err(format!("writer affected {count} rows")); }
+        Ok(())
+    }.await;
+
+    if let Some(task) = pending {
+        task.abort();
+    }
+    let _ = timeout(Duration::from_secs(5), fx.db.batch_execute("ROLLBACK")).await;
+    let cleanup = timeout(
+        Duration::from_secs(5),
+        fx.db
+            .batch_execute(&format!("DROP SCHEMA {} CASCADE", fx.schema)),
+    )
+    .await;
+    for driver in drivers {
+        driver.abort();
+    }
+    assert!(
+        matches!(cleanup, Ok(Ok(()))),
+        "fixture cleanup failed: {cleanup:?}; contention phases: {result:?}"
+    );
+    result.expect("contention phases failed");
+}
