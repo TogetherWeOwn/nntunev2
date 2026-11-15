@@ -542,3 +542,120 @@ async fn subsonic_snapshot_returns_every_member_track() {
     assert!(tracks.iter().any(|t| t.recording_mbid == recordings[50]));
     assert_eq!(attempts.get(), 1, "one mirror connection for three reads");
 }
+
+fn synthetic_uuid(kind: u32, n: u32) -> String {
+    format!("{n:08x}-{kind:04x}-4000-8000-{n:012x}")
+}
+
+/// Per-field repeat counts (in characters of `filler`) for one synthetic
+/// mirror fixture. Everything else stays a short constant.
+#[derive(Clone, Copy)]
+struct FieldLens {
+    artist_name: i32,
+    sort_name: i32,
+    release_title: i32,
+    track_title: i32,
+}
+
+const SHORT: FieldLens = FieldLens {
+    artist_name: 1,
+    sort_name: 1,
+    release_title: 1,
+    track_title: 1,
+};
+
+/// `n` member releases, each with its own artist and exactly one recording.
+/// Returns the app client and mirror client ready for the production read.
+async fn sized_fixture(n: u32, lens: FieldLens, filler: &str) -> (Client, Client) {
+    let releases: Vec<String> = (1..=n).map(|i| synthetic_uuid(1, i)).collect();
+    let recordings: Vec<String> = (1..=n).map(|i| synthetic_uuid(2, i)).collect();
+    let app = client(false).await;
+    app.execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) \
+         SELECT 'u1', r.release, r.release, ARRAY[r.recording] \
+         FROM unnest($1::text[], $2::text[]) AS r(release, recording)",
+        &[&releases, &recordings],
+    )
+    .await
+    .unwrap();
+    let mirror = mirror_client().await;
+    mirror
+        .execute(
+            "INSERT INTO mb_artist SELECT r::uuid, repeat($2::text, $3::int), repeat($2::text, $4::int), 'Person', 'US' FROM unnest($1::text[]) AS r",
+            &[&releases, &filler, &lens.artist_name, &lens.sort_name],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            "INSERT INTO mb_release SELECT r::uuid, repeat($2::text, $3::int), 'Album', 2001, r::uuid FROM unnest($1::text[]) AS r",
+            &[&releases, &filler, &lens.release_title],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            "INSERT INTO mb_recording SELECT g::uuid, repeat($2::text, $3::int), 1000 FROM unnest($1::text[]) AS g",
+            &[&recordings, &filler, &lens.track_title],
+        )
+        .await
+        .unwrap();
+    mirror
+        .execute(
+            "INSERT INTO mb_track SELECT r.release::uuid, r.recording::uuid, 1, 1 FROM unnest($1::text[], $2::text[]) AS r(release, recording)",
+            &[&releases, &recordings],
+        )
+        .await
+        .unwrap();
+    (app, mirror)
+}
+
+async fn snapshot_of(
+    app: Client,
+    mirror: Client,
+    cap: i64,
+) -> (
+    Result<
+        (
+            Vec<nntune_api::catalogue::ArtistDbRow>,
+            Vec<nntune_api::catalogue::ReleaseDbRow>,
+            Vec<nntune_api::catalogue::TrackDbRow>,
+        ),
+        StoreError,
+    >,
+    usize,
+) {
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+    let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+    (result, attempts.get())
+}
+
+#[tokio::test]
+async fn synthetic_fixture_round_trips_complete_catalogue() {
+    let (app, mirror) = sized_fixture(2, SHORT, "x").await;
+    let (result, attempts) = snapshot_of(app, mirror, 10).await;
+    let (artists, releases, tracks) = result.unwrap();
+    assert_eq!((artists.len(), releases.len(), tracks.len()), (2, 2, 2));
+    for n in 1..=2 {
+        let release = synthetic_uuid(1, n);
+        let recording = synthetic_uuid(2, n);
+        let artist = artists.iter().find(|row| row.mbid == release).unwrap();
+        assert_eq!((&*artist.name, &*artist.sort_name), ("x", "x"));
+        assert_eq!(artist.artist_type.as_deref(), Some("Person"));
+        assert_eq!(artist.country.as_deref(), Some("US"));
+        let album = releases.iter().find(|row| row.mbid == release).unwrap();
+        assert_eq!(&album.title, "x");
+        assert_eq!(album.artist_mbid.as_deref(), Some(release.as_str()));
+        let track = tracks
+            .iter()
+            .find(|row| row.recording_mbid == recording)
+            .unwrap();
+        assert_eq!(
+            (&*track.release_mbid, &*track.title),
+            (release.as_str(), "x")
+        );
+        assert_eq!((track.medium_no, track.track_no), (Some(1), Some(1)));
+    }
+    assert_eq!(attempts, 1);
+}
