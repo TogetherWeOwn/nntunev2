@@ -291,6 +291,218 @@ async fn taste_get_reads_only_exact_owner_kind_and_identity() {
 }
 
 #[tokio::test]
+async fn taste_upsert_replays_and_fails_closed() {
+    use nntune_api::target_identity::TargetKind::{Release, Track};
+    use nntune_api::taste_signal::TasteSignal::{Ban, Love, Snooze};
+    // Each injection supplies one connection to the production method.
+    for (existing, kind, signal, until, now, created, expiry) in [
+        (None, Track, Love, None, 10, 10, None),
+        (
+            Some(("love", None::<i64>, 10_i64)),
+            Track,
+            Love,
+            None,
+            20,
+            10,
+            None,
+        ),
+        (
+            Some(("snooze", Some(50), 10)),
+            Track,
+            Love,
+            None,
+            30,
+            30,
+            None,
+        ),
+        (
+            Some(("snooze", Some(25), 10)),
+            Track,
+            Love,
+            None,
+            30,
+            30,
+            None,
+        ),
+        (
+            Some(("snooze", Some(25), 10)),
+            Track,
+            Snooze,
+            Some(50),
+            30,
+            10,
+            Some(50),
+        ),
+        (Some(("love", None, 10)), Track, Ban, None, 30, 10, None),
+        (Some(("love", None, 10)), Release, Ban, None, 30, 30, None),
+    ] {
+        let app = client(false).await;
+        app.batch_execute("BEGIN; INSERT INTO public.users (id,email,created_at) VALUES ('taste-writer','taste-writer@example.invalid',1)").await.unwrap();
+        if let Some((old, old_until, old_created)) = existing {
+            app.execute(
+                "INSERT INTO public.account_taste VALUES ($1,'track',$2,$3,$4,$5,$5)",
+                &[&"taste-writer", &"Job_A", &old, &old_until, &old_created],
+            )
+            .await
+            .unwrap();
+        }
+        let store =
+            catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let row = store
+            .taste_upsert("taste-writer", kind, "Job_A", signal, until, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                row.kind.as_str(),
+                row.target_id.as_str(),
+                row.signal.as_str(),
+                row.snooze_until,
+                row.created_at,
+                row.updated_at
+            ),
+            (
+                kind.as_str(),
+                "Job_A",
+                signal.as_str(),
+                expiry,
+                created,
+                now as i64
+            )
+        );
+    }
+    for (user, invalid) in [
+        ("missing", false),
+        ("taste-deleting", false),
+        ("taste-writer", true),
+    ] {
+        let app = client(false).await;
+        app.batch_execute("BEGIN; INSERT INTO public.users (id,email,created_at) VALUES ('taste-writer','taste-writer@example.invalid',1), ('taste-deleting','taste-deleting@example.invalid',1); UPDATE public.users SET deleting_at = now() WHERE id = 'taste-deleting'").await.unwrap();
+        let store =
+            catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+        assert!(store
+            .taste_upsert(
+                user,
+                Track,
+                "Job_A",
+                if invalid { Snooze } else { Love },
+                None,
+                70
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use nntune_api::taste_signal::TasteSignal::{Ban, Snooze};
+    let observer = client(false).await;
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-iso-a','taste-iso-a@example.invalid',1), ('taste-iso-b','taste-iso-b@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-iso-a','track','job','love',NULL,1,1), ('taste-iso-b','track','job','love',NULL,2,2)").await.unwrap();
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let changed = store
+        .taste_upsert("taste-iso-a", Track, "job", Ban, None, 3)
+        .await;
+    let store = catalogue_store_for_postgres_test(
+        client(false).await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    let rejected = store
+        .taste_upsert("taste-iso-a", Track, "job", Snooze, None, 4)
+        .await;
+    let rows = observer.query("SELECT user_id, signal, updated_at FROM public.account_taste WHERE user_id IN ('taste-iso-a','taste-iso-b') ORDER BY user_id", &[]).await.unwrap();
+    let states: Vec<(String, String, i64)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id IN ('taste-iso-a','taste-iso-b')")
+        .await
+        .unwrap();
+    assert!(changed.is_ok());
+    assert!(rejected.is_err());
+    assert_eq!(
+        states,
+        vec![
+            ("taste-iso-a".into(), "ban".into(), 3),
+            ("taste-iso-b".into(), "love".into(), 2)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn taste_upsert_waits_for_deletion_fence() {
+    use nntune_api::target_identity::TargetKind::Track;
+    use nntune_api::taste_signal::TasteSignal::Ban;
+    use std::time::Duration;
+    let observer = client(false).await;
+    let locker = client(false).await;
+    let writer = client(false).await;
+    let writer_pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-race','taste-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-race','track','old','love',NULL,1,1)").await.unwrap();
+    locker
+        .batch_execute("BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let store =
+        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let write = store.taste_upsert("taste-race", Track, "old", Ban, None, 10);
+    let release = async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                        &[&writer_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        locker.batch_execute("COMMIT").await.unwrap();
+        observed
+    };
+    let (result, observed) = tokio::join!(write, release);
+    let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = 'taste-race' AND target_id = 'old'", &[]).await.unwrap();
+    let state: (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let remaining: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM public.account_taste WHERE user_id = 'taste-race'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(observed, "writer must wait on the deleting account");
+    assert!(result.is_err());
+    assert_eq!(state, ("love".into(), 1, 1));
+    assert_eq!(remaining, 0, "account deletion cascades existing taste");
+}
+
+#[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
     let rows = store.catalogue_library("u1").await.unwrap();

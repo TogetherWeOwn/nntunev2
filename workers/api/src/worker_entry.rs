@@ -2508,6 +2508,43 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn taste_upsert(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        signal: crate::taste_signal::TasteSignal,
+        snooze_until: Option<u64>,
+        now: u64,
+    ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let snooze_until = snooze_until.map(i64_of).transpose()?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&signal.as_str(), Type::TEXT),
+                            (&snooze_until, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_upsert"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                taste_row_from_row(&rows[0])
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn taste_get(
         &self,
         user_id: &str,
