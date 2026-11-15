@@ -5,6 +5,10 @@ pub fn taste_get_statement() -> &'static str {
     "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND kind = $2 AND target_id = $3"
 }
 
+pub fn taste_list_statement() -> &'static str {
+    "SELECT kind, target_id, signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND (signal <> 'snooze' OR snooze_until > $2) ORDER BY updated_at DESC LIMIT 500"
+}
+
 /// Upsert under the account deletion fence, preserving a replayed love's timestamp.
 /// Adapted from the preference writer in PR #982.
 pub fn taste_upsert_statement() -> &'static str {
