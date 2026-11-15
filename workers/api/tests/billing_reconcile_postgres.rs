@@ -1205,11 +1205,13 @@ async fn abandoned_table_lock_expires_and_rollback_cleans_local_settings() {
             pending.push(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
             let task = pending.last_mut().unwrap();
             // Observe the actual wait before allowing the server timeout to end it.
+            let relation = format!("{schema}.subscriptions");
+            let params: [&(dyn ToSql + Sync); 3] = [&holder_pid, &writer_pid, &relation];
             timeout(Duration::from_secs(2), async {
                 loop {
                     tokio::select! {
                         result = &mut *task => return Err(format!("{expiry} writer finished before wait barrier: {result:?}")),
-                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2)) AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $3::regclass AND mode = 'ShareRowExclusiveLock' AND granted)", &[&holder_pid, &writer_pid, &format!("{schema}.subscriptions")]) => {
+                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2)) AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $3::text::regclass AND mode = 'ShareRowExclusiveLock' AND granted)", &params) => {
                             if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
                         }
                     }
@@ -1217,17 +1219,31 @@ async fn abandoned_table_lock_expires_and_rollback_cleans_local_settings() {
                 }
                 Ok::<(), String>(())
             }).await.map_err(|_| format!("{expiry} wait barrier timed out"))??;
-            if expiry == "transaction" {
-                // Keep the backend active, so idle expiry cannot explain termination.
-                pending.push(tokio::spawn(async move { holder.batch_execute("SELECT pg_sleep(6)").await.map(|_| 0) }));
+            let expiry_error = if expiry == "transaction" {
+                // Keep the client alive even if the statement unexpectedly succeeds.
+                let (send, receive) = tokio::sync::oneshot::channel();
+                pending.push(tokio::spawn(async move {
+                    let result = holder.batch_execute("SELECT pg_sleep(6)").await;
+                    let code = result.err().and_then(|e| e.code().map(|c| c.code().to_owned()));
+                    let _ = send.send(code);
+                    std::future::pending::<()>().await;
+                    drop(holder);
+                    Ok::<u64, tokio_postgres::Error>(0)
+                }));
+                Some(receive)
             } else {
                 // Keep the client alive but issue no command while the idle timer runs.
                 pending.push(tokio::spawn(async move { std::future::pending::<()>().await; drop(holder); Ok::<u64, tokio_postgres::Error>(0) }));
-            }
+                None
+            };
             let writer_index = pending.len() - 2;
             let task = &mut pending[writer_index];
             let count = timeout(Duration::from_secs(8), task).await.map_err(|_| format!("{expiry} writer did not resume"))?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
             if count != 1 { return Err(format!("{expiry} writer affected {count} rows")); }
+            if let Some(receive) = expiry_error {
+                let code = timeout(Duration::from_secs(5), receive).await.map_err(|_| "transaction expiry error timed out".to_string())?.map_err(|e| e.to_string())?;
+                if code.as_deref() != Some("25P04") { return Err(format!("unexpected transaction expiry SQLSTATE: {code:?}")); }
+            }
             // Backend exit can trail lock release. Observe it separately, within a bound.
             timeout(Duration::from_secs(5), async {
                 loop {
