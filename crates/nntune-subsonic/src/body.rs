@@ -17,6 +17,20 @@ pub enum BodyFault {
     Unreadable,
 }
 
+fn exceeds_cap(current: usize, incoming: usize, cap: usize) -> bool {
+    current.checked_add(incoming).map_or(true, |len| len > cap)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn length_overflow_is_oversized() {
+        assert!(super::exceeds_cap(usize::MAX, 1, usize::MAX));
+        assert!(!super::exceeds_cap(4, 6, 10));
+        assert!(super::exceeds_cap(4, 7, 10));
+    }
+}
+
 /// Accumulates body chunks under a byte cap and a declared `Content-Length`.
 #[derive(Debug)]
 pub struct FormBody {
@@ -50,7 +64,7 @@ impl FormBody {
 
     /// Append one chunk, refusing as soon as the cap would be crossed.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), BodyFault> {
-        if self.bytes.len().saturating_add(chunk.len()) > self.cap {
+        if exceeds_cap(self.bytes.len(), chunk.len(), self.cap) {
             return Err(BodyFault::Oversized);
         }
         self.bytes.extend_from_slice(chunk);
