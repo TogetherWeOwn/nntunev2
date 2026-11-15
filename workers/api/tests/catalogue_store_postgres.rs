@@ -122,18 +122,46 @@ async fn member_target_queries_isolate_caller_and_kind() {
     for (kind, target, expected) in [
         (TargetKind::Track, "Job_Own", true),
         (TargetKind::Track, "job_own", false),
-        (TargetKind::Track, "11111111-1111-1111-1111-AAAAAAAAAAAA", true),
-        (TargetKind::Track, "11111111-1111-1111-1111-aaaaaaaaaaaa", false),
+        (
+            TargetKind::Track,
+            "11111111-1111-1111-1111-AAAAAAAAAAAA",
+            true,
+        ),
+        (
+            TargetKind::Track,
+            "11111111-1111-1111-1111-aaaaaaaaaaaa",
+            false,
+        ),
         (TargetKind::Track, "OPAQUE-INVALID", false),
         (TargetKind::Track, "Job_Shared", true),
         (TargetKind::Track, "Job_Private", false),
-        (TargetKind::Track, "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB", true),
-        (TargetKind::Track, "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", true),
-        (TargetKind::Track, "ffffffff-ffff-4fff-8fff-ffffffffffff", false),
+        (
+            TargetKind::Track,
+            "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+            true,
+        ),
+        (
+            TargetKind::Track,
+            "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD",
+            true,
+        ),
+        (
+            TargetKind::Track,
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            false,
+        ),
         (TargetKind::Track, RELEASE, false),
-        (TargetKind::Release, "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", true),
+        (
+            TargetKind::Release,
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            true,
+        ),
         (TargetKind::Release, OTHER_RELEASE, true),
-        (TargetKind::Release, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", false),
+        (
+            TargetKind::Release,
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            false,
+        ),
         (TargetKind::Release, RECORDING, false),
         (TargetKind::Release, "Job_Own", false),
         (TargetKind::Track, "missing", false),
@@ -145,10 +173,19 @@ async fn member_target_queries_isolate_caller_and_kind() {
             TargetKind::Track => target.to_owned(),
             TargetKind::Release => canonical_target_id(target),
         };
-        let rows = app.query(member_target_statement(kind), &[&"u1", &target]).await.unwrap();
+        let rows = app
+            .query(member_target_statement(kind), &[&"u1", &target])
+            .await
+            .unwrap();
         assert_eq!(!rows.is_empty(), expected, "{kind:?} {target}");
     }
-    let rows = app.query(member_target_statement(TargetKind::Track), &[&"u1' OR true --", &"Job_Own"]).await.unwrap();
+    let rows = app
+        .query(
+            member_target_statement(TargetKind::Track),
+            &[&"u1' OR true --", &"Job_Own"],
+        )
+        .await
+        .unwrap();
     assert!(rows.is_empty(), "owner must also be bound");
 }
 
