@@ -1464,8 +1464,9 @@ jobs:
           echo "CC0 fixture fetched and sha256-verified against the manifest:"
           sha256sum "$fetched"
       - name: Run apps/web Playwright suite
-        run: pnpm test:e2e --reporter=dot,html
+        run: pnpm test:e2e
         env:
+          NNTUNE_E2E_HTML_REPORT: 'true'
           PLAYWRIGHT_HTML_OPEN: never
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
