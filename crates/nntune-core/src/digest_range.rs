@@ -5,8 +5,9 @@
 
 use crate::digest_chunk::{open_chunk, ChunkError};
 use crate::digest_enrollment::OriginManifest;
+use crate::digest_geometry::RangeGeometry;
 use crate::digest_verifier::PageError;
-use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader, PLAIN_CHUNK_SIZE};
+use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader};
 use zeroize::Zeroizing;
 
 #[cfg(test)]
@@ -40,8 +41,7 @@ impl OpenPart {
 pub struct DigestRange<'a> {
     manifest: &'a OriginManifest,
     key: &'a FileKey,
-    start: u64,
-    end: u64,
+    plan: RangeGeometry,
     next: u32,
     last: Option<u32>,
     failed: bool,
@@ -55,28 +55,20 @@ impl<'a> DigestRange<'a> {
         start: u64,
         end: u64,
     ) -> Result<Self, RangeError> {
-        let geometry = manifest.geometry();
-        if start > end || end > geometry.plaintext_len() {
-            return Err(RangeError::InvalidRange);
-        }
+        let plan = manifest
+            .geometry()
+            .range(start, end)
+            .ok_or(RangeError::InvalidRange)?;
         let header = Header::from_bytes(manifest.header_bytes());
         VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, key, &header)
             .map_err(|_| RangeError::Header)?;
-        let (next, last) = if geometry.plaintext_len() == 0 {
-            (0, Some(0))
-        } else if start == end {
-            (0, None)
-        } else {
-            (
-                (start / PLAIN_CHUNK_SIZE) as u32,
-                Some(((end - 1) / PLAIN_CHUNK_SIZE) as u32),
-            )
-        };
+        let (next, last) = plan
+            .chunks()
+            .map_or((0, None), |(first, last)| (first, Some(last)));
         Ok(Self {
             manifest,
             key,
-            start,
-            end,
+            plan,
             next,
             last,
             failed: false,
@@ -88,7 +80,9 @@ impl<'a> DigestRange<'a> {
         if self.failed || self.last.is_none() {
             None
         } else {
-            Some((self.next, self.next / 256))
+            self.plan
+                .chunk(self.next)
+                .map(|chunk| (chunk.index, chunk.page))
         }
     }
 
@@ -119,6 +113,7 @@ impl<'a> DigestRange<'a> {
         if self.failed || index != self.next || index > last {
             return Err(RangeError::InvalidChunk);
         }
+        let selection = self.plan.chunk(index).ok_or(RangeError::InvalidChunk)?;
         let bytes = open_chunk(self.manifest, self.key, index, page, sealed, wire_header).map_err(
             |error| match error {
                 ChunkError::Header => RangeError::Header,
@@ -128,17 +123,18 @@ impl<'a> DigestRange<'a> {
                 ChunkError::Authentication => RangeError::Authentication,
             },
         )?;
-        let chunk_start = u64::from(index) * PLAIN_CHUNK_SIZE;
-        let start = self
-            .start
-            .saturating_sub(chunk_start)
-            .min(bytes.len() as u64) as usize;
-        let end = self.end.saturating_sub(chunk_start).min(bytes.len() as u64) as usize;
+        if selection.end > bytes.len() {
+            return Err(RangeError::InvalidChunk);
+        }
         if index == last {
             self.last = None;
         } else {
             self.next += 1;
         }
-        Ok(OpenPart { bytes, start, end })
+        Ok(OpenPart {
+            bytes,
+            start: selection.start,
+            end: selection.end,
+        })
     }
 }
