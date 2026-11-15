@@ -118,12 +118,12 @@ test('BRM-02 recent actions expose the affected entry in their accessible names'
 	await open(page, baseURL!, {
 		history: [{ trackId: 'second-signal-missing', playedAt: 400 }, ...HISTORY_ENTRIES]
 	});
-	await expect(page.getByTestId('recently-played').getByRole('button', { name: /add.*queue/i })).toHaveCount(0);
 	await expect(row(page, 'second-signal').getByRole('button', { name: 'Forget Second Signal from recent history', exact: true })).toBeVisible();
 	await expect(row(page, 'second-signal-missing').getByRole('button', {
 		name: 'Forget unavailable entry second-signal-missing from recent history',
 		exact: true
 	})).toBeVisible();
+	await expect(page.getByTestId('recently-played').getByRole('button', { name: /add.*queue/i })).toHaveCount(0);
 });
 
 test('BRM-03 forgetting an unavailable row removes only that history entry without transport changes', async ({ page, baseURL }) => {
