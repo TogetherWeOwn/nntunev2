@@ -5,7 +5,11 @@ label supplied by a caller is not proof of provenance; no external source is
 admitted here. This is not a production ingest or a coverage measurement.
 """
 
+import json
+from pathlib import Path
+
 from cohort import MAX_ROWS, _mbid, admit_cohort
+from extract_receipts import FILES, verify_receipts
 from rollup import resolve
 from taxonomy import _is_qid
 
@@ -37,3 +41,22 @@ def resolve_synthetic(cohort_bytes, genres, parents, memberships, config):
         seen.add(key)
         rows.append({"artist_mbid": artist, "genre_qid": key[1], "source": "wikidata"})
     return resolve(genres, parents, rows, config)
+
+
+def resolve_fixture_extract(cohort_bytes, directory, config):
+    """Resolve a receipt-checked extract only if it matches the shipped fixture."""
+    cohort = admit_cohort(cohort_bytes)
+    _, manifest_digest, outputs = verify_receipts(directory)
+    expected = Path(__file__).resolve().parent.parent / "genre-extract/tests/fixtures/expected"
+    if any(outputs[name] != (expected / name).read_bytes() for name in FILES):
+        raise ValueError("extract is not the repository synthetic fixture")
+
+    def rows(name):
+        return [json.loads(line) for line in outputs[name].splitlines()]
+
+    artists = set(cohort["artist_mbids"])
+    memberships = [{**row, "source": "synthetic-fixture"}
+                   for row in rows("artist_genres.jsonl") if row["artist_mbid"] in artists]
+    result = resolve_synthetic(cohort_bytes, rows("genres.jsonl"),
+                               rows("genre_parents.jsonl"), memberships, config)
+    return {"manifest_sha256": manifest_digest, "resolution": result}
