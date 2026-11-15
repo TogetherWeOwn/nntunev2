@@ -770,6 +770,23 @@ pub fn catalogue_release_membership_statement() -> &'static str {
     "SELECT 1 FROM library WHERE (user_id = $1 OR user_id IS NULL) AND lower(release_mbid) = $2 LIMIT 1"
 }
 
+/// Probe a caller's own or shared track by exact job ID or recording MBID.
+/// Bind the server-supplied owner as $1 and the original target as $2, so
+/// UUID-shaped job IDs retain their exact case.
+pub fn member_track_target_statement() -> &'static str {
+    "SELECT 1 FROM library WHERE (user_id = $1 OR user_id IS NULL) AND (job_id = $2 OR ($2 ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' AND EXISTS (SELECT 1 FROM unnest(recording_mbids) AS m WHERE lower(m) = lower($2)))) LIMIT 1"
+}
+
+/// Select the catalogue membership authority. Track callers bind the original
+/// target; release callers must validate with [`is_catalogue_mbid`] and bind
+/// the canonical target, just as the catalogue detail path does.
+pub fn member_target_statement(kind: crate::target_identity::TargetKind) -> &'static str {
+    match kind {
+        crate::target_identity::TargetKind::Track => member_track_target_statement(),
+        crate::target_identity::TargetKind::Release => catalogue_release_membership_statement(),
+    }
+}
+
 /// Artist collection page, member-scoped: only artists of the caller's member
 /// releases, ordered by MBID (stable under renames, no false "ranked"
 /// implication). Parameters: the caller's well-formed member release MBIDs
