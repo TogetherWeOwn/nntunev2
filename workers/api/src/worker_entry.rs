@@ -1297,6 +1297,19 @@ impl PgStore {
     }
 }
 
+fn taste_row_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+    Ok(crate::preference_rows::TasteDbRow {
+        kind: row.try_get("kind").map_err(|_| StoreError)?,
+        target_id: row.try_get("target_id").map_err(|_| StoreError)?,
+        signal: row.try_get("signal").map_err(|_| StoreError)?,
+        snooze_until: row.try_get("snooze_until").map_err(|_| StoreError)?,
+        created_at: row.try_get("created_at").map_err(|_| StoreError)?,
+        updated_at: row.try_get("updated_at").map_err(|_| StoreError)?,
+    })
+}
+
 fn user_from_row(row: &tokio_postgres::Row) -> Result<UserRecord, StoreError> {
     Ok(UserRecord {
         id: row.try_get("id").map_err(|_| StoreError)?,
@@ -2495,6 +2508,36 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn taste_get(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_get_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_get"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(taste_row_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn catalogue_member_target(
         &self,
         user_id: &str,

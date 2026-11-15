@@ -212,6 +212,85 @@ async fn member_target_queries_isolate_caller_and_kind() {
 }
 
 #[tokio::test]
+async fn taste_get_reads_only_exact_owner_kind_and_identity() {
+    use nntune_api::preference_rows::TasteDbRow;
+    use nntune_api::target_identity::TargetKind::{Release, Track};
+    const JOB: &str = "11111111-1111-1111-1111-AAAAAAAAAAAA";
+    async fn seeded() -> Client {
+        let app = client(false).await;
+        app.batch_execute("BEGIN;
+            INSERT INTO public.users (id,email,created_at) VALUES ('taste-reader','taste-reader@example.invalid',1), ('taste-other','taste-other@example.invalid',1);
+            INSERT INTO public.account_taste VALUES
+              ('taste-reader','track','11111111-1111-1111-1111-AAAAAAAAAAAA','snooze',5,1,2),
+              ('taste-reader','release','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','love',NULL,3,4),
+              ('taste-reader','track','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','love',NULL,3,4),
+              ('taste-other','track','private','ban',NULL,6,7)").await.unwrap();
+        app
+    }
+    let snooze = TasteDbRow {
+        kind: "track".into(),
+        target_id: JOB.into(),
+        signal: "snooze".into(),
+        snooze_until: Some(5),
+        created_at: 1,
+        updated_at: 2,
+    };
+    let love = TasteDbRow {
+        kind: "release".into(),
+        target_id: RELEASE.into(),
+        signal: "love".into(),
+        snooze_until: None,
+        created_at: 3,
+        updated_at: 4,
+    };
+    for (owner, kind, target, expected) in [
+        ("taste-reader", Track, JOB, Some(snooze)),
+        ("taste-reader", Release, RELEASE, Some(love)),
+        (
+            "taste-reader",
+            Track,
+            RECORDING,
+            Some(TasteDbRow {
+                kind: "track".into(),
+                target_id: RECORDING.into(),
+                signal: "love".into(),
+                snooze_until: None,
+                created_at: 3,
+                updated_at: 4,
+            }),
+        ),
+        ("taste-reader", Track, "private", None),
+        ("taste-other", Track, JOB, None),
+        ("taste-reader", Release, JOB, None),
+        ("taste-reader", Track, RELEASE, None),
+        (
+            "taste-reader",
+            Track,
+            "11111111-1111-1111-1111-aaaaaaaaaaaa",
+            None,
+        ),
+        ("taste-reader' OR true --", Track, JOB, None),
+        ("taste-reader", Track, "missing", None),
+    ] {
+        let store = catalogue_store_for_postgres_test(
+            seeded().await,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        assert_eq!(
+            store.taste_get(owner, kind, target).await.unwrap(),
+            expected
+        );
+    }
+    let app = seeded().await;
+    assert!(app.batch_execute("SELECT 1/0").await.is_err());
+    let store =
+        catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+    assert!(store.taste_get("taste-reader", Track, JOB).await.is_err());
+}
+
+#[tokio::test]
 async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
     let (store, attempts) = store(true, false).await;
     let rows = store.catalogue_library("u1").await.unwrap();
