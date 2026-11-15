@@ -28,6 +28,50 @@ pub struct PageGeometry {
     pub final_page: bool,
 }
 
+/// Range selection only; callers must authenticate each complete chunk before use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeGeometry {
+    geometry: DigestGeometry,
+    start: u64,
+    end: u64,
+    chunks: Option<(u32, u32)>,
+}
+
+/// Complete chunk and page indices and the half-open slice within its plaintext.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeChunk {
+    pub index: u32,
+    pub page: u32,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl RangeGeometry {
+    /// Inclusive first and last chunk indices; `None` for empty nonempty-object ranges.
+    pub fn chunks(self) -> Option<(u32, u32)> {
+        self.chunks
+    }
+
+    /// Returns a selection only for a chunk belonging to this range.
+    pub fn chunk(self, index: u32) -> Option<RangeChunk> {
+        let (first, last) = self.chunks?;
+        if index < first || index > last {
+            return None;
+        }
+        let (sealed_len, _) = self.geometry.chunk(index)?;
+        let length = u64::from(sealed_len.checked_sub(16)?);
+        let offset = u64::from(index).checked_mul(CHUNK)?;
+        let page = index.checked_div(PAGE_ENTRIES)?;
+        self.geometry.page(page)?;
+        Some(RangeChunk {
+            index,
+            page,
+            start: usize::try_from(self.start.saturating_sub(offset).min(length)).ok()?,
+            end: usize::try_from(self.end.saturating_sub(offset).min(length)).ok()?,
+        })
+    }
+}
+
 impl DigestGeometry {
     /// Returns `None` outside the selected 8 GiB format bound.
     pub fn new(plaintext_len: u64) -> Option<Self> {
@@ -66,6 +110,29 @@ impl DigestGeometry {
         self.pages
     }
 
+    /// Plan a validated half-open plaintext range without opening any bytes.
+    pub fn range(self, start: u64, end: u64) -> Option<RangeGeometry> {
+        if start > end || end > self.plaintext_len {
+            return None;
+        }
+        let chunks = if self.plaintext_len == 0 {
+            Some((0, 0)) // The empty object still has a final authentication tag.
+        } else if start == end {
+            None
+        } else {
+            Some((
+                u32::try_from(start / CHUNK).ok()?,
+                u32::try_from((end - 1) / CHUNK).ok()?,
+            ))
+        };
+        Some(RangeGeometry {
+            geometry: self,
+            start,
+            end,
+            chunks,
+        })
+    }
+
     /// The exact page partition, or `None` for an out-of-range index.
     pub fn page(self, index: u32) -> Option<PageGeometry> {
         if index >= self.pages {
@@ -98,6 +165,77 @@ impl DigestGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_validation_and_empty_objects() {
+        let empty = DigestGeometry::new(0).unwrap();
+        let plan = empty.range(0, 0).unwrap();
+        assert_eq!(plan.chunks(), Some((0, 0)));
+        assert_eq!(
+            plan.chunk(0),
+            Some(RangeChunk {
+                index: 0,
+                page: 0,
+                start: 0,
+                end: 0
+            })
+        );
+        assert_eq!(plan.chunk(1), None);
+        assert_eq!(empty.range(0, 1), None);
+        let g = DigestGeometry::new(CHUNK + 1).unwrap();
+        for point in [0, 1, CHUNK, CHUNK + 1] {
+            let plan = g.range(point, point).unwrap();
+            assert_eq!(plan.chunks(), None);
+            assert_eq!(plan.chunk(0), None);
+        }
+        assert_eq!(g.range(2, 1), None);
+        assert_eq!(g.range(0, CHUNK + 2), None);
+        assert_eq!(g.range(u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn range_clips_at_chunk_and_page_boundaries() {
+        let boundary = 256 * CHUNK;
+        let g = DigestGeometry::new(boundary + 1).unwrap();
+        let plan = g.range(boundary - 1, boundary + 1).unwrap();
+        assert_eq!(plan.chunks(), Some((255, 256)));
+        assert_eq!(
+            plan.chunk(255),
+            Some(RangeChunk {
+                index: 255,
+                page: 0,
+                start: 65_535,
+                end: 65_536
+            })
+        );
+        assert_eq!(
+            plan.chunk(256),
+            Some(RangeChunk {
+                index: 256,
+                page: 1,
+                start: 0,
+                end: 1
+            })
+        );
+        assert_eq!(plan.chunk(254), None);
+        assert_eq!(plan.chunk(257), None);
+        assert_eq!(plan.chunk(u32::MAX), None);
+        let plan = g.range(CHUNK, 2 * CHUNK).unwrap();
+        assert_eq!(plan.chunks(), Some((1, 1)));
+        assert_eq!(
+            plan.chunk(1),
+            Some(RangeChunk {
+                index: 1,
+                page: 0,
+                start: 0,
+                end: 65_536
+            })
+        );
+        let g = DigestGeometry::new(1 << 33).unwrap();
+        let plan = g.range((1 << 33) - 1, 1 << 33).unwrap();
+        assert_eq!(plan.chunks(), Some((131_071, 131_071)));
+        assert_eq!(plan.chunk(131_071).unwrap().page, 511);
+    }
 
     #[test]
     fn canonical_geometry_at_chunk_and_page_boundaries() {
