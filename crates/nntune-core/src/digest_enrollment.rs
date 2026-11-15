@@ -44,7 +44,7 @@ impl OriginManifest {
     pub(crate) fn geometry(&self) -> DigestGeometry {
         self.geometry
     }
-    pub(crate) fn header(&self) -> &[u8; 48] {
+    pub(crate) fn header_bytes(&self) -> &[u8; 48] {
         &self.header
     }
     pub(crate) fn map_id(&self) -> &[u8; 16] {

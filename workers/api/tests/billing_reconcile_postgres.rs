@@ -1158,6 +1158,119 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
     result.expect("contention phases failed");
 }
 
+// A writer that does not take the advisory lock may commit or roll back while
+// the table lock is waiting. The subsequent READ COMMITTED statement must see
+// the resulting state; a pre-lock observation is not ownership evidence.
+#[tokio::test]
+async fn table_exclusion_classifies_after_writer_commit_or_rollback() {
+    snapshot_fixture(false)
+        .await
+        .expect("snapshot phases failed");
+}
+
+#[tokio::test]
+async fn snapshot_fixture_cleans_up_after_early_lock_completion() {
+    let result = snapshot_fixture(true).await;
+    assert_eq!(result.unwrap_err(), "lock finished before wait barrier");
+}
+
+async fn snapshot_fixture(force_early_completion: bool) -> Result<(), String> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let schema = format!(
+        "billing_snapshot_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut drivers = Vec::new();
+    let mut pending = Vec::new();
+    let result: Result<(), String> = timeout(Duration::from_secs(25), async {
+        let (observer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        observer.batch_execute(&format!("SET statement_timeout = '4s'; CREATE SCHEMA {schema}; CREATE TABLE {schema}.subscriptions (stripe_subscription_id text PRIMARY KEY, user_id text NOT NULL)")).await.map_err(|e| e.to_string())?;
+        for commit in [true, false] {
+            let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let (reader, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let reader_pid: i32 = reader.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            writer.batch_execute(&format!("BEGIN; SET LOCAL statement_timeout = '4s'; INSERT INTO {schema}.subscriptions VALUES ('sub', 'other')")).await.map_err(|e| e.to_string())?;
+            reader.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '4s'; SET LOCAL statement_timeout = '4s'; SET LOCAL transaction_timeout = '10s'").await.map_err(|e| e.to_string())?;
+            let before = reader.query_opt(&format!("SELECT user_id FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub'"), &[]).await.map_err(|e| e.to_string())?;
+            if before.is_some() { return Err("uncommitted writer was visible".into()); }
+            let sql = if force_early_completion { "INVALID LOCK".to_string() } else { format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE") };
+            pending.push(tokio::spawn(async move {
+                let result = reader.batch_execute(&sql).await;
+                (reader, result)
+            }));
+            let task = pending.last_mut().unwrap();
+            let finished_early = timeout(Duration::from_secs(3), async {
+                if force_early_completion {
+                    while !task.is_finished() { tokio::task::yield_now().await; }
+                }
+                loop {
+                    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&writer_pid, &reader_pid];
+                    tokio::select! {
+                        biased;
+                        _ = &mut *task => return Ok(true),
+                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", params) => {
+                            if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<bool, String>(false)
+            }).await.map_err(|_| "lock wait barrier timed out".to_string())??;
+            if finished_early {
+                pending.pop(); // The select consumed this handle's output.
+                return Err("lock finished before wait barrier".into());
+            }
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let completed = timeout(Duration::from_secs(5), pending.last_mut().unwrap()).await.map_err(|_| "lock did not resume".to_string())?;
+            pending.pop(); // The handle has been consumed, even if the task failed.
+            let (reader, lock) = completed.map_err(|e| e.to_string())?;
+            lock.map_err(|e| e.to_string())?;
+            let after = reader.query_opt(&format!("SELECT user_id FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub'"), &[]).await.map_err(|e| e.to_string())?;
+            let owner = after.map(|row| row.get::<_, String>(0));
+            if owner.as_deref() != if commit { Some("other") } else { None } {
+                return Err(format!("unexpected post-lock owner after commit={commit}: {owner:?}"));
+            }
+            reader.batch_execute("ROLLBACK").await.map_err(|e| e.to_string())?;
+            observer.batch_execute(&format!("DELETE FROM {schema}.subscriptions")).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("snapshot phases timed out".into()));
+    for task in pending {
+        task.abort();
+        let _ = task.await;
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    let cleanup = timeout(Duration::from_secs(5), async {
+        let (db, connection) = config.connect(NoTls).await?;
+        let driver = tokio::spawn(connection);
+        let result = async {
+            db.batch_execute(&format!("SET lock_timeout = '3s'; SET statement_timeout = '4s'; DROP SCHEMA IF EXISTS {schema} CASCADE")).await?;
+            let exists: bool = db.query_one("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", &[&schema]).await?.get(0);
+            Ok::<_, tokio_postgres::Error>(exists)
+        }.await;
+        drop(db);
+        driver.abort();
+        let _ = driver.await;
+        result
+    }).await;
+    assert!(
+        matches!(cleanup, Ok(Ok(false))),
+        "fixture cleanup failed: {cleanup:?}; snapshot phases: {result:?}"
+    );
+    result
+}
+
 // These are server-side expiry controls on a disposable relation, not proof of
 // production pooling, role privileges, version support, or driver cancellation.
 #[tokio::test]

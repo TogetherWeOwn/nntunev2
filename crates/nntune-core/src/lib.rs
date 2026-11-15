@@ -46,6 +46,7 @@ pub use velmora::{
     transports, yenc, Error, Result,
 };
 
+pub mod digest_chunk;
 pub mod digest_context;
 pub mod digest_enrollment;
 pub mod digest_geometry;

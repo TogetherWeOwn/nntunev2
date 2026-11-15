@@ -4,6 +4,7 @@ use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
 use crate::media::Sealer;
 use crate::rng::FillRandom;
+use sha2::{Digest, Sha256};
 
 struct Fixed;
 impl FillRandom for Fixed {

@@ -3,10 +3,10 @@
 //! This does not authorize serving or load provider data. The caller supplies
 //! each complete page and chunk in order; a failed chunk releases no plaintext.
 
+use crate::digest_chunk::{open_chunk, ChunkError};
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_verifier::PageError;
 use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader, PLAIN_CHUNK_SIZE};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 #[cfg(test)]
@@ -39,7 +39,7 @@ impl OpenPart {
 /// Sequential range cursor, retaining no page or plaintext between calls.
 pub struct DigestRange<'a> {
     manifest: &'a OriginManifest,
-    header: VerifiedHeader,
+    key: &'a FileKey,
     start: u64,
     end: u64,
     next: u32,
@@ -51,7 +51,7 @@ impl<'a> DigestRange<'a> {
     /// Select a half-open range; the empty object authenticates its final tag.
     pub fn new(
         manifest: &'a OriginManifest,
-        key: &FileKey,
+        key: &'a FileKey,
         start: u64,
         end: u64,
     ) -> Result<Self, RangeError> {
@@ -59,8 +59,8 @@ impl<'a> DigestRange<'a> {
         if start > end || end > geometry.plaintext_len() {
             return Err(RangeError::InvalidRange);
         }
-        let header = Header::from_bytes(manifest.header());
-        let header = VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, key, &header)
+        let header = Header::from_bytes(manifest.header_bytes());
+        VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, key, &header)
             .map_err(|_| RangeError::Header)?;
         let (next, last) = if geometry.plaintext_len() == 0 {
             (0, Some(0))
@@ -74,7 +74,7 @@ impl<'a> DigestRange<'a> {
         };
         Ok(Self {
             manifest,
-            header,
+            key,
             start,
             end,
             next,
@@ -119,46 +119,15 @@ impl<'a> DigestRange<'a> {
         if self.failed || index != self.next || index > last {
             return Err(RangeError::InvalidChunk);
         }
-        let geometry = self.manifest.geometry();
-        let reader = self
-            .header
-            .reader(geometry.plaintext_len())
-            .map_err(|_| RangeError::Header)?;
-        if index == 0 {
-            reader
-                .check_wire_header(wire_header.ok_or(RangeError::Header)?)
-                .map_err(|_| RangeError::Header)?;
-        }
-        let verified = self
-            .manifest
-            .verify_page(index / 256, page)
-            .map_err(RangeError::Page)?;
-        let expected = verified
-            .expectation(index)
-            .ok_or(RangeError::InvalidChunk)?;
-        let (length, final_chunk) = geometry.chunk(index).ok_or(RangeError::InvalidChunk)?;
-        if expected.index() != index
-            || expected.sealed_len() != length
-            || expected.final_chunk() != final_chunk
-            || sealed.len() != length as usize
-        {
-            return Err(RangeError::InvalidChunk);
-        }
-        let mut mismatch = false;
-        let opened = reader.open_chunk_with_precheck(u64::from(index), sealed, |bytes| {
-            if <[u8; 32]>::from(Sha256::digest(bytes)) != *expected.digest() {
-                mismatch = true;
-                return Err(crate::Error::Malformed("digest mismatch".into()));
-            }
-            Ok(())
-        });
-        let bytes = opened.map_err(|_| {
-            if mismatch {
-                RangeError::DigestMismatch
-            } else {
-                RangeError::Authentication
-            }
-        })?;
+        let bytes = open_chunk(self.manifest, self.key, index, page, sealed, wire_header).map_err(
+            |error| match error {
+                ChunkError::Header => RangeError::Header,
+                ChunkError::Page(error) => RangeError::Page(error),
+                ChunkError::InvalidChunk => RangeError::InvalidChunk,
+                ChunkError::DigestMismatch => RangeError::DigestMismatch,
+                ChunkError::Authentication => RangeError::Authentication,
+            },
+        )?;
         let chunk_start = u64::from(index) * PLAIN_CHUNK_SIZE;
         let start = self
             .start
