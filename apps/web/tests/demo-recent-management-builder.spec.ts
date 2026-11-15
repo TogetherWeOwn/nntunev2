@@ -2,9 +2,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
  * Builder-owned review-round pins for per-entry demo history management.
- * The paired acceptance suite remains byte-identical; this file covers
- * review-found behavior around empty queues, row-specific names, unavailable
- * entry removal, and the narrow-screen touch target.
+ * The paired bank remains acceptance-owned with authorized retirement amendments.
+ * This file pins row-specific names, unavailable entry removal, and the
+ * narrow-screen touch target.
  */
 const HISTORY = 'nntune:demo-recently-played:v1';
 const QUEUE = 'nntune:demo-queue:v1';
@@ -113,30 +113,17 @@ test.afterEach(async ({ page }) => {
 	expect(networkCalls.get(page) ?? [], 'no backend, telemetry, provider, or external requests').toEqual([]);
 });
 
-test('BRM-01 adding a recent entry to an empty queue selects without playing', async ({ page, baseURL }) => {
-	await open(page, baseURL!, {
-		history: [{ trackId: 'second-signal', playedAt: 200 }],
-		order: [],
-		currentId: null
-	});
-	await expect(page.getByTestId('player-status')).toHaveText('Status: empty');
-	const playsBefore = (await probe(page)).plays;
-	await row(page, 'second-signal').getByRole('button', { name: /add.*queue/i }).click();
-	await expect(page.getByTestId('player-status')).toHaveText('Status: selected');
-	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
-	expect((await probe(page)).plays).toBe(playsBefore);
-});
 
 test('BRM-02 recent actions expose the affected entry in their accessible names', async ({ page, baseURL }) => {
 	await open(page, baseURL!, {
 		history: [{ trackId: 'second-signal-missing', playedAt: 400 }, ...HISTORY_ENTRIES]
 	});
-	await expect(row(page, 'second-signal').getByRole('button', { name: 'Add Second Signal to queue', exact: true })).toBeVisible();
 	await expect(row(page, 'second-signal').getByRole('button', { name: 'Forget Second Signal from recent history', exact: true })).toBeVisible();
 	await expect(row(page, 'second-signal-missing').getByRole('button', {
 		name: 'Forget unavailable entry second-signal-missing from recent history',
 		exact: true
 	})).toBeVisible();
+	await expect(page.getByTestId('recently-played').getByRole('button', { name: /add.*queue/i })).toHaveCount(0);
 });
 
 test('BRM-03 forgetting an unavailable row removes only that history entry without transport changes', async ({ page, baseURL }) => {
@@ -152,7 +139,7 @@ test('BRM-03 forgetting an unavailable row removes only that history entry witho
 test('BRM-04 recent action touch targets are at least 44px on a narrow screen', async ({ page, baseURL }) => {
 	await page.setViewportSize({ width: 375, height: 812 });
 	await open(page, baseURL!);
-	const action = row(page, 'second-signal').getByRole('button', { name: /add.*queue/i });
+	const action = row(page, 'second-signal').getByRole('button', { name: /forget/i });
 	await action.scrollIntoViewIfNeeded();
 	const box = await action.boundingBox();
 	expect(box).not.toBeNull();
