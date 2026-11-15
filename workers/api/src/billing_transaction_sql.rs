@@ -20,6 +20,13 @@ pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
     paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale \
     FROM public.subscriptions WHERE stripe_subscription_id = $1";
 
+/// Unused production write for the future transaction. It has the same 15
+/// parameters as `store_reconciled_subscription_statement`, and returns the
+/// written owner and subscription key for caller-side identity checking. A
+/// missing row is not itself a classification of the reason for suppression.
+/// This statement alone does not couple the write to the lock, lookup or history.
+pub const WRITE_SUBSCRIPTION: &str = include_str!("billing_transaction_write.sql");
+
 /// Ordered parameters for the global lookup: key, incoming paid-through epoch,
 /// incoming paid invoice ID. Do not use an owner filter to hide foreign rows.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +57,35 @@ mod tests {
             "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE"
         );
         assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale FROM public.subscriptions WHERE stripe_subscription_id = $1");
+    }
+
+    #[test]
+    fn write_matches_existing_statement_except_relation_guard_and_returning() {
+        let existing = crate::billing_reconcile::store_reconciled_subscription_statement();
+        let expected = existing.replacen(
+            "INSERT INTO subscriptions ",
+            "INSERT INTO public.subscriptions ",
+            1,
+        ) + " AND subscriptions.user_id = EXCLUDED.user_id RETURNING user_id, stripe_subscription_id";
+        assert_eq!(WRITE_SUBSCRIPTION.trim(), expected);
+
+        // Pin the insert bind order and the three additional fold inputs.
+        assert!(WRITE_SUBSCRIPTION.contains("SELECT $1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint) WHERE NOT $15::boolean"));
+        assert!(WRITE_SUBSCRIPTION.contains("subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13"));
+        let mut parameters: Vec<usize> = WRITE_SUBSCRIPTION
+            .split('$')
+            .skip(1)
+            .map(|part| {
+                part.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        parameters.sort_unstable();
+        parameters.dedup();
+        assert_eq!(parameters, (1..=15).collect::<Vec<_>>());
     }
 
     #[test]
