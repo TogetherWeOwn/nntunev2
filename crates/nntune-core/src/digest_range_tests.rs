@@ -52,15 +52,15 @@ fn id(n: u8) -> [u8; 16] {
     id
 }
 
-fn fixture(
-    length: usize,
-) -> (
-    OriginManifest,
-    FileKey,
-    [u8; 48],
-    Vec<Vec<u8>>,
-    Vec<Vec<u8>>,
-) {
+struct Fixture {
+    manifest: OriginManifest,
+    key: FileKey,
+    header: [u8; 48],
+    chunks: Vec<Vec<u8>>,
+    pages: Vec<Vec<u8>>,
+}
+
+fn fixture(length: usize) -> Fixture {
     let mut builder = DigestEnrollment::new(length as u64, [id(1); 5], id(2)).unwrap();
     let key = FileKey::from_bytes(*builder.key().expose_secret());
     let header = builder.header().to_bytes();
@@ -73,12 +73,24 @@ fn fixture(
             pages.push(page);
         }
     }
-    (builder.finish().unwrap(), key, header, chunks, pages)
+    Fixture {
+        manifest: builder.finish().unwrap(),
+        key,
+        header,
+        chunks,
+        pages,
+    }
 }
 
 #[test]
 fn opens_cross_chunk_range_and_rejects_wrong_order() {
-    let (manifest, key, header, chunks, pages) = fixture(65_537);
+    let Fixture {
+        manifest,
+        key,
+        header,
+        chunks,
+        pages,
+    } = fixture(65_537);
     let mut cursor = DigestRange::new(&manifest, &key, 65_535, 65_537).unwrap();
     assert_eq!(cursor.next_indices(), Some((0, 0)));
     assert_eq!(
@@ -111,7 +123,13 @@ fn opens_cross_chunk_range_and_rejects_wrong_order() {
 #[test]
 fn opens_across_page_boundary() {
     let boundary = 256 * 65_536;
-    let (manifest, key, _, chunks, pages) = fixture(boundary + 1);
+    let Fixture {
+        manifest,
+        key,
+        chunks,
+        pages,
+        ..
+    } = fixture(boundary + 1);
     let mut cursor =
         DigestRange::new(&manifest, &key, boundary as u64 - 1, boundary as u64 + 1).unwrap();
     assert_eq!(cursor.next_indices(), Some((255, 0)));
@@ -135,7 +153,13 @@ fn opens_across_page_boundary() {
 
 #[test]
 fn mismatch_truncation_and_header_failure_release_nothing() {
-    let (manifest, key, header, chunks, pages) = fixture(1);
+    let Fixture {
+        manifest,
+        key,
+        header,
+        chunks,
+        pages,
+    } = fixture(1);
     let mut changed = chunks[0].clone();
     changed[0] ^= 1;
     let mut cursor = DigestRange::new(&manifest, &key, 0, 1).unwrap();
