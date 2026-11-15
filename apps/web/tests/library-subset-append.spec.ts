@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: append an explicitly selected subset of library tracks.
@@ -69,6 +70,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * removal/multi-select, server playlists, saved selections, cross-device
  * state, backend search, audio transport, deployed streaming. Select
  * all/displayed is pinned by `tests/library-select-all-displayed.spec.ts`.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -163,6 +170,7 @@ test('[SUB-B-00] control: the library renders fixture rows in API order', async 
 		.getByTestId('library-item')
 		.evaluateAll((items) => items.map((item) => item.getAttribute('data-id')));
 	expect(rendered).toEqual(['row-zulu', 'row-alpha', 'row-mike', 'row-bravo']);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });
 
@@ -205,6 +213,7 @@ test('[SUB-B-02] checking boxes queues, stars, fetches and plays nothing', async
 	await second.check();
 
 	await expect(selectionCount(page)).toContainText('2 selected');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
@@ -237,6 +246,7 @@ test('[SUB-B-03] checkbox activation never bubbles into row-add or star', async 
 
 	await expect(box).toBeChecked();
 	await expect(selectionCount(page)).toContainText('1 selected');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(starButton(page, 'row-alpha')).toHaveAttribute('aria-pressed', 'false');
@@ -285,6 +295,7 @@ test('[SUB-B-05] append adds the subset around queued duplicates in activation o
 
 	// Pre-queue one row through the immediate gesture: current is zulu.
 	await row(page, 'row-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 
@@ -329,6 +340,7 @@ test('[SUB-B-06] appending twice is idempotent and keeps the selection', async (
 
 	const append = appendButton(page);
 	await append.click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha']);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
@@ -350,6 +362,7 @@ test('[SUB-B-07] clear empties the pending selection only', async ({ page }) => 
 
 	await row(page, 'row-zulu').click();
 	await starButton(page, 'row-bravo').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 
@@ -392,6 +405,7 @@ test('[SUB-B-08] deselect then reselect moves the ID to the end of the activatio
 
 	await appendButton(page).click();
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha', 'row-zulu']);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
@@ -420,6 +434,7 @@ test('[SUB-B-09] later sort changes keep every choice in activation order', asyn
 
 	// Append follows activation order (mike, zulu), not either sorted order.
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 });
@@ -486,6 +501,7 @@ test('[SUB-B-11] a successful refresh prunes IDs the snapshot no longer carries'
 	await expect(row(page, 'row-zulu')).toHaveCount(0);
 
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha']);
 });
@@ -530,6 +546,7 @@ test('[SUB-B-13] an auth transition purges the pending selection', async ({ page
 	await expect(selectionCount(page)).toContainText('0 selected');
 	await expect(checkbox(page, 'row-kilo')).not.toBeChecked();
 	await expect(appendButton(page)).toBeDisabled();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });
 
@@ -575,6 +592,7 @@ for (const status of [401, 403, 404] as const) {
 		await expect(page.getByTestId('library-item')).toHaveCount(NEXT_ACCOUNT.length);
 		await expect(selectionCount(page)).toContainText('0 selected');
 		await expect(appendButton(page)).toBeDisabled();
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	});
 }
@@ -622,6 +640,7 @@ test('[SUB-B-16] checking, clearing and appending mutate nothing over the networ
 	await checkbox(page, 'row-zulu').check();
 
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 
 	await clearButton(page).click();
@@ -699,6 +718,7 @@ test('[SUB-B-18] narrow-screen light and dark keep every control visible and ope
 	await checkbox(page, 'row-alpha').check();
 	await checkbox(page, 'row-mike').check();
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-alpha', 'row-mike']);
 });
@@ -721,6 +741,7 @@ test('[SUB-B-19] a failed refresh keeps selection controls operable with polite 
 	await checkbox(page, 'row-alpha').check();
 	await expect(selectionCount(page)).toContainText('2 selected');
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	const result = page.getByTestId('append-result');
 	await expect(result).toBeVisible();
@@ -740,6 +761,7 @@ test('[SUB-B-20] immediate row-add and star keep working alongside selection', a
 	// Immediate queue gesture-order still works and ignores the pending set.
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-zulu', 'row-alpha']);
 	await expect(selectionCount(page)).toContainText('0 selected');

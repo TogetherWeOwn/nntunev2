@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned regressions complementing the protected grouped-library and
@@ -13,6 +14,12 @@ import { expect, test, type Page } from '@playwright/test';
  *   focus on a row that is not the next displayed row.
  * - Removing the direct 401/403 grouping reset leaves a recovered account
  *   grouped even though no storage-event auth transition occurred.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const GROUPED_ITEMS = [
@@ -117,6 +124,7 @@ test('[GA-R01] grouped bulk appends missing tracks in rendered group order after
 
 	const quietRow = page.locator('[data-testid="library-item"][data-id="grouped-unknown"]');
 	await quietRow.getByRole('button', { name: 'Quiet Track', exact: true }).click();
+	await openQueue(page);
 	await expectQueueOrder(page, ['grouped-unknown'], 'grouped-unknown');
 
 	await groupToggle(page).click();
@@ -155,6 +163,7 @@ test('[GA-R02] grouped Select all appends in rendered group order', async ({ pag
 		.click();
 	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
 
+	await openQueue(page);
 	await expectQueueOrder(page, GROUPED_ROW_ORDER, GROUPED_ROW_ORDER[0]);
 });
 

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Test-Author owned RED acceptance for LIBQUEUESHARE: copy a link to any
@@ -71,6 +72,12 @@ import { expect, test, type Page } from '@playwright/test';
  * counts as RED: this file imports only `@playwright/test`.
  * Every RED assertion message is a compact JSON receipt:
  * {"case","expected","actual","status","error_code","next_action"}.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -237,6 +244,7 @@ async function seedQueue(page: Page) {
 	await selectLibraryRow(page, 'qshare-coral', 'Coral Night');
 	await selectLibraryRow(page, 'qshare-pine', 'Pine Morning');
 	await selectLibraryRow(page, 'qshare-ember', 'Ember Line');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
 }
@@ -361,6 +369,7 @@ test('[QUEUESHARE-01] queue rows expose labeled native copy actions, keyboard-fo
 	page
 }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await seedQueue(page);
 	const copy = await expectQueueCopyButton(page, 'QUEUESHARE-01', 'qshare-pine', 'Pine Morning');

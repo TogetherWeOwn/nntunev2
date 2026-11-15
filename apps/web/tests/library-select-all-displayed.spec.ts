@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: select all displayed library tracks in one action.
@@ -68,6 +69,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * Focused command (repo root, deterministic, offline):
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test \
  *     tests/library-select-all-displayed.spec.ts --workers=1 --retries=0
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Loaded (API) order is neither title order nor any activation order used
@@ -219,6 +226,7 @@ test('[SA-B-00] control: fixtures, existing controls and individual selection al
 
 	const mike = checkbox(page, 'sa-mike');
 	await expect(mike, 'checkbox missing on row sa-mike').toBeVisible();
+	await openQueue(page);
 	await mike.check();
 	await expect(selectionCount(page)).toContainText('1 selected');
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
@@ -239,6 +247,7 @@ test('[SA-B-01] one Select all action selects every displayed row, then a few ca
 	await expectChecked(page, ALL_IDS, []);
 	await expectFindCount(page, 5);
 	// Selecting is not queueing.
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(appendButton(page)).toBeEnabled();
 
@@ -281,6 +290,7 @@ test('[SA-B-03] select-all under a find adds only the displayed rows and preserv
 	await openLibrary(page);
 
 	// Bravo is selected first; the find below hides it.
+	await openQueue(page);
 	await checkbox(page, 'sa-bravo').check();
 	await expect(selectionCount(page)).toContainText('1 selected');
 
@@ -350,6 +360,7 @@ test('[SA-B-05] after an ordering switch, append order proves new IDs were added
 
 	// Delta is activated first, before any reorder, so it must keep the
 	// head of the activation order a select-all appends behind.
+	await openQueue(page);
 	await checkbox(page, 'sa-delta').check();
 	await orderControl(page).selectOption('title');
 	await expectDisplayed(page, ['sa-alpha', 'sa-bravo', 'sa-delta', 'sa-mike', 'sa-zulu']);
@@ -390,6 +401,7 @@ test('[SA-B-06] a successful refresh prunes a select-all and selecting-all again
 	await expect(page.getByTestId('selection-hidden-count')).toHaveCount(0);
 
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect
 		.poll(() => queueOrder(page))
 		.toEqual(['sa-alpha', 'sa-mike', 'sa-bravo', 'sa-delta']);
@@ -446,6 +458,7 @@ test('[SA-B-08] select-all and clear are presentation-only: no fetch, write, que
 
 	expect(h.requests, 'selecting must not refetch the library').toEqual(beforeRequests);
 	expect(h.writes, 'selecting must not mutate over the network').toEqual([]);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
@@ -460,6 +473,7 @@ test('[SA-B-09] a find-scoped select-all reviews exactly under Selected only, in
 	page
 }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await findField(page).fill('harbor');
 	await expectDisplayed(page, ['sa-zulu', 'sa-mike', 'sa-delta']);
 

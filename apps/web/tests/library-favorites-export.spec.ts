@@ -1,6 +1,7 @@
 import { expect, test, type Download, type Locator, type Page } from '@playwright/test';
 import { mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Test-Author owned RED acceptance for FAVEXPORT: export the device-local
@@ -53,6 +54,12 @@ import { dirname } from 'node:path';
  * at its button/status assertion with a NEXT action. Assertions about
  * announcements are scoped to the section/`main` regions, never
  * page-wide live-region counts.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -437,6 +444,7 @@ test('[FAVEXPORT-02] copy writes the numbered text in arranged order, not load, 
 	// Diverge every other order a wrong implementation might reuse:
 	// main list by title (a/m/z), queue built Alpha then Zulu (a/z),
 	// favorites arranged by moving Mike up (z/m/a).
+	await openQueue(page);
 	await page.getByRole('combobox', { name: 'Order tracks', exact: true }).selectOption('title');
 	await page
 		.locator('[data-testid="library-item"][data-id="fav-a"]')
@@ -531,6 +539,7 @@ test('[FAVEXPORT-04] exporting mutates neither favorites, queue, selection, play
 		.locator('[data-testid="library-item"][data-id="fav-z"]')
 		.getByRole('button', { name: /^Zulu Song/ })
 		.click();
+	await openQueue(page);
 	await page.getByRole('checkbox', { name: 'Select Mike Song', exact: true }).check();
 	await move(page, 'Mike Song', 'up').click();
 	await expectFavoriteIds(page, ['fav-z', 'fav-m', 'fav-a']);

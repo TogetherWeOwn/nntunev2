@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the paired build makes this file pass without editing it.
@@ -43,6 +44,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Focused command (repo root, deterministic, offline):
  *   pnpm --dir apps/web exec playwright test tests/library-local-filter.spec.ts
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -253,6 +260,7 @@ test('LF-00 control: API order and gesture-order queue work before find lands', 
 	await expect(page.getByTestId('library-track-count')).toContainText('8 tracks');
 	await row(page, 'filter-alpha').click();
 	await row(page, 'filter-zulu').click();
+	await openQueue(page);
 	await expectQueue(page, ['filter-alpha', 'filter-zulu'], 'filter-alpha', 'Alpha Song');
 	expect(api.requests()).toBe(1);
 	// Finding must not add a batch action beyond the approved displayed-track action.
@@ -358,6 +366,7 @@ test('LF-05 presentation-only: filter and clear change no queue, stars, storage 
 	const field = await requireFind(page);
 	await row(page, 'filter-alpha').click();
 	await row(page, 'filter-zulu').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	await starButton(page, 'filter-beta').click();
 	const queued = ['filter-alpha', 'filter-zulu'];
@@ -387,6 +396,7 @@ test('LF-06 enqueue: clicking a matched row queues that exact stable id', async 
 	await mockLibrary(page);
 	await openLibrary(page);
 	const field = await requireFind(page);
+	await openQueue(page);
 	await field.fill('gamma');
 	await expectView(page, ['filter-gamma']);
 	await row(page, 'filter-gamma').click();
@@ -555,6 +565,7 @@ test('LF-11 auth: account change clears the query with the queue and favorites',
 	await mockLibrary(page, reply);
 	await openLibrary(page);
 	const field = await requireFind(page);
+	await openQueue(page);
 	await field.fill('beta');
 	await expectView(page, ['filter-beta']);
 	await row(page, 'filter-beta').click();

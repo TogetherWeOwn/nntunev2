@@ -9,6 +9,11 @@ export function formatDuration(totalSeconds: number): string {
 	return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+/** Remaining milliseconds round up so a running timer never displays zero early. */
+export function formatRemainingMs(remainingMs: number): string {
+	return formatDuration(Math.ceil(Math.max(0, remainingMs) / 1000));
+}
+
 /** Display strings for the current track's elapsed/remaining/total media time. */
 export interface TrackTime {
 	elapsed: string;

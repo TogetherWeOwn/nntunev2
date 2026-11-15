@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import ts from 'typescript';
 import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { createPlayerFacade, MIRROR_QUEUE } from './player-harness.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import type { LibraryItem } from '#lib/library/cache.js';
@@ -26,14 +27,14 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback',
-		'resetRestartOnSourceChange', 'syncMiniPlayerHint'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'retireQueueWork', 'queueFavorites', 'clearShareFeedback',
+		'resetRestartOnSourceChange', 'syncMiniPlayerHint', 'libraryInputCurrent', 'sourceProjections'
 	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
 		'favoriteTracks', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'playEpoch'
+		'restartCanSeek', 'restartStatus', 'playEpoch'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -48,13 +49,16 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint, setMiniPlayerHint, createPlayerFacade,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
-	return new Function(...Object.keys(bindings), `${compiled}
+	return new Function(...Object.keys(bindings), `const player = createPlayerFacade({ queue, queueFeedback: queueAnnouncement }); ${MIRROR_QUEUE}
+		let shareAlive = true, loading = false, libraryUnavailable = false;
+		let libraryInputOwner = player.sourceInputOwner();
+${compiled}
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.get().queueFeedback })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;

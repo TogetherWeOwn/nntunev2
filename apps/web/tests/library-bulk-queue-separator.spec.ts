@@ -1,4 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
+
+/*
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
+ */
 
 // Builder-owned companion to BULK-03. Keep the protected acceptance bank intact.
 // Catches a queue row losing the leading separator space after a bulk append.
@@ -19,6 +28,7 @@ test('bulk-added queue rows match the now-playing title and artist spacing', asy
 	}));
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
+	await openQueue(page);
 	await page.getByRole('combobox', { name: /order|sort/i }).selectOption({ label: 'Artist A–Z' });
 	await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
 	const rows = page.getByTestId('queue-item');

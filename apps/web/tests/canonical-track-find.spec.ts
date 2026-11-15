@@ -1,8 +1,17 @@
 import { expect, test, type Locator, type Page, type TestInfo } from '@playwright/test';
+// EL TWO-5795 (demo/player retirement): this spec is hosted on the retired
+// `/demo/player` surface and the deleted `/api/demo/*` synthetic-media endpoints.
+// Vectors and case IDs are preserved; migration to the product surface is
+// deferred per fallback (b) — see the PR body disposition manifest.
+test.skip(true, 'EL TWO-5795: demo/player retirement — migration deferred, vectors preserved');
+
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the paired build makes this file pass without editing
- * it. Offline browser contract for finding canonically equivalent track
+ * it. One-time reviewed exception: seedQueue opens the persistent queue
+ * through its visible toggle; every behavior predicate remains protected.
+ * Offline browser contract for finding canonically equivalent track
  * names across the three find surfaces — the loaded-library find, the
  * library PlayerQueue filter and the demo queue filter — not
  * implementation/source-shape pins. The pure halves are
@@ -232,6 +241,7 @@ async function seedQueue(page: Page) {
 	for (const item of ITEMS) {
 		await page.locator(`[data-testid="library-item"][data-id="${item.id}"] button.nt-library-row`).click();
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(ITEMS.length);
 }
 

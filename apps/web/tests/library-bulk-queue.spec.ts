@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { closeQueue, openQueue } from './helpers/queue-host';
 
 /**
  * BULK acceptance bank — protected; the paired build owns the combined GREEN
@@ -31,6 +32,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * enabled state; network/storage/favorite/media side effects; auth leakage;
  * refresh auto-queueing; inaccessible or overflowing narrow-screen action.
  * Pre-feature expected RED: action/disabled-state assertions, never setup errors.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const LABEL = 'Add displayed tracks to queue';
@@ -140,6 +147,7 @@ test.beforeEach(async ({ context }) => {
 test('BULK-00 control: existing library order, single add and current selection work', async ({ page }) => {
 	await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await expectView(page, ORIGINAL);
 	await rowAction(page, 'bulk-z').click();
 	await rowAction(page, 'bulk-a').click();
@@ -151,6 +159,7 @@ test('BULK-00 control: existing library order, single add and current selection 
 test('BULK-01 title-sorted view appends in displayed order, announces four, and disables repeat', async ({ page }) => {
 	const api = await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await sort(page, 'Title A–Z');
 	await expectView(page, TITLE);
 	await expect(action(page), 'the one-action bulk queue control is missing').toBeVisible();
@@ -171,6 +180,7 @@ test('BULK-01 title-sorted view appends in displayed order, announces four, and 
 test('BULK-02 mixed queued IDs preserve arranged prefix/current index, count only missing, then re-enable', async ({ page }) => {
 	await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await rowAction(page, 'bulk-z').click();
 	await rowAction(page, 'bulk-a').click();
 	await queued(page, 'bulk-z').getByRole('button', { name: 'Move Zulu Song down', exact: true }).click();
@@ -204,6 +214,7 @@ test('BULK-03 artist order uses title/artist fallbacks without storage, favorite
 	});
 	const api = await mockLibrary(page);
 	await openLibrary(page);
+	await openQueue(page);
 	await row(page, 'bulk-z').getByRole('button', { name: 'Star Zulu Song', exact: true }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 	await sort(page, 'Artist A–Z');
@@ -230,6 +241,7 @@ test('BULK-03 artist order uses title/artist fallbacks without storage, favorite
 test('BULK-04 empty library has a disabled labeled action, no queue and no false added confirmation', async ({ page }) => {
 	const api = await mockLibrary(page, { items: [] });
 	await openLibrary(page, 0);
+	await openQueue(page);
 	await expect(action(page)).toBeVisible();
 	await expect(action(page)).toBeDisabled();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
@@ -243,6 +255,7 @@ test('BULK-04 empty library has a disabled labeled action, no queue and no false
 test('BULK-05 singleton reports one; clear re-enables; already-queued starts disabled', async ({ page }) => {
 	await mockLibrary(page, { items: [ITEMS[0]] });
 	await openLibrary(page, 1);
+	await openQueue(page);
 	await rowAction(page, 'bulk-z').click();
 	await expect(action(page)).toBeDisabled();
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
@@ -270,6 +283,7 @@ test('BULK-06 initial pending/refused response never enables bulk; Retry only lo
 	await mockLibrary(page);
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expectView(page, ORIGINAL);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(action(page)).toBeEnabled();
 	await action(page).click();
@@ -281,6 +295,7 @@ test('BULK-07 refresh preserves surviving current, never auto-adds and bulk uses
 	const reply: Reply = { items: ITEMS };
 	const api = await mockLibrary(page, reply);
 	await openLibrary(page);
+	await openQueue(page);
 	await rowAction(page, 'bulk-z').click();
 	await sort(page, 'Title A–Z');
 	reply.status = 503;
@@ -305,6 +320,7 @@ test('BULK-08 auth transition clears bulk-populated queue; next account adds onl
 	const reply: Reply = { items: ITEMS };
 	await mockLibrary(page, reply);
 	await openLibrary(page);
+	await openQueue(page);
 	await expect(action(page)).toBeEnabled();
 	await action(page).click();
 	await expectQueue(page, ORIGINAL, 'bulk-z');
@@ -351,10 +367,17 @@ for (const scheme of ['light', 'dark'] as const) {
 		expect(box!.height, 'touch action needs a usable target').toBeGreaterThanOrEqual(44);
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 		await page.keyboard.press('Enter');
+		await openQueue(page);
 		await expectQueue(page, ORIGINAL, 'bulk-z');
 		await expectAdded(page, 4);
+		await closeQueue(page, { url: /\/library(\?|$)/, heading: 'Library' });
 		await expect(action(page)).toBeDisabled();
+		// Close returns focus to the shell Queue toggle; Enter there would reopen the queue
+		// instead of exercising the disabled action. A disabled action cannot take focus, so
+		// blur to the document body and let Enter be a true no-op.
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
 		await page.keyboard.press('Enter');
+		await openQueue(page);
 		await expectQueue(page, ORIGINAL, 'bulk-z');
 	});
 }

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Selection isolation + row accessible names (companion to the paired
@@ -12,6 +13,12 @@ import { expect, test, type Page } from '@playwright/test';
  *   so the next session's Retry never renders the previous account's
  *   queue (the same isolation invariant `library-cache.spec.ts` pins
  *   for items and snapshots).
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ACCOUNT_A = [
@@ -66,6 +73,7 @@ test('auth transition clears selections and Retry loads the next account clean',
 	await expect(page.getByTestId('library-item')).toHaveCount(ACCOUNT_A.length);
 
 	await page.locator('[data-testid="library-item"][data-id="row-zulu"]').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 
 	await fireAuthTransition(page);
@@ -89,6 +97,7 @@ test('401 clears selections instead of carrying them into the next session', asy
 	await expect(page.getByTestId('library-item')).toHaveCount(ACCOUNT_A.length);
 
 	await page.locator('[data-testid="library-item"][data-id="row-alpha"]').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 
 	await page.unroute('**/api/library');

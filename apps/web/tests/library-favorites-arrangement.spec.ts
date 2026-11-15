@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the builder must not edit this file or sibling favorites tests.
@@ -6,6 +7,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * No proposed helper imports: RED must be a browser assertion, not a missing API.
  * FAVORDER-01..09 are stable case IDs. Pure movement has no exported baseline seam;
  * these exercise the same ordered-ID contract through its existing UI/storage seams.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 const ITEMS = [
 	{ id: 'arr-z', title: 'Zulu Song', artist: 'Harbor Lights' },
@@ -181,6 +188,7 @@ for (const theme of ['light', 'dark'] as const) {
 			expect(box.height).toBeGreaterThan(0);
 			expect(box.visibility).toBe('visible');
 		}
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		await expect(page.getByTestId('audio-player')).toHaveCount(0);
 	});
@@ -311,6 +319,7 @@ test('[FAVORDER-08] movement leaves main ordering, stars, selected queue and req
 	page.on('request', (request) => requests.push(`${request.method()} ${new URL(request.url()).pathname}`));
 	page.on('pageerror', (error) => errors.push(error.message));
 	await open(page, ALL);
+	await openQueue(page);
 	await page.getByRole('combobox', { name: 'Order tracks', exact: true }).selectOption('title');
 	await page.locator('[data-testid="library-item"][data-id="arr-a"]')
 		.getByRole('button', { name: /^Alpha Song/ }).click();

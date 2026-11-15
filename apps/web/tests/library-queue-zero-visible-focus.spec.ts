@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Builder-owned: remove/clear focus recovery when a filter hides survivors.
@@ -17,6 +18,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   pnpm install --frozen-lockfile
  *   pnpm exec playwright install chromium
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm test:e2e tests/library-queue-zero-visible-focus.spec.ts --workers=1
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 test.use({ viewport: { width: 1000, height: 700 } });
@@ -41,6 +48,7 @@ async function seedQueue(page: Page): Promise<void> {
 	await page.locator('[data-testid="library-item"][data-id="row-mike"]').click();
 	await page.locator('[data-testid="library-item"][data-id="row-zulu"]').click();
 	await page.locator('[data-testid="library-item"][data-id="row-alpha"]').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 }

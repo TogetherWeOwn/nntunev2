@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { createQueue, formatQueueM3U, formatQueueText } from '#lib/player/queue.js';
+	import { createTrackListExport } from '#lib/player/trackListExport.js';
 	import type { LibraryItem } from './cache.js';
 	import { appendSelection } from './selection.js';
 
@@ -19,92 +20,28 @@
 	const selectionKey = $derived(JSON.stringify(snapshot.tracks));
 	let status = $state('');
 	let fallback = $state<string | null>(null);
-	let generation = 0;
 	let alive = true;
-	let downloadUrl: string | null = null;
-
-	function releaseDownload(): void {
-		if (downloadUrl !== null) URL.revokeObjectURL(downloadUrl);
-		downloadUrl = null;
-	}
-
-	function beginExport(): number {
-		generation += 1;
-		status = '';
-		fallback = null;
-		return generation;
-	}
+	const exporter = createTrackListExport({
+		getQueue: () => snapshot,
+		getKey: () => selectionKey,
+		isActive: () => alive,
+		onOutcome: (text, manual) => { status = text; fallback = manual; },
+		formatText: formatQueueText, formatM3U: formatQueueM3U,
+		noun: 'selected tracks', filename: 'selected.m3u',
+		unsafeMessage: 'Could not export the selection: it contains an unsafe track id.'
+	});
+	const copySelectedText = exporter.copy;
+	const downloadSelectedM3U = exporter.download;
 
 	$effect(() => {
 		selectionKey;
-		beginExport();
+		exporter.reset();
 	});
 
 	onDestroy(() => {
 		alive = false;
-		generation += 1;
-		releaseDownload();
+		exporter.reset(true);
 	});
-
-	async function copySelectedText(): Promise<void> {
-		const operation = beginExport();
-		const selected = snapshot;
-		const key = selectionKey;
-		if (!alive || selected.tracks.length === 0) return;
-		let text: string;
-		try {
-			// Text formatting alone does not validate ids. Apply the single
-			// export-safety guard before either output path can produce bytes.
-			formatQueueM3U(selected);
-			text = formatQueueText(selected);
-		} catch {
-			status = 'Could not export the selection: it contains an unsafe track id.';
-			return;
-		}
-		try {
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
-		} catch {
-			if (!alive || key !== selectionKey || operation !== generation) return;
-			status = 'Clipboard unavailable. Copy the selected tracks manually below.';
-			fallback = text;
-			return;
-		}
-		// Selection/snapshot changes and teardown invalidate late settlements,
-		// even before the reactive feedback reset has flushed.
-		if (!alive || key !== selectionKey || operation !== generation) return;
-		status = 'Copied selected tracks as text.';
-	}
-
-	function downloadSelectedM3U(): void {
-		beginExport();
-		if (!alive || snapshot.tracks.length === 0) return;
-		let m3u: string;
-		try {
-			m3u = formatQueueM3U(snapshot);
-		} catch {
-			status = 'Could not export the selection: it contains an unsafe track id.';
-			return;
-		}
-		const link = document.createElement('a');
-		try {
-			// Keep one URL until the next download or teardown, not a timer
-			// that could revoke it while the browser is still saving the file.
-			releaseDownload();
-			downloadUrl = URL.createObjectURL(new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' }));
-			link.href = downloadUrl;
-			link.download = 'selected.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			status = 'Download started. Check your browser’s downloads for selected.m3u.';
-		} catch {
-			releaseDownload();
-			status = 'Could not start the download. Try again or copy the selected tracks as text.';
-		} finally {
-			link.remove();
-		}
-	}
 </script>
 
 <button

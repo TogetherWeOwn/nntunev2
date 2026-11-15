@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance-owned: the paired build makes this file pass without editing
@@ -65,6 +66,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * Focused command (repo root, deterministic, offline):
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test tests/library-find-scope.spec.ts --workers=1 --retries=0
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -373,6 +380,7 @@ test('[FS-B00] control: shipped find, API order and queueing work before scope l
 	const api = await mockLibrary(page);
 	await openLibrary(page);
 	const field = await requireFind(page);
+	await openQueue(page);
 	await field.fill('harbor');
 	// Shipped behavior: title OR artist, so both collision rows show.
 	await expectRows(page, ['scope-alpha', 'scope-beta']);
@@ -618,6 +626,7 @@ test('[FS-B07] composition: scope hides but never clears checkbox selections', a
 
 	const alphaChoice = page.getByRole('checkbox', { name: 'Select Harbor Song', exact: true });
 	const betaChoice = page.getByRole('checkbox', { name: 'Select Morning Song', exact: true });
+	await openQueue(page);
 	await alphaChoice.check();
 	await betaChoice.check();
 	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
@@ -682,6 +691,7 @@ test('[FS-B08] presentation-only: scope changes touch no network, media, queue, 
 
 	await row(page, 'scope-alpha').click();
 	await row(page, 'scope-zulu').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	await starButton(page, 'scope-beta').click();
 	await page.getByRole('checkbox', { name: 'Select Morning Song', exact: true }).check();

@@ -16,15 +16,20 @@ import {
  * explicit repeat Off/One/Queue control on `/library`. The Builder wires
  * `apps/web/src/routes/library/+page.svelte` to satisfy this file plus
  * `apps/web/tests/library-repeat-end-policy.spec.ts` and must not edit either
- * file.
+ * file, except for the Engineering Lead's one-time same-PR physical
+ * player/queue owner-chain migration of source loading/docs and U03–U05.
+ * U01/U02 and U06–U12 stay unchanged;
+ * general Test-Author protection and independent final review remain required.
  *
- * LOCKED CONTRACT (`apps/web/src/routes/library/+page.svelte`):
+ * LOCKED CONTRACT (library controls + layout-owned playback):
  * - A NATIVE <select> `player-repeat` (accessible name /repeat/i, values
  *   off/one/queue, labels Off/One/Queue, default Off) plus a `repeat-status`
  *   live region (role=status, text "Repeat: Off/One/Queue"). The mode persists
  *   across reload (local-state-bounds pattern); corrupt values fall back to Off.
- * - The native `<audio data-testid="audio-player">` carries an `ended` handler
- *   wired to the existing `naturalEndPolicy` core from `#lib/player/queue.js`:
+ * - The layout provides one session and mounts PlayerAudio. Its native
+ *   `<audio data-testid="audio-player">` attaches to that session's transport,
+ *   whose guarded `ended` listener calls the session's existing
+ *   `naturalEndPolicy` core from `lib/player/queue.js`:
  *   Off advances then stops truthfully at queue end; One replays current;
  *   Queue loops to first. Never autoplays from empty, never fabricates a track,
  *   never uses a native `loop` attribute. Auth teardown clears pending end
@@ -39,7 +44,9 @@ import {
  * - `apps/web/src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts` (this file)
  * - `apps/web/tests/library-repeat-end-policy.spec.ts`
  * BUILDER-OWNED implementation surface:
- * - `apps/web/src/routes/library/+page.svelte` (repeat control + status,
+ * - `apps/web/src/routes/library/+page.svelte` (repeat control + status)
+ * - `apps/web/src/routes/+layout.svelte`, `lib/player/PlayerAudio.svelte`,
+ *   `lib/player/context.ts`, `session.ts`, `transport.ts` (persistent playback,
  *   ended wiring via naturalEndPolicy, persistence, announcements)
  * - Existing queue/resume/share/sleep suites stay unchanged.
  *
@@ -48,16 +55,19 @@ import {
  * Companion browser run (builds + serves locally; no staging/prod):
  *   pnpm exec playwright test tests/library-repeat-end-policy.spec.ts
  *
- * RED NOW: the library route has no repeat hooks and does not reference
- * `naturalEndPolicy`. GREEN CONTROLS: the no-loop pin and the
- * naturalEndPolicy vector pins pass on the current tree, proving this file
- * compiles and the reuse contract holds.
+ * W11 keeps repeat hooks in the library and moves playback ownership to the
+ * persistent layout. Each source connection below is checked separately;
+ * unmounted demo references cannot satisfy the production chain.
  * Every RED assertion message is a compact JSON receipt:
  * {"case","expected","actual","status","error_code","next_action"}.
  */
 
-// Raw route markup via Vite glob: no node:fs, no @types/node needed.
-const sources = import.meta.glob('../../routes/**/*.svelte', {
+// Named production owners only; no concatenated source-token surrogate.
+const sources = import.meta.glob([
+	'../../routes/library/+page.svelte', '../../routes/+layout.svelte',
+	'../player/PlayerAudio.svelte', '../player/context.ts',
+	'../player/session.ts', '../player/transport.ts'
+], {
 	query: '?raw',
 	import: 'default',
 	eager: true
@@ -158,45 +168,62 @@ describe('library repeat hooks are declared in the library markup', () => {
 		).toContain('data-testid="repeat-status"');
 	});
 
-	it('LIBREP-U03 wires the native ended event on the library audio', () => {
-		expect(
-			routeSource(),
-			note(
-				'LIBREP-U03',
-				'the library markup handles the audio ended event via onended',
-				'no ended handler',
-				'ended_handler_missing',
-				'Builder adds onended to the library <audio> and routes it through naturalEndPolicy (no parallel end-policy).'
-			)
-		).toContain('onended');
+	it('LIBREP-U03 wires the mounted audio through the shared session to a guarded ended listener', () => {
+		const layout = sources['../../routes/+layout.svelte'];
+		expect(layout).toContain("import { createPlayerSession } from '#lib/player/session.js'");
+		expect(layout.match(/createPlayerSession\(\{ flush: tick \}\)/g)).toHaveLength(1);
+		expect(layout).toContain('const player = createPlayerSession({ flush: tick })');
+		expect(layout).toContain('providePlayerSession(player)');
+		expect(layout).toContain("import PlayerAudio from '#lib/player/PlayerAudio.svelte'");
+		// Authorized same-PR owner-wiring pin: presentation props keep this decoder mount.
+		expect(layout).toContain('<PlayerAudio {queueToggle} expanded={nowPlayingRoute} viewHeader={nowPlayingHeader} onNowPlayingOpen={noteNowPlayingOpen} />');
+		const context = sources['../player/context.ts'];
+		expect(context).toContain('setContext(PLAYER_SESSION, session)');
+		expect(context).toContain('getContext<PlayerSession>(PLAYER_SESSION)');
+		const audio = sources['../player/PlayerAudio.svelte'];
+		expect(audio).toContain('const player = usePlayerSession()');
+		expect(audio).toMatch(/<audio[^>]*bind:this=\{audio\}[^>]*data-testid="audio-player"/);
+		expect(audio).toContain('return player.attach(audio)');
+		const session = sources['../player/session.ts'];
+		expect(session).toContain("import { createTransport, type Transport, type TransportSnapshot } from './transport.js'");
+		expect(session).toContain('transport = createTransport({');
+		expect(session).toContain('const activeTransport = transport');
+		expect(session).toContain('activeTransport.connect(audio, selected)');
+		expect(session).toContain('if (!current() || transport !== activeTransport) return () => {}');
+		const transport = sources['../player/transport.ts'];
+		expect(transport).toContain("['ended', () => {");
+		expect(transport).toContain('if (!played || completed || !audio.ended || audio.error) return');
+		expect(transport).toContain('const guarded = () => { if (isCurrent()) handler(); }');
+		expect(transport).toContain('audio.addEventListener(name, guarded)');
+		expect(transport).toContain('if (!sleeping) deps.onended(current.id)');
 	});
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {
-		expect(
-			routeSource(),
-			note(
-				'LIBREP-U04',
-				'the library route reuses naturalEndPolicy',
-				'no reference',
-				'end_policy_reuse_missing',
-				'Builder imports naturalEndPolicy from #lib/player/queue.js and drives every library ended event through it.'
-			)
-		).toContain('naturalEndPolicy');
+		const session = sources['../player/session.ts'];
+		expect(session).toMatch(/import \{[^}]*naturalEndPolicy[^}]*\} from '\.\/queue\.js'/);
+		expect(session).toContain('onended: (id) => void advanceAfterEnd(id)');
+		expect(session).toContain('if (!started || currentTrack(state.queue)?.id !== id) return');
+		expect(session).toMatch(/const result = naturalEndPolicy\(state\.queue, \{\s*repeat: state\.repeat,/);
+		expect(session).toContain("if (result.action !== 'play') return");
+		expect(session).toContain('setQueue(result.queue)');
+		expect(session).toContain('if (!transport?.seekToStart()) return');
+		expect(session).toContain('await transport.play()');
 	});
 
 	it('LIBREP-U05 never uses a native loop attribute (control: passes now, must stay green)', () => {
-		const source = routeSource();
-		for (const forbidden of ['loop=', 'loop={true}', '.loop = true']) {
-			expect(
-				source,
-				note(
-					'LIBREP-U05',
-					`no "${forbidden}" in the library route`,
-					'native loop present',
-					'native_loop_forbidden',
-					'Remove the native loop; One/Queue replay comes from naturalEndPolicy-driven play-from-zero, never the loop attribute.'
-				)
-			).not.toContain(forbidden);
+		for (const [owner, source] of Object.entries(sources)) {
+			for (const forbidden of ['loop=', 'loop={true}', '.loop = true']) {
+				expect(
+					source,
+					note(
+						'LIBREP-U05',
+						`no "${forbidden}" in ${owner}`,
+						'native loop present',
+						'native_loop_forbidden',
+						'Remove the native loop; One/Queue replay comes from naturalEndPolicy-driven play-from-zero, never the loop attribute.'
+					)
+				).not.toContain(forbidden);
+			}
 		}
 	});
 });

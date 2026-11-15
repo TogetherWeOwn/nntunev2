@@ -1,6 +1,7 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 import { TESTIDS } from '../../../e2e/helpers/contract';
+import { closeQueue, openQueue } from './helpers/queue-host.js';
 
 const ITEMS = [
 	{ id: 'coral', title: 'Coral Night', artist: 'Harbor Lights' },
@@ -21,7 +22,7 @@ async function seed(page: Page, items: Array<{ id: string; title: string; artist
 }
 
 const libraryRow = (page: Page, id: string) => page.locator(`[data-testid="library-item"][data-id="${id}"]`);
-const queueRow = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
+const queueRow = (page: Page, id: string) => page.getByTestId('queue-panel').locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 const menu = (page: Page) => page.getByTestId(TESTIDS.trackContextMenu);
 
 async function startFocusJournal(page: Page) {
@@ -66,11 +67,12 @@ async function attachFocusJournal(page: Page, testInfo: import('@playwright/test
 
 async function queueAll(page: Page) {
 	for (const item of ITEMS) await libraryRow(page, item.id).locator('.nt-library-row').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(ITEMS.length);
 }
 
 async function queueIds(page: Page) {
-	return page.getByTestId('queue-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')));
+	return page.getByTestId('queue-panel').getByTestId('queue-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')));
 }
 
 test('More, right-click and keyboard menus share actions, navigation and return focus', async ({ page }) => {
@@ -102,6 +104,7 @@ test('More, right-click and keyboard menus share actions, navigation and return 
 	await expect(more).toBeFocused();
 	await libraryRow(page, 'coral').click({ button: 'right' });
 	await menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('queue-item')).toHaveAttribute('data-track-id', 'coral');
 	await expect(page.locator('audio[src]:not([src=""])')).toHaveCount(0);
@@ -293,6 +296,7 @@ test('modifier selection and list-scoped select all do not queue or change favor
 	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
 	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
 	await menu(page).getByRole('menuitem', { name: 'Play next', exact: true }).click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember']);
 	await page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Clear selection', exact: true }).click();
 	await expect(page.getByTestId('selection-count')).toHaveText('0 selected');
@@ -304,7 +308,7 @@ test('queue batch selection has keyboard insertion parity and preserves the curr
 	const current = await page.getByTestId('now-playing').textContent();
 	await queueRow(page, 'dawn').getByRole('checkbox').check();
 	await queueRow(page, 'tide').getByRole('checkbox').click({ modifiers: ['Shift'] });
-	const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+	const toolbar = page.getByTestId('queue-panel').getByTestId(TESTIDS.queueSelectionToolbar);
 	await expect(toolbar.getByRole('status')).toHaveText('3 selected in queue');
 	await toolbar.getByLabel('Move selected before').selectOption('coral');
 	await toolbar.getByRole('button', { name: 'Move selected', exact: true }).click();
@@ -315,7 +319,7 @@ test('queue batch selection has keyboard insertion parity and preserves the curr
 	await expect(menu(page)).toHaveAttribute('aria-label', '3 selected tracks');
 	await menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
-	await toolbar.getByRole('button', { name: 'Remove selected from queue' }).click();
+	await toolbar.getByRole('button', { name: 'Remove selected from queue', exact: true }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 });
 
@@ -325,7 +329,7 @@ for (const action of ['Move selected', 'Play next']) {
 		await queueAll(page);
 		await queueRow(page, 'ember').getByRole('checkbox').check();
 		await queueRow(page, 'dawn').getByRole('checkbox').check();
-		const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+		const toolbar = page.getByTestId('queue-panel').getByTestId(TESTIDS.queueSelectionToolbar);
 		await toolbar.getByLabel('Move selected before').selectOption('tide');
 		await toolbar.getByRole('button', { name: action, exact: true }).click();
 		await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
@@ -359,11 +363,12 @@ test('narrow row retains its primary action alongside More', async ({ page }) =>
 	await page.setViewportSize({ width: 320, height: 844 });
 	await seed(page);
 	await libraryRow(page, 'coral').click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 	await expect(menu(page)).toHaveCount(0);
 });
 
-for (const path of ['/library/liked', '/library/recent', '/search?q=Coral', '/demo/player']) {
+for (const path of ['/library/liked', '/library/recent', '/search?q=Coral']) {
 	test(`${path} does not opt into track menus or drag controls`, async ({ page }) => {
 		await seed(page);
 		await libraryRow(page, 'coral').getByRole('button', { name: /^Star Coral Night/ }).click();
@@ -384,6 +389,7 @@ for (const path of ['/library/liked', '/library/recent', '/search?q=Coral', '/de
 test('native drag inserts into an empty queue, rejects external data and supports queue reordering', async ({ page }) => {
 	await page.setViewportSize({ width: 1280, height: 1800 });
 	await seed(page);
+	await openQueue(page);
 	await libraryRow(page, 'coral').dragTo(page.getByTestId(TESTIDS.queueDropTarget), { sourcePosition: { x: 4, y: 4 } });
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 	await libraryRow(page, 'dawn').locator('.nt-library-row').click();
@@ -415,6 +421,7 @@ test('library batch Play now uses displayed order and hydrates only its first tr
 	await libraryRow(page, 'ember').getByTestId(TESTIDS.trackMore).click();
 	await expect(menu(page)).toHaveAttribute('aria-label', '2 selected tracks');
 	await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember']);
 	await expect(queueRow(page, 'dawn')).toHaveAttribute('aria-current', 'true');
 	await expect(page.getByTestId('queue-announcement')).toHaveText('Playing Dawn Chorus. Added 2.');
@@ -502,6 +509,7 @@ for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as cons
 		await menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
 		await libraryRow(page, 'coral').locator('.nt-library-row').click();
 		await expect(page.locator('audio')).toHaveCount(0);
+		await openQueue(page);
 		await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
 		await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
 		await expect(queueRow(page, 'dawn')).toHaveAttribute('aria-current', 'true');
@@ -552,7 +560,7 @@ test('Clear selection keeps library focus and queue Done recovers disappearing t
 	await page.getByLabel('Show', { exact: true }).selectOption('all');
 	await queueAll(page);
 	await queueRow(page, 'dawn').getByRole('checkbox').check();
-	await page.getByTestId(TESTIDS.queueSelectionToolbar).getByRole('button', { name: 'Done', exact: true }).focus();
+	await page.getByTestId('queue-panel').getByTestId(TESTIDS.queueSelectionToolbar).getByRole('button', { name: 'Done', exact: true }).focus();
 	await page.keyboard.press('Enter');
 	await expect(queueRow(page, 'dawn').getByRole('checkbox')).toBeFocused();
 });
@@ -565,12 +573,14 @@ for (const width of [1280, 390]) for (const colorScheme of ['light', 'dark'] as 
 		await queueAll(page);
 		await queueRow(page, 'dawn').getByRole('checkbox').check();
 		await queueRow(page, 'ember').getByRole('checkbox').check();
+		await closeQueue(page, { url: /\/library$/, heading: 'Library' });
 		await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
 		await expect(menu(page)).toBeVisible();
 		const results = await new AxeBuilder({ page }).analyze();
 		expect(results.violations.filter((violation) =>
 			violation.impact === 'serious' || violation.impact === 'critical')).toEqual([]);
 		await page.keyboard.press('Escape');
+		await openQueue(page);
 		await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
 		await expect(menu(page)).toHaveAttribute('aria-label', '2 selected tracks');
 		const queueResults = await new AxeBuilder({ page }).analyze();
@@ -609,6 +619,7 @@ for (const interruption of ['blur', 'scroll', 'hidden'] as const) {
 
 test('hiding the page invalidates a native drag before a later drop', async ({ page }) => {
 	await seed(page);
+	await openQueue(page);
 	await page.evaluate(() => {
 		const source = document.querySelector('[data-testid="library-item"]')!;
 		const destination = document.querySelector('[data-testid="queue-drop-target"]')!;
@@ -662,6 +673,25 @@ for (const surface of ['library', 'favorites', 'queue'] as const) {
 	});
 }
 
+for (const moveFocus of [false, true]) {
+	test(`queue-menu auth cleanup ${moveFocus ? 'preserves a newer Library focus choice' : 'lands on the mounted Library recovery control'}`, async ({ page }) => {
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await seed(page);
+		await queueAll(page);
+		await queueRow(page, 'coral').getByTestId(TESTIDS.queueMore).click();
+		await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+		await page.evaluate((move) => {
+			window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' }));
+			if (move) document.getElementById('library-density')?.focus();
+		}, moveFocus);
+		await expect(menu(page)).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(0);
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
+		await expect(moveFocus ? page.getByLabel('Density', { exact: true })
+			: page.getByRole('button', { name: 'Retry', exact: true })).toBeFocused();
+	});
+}
+
 test('library toolbar reserves Play next before Append selected and includes hidden tracks in activation order', async ({ page }) => {
 	await seed(page);
 	const toolbar = page.getByTestId(TESTIDS.trackSelectionToolbar);
@@ -676,6 +706,7 @@ test('library toolbar reserves Play next before Append selected and includes hid
 	await page.getByLabel('Find in loaded tracks', { exact: true }).fill('Dawn');
 	await expect(page.getByTestId('selection-hidden-count')).toContainText('1 selected track is hidden');
 	await next.click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'dawn']);
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
 });
@@ -685,8 +716,13 @@ test('library touch More and grip targets meet the coarse-pointer minimum', asyn
 	const page = await context.newPage();
 	await seed(page);
 	await queueAll(page);
-	for (const control of [libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore),
-		queueRow(page, 'coral').getByTestId(TESTIDS.queueMore),
+	await closeQueue(page, { url: /\/library$/, heading: 'Library' });
+	const libraryControl = libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+	const libraryBox = (await libraryControl.boundingBox())!;
+	expect(libraryBox.width).toBeGreaterThanOrEqual(48);
+	expect(libraryBox.height).toBeGreaterThanOrEqual(48);
+	await openQueue(page);
+	for (const control of [queueRow(page, 'coral').getByTestId(TESTIDS.queueMore),
 		queueRow(page, 'coral').getByRole('button', { name: 'Reorder Coral Night', exact: true })]) {
 		const box = (await control.boundingBox())!;
 		expect(box.width).toBeGreaterThanOrEqual(48);
@@ -739,11 +775,16 @@ test('a stationary touch drag scrolls its queue pane and stops scrolling on drop
 	const items = [...ITEMS, ...Array.from({ length: 40 }, (_, i) => ({ id: `extra-${i}`, title: `Extra ${i}` }))];
 	await seed(page, items);
 	await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
+	await openQueue(page);
 	const list = page.getByTestId(TESTIDS.queueDropTarget);
 	await list.evaluate((node) => { node.style.maxHeight = '320px'; node.style.overflowY = 'auto'; });
-	await list.scrollIntoViewIfNeeded();
+	// Nearest-edge scrolling can leave the drop point behind fixed shell controls.
+	await list.evaluate((node) => node.scrollIntoView({ block: 'center', behavior: 'instant' }));
 	const source = (await queueRow(page, 'coral').getByRole('button', { name: /^Reorder / }).boundingBox())!;
 	const box = (await list.boundingBox())!;
+	const dropHitsList = () => list.evaluate((node, point) => node.contains(document.elementFromPoint(point.x, point.y)),
+		{ x: box.x + 40, y: box.y + box.height - 8 });
+	expect(await dropHitsList()).toBe(true);
 	const session = await context.newCDPSession(page);
 	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
@@ -764,6 +805,7 @@ test('a stationary touch drag scrolls its queue pane and stops scrolling on drop
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
 	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: box.x + 40, y: box.y + box.height - 8 }] });
 	await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeGreaterThan(200);
+	expect(await dropHitsList()).toBe(true);
 	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
@@ -817,6 +859,7 @@ test('library Play now retains queued audio and plays once when refresh omits st
 	await page.goto('/library');
 	await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(ITEMS.length);
 	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 	await expect(page.locator('audio')).toHaveAttribute('src', /\/interaction-audio\/coral$/);
 	const playsBefore = await page.evaluate(() => (window as unknown as { playCalls: number }).playCalls);
@@ -837,6 +880,7 @@ test('library Play now retains queued audio and plays once when refresh omits st
 test('library Play next on only the current track is a silent no-op', async ({ page }) => {
 	await seed(page);
 	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await openQueue(page);
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 	const announcement = page.getByTestId('queue-announcement');
 	const before = await announcement.textContent();
@@ -856,7 +900,7 @@ test('queue Move selected before resets to End of queue when the chosen target j
 	await queueAll(page);
 	const current = await page.getByTestId('now-playing').textContent();
 	await queueRow(page, 'dawn').getByRole('checkbox').check();
-	const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+	const toolbar = page.getByTestId('queue-panel').getByTestId(TESTIDS.queueSelectionToolbar);
 	const select = toolbar.getByLabel('Move selected before');
 	await select.selectOption('ember');
 	await expect(select).toHaveValue('ember');

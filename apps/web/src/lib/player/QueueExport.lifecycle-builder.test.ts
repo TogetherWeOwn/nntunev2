@@ -1,49 +1,27 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import ts from 'typescript';
-import { createQueue, formatQueueM3U, formatQueueText } from './queue.js';
-
-const sources = import.meta.glob('./QueueExport.svelte', {
-	query: '?raw', import: 'default', eager: true
-}) as Record<string, string>;
+import { get } from 'svelte/store';
+import { createQueue } from './queue.js';
+import { createPlayerSession } from './session.js';
 const QUEUE = createQueue([{ id: 'one', title: 'Title', artist: 'Artist', streamUrl: '' }]);
 
-/** Run the real component handlers/effects, replacing only Svelte cells and
- * browser I/O. Protected browser acceptance covers actual effect scheduling,
- * rendered controls, clipboard contents and downloaded bytes. These cases
- * catch leaked Blob URLs and stale settlements across auth/action/teardown.
+/** Exercise the real layout owner, replacing only browser I/O. Protected
+ * browser acceptance covers rendered controls, clipboard contents and bytes.
+ * Queue edits and auth resets now invalidate synchronously, not in view effects.
  */
 function component() {
-	const source = sources['./QueueExport.svelte'];
-	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script>'));
-	const parsed = ts.createSourceFile('export.ts', script, ts.ScriptTarget.Latest, true);
-	const body = parsed.statements.filter((node) => !ts.isImportDeclaration(node))
-		.map((node) => node.getText(parsed)).join('\n');
-	const compiled = ts.transpileModule(body, {
-		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
-	}).outputText;
-	const effects: (() => void)[] = [];
-	let destroy = () => {};
-	const bindings = {
-		formatQueueM3U, formatQueueText,
-		$props: () => ({ queue: QUEUE, authGeneration: 0, loading: false }),
-		$state: <T>(value: T) => value,
-		$effect: (effect: () => void) => effects.push(effect),
-		onDestroy: (callback: () => void) => { destroy = callback; }
+	const player = createPlayerSession({ flush: () => Promise.resolve() });
+	player.start(null);
+	player.setQueue(QUEUE);
+	return {
+		copyQueueText: player.queueExport.copy,
+		downloadQueueM3U: player.queueExport.download,
+		read: () => get(player.queueExport),
+		changeAccount: () => {
+			player.resetAtAuthBoundary();
+			player.setQueue(QUEUE);
+		},
+		destroy: player.destroy
 	};
-	const instance = new Function(...Object.keys(bindings), `${compiled}
-		return {
-			copyQueueText, downloadQueueM3U,
-			read: () => ({ status, fallback }),
-			changeAccount: () => { authGeneration += 1; }
-		};
-	`)(...Object.values(bindings)) as {
-		copyQueueText: () => Promise<void>;
-		downloadQueueM3U: () => void;
-		read: () => { status: string; fallback: string | null };
-		changeAccount: () => void;
-	};
-	effects.forEach((effect) => effect());
-	return { ...instance, flush: () => effects.forEach((effect) => effect()), destroy: () => destroy() };
 }
 
 function browser() {
@@ -105,7 +83,6 @@ test('auth reset releases the retained URL and clears export feedback even with 
 	exportUI.downloadQueueM3U();
 	expect(exportUI.read().status).toMatch(/download started/i);
 	exportUI.changeAccount();
-	exportUI.flush();
 	expect(io.active.size).toBe(0);
 	expect(io.released).toEqual(['blob:queue-1']);
 	expect(exportUI.read()).toEqual({ status: '', fallback: null });

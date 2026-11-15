@@ -6,6 +6,7 @@ import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
+import { createPlayerFacade, MIRROR_QUEUE } from './player-harness.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
@@ -24,13 +25,14 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue',
+		'missingDisplayedTracks', 'queuedTrackFor', 'playableTrackFor', 'appendMissingTracks', 'replaceQueue', 'retireQueueWork',
+		'libraryInputCurrent', 'sourceProjections',
 		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'playEpoch']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'playEpoch']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -51,15 +53,17 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
 		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint, setMiniPlayerHint, createPlayerFacade,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
-	return new Function(...Object.keys(bindings), `${compiled}
+	return new Function(...Object.keys(bindings), `const player = createPlayerFacade({ queue, queueFeedback: queueAnnouncement }); ${MIRROR_QUEUE}
+		let shareAlive = true, loading = false, libraryInputOwner = player.sourceInputOwner();
+${compiled}
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,
 			add: addDisplayedTracksToQueue,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.get().queueFeedback })
 		};
 	`)(...Object.values(bindings)) as {
 		disabled: boolean; allQueued: boolean; add: () => void;

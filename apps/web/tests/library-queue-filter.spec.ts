@@ -4,6 +4,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type QueueState, type Track } from '../src/lib/player/queue.js';
 import { choose } from './appearance.helpers.js';
 import type {} from './fixtures/queue-filter/mount.js';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * QFILTER — queue-only presentation acceptance; protected test-only handoff.
@@ -29,6 +30,12 @@ import type {} from './fixtures/queue-filter/mount.js';
  * Expected RED before implementation: missing "Filter queue" / count assertions,
  * not timeout clicks, setup/import errors, or a dummy feature implementation.
  * Builder owns combined GREEN ready PR and all same-head gates. No RED-only PR.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
@@ -148,6 +155,7 @@ async function seed(page: Page, baseURL: string, payload = { current: ITEMS as u
 	for (const item of ITEMS) {
 		await page.locator(`[data-testid="library-item"][data-id="${item.id}"] button.nt-library-row`).dispatchEvent('click');
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(7);
 	await page.getByTestId('player-next').click();
 	await page.getByTestId('player-next').click();

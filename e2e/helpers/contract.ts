@@ -53,15 +53,7 @@ export const TESTIDS = {
   shellRail: 'shell-rail',
   shellTabbar: 'shell-tabbar',
   miniPlayer: 'mini-player',
-} as const;
-
-// UI hooks the player-bar build (design spec v1) must render; declared now
-// so the dual-generation drivers can target them the moment they exist.
-// Deliberately NOT in TESTIDS yet: the web contract test
-// (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to be
-// declared in route markup, and these land with their build — move each key
-// into TESTIDS (and map its route there) in the PR that renders it.
-export const PENDING_TESTIDS = {
+  // Custom transport hooks are now rendered by the persistent app player.
   playerBar: 'player-bar',
   playerPlayPause: 'player-play-pause',
   playerSeek: 'player-seek',

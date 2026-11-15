@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: the library error state offers typed sign-in recovery.
@@ -23,6 +24,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - Privacy behavior is unchanged throughout: a prior account's tracks
  *   and queue never reappear during the failure, on the way to `/login`,
  *   or after the next account's library loads.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
@@ -146,6 +153,7 @@ test('success then 401 offers sign-in, and the prior queue never reaches the nex
 	await page.goto('/library');
 	await expect(page.getByTestId('library-list')).toContainText('Private Song One');
 	await libraryRow(page, 'track-mine-1').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Private Song One');
 
@@ -177,6 +185,7 @@ test('cross-tab auth transition offers sign-in and private tracks stay gone on t
 	await page.goto('/library');
 	await expect(page.getByTestId('library-list')).toContainText('Private Song One');
 	await libraryRow(page, 'track-mine-2').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 
 	await fireAuthTransition(page);

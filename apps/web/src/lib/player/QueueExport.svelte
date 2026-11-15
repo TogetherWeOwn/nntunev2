@@ -1,92 +1,8 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
-	import { formatQueueM3U, formatQueueText, type QueueState } from './queue.js';
+	import { usePlayerSession } from './context.js';
 
-	let { queue, authGeneration, loading = false }: {
-		queue: QueueState;
-		authGeneration: number;
-		loading?: boolean;
-	} = $props();
-
-	let status = $state('');
-	let fallback = $state<string | null>(null);
-	let generation = 0;
-	let alive = true;
-	let downloadUrl: string | null = null;
-
-	function releaseDownload(): void {
-		if (downloadUrl !== null) URL.revokeObjectURL(downloadUrl);
-		downloadUrl = null;
-	}
-
-	function clearFeedback(): number {
-		generation += 1;
-		status = '';
-		fallback = null;
-		return generation;
-	}
-
-	// Queue replacements, including selection, invalidate feedback. Snapshot
-	// identity also fences same-tick edits before this effect has flushed.
-	$effect(() => {
-		queue;
-		clearFeedback();
-	});
-
-	$effect(() => {
-		authGeneration;
-		clearFeedback();
-		releaseDownload();
-	});
-
-	onDestroy(() => {
-		alive = false;
-		clearFeedback();
-		releaseDownload();
-	});
-
-	async function copyQueueText(): Promise<void> {
-		const action = clearFeedback();
-		const snapshot = queue;
-		const account = authGeneration;
-		if (!alive || snapshot.tracks.length === 0) return;
-		const text = formatQueueText(snapshot);
-		try {
-			// The clipboard getter and the write may both fail; keep manual copy usable.
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
-		} catch {
-			if (!alive || queue !== snapshot || account !== authGeneration || action !== generation) return;
-			status = 'Clipboard unavailable. Copy the queue manually below.';
-			fallback = text;
-			return;
-		}
-		if (!alive || queue !== snapshot || account !== authGeneration || action !== generation) return;
-		status = 'Copied queue as text.';
-	}
-
-	function downloadQueueM3U(): void {
-		clearFeedback();
-		if (!alive || queue.tracks.length === 0) return;
-		const link = document.createElement('a');
-		try {
-			// Keep at most one URL until the next download, auth reset or teardown.
-			releaseDownload();
-			const blob = new Blob([formatQueueM3U(queue)], { type: 'audio/x-mpegurl;charset=utf-8' });
-			downloadUrl = URL.createObjectURL(blob);
-			link.href = downloadUrl;
-			link.download = 'queue.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			status = 'Download started. Check your browser’s downloads for queue.m3u.';
-		} catch {
-			releaseDownload();
-			status = 'Could not start the download. Try again or copy the queue as text.';
-		} finally {
-			link.remove();
-		}
-	}
+	const player = usePlayerSession();
+	const exporter = player.queueExport;
 </script>
 
 <div class="queue-export">
@@ -94,34 +10,34 @@
 		<button
 			class="nt-button"
 			type="button"
-			disabled={queue.tracks.length === 0}
+			disabled={$player.queue.tracks.length === 0}
 			aria-describedby="queue-export-scope queue-export-status"
-			onclick={downloadQueueM3U}
+			onclick={exporter.download}
 		>
 			Download queue (.m3u)
 		</button>
 		<button
 			class="nt-button"
 			type="button"
-			disabled={queue.tracks.length === 0}
+			disabled={$player.queue.tracks.length === 0}
 			aria-describedby="queue-export-scope queue-export-status"
-			onclick={() => void copyQueueText()}
+			onclick={() => void exporter.copy()}
 		>
 			Copy queue as text
 		</button>
 	</div>
 	<p id="queue-export-scope">Whole queue, in arranged order. Track IDs only in M3U — no audio or stream links. This queue is not kept across reloads.</p>
-	<p id="queue-export-status" data-testid="queue-export-status" aria-live={loading ? 'off' : 'polite'}>
-		{queue.tracks.length === 0 ? 'Nothing to export: the queue is empty. Add a track first.' : status}
+	<p id="queue-export-status" data-testid="queue-export-status" aria-live={$player.queueLiveRegions ? 'polite' : 'off'}>
+		{$player.queue.tracks.length === 0 ? 'Nothing to export: the queue is empty. Add a track first.' : $exporter.status}
 	</p>
-	{#if fallback !== null}
+	{#if $exporter.fallback !== null}
 		<label for="queue-export-fallback-field">Queue as text</label>
 		<textarea
 			id="queue-export-fallback-field"
 			data-testid="queue-export-fallback"
 			readonly
 			rows="4"
-			value={fallback}
+			value={$exporter.fallback}
 			aria-describedby="queue-export-instructions"
 		></textarea>
 		<p id="queue-export-instructions" data-testid="queue-export-instructions">

@@ -17,6 +17,7 @@ export const DESIGN_STRINGS_EN: Record<DesignStringKey, string> = {
 	'design.icon.pause': 'Pause',
 	'design.icon.skip-back': 'Previous track',
 	'design.icon.skip-forward': 'Next track',
+	'design.icon.restart': 'Restart current track',
 	'design.icon.shuffle': 'Shuffle',
 	'design.icon.repeat': 'Repeat',
 	'design.icon.repeat-1': 'Repeat one',

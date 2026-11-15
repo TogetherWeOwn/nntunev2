@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Test-Author owned RED acceptance for LIBSHARE: copy a library track link
@@ -77,6 +78,12 @@ import { expect, test, type Page } from '@playwright/test';
  * failure counts as RED: this file imports only `@playwright/test`.
  * Every RED assertion message is a compact JSON receipt:
  * {"case","expected","actual","status","error_code","next_action"}.
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 const ITEMS = [
@@ -404,6 +411,7 @@ test('[LIBSHARE-03] non-current rows copy t=0 and change nothing', async ({ page
 	expectShareUrl(written ?? '', { track: 'share-pine', t: 0 }, page.url());
 
 	// Copying a row selects nothing: the queue still holds only coral, current.
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	expect(await currentQueueId(page)).toBe('share-coral');
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
@@ -498,6 +506,7 @@ test('[LIBSHARE-06] unusable media disables or refuses the current row without c
 
 test('[LIBSHARE-07] empty queue: row copy works at t=0', async ({ page }) => {
 	await openLibrary(page);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	const copy = await expectRowCopyButton(page, 'LIBSHARE-07', 'share-coral', 'Coral Night');
 
@@ -645,6 +654,7 @@ test('[LIBSHARE-11] rejected clipboard write falls back without claiming success
 	await expect(page.getByTestId('library-share-instructions')).not.toContainText(/copied|success/i);
 	await expect(page.getByTestId('library-share-status')).not.toContainText(/copied|success/i);
 	expect(await execCommandCallCount(page), 'rejection must not use execCommand').toBe(0);
+	await openQueue(page);
 	expect(await queueOrder(page), 'rejection must not change the queue').toEqual(['share-coral']);
 });
 
@@ -752,6 +762,7 @@ test('[LIBSHARE-15] copy never plays, pauses, seeks, changes queue/order/selecti
 	const copy = await expectRowCopyButton(page, 'LIBSHARE-15', 'share-coral', 'Coral Night');
 
 	await setAudioTime(page, 50);
+	await openQueue(page);
 	const before = {
 		queue: await queueOrder(page),
 		current: await currentQueueId(page),
@@ -784,6 +795,7 @@ test('[LIBSHARE-16] opening a valid link selects the track and seeks without aut
 }) => {
 	await openLibrary(page, { url: '/library?track=share-pine&t=77' });
 
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	expect(await currentQueueId(page)).toBe('share-pine');
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
@@ -858,6 +870,7 @@ test('[LIBSHARE-19] invalid links show the invalid notice and change nothing', a
 		expect(role, `invalid notice must use role=alert (actual role=${role})`).toBe('alert');
 
 		// Never partial: nothing selected, no queue, no audio, no playback.
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		expect(await audioCount(page), 'invalid link must not summon audio').toBe(0);
 		expect(await mediaCallCounts(page), 'invalid link must not autoplay').toEqual({
@@ -885,6 +898,7 @@ test('[LIBSHARE-20] links resolve only against loaded items; empty library stays
 				'Builder resolves ?track= only against currently loaded item ids (never the demo catalogue, never trimmed).'
 			)
 		).toBeVisible();
+		await openQueue(page);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		expect(await audioCount(page)).toBe(0);
 	}
@@ -897,6 +911,7 @@ test('[LIBSHARE-20] links resolve only against loaded items; empty library stays
 		'empty library must still show the invalid notice (page-level placement)'
 	).toBeVisible();
 	await expect(page.getByRole('status')).toContainText(/library is empty/i);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	expect(await audioCount(page)).toBe(0);
 });
@@ -904,6 +919,7 @@ test('[LIBSHARE-20] links resolve only against loaded items; empty library stays
 test('[LIBSHARE-21] items without stream URLs keep select-only behavior', async ({ page }) => {
 	await openLibrary(page, { items: PLAIN_ITEMS });
 	await selectRow(page, 'plain-coral', 'Plain Coral');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	expect(
 		await audioCount(page),
@@ -920,6 +936,7 @@ test('[LIBSHARE-21] items without stream URLs keep select-only behavior', async 
 	// Opening a link selects without audio, without the invalid notice, without crashing.
 	await page.goto('/library?track=plain-pine&t=45');
 	await expect(page.getByTestId('library-item')).toHaveCount(PLAIN_ITEMS.length);
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	expect(await currentQueueId(page)).toBe('plain-pine');
 	await expect(page.getByTestId('now-playing')).toContainText('Plain Pine');
@@ -956,6 +973,7 @@ test('[LIBSHARE-22] successive copies read live state at activation (no stale sn
 	// explicitly before sampling pine's position.
 	await page.getByTestId('player-next').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
+	await openQueue(page);
 	expect(await currentQueueId(page)).toBe('share-pine');
 	await setAudioTime(page, 5.9);
 	const pineCopy = await expectRowCopyButton(page, 'LIBSHARE-22', 'share-pine', 'Pine Morning');

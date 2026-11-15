@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { openQueue } from './helpers/queue-host';
 
 /**
  * Acceptance: review only selected tracks before appending them.
@@ -77,6 +78,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * Focused command (repo root, deterministic, offline):
  *   CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test \
  *     tests/library-selected-view.spec.ts --workers=1 --retries=0
+ *
+ * Narrow exception: the Engineering Lead authorized a one-time migration, in
+ * the same pull request, of this file's physical queue host, opening, locator
+ * and lifecycle setup to the persistent shell's Queue panel. Every assertion
+ * and behavior vector remains protected, and an independent equivalence
+ * review is required.
  */
 
 // Loaded (API) order is neither title order nor any activation order used
@@ -296,6 +303,7 @@ test('[SV-B-00] control: fixtures, existing Show choices and individual selectio
 
 	await selectTracks(page, ['sv-mike']);
 	await expect(selectionCount(page)).toContainText('1 selected');
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await checkbox(page, 'sv-mike').uncheck();
 	await expect(selectionCount(page)).toContainText('0 selected');
@@ -330,6 +338,7 @@ test('[SV-B-01] Selected only shows a noncontiguous selection in loaded order; v
 	for (const id of ['sv-zulu', 'sv-mike', 'sv-delta']) {
 		await expect(checkbox(page, id)).toBeChecked();
 	}
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 
 	// Round-trip through the other views: the selection set is untouched.
@@ -463,6 +472,7 @@ test('[SV-B-05] Append selected keeps activation order, never the Selected-only 
 	// Title display: delta, mike, zulu. All three orders differ pairwise.
 	await selectTracks(page, ['sv-delta', 'sv-zulu', 'sv-mike']);
 	await chooseShow(page, 'Selected only');
+	await openQueue(page);
 	await orderControl(page).selectOption('title');
 	await expectDisplayed(page, ['sv-delta', 'sv-mike', 'sv-zulu']);
 
@@ -482,6 +492,7 @@ test('[SV-B-06] Add displayed tracks consumes exactly the Selected-only projecti
 	await openLibrary(page);
 	await selectTracks(page, ['sv-delta', 'sv-zulu', 'sv-mike']);
 	await chooseShow(page, 'Selected only');
+	await openQueue(page);
 	await orderControl(page).selectOption('title-desc');
 	await expectDisplayed(page, ['sv-zulu', 'sv-mike', 'sv-delta']);
 
@@ -565,6 +576,7 @@ test('[SV-B-08] view, query and selection changes touch no queue, media, favorit
 	// one favorite, and a pending selection.
 	await row(page, 'sv-zulu').click();
 	await row(page, 'sv-bravo').click();
+	await openQueue(page);
 	await page.getByTestId('player-next').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Bravo Song');
 	await row(page, 'sv-delta').getByRole('button', { name: 'Star Delta Song', exact: true }).click();
@@ -632,6 +644,7 @@ test('[SV-B-09] a transient refresh keeps the Selected-only view; a successful o
 
 	// Survivors keep their activation order for appending (mike before alpha).
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect.poll(() => queueOrder(page)).toEqual(['sv-mike', 'sv-alpha']);
 });
 
@@ -641,6 +654,7 @@ test('[SV-B-10] account teardown purges the selection and resets the view for th
 	const payload: { current: unknown } = { current: ITEMS };
 	await openLibrary(page, payload);
 	await row(page, 'sv-zulu').click();
+	await openQueue(page);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await selectTracks(page, ['sv-mike', 'sv-delta']);
 	await chooseShow(page, 'Selected only');
@@ -698,5 +712,6 @@ test('[SV-B-11] at 320px in light and dark, Selected only stays visible and oper
 	// And the narrow layout still appends the reviewed set in activation order.
 	await chooseShow(page, 'Selected only');
 	await appendButton(page).click();
+	await openQueue(page);
 	await expect.poll(() => queueOrder(page)).toEqual(['sv-alpha', 'sv-mike']);
 });

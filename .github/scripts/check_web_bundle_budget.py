@@ -32,6 +32,7 @@ as Wasm enforcement.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -92,6 +93,17 @@ def check(client_dir: Path, budget: int) -> tuple[int, list[tuple[Path, int]]]:
     return total, sized
 
 
+def annotate(level: str, message: str) -> None:
+    """Expose the existing result through Actions without changing enforcement."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(
+            f"::{level} title=Client-JS bundle budget::{escaped}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -111,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         total, sized = check(args.client_dir, args.budget)
     except BudgetError as exc:
         print(f"bundle budget: FAIL: {exc}", flush=True)
+        annotate("error", str(exc))
         if args.client_dir.is_dir():
             try:
                 over = measure(args.client_dir)
@@ -120,12 +133,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"bundle budget:   {size:>8} B  {path.name}", flush=True)
         return 1
     headroom = args.budget - total
-    print(
-        f"bundle budget: PASS: client JS total {total} B "
-        f"within budget {args.budget} B "
-        f"({len(sized)} files, {headroom} B headroom)",
-        flush=True,
+    message = (
+        f"client JS total {total} B within budget {args.budget} B "
+        f"({len(sized)} files, {headroom} B headroom)"
     )
+    print(f"bundle budget: PASS: {message}", flush=True)
+    annotate("notice", message)
     return 0
 
 
