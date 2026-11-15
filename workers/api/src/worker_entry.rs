@@ -2643,6 +2643,27 @@ impl Store for PgStore {
         .await
     }
 
+    async fn likes_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::likes_list_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.likes_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn like_delete(
         &self,
         user_id: &str,

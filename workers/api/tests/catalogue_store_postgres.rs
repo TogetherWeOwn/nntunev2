@@ -255,6 +255,7 @@ async fn taste_collection_is_bounded_scoped_and_fails_closed() {
         assert!(!rows.iter().any(|r| r.target_id == id));
     }
     assert_eq!(rows[0].snooze_until, Some(101));
+    drop(store);
     for owner in ["absent", "collection-owner' OR true --"] {
         let store = catalogue_store_for_postgres_test(
             client(false).await,
@@ -279,6 +280,61 @@ async fn taste_collection_is_bounded_scoped_and_fails_closed() {
     let store =
         catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
     assert!(store.taste_list("collection-owner", 100).await.is_err());
+}
+
+#[tokio::test]
+async fn likes_collection_is_bounded_scoped_and_fails_closed() {
+    async fn seeded() -> Client {
+        let app = client(false).await;
+        app.batch_execute("BEGIN;
+            INSERT INTO public.users (id,email,created_at) VALUES ('likes-owner','likes-owner@example.invalid',1), ('likes-other','likes-other@example.invalid',1);
+            INSERT INTO public.account_taste SELECT 'likes-owner', 'track', 'Job-' || i, 'love', NULL, i, i FROM generate_series(1, 501) i;
+            INSERT INTO public.account_taste VALUES
+                ('likes-owner','release','Job-501','love',NULL,502,502),
+                ('likes-owner','track','job-501','dislike',NULL,503,503),
+                ('likes-owner','track','hide','hide',NULL,504,504),
+                ('likes-owner','track','ban','ban',NULL,505,505),
+                ('likes-owner','track','past','snooze',99,506,506),
+                ('likes-owner','track','equal','snooze',100,507,507),
+                ('likes-owner','track','future','snooze',101,508,508),
+                ('likes-other','track','private','love',NULL,999,999)").await.unwrap();
+        app
+    }
+    let app = seeded().await;
+    let store =
+        catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let rows = store.likes_list("likes-owner").await.unwrap();
+    assert_eq!(rows.len(), 500);
+    assert!(rows.windows(2).all(|p| p[0].created_at >= p[1].created_at));
+    assert!(rows
+        .iter()
+        .all(|r| r.signal == "love" && r.target_id != "private"));
+    assert!(rows
+        .iter()
+        .any(|r| r.kind == "release" && r.target_id == "Job-501"));
+    assert!(rows
+        .iter()
+        .any(|r| r.kind == "track" && r.target_id == "Job-501"));
+    assert_eq!(rows[0].created_at, 502);
+    assert!(!rows.iter().any(|r| r.target_id == "Job-1"));
+    drop(store);
+    let store = catalogue_store_for_postgres_test(
+        seeded().await,
+        false,
+        Err(StoreError),
+        Rc::new(Cell::new(0)),
+    );
+    assert!(store
+        .likes_list("likes-owner' OR true --")
+        .await
+        .unwrap()
+        .is_empty());
+    drop(store);
+    let app = seeded().await;
+    assert!(app.batch_execute("SELECT 1/0").await.is_err());
+    let store =
+        catalogue_store_for_postgres_test(app, false, Err(StoreError), Rc::new(Cell::new(0)));
+    assert!(store.likes_list("likes-owner").await.is_err());
 }
 
 #[tokio::test]
