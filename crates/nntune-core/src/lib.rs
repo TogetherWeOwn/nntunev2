@@ -52,6 +52,7 @@ pub mod digest_cursor;
 pub mod digest_enrollment;
 pub mod digest_geometry;
 pub mod digest_page;
+pub mod digest_range;
 #[cfg(test)]
 mod digest_test_fixture;
 pub mod digest_verifier;
