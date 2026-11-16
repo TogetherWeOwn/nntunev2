@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -47,7 +48,7 @@ class RustPin(unittest.TestCase):
     def test_toolchain_accepts_only_the_tuple(self):
         pins = wt.load_pins()
         env = {"RUSTUP_TOOLCHAIN": "1.98.1"}
-        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp) / "h"):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(Path(tmp) / "h"))):
             root = self.sysroot(tmp)
             (root / "lib/rustlib" / pins["rust"]["target"] / "lib/a.rlib").write_bytes(b"a")
             std = {"a.rlib": hashlib.sha256(b"a").hexdigest()}
@@ -60,7 +61,7 @@ class RustPin(unittest.TestCase):
     def test_toolchain_probes_use_validated_environment(self):
         pins = wt.load_pins()
         env = {"RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
-        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp) / "h"):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(Path(tmp) / "h"))):
             root = self.sysroot(tmp)
             (root / "lib/rustlib" / pins["rust"]["target"] / "lib/a.rlib").write_bytes(b"a")
             fake = self.fake_run(root)
@@ -76,11 +77,12 @@ class RustPin(unittest.TestCase):
         for bad in ({}, {"RUSTUP_TOOLCHAIN": "stable"}, {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTFLAGS": "-C x"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_TARGET": "x86_64-unknown-linux-gnu"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS": "x"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_INCREMENTAL": "1"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTC_WRAPPER": "w"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTUP_DIST_SERVER": "x", "RUSTUP_UPDATE_ROOT": "x"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 wt.rust_env_refusals(bad, "1.98.1")
-        wt.rust_env_refusals({"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_JOBS": "2"}, "1.98.1")
+        wt.rust_env_refusals({"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0"}, "1.98.1")
 
     def test_installed_std_must_match_verified_digests(self):
         pins = wt.load_pins()
@@ -92,7 +94,7 @@ class RustPin(unittest.TestCase):
             env = {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_HOME": str(Path(tmp) / ".cargo"), "RUST_STD_DIGESTS": str(digests)}
             (lib / "libcore.rlib").write_bytes(b"core")
             digests.write_text(json.dumps({"libcore.rlib": hashlib.sha256(b"core").hexdigest()}))
-            with patch.object(Path, "home", return_value=Path(tmp)):
+            with patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=tmp)):
                 wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
                 (lib / "libcore.rlib").write_bytes(b"tampered")
                 with self.assertRaises(ValueError):
@@ -103,7 +105,7 @@ class RustPin(unittest.TestCase):
                     wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
 
     def test_cargo_config_and_home_refused(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp) / "h"):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(Path(tmp) / "h"))):
             tmp = Path(tmp)
             for directory in (tmp / "repo/workers/api", tmp / "repo/workers", tmp, tmp / "h"):
                 config = directory / ".cargo/config.toml"
@@ -114,6 +116,31 @@ class RustPin(unittest.TestCase):
                 config.unlink()
             with self.assertRaises(ValueError):
                 wt.cargo_config_refusals({"CARGO_HOME": str(tmp / "other")}, tmp / "repo")
+
+    def test_supplied_home_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"HOME": str(Path(tmp) / "ambient")}):
+            home = Path(tmp) / "child"
+            (home / ".cargo").mkdir(parents=True)
+            (home / ".cargo/config.toml").touch()
+            with self.assertRaises(ValueError):
+                wt.cargo_config_refusals({"HOME": str(home)}, Path(tmp) / "repo")
+
+    def test_install_and_probes_share_pinned_environment(self):
+        pins = wt.load_pins()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.sysroot(tmp)
+            (root / "lib/rustlib" / pins["rust"]["target"] / "lib/a.rlib").write_bytes(b"a")
+            env = {"HOME": tmp, "RUNNER_TEMP": tmp, "GITHUB_ENV": str(Path(tmp) / "github-env"), "RUSTUP_HOME": str(Path(tmp) / "child")}
+            expected = {**env, "RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
+            calls = []
+            fake = self.fake_run(root)
+            def run(cmd, **kwargs):
+                calls.append(cmd[0])
+                self.assertEqual(kwargs["env"], expected)
+                return fake(cmd, **kwargs)
+            with patch.dict("os.environ", {"RUSTUP_HOME": str(Path(tmp) / "ambient")}), patch.object(wt, "require_actions"), patch.object(wt, "verify_rust_source"), patch.object(wt, "tar_files", return_value={"a.rlib": hashlib.sha256(b"a").hexdigest()}):
+                wt.install_rust(env, run=run)
+            self.assertEqual(calls, ["rustup", "rustup", "rustc", "cargo", "rustc"])
 
     def test_api_lock_identity_is_pinned(self):
         pins = wt.load_pins()

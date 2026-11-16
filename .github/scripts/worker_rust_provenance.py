@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tarfile
@@ -44,16 +45,16 @@ def rust_env_refusals(env, version: str) -> None:
     """Refuse ambient settings that can alter the compiler, std or target."""
     for key in env:
         name = key.upper()
-        if name in RUST_ENV_ALLOWED:
+        if name in RUST_ENV_ALLOWED or (name == "CARGO_INCREMENTAL" and env[key] == "0"):
             continue
-        if name in RUST_ENV_EXACT or name.startswith(RUST_ENV_PREFIXES):
+        if name == "CARGO_INCREMENTAL" or name in RUST_ENV_EXACT or name.startswith(RUST_ENV_PREFIXES):
             raise ValueError(f"{key} may change the pinned Rust build")
     if env.get("RUSTUP_TOOLCHAIN") != version:
         raise ValueError("RUSTUP_TOOLCHAIN is not the pinned version")
 
 
 def cargo_config_refusals(env, root: Path = ROOT) -> None:
-    home = Path.home() / ".cargo"
+    home = Path(env.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir) / ".cargo"
     if env.get("CARGO_HOME") and Path(env["CARGO_HOME"]).resolve() != home.resolve():
         raise ValueError("CARGO_HOME is not the default Cargo home")
     work = root / "workers"
@@ -153,17 +154,18 @@ def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
     require_actions(env)
     pins = load_pins()
     rust = pins["rust"]
-    rust_env_refusals({**env, "RUSTUP_TOOLCHAIN": rust["version"]}, rust["version"])
+    env = {**env, "RUSTUP_TOOLCHAIN": rust["version"]}
+    rust_env_refusals(env, rust["version"])
     t, v = rust["target"], rust["version"]
     std_files = tar_files(verify_rust_source(pins, dl), f"rust-std-{v}-{t}/rust-std-{t}/lib/rustlib/{t}/lib/", 200_000_000)
     run(["rustup", "toolchain", "install", rust["version"], "--profile", "minimal",
-         "--no-self-update", "--target", rust["target"]], check=True, cwd=ROOT)
-    run(["rustup", "default", rust["version"]], check=True, cwd=ROOT)
+         "--no-self-update", "--target", rust["target"]], check=True, cwd=ROOT, env=env)
+    run(["rustup", "default", rust["version"]], check=True, cwd=ROOT, env=env)
     digests = Path(env["RUNNER_TEMP"]) / "rust-std-digests.json"
     digests.write_text(json.dumps(std_files, sort_keys=True))
     with open(env["GITHUB_ENV"], "a") as output:
         output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\nRUST_STD_DIGESTS={digests}\n")
-    verify_rust_toolchain(pins, {**env, "RUSTUP_TOOLCHAIN": rust["version"]}, run, std_files)
+    verify_rust_toolchain(pins, env, run, std_files)
     print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
 
 
