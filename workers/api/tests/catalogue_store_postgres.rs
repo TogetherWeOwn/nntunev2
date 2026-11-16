@@ -1924,7 +1924,7 @@ async fn private_session_delete_is_scoped_and_rolls_back() {
         observer.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
         for id in [&owner, &missing] {
             let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
-            if !matches (store.delete_private_session(id, "a").await, Err(StoreError)) { return Err("unavailable account accepted".into()); }
+            if !matches!(store.delete_private_session(id, "a").await, Err(StoreError)) { return Err("unavailable account accepted".into()); }
         }
         let failed = private_client().await?;
         failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
@@ -1964,7 +1964,7 @@ async fn private_session_delete_respects_account_fence() {
             let writer = private_client().await?;
             let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
             let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
-            let delete = store.delete_private_session(&owner, "target");
+            let delete = store.delete_private_session(&owner, if deleting { "missing" } else { "target" });
             tokio::pin!(delete);
             blocker_observer::observe_blocked(observer, locker_pid, writer_pid, delete.as_mut()).await?;
             let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
