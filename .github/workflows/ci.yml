@@ -894,6 +894,8 @@ jobs:
         with:
           workspaces: workers/repair
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test runtime probe observation checks
+        run: node --test workers/repair/tests/runtime/observations.test.mjs
       - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
