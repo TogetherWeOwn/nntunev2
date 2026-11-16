@@ -19,6 +19,9 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+mod billing_owned_socket;
 pub mod billing_reconcile;
 pub mod billing_store_classification;
 pub mod billing_sweep;
