@@ -38,16 +38,16 @@ struct Limits {
     aggregate_bytes: usize,
 }
 
+type FixtureFields = (
+    [Option<&'static str>; 5],
+    [Option<&'static str>; 5],
+    [Option<&'static str>; 6],
+);
+
 // Every field comes from literals in this module, never from a caller-supplied
 // 'static reference. Repeating a row repeats its charges, even for equal text.
 impl Fixture {
-    fn fields(
-        self,
-    ) -> (
-        [Option<&'static str>; 5],
-        [Option<&'static str>; 5],
-        [Option<&'static str>; 6],
-    ) {
+    fn fields(self) -> FixtureFields {
         let text = if self.empty_text { "" } else { "fixture" };
         let optional = match self.optional {
             OptionalText::None => None,
