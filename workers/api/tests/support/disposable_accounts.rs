@@ -1,7 +1,7 @@
 //! Committed account fixtures for tests that need multiple database sessions.
 use tokio_postgres::{Client, Config, NoTls};
 
-pub async fn connect() -> Client {
+pub async fn connect_guarded() -> Result<Client, tokio_postgres::Error> {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("CI disposable database is required; never silently skip")
         .parse()
@@ -12,10 +12,16 @@ pub async fn connect() -> Client {
         matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
         if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
     );
-    let (client, connection) = config.connect(NoTls).await.unwrap();
+    let (client, connection) = config.connect(NoTls).await?;
     tokio::spawn(async move { connection.await.unwrap() });
+    client.batch_execute("SET statement_timeout = '3s'").await?;
+    Ok(client)
+}
+
+pub async fn connect() -> Client {
+    let client = connect_guarded().await.unwrap();
     client
-        .batch_execute("SET statement_timeout = '3s'; SET search_path = pg_temp")
+        .batch_execute("SET search_path = pg_temp")
         .await
         .unwrap();
     client
