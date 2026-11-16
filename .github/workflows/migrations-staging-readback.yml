@@ -26,6 +26,7 @@ concurrency:
 
 jobs:
   readback:
+    name: Read staging ledger row
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
