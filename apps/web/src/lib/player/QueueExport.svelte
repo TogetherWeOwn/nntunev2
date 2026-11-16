@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { createM3UDownload, m3uDownloadFailure } from './m3uDownload.js';
 	import { formatQueueM3U, formatQueueText, type QueueState } from './queue.js';
 
 	let { queue, authGeneration, loading = false }: {
@@ -12,11 +13,10 @@
 	let fallback = $state<string | null>(null);
 	let generation = 0;
 	let alive = true;
-	let downloadUrl: string | null = null;
+	const download = createM3UDownload();
 
 	function releaseDownload(): void {
-		if (downloadUrl !== null) URL.revokeObjectURL(downloadUrl);
-		downloadUrl = null;
+		download.release();
 	}
 
 	function clearFeedback(): number {
@@ -70,19 +70,10 @@
 		if (!alive || queue.tracks.length === 0) return;
 		const link = document.createElement('a');
 		try {
-			// Keep at most one URL until the next download, auth reset or teardown.
-			releaseDownload();
-			const blob = new Blob([formatQueueM3U(queue)], { type: 'audio/x-mpegurl;charset=utf-8' });
-			downloadUrl = URL.createObjectURL(blob);
-			link.href = downloadUrl;
-			link.download = 'queue.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			status = 'Download started. Check your browser’s downloads for queue.m3u.';
+			status = download.download(link, () => formatQueueM3U(queue), 'queue.m3u');
 		} catch {
 			releaseDownload();
-			status = 'Could not start the download. Try again or copy the queue as text.';
+			status = m3uDownloadFailure('queue');
 		} finally {
 			link.remove();
 		}
