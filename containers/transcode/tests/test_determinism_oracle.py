@@ -2,7 +2,7 @@
 """Exercise the real image self-test's oracles with controlled external tools.
 
 This is not an image/encoder run. The doubles isolate command exit handling,
-large encoder listings, and ffprobe metadata; image CI still runs real Docker.
+large encoder listings, ffprobe metadata, and decoded PCM; image CI still runs real Docker.
 """
 import copy
 import json
@@ -27,6 +27,15 @@ if args[0] in ("run", "rm"):
     sys.exit(0)
 if args[0] != "exec":
     sys.exit(90)
+if args[1] == "-i" and args[3] == "ffmpeg":
+    sys.stdin.buffer.read()
+    mode = os.environ.get("ORACLE_DECODE", "valid")
+    pcm = {"valid": b"\x01\x00\x01\x00" * 240000,
+           "failed": b"\x01\x00\x01\x00" * 240000,
+           "empty": b"", "truncated": b"\x01\x00\x01\x00" * 1000,
+           "silence": b"\x00" * 960000}[mode]
+    sys.stdout.buffer.write(pcm)
+    sys.exit(7 if mode == "failed" else 0)
 if args[2] == "ffmpeg":
     mode = os.environ.get("ORACLE_ENCODER", "ok")
     if mode == "misleading":
@@ -68,7 +77,7 @@ else:
 
 
 class DeterminismOracleTests(unittest.TestCase):
-    def run_oracle(self, *, encoder="ok", probe=None, probe_exit=0):
+    def run_oracle(self, *, encoder="ok", probe=None, probe_exit=0, decode="valid"):
         with tempfile.TemporaryDirectory(prefix="transcode-oracle-") as root:
             root = Path(root)
             for name, body in (("docker", DOCKER), ("curl", CURL)):
@@ -77,7 +86,7 @@ class DeterminismOracleTests(unittest.TestCase):
                 path.chmod(0o755)
             env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", TMPDIR=str(root),
                        ORACLE_ENCODER=encoder, ORACLE_PROBE=json.dumps(PROBE if probe is None else probe),
-                       ORACLE_PROBE_EXIT=str(probe_exit))
+                       ORACLE_PROBE_EXIT=str(probe_exit), ORACLE_DECODE=decode)
             # Noninteractive shell bootstrap must not replace this test's PATH.
             env.pop("BASH_ENV", None)
             return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=20)
@@ -90,6 +99,19 @@ class DeterminismOracleTests(unittest.TestCase):
         result = self.run_oracle()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all assertions passed", result.stdout)
+
+    def test_valid_pcm_is_accepted(self):
+        result = self.run_oracle(decode="valid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fully decodes to non-silent PCM", result.stdout)
+
+    def test_decoder_failure_with_plausible_pcm_is_rejected(self):
+        self.assert_rejected(self.run_oracle(decode="failed"), "full decode failed")
+
+    def test_empty_truncated_or_silent_pcm_is_rejected(self):
+        for decode in ("empty", "truncated", "silence"):
+            with self.subTest(decode=decode):
+                self.assert_rejected(self.run_oracle(decode=decode), "decoded PCM mismatch")
 
     def test_missing_or_non_encoder_libopus_is_rejected(self):
         for encoder in ("missing", "misleading"):

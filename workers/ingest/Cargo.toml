@@ -10,7 +10,7 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "queue", "tokio-postgres"] }
+worker = { version = "0.9", features = ["http", "queue", "tokio-postgres"] }
 http = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

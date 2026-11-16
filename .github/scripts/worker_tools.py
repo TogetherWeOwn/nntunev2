@@ -2,14 +2,14 @@
 """Prepare and audit pinned worker build tools (GitHub Actions on Linux x86_64 only).
 
 Usage:
-  worker_tools.py install
-  worker_tools.py check-build <worker-build-log>
+  worker_tools.py install [repair]
+  worker_tools.py check-build <worker-build-log> [repair]
 
 Pins live in .github/worker-toolchain.json, the single manifest. The install and
 log-check logic is adapted from the earlier qualification tooling, reduced to what
-ordinary api, mb and ingest release builds need.
+ordinary api, mb and ingest release builds need; repair is opt-in.
 
-worker-build 0.8.7 resolves each tool from a <NAME>_BIN override first, then its
+worker-build resolves each tool from a <NAME>_BIN override first, then its
 cache, then a download. `check-build` proves every build used the overrides.
 """
 
@@ -84,8 +84,16 @@ def require_actions(env=os.environ, system: str | None = None, machine: str | No
             raise RuntimeError(f"{key} is required")
 
 
-def check_locks(pins: dict, root: Path = ROOT) -> None:
-    for worker in LOCKED_WORKERS:
+def select_profile(pins: dict, profile: str) -> tuple[dict, tuple[str, ...]]:
+    if profile == "ordinary":
+        return pins, LOCKED_WORKERS
+    if profile == "repair":
+        return {**pins, **pins["repair-profile"]}, ("repair",)
+    raise ValueError(f"unknown worker tool profile: {profile}")
+
+
+def check_locks(pins: dict, root: Path = ROOT, workers: tuple[str, ...] = LOCKED_WORKERS) -> None:
+    for worker in workers:
         packages = tomllib.loads((root / f"workers/{worker}/Cargo.lock").read_text())["package"]
         for name, version in (("worker", pins["worker-build"]["version"]),
                               ("wasm-bindgen", pins["wasm-bindgen-cli"]["version"])):
@@ -199,10 +207,10 @@ def version_matches(output: str, expected: str) -> bool:
     return re.search(rf"(?<![\d.]){re.escape(expected)}(?![\d.])", output) is not None
 
 
-def install(env=os.environ, dl=download, run=subprocess.run) -> None:
+def install(env=os.environ, dl=download, run=subprocess.run, profile: str = "ordinary") -> None:
     require_actions(env)
-    pins = load_pins()
-    check_locks(pins)
+    pins, workers = select_profile(load_pins(), profile)
+    check_locks(pins, workers=workers)
     root = Path(env["RUNNER_TEMP"]) / "worker-tools"
     root.mkdir()  # A reused or nonempty root is not admissible.
     tool_root = root / "installed"
@@ -267,9 +275,18 @@ def check_build(log_path: str, env=os.environ) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if argv[1:2] == ["install"] and len(argv) == 2:
+    if argv[1:] == ["install"] or (argv[1:2] == ["check-build"] and len(argv) == 3):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from worker_rust_provenance import check_lock_identity, verify_rust_toolchain
+        pins = load_pins()
+        check_lock_identity(pins)
+        verify_rust_toolchain(pins)
+    if argv[1:] == ["install"]:
         install()
-    elif argv[1:2] == ["check-build"] and len(argv) == 3:
+    elif argv[1:] == ["install", "repair"]:
+        install(profile="repair")
+    elif (argv[1:2] == ["check-build"] and
+          (len(argv) == 3 or (len(argv) == 4 and argv[3] == "repair"))):
         check_build(argv[2])
     else:
         print(__doc__, file=sys.stderr)

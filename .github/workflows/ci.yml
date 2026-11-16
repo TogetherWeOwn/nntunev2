@@ -42,7 +42,7 @@ jobs:
       actions: read # Nested OSV reads same-run comparison artifacts.
       contents: read
       security-events: write # Nested OSV uploads comparison SARIF.
-    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36 # v0.5.0
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
 
   rust-test:
     name: rust test (native)
@@ -483,6 +483,82 @@ jobs:
       - run: cargo clippy -p nntune-test-nntp --all-targets -- -D warnings
       - run: cargo fmt -p nntune-test-nntp -- --check
 
+  billing-pool-fixture:
+    name: billing-pool-fixture
+    permissions: {}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: nntune_ci
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nntune_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Install pinned Ubuntu pooler
+        run: |
+          # Keep the signed development-archive versions available after newer uploads.
+          # Resolute packages remain preferred except for the explicit pins below.
+          printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261115T000000Z tenacious main universe' | sudo tee /etc/apt/sources.list.d/fixture-pooler.list >/dev/null
+          printf 'Package: *\nPin: release n=tenacious\nPin-Priority: 100\n' | sudo tee /etc/apt/preferences.d/fixture-pooler >/dev/null
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pgbouncer=1.26.1-1 libssl4=4.0.3-1ubuntu1 openssl-provider-legacy=4.0.3-1ubuntu1
+          sudo systemctl stop pgbouncer.service
+      - name: Configure disposable pool
+        env:
+          PGPASSWORD: ci-throwaway
+        run: |
+          set -eu
+          psql -h 127.0.0.1 -U postgres -d nntune_ci -v ON_ERROR_STOP=1 <<'SQL'
+          REVOKE CONNECT ON DATABASE nntune_ci FROM PUBLIC;
+          CREATE ROLE fixture LOGIN PASSWORD 'fixture-only';
+          GRANT CONNECT ON DATABASE nntune_ci TO fixture;
+          SQL
+          umask 077
+          mkdir -p "$RUNNER_TEMP/billing-pool"
+          printf '"fixture" "fixture-only"\n' > "$RUNNER_TEMP/billing-pool/users.txt"
+          printf '%s\n' \
+            '[databases]' \
+            'nntune_ci = host=127.0.0.1 port=5432 dbname=nntune_ci' \
+            '[pgbouncer]' \
+            'listen_addr = 127.0.0.1' \
+            'listen_port = 6433' \
+            'unix_socket_dir =' \
+            'auth_type = plain' \
+            "auth_file = $RUNNER_TEMP/billing-pool/users.txt" \
+            'pool_mode = transaction' \
+            'default_pool_size = 1' \
+            'reserve_pool_size = 0' \
+            'max_db_connections = 1' \
+            'max_client_conn = 10' \
+            "pidfile = $RUNNER_TEMP/billing-pool/pgbouncer.pid" \
+            "logfile = $RUNNER_TEMP/billing-pool/pgbouncer.log" \
+            > "$RUNNER_TEMP/billing-pool/pgbouncer.ini"
+          pgbouncer -d "$RUNNER_TEMP/billing-pool/pgbouncer.ini"
+          for attempt in {1..20}; do
+            if pg_isready -h 127.0.0.1 -p 6433 -U fixture -d nntune_ci; then break; fi
+            if [ "$attempt" -eq 20 ]; then exit 1; fi
+            sleep 1
+          done
+      - name: Verify pooled connections
+        env:
+          PGPASSWORD: fixture-only
+        run: |
+          set -eu
+          export PGCONNECT_TIMEOUT=5
+          first=$(psql -h 127.0.0.1 -p 6433 -U fixture -d nntune_ci -AtX -v ON_ERROR_STOP=1 -c 'SELECT current_user || colon || pg_backend_pid() FROM (SELECT chr(58) AS colon) AS separator')
+          second=$(psql -h 127.0.0.1 -p 6433 -U fixture -d nntune_ci -AtX -v ON_ERROR_STOP=1 -c 'SELECT current_user || colon || pg_backend_pid() FROM (SELECT chr(58) AS colon) AS separator')
+          test "$first" = "$second"
+          case "$first" in fixture:[0-9]*) ;; *) exit 1 ;; esac
+
   api:
     name: api
     runs-on: ubuntu-latest
@@ -541,6 +617,10 @@ jobs:
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
       - name: Test fail-closed staging schema gate (mocked; no credentials)
         run: python3 .github/scripts/test_staging_api_schema_gate.py
+      - name: Test span observation evaluator (offline)
+        run: python3 workers/api/tests/test_span_result.py
+      - name: Test Worker span runtime evaluator (offline)
+        run: python3 .github/scripts/worker_span_runtime.py --self-test
 
   mb-import-etl:
     name: mb-import-etl
@@ -894,6 +974,10 @@ jobs:
         with:
           workspaces: workers/repair
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test runtime probe observation checks
+        run: node --test workers/repair/tests/runtime/observations.test.mjs
+      - name: Test runtime case collector
+        run: node --test workers/repair/tests/runtime/collector.test.mjs
       - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
@@ -927,14 +1011,15 @@ jobs:
         run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
       - name: Smoke the shipped server and pinned par2 binary
         run: |
-          docker run -d --name repair-smoke -p 18080:8080 nntune-repair:ci
+          trap 'docker rm -f repair-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name repair-smoke -p 127.0.0.1:18080:8080 nntune-repair:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18080/health; then break; fi
+            if curl --max-time 2 -fsS http://127.0.0.1:18080/health; then break; fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
+          curl --max-time 2 -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
           docker exec repair-smoke /usr/local/bin/par2 --version | head -1
-          docker rm -f repair-smoke
+          python3 containers/repair/tests/test_image_repair.py repair-smoke
 
   rust-transcode:
     name: rust (workers/transcode)
@@ -1016,7 +1101,7 @@ jobs:
         # image (containers/mb-import/Dockerfile:3) so the integration
         # suite never tests against a newer Postgres than the image
         # ships; re-pin both deliberately.
-        image: postgres:18-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
+        image: postgres:18-bookworm@sha256:ece55f7868da684e400f82f1030a050718adbdd65c23aa500c486f6e2950dc0f
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
@@ -1250,9 +1335,9 @@ jobs:
     name: e2e-lint
     runs-on: ubuntu-latest
     # Preinstalled browsers + OS libraries avoid per-job apt mirror stalls.
-    # linux/amd64 v1.64.1-noble manifest verified 2026-10-23. Re-pin with
+    # v1.65.0-noble image index verified 2026-11-16. Re-pin with
     # e2e/package-lock.json; the offline image test rejects version drift.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1443,13 +1528,24 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      # Client-JS bundle budget: fail when the built client output exceeds
-      # the budget pinned in check_web_bundle_budget.py. Runs in
+      - name: Exclude history instrumentation from ordinary output
+        run: |
+          test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
+          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store' .svelte-kit/output/client .svelte-kit/output/server; then
+            echo 'Test-only history instrumentation found in ordinary output'
+            exit 1
+          else
+            result=$?
+            test "$result" -eq 1
+          fi
+      # Client-JS bundle budget: warn (advisory, owner 2026-11-16) when the
+      # built client output exceeds the budget pinned in
+      # check_web_bundle_budget.py; measurement errors still fail. Runs in
       # this job so the fresh `pnpm build` output is present; the checker is
       # fail-closed when the output dir is missing. Absolute script paths
       # because this job defaults to working-directory apps/web. Keep this
       # job id in ci-ok's needs (already there via web-build).
-      - name: Enforce client-JS bundle budget
+      - name: Report client-JS bundle budget
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"
       - name: Bundle-budget self-tests (pass + breach fixtures)
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
@@ -1470,7 +1566,7 @@ jobs:
     # setup/headroom. Re-measure when the reported suite exceeds
     # 25 minutes or the test count passes ~1,800; re-pin the container
     # with the web lock; test_ci_web_e2e_timeout.py pins this value.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     timeout-minutes: 45
     defaults:
       run:
@@ -1574,10 +1670,56 @@ jobs:
   # its own job so the gate is fast and independently visible; the same spec
   # also runs inside the full web-e2e suite. Keep this job id in ci-ok's
   # needs; re-pin the container with the web lock.
+  history-fixture:
+    name: history-fixture
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: pnpm-setup
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Run real-route history fixture
+        run: pnpm exec playwright test --config tests/history-fixture.playwright.config.ts
+      - name: Require mobile screenshots and report
+        run: |
+          test -s history-fixture-report/index.html
+          test "$(find test-results -name history-fixture-light.png -size +0c | wc -l)" -eq 1
+          test "$(find test-results -name history-fixture-dark.png -size +0c | wc -l)" -eq 1
+      - name: Upload fixture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: history-fixture-results
+          path: |
+            apps/web/history-fixture-report/
+            apps/web/test-results/
+          retention-days: 7
+          if-no-files-found: error
+
   web-a11y:
     name: web-a11y
     runs-on: ubuntu-latest
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     timeout-minutes: 15
     defaults:
       run:
@@ -1685,11 +1827,10 @@ jobs:
       - name: Test canonical tool preparation and workflow boundaries
         run: |
           python3 -I .github/scripts/test_worker_tools.py
+          python3 -I .github/scripts/test_worker_rust_provenance.py
           python3 -I .github/scripts/test_worker_build_workflow.py
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Prepare canonical Worker tools
         run: python3 -I .github/scripts/worker_tools.py install
       - name: Build ordinary Worker release bundles
@@ -1714,6 +1855,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
+      - name: Exercise construction ledger on wasm32 release
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/worker_rust_provenance.py verify-rust
+          cargo build --locked --release --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,ledger-wasm-test --target-dir "$RUNNER_TEMP/ledger-target"
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ledger-js" "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+          node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
       - name: Exercise staging body adapter in a synthetic WASM stream runtime
         run: |
           set -euo pipefail
@@ -1734,6 +1882,8 @@ jobs:
       - name: Exercise Worker routing with disposable PostgreSQL
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
+          python3 -I workers/api/tests/test_pg_protocol_frames.py
+          python3 -I workers/api/tests/test_pg_commit_barrier.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
@@ -1763,7 +1913,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
