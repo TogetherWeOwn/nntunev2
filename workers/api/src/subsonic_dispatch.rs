@@ -76,6 +76,8 @@ use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::subsonic_auth::AuthError;
 use crate::subsonic_http::CredentialParseError;
 
+pub mod snapshot_order;
+
 /// Production FLAC identity: the catalogue is FLAC-only, so every song
 /// advertises `audio/flac`/`flac` and the stream mount refuses any
 /// transcoding request instead of silently serving original bytes.
