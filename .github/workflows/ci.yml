@@ -486,7 +486,7 @@ jobs:
   billing-pool-fixture:
     name: billing-pool-fixture
     permissions: {}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     services:
       postgres:
@@ -504,7 +504,7 @@ jobs:
     steps:
       - name: Install pinned Ubuntu pooler
         run: |
-          # Noble has no security-fixed pooler; keep its packages preferred
+          # Resolute has no security-fixed pooler; keep its packages preferred
           # while selecting the fixed pooler and its required libraries explicitly.
           printf '%s\n' 'deb http://archive.ubuntu.com/ubuntu tenacious main universe' | sudo tee /etc/apt/sources.list.d/fixture-pooler.list >/dev/null
           printf 'Package: *\nPin: release n=tenacious\nPin-Priority: 100\n' | sudo tee /etc/apt/preferences.d/fixture-pooler >/dev/null
