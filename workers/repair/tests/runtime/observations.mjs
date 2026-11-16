@@ -23,7 +23,7 @@ export function evaluateObservations({ pins, versions, controls, transition }) {
   check("pending body read", Number.isInteger(t?.pullCount) && t.pullCount > 0 && Number.isInteger(t.readCallsAtBarrier) && t.readCallsAtBarrier > 0 && t.aSettledAtBarrier === false);
   const log = Array.isArray(t?.log) ? t.log : [];
   // Reject malformed, duplicate or unordered sequence numbers rather than sorting them.
-  check("ordered event log", log.length > 0 && log.every((e, i) => Number.isSafeInteger(e?.seq) && e.seq > (i ? log[i - 1]?.seq : 0)));
+  check("ordered event log", log.length > 0 && Array.from(log).every((e, i) => Number.isSafeInteger(e?.seq) && e.seq > (i ? log[i - 1]?.seq : 0)));
   const event = (name) => log.find((e) => e?.event === name);
   const error = event("A.body-errored");
   const invoke = event("B.invoke");

@@ -68,6 +68,9 @@ test("rejects fabricated ordering, wrong context, and unlinked ticks", () => {
   fails(value, "B handler tick before A settlement");
   value.transition.log[3].seq = 2;
   fails(value, "ordered event log");
+  const sparse = fixture();
+  sparse.transition.log.length++;
+  fails(sparse, "ordered event log");
 });
 
 test("missing transition, rejected handlers and unhandled errors never pass", () => {
