@@ -650,11 +650,11 @@ async fn taste_upsert_waits_for_deletion_fence() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::Ban;
     use std::time::Duration;
+    let locker = client(false).await;
+    let writer = client(false).await;
     let accounts = disposable_accounts::Accounts::new(1).await;
     let account = accounts.id(0).to_owned();
     let observer = &accounts.observer;
-    let locker = client(false).await;
-    let writer = client(false).await;
     let outcome = async {
         let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
         observer.execute("INSERT INTO public.account_taste VALUES ($1,'track','old','love',NULL,1,1)", &[&account]).await?;
