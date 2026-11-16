@@ -57,6 +57,21 @@ class RustPin(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     wt.verify_rust_toolchain(pins, env, run, std, Path(tmp))
 
+    def test_toolchain_probes_use_validated_environment(self):
+        pins = wt.load_pins()
+        env = {"RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp) / "h"):
+            root = self.sysroot(tmp)
+            (root / "lib/rustlib" / pins["rust"]["target"] / "lib/a.rlib").write_bytes(b"a")
+            fake = self.fake_run(root)
+
+            def run(cmd, **kwargs):
+                self.assertEqual(kwargs["env"], env)
+                return fake(cmd, **kwargs)
+
+            with patch.dict("os.environ", {"RUSTUP_TOOLCHAIN": "stable"}):
+                wt.verify_rust_toolchain(pins, env, run, {"a.rlib": hashlib.sha256(b"a").hexdigest()}, Path(tmp))
+
     def test_environment_overrides_refused(self):
         for bad in ({}, {"RUSTUP_TOOLCHAIN": "stable"}, {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTFLAGS": "-C x"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_TARGET": "x86_64-unknown-linux-gnu"},

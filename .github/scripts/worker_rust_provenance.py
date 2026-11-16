@@ -128,7 +128,7 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_fi
     want = load_std(env) if std_files is None else std_files
 
     def out(*cmd):
-        return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT).stdout
+        return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT, env=env).stdout
 
     rustc = parse_vv(out("rustc", "-vV"))
     cargo = parse_vv(out("cargo", "-vV"))
