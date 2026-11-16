@@ -60,7 +60,11 @@ def eid(n): return str(uuid.UUID(int=n))
 N_ART, N_GRP, N_REL, N_REC, N_URL = 120, 30, 60, 60, 10
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     for i in range(1, N_ART + 1):
-        f.write(f'{eid(i)}\tBand {i}\t{i}, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+        if i == 2:
+            # COPY text escapes, including literal backslash-N versus NULL.
+            f.write(f'{eid(i)}\tÉcho\\tLine\\nBack\\\\slash\t\\\\N\t\\N\t\\x55\\x53\t2024-05-01T12:00:00Z\n')
+        else:
+            f.write(f'{eid(i)}\tBand {i}\t{i}, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
     f.write('not-a-uuid\tBad\tBad\tGroup\tUS\t2024-05-01T12:00:00Z\n')
     f.write(f'{eid(9001)}\tBad TS\tBad TS\tGroup\tUS\tnot-a-date\n')
     f.write(f'{eid(9002)}\tShort\n')
@@ -112,6 +116,14 @@ echo "=== 1. full import: counts, cursor, DLQ ==="
 reset_db
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "artists loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "artist COPY name bytes" "c38963686f094c696e650a4261636b5c736c617368" \
+  "$(db -c "SELECT encode(convert_to(name, 'UTF8'), 'hex') FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000002';")"
+check "artist COPY literal backslash-N" "5c4e" \
+  "$(db -c "SELECT encode(convert_to(sort_name, 'UTF8'), 'hex') FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000002';")"
+check "artist COPY null type" "t" \
+  "$(db -c "SELECT type IS NULL FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000002';")"
+check "artist COPY escaped country" "US" \
+  "$(db -c "SELECT country FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000002';")"
 check "release groups loaded" "30" "$(db -c 'SELECT count(*) FROM mb_release_group;')"
 check "releases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
 check "releases carry group" "60" "$(db -c 'SELECT count(*) FROM mb_release WHERE release_group_mbid IS NOT NULL;')"
