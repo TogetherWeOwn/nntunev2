@@ -68,7 +68,7 @@ async fn private_session_upsert_rolls_back_after_mutation() {
         observer.execute("INSERT INTO public.private_sessions VALUES ($1,'keep',11), ($2,'target',12)",
             &[&owner, &other]).await.map_err(|e| e.to_string())?;
         for (session, expiry, inject) in [("target", 30_u64, true), ("target", 40, false),
-            ("target", 20, false), ("target", 10, true)] {
+            ("target", 20, false), ("target", 60, false), ("target", 10, true)] {
             let reached = Rc::new(Cell::new(false));
             let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
             if inject {
@@ -89,7 +89,7 @@ async fn private_session_upsert_rolls_back_after_mutation() {
             let actual: Vec<(String, String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
             observer.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
             let mut expected = vec![(owner.clone(), "keep".into(), 11), (other.clone(), "target".into(), 12)];
-            if expiry != 30 { expected.push((owner.clone(), "target".into(), if expiry == 40 { 40 } else { 20 })); }
+            if expiry != 30 { expected.push((owner.clone(), "target".into(), match expiry { 40 => 40, 20 => 20, _ => 60 })); }
             expected.sort();
             if actual != expected { return Err(format!("unexpected committed rows after expiry {expiry}")); }
         }
@@ -135,7 +135,7 @@ async fn private_session_upsert_rolls_back_after_mutation() {
         }
         let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2) ORDER BY user_id,session_id", &[&owner, &other]).await.map_err(|e| e.to_string())?;
         let actual: Vec<(String, String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
-        let mut expected = vec![(owner.clone(), "keep".into(), 11), (owner.clone(), "target".into(), 20), (other.clone(), "target".into(), 12)];
+        let mut expected = vec![(owner.clone(), "keep".into(), 11), (owner.clone(), "target".into(), 60), (other.clone(), "target".into(), 12)];
         expected.sort();
         if actual != expected { return Err("failed upsert changed scoped rows".into()); }
         observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
