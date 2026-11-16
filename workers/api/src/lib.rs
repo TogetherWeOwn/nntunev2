@@ -132,6 +132,10 @@ mod logging_tests {
     }
 }
 
+// Test-only real-workerd span probe; absent unless `span-runtime-test` is on.
+#[cfg(all(target_arch = "wasm32", feature = "span-runtime-test"))]
+mod span_runtime_probe;
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
@@ -143,7 +147,10 @@ use worker::*;
 
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
-#[cfg(not(all(target_arch = "wasm32", feature = "staging-body-wasm-test")))]
+#[cfg(not(all(
+    target_arch = "wasm32",
+    any(feature = "staging-body-wasm-test", feature = "span-runtime-test")
+)))]
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,

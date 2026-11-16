@@ -1739,6 +1739,17 @@ jobs:
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
+      # Real workerd (pinned Wrangler, loopback, no credentials): concurrent
+      # Worker 0.9 Rust span identity/restoration plus a must-fail control.
+      # Rebuilds workers/api (test feature) and restores build/, so it runs last.
+      - name: Test Worker span runtime evaluator
+        run: python3 -I .github/scripts/worker_span_runtime.py --self-test
+      - name: Exercise concurrent Rust span identity in real workerd
+        run: |
+          set -euo pipefail
+          mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
+          test "${#wranglers[@]}" -eq 1
+          python3 -I .github/scripts/worker_span_runtime.py --wrangler "${wranglers[0]}"
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

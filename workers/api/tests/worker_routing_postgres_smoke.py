@@ -32,7 +32,7 @@ spec.loader.exec_module(fixture)
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
 MANIFEST = ROOT / "migrations/manifest.toml"
-WRANGLER_VERSION = "4.153.0"
+WRANGLER_VERSION = "4.159.0"
 RP_ID = "example.test"
 ORIGIN = f"https://{RP_ID}"
 IDENT = re.compile(r"[A-Za-z0-9_]+")
@@ -175,7 +175,7 @@ def find_wrangler(explicit):
 
 
 def check_source_phase_bundle(index):
-    check(re.search(r"\bimport\s+source\s+\w+\s+from\s+['\"]\./index_bg\.wasm['\"]", index),
+    check(re.search(r"\bimport\s+source\s+\w+\s+from\s*['\"]\./index_bg\.wasm['\"]", index),
           "generated Worker bundle is missing its source-phase Wasm import")
 
 
