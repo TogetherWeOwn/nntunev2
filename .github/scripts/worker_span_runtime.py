@@ -89,7 +89,7 @@ def build(env, output):
         finally:
             try:
                 shutdown_process_group(proc)
-            except Exception as exc:
+            except BaseException as exc:
                 raise BuildShutdownError(f"build shutdown unverified; output retained at {output}") from exc
     check(returncode == 0, f"span-runtime-test worker-build failed; see {log_path}")
     subprocess.run([sys.executable, "-I", str(ROOT / ".github/scripts/worker_tools.py"),
@@ -180,8 +180,8 @@ def run(wrangler):
                 evaluate_scoped([get(port, "scoped")])
                 print(f"worker span runtime: ok (real workerd; requests={REQUESTS}; tasks={TASKS}; scoped/control/post-control passed)")
             except Exception:
-                log.seek(0)
-                sys.stdout.write(log.read()[-4000:])
+                with (state / "runtime.log").open() as diagnostics:
+                    sys.stdout.write(diagnostics.read()[-4000:])
                 raise
             finally:
                 try:
@@ -302,6 +302,62 @@ class SelfTest(unittest.TestCase):
                         proc.wait.assert_called_once_with(timeout=2400)
                         shutdown.assert_called_once_with(proc)
                         self.assertEqual(command.call_count, 3 if result == 0 and not shutdown_fails else 1)
+
+    def test_interrupted_build_shutdown_retains_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "runtime"
+            state.mkdir()
+            proc = mock.Mock()
+            proc.wait.side_effect = subprocess.TimeoutExpired("worker-build", 2400)
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp}), \
+                 mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
+                 mock.patch(__name__ + ".subprocess.run"), \
+                 mock.patch(__name__ + ".subprocess.Popen", return_value=proc), \
+                 mock.patch(__name__ + ".shutdown_process_group", side_effect=KeyboardInterrupt):
+                with self.assertRaises(BuildShutdownError) as caught:
+                    run(Path("wrangler"))
+                self.assertIsInstance(caught.exception.__cause__, KeyboardInterrupt)
+                self.assertTrue(state.is_dir())
+
+    def test_diagnostic_read_does_not_move_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "runtime"
+            state.mkdir()
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            writer = None
+            open_path = Path.open
+
+            def open_log(path, *args, **kwargs):
+                nonlocal writer
+                stream = open_path(path, *args, **kwargs)
+                if path == state / "runtime.log":
+                    if args and args[0] == "w+":
+                        writer = stream
+                    else:
+                        read = stream.read
+                        def interleaved_read(*read_args):
+                            writer.write("child append\n")
+                            writer.flush()
+                            return read(*read_args)
+                        stream.read = interleaved_read
+                return stream
+
+            def start(*args, **kwargs):
+                kwargs["stdout"].write("original prefix\n")
+                kwargs["stdout"].flush()
+                return proc
+
+            with mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
+                 mock.patch(__name__ + ".build"), \
+                 mock.patch(__name__ + ".free_ports", return_value=(10001, 10002)), \
+                 mock.patch(__name__ + ".subprocess.Popen", side_effect=start), \
+                 mock.patch(__name__ + ".get", side_effect=ValueError("request")), \
+                 mock.patch(__name__ + ".shutdown_process_group", side_effect=RuntimeError("alive")), \
+                 mock.patch.object(Path, "open", open_log):
+                with self.assertRaisesRegex(RuntimeError, "alive"):
+                    run(Path("wrangler"))
+            self.assertEqual((state / "runtime.log").read_text(), "original prefix\nchild append\n")
 
     def test_free_ports_simultaneous(self):
         active = set()
