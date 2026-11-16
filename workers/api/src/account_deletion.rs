@@ -145,6 +145,16 @@ pub const WRITER_FENCE_USER_SQL: &str = r#"
 SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE
 "#;
 
+/// Exclusively lock a non-deleting account for a private-session transaction.
+///
+/// `$1` is the TEXT user id. Keep the lock until the transaction commits or
+/// rolls back; zero rows means the account is absent or deleting and the caller
+/// must refuse the mutation. All competing private-session writers must take
+/// this fence before touching session rows, including for absent sessions.
+pub const PRIVATE_SESSION_ACCOUNT_FENCE_SQL: &str = r#"
+SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR UPDATE
+"#;
+
 /// Outcome of a fenced write after combining the write's affected-row count
 /// with an [`ACCOUNT_DELETING_PROBE_SQL`] classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +209,14 @@ mod tests {
         );
         assert!(!sql.contains("forupdate"), "{sql}");
         assert!(!sql.contains("nowait"), "{sql}");
+    }
+
+    #[test]
+    fn private_session_fence_is_exclusive_and_non_deleting() {
+        assert_eq!(
+            normalize(PRIVATE_SESSION_ACCOUNT_FENCE_SQL),
+            "selectidfromuserswhereid=$1anddeleting_atisnullforupdate"
+        );
     }
 
     #[test]

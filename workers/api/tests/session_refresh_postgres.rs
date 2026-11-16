@@ -11,6 +11,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/private_account_fence.rs"]
+mod private_account_fence;
+
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const SIGNING_KEY: &[u8] = b"synthetic-test-key-0123456789abcdef";
 const ATTEMPTS: usize = 3;
