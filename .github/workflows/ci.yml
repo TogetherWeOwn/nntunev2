@@ -672,7 +672,9 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 19
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 21
+          printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_sql_relation_is_transformed_only_for_the_trusted_schema: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_transaction_matrix_and_rollback_on_disposable_schema: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'snapshot_fixture_cleans_up_after_early_lock_completion: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'table_exclusion_classifies_after_writer_commit_or_rollback: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'abandoned_table_lock_expires_and_rollback_cleans_local_settings: test'
