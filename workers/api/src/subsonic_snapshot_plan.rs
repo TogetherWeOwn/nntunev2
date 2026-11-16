@@ -73,9 +73,230 @@ pub fn plan_snapshot_output(
     Ok(())
 }
 
+type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
+
+/// Even an empty borrowed slice can have a retained, allocated backing vector.
+/// Without a raw-row receipt no input is admitted.
+pub fn reject_unproven_rows(
+    _artists: &[ArtistDbRow],
+    _releases: &[ReleaseDbRow],
+    _tracks: &[TrackDbRow],
+) -> Result<(), BudgetExceeded> {
+    Err(BudgetExceeded)
+}
+
+/// Construct only when retained raw allocations have a trustworthy receipt.
+/// No such receipt is currently available: all inputs are rejected before
+/// any charge or allocation. This entry point is not connected to the mount.
+pub fn build_bounded_snapshot(
+    budget: &mut ConstructionBudget,
+    artists: &[ArtistDbRow],
+    releases: &[ReleaseDbRow],
+    tracks: &[TrackDbRow],
+    work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+) -> Result<Snapshot, BudgetExceeded> {
+    reject_unproven_rows(artists, releases, tracks)?;
+    construct_snapshot(budget, artists, releases, tracks, work)
+}
+
+fn construct_snapshot(
+    budget: &mut ConstructionBudget,
+    artists: &[ArtistDbRow],
+    releases: &[ReleaseDbRow],
+    tracks: &[TrackDbRow],
+    work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+) -> Result<Snapshot, BudgetExceeded> {
+    use crate::subsonic_dispatch::snapshot_order::{order_snapshot, order_work};
+    let needed = order_work(artists.len(), releases.len(), tracks.len(), artists.len())
+        .ok_or(BudgetExceeded)?;
+    if needed.comparisons > work.comparisons || needed.artist_row_probes > work.artist_row_probes {
+        return Err(BudgetExceeded);
+    }
+    plan_snapshot_output(budget, artists, releases, tracks)?;
+    fn copy(s: &str) -> Result<String, BudgetExceeded> {
+        let mut out = String::new();
+        out.try_reserve_exact(s.len()).map_err(|_| BudgetExceeded)?;
+        out.push_str(s);
+        Ok(out)
+    }
+    fn vector<T>(len: usize) -> Result<Vec<T>, BudgetExceeded> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| BudgetExceeded)?;
+        Ok(out)
+    }
+    let mut out_artists = vector(artists.len())?;
+    let mut out_albums = vector(releases.len())?;
+    let mut out_songs = vector(tracks.len())?;
+    for a in artists {
+        out_artists.push(Artist {
+            id: copy(&a.mbid)?,
+            name: copy(&a.name)?,
+        });
+    }
+    for r in releases {
+        let artist_id = r.artist_mbid.as_deref().unwrap_or("");
+        let artist = r.artist_name.as_deref().unwrap_or("");
+        let sort = artists
+            .iter()
+            .rev()
+            .find(|a| a.mbid == artist_id)
+            .map_or(artist, |a| a.sort_name.as_str());
+        let mut duration = 0i64;
+        for t in tracks.iter().filter(|t| t.release_mbid == r.mbid) {
+            duration = duration
+                .checked_add(i64::from(t.duration_ms.unwrap_or(0)) / 1000)
+                .ok_or(BudgetExceeded)?;
+        }
+        out_albums.push(Album {
+            id: copy(&r.mbid)?,
+            name: copy(&r.title)?,
+            artist: copy(artist)?,
+            artist_id: copy(artist_id)?,
+            duration,
+            created: copy(NOW)?,
+            year: r.year.map(i64::from),
+            release_date: None,
+            curated_at: None,
+            artist_sort_name: copy(sort)?,
+        });
+    }
+    for t in tracks {
+        let duration = i64::from(t.duration_ms.unwrap_or(0)) / 1000;
+        let year = releases
+            .iter()
+            .rev()
+            .find(|r| r.mbid == t.release_mbid)
+            .and_then(|r| r.year)
+            .map(i64::from)
+            .unwrap_or(0);
+        out_songs.push(Song {
+            id: copy(&t.recording_mbid)?,
+            title: copy(&t.title)?,
+            album: copy(&t.release_title)?,
+            artist: copy(t.artist_name.as_deref().unwrap_or(""))?,
+            track: t.track_no.map(i64::from).unwrap_or(0),
+            year,
+            genre: String::new(),
+            cover_art: copy(&t.release_mbid)?,
+            size: duration
+                .checked_mul(crate::ledger::STREAM_BYTES_PER_SEC as i64)
+                .ok_or(BudgetExceeded)?,
+            content_type: copy(FLAC_CONTENT_TYPE)?,
+            suffix: copy(FLAC_SUFFIX)?,
+            duration,
+            disc: t.medium_no.map(i64::from).unwrap_or(1),
+            created: copy(NOW)?,
+            album_id: copy(&t.release_mbid)?,
+            artist_id: copy(t.artist_mbid.as_deref().unwrap_or(""))?,
+        });
+    }
+    order_snapshot(
+        &mut out_artists,
+        &mut out_albums,
+        &mut out_songs,
+        artists,
+        work,
+    )
+    .map_err(|_| BudgetExceeded)?;
+    Ok((out_artists, out_albums, out_songs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artist(mbid: &str, name: &str, sort: &str) -> ArtistDbRow {
+        ArtistDbRow {
+            mbid: mbid.into(),
+            name: name.into(),
+            sort_name: sort.into(),
+            artist_type: None,
+            country: None,
+        }
+    }
+    fn release(mbid: &str, artist: Option<(&str, &str)>) -> ReleaseDbRow {
+        ReleaseDbRow {
+            mbid: mbid.into(),
+            title: "T".into(),
+            release_type: None,
+            year: None,
+            artist_mbid: artist.map(|a| a.0.into()),
+            artist_name: artist.map(|a| a.1.into()),
+        }
+    }
+    fn track(release: &str) -> TrackDbRow {
+        TrackDbRow {
+            release_mbid: release.into(),
+            recording_mbid: "rec".into(),
+            title: "tt".into(),
+            duration_ms: None,
+            medium_no: None,
+            track_no: None,
+            release_title: "".into(),
+            artist_mbid: None,
+            artist_name: None,
+        }
+    }
+    fn total(a: &[ArtistDbRow], r: &[ReleaseDbRow], t: &[TrackDbRow]) -> usize {
+        let mut b = ConstructionBudget::new(usize::MAX);
+        plan_snapshot_output(&mut b, a, r, t).unwrap();
+        b.charged()
+    }
+
+    #[test]
+    fn builder_rejects_unproven_rows_before_charging() {
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        assert!(
+            build_bounded_snapshot(&mut budget, &[artist("a", "n", "s")], &[], &[], work).is_err()
+        );
+        assert_eq!(budget.charged(), 0);
+        let empty: Vec<ArtistDbRow> = Vec::with_capacity(1);
+        assert!(build_bounded_snapshot(&mut budget, &empty, &[], &[], work).is_err());
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[test]
+    fn internal_mapper_preserves_duplicate_occurrences_and_fields() {
+        let artists = [artist("a", "First", "Z"), artist("a", "Last", "A")];
+        let mut releases = [release("r", Some(("a", "First"))), release("r", None)];
+        releases[0].year = Some(2001);
+        releases[1].year = Some(2002);
+        let mut tracks = [track("r"), track("r")];
+        tracks[0].duration_ms = Some(2500);
+        tracks[1].duration_ms = Some(3500);
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let need = total(&artists, &releases, &tracks);
+        let mut budget = ConstructionBudget::new(need);
+        let actual = construct_snapshot(&mut budget, &artists, &releases, &tracks, work).unwrap();
+        let expected = crate::subsonic_dispatch::build_snapshot(&artists, &releases, &tracks);
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        let mut short = ConstructionBudget::new(need - 1);
+        assert!(construct_snapshot(&mut short, &artists, &releases, &tracks, work).is_err());
+    }
+
+    #[test]
+    fn unproven_rows_fail_closed_for_each_row_kind() {
+        assert_eq!(reject_unproven_rows(&[], &[], &[]), Err(BudgetExceeded));
+        assert_eq!(
+            reject_unproven_rows(&[artist("a", "n", "s")], &[], &[]),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(
+            reject_unproven_rows(&[], &[release("r", None)], &[]),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(
+            reject_unproven_rows(&[], &[], &[track("r")]),
+            Err(BudgetExceeded)
+        );
+    }
 
     fn cost(n: usize, size: usize) -> usize {
         ((n * size + 11) & !7).max(16) + 8
