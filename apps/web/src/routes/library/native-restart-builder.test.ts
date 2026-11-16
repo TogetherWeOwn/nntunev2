@@ -6,6 +6,7 @@ import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
+import { seekableIncludesStart } from '#lib/player/seekableIncludesStart.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -19,7 +20,7 @@ function restartFixture() {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
-		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
+		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
 		'currentAudioEvent', 'handleEnded', 'shortTitle'
 	]);
@@ -52,7 +53,7 @@ function restartFixture() {
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
-		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy,
+		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, seekableIncludesStart,
 		streamUrl: track.streamUrl,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};

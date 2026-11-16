@@ -1,10 +1,9 @@
-//! Inert output-allocation planner for `subsonic_dispatch::build_snapshot`.
+//! Inert accounting for snapshot output allocations only.
 //!
-//! The inert builder rejects raw rows without precharge provenance.
-//! It plans output charges before allocating and uses borrowed scans and bounded
-//! in-place ordering instead of the existing mapper's maps and sort scratch.
-//! Charges are cumulative; after an error discard the budget. This does not
-//! authorize mounting or account for database collection or runtime memory.
+//! Success does not admit raw rows or authorize construction or mounting.
+//! Raw row allocations, database collection, ordering work and other runtime
+//! allocations require separate accounting. Charges are cumulative; discard
+//! the budget after an error.
 
 use nntune_subsonic::construction_budget::{BudgetExceeded, ConstructionBudget};
 use nntune_subsonic::library::{Album, Artist, Song, NOW};
@@ -12,17 +11,13 @@ use nntune_subsonic::library::{Album, Artist, Song, NOW};
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::subsonic_dispatch::{FLAC_CONTENT_TYPE, FLAC_SUFFIX};
 
-type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
-
 fn vec_of<T>(b: &mut ConstructionBudget, n: usize) -> Result<(), BudgetExceeded> {
-    // An empty Vec or ZST buffer does not allocate.
     if n == 0 || std::mem::size_of::<T>() == 0 {
         return Ok(());
     }
     b.charge(n, std::mem::size_of::<T>(), std::mem::align_of::<T>())
 }
 
-/// A cloned `String` has capacity == len; an empty one does not allocate.
 fn string(b: &mut ConstructionBudget, len: usize) -> Result<(), BudgetExceeded> {
     if len == 0 {
         return Ok(());
@@ -34,18 +29,8 @@ fn opt(b: &mut ConstructionBudget, s: &Option<String>) -> Result<(), BudgetExcee
     string(b, s.as_deref().map_or(0, str::len))
 }
 
-/// Even an empty borrowed slice can have a retained, allocated backing vector.
-/// Without a raw-row receipt no input is admitted.
-pub fn reject_unproven_rows(
-    _artists: &[ArtistDbRow],
-    _releases: &[ReleaseDbRow],
-    _tracks: &[TrackDbRow],
-) -> Result<(), BudgetExceeded> {
-    Err(BudgetExceeded)
-}
-
-/// Charge the exact output vectors and per-field string copies of
-/// `build_snapshot(artists, releases, tracks)`, in a fixed order.
+/// Charge output vectors and string copies, without allocating or admitting rows.
+/// The future constructor must reserve the planned capacities before copying.
 pub fn plan_snapshot_output(
     budget: &mut ConstructionBudget,
     artists: &[ArtistDbRow],
@@ -63,32 +48,41 @@ pub fn plan_snapshot_output(
         let artist_id = r.artist_mbid.as_deref().unwrap_or("");
         string(budget, r.mbid.len())?;
         string(budget, r.title.len())?;
-        opt(budget, &r.artist_name)?; // artist
+        opt(budget, &r.artist_name)?;
         string(budget, artist_id.len())?;
         string(budget, NOW.len())?;
-        // HashMap collect keeps the LAST artist for a duplicate mbid, so the
-        // reverse scan finds the same row; otherwise the artist name is copied.
+        // The existing mapper keeps the last artist with a duplicate ID.
         let sort_len = match artists.iter().rev().find(|a| a.mbid == artist_id) {
             Some(a) => a.sort_name.len(),
             None => r.artist_name.as_deref().map_or(0, str::len),
         };
-        string(budget, sort_len)?; // artist_sort_name
+        string(budget, sort_len)?;
     }
-    // Duplicate release IDs only change `Song::year` (numeric), not any copy.
     for t in tracks {
         string(budget, t.recording_mbid.len())?;
         string(budget, t.title.len())?;
         string(budget, t.release_title.len())?;
         opt(budget, &t.artist_name)?;
-        // genre is empty and never allocates; release_mbid is copied twice.
-        string(budget, t.release_mbid.len())?; // cover_art
+        string(budget, t.release_mbid.len())?; // cover art
         string(budget, FLAC_CONTENT_TYPE.len())?;
         string(budget, FLAC_SUFFIX.len())?;
         string(budget, NOW.len())?;
-        string(budget, t.release_mbid.len())?; // album_id
+        string(budget, t.release_mbid.len())?; // album ID
         opt(budget, &t.artist_mbid)?;
     }
     Ok(())
+}
+
+type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
+
+/// Even an empty borrowed slice can have a retained, allocated backing vector.
+/// Without a raw-row receipt no input is admitted.
+pub fn reject_unproven_rows(
+    _artists: &[ArtistDbRow],
+    _releases: &[ReleaseDbRow],
+    _tracks: &[TrackDbRow],
+) -> Result<(), BudgetExceeded> {
+    Err(BudgetExceeded)
 }
 
 /// Construct only when retained raw allocations have a trustworthy receipt.
@@ -211,9 +205,6 @@ fn construct_snapshot(
 mod tests {
     use super::*;
 
-    fn cost(cap: usize, size: usize) -> usize {
-        ((cap * size + 11) & !7).max(16) + 8
-    }
     fn artist(mbid: &str, name: &str, sort: &str) -> ArtistDbRow {
         ArtistDbRow {
             mbid: mbid.into(),
@@ -307,48 +298,117 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_input_charges_nothing() {
-        assert_eq!(total(&[], &[], &[]), 0);
+    fn cost(n: usize, size: usize) -> usize {
+        ((n * size + 11) & !7).max(16) + 8
     }
 
     #[test]
-    fn charges_vectors_and_each_distinct_field_copy() {
-        let a = [artist("a1", "Name", "Sort")];
-        let r = [release("r1", Some(("a1", "Name")))];
-        let t = [track("r1")];
-        let sz = std::mem::size_of::<Artist>();
-        let al = std::mem::size_of::<Album>();
-        let so = std::mem::size_of::<Song>();
-        let vectors = cost(1, sz) + cost(1, al) + cost(1, so);
-        // artist: id, name
-        let artists = cost(2, 1) + cost(4, 1);
-        // album: id, title, artist, artist_id, created, sort ("Sort", not name)
-        let albums = [2, 1, 4, 2, NOW.len(), 4]
+    fn output_field_accounting_and_limit_boundaries() {
+        let artists = [
+            ArtistDbRow {
+                mbid: "a".into(),
+                name: "artist".into(),
+                sort_name: "ignored".into(),
+                artist_type: None,
+                country: None,
+            },
+            ArtistDbRow {
+                mbid: "a".into(),
+                name: "last".into(),
+                sort_name: "a much longer sort name".into(),
+                artist_type: None,
+                country: None,
+            },
+        ];
+        let releases = [
+            ReleaseDbRow {
+                mbid: "release".into(),
+                title: "title".into(),
+                release_type: None,
+                year: None,
+                artist_mbid: Some("a".into()),
+                artist_name: Some("fallback".into()),
+            },
+            ReleaseDbRow {
+                mbid: "other".into(),
+                title: "".into(),
+                release_type: None,
+                year: None,
+                artist_mbid: None,
+                artist_name: Some("fallback name".into()),
+            },
+        ];
+        let tracks = [TrackDbRow {
+            release_mbid: "release".into(),
+            recording_mbid: "recording".into(),
+            title: "song".into(),
+            duration_ms: None,
+            medium_no: None,
+            track_no: None,
+            release_title: "album".into(),
+            artist_mbid: Some("artist-id".into()),
+            artist_name: Some("artist-name".into()),
+        }];
+        let expected = cost(2, std::mem::size_of::<Artist>())
+            + cost(2, std::mem::size_of::<Album>())
+            + cost(1, std::mem::size_of::<Song>())
+            + [
+                1,
+                6,
+                1,
+                4,
+                7,
+                5,
+                8,
+                1,
+                NOW.len(),
+                23,
+                5,
+                13,
+                NOW.len(),
+                13,
+                9,
+                4,
+                5,
+                11,
+                7,
+                FLAC_CONTENT_TYPE.len(),
+                FLAC_SUFFIX.len(),
+                NOW.len(),
+                7,
+                9,
+            ]
+            .into_iter()
             .map(|n| cost(n, 1))
-            .iter()
             .sum::<usize>();
-        // song: id, title, cover_art, content_type, suffix, created, album_id
-        // (empty album/artist/genre/artist_id skipped; release_mbid twice)
-        let songs = [
-            3,
-            2,
-            2,
-            FLAC_CONTENT_TYPE.len(),
-            FLAC_SUFFIX.len(),
-            NOW.len(),
-            2,
-        ]
-        .map(|n| cost(n, 1))
-        .iter()
-        .sum::<usize>();
-        assert_eq!(total(&a, &r, &t), vectors + artists + albums + songs);
+        let mut exact = ConstructionBudget::new(expected);
+        assert_eq!(
+            plan_snapshot_output(&mut exact, &artists, &releases, &tracks),
+            Ok(())
+        );
+        assert_eq!(exact.charged(), expected);
+        let mut short = ConstructionBudget::new(expected - 1);
+        assert_eq!(
+            plan_snapshot_output(&mut short, &artists, &releases, &tracks),
+            Err(BudgetExceeded)
+        );
+        assert!(short.charged() < expected);
+        let mut extra = ConstructionBudget::new(expected + 1);
+        assert_eq!(
+            plan_snapshot_output(&mut extra, &artists, &releases, &tracks),
+            Ok(())
+        );
+        assert_eq!(extra.charged(), expected);
     }
 
     #[test]
-    fn checked_overflow_fails_closed() {
-        let mut b = ConstructionBudget::new(usize::MAX);
-        assert_eq!(vec_of::<Song>(&mut b, usize::MAX), Err(BudgetExceeded));
-        assert_eq!(b.charged(), 0);
+    fn empty_and_overflow() {
+        let mut budget = ConstructionBudget::new(0);
+        assert_eq!(plan_snapshot_output(&mut budget, &[], &[], &[]), Ok(()));
+        assert_eq!(budget.charged(), 0);
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        assert_eq!(vec_of::<Song>(&mut budget, usize::MAX), Err(BudgetExceeded));
+        assert_eq!(string(&mut budget, usize::MAX), Err(BudgetExceeded));
+        assert_eq!(budget.charged(), 0);
     }
 }
