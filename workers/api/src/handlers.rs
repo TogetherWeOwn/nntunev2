@@ -1557,6 +1557,14 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
     }
+    /// Delete only the specified owner's session; an absent session is harmless.
+    fn delete_private_session(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Read a resolved target exactly, including expired snoozes. Callers must
     /// canonicalize known MBIDs and preserve opaque job IDs, including UUID-shaped
     /// ones. Presentation filters expired snoozes.
@@ -8807,6 +8815,23 @@ mod tests {
             if let Some(row) = self.native_credentials.borrow_mut().get_mut(id) {
                 row.last_used_at = Some(now);
             }
+            Ok(())
+        }
+        async fn delete_private_session(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<(), StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || session_id.contains('\0')
+            {
+                return Err(StoreError);
+            }
+            self.private_sessions
+                .borrow_mut()
+                .remove(&(user_id.into(), session_id.into()));
             Ok(())
         }
         async fn taste_upsert(
@@ -23063,6 +23088,33 @@ mod tests {
         }
         *store.fail_catalogue_reads.borrow_mut() = true;
         assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
+    }
+
+    #[test]
+    fn fake_private_session_mutations_are_scoped_and_fenced() {
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for (owner, session, expiry) in [("u1", "A", 1), ("u1", "a", 2), ("u2", "A", 3)] {
+            block_on(s.upsert_private_session(owner, session, expiry)).unwrap();
+        }
+        block_on(s.delete_private_session("u1", "A")).unwrap();
+        block_on(s.delete_private_session("u1", "A")).unwrap();
+        assert_eq!(s.private_sessions.borrow().len(), 2);
+        assert!(block_on(s.delete_private_session("missing", "a")).is_err());
+        s.deleting_users.borrow_mut().insert("u1".into());
+        assert!(block_on(s.delete_private_session("u1", "a")).is_err());
+        *s.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(s.delete_private_session("u2", "A")).is_err());
+        assert_eq!(
+            s.private_sessions.borrow().get(&("u1".into(), "a".into())),
+            Some(&2)
+        );
+        assert_eq!(
+            s.private_sessions.borrow().get(&("u2".into(), "A".into())),
+            Some(&3)
+        );
     }
 
     #[test]

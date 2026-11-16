@@ -1891,3 +1891,95 @@ async fn snapshot_membership_queries_share_one_committed_snapshot() {
         .unwrap();
     result.unwrap();
 }
+
+#[tokio::test]
+async fn private_session_delete_is_scoped_and_rolls_back() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let observer = &accounts.observer;
+    let result: Result<(), String> = async {
+        observer.execute("INSERT INTO public.private_sessions VALUES ($1,'A',1), ($1,'a',2), ($1,'keep',3), ($2,'A',4)", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let reached = Rc::new(Cell::new(false));
+        let marker = reached.clone();
+        store.set_preflight_hook("private-session-delete", Box::new(move || Box::pin(async move {
+            marker.set(true);
+            Err(StoreError)
+        })));
+        if !matches!(store.delete_private_session(&owner, "A").await, Err(StoreError)) || !reached.get() {
+            return Err("delete rollback injection was not reached".into());
+        }
+        // Acquire the account fence before checking the rollback.
+        observer.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        observer.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let count: i64 = observer.query_one("SELECT count(*) FROM public.private_sessions WHERE user_id = $1 AND session_id = 'A'", &[&owner]).await.map_err(|e| e.to_string())?.get(0);
+        observer.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+        if count != 1 { return Err("delete did not roll back".into()); }
+        for (id, session) in [(&owner, "A"), (&owner, "A"), (&owner, "missing"), (&other, "a")] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            store.delete_private_session(id, session).await.map_err(|_| "valid delete failed".to_string())?;
+        }
+        let missing = format!("{owner}-missing");
+        observer.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        for id in [&owner, &missing] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            if !matches (store.delete_private_session(id, "a").await, Err(StoreError)) { return Err("unavailable account accepted".into()); }
+        }
+        let failed = private_client().await?;
+        failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        if failed.batch_execute("SELECT 1/0").await.is_ok() { return Err("failure injection failed".into()); }
+        let store = catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !matches!(store.delete_private_session(&other, "A").await, Err(StoreError)) { return Err("database error was not opaque".into()); }
+        drop(store);
+        let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2)", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        let mut actual: Vec<(String,String,i64)> = rows.iter().map(|r| (r.get(0),r.get(1),r.get(2))).collect();
+        let mut expected = vec![(owner.clone(),"a".into(),2), (owner.clone(),"keep".into(),3), (other.clone(),"A".into(),4)];
+        actual.sort(); expected.sort();
+        if actual != expected { return Err("delete changed unrelated sessions".into()); }
+        Ok(())
+    }.await;
+    let _ = observer.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn private_session_delete_respects_account_fence() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let observer = &accounts.observer;
+    let locker = client(false).await;
+    let result: Result<(), String> = async {
+        observer.execute("INSERT INTO public.private_sessions VALUES ($1,'target',1), ($2,'target',2)", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        for deleting in [true, false] {
+            locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+            if deleting {
+                locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+            } else {
+                locker.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+            }
+            let locker_pid: i32 = locker.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let writer = private_client().await?;
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+            let delete = store.delete_private_session(&owner, "target");
+            tokio::pin!(delete);
+            blocker_observer::observe_blocked(observer, locker_pid, writer_pid, delete.as_mut()).await?;
+            let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            unrelated.delete_private_session(&other, "missing").await.map_err(|_| "unrelated account blocked".to_string())?;
+            let count: i64 = observer.query_one("SELECT count(*) FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target'", &[&owner]).await.map_err(|e| e.to_string())?.get(0);
+            if count != 1 { return Err("delete ran before account lock released".into()); }
+            locker.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+            if delete.await.is_err() != deleting { return Err("unexpected result after account fence".into()); }
+            if deleting { observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?; }
+        }
+        let rows = observer.query("SELECT user_id FROM public.private_sessions WHERE user_id IN ($1,$2)", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        if rows.len() != 1 || rows[0].get::<_, String>(0) != other { return Err("unexpected rows after account fence".into()); }
+        Ok(())
+    }.await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
