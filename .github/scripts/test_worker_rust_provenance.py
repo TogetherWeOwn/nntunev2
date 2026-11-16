@@ -144,6 +144,15 @@ class RustPin(unittest.TestCase):
                 wt.install_rust(env, run=run)
             self.assertEqual(calls, ["rustup", "rustup", "rustc", "cargo", "rustc"])
 
+    def test_relative_rustup_home_refused_before_install_or_probe(self):
+        env = {"RUSTUP_HOME": "relative", "RUSTUP_TOOLCHAIN": "1.98.1"}
+        def no_run(*args, **kwargs):
+            self.fail("subprocess must not run")
+        with self.assertRaisesRegex(ValueError, "RUSTUP_HOME must be absolute"):
+            wt.verify_rust_toolchain(wt.load_pins(), env, no_run, {})
+        with patch.object(wt, "require_actions"), self.assertRaisesRegex(ValueError, "RUSTUP_HOME must be absolute"):
+            wt.install_rust(env, run=no_run)
+
     def test_api_lock_identity_is_pinned(self):
         pins = wt.load_pins()
         wt.check_lock_identity(pins)

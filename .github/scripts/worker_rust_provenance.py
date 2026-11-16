@@ -49,6 +49,8 @@ def rust_env_refusals(env, version: str) -> None:
             continue
         if name == "CARGO_INCREMENTAL" or name in RUST_ENV_EXACT or name.startswith(RUST_ENV_PREFIXES):
             raise ValueError(f"{key} may change the pinned Rust build")
+    if env.get("RUSTUP_HOME") and not Path(env["RUSTUP_HOME"]).is_absolute():
+        raise ValueError("RUSTUP_HOME must be absolute")
     if env.get("RUSTUP_TOOLCHAIN") != version:
         raise ValueError("RUSTUP_TOOLCHAIN is not the pinned version")
 
@@ -170,7 +172,6 @@ def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
         output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\nRUST_STD_DIGESTS={digests}\n")
     verify_rust_toolchain(pins, env, run, std_files)
     print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
-
 
 
 if __name__ == "__main__":
