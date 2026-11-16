@@ -76,7 +76,11 @@ class SelfTest(unittest.TestCase):
         body = self.body(False)
         body["observations"]["tasks"][0] = dict.fromkeys(
             ("root", "before", "mid", "end", "after"), "other")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "malformed control observation"):
+            evaluate_negative(body)
+        body = self.body(False)
+        body["observations"]["tasks"][0]["before"] = "other"
+        with self.assertRaisesRegex(ValueError, "negative control did not observe root throughout"):
             evaluate_negative(body)
 
     def test_concurrent_collision(self):
