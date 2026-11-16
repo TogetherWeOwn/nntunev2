@@ -17,6 +17,8 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/billing_contention.rs"]
 mod billing_contention;
+#[path = "support/billing_transaction_fixture.rs"]
+mod billing_transaction_fixture;
 
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const T: i64 = 1_786_032_000;
@@ -1397,4 +1399,112 @@ async fn abandoned_table_lock_expires_and_rollback_cleans_local_settings() {
         "fixture cleanup failed: {cleanup:?}; phases: {result:?}"
     );
     result.expect("expiry phases failed");
+}
+
+#[test]
+fn coupled_sql_relation_is_transformed_only_for_the_trusted_schema() {
+    let [lock, lookup, write] = billing_transaction_fixture::fixed_sql("billing_test_1_2");
+    assert!(lock.contains("billing_test_1_2.subscriptions IN SHARE ROW EXCLUSIVE"));
+    assert!(lookup.contains("FROM billing_test_1_2.subscriptions WHERE"));
+    assert!(write.starts_with("INSERT INTO billing_test_1_2.subscriptions "));
+    assert!(
+        std::panic::catch_unwind(|| billing_transaction_fixture::fixed_sql("x; DROP")).is_err()
+    );
+}
+
+#[tokio::test]
+async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
+    use billing_transaction_fixture::{run, Class};
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    let schema = fx.schema.clone();
+    // Non-explicit guarded upsert: exact RETURNING, then an equal-end replay.
+    let first = fx
+        .fold(
+            "u1",
+            &remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]),
+        )
+        .await;
+    assert!(!first.explicit_stale);
+    assert_eq!(
+        run(&mut fx.db, &schema, "u1", &first).await,
+        Ok(Class::Wrote)
+    );
+    let stored = fx.snap("sub_a").await.unwrap();
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert_eq!(
+        run(&mut fx.db, &schema, "u1", &first).await,
+        Ok(Class::Wrote)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+
+    let mut stale = fx
+        .fold("u1", &remote("sub_a", &[invoice("sub_a", 1)]))
+        .await;
+    assert!(stale.explicit_stale);
+    let mut extra = stale.history[0].clone();
+    extra.stripe_invoice_id = "inv_extra".into();
+    stale.history.push(extra);
+    // Explicit stale: own succeeds and keeps history; the row never changes.
+    assert_eq!(
+        run(&mut fx.db, &schema, "u1", &stale).await,
+        Ok(Class::OwnStale)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    // Foreign owner rejects whatever the history, and leaves no history.
+    let mut foreign = stale.clone();
+    foreign.history[1].stripe_invoice_id = "inv_foreign".into();
+    for history_empty in [false, true] {
+        if history_empty {
+            foreign.history.clear();
+        }
+        assert!(run(&mut fx.db, &schema, "u2", &foreign).await.is_err());
+        assert_eq!(fx.history_rows("sub_a").await, 3);
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    }
+    let mut unflagged_foreign = stale.clone();
+    unflagged_foreign.explicit_stale = false;
+    assert!(run(&mut fx.db, &schema, "u2", &unflagged_foreign)
+        .await
+        .is_err());
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    // Absent: empty explicit stale succeeds without a row; with history rejects.
+    let mut absent = stale.clone();
+    absent.row.stripe_subscription_id = "sub_missing".into();
+    for h in &mut absent.history {
+        h.stripe_subscription_id = "sub_missing".into();
+    }
+    absent.history[1].stripe_invoice_id = "inv_absent".into();
+    assert!(run(&mut fx.db, &schema, "u1", &absent).await.is_err());
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    absent.history.clear();
+    assert_eq!(
+        run(&mut fx.db, &schema, "u1", &absent).await,
+        Ok(Class::AbsentEmpty)
+    );
+    assert!(fx.snap("sub_missing").await.is_none());
+    // Zero rows from a non-explicit write are recognized only as own PG-stale.
+    let mut unflagged = stale.clone();
+    unflagged.explicit_stale = false;
+    assert_eq!(
+        run(&mut fx.db, &schema, "u1", &unflagged).await,
+        Ok(Class::OwnStale)
+    );
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    // A history SQL failure after a successful write rolls the write back.
+    let mut failing = fx
+        .fold("u2", &remote("sub_r", &[invoice("sub_r", 1)]))
+        .await;
+    failing.history[0].plan_id = "missing_plan".into();
+    let failure = run(&mut fx.db, &schema, "u2", &failing).await.unwrap_err();
+    assert!(
+        failure.contains("foreign key"),
+        "unexpected failure: {failure}"
+    );
+    assert!(fx.snap("sub_r").await.is_none());
+    assert_eq!(fx.history_rows("sub_r").await, 0);
+    assert_eq!(fx.snap("sub_a").await, Some(stored));
+    fx.cleanup().await;
 }
