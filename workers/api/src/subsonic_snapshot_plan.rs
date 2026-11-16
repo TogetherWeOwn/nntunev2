@@ -73,6 +73,45 @@ pub fn plan_snapshot_output(
     Ok(())
 }
 
+// This receipt owns its rows and exclusively borrows the ledger for their
+// entire lifetime. It deliberately has no mutable row access or constructor
+// accepting caller-owned vectors. Only the zero-allocation case is proven:
+// try_reserve_exact does not promise an upper bound on allocator capacity.
+// Nonempty construction must remain unavailable until that bound is proven.
+#[allow(dead_code)]
+struct OwnedRawRows<'a> {
+    budget: &'a mut ConstructionBudget,
+    artists: Vec<ArtistDbRow>,
+    releases: Vec<ReleaseDbRow>,
+    tracks: Vec<TrackDbRow>,
+}
+
+#[allow(dead_code)]
+impl<'a> OwnedRawRows<'a> {
+    fn try_copy(
+        budget: &'a mut ConstructionBudget,
+        artists: &[ArtistDbRow],
+        releases: &[ReleaseDbRow],
+        tracks: &[TrackDbRow],
+    ) -> Result<Self, BudgetExceeded> {
+        // The caller's storage is not retained. No reservation or copy is
+        // attempted until its maximum retained capacity can be established.
+        if !artists.is_empty() || !releases.is_empty() || !tracks.is_empty() {
+            return Err(BudgetExceeded);
+        }
+        Ok(Self {
+            budget,
+            artists: Vec::new(),
+            releases: Vec::new(),
+            tracks: Vec::new(),
+        })
+    }
+
+    fn rows(&self) -> (&[ArtistDbRow], &[ReleaseDbRow], &[TrackDbRow]) {
+        (&self.artists, &self.releases, &self.tracks)
+    }
+}
+
 type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
 
 /// Even an empty borrowed slice can have a retained, allocated backing vector.
@@ -244,6 +283,76 @@ mod tests {
     }
 
     #[test]
+    fn empty_owned_receipt_retains_ledger_and_no_allocations() {
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        budget.charge(1, 1, 1).unwrap();
+        let prior = budget.charged();
+        let borrowed_artists = Vec::<ArtistDbRow>::with_capacity(1);
+        let borrowed_releases = Vec::<ReleaseDbRow>::with_capacity(1);
+        let borrowed_tracks = Vec::<TrackDbRow>::with_capacity(1);
+        {
+            let receipt = OwnedRawRows::try_copy(
+                &mut budget,
+                &borrowed_artists,
+                &borrowed_releases,
+                &borrowed_tracks,
+            )
+            .unwrap();
+            assert_eq!(receipt.budget.charged(), prior);
+            assert_eq!(receipt.artists.capacity(), 0);
+            assert_eq!(receipt.releases.capacity(), 0);
+            assert_eq!(receipt.tracks.capacity(), 0);
+            let (artists, releases, tracks) = receipt.rows();
+            assert_eq!(
+                reject_unproven_rows(artists, releases, tracks),
+                Err(BudgetExceeded)
+            );
+        }
+        assert_eq!(budget.charged(), prior);
+    }
+
+    #[test]
+    fn owned_copy_rejects_each_unproven_nonempty_input_without_charging() {
+        let artists = [artist("", "", "")];
+        let releases = [release("", None)];
+        let tracks = [track("")];
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        budget.charge(1, 1, 1).unwrap();
+        let prior = budget.charged();
+        for (a, r, t) in [
+            (artists.as_slice(), &[][..], &[][..]),
+            (&[][..], releases.as_slice(), &[][..]),
+            (&[][..], &[][..], tracks.as_slice()),
+        ] {
+            assert!(OwnedRawRows::try_copy(&mut budget, a, r, t).is_err());
+            assert_eq!(budget.charged(), prior);
+        }
+    }
+
+    #[test]
+    fn empty_receipt_at_exhausted_limit_does_not_carry_borrowed_storage() {
+        let mut budget = ConstructionBudget::new(0);
+        let artists = Vec::<ArtistDbRow>::with_capacity(32);
+        let receipt = OwnedRawRows::try_copy(&mut budget, &artists, &[], &[]).unwrap();
+        assert_eq!(receipt.budget.charged(), 0);
+        assert_eq!(receipt.artists.capacity(), 0);
+        assert!(receipt.rows().0.is_empty());
+    }
+
+    #[test]
+    fn raw_copy_plan_rejects_overflow_with_existing_charge() {
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        budget.charge(1, 1, 1).unwrap();
+        let prior = budget.charged();
+        assert_eq!(
+            vec_of::<TrackDbRow>(&mut budget, usize::MAX),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(string(&mut budget, usize::MAX), Err(BudgetExceeded));
+        assert_eq!(budget.charged(), prior);
+    }
+
+    #[test]
     fn builder_rejects_unproven_rows_before_charging() {
         let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
             comparisons: usize::MAX,
@@ -254,9 +363,17 @@ mod tests {
             build_bounded_snapshot(&mut budget, &[artist("a", "n", "s")], &[], &[], work).is_err()
         );
         assert_eq!(budget.charged(), 0);
-        let empty: Vec<ArtistDbRow> = Vec::with_capacity(1);
-        assert!(build_bounded_snapshot(&mut budget, &empty, &[], &[], work).is_err());
-        assert_eq!(budget.charged(), 0);
+        let empty_artists: Vec<ArtistDbRow> = Vec::with_capacity(1);
+        let empty_releases: Vec<ReleaseDbRow> = Vec::with_capacity(1);
+        let empty_tracks: Vec<TrackDbRow> = Vec::with_capacity(1);
+        for (artists, releases, tracks) in [
+            (empty_artists.as_slice(), &[][..], &[][..]),
+            (&[][..], empty_releases.as_slice(), &[][..]),
+            (&[][..], &[][..], empty_tracks.as_slice()),
+        ] {
+            assert!(build_bounded_snapshot(&mut budget, artists, releases, tracks, work).is_err());
+            assert_eq!(budget.charged(), 0);
+        }
     }
 
     #[test]
