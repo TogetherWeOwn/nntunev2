@@ -20,7 +20,7 @@ pub struct OrderWork {
 pub fn order_work(artists: usize, albums: usize, songs: usize, rows: usize) -> Option<OrderWork> {
     fn pairs(n: usize) -> Option<usize> {
         let previous = n.saturating_sub(1);
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             (n / 2).checked_mul(previous)
         } else {
             n.checked_mul(previous / 2)
@@ -35,6 +35,10 @@ pub fn order_work(artists: usize, albums: usize, songs: usize, rows: usize) -> O
     })
 }
 
+/// The work estimate overflowed or exceeded the supplied limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderRefused;
+
 /// Rejects before touching any output if either work limit is insufficient.
 pub fn order_snapshot(
     artists: &mut [Artist],
@@ -42,10 +46,11 @@ pub fn order_snapshot(
     songs: &mut [Song],
     artist_rows: &[ArtistDbRow],
     budget: OrderWork,
-) -> Result<(), ()> {
-    let work = order_work(artists.len(), albums.len(), songs.len(), artist_rows.len()).ok_or(())?;
+) -> Result<(), OrderRefused> {
+    let work = order_work(artists.len(), albums.len(), songs.len(), artist_rows.len())
+        .ok_or(OrderRefused)?;
     if work.comparisons > budget.comparisons || work.artist_row_probes > budget.artist_row_probes {
-        return Err(());
+        return Err(OrderRefused);
     }
     stable_insertion(artists, |a, b| {
         artist_sort(a, artist_rows)
