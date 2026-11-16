@@ -112,6 +112,8 @@ describe('attribution inventory v1', () => {
 		expect(inventoryDrift(changed, lockfile)).toContain('package drift: @sveltejs/kit');
 		expect(inventoryDrift(packageJson, lockfile.replace('version: 5.57.3\n', 'version: 5.57.4\n')))
 			.toContain('package drift: svelte');
+		expect(inventoryDrift(packageJson, lockfile.replace('version: 3.2.0(', 'version: 3.1.1(')))
+			.toContain('package drift: @sveltejs/kit');
 		expect(inventoryDrift(packageJson, '')).toHaveLength(3);
 	});
 });
