@@ -45,10 +45,11 @@ async fn private_account_fence_serializes_and_refuses_closed_accounts() {
         let pending = waiter.query(FENCE, params);
         tokio::pin!(pending);
         let blocked_by_holder = tokio::time::timeout(Duration::from_secs(2), async {
+            let blocker_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&holder_pid, &waiter_pid];
             loop {
                 tokio::select! {
                     result = &mut pending => return Err(format!("waiter completed before release: {result:?}")),
-                    result = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", &[&holder_pid, &waiter_pid]) => {
+                    result = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2))", blocker_params) => {
                         let row = result.map_err(|error| error.to_string())?;
                         if row.get::<_, bool>(0) { return Ok(()); }
                     }
