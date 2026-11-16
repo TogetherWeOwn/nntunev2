@@ -157,6 +157,42 @@ async fn private_session_upsert_rolls_back_after_mutation() {
 }
 
 #[tokio::test]
+async fn private_session_blocked_mutation_releases_account_fence() {
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let owner = accounts.id(0).to_owned();
+    let observer = &accounts.observer;
+    let locker = client(false).await;
+    let result: Result<(), String> = async {
+        observer.execute("INSERT INTO public.private_sessions VALUES ($1, 'target', 10)", &[&owner]).await.map_err(|e| e.to_string())?;
+        locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        locker.query_one("SELECT session_id FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target' FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let locker_pid: i32 = locker.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let writer = private_client().await?;
+        writer.batch_execute("SET statement_timeout = 0; SET lock_timeout = 0").await.map_err(|e| e.to_string())?;
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let upsert = store.upsert_private_session(&owner, "target", 99);
+        tokio::pin!(upsert);
+        blocker_observer::observe_blocked(observer, locker_pid, writer_pid, upsert.as_mut()).await?;
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(20), upsert).await, Ok(Err(StoreError))) {
+            return Err("blocked mutation did not return a bounded opaque error".into());
+        }
+        // The session lock is still held; acquiring the account fence proves the
+        // writer has released its transaction independently of that lock.
+        observer.batch_execute("BEGIN; SET LOCAL lock_timeout = '2s'").await.map_err(|e| e.to_string())?;
+        observer.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let expiry: i64 = observer.query_one("SELECT expires_at FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target'", &[&owner]).await.map_err(|e| e.to_string())?.get(0);
+        observer.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+        if expiry != 10 { return Err("blocked mutation changed the stored expiration".into()); }
+        Ok(())
+    }.await;
+    let _ = observer.batch_execute("ROLLBACK").await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn private_session_upsert_respects_account_fence() {
     let accounts = disposable_accounts::Accounts::new(2).await;
     let owner = accounts.id(0).to_owned();

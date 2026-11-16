@@ -2636,6 +2636,10 @@ impl Store for PgStore {
                     .start()
                     .await
                     .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
                 if transaction
                     .query_typed(
                         crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
