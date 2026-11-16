@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -20,9 +21,19 @@ from check_web_bundle_budget import (
     BudgetExceeded,
     check,
     default_client_dir,
-    main,
     measure,
 )
+from check_web_bundle_budget import (
+    main as budget_main,
+)
+
+
+def main(args: list[str]) -> int:
+    # Ordinary fixtures must not publish synthetic overages to the real job.
+    with patch.dict(os.environ):
+        os.environ.pop("GITHUB_ACTIONS", None)
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        return budget_main(args)
 
 
 def _client_dir_with(sizes: dict[str, int]) -> Path:
@@ -137,9 +148,9 @@ def test_equal_size_files_sort_by_full_path() -> None:
     # this proves the tie-break uses the full path, not the file name.
     client = _client_dir_with({"b.js": 100, "a/z.js": 100})
     _, sized = check(client, 10_000)
-    assert [str(path) for path, _ in sized] == sorted(
-        str(path) for path, _ in sized
-    ), sized
+    assert [str(path) for path, _ in sized] == sorted(str(path) for path, _ in sized), (
+        sized
+    )
     assert sized[0][0].name == "z.js", sized
 
 
@@ -287,25 +298,45 @@ def test_two_file_over_budget_reports_both_in_order() -> None:
 def test_overage_publishes_actions_warning_and_summary() -> None:
     client = _client_dir_with({"a.js": 900, "b.js": 200})
     summary = Path(tempfile.mkdtemp()) / "summary.md"
-    saved = {key: os.environ.get(key) for key in ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")}
+    saved = {
+        key: os.environ.get(key) for key in ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")
+    }
     os.environ["GITHUB_ACTIONS"] = "true"
     os.environ["GITHUB_STEP_SUMMARY"] = str(summary)
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            assert main(["--client-dir", str(client), "--budget", "1000"]) == 0
+            assert budget_main(["--client-dir", str(client), "--budget", "1000"]) == 0
     finally:
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-    annotations = [line for line in buf.getvalue().splitlines() if line.startswith("::warning::")]
+    annotations = [
+        line for line in buf.getvalue().splitlines() if line.startswith("::warning::")
+    ]
     assert len(annotations) == 1, annotations
     assert "over by 100 B" in annotations[0], annotations
     text = summary.read_text(encoding="utf-8")
     assert "Client-JS bundle budget (advisory)" in text, text
     assert "client JS total 1100 B exceeds budget 1000 B" in text, text
+
+
+def test_ordinary_fixture_isolates_inherited_actions_environment() -> None:
+    client = _client_dir_with({"a.js": 1_001})
+    summary = Path(tempfile.mkdtemp()) / "summary.md"
+    summary.write_text("existing\n", encoding="utf-8")
+    with patch.dict(
+        os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(summary)}
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert main(["--client-dir", str(client), "--budget", "1000"]) == 0
+        assert os.environ["GITHUB_ACTIONS"] == "true"
+        assert os.environ["GITHUB_STEP_SUMMARY"] == str(summary)
+    assert "::warning::" not in buf.getvalue(), buf.getvalue()
+    assert summary.read_text(encoding="utf-8") == "existing\n"
 
 
 def test_overage_outside_actions_prints_no_annotation() -> None:
@@ -345,8 +376,8 @@ def _parse_byte_number(text: str) -> int:
 
 def test_readme_budget_matches_pinned_constant() -> None:
     """README budget number must equal BUDGET_CLIENT_JS_BYTES."""
-    readme = _repo_root().joinpath("apps", "web", "README.md").read_text(
-        encoding="utf-8"
+    readme = (
+        _repo_root().joinpath("apps", "web", "README.md").read_text(encoding="utf-8")
     )
     match = re.search(r"exceeds\s+\*\*([\d,]+)\s*B", readme)
     assert match is not None, "README budget figure not found"
@@ -359,8 +390,8 @@ def test_readme_budget_matches_pinned_constant() -> None:
 
 def test_readme_baseline_matches_script_measured_figure() -> None:
     """README baseline must equal the script's measured figure."""
-    readme = _repo_root().joinpath("apps", "web", "README.md").read_text(
-        encoding="utf-8"
+    readme = (
+        _repo_root().joinpath("apps", "web", "README.md").read_text(encoding="utf-8")
     )
     readme_match = re.search(r"Baseline was\s+([\d,]+)\s*B", readme)
     assert readme_match is not None, "README baseline figure not found"
@@ -378,15 +409,16 @@ def test_readme_baseline_matches_script_measured_figure() -> None:
     )
     script_baseline = next(iter(script_figures))
     assert readme_baseline == script_baseline, (
-        f"README baseline {readme_baseline} B != "
-        f"script measured {script_baseline} B"
+        f"README baseline {readme_baseline} B != script measured {script_baseline} B"
     )
 
 
 def test_splitting_plan_headroom_matches_pinned_budget() -> None:
     """The plan's measured totals and headroom must sum to the ceiling."""
-    plan = _repo_root().joinpath("docs", "web-code-splitting-plan.md").read_text(
-        encoding="utf-8"
+    plan = (
+        _repo_root()
+        .joinpath("docs", "web-code-splitting-plan.md")
+        .read_text(encoding="utf-8")
     )
     limit = re.search(r"exceeds\s+([\d,]+)\s+raw bytes", plan)
     assert limit is not None, "splitting plan budget figure not found"
@@ -419,6 +451,7 @@ def main_test() -> int:
         test_missing_dir_reports_fail_without_file_lines,
         test_two_file_over_budget_reports_both_in_order,
         test_overage_publishes_actions_warning_and_summary,
+        test_ordinary_fixture_isolates_inherited_actions_environment,
         test_overage_outside_actions_prints_no_annotation,
         test_under_budget_pass_report_text,
         test_readme_budget_matches_pinned_constant,
