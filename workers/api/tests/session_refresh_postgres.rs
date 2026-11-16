@@ -11,6 +11,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/blocker_observer.rs"]
+mod blocker_observer;
 #[path = "support/private_account_fence.rs"]
 mod private_account_fence;
 
