@@ -1465,9 +1465,9 @@ async fn coupled_fixture_waits_for_raw_insert_commit_or_rollback() {
             let (next_runner, classification) = completed.map_err(|e| e.to_string())?;
             runner = next_runner;
             if commit {
-                if !matches!(&classification, Err(error) if error == "foreign or mismatched target") { return Err(format!("committed foreign insert: {classification:?}")); }
+                if !matches!(&classification, Err(billing_transaction_fixture::FixtureError::Refusal(error)) if error == "foreign or mismatched target") { return Err(format!("committed foreign insert: {classification:?}")); }
                 if fx.snap("sub_raw").await.map(|row| row.user_id).as_deref() != Some("u2") { return Err("committed foreign row changed".into()); }
-            } else if classification != Ok(billing_transaction_fixture::Class::AbsentEmpty) || fx.snap("sub_raw").await.is_some() {
+            } else if !matches!(&classification, Ok(billing_transaction_fixture::Class::AbsentEmpty)) || fx.snap("sub_raw").await.is_some() {
                 return Err(format!("rolled-back insert: {classification:?}"));
             }
             if fx.history_rows("sub_raw").await != 0 { return Err("unexpected history".into()); }
@@ -1501,16 +1501,16 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
         )
         .await;
     assert!(!first.explicit_stale);
-    assert_eq!(
+    assert!(matches!(
         run(&mut fx.db, &schema, "u1", &first).await,
         Ok(Class::Wrote)
-    );
+    ));
     let stored = fx.snap("sub_a").await.unwrap();
     assert_eq!(fx.history_rows("sub_a").await, 2);
-    assert_eq!(
+    assert!(matches!(
         run(&mut fx.db, &schema, "u1", &first).await,
         Ok(Class::Wrote)
-    );
+    ));
     assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
 
     let mut stale = fx
@@ -1521,10 +1521,10 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     extra.stripe_invoice_id = "inv_extra".into();
     stale.history.push(extra);
     // Explicit stale: own succeeds and keeps history; the row never changes.
-    assert_eq!(
+    assert!(matches!(
         run(&mut fx.db, &schema, "u1", &stale).await,
         Ok(Class::OwnStale)
-    );
+    ));
     assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
     assert_eq!(fx.history_rows("sub_a").await, 3);
     // Foreign owner rejects whatever the history, and leaves no history.
@@ -1534,15 +1534,17 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
         if history_empty {
             foreign.history.clear();
         }
-        assert!(run(&mut fx.db, &schema, "u2", &foreign).await.is_err());
+        assert!(matches!(run(&mut fx.db, &schema, "u2", &foreign).await,
+            Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "foreign or mismatched target"));
         assert_eq!(fx.history_rows("sub_a").await, 3);
         assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
     }
     let mut unflagged_foreign = stale.clone();
     unflagged_foreign.explicit_stale = false;
-    assert!(run(&mut fx.db, &schema, "u2", &unflagged_foreign)
-        .await
-        .is_err());
+    assert!(
+        matches!(run(&mut fx.db, &schema, "u2", &unflagged_foreign).await,
+        Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "foreign or mismatched target")
+    );
     assert_eq!(fx.history_rows("sub_a").await, 3);
     // Absent: empty explicit stale succeeds without a row; with history rejects.
     let mut absent = stale.clone();
@@ -1551,21 +1553,22 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
         h.stripe_subscription_id = "sub_missing".into();
     }
     absent.history[1].stripe_invoice_id = "inv_absent".into();
-    assert!(run(&mut fx.db, &schema, "u1", &absent).await.is_err());
+    assert!(matches!(run(&mut fx.db, &schema, "u1", &absent).await,
+        Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "absent row with history rejected"));
     assert_eq!(fx.history_rows("sub_a").await, 3);
     absent.history.clear();
-    assert_eq!(
+    assert!(matches!(
         run(&mut fx.db, &schema, "u1", &absent).await,
         Ok(Class::AbsentEmpty)
-    );
+    ));
     assert!(fx.snap("sub_missing").await.is_none());
     // Zero rows from a non-explicit write are recognized only as own PG-stale.
     let mut unflagged = stale.clone();
     unflagged.explicit_stale = false;
-    assert_eq!(
+    assert!(matches!(
         run(&mut fx.db, &schema, "u1", &unflagged).await,
         Ok(Class::OwnStale)
-    );
+    ));
     assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
     // A history SQL failure after a successful write rolls the write back.
     let mut failing = fx
@@ -1573,10 +1576,17 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
         .await;
     failing.history[0].plan_id = "missing_plan".into();
     let failure = run(&mut fx.db, &schema, "u2", &failing).await.unwrap_err();
-    assert!(
-        failure.contains("foreign key"),
-        "unexpected failure: {failure}"
-    );
+    match failure {
+        billing_transaction_fixture::FixtureError::Postgres(error) => {
+            let db_error = error.as_db_error().expect("database error");
+            assert_eq!(
+                db_error.code(),
+                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION
+            );
+            assert!(db_error.message().contains("foreign key"));
+        }
+        other => panic!("expected PostgreSQL error, got {other:?}"),
+    }
     assert!(fx.snap("sub_r").await.is_none());
     assert_eq!(fx.history_rows("sub_r").await, 0);
     assert_eq!(fx.snap("sub_a").await, Some(stored));
