@@ -52,7 +52,7 @@ def main():
     allowed = {f"workers/{worker}/Cargo.lock" for worker in WORKERS}
     report = [
         f"PR head: {head}",
-        f"workflow revision: {head}:.github/workflows/ci.yml",
+        f"workflow revision: {head}:.github/workflows/worker-lock-proposal.yml",
         f"run: {os.environ['GITHUB_RUN_ID']} attempt {os.environ['GITHUB_RUN_ATTEMPT']}",
         run("rustup", "run", TOOLCHAIN, "rustc", "--version", capture=True).strip(),
         run("rustup", "run", TOOLCHAIN, "cargo", "--version", capture=True).strip(),
