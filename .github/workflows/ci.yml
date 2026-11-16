@@ -1685,6 +1685,7 @@ jobs:
       - name: Test canonical tool preparation and workflow boundaries
         run: |
           python3 -I .github/scripts/test_worker_tools.py
+          python3 -I .github/scripts/test_worker_rust_provenance.py
           python3 -I .github/scripts/test_worker_build_workflow.py
       - name: Install Rust stable
         run: |
