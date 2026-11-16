@@ -160,6 +160,30 @@ test('real mutation stays in the originating tab', async ({ page }) => {
 	} finally { await other.close(); }
 });
 
+test('real play write leaves the other tab history and transport unchanged', async ({ page }) => {
+	await open(page);
+	const other = await page.context().newPage();
+	try {
+		await open(other);
+		const otherBytes = await raw(other);
+		const otherRows = await other.getByTestId('recent-item').evaluateAll((rows) =>
+			rows.map((row) => ({ id: row.getAttribute('data-track-id'), text: row.textContent }))
+		);
+		expect(otherRows.map((row) => row.id)).toEqual(['third-light', 'demo-track']);
+		const otherTransport = await snapshot(other);
+		await page.getByTestId('queue-select-demo-track').click();
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		await expect.poll(async () => JSON.parse((await raw(page))!)[0]).toEqual({ trackId: 'demo-track', playedAt: new Date('2026-01-01T12:00:00Z').getTime() });
+		await other.waitForTimeout(100);
+		expect(await raw(other)).toBe(otherBytes);
+		expect(await other.getByTestId('recent-item').evaluateAll((rows) =>
+			rows.map((row) => ({ id: row.getAttribute('data-track-id'), text: row.textContent }))
+		)).toEqual(otherRows);
+		expect(await snapshot(other)).toEqual(otherTransport);
+		expect(calls.get(other)).toEqual([]);
+	} finally { await other.close(); }
+});
+
 for (const colorScheme of ['light', 'dark'] as const) {
 	test(`mobile ${colorScheme} real store mutation preserves transport`, async ({ browser, baseURL }, info) => {
 		const context = await browser.newContext({ baseURL, viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true, colorScheme });
