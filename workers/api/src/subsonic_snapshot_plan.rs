@@ -12,6 +12,8 @@ use nntune_subsonic::library::{Album, Artist, Song, NOW};
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::subsonic_dispatch::{FLAC_CONTENT_TYPE, FLAC_SUFFIX};
 
+type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
+
 fn vec_of<T>(b: &mut ConstructionBudget, n: usize) -> Result<(), BudgetExceeded> {
     // An empty Vec or ZST buffer does not allocate.
     if n == 0 || std::mem::size_of::<T>() == 0 {
@@ -98,7 +100,7 @@ pub fn build_bounded_snapshot(
     releases: &[ReleaseDbRow],
     tracks: &[TrackDbRow],
     work: crate::subsonic_dispatch::snapshot_order::OrderWork,
-) -> Result<(Vec<Artist>, Vec<Album>, Vec<Song>), BudgetExceeded> {
+) -> Result<Snapshot, BudgetExceeded> {
     reject_unproven_rows(artists, releases, tracks)?;
     construct_snapshot(budget, artists, releases, tracks, work)
 }
@@ -109,7 +111,7 @@ fn construct_snapshot(
     releases: &[ReleaseDbRow],
     tracks: &[TrackDbRow],
     work: crate::subsonic_dispatch::snapshot_order::OrderWork,
-) -> Result<(Vec<Artist>, Vec<Album>, Vec<Song>), BudgetExceeded> {
+) -> Result<Snapshot, BudgetExceeded> {
     use crate::subsonic_dispatch::snapshot_order::{order_snapshot, order_work};
     let needed = order_work(artists.len(), releases.len(), tracks.len(), artists.len())
         .ok_or(BudgetExceeded)?;
