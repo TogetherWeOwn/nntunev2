@@ -44,7 +44,9 @@ SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
 ) AS cases(s);
 SELECT pg_temp.expect_error(s, '23503') FROM (VALUES
     ($q$INSERT INTO public.storage_library_namespaces VALUES ('10000000-0000-4000-8000-000000000004','00000000-0000-4000-8000-000000000099',NULL)$q$),
-    ($q$INSERT INTO public.storage_library_namespaces VALUES ('10000000-0000-4000-8000-000000000004','00000000-0000-4000-8000-000000000001','missing-owner')$q$),
+    ($q$INSERT INTO public.storage_library_namespaces VALUES ('10000000-0000-4000-8000-000000000004','00000000-0000-4000-8000-000000000001','missing-owner')$q$)
+) AS cases(s);
+SELECT pg_temp.expect_error(s, '23001') FROM (VALUES
     ($q$DELETE FROM public.storage_environments WHERE id='00000000-0000-4000-8000-000000000001'$q$),
     ($q$DELETE FROM public.users WHERE id='namespace-owner'$q$)
 ) AS cases(s);
