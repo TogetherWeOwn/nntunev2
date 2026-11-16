@@ -3,7 +3,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
-	import { seekableIncludesStart } from '#lib/player/seekableIncludesStart.js';
+	import { restartIsAvailable } from './restartAvailability.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -1105,19 +1105,6 @@
 			return;
 		}
 		restartCanSeek = restartIsAvailable(element);
-	}
-
-	function restartIsAvailable(element: HTMLAudioElement): boolean {
-		try {
-			return (
-				Number.isFinite(element.duration) &&
-				element.duration > 0 &&
-				Number.isFinite(element.currentTime) &&
-				seekableIncludesStart(element)
-			);
-		} catch {
-			return false;
-		}
 	}
 
 	function setRestartStatus(text: string): void {
