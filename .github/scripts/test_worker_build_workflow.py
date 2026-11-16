@@ -87,6 +87,15 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertNotIn("worker-build", generate)
                 self.assertNotIn("--no-build", items[upload])
 
+    def test_worker_jobs_use_the_pinned_rust_toolchain(self):
+        for name, path in (("worker-release-builds", "ci.yml"), ("staging-api", "deploy.yml"),
+                           ("staging-mb", "deploy.yml"), ("staging-ingest", "deploy.yml")):
+            with self.subTest(job=name):
+                section = job((ROOT / ".github/workflows" / path).read_text(), name)
+                self.assertNotIn("rustup default stable", section)
+                self.assertNotIn("toolchain install stable", section)
+                self.assertLess(section.index("worker_tools.py rust"), section.index("worker_tools.py install"))
+
     def test_committed_configs_keep_the_local_build_command(self):
         for path in ("workers/api/wrangler.toml.example", "workers/mb/wrangler.toml",
                      "workers/ingest/wrangler.toml"):

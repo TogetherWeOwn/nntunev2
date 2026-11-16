@@ -174,10 +174,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Rust toolchain
+        run: python3 -I .github/scripts/worker_tools.py rust
       - name: Check api staging configuration
         id: config
         working-directory: workers/api
@@ -516,10 +514,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Rust toolchain
+        run: python3 -I .github/scripts/worker_tools.py rust
       - name: Check mb staging configuration
         id: config
         working-directory: workers/mb
@@ -725,10 +721,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Rust toolchain
+        run: python3 -I .github/scripts/worker_tools.py rust
       - name: Check ingest staging configuration
         id: config
         working-directory: workers/ingest

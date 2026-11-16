@@ -42,6 +42,12 @@ class ManifestAndLocks(unittest.TestCase):
     def test_repository_locks_agree(self):
         wt.check_locks(wt.load_pins())
 
+    def test_missing_lock_pin_refused(self):
+        pins = wt.load_pins()
+        pins["locks"] = {}
+        with self.assertRaises(ValueError):
+            wt.check_locks(pins)
+
     def test_lock_mismatch_refused(self):
         pins = wt.load_pins()
         with tempfile.TemporaryDirectory() as tmp:
@@ -51,6 +57,8 @@ class ManifestAndLocks(unittest.TestCase):
                 (directory / "Cargo.lock").write_text(
                     '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
                     '[[package]]\nname = "wasm-bindgen"\nversion = "0.2.129"\n')
+            api_lock = Path(tmp) / "workers/api/Cargo.lock"
+            pins["locks"]["workers/api/Cargo.lock"] = hashlib.sha256(api_lock.read_bytes()).hexdigest()
             wt.check_locks(pins, Path(tmp))
             (Path(tmp) / "workers/mb/Cargo.lock").write_text(
                 '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
@@ -252,6 +260,100 @@ class Checksums(unittest.TestCase):
     def test_download_requires_https(self):
         with self.assertRaises(ValueError):
             wt.download("http://example.invalid/x", 10)
+
+
+class RustPin(unittest.TestCase):
+    VV = ("rustc 1.98.1\nbinary: rustc\ncommit-hash: {c}\nhost: {h}\nrelease: {r}\n")
+
+    def fake_run(self, sysroot, commit=None, release=None):
+        rust = wt.load_pins()["rust"]
+
+        def run(cmd, **kwargs):
+            class Result:
+                stdout = ""
+            if cmd[0] == "rustc" and cmd[1] == "-vV":
+                Result.stdout = self.VV.format(c=commit or rust["commit"], h=rust["host"],
+                                               r=release or rust["version"])
+            elif cmd[0] == "cargo":
+                Result.stdout = self.VV.format(c=rust["cargo-commit-prefix"] + "0", h=rust["host"], r="1.98.1")
+            else:
+                Result.stdout = str(sysroot) + "\n"
+            return Result
+        return run
+
+    def sysroot(self, tmp):
+        rust = wt.load_pins()["rust"]
+        root = Path(tmp) / f"{rust['version']}-{rust['host']}"
+        (root / "lib/rustlib" / rust["target"] / "lib").mkdir(parents=True)
+        return root
+
+    def test_pins_are_the_verified_official_tuple(self):
+        rust = wt.load_pins()["rust"]
+        self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
+        self.assertEqual(rust["channel-manifest"]["sha256"],
+                         "a7c8774a5fd8441c997d94c029776cbc5eb111e9d72ab5d256fa69866644347e")
+        self.assertEqual(rust["rust-src"]["xz-sha256"],
+                         "5c846ebcebcc7e2e0777a4cdaa12051691593f16a7e94edbae5e6241cc62d98c")
+
+    def test_toolchain_accepts_only_the_tuple(self):
+        pins = wt.load_pins()
+        env = {"RUSTUP_TOOLCHAIN": "1.98.1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.sysroot(tmp)
+            wt.verify_rust_toolchain(pins, env, self.fake_run(root))
+            for run in (self.fake_run(root, commit="0" * 40), self.fake_run(root, release="1.98.0"),
+                        self.fake_run(Path(tmp) / "stable-x86_64-unknown-linux-gnu")):
+                with self.assertRaises(ValueError):
+                    wt.verify_rust_toolchain(pins, env, run)
+
+    def test_environment_overrides_refused(self):
+        for bad in ({}, {"RUSTUP_TOOLCHAIN": "stable"}, {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTFLAGS": "-C x"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_TARGET": "x86_64-unknown-linux-gnu"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS": "x"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTC_WRAPPER": "w"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                wt.rust_env_refusals(bad, "1.98.1")
+        wt.rust_env_refusals({"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_BUILD_JOBS": "2"}, "1.98.1")
+
+    def test_installed_std_must_match_official_archive(self):
+        pins = wt.load_pins()
+        rust = pins["rust"]
+        prefix = f"rust-std-{rust['version']}-{rust['target']}/rust-std-{rust['target']}/lib/rustlib/{rust['target']}/lib/"
+        archive = tar_with(prefix + "libcore.rlib", b"core", mode="w:xz")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.sysroot(tmp)
+            lib = root / "lib/rustlib" / rust["target"] / "lib"
+            env = {"RUSTUP_TOOLCHAIN": "1.98.1"}
+            (lib / "libcore.rlib").write_bytes(b"core")
+            wt.verify_rust_toolchain(pins, env, self.fake_run(root), archive)
+            (lib / "libcore.rlib").write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                wt.verify_rust_toolchain(pins, env, self.fake_run(root), archive)
+
+    def test_source_refuses_tampered_manifest(self):
+        with self.assertRaises(ValueError):
+            wt.verify_rust_source(wt.load_pins(), lambda url, limit: b"tampered")
+
+    def test_api_lock_identity_is_pinned(self):
+        pins = wt.load_pins()
+        pins["locks"]["workers/api/Cargo.lock"] = "0" * 64
+        with self.assertRaises(ValueError):
+            wt.check_locks(pins)
+
+    def test_provenance_binds_tuple_lock_and_artifact(self):
+        pins = wt.load_pins()
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Path(tmp) / "workers/api"
+            (worker / "build").mkdir(parents=True)
+            (worker / "Cargo.lock").write_bytes(b"lock")
+            with self.assertRaises(ValueError):
+                wt.provenance("worker-api.log", pins, Path(tmp))
+            (worker / "build/index_bg.wasm").write_bytes(b"wasm")
+            record = wt.provenance("/x/worker-api.log", pins, Path(tmp))
+            self.assertEqual(record["index_bg.wasm-sha256"], hashlib.sha256(b"wasm").hexdigest())
+            self.assertEqual(record["commit"], pins["rust"]["commit"])
+            with self.assertRaises(ValueError):
+                wt.provenance("worker-other.log", pins, Path(tmp))
 
 
 class CheckBuild(unittest.TestCase):

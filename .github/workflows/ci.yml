@@ -1685,10 +1685,8 @@ jobs:
         run: |
           python3 -I .github/scripts/test_worker_tools.py
           python3 -I .github/scripts/test_worker_build_workflow.py
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Rust toolchain
+        run: python3 -I .github/scripts/worker_tools.py rust
       - name: Prepare canonical Worker tools
         run: python3 -I .github/scripts/worker_tools.py install
       - name: Build ordinary Worker release bundles

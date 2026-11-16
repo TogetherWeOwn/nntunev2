@@ -2,8 +2,9 @@
 """Prepare and audit pinned worker build tools (GitHub Actions on Linux x86_64 only).
 
 Usage:
+  worker_tools.py rust                       install and verify the pinned Rust toolchain
   worker_tools.py install
-  worker_tools.py check-build <worker-build-log>
+  worker_tools.py check-build <worker-build-log>   (log named worker-<name>.log)
 
 Pins live in .github/worker-toolchain.json, the single manifest. The install and
 log-check logic is adapted from the earlier qualification tooling, reduced to what
@@ -40,6 +41,17 @@ OVERRIDES = (
     ("ESBUILD_BIN", "Esbuild"),
     ("WASM_OPT_BIN", "Wasm Opt"),
 )
+
+
+# Environment that could silently change the compiler, std or codegen of a build.
+RUST_ENV_EXACT = {"RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+                  "RUSTC_BOOTSTRAP", "CARGO_ENCODED_RUSTFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS",
+                  "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_RUSTC",
+                  "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                  "CARGO_BUILD_RUSTDOCFLAGS", "CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR",
+                  "CARGO_UNSTABLE_BUILD_STD", "CARGO", "RUSTUP_HOME_OVERRIDE"}
+RUST_ENV_PREFIXES = ("CARGO_TARGET_", "CARGO_PROFILE_", "CARGO_UNSTABLE_", "CARGO_BUILD_")
+RUST_ENV_ALLOWED = {"CARGO_BUILD_JOBS"}
 
 
 def load_pins(path: Path = MANIFEST) -> dict:
@@ -85,6 +97,11 @@ def require_actions(env=os.environ, system: str | None = None, machine: str | No
 
 
 def check_locks(pins: dict, root: Path = ROOT) -> None:
+    if set(pins.get("locks", {})) != {"workers/api/Cargo.lock"}:
+        raise ValueError("missing or unexpected pinned lock identities")
+    for lock, digest in pins["locks"].items():
+        if hashlib.sha256((root / lock).read_bytes()).hexdigest() != digest:
+            raise ValueError(f"{lock} differs from the pinned lock identity")
     for worker in LOCKED_WORKERS:
         packages = tomllib.loads((root / f"workers/{worker}/Cargo.lock").read_text())["package"]
         for name, version in (("worker", pins["worker-build"]["version"]),
@@ -199,10 +216,135 @@ def version_matches(output: str, expected: str) -> bool:
     return re.search(rf"(?<![\d.]){re.escape(expected)}(?![\d.])", output) is not None
 
 
+def rust_env_refusals(env, version: str) -> None:
+    """Refuse ambient settings that can alter the compiler, std or target."""
+    for key in env:
+        name = key.upper()
+        if name in RUST_ENV_ALLOWED:
+            continue
+        if name in RUST_ENV_EXACT or name.startswith(RUST_ENV_PREFIXES):
+            raise ValueError(f"{key} may change the pinned Rust build")
+    if env.get("RUSTUP_TOOLCHAIN") != version:
+        raise ValueError("RUSTUP_TOOLCHAIN is not the pinned version")
+
+
+def parse_vv(text: str) -> dict:
+    return dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+
+
+def tar_files(archive: bytes, prefix: str, limit: int) -> dict:
+    """sha256 of each regular file below prefix in an xz tarball; nothing is extracted."""
+    found = {}
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:xz") as bundle:
+        for member in bundle:
+            if member.name.startswith(prefix) and member.isfile() and member.size <= limit:
+                found[member.name[len(prefix):]] = hashlib.sha256(bundle.extractfile(member).read()).hexdigest()
+    return found
+
+
+def verify_rust_source(pins: dict, dl=download) -> bytes:
+    """Check the official channel manifest, rust-src and wasm std against the pins.
+
+    Returns the verified wasm std archive for comparison with the installed sysroot."""
+    rust = pins["rust"]
+    text = verified(dl(rust["channel-manifest"]["url"], 5_000_000), rust["channel-manifest"]["sha256"])
+    manifest = tomllib.loads(text.decode())
+    for name in ("rustc", "cargo", "rust-std", "rust-src"):
+        if manifest["pkg"][name]["git_commit_hash"] != rust["commit"]:
+            raise ValueError(f"channel manifest {name} commit disagrees with pin")
+    if not manifest["pkg"]["rustc"]["version"].startswith(rust["version"] + " (" + rust["commit"][:9]):
+        raise ValueError("channel manifest rustc version disagrees with pin")
+    std = manifest["pkg"]["rust-std"]["target"][rust["target"]]
+    src = manifest["pkg"]["rust-src"]["target"]["*"]
+    for entry, component in ((std, "rust-std-wasm32"), (src, "rust-src")):
+        if (entry["xz_url"] != rust[component]["xz-url"]
+                or entry["xz_hash"] != rust[component]["xz-sha256"]):
+            raise ValueError(f"channel manifest {component} disagrees with pin")
+    source = verified(dl(rust["rust-src"]["xz-url"], 20_000_000), rust["rust-src"]["xz-sha256"])
+    lock_path = f"rust-src-{rust['version']}/rust-src/lib/rustlib/src/rust/library/Cargo.lock"
+    with tarfile.open(fileobj=io.BytesIO(source), mode="r:xz") as bundle:
+        member = bundle.getmember(lock_path)
+        if not member.isfile() or member.size > 2_000_000:
+            raise ValueError("unexpected rust-src member")
+        lock = tomllib.loads(bundle.extractfile(member).read().decode())
+    want = rust["std-lock"]
+    if not any(p["name"] == want["package"] and p["version"] == want["version"]
+               and p.get("checksum") == want["checksum"] for p in lock["package"]):
+        raise ValueError("std library lock disagrees with pinned allocator identity")
+    return verified(dl(rust["rust-std-wasm32"]["xz-url"], 60_000_000), rust["rust-std-wasm32"]["xz-sha256"])
+
+
+def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_archive: bytes | None = None) -> None:
+    """Fail closed unless the active toolchain is exactly the pinned tuple.
+
+    With std_archive, the installed wasm std files are byte-compared to the verified archive."""
+    rust = pins["rust"]
+    rust_env_refusals(env, rust["version"])
+
+    def out(*cmd):
+        return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT).stdout
+
+    rustc = parse_vv(out("rustc", "-vV"))
+    cargo = parse_vv(out("cargo", "-vV"))
+    if (rustc.get("release") != rust["version"] or rustc.get("commit-hash") != rust["commit"]
+            or rustc.get("host") != rust["host"]):
+        raise ValueError("active rustc is not the pinned release, commit and host")
+    if cargo.get("host") != rust["host"] or not cargo.get("commit-hash", "").startswith(rust["cargo-commit-prefix"]):
+        raise ValueError("active cargo is not the pinned cargo")
+    sysroot = Path(out("rustc", "--print", "sysroot").strip())
+    if sysroot.name != f"{rust['version']}-{rust['host']}":
+        raise ValueError("active sysroot is not the pinned toolchain")
+    libdir = sysroot / "lib/rustlib" / rust["target"] / "lib"
+    if not libdir.is_dir():
+        raise ValueError("pinned wasm32 std is not installed")
+    if std_archive is not None:
+        want = tar_files(std_archive, f"rust-std-{rust['version']}-{rust['target']}/rust-std-{rust['target']}/lib/rustlib/{rust['target']}/lib/", 200_000_000)
+        have = {str(f.relative_to(libdir)): hashlib.sha256(f.read_bytes()).hexdigest()
+                for f in libdir.rglob("*") if f.is_file()}
+        if not want or want != have:
+            raise ValueError("installed wasm32 std differs from the verified official archive")
+
+
+def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
+    require_actions(env)
+    pins = load_pins()
+    rust = pins["rust"]
+    std_archive = verify_rust_source(pins, dl)
+    run(["rustup", "toolchain", "install", rust["version"], "--profile", "minimal",
+         "--no-self-update", "--target", rust["target"]], check=True, cwd=ROOT)
+    run(["rustup", "default", rust["version"]], check=True, cwd=ROOT)
+    with open(env["GITHUB_ENV"], "a") as output:
+        output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\n")
+    verify_rust_toolchain(pins, {**env, "RUSTUP_TOOLCHAIN": rust["version"]}, run, std_archive)
+    print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
+
+
+def provenance(log_path: str, pins: dict, root: Path = ROOT) -> dict:
+    """Record the verified tuple with digests of the lock and built artifacts."""
+    match = re.fullmatch(r"worker-([a-z]+)\.log", Path(log_path).name)
+    if not match or match.group(1) not in LOCKED_WORKERS:
+        raise ValueError("build log must be named worker-<api|mb|ingest>.log")
+    worker = match.group(1)
+    build = root / "workers" / worker / "build"
+    wasm = build / "index_bg.wasm"
+    if not wasm.is_file():
+        raise ValueError("build did not produce index_bg.wasm")
+    lock = root / "workers" / worker / "Cargo.lock"
+    rust = pins["rust"]
+    return {"worker": worker, "rust": rust["version"], "commit": rust["commit"],
+            "host": rust["host"], "target": rust["target"],
+            "channel-manifest-sha256": rust["channel-manifest"]["sha256"],
+            "cargo-lock-sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+            "worker-build": pins["worker-build"]["version"],
+            "wasm-bindgen": pins["wasm-bindgen-cli"]["version"],
+            "index_bg.wasm-sha256": hashlib.sha256(wasm.read_bytes()).hexdigest()}
+
+
 def install(env=os.environ, dl=download, run=subprocess.run) -> None:
     require_actions(env)
     pins = load_pins()
     check_locks(pins)
+    verify_rust_toolchain(pins, env, run)
     root = Path(env["RUNNER_TEMP"]) / "worker-tools"
     root.mkdir()  # A reused or nonempty root is not admissible.
     tool_root = root / "installed"
@@ -267,10 +409,17 @@ def check_build(log_path: str, env=os.environ) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if argv[1:2] == ["install"] and len(argv) == 2:
+    if argv[1:2] == ["rust"] and len(argv) == 2:
+        install_rust()
+    elif argv[1:2] == ["install"] and len(argv) == 2:
         install()
     elif argv[1:2] == ["check-build"] and len(argv) == 3:
+        pins = load_pins()
+        check_locks(pins)
+        verify_rust_toolchain(pins)
         check_build(argv[2])
+        record = provenance(argv[2], pins)
+        print("worker build provenance: " + json.dumps(record, sort_keys=True), flush=True)
     else:
         print(__doc__, file=sys.stderr)
         return 2
