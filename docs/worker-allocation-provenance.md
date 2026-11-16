@@ -14,7 +14,8 @@ not a proof of an allocation charge.
 The release build records the lockfile and resulting WASM digests along with the
 compiler and tool versions. The pinned source and target archives are checked
 against the channel manifest; the installed target standard library is compared
-to the verified archive. The compiler and Cargo identities are checked using
+to the verified digests before each Worker build and provenance (missing
+evidence fails); Cargo configs and alternate rustup sources are refused. The compiler and Cargo identities are checked using
 their reported versions and rustup's installation checks. A build log is not an
 independent attestation that later-uploaded bytes match the recorded digest.
 

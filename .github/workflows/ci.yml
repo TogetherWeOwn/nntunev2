@@ -1693,6 +1693,7 @@ jobs:
         run: |
           set -euo pipefail
           for worker in api mb ingest; do
+            python3 -I .github/scripts/worker_tools.py verify-rust
             (cd "workers/$worker" && cargo metadata --locked --format-version 1 > /dev/null)
             (cd "workers/$worker" && worker-build --release -- --locked) 2>&1 | tee "$RUNNER_TEMP/worker-$worker.log"
             python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-$worker.log"

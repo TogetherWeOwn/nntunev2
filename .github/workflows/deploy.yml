@@ -207,6 +207,7 @@ jobs:
         working-directory: workers/api
         run: |
           set -euo pipefail
+          python3 -I ../../.github/scripts/worker_tools.py verify-rust
           cargo metadata --locked --format-version 1 > /dev/null
           worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
           python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-api.log"
@@ -543,6 +544,7 @@ jobs:
         working-directory: workers/mb
         run: |
           set -euo pipefail
+          python3 -I ../../.github/scripts/worker_tools.py verify-rust
           cargo metadata --locked --format-version 1 > /dev/null
           worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-mb.log"
           python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-mb.log"
@@ -766,6 +768,7 @@ jobs:
         working-directory: workers/ingest
         run: |
           set -euo pipefail
+          python3 -I ../../.github/scripts/worker_tools.py verify-rust
           cargo metadata --locked --format-version 1 > /dev/null
           worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-ingest.log"
           python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-ingest.log"

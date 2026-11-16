@@ -50,7 +50,8 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                         command += f" --component {components}"
                     if target:
                         command += f" --target {target}"
-                    self.assertIn(command + "\n          rustup default stable\n", section)
+                    pinned = path == "deploy.yml"  # staging jobs install the pinned tuple instead
+                    self.assertIn("worker_tools.py rust\n" if pinned else command + "\n          rustup default stable\n", section)
 
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):

@@ -95,6 +95,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertNotIn("rustup default stable", section)
                 self.assertNotIn("toolchain install stable", section)
                 self.assertLess(section.index("worker_tools.py rust"), section.index("worker_tools.py install"))
+                self.assertLess(section.index("worker_tools.py verify-rust"), section.index("worker-build --release"))
 
     def test_committed_configs_keep_the_local_build_command(self):
         for path in ("workers/api/wrangler.toml.example", "workers/mb/wrangler.toml",

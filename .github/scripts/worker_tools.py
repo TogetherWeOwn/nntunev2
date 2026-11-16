@@ -49,7 +49,8 @@ RUST_ENV_EXACT = {"RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_
                   "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_RUSTC",
                   "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
                   "CARGO_BUILD_RUSTDOCFLAGS", "CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR",
-                  "CARGO_UNSTABLE_BUILD_STD", "CARGO", "RUSTUP_HOME_OVERRIDE"}
+                  "CARGO_UNSTABLE_BUILD_STD", "CARGO", "RUSTUP_HOME_OVERRIDE",
+                  "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT"}
 RUST_ENV_PREFIXES = ("CARGO_TARGET_", "CARGO_PROFILE_", "CARGO_UNSTABLE_", "CARGO_BUILD_")
 RUST_ENV_ALLOWED = {"CARGO_BUILD_JOBS"}
 
@@ -228,6 +229,25 @@ def rust_env_refusals(env, version: str) -> None:
         raise ValueError("RUSTUP_TOOLCHAIN is not the pinned version")
 
 
+def cargo_config_refusals(env, root: Path = ROOT) -> None:
+    home = Path.home() / ".cargo"
+    if env.get("CARGO_HOME") and Path(env["CARGO_HOME"]).resolve() != home.resolve():
+        raise ValueError("CARGO_HOME is not the default Cargo home")
+    work = root / "workers"
+    dirs = [home, *(d / ".cargo" for d in (*(work / w for w in LOCKED_WORKERS), work, *work.parents))]
+    for directory in dirs:
+        for name in ("config", "config.toml"):
+            if os.path.lexists(directory / name):
+                raise ValueError(f"Cargo config {directory / name} may change the pinned Rust build")
+
+
+def load_std(env) -> dict:
+    path = env.get("RUST_STD_DIGESTS")
+    if not path or not Path(path).is_file():
+        raise ValueError("verified wasm32 std digests are missing; run worker_tools.py rust first")
+    return json.loads(Path(path).read_text())
+
+
 def parse_vv(text: str) -> dict:
     return dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
 
@@ -274,12 +294,15 @@ def verify_rust_source(pins: dict, dl=download) -> bytes:
     return verified(dl(rust["rust-std-wasm32"]["xz-url"], 60_000_000), rust["rust-std-wasm32"]["xz-sha256"])
 
 
-def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_archive: bytes | None = None) -> None:
+def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_files: dict | None = None,
+                         root: Path = ROOT) -> None:
     """Fail closed unless the active toolchain is exactly the pinned tuple.
 
-    With std_archive, the installed wasm std files are byte-compared to the verified archive."""
+    Installed wasm std is always compared to the verified digests (std_files or RUST_STD_DIGESTS)."""
     rust = pins["rust"]
     rust_env_refusals(env, rust["version"])
+    cargo_config_refusals(env, root)
+    want = load_std(env) if std_files is None else std_files
 
     def out(*cmd):
         return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT).stdout
@@ -289,7 +312,7 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_ar
     if (rustc.get("release") != rust["version"] or rustc.get("commit-hash") != rust["commit"]
             or rustc.get("host") != rust["host"]):
         raise ValueError("active rustc is not the pinned release, commit and host")
-    if cargo.get("host") != rust["host"] or not cargo.get("commit-hash", "").startswith(rust["cargo-commit-prefix"]):
+    if cargo.get("host") != rust["host"] or cargo.get("commit-hash") != rust["cargo-commit"]:
         raise ValueError("active cargo is not the pinned cargo")
     sysroot = Path(out("rustc", "--print", "sysroot").strip())
     if sysroot.name != f"{rust['version']}-{rust['host']}":
@@ -297,25 +320,27 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_ar
     libdir = sysroot / "lib/rustlib" / rust["target"] / "lib"
     if not libdir.is_dir():
         raise ValueError("pinned wasm32 std is not installed")
-    if std_archive is not None:
-        want = tar_files(std_archive, f"rust-std-{rust['version']}-{rust['target']}/rust-std-{rust['target']}/lib/rustlib/{rust['target']}/lib/", 200_000_000)
-        have = {str(f.relative_to(libdir)): hashlib.sha256(f.read_bytes()).hexdigest()
-                for f in libdir.rglob("*") if f.is_file()}
-        if not want or want != have:
-            raise ValueError("installed wasm32 std differs from the verified official archive")
+    have = {str(f.relative_to(libdir)): hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in libdir.rglob("*") if f.is_file()}
+    if not want or want != have:
+        raise ValueError("installed wasm32 std differs from the verified official archive")
 
 
 def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
     require_actions(env)
     pins = load_pins()
     rust = pins["rust"]
-    std_archive = verify_rust_source(pins, dl)
+    rust_env_refusals({**env, "RUSTUP_TOOLCHAIN": rust["version"]}, rust["version"])
+    t, v = rust["target"], rust["version"]
+    std_files = tar_files(verify_rust_source(pins, dl), f"rust-std-{v}-{t}/rust-std-{t}/lib/rustlib/{t}/lib/", 200_000_000)
     run(["rustup", "toolchain", "install", rust["version"], "--profile", "minimal",
          "--no-self-update", "--target", rust["target"]], check=True, cwd=ROOT)
     run(["rustup", "default", rust["version"]], check=True, cwd=ROOT)
+    digests = Path(env["RUNNER_TEMP"]) / "rust-std-digests.json"
+    digests.write_text(json.dumps(std_files, sort_keys=True))
     with open(env["GITHUB_ENV"], "a") as output:
-        output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\n")
-    verify_rust_toolchain(pins, {**env, "RUSTUP_TOOLCHAIN": rust["version"]}, run, std_archive)
+        output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\nRUST_STD_DIGESTS={digests}\n")
+    verify_rust_toolchain(pins, {**env, "RUSTUP_TOOLCHAIN": rust["version"]}, run, std_files)
     print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
 
 
@@ -413,6 +438,8 @@ def main(argv: list[str]) -> int:
         install_rust()
     elif argv[1:2] == ["install"] and len(argv) == 2:
         install()
+    elif argv[1:2] == ["verify-rust"] and len(argv) == 2:
+        verify_rust_toolchain(load_pins())
     elif argv[1:2] == ["check-build"] and len(argv) == 3:
         pins = load_pins()
         check_locks(pins)
