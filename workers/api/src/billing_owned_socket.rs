@@ -1,7 +1,6 @@
 //! Request-owned Worker socket preparation. This is not connected to routing.
 
-use std::{cell::RefCell, future::Ready, io, rc::Rc};
-use tokio_postgres::tls::TlsConnect;
+use std::{cell::RefCell, io, rc::Rc};
 use wasm_bindgen::prelude::*;
 use worker::{js_sys, worker_sys, Socket};
 
@@ -17,7 +16,7 @@ struct Registry {
     closed: bool,
 }
 
-/// Owns all raw handles, including the replacement returned by STARTTLS.
+/// Owns the raw socket handle until the request ends.
 #[derive(Default)]
 pub(crate) struct SocketGuard(Rc<RefCell<Registry>>);
 
@@ -58,10 +57,6 @@ impl SocketGuard {
             .map_err(|_| io::Error::other("socket connect failed"))?;
         self.register(raw)
     }
-
-    pub(crate) fn tls(&self) -> TrackedTls {
-        TrackedTls(self.0.clone())
-    }
 }
 
 impl Drop for SocketGuard {
@@ -71,30 +66,5 @@ impl Drop for SocketGuard {
         for socket in registry.sockets.drain(..) {
             observe_socket_close(&socket);
         }
-    }
-}
-
-pub(crate) struct TrackedTls(Rc<RefCell<Registry>>);
-
-impl TlsConnect<Socket> for TrackedTls {
-    type Stream = Socket;
-    type Error = io::Error;
-    type Future = Ready<Result<Socket, io::Error>>;
-
-    fn connect(self, socket: Socket) -> Self::Future {
-        let result = (|| {
-            let mut registry = self.0.borrow_mut();
-            if registry.closed || registry.sockets.len() != 1 {
-                return Err(io::Error::other("socket owner unavailable"));
-            }
-            let raw = &registry.sockets[0];
-            let upgraded = raw
-                .start_tls()
-                .map_err(|_| io::Error::other("TLS upgrade failed"))?;
-            registry.sockets.push(upgraded.clone());
-            drop(socket);
-            Ok(Socket::from(upgraded))
-        })();
-        std::future::ready(result)
     }
 }
