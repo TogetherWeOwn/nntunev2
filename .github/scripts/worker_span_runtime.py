@@ -148,7 +148,7 @@ def run(wrangler):
         runtime_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
                        "XDG_CONFIG_HOME": str(home), "CI": "1", "NO_COLOR": "1",
                        "WRANGLER_SEND_METRICS": "false"}
-        with tempfile.TemporaryFile("w+") as log:
+        with (state / "runtime.log").open("w+") as log:
             proc = subprocess.Popen(
                 ["node", str(wrangler), "dev", "--config", str(config), "--local",
                  "--persist-to", str(state / "data"), "--ip", "127.0.0.1",
@@ -184,7 +184,11 @@ def run(wrangler):
                 sys.stdout.write(log.read()[-4000:])
                 raise
             finally:
-                shutdown_process_group(proc)
+                try:
+                    shutdown_process_group(proc)
+                except Exception:
+                    print(f"runtime shutdown unverified; state and log retained at {state}", file=sys.stderr)
+                    raise
                 proc = None
     finally:
         if proc is None and not preserve:
@@ -247,23 +251,33 @@ class SelfTest(unittest.TestCase):
                 proc = mock.Mock()
                 proc.poll.return_value = None
                 error = BuildShutdownError(stage) if stage == "build_shutdown" else ValueError(stage)
-                with tempfile.TemporaryFile("w+") as log, \
-                     mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
-                     mock.patch(__name__ + ".tempfile.TemporaryFile", return_value=log), \
+                def start(*args, **kwargs):
+                    if stage == "start":
+                        raise error
+                    kwargs["stdout"].write("runtime diagnostic\n")
+                    kwargs["stdout"].flush()
+                    return proc
+
+                with mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
                      mock.patch(__name__ + ".build", side_effect=error if stage.startswith("build") else None), \
                      mock.patch(__name__ + ".free_ports", return_value=(10001, 10002)), \
-                     mock.patch(__name__ + ".subprocess.Popen", side_effect=error if stage == "start" else None, return_value=proc), \
-                     mock.patch(__name__ + ".get", side_effect=ValueError(stage)), \
+                     mock.patch(__name__ + ".subprocess.Popen", side_effect=start) as popen, \
+                     mock.patch(__name__ + ".get", side_effect=ValueError(stage) if stage == "request" else None), \
+                     mock.patch(__name__ + ".evaluate_burst"), \
+                     mock.patch(__name__ + ".evaluate_negative"), \
+                     mock.patch(__name__ + ".evaluate_scoped"), \
                      mock.patch(__name__ + ".shutdown_process_group", side_effect=error if stage == "shutdown" else None) as shutdown:
                     with self.assertRaises((ValueError, BuildShutdownError)):
                         run(Path("wrangler"))
                     self.assertEqual(shutdown.call_count, int(stage in ("request", "shutdown")))
-                    self.assertEqual(log.closed, stage not in ("build", "build_shutdown"))
+                    if stage in ("start", "request", "shutdown"):
+                        self.assertTrue(popen.call_args.kwargs["stdout"].closed)
                 self.assertEqual(original.read_text(), "original")
                 self.assertEqual(state.exists(), stage in ("build_shutdown", "shutdown"))
                 if stage == "shutdown":
                     self.assertTrue((state / "wrangler.toml").is_file())
                     self.assertTrue((state / "home").is_dir())
+                    self.assertEqual((state / "runtime.log").read_text(), "runtime diagnostic\n")
 
     def test_build_supervision(self):
         for result in (0, 1, subprocess.TimeoutExpired("worker-build", 2400)):
