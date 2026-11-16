@@ -83,40 +83,100 @@ mod tests {
 
     #[test]
     fn output_field_accounting_and_limit_boundaries() {
-        let artists = [ArtistDbRow {
-            mbid: "a".into(), name: "artist".into(), sort_name: "ignored".into(),
-            artist_type: None, country: None,
-        }, ArtistDbRow {
-            mbid: "a".into(), name: "last".into(), sort_name: "a much longer sort name".into(),
-            artist_type: None, country: None,
-        }];
-        let releases = [ReleaseDbRow {
-            mbid: "release".into(), title: "title".into(), release_type: None, year: None,
-            artist_mbid: Some("a".into()), artist_name: Some("fallback".into()),
-        }, ReleaseDbRow {
-            mbid: "other".into(), title: "".into(), release_type: None, year: None,
-            artist_mbid: None, artist_name: Some("fallback name".into()),
-        }];
+        let artists = [
+            ArtistDbRow {
+                mbid: "a".into(),
+                name: "artist".into(),
+                sort_name: "ignored".into(),
+                artist_type: None,
+                country: None,
+            },
+            ArtistDbRow {
+                mbid: "a".into(),
+                name: "last".into(),
+                sort_name: "a much longer sort name".into(),
+                artist_type: None,
+                country: None,
+            },
+        ];
+        let releases = [
+            ReleaseDbRow {
+                mbid: "release".into(),
+                title: "title".into(),
+                release_type: None,
+                year: None,
+                artist_mbid: Some("a".into()),
+                artist_name: Some("fallback".into()),
+            },
+            ReleaseDbRow {
+                mbid: "other".into(),
+                title: "".into(),
+                release_type: None,
+                year: None,
+                artist_mbid: None,
+                artist_name: Some("fallback name".into()),
+            },
+        ];
         let tracks = [TrackDbRow {
-            release_mbid: "release".into(), recording_mbid: "recording".into(),
-            title: "song".into(), duration_ms: None, medium_no: None, track_no: None,
-            release_title: "album".into(), artist_mbid: Some("artist-id".into()),
+            release_mbid: "release".into(),
+            recording_mbid: "recording".into(),
+            title: "song".into(),
+            duration_ms: None,
+            medium_no: None,
+            track_no: None,
+            release_title: "album".into(),
+            artist_mbid: Some("artist-id".into()),
             artist_name: Some("artist-name".into()),
         }];
         let expected = cost(2, std::mem::size_of::<Artist>())
             + cost(2, std::mem::size_of::<Album>())
             + cost(1, std::mem::size_of::<Song>())
-            + [1, 6, 1, 4, 7, 5, 8, 1, NOW.len(), 23, 5, 13, NOW.len(), 13,
-                9, 4, 5, 11, 7, FLAC_CONTENT_TYPE.len(), FLAC_SUFFIX.len(), NOW.len(), 7, 9]
-                .into_iter().map(|n| cost(n, 1)).sum::<usize>();
+            + [
+                1,
+                6,
+                1,
+                4,
+                7,
+                5,
+                8,
+                1,
+                NOW.len(),
+                23,
+                5,
+                13,
+                NOW.len(),
+                13,
+                9,
+                4,
+                5,
+                11,
+                7,
+                FLAC_CONTENT_TYPE.len(),
+                FLAC_SUFFIX.len(),
+                NOW.len(),
+                7,
+                9,
+            ]
+            .into_iter()
+            .map(|n| cost(n, 1))
+            .sum::<usize>();
         let mut exact = ConstructionBudget::new(expected);
-        assert_eq!(plan_snapshot_output(&mut exact, &artists, &releases, &tracks), Ok(()));
+        assert_eq!(
+            plan_snapshot_output(&mut exact, &artists, &releases, &tracks),
+            Ok(())
+        );
         assert_eq!(exact.charged(), expected);
         let mut short = ConstructionBudget::new(expected - 1);
-        assert_eq!(plan_snapshot_output(&mut short, &artists, &releases, &tracks), Err(BudgetExceeded));
+        assert_eq!(
+            plan_snapshot_output(&mut short, &artists, &releases, &tracks),
+            Err(BudgetExceeded)
+        );
         assert!(short.charged() < expected);
         let mut extra = ConstructionBudget::new(expected + 1);
-        assert_eq!(plan_snapshot_output(&mut extra, &artists, &releases, &tracks), Ok(()));
+        assert_eq!(
+            plan_snapshot_output(&mut extra, &artists, &releases, &tracks),
+            Ok(())
+        );
         assert_eq!(extra.charged(), expected);
     }
 
