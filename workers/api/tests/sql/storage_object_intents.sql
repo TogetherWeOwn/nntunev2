@@ -73,8 +73,10 @@ SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
     ($q$UPDATE public.storage_object_intents SET plaintext_bytes = plaintext_bytes$q$),
     ($q$UPDATE public.storage_object_intents SET environment_id = '00000000-0000-4000-8000-000000000002' WHERE object_id = '20000000-0000-4000-8000-000000000001'$q$),
     ($q$DELETE FROM public.storage_object_intents WHERE object_id = '20000000-0000-4000-8000-000000000001'$q$),
-    ($q$TRUNCATE public.storage_object_intents$q$)
+    ($q$TRUNCATE public.storage_object_intents CASCADE$q$)
 ) AS cases(s);
+-- Referencing digest-map tables also prevent truncation without CASCADE.
+SELECT pg_temp.expect_error($q$TRUNCATE public.storage_object_intents$q$, '0A000');
 SELECT pg_temp.expect_error(s, '23503') FROM (VALUES
     (pg_temp.ins(env := '00000000-0000-4000-8000-000000000099')),
     (pg_temp.ins(lib := '10000000-0000-4000-8000-000000000099')),
