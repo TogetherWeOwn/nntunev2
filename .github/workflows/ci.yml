@@ -619,6 +619,8 @@ jobs:
         run: python3 .github/scripts/test_staging_api_schema_gate.py
       - name: Test span observation evaluator (offline)
         run: python3 workers/api/tests/test_span_result.py
+      - name: Test Worker span runtime evaluator (offline)
+        run: python3 .github/scripts/worker_span_runtime.py --self-test
 
   mb-import-etl:
     name: mb-import-etl
