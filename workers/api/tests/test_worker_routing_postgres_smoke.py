@@ -14,6 +14,13 @@ ENV = {"NNTUNE_SMOKE_PG_PASSWORD": "p@ss/w"}
 
 
 class Helpers(unittest.TestCase):
+    def test_source_phase_import_is_required(self):
+        smoke.check_source_phase_bundle('import source wasm from "./index_bg.wasm";')
+        for index in ('import wasm from "./index_bg.wasm";',
+                      'import source wasm from "./other.wasm";', ''):
+            with self.subTest(index=index), self.assertRaises(smoke.Failure):
+                smoke.check_source_phase_bundle(index)
+
     def test_config_is_toml_with_quoted_local_hyperdrive(self):
         s = smoke.pg_settings(ENV)
         cfg = tomllib.loads(smoke.wrangler_toml(smoke.conn_string(s, "nntune_smoke_ab"), SHA))

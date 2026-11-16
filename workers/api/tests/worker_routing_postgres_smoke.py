@@ -174,6 +174,11 @@ def find_wrangler(explicit):
     return found[0].resolve()
 
 
+def check_source_phase_bundle(index):
+    check(re.search(r"\bimport\s+source\s+\w+\s+from\s+['\"]\./index_bg\.wasm['\"]", index),
+          "generated Worker bundle is missing its source-phase Wasm import")
+
+
 def prerequisites(args):
     check(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
           "run only on a GitHub-hosted Actions runner with its disposable PostgreSQL service")
@@ -184,6 +189,7 @@ def prerequisites(args):
     wrangler = find_wrangler(args.wrangler or os.environ.get("NNTUNE_WRANGLER"))
     check(BUNDLE.is_file() and (BUNDLE.parent.parent / "index_bg.wasm").is_file(),
           "missing prebuilt Worker bundle (worker-build --release -- --locked in workers/api)")
+    check_source_phase_bundle((BUNDLE.parent.parent / "index.js").read_text())
     sha = os.environ.get("GITHUB_SHA", "")
     return s, wrangler, sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "0123456789abcdef0123456789abcdef01234567"
 

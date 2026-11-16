@@ -49,12 +49,12 @@ class ManifestAndLocks(unittest.TestCase):
                 directory = Path(tmp) / "workers" / worker
                 directory.mkdir(parents=True)
                 (directory / "Cargo.lock").write_text(
-                    '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
-                    '[[package]]\nname = "wasm-bindgen"\nversion = "0.2.129"\n')
+                    f'[[package]]\nname = "worker"\nversion = "{pins["worker-build"]["version"]}"\n'
+                    f'[[package]]\nname = "wasm-bindgen"\nversion = "{pins["wasm-bindgen-cli"]["version"]}"\n')
             wt.check_locks(pins, Path(tmp))
             (Path(tmp) / "workers/mb/Cargo.lock").write_text(
-                '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
-                '[[package]]\nname = "wasm-bindgen"\nversion = "0.2.128"\n')
+                f'[[package]]\nname = "worker"\nversion = "{pins["worker-build"]["version"]}"\n'
+                '[[package]]\nname = "wasm-bindgen"\nversion = "0.0.0"\n')
             with self.assertRaises(ValueError):
                 wt.check_locks(pins, Path(tmp))
 

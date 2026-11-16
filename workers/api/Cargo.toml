@@ -47,7 +47,7 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] 
 # Worker HTTP + Hyperdrive entry (same versions as workers/mb). These
 # compile natively so `cargo test` keeps covering the core handlers;
 # the runtime-only paths live in `worker_entry`.
-worker = { version = "0.8", features = ["http", "tokio-postgres"] }
+worker = { version = "0.9", features = ["http", "tokio-postgres"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 wasm-bindgen-futures = "0.4"
 # Only for the capped request-body stream read in the Worker entry.
@@ -59,7 +59,7 @@ futures-timer = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-util = "0.3"
-worker = "0.8"
+worker = "0.9"
 
 [features]
 postgres-tests = []
