@@ -203,6 +203,11 @@ file = "0041_account_taste_and_privacy.sql"
 target = "app"
 sha256 = "378c0932a25758f4b50282bab112220bc090a5b0ff01707a9b6e432adb40374e"
 
+[[migration]]
+file = "0042_storage_namespaces.sql"
+target = "app"
+sha256 = "40e243b952f7fc289f0167cb118a3fcc5ec3b17c1b74b62424a2abd3477a88ab"
+
 [[migration.source_rename_history]]
 parent = "eca22a03b3d5809d1c623b7d4398d53220d10570"
 commit = "4d977b054c81f138c8593e3270fefb8c7469ac27"
