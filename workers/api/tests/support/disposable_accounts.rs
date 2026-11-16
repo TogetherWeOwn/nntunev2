@@ -1,5 +1,4 @@
 //! Committed account fixtures for tests that need multiple database sessions.
-use std::time::Duration;
 use tokio_postgres::{Client, Config, NoTls};
 
 pub async fn connect() -> Client {
@@ -47,34 +46,5 @@ impl Accounts {
             .execute("DELETE FROM public.users WHERE id = ANY($1)", &[&self.ids])
             .await
             .unwrap();
-    }
-}
-
-/// Always release the locker, including when observation fails or times out.
-pub async fn release_after_wait(
-    observer: &Client,
-    locker: &Client,
-    pid: i32,
-) -> Result<bool, tokio_postgres::Error> {
-    let observed = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let waiting: bool = observer
-                .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
-                    &[&pid],
-                )
-                .await?
-                .get(0);
-            if waiting {
-                return Ok::<_, tokio_postgres::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    locker.batch_execute("COMMIT").await?;
-    match observed {
-        Ok(result) => result.map(|()| true),
-        Err(_) => Ok(false),
     }
 }

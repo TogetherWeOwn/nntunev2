@@ -649,36 +649,60 @@ async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
 async fn taste_upsert_waits_for_deletion_fence() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::Ban;
+    use std::time::Duration;
+    let observer = client(false).await;
     let locker = client(false).await;
     let writer = client(false).await;
-    let check = disposable_accounts::connect().await;
-    let accounts = disposable_accounts::Accounts::new(1).await;
-    let account = accounts.id(0);
-    let observer = &accounts.observer;
-    let result = async {
-        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
-        observer.execute("INSERT INTO public.account_taste VALUES ($1,'track','old','love',NULL,1,1)", &[&account]).await?;
-        locker.batch_execute("BEGIN").await?;
-        locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&account]).await?;
-        let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
-        let write = store.taste_upsert(account, Track, "old", Ban, None, 10);
-        let release = disposable_accounts::release_after_wait(observer, &locker, writer_pid);
-        let (result, observed) = tokio::join!(write, release);
-        let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND target_id = 'old'", &[&account]).await?;
-        Ok::<_, tokio_postgres::Error>((result, observed?, (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, i64>(2))))
-    }.await;
-    let _ = locker.batch_execute("ROLLBACK").await;
-    let account = account.to_owned();
-    accounts.cleanup().await;
-    let remaining: i64 = check
+    let writer_pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-race','taste-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-race','track','old','love',NULL,1,1)").await.unwrap();
+    locker
+        .batch_execute("BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let store =
+        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+    let write = store.taste_upsert("taste-race", Track, "old", Ban, None, 10);
+    let release = async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
+                        &[&writer_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        locker.batch_execute("COMMIT").await.unwrap();
+        observed
+    };
+    let (result, observed) = tokio::join!(write, release);
+    let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = 'taste-race' AND target_id = 'old'", &[]).await.unwrap();
+    let state: (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    observer
+        .batch_execute("DELETE FROM public.users WHERE id = 'taste-race'")
+        .await
+        .unwrap();
+    let remaining: i64 = observer
         .query_one(
-            "SELECT count(*) FROM public.account_taste WHERE user_id = $1",
-            &[&account],
+            "SELECT count(*) FROM public.account_taste WHERE user_id = 'taste-race'",
+            &[],
         )
         .await
         .unwrap()
         .get(0);
-    let (result, observed, state) = result.unwrap();
     assert!(observed, "writer must wait on the deleting account");
     assert!(result.is_err());
     assert_eq!(state, ("love".into(), 1, 1));
