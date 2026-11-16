@@ -18,6 +18,9 @@ the app entries up to the input file in manifest order and stops at the
 first failure, reporting the applied prefix as evidence.
 """
 import argparse
+import datetime
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -213,7 +216,7 @@ def quote_literal(name):
     return "'" + name.replace("'", "''") + "'"
 
 
-def read_row(child, entry, filename):
+def read_row(child, entry, filename, preserve=False):
     """Return the recorded row for an entry under any of its names
     (current name or a renamed_from alias), mirroring entry identity."""
     names = entry_names(entry)
@@ -227,7 +230,7 @@ def read_row(child, entry, filename):
         input=sql, text=True, capture_output=True, timeout=60, env=child)
     if result.returncode != 0:
         raise StagingApplyError("evidence read failed; connection details redacted")
-    return result.stdout.strip()
+    return result.stdout.removesuffix("\n") if preserve else result.stdout.strip()
 
 
 def run_evidence(data_root, migration_file, applied_files, apply_outcome,
@@ -272,9 +275,44 @@ def run_evidence(data_root, migration_file, applied_files, apply_outcome,
             "apply succeeded but no recorded row exists for: " + ", ".join(missing))
 
 
+def run_readback(data_root, filename, expected_sha, expected_database, environ=None):
+    """Observe one exact ledger row; this path never invokes the migrator."""
+    source = _env(environ)
+    if (not FILE_RE.fullmatch(filename) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            or expected_database != "nntunev2_staging"):
+        raise StagingApplyError("invalid readback scope")
+    entries = load_entries(data_root)
+    matches = [entry for entry in entries if entry["file"] == filename]
+    if (len(matches) != 1 or matches[0].get("target") != "app"
+            or matches[0].get("sha256") != expected_sha
+            or matches[0].get("renamed_from")):
+        raise StagingApplyError("readback manifest identity mismatch")
+    path = Path(data_root) / "migrations" / filename
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
+        raise StagingApplyError("readback migration bytes mismatch")
+    child = evidence_child_env(source.get(SECRET_ENV, ""), expected_database)
+    row = read_row(child, matches[0], filename, preserve=True)
+    fields = row.split("\t")
+    if (len(fields) != 4 or fields[0] != filename or fields[1] != expected_sha
+            or not fields[2] or not fields[3]
+            or any(any(ord(ch) < 32 or ord(ch) == 127 for ch in field) for field in fields)):
+        raise StagingApplyError("readback row missing, ambiguous or mismatched")
+    receipt = dict(zip(("file", "sha256", "applied_at", "applied_by"), fields))
+    receipt.update({"kind": "staging-ledger-readback", "trusted_revision": source["TRUSTED_REVISION"],
+                    "data_revision": source["DATA_REVISION"], "run_id": source["GITHUB_RUN_ID"],
+                    "run_attempt": source["GITHUB_RUN_ATTEMPT"], "job": source["GITHUB_JOB"],
+                    "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    text = json.dumps(receipt, ensure_ascii=True, indent=2) + "\n"
+    Path(source["READBACK_RECEIPT"]).write_text(text)
+    with open(source["GITHUB_STEP_SUMMARY"], "a") as handle:
+        handle.write("### New staging ledger readback (not original apply evidence)\n\n```json\n")
+        handle.write(text + "```\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("phase", choices=("apply", "evidence"))
+    parser.add_argument("phase", choices=("apply", "evidence", "readback"))
+    parser.add_argument("--expected-sha", default="")
     parser.add_argument("--trusted-root", default="trusted")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--file", required=True)
@@ -288,11 +326,18 @@ def main(argv=None):
         if args.phase == "apply":
             apply_files(args.trusted_root, args.data_root, args.file,
                         args.applied_by, args.mode, args.expect_database)
-        else:
+        elif args.phase == "evidence":
             run_evidence(args.data_root, args.file, args.applied_files,
                          args.apply_outcome, args.expect_database)
+        else:
+            run_readback(args.data_root, args.file, args.expected_sha, args.expect_database)
     except StagingApplyError as exc:
         print(f"migrations-staging-apply: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        if args.phase != "readback":
+            raise
+        print("migrations-staging-apply: readback failed; details redacted", file=sys.stderr)
         return 1
     return 0
 

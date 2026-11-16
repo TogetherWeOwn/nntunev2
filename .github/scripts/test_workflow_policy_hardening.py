@@ -162,6 +162,26 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         # still records evidence.
         self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
 
+    def test_staging_readback_is_observation_only(self):
+        text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("workflow_dispatch:", triggers)
+        for event in ("pull_request", "push", "schedule"):
+            self.assertNotIn(event + ":", triggers)
+        self.assertIn('"$WORKFLOW_REF" == refs/heads/main', text)
+        self.assertIn("contents: read", text)
+        self.assertIn("name: staging", text)
+        self.assertEqual(text.count("persist-credentials: false"), 2)
+        self.assertIn("ref: ${{ inputs.ref }}", text)
+        self.assertIn("ref: ${{ github.sha }}", text)
+        self.assertIn("git -C data rev-parse HEAD", text)
+        self.assertIn("git -C trusted rev-parse HEAD", text)
+        self.assertEqual(text.count("staging_apply.py readback"), 1)
+        for forbidden in ("staging_apply.py apply", "apply_migration.py", "all-pending", "--record-only", "$GITHUB_ENV"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("path: readback-receipt.json", text)
+        self.assertIn("if-no-files-found: error", text)
+
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter
         # leaves Rust/docs-only PRs waiting forever.

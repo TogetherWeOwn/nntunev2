@@ -1,0 +1,90 @@
+name: migrations-staging-readback
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact data commit SHA
+        type: string
+        required: true
+      file:
+        description: App migration basename
+        type: string
+        required: true
+      sha256:
+        description: Expected migration SHA256
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrations-staging-apply
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  readback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+    steps:
+      - name: Validate dispatch
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+          DATA_REF: ${{ inputs.ref }}
+          FILE: ${{ inputs.file }}
+          SHA: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_REF" == refs/heads/main ]]
+          [[ "$DATA_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FILE" =~ ^[0-9]{4}_[A-Za-z0-9_]+\.sql$ ]]
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Check out data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: data
+          persist-credentials: false
+
+      - name: Check out trusted code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Verify revisions
+        env:
+          DATA_REF: ${{ inputs.ref }}
+          TRUSTED_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C data rev-parse HEAD)" = "$DATA_REF"
+          test "$(git -C trusted rev-parse HEAD)" = "$TRUSTED_REF"
+          command -v psql >/dev/null
+          test -r /etc/ssl/certs/ca-certificates.crt
+
+      - name: Observe ledger row
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          DATA_REVISION: ${{ inputs.ref }}
+          TRUSTED_REVISION: ${{ github.sha }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+          READBACK_RECEIPT: readback-receipt.json
+        run: |
+          set -euo pipefail
+          python3 -E -s trusted/.github/scripts/staging_apply.py readback --data-root data --file "$MIGRATION_FILE" --expected-sha "$EXPECTED_SHA" --expect-database nntunev2_staging
+
+      - name: Upload sanitized readback receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-ledger-readback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: readback-receipt.json
+          retention-days: 7
+          if-no-files-found: error

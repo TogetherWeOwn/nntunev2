@@ -1,4 +1,6 @@
 """Executed tests for the staging-apply driver (finding 5 coverage)."""
+import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -63,6 +65,56 @@ class StagingApplyTests(unittest.TestCase):
         (trusted / ".github/scripts/apply_migration.py").write_text(
             "import sys\nsys.exit(0)\n")
         return data, trusted, root
+
+    def test_readback_observes_exact_row_without_apply(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, _, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"),
+               "READBACK_RECEIPT": str(root / "receipt"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "observe"}
+        valid = f"0054_first.sql\t{sha}\t2026-11-16 01:02:03+00\tactor"
+        calls = []
+
+        def fake_psql(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout=valid)
+
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", side_effect=fake_psql), \
+             patch.object(staging_apply, "apply_files", side_effect=AssertionError("apply reached")):
+            staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        receipt = json.loads((root / "receipt").read_text())
+        self.assertEqual(receipt["applied_by"], "actor")
+        self.assertEqual(receipt["kind"], "staging-ledger-readback")
+        self.assertIn("not original apply", (root / "summary").read_text())
+        self.assertEqual(len(calls), 1)
+        argv, kw = calls[0]
+        self.assertEqual(argv[0], "psql")
+        self.assertNotIn("secretpw", str(argv))
+        self.assertEqual(kw["env"]["PGSSLMODE"], "verify-full")
+        self.assertIn("default_transaction_read_only=on", kw["env"]["PGOPTIONS"])
+        self.assertTrue(kw["input"].startswith("SELECT file, sha256, applied_at, applied_by"))
+        self.assertNotIn("secretpw", (root / "receipt").read_text())
+        with patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=URL_REQUIRE)):
+            with self.assertRaises(staging_apply.StagingApplyError) as error:
+                staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+            self.assertNotIn("secretpw", str(error.exception))
+        with self.assertRaises(staging_apply.StagingApplyError):
+            staging_apply.evidence_child_env(URL_REQUIRE + "&sslrootcert=/tmp/untrusted", DB)
+        for bad in ("", valid + "\n" + valid, valid.replace(sha, "f" * 64)):
+            with self.subTest(row=bad), patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=bad)):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            for file, digest, db in (("../oops", sha, DB), ("0054_first.sql", "f" * 64, DB),
+                                     ("0054_first.sql", sha, "production")):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_readback(str(data), file, digest, db, env)
+            runner.assert_not_called()
 
     # Finding 2: single mode refuses a mirror file before connecting.
     def test_single_mode_refuses_mirror_before_connecting(self):
@@ -146,7 +198,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp"}
         calls = []
 
@@ -213,7 +265,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp",
                "FAKE_SECRET": "spike-value", "GITHUB_TOKEN": "spike"}
         staging_apply.apply_files(str(trusted), str(data),
@@ -233,7 +285,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp"}
         seen = []
 
