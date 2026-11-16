@@ -2621,6 +2621,29 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        crate::preference_rows::private_session_active_statement(),
+                        &[&user_id, &session_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .ok_or(StoreError)?;
+                row.try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn upsert_private_session(
         &self,
         user_id: &str,

@@ -675,6 +675,18 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Observe an exact private session using server time. This is not authority
+    /// to issue a play; activation must recheck under the account fence.
+    fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (user_id, session_id);
+            Err(StoreError)
+        }
+    }
     /// Atomically replace the expiration for an exact owner/session pair.
     /// Writers must fence the account against deletion and reject missing or
     /// deleting accounts, invalid database values and storage failures.
@@ -7772,7 +7784,65 @@ mod tests {
         assert_eq!(*store.private_sessions.borrow(), expected);
     }
 
+    #[test]
+    fn private_session_active_is_an_owner_scoped_observation() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        block_on(store.upsert_private_session("alice", "Session", 253_402_300_799)).unwrap();
+        block_on(store.upsert_private_session("alice", "expired", 0)).unwrap();
+        assert!(block_on(store.private_session_active("alice", "Session")).unwrap());
+        for (owner, session) in [
+            ("alice", "session"),
+            ("Alice", "Session"),
+            ("alice", "expired"),
+            ("alice", "absent"),
+        ] {
+            assert!(!block_on(store.private_session_active(owner, session)).unwrap());
+        }
+        for (owner, session) in [("missing", "Session"), ("alice", ""), ("alice", "bad\0id")] {
+            assert!(block_on(store.private_session_active(owner, session)).is_err());
+        }
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.private_session_active("alice", "Session")).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.private_session_active("alice", "Session")).is_err());
+    }
+
     impl Store for FakeStore {
+        async fn private_session_active(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || session_id.contains('\0')
+                || !(1..=128).contains(&session_id.chars().count())
+            {
+                return Err(StoreError);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| StoreError)?
+                .as_secs();
+            Ok(self
+                .private_sessions
+                .borrow()
+                .get(&(user_id.into(), session_id.into()))
+                .is_some_and(|expiry| *expiry > now))
+        }
+
         async fn upsert_private_session(
             &self,
             user_id: &str,
