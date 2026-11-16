@@ -85,7 +85,8 @@ test('real mounted store clears without remount and records again', async ({ pag
 	await expect.poll(async () => JSON.parse((await raw(page))!)[0]?.trackId).toBe('third-light');
 	const after = await snapshot(page);
 	expect(after.id).toBe(before.id);
-	expect(after.node).toBe(before.node);
+	// Switching tracks intentionally replaces the keyed audio element; clear did not.
+	expect(after.node).not.toBe(before.node);
 });
 
 for (const mode of ['writes', 'all'] as const) {
@@ -124,12 +125,12 @@ test('a retained operation rejects after the route unmounts', async ({ page }) =
 		(window as Instrumented).__oldHistoryFixture = (window as Instrumented).__nntuneHistoryFixture;
 		const link = document.createElement('a');
 		link.id = 'fixture-navigation';
-		link.href = '/pricing';
+		link.href = '/';
 		link.textContent = 'Navigate';
 		document.body.append(link);
 	});
 	await page.locator('#fixture-navigation').click();
-	await expect(page).toHaveURL(/\/pricing$/);
+	await expect(page).toHaveURL(/\/$/);
 	await expect.poll(() => page.evaluate(() => '__nntuneHistoryFixture' in window)).toBe(false);
 	expect(await page.evaluate(async () => {
 		try { await (window as Instrumented).__oldHistoryFixture!.clear(); return false; }
