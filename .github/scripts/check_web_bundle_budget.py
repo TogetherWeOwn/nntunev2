@@ -42,7 +42,9 @@ import sys
 from pathlib import Path
 
 # Pinned budget, raw bytes. See module docstring for how to update.
-BUDGET_CLIENT_JS_BYTES = 368_640  # 360 KiB; measured 339,150 B on 2026-11-03 (W10 app-shell client)
+BUDGET_CLIENT_JS_BYTES = (
+    368_640  # 360 KiB; measured 339,150 B on 2026-11-03 (W10 app-shell client)
+)
 
 CLIENT_DIR_PARTS = ("apps", "web", ".svelte-kit", "output", "client")
 
@@ -71,8 +73,7 @@ def client_js_files(client_dir: Path) -> list[Path]:
     files = sorted(p for p in client_dir.rglob("*.js") if p.is_file())
     if not files:
         raise BudgetError(
-            f"no client JS files under {client_dir}; "
-            "refusing to pass an empty bundle"
+            f"no client JS files under {client_dir}; refusing to pass an empty bundle"
         )
     return files
 
@@ -110,8 +111,14 @@ def publish_warning(message: str) -> None:
     print(f"::warning::{escaped}", flush=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(f"## Client-JS bundle budget (advisory)\n\n- {message}\n")
+        try:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(f"## Client-JS bundle budget (advisory)\n\n- {message}\n")
+        except OSError as exc:
+            print(
+                f"bundle budget: WARNING: could not write job summary: {exc}",
+                flush=True,
+            )
 
 
 def report_top_files(client_dir: Path) -> None:

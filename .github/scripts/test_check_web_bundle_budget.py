@@ -323,6 +323,24 @@ def test_overage_publishes_actions_warning_and_summary() -> None:
     assert "client JS total 1100 B exceeds budget 1000 B" in text, text
 
 
+def test_overage_with_unwritable_summary_remains_advisory() -> None:
+    client = _client_dir_with({"a.js": 1_001})
+    summary_dir = Path(tempfile.mkdtemp())
+    for summary in (summary_dir, summary_dir / "missing" / "summary.md"):
+        with patch.dict(
+            os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(summary)}
+        ):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert (
+                    budget_main(["--client-dir", str(client), "--budget", "1000"]) == 0
+                )
+        output = buf.getvalue()
+        assert "bundle budget: WARNING" in output, output
+        assert "::warning::" in output, output
+        assert "over by 1 B" in output, output
+
+
 def test_ordinary_fixture_isolates_inherited_actions_environment() -> None:
     client = _client_dir_with({"a.js": 1_001})
     summary = Path(tempfile.mkdtemp()) / "summary.md"
@@ -451,6 +469,7 @@ def main_test() -> int:
         test_missing_dir_reports_fail_without_file_lines,
         test_two_file_over_budget_reports_both_in_order,
         test_overage_publishes_actions_warning_and_summary,
+        test_overage_with_unwritable_summary_remains_advisory,
         test_ordinary_fixture_isolates_inherited_actions_environment,
         test_overage_outside_actions_prints_no_annotation,
         test_under_budget_pass_report_text,
