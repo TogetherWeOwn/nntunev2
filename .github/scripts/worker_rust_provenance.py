@@ -54,6 +54,9 @@ def rust_env_refusals(env, version: str) -> None:
 
 
 def cargo_config_refusals(env, root: Path = ROOT) -> None:
+    for key in ("HOME", "CARGO_HOME"):
+        if env.get(key) and not Path(env[key]).is_absolute():
+            raise ValueError(f"{key} must be absolute")
     home = Path(env.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir) / ".cargo"
     if env.get("CARGO_HOME") and Path(env["CARGO_HOME"]).resolve() != home.resolve():
         raise ValueError("CARGO_HOME is not the default Cargo home")

@@ -114,8 +114,10 @@ class RustPin(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     wt.cargo_config_refusals({}, tmp / "repo")
                 config.unlink()
-            with self.assertRaises(ValueError):
-                wt.cargo_config_refusals({"CARGO_HOME": str(tmp / "other")}, tmp / "repo")
+            for env in ({"CARGO_HOME": str(tmp / "other")}, {"HOME": "child"}, {"CARGO_HOME": ".cargo"}):
+                with self.assertRaises(ValueError):
+                    wt.cargo_config_refusals(env, tmp / "repo")
+            wt.cargo_config_refusals({"HOME": ""}, tmp / "repo")
 
     def test_supplied_home_config_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"HOME": str(Path(tmp) / "ambient")}):
