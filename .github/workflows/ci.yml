@@ -541,6 +541,8 @@ jobs:
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
       - name: Test fail-closed staging schema gate (mocked; no credentials)
         run: python3 .github/scripts/test_staging_api_schema_gate.py
+      - name: Test span observation evaluator (offline)
+        run: python3 workers/api/tests/test_span_result.py
 
   mb-import-etl:
     name: mb-import-etl
