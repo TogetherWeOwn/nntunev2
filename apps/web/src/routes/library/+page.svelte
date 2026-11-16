@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
@@ -347,7 +348,16 @@
 	// selection change swaps the queue object and hides it (no effect needed).
 	let queueShareOutcome: { status: string; fallbackUrl: string | null; forQueue: QueueState | null } =
 		$state({ status: '', fallbackUrl: null, forQueue: null });
-	let queueShareGeneration = 0;
+	const queueShare = createQueueShare({
+		getQueue: () => queue,
+		getPosition: () => audioEl?.currentTime,
+		getOrigin: () => window.location.origin,
+		getClipboard: clipboardWriter,
+		shortTitle,
+		onOutcome: (status, fallbackUrl, forQueue) => {
+			queueShareOutcome = { status, fallbackUrl, forQueue };
+		}
+	});
 	const queueShareStatus = $derived(
 		queueShareOutcome.forQueue === queue ? queueShareOutcome.status : ''
 	);
@@ -881,27 +891,13 @@
 		shareFallbackUrl = null;
 	}
 
-	/**
-	 * Drop visible queue-share feedback. Only a new activation or the auth
-	 * boundary supersedes a pending write (`supersede`); a queue edit merely
-	 * clears what is shown, and the late completion re-checks its row.
-	 */
-	function clearQueueShareFeedback(supersede = false): void {
-		if (supersede) queueShareGeneration += 1;
-		setQueueShareOutcome('', null);
-	}
-
-	function setQueueShareOutcome(status: string, fallbackUrl: string | null): void {
-		queueShareOutcome = { status, fallbackUrl, forQueue: queue };
-	}
-
 	function resetShareAtAuthBoundary(): void {
 		endGeneration += 1;
 		playingElement = null;
 		if (audioEl && !audioEl.paused) audioEl.pause();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
-		clearQueueShareFeedback(true);
+		queueShare.reset();
 		pendingShareSeek = null;
 		restartSupersededSources.clear();
 		restartCanSeek = false;
@@ -928,53 +924,6 @@
 		// would announce a lone surrogate before the ellipsis.
 		const points = Array.from(title);
 		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
-	}
-
-	/**
-	 * Copy the browse-format link for one queued row. Never selects, seeks,
-	 * plays, fetches or persists; the position is read live and only for the
-	 * current track, so a queued row is never stamped with another track's
-	 * time. A row that left the queue before the write finished reports
-	 * unavailable instead of a stale success.
-	 */
-	async function copyQueuedTrackLink(id: string): Promise<void> {
-		clearQueueShareFeedback(true);
-		const generation = queueShareGeneration;
-		const queued = queue.tracks.find((track) => track.id === id);
-		if (!queued) {
-			setQueueShareOutcome('Link unavailable — that track is no longer in the queue.', null);
-			return;
-		}
-		const title = shortTitle(queued.title?.trim() ? queued.title : queued.id);
-		const unavailable = `Link unavailable — ${title} is no longer in the queue.`;
-		const current = queueCurrentTrack(queue);
-		const position = current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
-		const seconds = typeof position === 'number' && Number.isFinite(position) && position >= 0 ? position : 0;
-		let url: string;
-		try {
-			url = `${window.location.origin}/library?${buildShareQuery(id, seconds)}`;
-		} catch {
-			setQueueShareOutcome(unavailable, null);
-			return;
-		}
-		const clipboard = clipboardWriter();
-		if (!clipboard) {
-			setQueueShareOutcome('', url);
-			return;
-		}
-		let written = true;
-		try {
-			await clipboard.writeText(url);
-		} catch {
-			written = false;
-		}
-		if (!shareAlive || generation !== queueShareGeneration) return;
-		if (!queue.tracks.some((track) => track.id === id)) {
-			setQueueShareOutcome(unavailable, null);
-			return;
-		}
-		if (written) setQueueShareOutcome(`Copied link for ${title}.`, null);
-		else setQueueShareOutcome('', url);
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
@@ -1997,6 +1946,7 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			queueShare.dispose();
 			endGeneration += 1;
 			playingElement = null;
 			if (audioEl && !audioEl.paused) audioEl.pause();
@@ -2478,7 +2428,7 @@
 				onclear={clearQueuedTracks}
 				onselect={selectQueuedTrack}
 				onplaynow={(id) => void playQueuedTrack(id)}
-				oncopylink={(id) => void copyQueuedTrackLink(id)}
+				oncopylink={(id) => void queueShare.copy(id)}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
