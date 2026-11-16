@@ -1409,6 +1409,80 @@ async fn coupled_fixture_waits_for_raw_insert_commit_or_rollback() {
     result.expect("raw writer exclusion failed");
 }
 
+// A raw parent delete reaches the FK cascade without participating in the
+// fixture's locking convention. Observe the child relation wait before release.
+#[tokio::test]
+async fn parent_delete_waits_for_subscription_exclusion() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    for commit_delete in [false, true] {
+        let mut fx = Fx::new().await;
+        fx.add_user("u1").await;
+        let before = fx.seed_active("u1", "sub_parent").await;
+        assert_eq!(fx.history_rows("sub_parent").await, 2);
+        let config =
+            disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+        let (holder, connection) = config.connect(NoTls).await.unwrap();
+        let holder_driver = tokio::spawn(connection);
+        let (deleter, connection) = config.connect(NoTls).await.unwrap();
+        let deleter_driver = tokio::spawn(connection);
+        let holder_pid: i32 = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let deleter_pid: i32 = deleter
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        holder.batch_execute(&format!("SET search_path TO {}; SET statement_timeout = '5s'; BEGIN; LOCK TABLE subscriptions IN SHARE ROW EXCLUSIVE MODE", fx.schema)).await.unwrap();
+        deleter
+            .batch_execute(&format!(
+                "SET search_path TO {}; SET statement_timeout = '5s'; BEGIN",
+                fx.schema
+            ))
+            .await
+            .unwrap();
+        let (phase_tx, phase_rx) = billing_contention::phase();
+        let mut pending = tokio::spawn(async move {
+            let _ = phase_tx.send(());
+            let result = deleter
+                .execute("DELETE FROM users WHERE id = 'u1'", &[])
+                .await;
+            (deleter, result)
+        });
+        let result: Result<(), String> = async {
+            billing_contention::reached(phase_rx).await?;
+            billing_contention::relation_wait(&fx.db, &mut pending, holder_pid, deleter_pid, &format!("{}.subscriptions", fx.schema), "RowExclusiveLock").await?;
+            if fx.snap("sub_parent").await != Some(before.clone()) || fx.history_rows("sub_parent").await != 2 {
+                return Err("uncommitted deletion changed the visible snapshot".into());
+            }
+            holder.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+            let (deleter, deleted) = timeout(Duration::from_secs(5), &mut pending).await.map_err(|_| "delete did not finish after release".to_string())?.map_err(|e| e.to_string())?;
+            if deleted.map_err(|e| e.to_string())? != 1 { return Err("expected one deleted parent".into()); }
+            deleter.batch_execute(if commit_delete { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let row = fx.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $2::text::regclass AND mode = 'ShareRowExclusiveLock')", &[&holder_pid, &format!("{}.subscriptions", fx.schema)]).await.map_err(|e| e.to_string())?;
+            if row.get::<_, bool>(0) { return Err("holder retained subscription lock".into()); }
+            let parent_exists: bool = fx.db.query_one("SELECT EXISTS (SELECT 1 FROM users WHERE id = 'u1')", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let expected = if commit_delete { None } else { Some(before.clone()) };
+            if parent_exists == commit_delete || fx.snap("sub_parent").await != expected || fx.history_rows("sub_parent").await != if commit_delete { 0 } else { 2 } {
+                return Err("delete did not commit or roll back parent and children together".into());
+            }
+            Ok(())
+        }.await;
+        pending.abort();
+        drop(holder);
+        holder_driver.abort();
+        deleter_driver.abort();
+        let _ = holder_driver.await;
+        let _ = deleter_driver.await;
+        fx.cleanup().await;
+        result.expect("parent delete contention failed");
+    }
+}
+
 #[tokio::test]
 async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     use billing_transaction_fixture::{run, Class};

@@ -9,27 +9,17 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/blocker_observer.rs"]
 mod blocker_observer;
+#[path = "support/disposable_accounts.rs"]
+mod disposable_accounts;
 
 const RELEASE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RECORDING: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OTHER_RELEASE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 async fn client(populated: bool) -> Client {
-    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
-        .expect("CI disposable database is required; never silently skip")
-        .parse()
-        .unwrap();
-    assert_eq!(config.get_dbname(), Some("nntune_ci"));
-    assert!(config.get_hostaddrs().is_empty(), "no address overrides");
-    assert!(
-        matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
-        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
-    );
-    let (client, connection) = config.connect(NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap() });
+    let client = disposable_accounts::connect().await;
     client.batch_execute(
-        "SET statement_timeout = '3s'; SET search_path = pg_temp;
-         CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
+        "CREATE TEMP TABLE library (user_id TEXT, job_id TEXT, release_mbid TEXT, recording_mbids TEXT[], idempotency_key TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text)",
     ).await.unwrap();
     if populated {
         // Duplicate recordings and malformed stored MBIDs must survive library
@@ -82,20 +72,11 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 
 #[tokio::test]
 async fn private_session_upsert_rolls_back_after_mutation() {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let owner = format!("private-rollback-{}-{nonce}", std::process::id());
-    let other = format!("{owner}-other");
-    let observer = client(false).await;
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let observer = &accounts.observer;
     let result: Result<(), String> = async {
-        for id in [&owner, &other] {
-            observer.execute("INSERT INTO public.users (id,email,created_at) VALUES ($1,$2,1)",
-                &[id, &format!("{id}@example.invalid")]).await.map_err(|e| e.to_string())?;
-        }
         observer.execute("INSERT INTO public.private_sessions VALUES ($1,'keep',11), ($2,'target',12)",
             &[&owner, &other]).await.map_err(|e| e.to_string())?;
         for (session, expiry, inject) in [("target", 30_u64, true), ("target", 40, false),
@@ -183,32 +164,18 @@ async fn private_session_upsert_rolls_back_after_mutation() {
     }.await;
     // Also release a failed observer transaction before fixture cleanup.
     let _ = observer.batch_execute("ROLLBACK").await;
-    observer
-        .execute(
-            "DELETE FROM public.users WHERE id IN ($1,$2)",
-            &[&owner, &other],
-        )
-        .await
-        .unwrap();
+    accounts.cleanup().await;
     result.unwrap();
 }
 
 #[tokio::test]
 async fn private_session_upsert_respects_account_fence() {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let owner = format!("private-fence-{}-{nonce}", std::process::id());
-    let other = format!("{owner}-other");
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
     let locker = client(false).await;
-    let observer = client(false).await;
+    let observer = &accounts.observer;
     let result: Result<(), String> = async {
-        for id in [&owner, &other] {
-            observer.execute("INSERT INTO public.users (id,email,created_at) VALUES ($1,$2,1)", &[id, &format!("{id}@example.invalid")]).await.map_err(|e| e.to_string())?;
-        }
         locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
         locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
         let blocked = private_client().await?;
@@ -242,16 +209,50 @@ async fn private_session_upsert_respects_account_fence() {
         let mut expected = vec![(owner.clone(), "absent".into(), 10), (other.clone(), "absent".into(), 20)];
         expected.sort();
         if actual != expected { return Err("unexpected rows after fence controls".into()); }
+
+        // Hold an actual writer after its mutation; a distinct absent session must
+        // wait on that writer rather than merely on an externally held lock.
+        let first_client = private_client().await?;
+        let first_pid: i32 = first_client.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let first = catalogue_store_for_postgres_test(first_client, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let reached = Rc::new(Cell::new(false));
+        let release = Rc::new(Cell::new(false));
+        let (hook_reached, hook_release) = (reached.clone(), release.clone());
+        first.set_preflight_hook("private-session-upsert", Box::new(move || Box::pin(async move {
+            hook_reached.set(true);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !hook_release.get() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+            }).await.map_err(|_| StoreError)?;
+            Ok(())
+        })));
+        let writer = first.upsert_private_session(&owner, "writer-one", 30);
+        tokio::pin!(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !reached.get() {
+                tokio::select! {
+                    _ = writer.as_mut() => return Err("first writer finished before its hook".to_string()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+            Ok(())
+        }).await.map_err(|_| "first writer did not reach its hook".to_string())??;
+        let second_client = private_client().await?;
+        let second_pid: i32 = second_client.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let second = catalogue_store_for_postgres_test(second_client, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let waiter = second.upsert_private_session(&owner, "writer-two", 40);
+        tokio::pin!(waiter);
+        blocker_observer::observe_blocked(observer, first_pid, second_pid, waiter.as_mut()).await?;
+        let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        unrelated.upsert_private_session(&other, "writer-three", 50).await.map_err(|_| "unrelated writer blocked".to_string())?;
+        release.set(true);
+        writer.await.map_err(|_| "first writer failed".to_string())?;
+        waiter.await.map_err(|_| "second writer failed after release".to_string())?;
+        let count: i64 = observer.query_one("SELECT count(*) FROM public.private_sessions WHERE (user_id = $1 AND session_id IN ('writer-one','writer-two')) OR (user_id = $2 AND session_id = 'writer-three')", &[&owner, &other]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 3 { return Err("writer controls did not commit all sessions".into()); }
         Ok(())
     }.await;
     let _ = locker.batch_execute("ROLLBACK").await;
-    observer
-        .execute(
-            "DELETE FROM public.users WHERE id IN ($1,$2)",
-            &[&owner, &other],
-        )
-        .await
-        .unwrap();
+    accounts.cleanup().await;
     result.unwrap();
 }
 
@@ -816,8 +817,11 @@ async fn preference_deletes_are_scoped_idempotent_and_fenced() {
 async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::{Ban, Snooze};
-    let observer = client(false).await;
-    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-iso-a','taste-iso-a@example.invalid',1), ('taste-iso-b','taste-iso-b@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-iso-a','track','job','love',NULL,1,1), ('taste-iso-b','track','job','love',NULL,2,2)").await.unwrap();
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let (a, b) = (accounts.id(0), accounts.id(1));
+    let observer = &accounts.observer;
+    let result = async {
+    observer.execute("INSERT INTO public.account_taste VALUES ($1,'track','job','love',NULL,1,1), ($2,'track','job','love',NULL,2,2)", &[&a, &b]).await?;
     let store = catalogue_store_for_postgres_test(
         client(false).await,
         false,
@@ -825,7 +829,7 @@ async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
         Rc::new(Cell::new(0)),
     );
     let changed = store
-        .taste_upsert("taste-iso-a", Track, "job", Ban, None, 3)
+        .taste_upsert(a, Track, "job", Ban, None, 3)
         .await;
     let store = catalogue_store_for_postgres_test(
         client(false).await,
@@ -834,26 +838,22 @@ async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
         Rc::new(Cell::new(0)),
     );
     let rejected = store
-        .taste_upsert("taste-iso-a", Track, "job", Snooze, None, 4)
+        .taste_upsert(a, Track, "job", Snooze, None, 4)
         .await;
-    let rows = observer.query("SELECT user_id, signal, updated_at FROM public.account_taste WHERE user_id IN ('taste-iso-a','taste-iso-b') ORDER BY user_id", &[]).await.unwrap();
-    let states: Vec<(String, String, i64)> = rows
-        .iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
-    observer
-        .batch_execute("DELETE FROM public.users WHERE id IN ('taste-iso-a','taste-iso-b')")
-        .await
-        .unwrap();
+    let rows = observer.query("SELECT user_id, signal, updated_at FROM public.account_taste WHERE user_id = ANY($1)", &[&vec![a, b]]).await?;
+    let states: Vec<(String, String, i64)> = rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect();
+    Ok::<_, tokio_postgres::Error>((changed, rejected, states))
+    }.await;
+    let expected = [
+        (a.to_owned(), "ban".to_owned(), 3),
+        (b.to_owned(), "love".to_owned(), 2),
+    ];
+    accounts.cleanup().await;
+    let (changed, rejected, states) = result.unwrap();
     assert!(changed.is_ok());
     assert!(rejected.is_err());
-    assert_eq!(
-        states,
-        vec![
-            ("taste-iso-a".into(), "ban".into(), 3),
-            ("taste-iso-b".into(), "love".into(), 2)
-        ]
-    );
+    assert_eq!(states.len(), 2);
+    assert!(expected.iter().all(|row| states.contains(row)));
 }
 
 #[tokio::test]
@@ -861,59 +861,54 @@ async fn taste_upsert_waits_for_deletion_fence() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::Ban;
     use std::time::Duration;
-    let observer = client(false).await;
     let locker = client(false).await;
     let writer = client(false).await;
-    let writer_pid: i32 = writer
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    observer.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('taste-race','taste-race@example.invalid',1); INSERT INTO public.account_taste VALUES ('taste-race','track','old','love',NULL,1,1)").await.unwrap();
-    locker
-        .batch_execute("BEGIN; UPDATE public.users SET deleting_at = now() WHERE id = 'taste-race'")
-        .await
-        .unwrap();
-    let store =
-        catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
-    let write = store.taste_upsert("taste-race", Track, "old", Ban, None, 10);
-    let release = async {
-        let observed = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = observer
-                    .query_one(
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let account = accounts.id(0).to_owned();
+    let observer = &accounts.observer;
+    let outcome = async {
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        observer.execute("INSERT INTO public.account_taste VALUES ($1,'track','old','love',NULL,1,1)", &[&account]).await?;
+        locker.batch_execute("BEGIN").await?;
+        locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&account]).await?;
+        let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let write = store.taste_upsert(&account, Track, "old", Ban, None, 10);
+        let release = async {
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let waiting: bool = observer.query_one(
                         "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
                         &[&writer_pid],
-                    )
-                    .await
-                    .unwrap()
-                    .get(0);
-                if waiting {
-                    break;
+                    ).await?.get(0);
+                    if waiting {
+                        return Ok::<_, tokio_postgres::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            }).await;
+            locker.batch_execute("COMMIT").await?;
+            match observed {
+                Ok(result) => result.map(|()| true),
+                Err(_) => Ok(false),
             }
-        })
-        .await
-        .is_ok();
-        locker.batch_execute("COMMIT").await.unwrap();
-        observed
-    };
-    let (result, observed) = tokio::join!(write, release);
-    let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = 'taste-race' AND target_id = 'old'", &[]).await.unwrap();
-    let state: (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
-    observer
-        .batch_execute("DELETE FROM public.users WHERE id = 'taste-race'")
-        .await
-        .unwrap();
-    let remaining: i64 = observer
+        };
+        let (result, observed) = tokio::join!(write, release);
+        let row = observer.query_one("SELECT signal, created_at, updated_at FROM public.account_taste WHERE user_id = $1 AND target_id = 'old'", &[&account]).await?;
+        let state: (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
+        Ok::<_, tokio_postgres::Error>((result, observed?, state))
+    }.await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    let check = client(false).await;
+    let remaining: i64 = check
         .query_one(
-            "SELECT count(*) FROM public.account_taste WHERE user_id = 'taste-race'",
-            &[],
+            "SELECT count(*) FROM public.account_taste WHERE user_id = $1",
+            &[&account],
         )
         .await
         .unwrap()
         .get(0);
+    let (result, observed, state) = outcome.unwrap();
     assert!(observed, "writer must wait on the deleting account");
     assert!(result.is_err());
     assert_eq!(state, ("love".into(), 1, 1));
