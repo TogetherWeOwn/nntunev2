@@ -931,14 +931,15 @@ jobs:
         run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
       - name: Smoke the shipped server and pinned par2 binary
         run: |
-          docker run -d --name repair-smoke -p 18080:8080 nntune-repair:ci
+          trap 'docker rm -f repair-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name repair-smoke -p 127.0.0.1:18080:8080 nntune-repair:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18080/health; then break; fi
+            if curl --max-time 2 -fsS http://127.0.0.1:18080/health; then break; fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
+          curl --max-time 2 -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
           docker exec repair-smoke /usr/local/bin/par2 --version | head -1
-          docker rm -f repair-smoke
+          python3 containers/repair/tests/test_image_repair.py repair-smoke
 
   rust-transcode:
     name: rust (workers/transcode)
