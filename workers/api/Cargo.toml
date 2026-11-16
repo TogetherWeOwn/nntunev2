@@ -66,8 +66,6 @@ worker = "0.9"
 postgres-tests = []
 # Exposes the inert adapter only to the synthetic WASM runtime test.
 staging-body-wasm-test = []
-# Separate Worker build for owned-transport runtime tests; never enabled in releases.
-billing-owned-wasm-test = []
 ledger-wasm-test = ["nntune-subsonic/ledger-wasm-test"]
 
 [[test]]
