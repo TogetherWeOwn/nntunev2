@@ -139,6 +139,26 @@ impl StagingBody {
     }
 }
 
+// This export exists only in the synthetic runtime test build, never in the
+// ordinary Worker bundle. It exercises the same entry point used by callers.
+#[cfg(all(target_arch = "wasm32", feature = "staging-body-wasm-test"))]
+mod wasm_test {
+    use super::StagingBody;
+    use worker::wasm_bindgen::{self, prelude::*, JsValue};
+
+    #[wasm_bindgen]
+    pub async fn collect_staging_test(
+        request: worker::web_sys::Request,
+        declared: Option<u32>,
+    ) -> Result<String, JsValue> {
+        let body = StagingBody::new(declared.map(|n| n as usize))
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        body.collect_worker(&request.into(), None)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+    }
+}
+
 fn map_fault(fault: BodyFault) -> StagingBodyError {
     match fault {
         BodyFault::Oversized => StagingBodyError::TooLarge,

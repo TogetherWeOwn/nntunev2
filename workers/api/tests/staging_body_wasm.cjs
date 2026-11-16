@@ -1,0 +1,35 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const { collect_staging_test: collect } = require(process.env.STAGING_BODY_WASM_JS);
+const bytes = (s) => new TextEncoder().encode(s);
+const request = (stream) => new Request('https://example.test/', {
+  method: 'POST', body: stream, duplex: 'half',
+});
+const chunks = (...values) => new ReadableStream({
+  start(controller) {
+    for (const value of values) controller.enqueue(value);
+    controller.close();
+  },
+});
+
+test('collects bounded chunks through the Worker adapter', async () => {
+  const text = 'x=' + 'a'.repeat(8190);
+  for (const declared of [undefined, 0, 1, 8192]) {
+    assert.equal(await collect(request(chunks(bytes('x='), bytes(text.slice(2)))), declared), text);
+  }
+});
+
+test('rejects oversized chunks and cumulative input', async () => {
+  await assert.rejects(collect(request(chunks(bytes('x=' + 'a'.repeat(8191))))), (e) => e === 'TooLarge');
+  await assert.rejects(collect(request(chunks(bytes('x='), bytes('a'.repeat(8190)), bytes('z')))), (e) => e === 'TooLarge');
+  await assert.rejects(collect(request(chunks(bytes('x=1'))), 8193), (e) => e === 'TooLarge');
+});
+
+test('rejects short declarations, stream errors and non-byte chunks', async () => {
+  await assert.rejects(collect(request(chunks(bytes('ab'))), 3), (e) => e === 'Unreadable');
+  const failed = new ReadableStream({ start(controller) { controller.error(new Error('failed')); } });
+  await assert.rejects(collect(request(failed)), (e) => e === 'Unreadable');
+  await assert.rejects(collect(request(chunks('not bytes'))), (e) => e === 'Unreadable');
+});
