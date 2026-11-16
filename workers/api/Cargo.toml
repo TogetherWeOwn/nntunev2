@@ -63,6 +63,8 @@ worker = "0.8"
 
 [features]
 postgres-tests = []
+# Exposes the inert adapter only to the synthetic WASM runtime test.
+staging-body-wasm-test = []
 
 [[test]]
 name = "session_refresh_postgres"
