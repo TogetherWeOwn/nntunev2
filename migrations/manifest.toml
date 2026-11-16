@@ -220,3 +220,8 @@ sha256 = "40e243b952f7fc289f0167cb118a3fcc5ec3b17c1b74b62424a2abd3477a88ab"
 file = "0043_storage_object_intents.sql"
 target = "app"
 sha256 = "20aba6004de405fd9b3bd9c5c74e418d3f9ac0626058e5f4b6aac4218fa77787"
+
+[[migration]]
+file = "0044_storage_digest_map_intents.sql"
+target = "app"
+sha256 = "ce01351b0b5302b802aaf667a98d419d60666a51f6163a60040cd242ee0dc62e"
