@@ -2672,6 +2672,52 @@ impl Store for PgStore {
         .await
     }
 
+    async fn delete_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_delete_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-delete").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn taste_list(
         &self,
         user_id: &str,

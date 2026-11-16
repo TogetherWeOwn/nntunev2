@@ -30,6 +30,10 @@ pub fn private_session_upsert_statement() -> &'static str {
     "INSERT INTO public.private_sessions (user_id, session_id, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id, session_id) DO UPDATE SET expires_at = EXCLUDED.expires_at"
 }
 
+pub fn private_session_delete_statement() -> &'static str {
+    "DELETE FROM public.private_sessions WHERE user_id = $1 AND session_id = $2"
+}
+
 /// A taste row as returned by a store; its fields are not validated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TasteDbRow {
