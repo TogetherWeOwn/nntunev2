@@ -141,6 +141,9 @@ use nntune_subsonic::{
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
+// The synthetic Node build exports only the adapter, not the Worker entry
+// whose database transport imports the Cloudflare-only sockets module.
+#[cfg(not(all(target_arch = "wasm32", feature = "staging-body-wasm-test")))]
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,
