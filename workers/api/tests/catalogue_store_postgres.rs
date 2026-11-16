@@ -37,23 +37,11 @@ async fn client(populated: bool) -> Client {
 }
 
 async fn private_client() -> Result<Client, String> {
-    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
-        .map_err(|e| e.to_string())?
-        .parse::<Config>()
+    let client = disposable_accounts::connect_guarded()
+        .await
         .map_err(|e| e.to_string())?;
-    if config.get_dbname() != Some("nntune_ci")
-        || !config.get_hostaddrs().is_empty()
-        || !matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
-            if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
-    {
-        return Err("disposable local database required".into());
-    }
-    let (client, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
     client
-        .batch_execute("SET statement_timeout = '3s'; SET search_path = pg_temp, public")
+        .batch_execute("SET search_path = pg_temp, public")
         .await
         .map_err(|e| e.to_string())?;
     Ok(client)
@@ -1156,21 +1144,10 @@ const SNAPSHOT_RELEASE: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 /// production mirror statements query, on a second disposable connection
 /// (temp tables are per-session, so app and mirror stay separate).
 async fn mirror_client() -> Client {
-    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
-        .expect("CI disposable database is required; never silently skip")
-        .parse()
-        .unwrap();
-    assert_eq!(config.get_dbname(), Some("nntune_ci"));
-    assert!(config.get_hostaddrs().is_empty(), "no address overrides");
-    assert!(
-        matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
-        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
-    );
-    let (client, connection) = config.connect(NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap() });
+    let client = disposable_accounts::connect_guarded().await.unwrap();
     client
         .batch_execute(
-            "SET statement_timeout = '3s'; SET search_path = pg_temp;
+            "SET search_path = pg_temp;
              CREATE TEMP TABLE mb_artist (mbid uuid PRIMARY KEY, name text, sort_name text, type text, country text);
              CREATE TEMP TABLE mb_release (mbid uuid PRIMARY KEY, title text, release_type text, year smallint, artist_mbid uuid);
              CREATE TEMP TABLE mb_recording (mbid uuid PRIMARY KEY, title text, duration_ms integer);
