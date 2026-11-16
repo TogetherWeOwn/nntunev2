@@ -53,6 +53,7 @@ pub mod subsonic_config;
 pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
+pub mod subsonic_snapshot_plan;
 pub mod target_identity;
 pub mod taste_signal;
 pub mod vault;

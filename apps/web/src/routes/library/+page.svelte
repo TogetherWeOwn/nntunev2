@@ -3,6 +3,8 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
+	import { restartIsAvailable } from './restartAvailability.js';
+	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -1092,24 +1094,6 @@
 		}
 	}
 
-	// True when position 0 lies inside a native seekable range. Any unreadable
-	// or non-finite range bound is unusable media, never an exception.
-	function seekableIncludesStart(element: HTMLAudioElement): boolean {
-		try {
-			const ranges = element.seekable;
-			for (let index = 0; index < ranges.length; index += 1) {
-				const start = ranges.start(index);
-				const end = ranges.end(index);
-				if (Number.isFinite(start) && Number.isFinite(end) && start <= 0 && end >= 0) {
-					return true;
-				}
-			}
-		} catch {
-			// Fall through: an unreadable range set cannot restart.
-		}
-		return false;
-	}
-
 	// Media events re-evaluate restart availability from the live element.
 	// Events from a detached or replaced element are ignored, so stale
 	// nodes can never enable, disable, or complete a restart.
@@ -1122,19 +1106,6 @@
 			return;
 		}
 		restartCanSeek = restartIsAvailable(element);
-	}
-
-	function restartIsAvailable(element: HTMLAudioElement): boolean {
-		try {
-			return (
-				Number.isFinite(element.duration) &&
-				element.duration > 0 &&
-				Number.isFinite(element.currentTime) &&
-				seekableIncludesStart(element)
-			);
-		} catch {
-			return false;
-		}
 	}
 
 	function setRestartStatus(text: string): void {
@@ -1715,7 +1686,7 @@
 
 
 	function interactionIds(id: string): string[] {
-		return selectedIds.includes(id) ? [...new Set(renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id))] : [id];
+		return projectInteractionIds(id, selectedIds, renderedItems);
 	}
 
 	// Re-resolve deferred actions after refresh without substituting another occurrence.
@@ -1732,8 +1703,7 @@
 	}
 
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
-		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : source;
-		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
+		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable);
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
 	}
