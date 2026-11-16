@@ -7,6 +7,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/blocker_observer.rs"]
+mod blocker_observer;
 #[path = "support/disposable_accounts.rs"]
 mod disposable_accounts;
 
@@ -34,6 +36,17 @@ async fn client(populated: bool) -> Client {
     client
 }
 
+async fn private_client() -> Result<Client, String> {
+    let client = disposable_accounts::connect_guarded()
+        .await
+        .map_err(|e| e.to_string())?;
+    client
+        .batch_execute("SET search_path = pg_temp, public")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(client)
+}
+
 async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>>) {
     let attempts = Rc::new(Cell::new(0));
     let store = catalogue_store_for_postgres_test(
@@ -43,6 +56,228 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
         attempts.clone(),
     );
     (store, attempts)
+}
+
+#[tokio::test]
+async fn private_session_upsert_rolls_back_after_mutation() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let observer = &accounts.observer;
+    let result: Result<(), String> = async {
+        observer.execute("INSERT INTO public.private_sessions VALUES ($1,'keep',11), ($2,'target',12)",
+            &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        for (session, expiry, inject) in [("target", 30_u64, true), ("target", 40, false),
+            ("target", 20, false), ("target", 60, false), ("target", 10, true)] {
+            let reached = Rc::new(Cell::new(false));
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            if inject {
+                let marker = reached.clone();
+                store.set_preflight_hook("private-session-upsert", Box::new(move || Box::pin(async move {
+                    marker.set(true);
+                    Err(StoreError)
+                })));
+            }
+            let outcome = store.upsert_private_session(&owner, session, expiry).await;
+            if outcome.is_err() != inject || reached.get() != inject {
+                return Err(format!("unexpected outcome or hook reachability for expiry {expiry}"));
+            }
+            // The observer fence waits for rollback/commit before reading committed rows.
+            observer.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+            observer.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+            let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2) ORDER BY user_id,session_id", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+            let actual: Vec<(String, String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
+            observer.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+            let mut expected = vec![(owner.clone(), "keep".into(), 11), (other.clone(), "target".into(), 12)];
+            if expiry != 30 { expected.push((owner.clone(), "target".into(), match expiry { 40 => 40, 20 => 20, _ => 60 })); }
+            expected.sort();
+            if actual != expected { return Err(format!("unexpected committed rows after expiry {expiry}")); }
+        }
+        let missing = format!("{owner}-missing");
+        for (id, session, expiry) in [
+            (owner.as_str(), "", 1_u64),
+            (owner.as_str(), "\0", 1),
+            (owner.as_str(), "target", u64::MAX),
+            (owner.as_str(), "target", 253_402_300_800),
+            (owner.as_str(), &"x".repeat(129), 1),
+            (missing.as_str(), "target", 1),
+        ] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            if store.upsert_private_session(id, session, expiry).await.is_ok() {
+                return Err("invalid or missing-account upsert succeeded".into());
+            }
+        }
+        // Lock only the session row, so the writer's account fence succeeds but its mutation times out.
+        observer.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        observer.query_one("SELECT session_id FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target' FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let failed_mutation = private_client().await?;
+        failed_mutation.batch_execute("SET lock_timeout = '200ms'").await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(failed_mutation, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !matches!(store.upsert_private_session(&owner, "target", 99).await, Err(StoreError)) {
+            return Err("mutation failure did not return opaque store error".into());
+        }
+        drop(store);
+        observer.batch_execute("ROLLBACK").await.map_err(|e| e.to_string())?;
+        let failed = private_client().await?;
+        failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        if failed.batch_execute("SELECT 1/0").await.is_ok() {
+            return Err("database failure injection did not abort the transaction".into());
+        }
+        let store = catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !matches!(store.upsert_private_session(&owner, "target", 99).await, Err(StoreError)) {
+            return Err("database failure did not return opaque store error".into());
+        }
+        drop(store);
+        observer.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if store.upsert_private_session(&owner, "target", 99).await.is_ok() {
+            return Err("deleting-account upsert succeeded".into());
+        }
+        let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2) ORDER BY user_id,session_id", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        let actual: Vec<(String, String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
+        let mut expected = vec![(owner.clone(), "keep".into(), 11), (owner.clone(), "target".into(), 60), (other.clone(), "target".into(), 12)];
+        expected.sort();
+        if actual != expected { return Err("failed upsert changed scoped rows".into()); }
+        observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let wide = "é".repeat(128);
+        for (session, expiry) in [("A", 0_u64), ("a", 1), (wide.as_str(), 2)] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            store.upsert_private_session(&owner, session, expiry).await.map_err(|_| "valid session rejected".to_string())?;
+            let row = observer.query_one("SELECT expires_at FROM public.private_sessions WHERE user_id = $1 AND session_id = $2", &[&owner, &session]).await.map_err(|e| e.to_string())?;
+            if row.get::<_, i64>(0) != expiry as i64 { return Err("unexpected boundary expiration".into()); }
+        }
+        let cases = observer.query("SELECT session_id FROM public.private_sessions WHERE user_id = $1 AND session_id IN ('A', 'a')", &[&owner]).await.map_err(|e| e.to_string())?;
+        if cases.len() != 2 { return Err("case-distinct sessions did not coexist".into()); }
+        Ok(())
+    }.await;
+    // Also release a failed observer transaction before fixture cleanup.
+    let _ = observer.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn private_session_blocked_mutation_releases_account_fence() {
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let owner = accounts.id(0).to_owned();
+    let observer = &accounts.observer;
+    let locker = client(false).await;
+    let result: Result<(), String> = async {
+        observer.execute("INSERT INTO public.private_sessions VALUES ($1, 'target', 10)", &[&owner]).await.map_err(|e| e.to_string())?;
+        locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        locker.query_one("SELECT session_id FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target' FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let locker_pid: i32 = locker.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let writer = private_client().await?;
+        writer.batch_execute("SET statement_timeout = 0; SET lock_timeout = 0").await.map_err(|e| e.to_string())?;
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let store = catalogue_store_for_postgres_test(writer, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let upsert = store.upsert_private_session(&owner, "target", 99);
+        tokio::pin!(upsert);
+        blocker_observer::observe_blocked(observer, locker_pid, writer_pid, upsert.as_mut()).await?;
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(20), upsert).await, Ok(Err(StoreError))) {
+            return Err("blocked mutation did not return a bounded opaque error".into());
+        }
+        // The session lock is still held; acquiring the account fence proves the
+        // writer has released its transaction independently of that lock.
+        observer.batch_execute("BEGIN; SET LOCAL lock_timeout = '2s'").await.map_err(|e| e.to_string())?;
+        observer.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let expiry: i64 = observer.query_one("SELECT expires_at FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target'", &[&owner]).await.map_err(|e| e.to_string())?.get(0);
+        observer.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+        if expiry != 10 { return Err("blocked mutation changed the stored expiration".into()); }
+        Ok(())
+    }.await;
+    let _ = observer.batch_execute("ROLLBACK").await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn private_session_upsert_respects_account_fence() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let locker = client(false).await;
+    let observer = &accounts.observer;
+    let result: Result<(), String> = async {
+        locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let blocked = private_client().await?;
+        let blocked_pid: i32 = blocked.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let locker_pid: i32 = locker.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let store = catalogue_store_for_postgres_test(blocked, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let upsert = store.upsert_private_session(&owner, "absent", 10);
+        tokio::pin!(upsert);
+        blocker_observer::observe_blocked(&observer, locker_pid, blocked_pid, upsert.as_mut()).await?;
+        let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        unrelated.upsert_private_session(&other, "absent", 20).await.map_err(|_| "unrelated account blocked".to_string())?;
+        locker.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+        if upsert.await.is_ok() { return Err("upsert accepted committed deletion".into()); }
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if store.upsert_private_session(&owner, "absent", 10).await.is_ok() {
+            return Err("upsert accepted account after deletion fence committed".into());
+        }
+        observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        locker.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
+        let blocked = private_client().await?;
+        let blocked_pid: i32 = blocked.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let store = catalogue_store_for_postgres_test(blocked, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let upsert = store.upsert_private_session(&owner, "absent", 10);
+        tokio::pin!(upsert);
+        blocker_observer::observe_blocked(&observer, locker_pid, blocked_pid, upsert.as_mut()).await?;
+        locker.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+        upsert.await.map_err(|_| "upsert failed after exclusive lock released".to_string())?;
+        let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2) ORDER BY user_id", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        let actual: Vec<(String, String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
+        let mut expected = vec![(owner.clone(), "absent".into(), 10), (other.clone(), "absent".into(), 20)];
+        expected.sort();
+        if actual != expected { return Err("unexpected rows after fence controls".into()); }
+
+        // Hold an actual writer after its mutation; a distinct absent session must
+        // wait on that writer rather than merely on an externally held lock.
+        let first_client = private_client().await?;
+        let first_pid: i32 = first_client.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let first = catalogue_store_for_postgres_test(first_client, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let reached = Rc::new(Cell::new(false));
+        let release = Rc::new(Cell::new(false));
+        let (hook_reached, hook_release) = (reached.clone(), release.clone());
+        first.set_preflight_hook("private-session-upsert", Box::new(move || Box::pin(async move {
+            hook_reached.set(true);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !hook_release.get() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+            }).await.map_err(|_| StoreError)?;
+            Ok(())
+        })));
+        let writer = first.upsert_private_session(&owner, "writer-one", 30);
+        tokio::pin!(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !reached.get() {
+                tokio::select! {
+                    _ = writer.as_mut() => return Err("first writer finished before its hook".to_string()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+            Ok(())
+        }).await.map_err(|_| "first writer did not reach its hook".to_string())??;
+        let second_client = private_client().await?;
+        let second_pid: i32 = second_client.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let second = catalogue_store_for_postgres_test(second_client, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let waiter = second.upsert_private_session(&owner, "writer-two", 40);
+        tokio::pin!(waiter);
+        blocker_observer::observe_blocked(observer, first_pid, second_pid, waiter.as_mut()).await?;
+        let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        unrelated.upsert_private_session(&other, "writer-three", 50).await.map_err(|_| "unrelated writer blocked".to_string())?;
+        release.set(true);
+        writer.await.map_err(|_| "first writer failed".to_string())?;
+        waiter.await.map_err(|_| "second writer failed after release".to_string())?;
+        let count: i64 = observer.query_one("SELECT count(*) FROM public.private_sessions WHERE (user_id = $1 AND session_id IN ('writer-one','writer-two')) OR (user_id = $2 AND session_id = 'writer-three')", &[&owner, &other]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 3 { return Err("writer controls did not commit all sessions".into()); }
+        Ok(())
+    }.await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
 }
 
 #[tokio::test]
