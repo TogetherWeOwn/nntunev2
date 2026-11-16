@@ -1412,6 +1412,80 @@ fn coupled_sql_relation_is_transformed_only_for_the_trusted_schema() {
     );
 }
 
+// A raw writer does not take the fixture's advisory lock. Its uncommitted
+// insert must finish before the fixture can classify the global target.
+#[tokio::test]
+async fn coupled_fixture_waits_for_raw_insert_commit_or_rollback() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let mut outcome = fx
+        .fold("u1", &remote("sub_raw", &[invoice("sub_raw", 1)]))
+        .await;
+    fx.db
+        .batch_execute("SET lock_timeout = '4s'; SET statement_timeout = '5s'")
+        .await
+        .unwrap();
+    outcome.explicit_stale = true;
+    outcome.history.clear();
+    let mut drivers = Vec::new();
+    let mut pending = None;
+    let result: Result<(), String> = timeout(Duration::from_secs(30), async {
+        let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        let (mut runner, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let runner_pid: i32 = runner.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        runner.batch_execute(&format!("SET search_path TO {}; SET lock_timeout = '4s'; SET statement_timeout = '5s'; SET transaction_timeout = '10s'", fx.schema)).await.map_err(|e| e.to_string())?;
+        writer.batch_execute(&format!("SET search_path TO {}; SET statement_timeout = '5s'", fx.schema)).await.map_err(|e| e.to_string())?;
+        for commit in [false, true] {
+            writer.batch_execute("BEGIN; INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES ('u2', 'sub_raw', 'cus_a', 'si_raw', 'price_plus_test', 'plus', 'canceled')").await.map_err(|e| e.to_string())?;
+            let (phase_tx, phase_rx) = billing_contention::phase();
+            let schema = fx.schema.clone();
+            let input = outcome.clone();
+            pending = Some(tokio::spawn(async move {
+                let _ = phase_tx.send(());
+                let result = billing_transaction_fixture::run(&mut runner, &schema, "u1", &input).await;
+                (runner, result)
+            }));
+            billing_contention::reached(phase_rx).await?;
+            let wait = billing_contention::relation_wait(&fx.db, pending.as_mut().unwrap(), writer_pid, runner_pid, &format!("{}.subscriptions", fx.schema), "ShareRowExclusiveLock").await;
+            if let Err(error) = wait {
+                if error == "lock finished before wait barrier" { pending = None; }
+                return Err(error);
+            }
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let completed = timeout(Duration::from_secs(5), pending.as_mut().unwrap()).await.map_err(|_| "fixture did not resume".to_string())?;
+            pending = None;
+            let (next_runner, classification) = completed.map_err(|e| e.to_string())?;
+            runner = next_runner;
+            if commit {
+                if !matches!(&classification, Err(error) if error == "foreign or mismatched target") { return Err(format!("committed foreign insert: {classification:?}")); }
+                if fx.snap("sub_raw").await.map(|row| row.user_id).as_deref() != Some("u2") { return Err("committed foreign row changed".into()); }
+            } else if classification != Ok(billing_transaction_fixture::Class::AbsentEmpty) || fx.snap("sub_raw").await.is_some() {
+                return Err(format!("rolled-back insert: {classification:?}"));
+            }
+            if fx.history_rows("sub_raw").await != 0 { return Err("unexpected history".into()); }
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("contention phases timed out".into()));
+    if let Some(task) = pending {
+        task.abort();
+        let _ = task.await;
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    fx.cleanup().await;
+    result.expect("raw writer exclusion failed");
+}
+
 #[tokio::test]
 async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     use billing_transaction_fixture::{run, Class};
