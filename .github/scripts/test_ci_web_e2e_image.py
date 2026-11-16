@@ -42,6 +42,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
             rf"^mcr\.microsoft\.com/playwright:v{re.escape(versions[0])}-noble@sha256:[0-9a-f]{{64}}$",
         )
         self.assertEqual(step_field(self.jobs["web-a11y"], "container"), image)
+        self.assertEqual(step_field(self.jobs["history-fixture"], "container"), image)
         self.assertNotIn("playwright install", self.job)
         self.assertNotIn("apt-get", self.job)
 
