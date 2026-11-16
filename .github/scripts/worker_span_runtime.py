@@ -71,16 +71,27 @@ def evaluate_negative(body):
     raise ValueError("positive evaluator accepted the unscoped control")
 
 
+class BuildShutdownError(RuntimeError):
+    """Build process group termination could not be verified."""
+
+
 def build(env, output):
     subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1"],
                    cwd=API, env=env, stdout=subprocess.DEVNULL, check=True, timeout=300)
     log_path = Path(env["RUNNER_TEMP"]) / "worker-span-runtime.log"
     with log_path.open("w") as log:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["worker-build", "--release", "--out-dir", str(output), "--", "--locked",
              "--features", "span-runtime-test"],
-            cwd=API, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=2400)
-    check(result.returncode == 0, f"span-runtime-test worker-build failed; see {log_path}")
+            cwd=API, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            result = proc.wait(timeout=2400)
+        finally:
+            try:
+                shutdown_process_group(proc)
+            except Exception as exc:
+                raise BuildShutdownError(f"build shutdown unverified; preserving {output.parent}") from exc
+    check(result == 0, f"span-runtime-test worker-build failed; see {log_path}")
     subprocess.run([sys.executable, "-I", str(ROOT / ".github/scripts/worker_tools.py"),
                     "check-build", str(log_path)], cwd=ROOT, env=env, check=True, timeout=120)
     subprocess.run(["git", "diff", "--exit-code", "--", "Cargo.lock"],
@@ -88,10 +99,13 @@ def build(env, output):
     check((output / "worker/shim.mjs").is_file(), "worker-build produced no shim.mjs")
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def free_ports():
+    with socket.socket() as first, socket.socket() as second:
+        first.bind(("127.0.0.1", 0))
+        second.bind(("127.0.0.1", 0))
+        ports = first.getsockname()[1], second.getsockname()[1]
+        check(ports[0] != ports[1], "duplicate runtime ports")
+        return ports
 
 
 def get(port, mode):
@@ -119,13 +133,18 @@ def run(wrangler):
     env = dict(os.environ, CI="1", WRANGLER_SEND_METRICS="false", NO_COLOR="1")
     state = Path(tempfile.mkdtemp(prefix="worker-span-runtime-"))
     proc = None
+    preserve = False
     try:
-        build(env, state / "bundle")
+        try:
+            build(env, state / "bundle")
+        except BuildShutdownError:
+            preserve = True
+            raise
         config = state / "wrangler.toml"
         config.write_text(CONFIG)
         home = state / "home"
         home.mkdir()
-        port = free_port()
+        port, inspector_port = free_ports()
         runtime_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
                        "XDG_CONFIG_HOME": str(home), "CI": "1", "NO_COLOR": "1",
                        "WRANGLER_SEND_METRICS": "false"}
@@ -133,7 +152,7 @@ def run(wrangler):
             proc = subprocess.Popen(
                 ["node", str(wrangler), "dev", "--config", str(config), "--local",
                  "--persist-to", str(state / "data"), "--ip", "127.0.0.1",
-                 "--port", str(port), "--inspector-port", str(free_port())],
+                 "--port", str(port), "--inspector-port", str(inspector_port)],
                 cwd=state, env=runtime_env, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True)
             try:
@@ -168,7 +187,7 @@ def run(wrangler):
                 shutdown_process_group(proc)
                 proc = None
     finally:
-        if proc is None:
+        if proc is None and not preserve:
             shutil.rmtree(state)
 
 
@@ -212,6 +231,32 @@ class SelfTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "captured child span mismatch"):
             evaluate_scoped([body])
 
+    def test_build_timeout_and_shutdown_failure(self):
+        for failure in (False, True):
+            with self.subTest(shutdown_failure=failure), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / "state"
+                state.mkdir()
+                proc = mock.Mock()
+                proc.wait.side_effect = subprocess.TimeoutExpired("worker-build", 2400)
+                with mock.patch.dict(os.environ, RUNNER_TEMP=tmp), \
+                     mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
+                     mock.patch(__name__ + ".subprocess.run"), \
+                     mock.patch(__name__ + ".subprocess.Popen", return_value=proc) as launch, \
+                     mock.patch(__name__ + ".shutdown_process_group", side_effect=RuntimeError("alive") if failure else None) as shutdown:
+                    with self.assertRaises(BuildShutdownError if failure else subprocess.TimeoutExpired):
+                        run(Path("wrangler"))
+                    self.assertTrue(launch.call_args.kwargs["start_new_session"])
+                    shutdown.assert_called_once_with(proc)
+                    self.assertEqual(state.exists(), failure)
+
+    def test_duplicate_ports_rejected(self):
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        sock.getsockname.return_value = ("127.0.0.1", 1234)
+        with mock.patch(__name__ + ".socket.socket", return_value=sock):
+            with self.assertRaisesRegex(ValueError, "duplicate runtime ports"):
+                free_ports()
+
     def test_failure_lifecycle(self):
         for stage in ("build", "start", "request", "shutdown"):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +274,7 @@ class SelfTest(unittest.TestCase):
                      mock.patch(__name__ + ".tempfile.TemporaryFile", return_value=log), \
                      mock.patch(__name__ + ".build", side_effect=ValueError(stage) if stage == "build" else None), \
                      mock.patch(__name__ + ".subprocess.Popen", side_effect=ValueError(stage) if stage == "start" else None, return_value=proc), \
+                     mock.patch(__name__ + ".free_ports", return_value=(1234, 1235)), \
                      mock.patch(__name__ + ".get", side_effect=ValueError(stage)), \
                      mock.patch(__name__ + ".shutdown_process_group", side_effect=ValueError(stage) if stage == "shutdown" else None) as shutdown:
                     with self.assertRaises(ValueError):
