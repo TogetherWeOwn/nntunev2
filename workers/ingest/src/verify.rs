@@ -2451,6 +2451,100 @@ mod tests {
         assert!(progress.repair_set_ids.is_empty());
     }
 
+    // Bitwise IEEE CRC-32, independent of the streaming implementation.
+    fn reference_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn reference_crc32_check_vectors() {
+        assert_eq!(reference_crc32(b""), 0);
+        assert_eq!(reference_crc32(b"123456789"), 0xCBF43926);
+    }
+
+    #[test]
+    fn crc32_zeros_matches_independent_reference() {
+        for n in [0usize, 1, 63, 64, 65, 127, 128, 129, 257] {
+            let mut input = b"prefix".to_vec();
+            input.resize(input.len() + n, 0);
+            input.extend_from_slice(b"suffix");
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(b"prefix");
+            crc32_zeros(&mut hasher, n as u64);
+            hasher.update(b"suffix");
+            assert_eq!(hasher.finalize(), reference_crc32(&input), "n={n}");
+        }
+    }
+
+    #[test]
+    fn block_counter_matches_independent_reference_across_resume_boundaries() {
+        const BLOCK: usize = 128;
+        let mut input: Vec<u8> = (0..309).map(|i| ((i * 37 + 11) % 251 + 1) as u8).collect();
+        input[65..130].fill(0);
+        let wants: Vec<u32> = input
+            .chunks(BLOCK)
+            .map(|chunk| {
+                let mut padded = chunk.to_vec();
+                padded.resize(BLOCK, 0);
+                reference_crc32(&padded)
+            })
+            .collect();
+
+        fn feed(counter: &mut BlockCounter<'_>, data: &[u8], start: usize, end: usize) {
+            let mut pos = start;
+            while pos < end {
+                let stop = if pos < 65 {
+                    end.min(65)
+                } else if pos < 130 {
+                    end.min(130)
+                } else {
+                    end
+                };
+                if (65..130).contains(&pos) {
+                    counter.zeros((stop - pos) as u64);
+                } else {
+                    counter.bytes(&data[pos..stop]);
+                }
+                pos = stop;
+            }
+        }
+
+        for corrupt in [false, true] {
+            let mut data = input.clone();
+            if corrupt {
+                data[175] ^= 1;
+            }
+            for split in [63, 64, 65, 127, 128, 129] {
+                let mut first = BlockCounter::new(&wants, BLOCK as u64, "fp".into());
+                feed(&mut first, &data, 0, split);
+                first.boundary(1, split as u64);
+                let cursor = first.boundary.expect("snapshot");
+                assert!(valid_cursor(
+                    &cursor,
+                    "fp",
+                    2,
+                    data.len() as u64,
+                    BLOCK as u64,
+                    wants.len()
+                ));
+                let mut resumed = BlockCounter::resume(&wants, BLOCK as u64, &cursor);
+                feed(&mut resumed, &data, split, data.len());
+                assert_eq!(
+                    resumed.finish(),
+                    u32::from(corrupt),
+                    "split={split}, corrupt={corrupt}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn crc32_zeros_matches_hashing_real_zeros() {
         for n in [0u64, 1, 7, 255, 256, 100_000, (1 << 20) + 3] {

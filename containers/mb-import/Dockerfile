@@ -1,6 +1,6 @@
 # mb-import: batch-only MusicBrainz dump import + replication applier.
 # Interactive traffic never touches this image (ADR 0001/0007).
-FROM postgres:18-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5 AS base
+FROM postgres:18-bookworm@sha256:ece55f7868da684e400f82f1030a050718adbdd65c23aa500c486f6e2950dc0f AS base
 
 # lbzip2: parallel decode of the streamed dump archive (stream_extract.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \

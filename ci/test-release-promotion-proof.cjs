@@ -154,7 +154,7 @@ describe("release retry and repair wiring", () => {
   it("keeps every CalVer call on the pinned shared releaser", () => {
     const uses = release.match(/TogetherWeOwn\/\.github\/actions\/calver@[^\r\n]+/g) || [];
     assert.deepEqual(uses, Array(4).fill(
-      "TogetherWeOwn/.github/actions/calver@d427f7212f478ea3823a605edb394b0722e152b5 # v0.6.0",
+      "TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0",
     ));
   });
 
