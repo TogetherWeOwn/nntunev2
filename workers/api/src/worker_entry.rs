@@ -2629,15 +2629,17 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         crate::preference_rows::private_session_active_statement(),
-                        &[&user_id, &session_id],
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
                     )
                     .await
-                    .map_err(|_| StoreError)?
-                    .ok_or(StoreError)?;
-                row.try_get(0).map_err(|_| StoreError)
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )

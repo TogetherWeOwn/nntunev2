@@ -66,14 +66,16 @@ async fn private_session_active_observes_owner_and_server_time() {
     let observer = &accounts.observer;
     let result: Result<(), String> = async {
         observer.execute("INSERT INTO public.private_sessions VALUES ($1,'Session',253402300799), ($1,'expired',0), ($2,'foreign',253402300799)", &[&owner, &other]).await.map_err(|e| e.to_string())?;
-        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
         for (id, session, expected) in [(&owner, "Session", true), (&owner, "session", false), (&owner, "expired", false), (&owner, "absent", false), (&owner, "foreign", false), (&other, "Session", false)] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
             if store.private_session_active(id, session).await.map_err(|_| "lookup failed")? != expected { return Err("incorrect active-session result".into()); }
         }
         for (id, session) in [(format!("{owner}-missing"), "Session"), (owner.clone(), ""), (owner.clone(), "bad\0id"), (owner.clone(), &"x".repeat(129))] {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
             if store.private_session_active(&id, session).await.is_ok() { return Err("invalid lookup succeeded".into()); }
         }
         observer.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
         if store.private_session_active(&owner, "Session").await.is_ok() { return Err("deleting account accepted".into()); }
         let failed = private_client().await?;
         failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
