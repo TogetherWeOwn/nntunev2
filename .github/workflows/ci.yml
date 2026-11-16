@@ -1686,6 +1686,7 @@ jobs:
         run: |
           python3 -I .github/scripts/test_worker_tools.py
           python3 -I .github/scripts/test_worker_rust_provenance.py
+          node --test .github/scripts/test_worker_build_observer.cjs
           python3 -I .github/scripts/test_worker_build_workflow.py
       - name: Install Rust stable
         run: |
