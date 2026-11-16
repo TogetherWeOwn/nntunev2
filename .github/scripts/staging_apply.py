@@ -227,10 +227,13 @@ def read_row(child, entry, filename, preserve=False):
         ["psql", "--no-psqlrc", "--no-password", "--quiet",
          "--tuples-only", "--no-align", "--field-separator", "\t",
          "--set", "ON_ERROR_STOP=1"],
-        input=sql, text=True, capture_output=True, timeout=60, env=child)
+        input=sql.encode("utf-8") if preserve else sql, text=not preserve,
+        capture_output=True, timeout=60, env=child)
     if result.returncode != 0:
         raise StagingApplyError("evidence read failed; connection details redacted")
-    return result.stdout.removesuffix("\n") if preserve else result.stdout.strip()
+    if preserve:
+        return result.stdout.decode("utf-8").removesuffix("\n")
+    return result.stdout.strip()
 
 
 def run_evidence(data_root, migration_file, applied_files, apply_outcome,

@@ -81,7 +81,7 @@ class StagingApplyTests(unittest.TestCase):
 
         def fake_psql(argv, **kwargs):
             calls.append((argv, kwargs))
-            return SimpleNamespace(returncode=0, stdout=valid)
+            return SimpleNamespace(returncode=0, stdout=valid.encode())
 
         from unittest.mock import patch
         with patch.object(staging_apply.subprocess, "run", side_effect=fake_psql), \
@@ -97,7 +97,7 @@ class StagingApplyTests(unittest.TestCase):
         self.assertNotIn("secretpw", str(argv))
         self.assertEqual(kw["env"]["PGSSLMODE"], "verify-full")
         self.assertIn("default_transaction_read_only=on", kw["env"]["PGOPTIONS"])
-        self.assertTrue(kw["input"].startswith("SELECT file, sha256, applied_at, applied_by"))
+        self.assertTrue(kw["input"].startswith(b"SELECT file, sha256, applied_at, applied_by"))
         self.assertNotIn("secretpw", (root / "receipt").read_text())
         with patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=URL_REQUIRE)):
             with self.assertRaises(staging_apply.StagingApplyError) as error:
@@ -106,7 +106,7 @@ class StagingApplyTests(unittest.TestCase):
         with self.assertRaises(staging_apply.StagingApplyError):
             staging_apply.evidence_child_env(URL_REQUIRE + "&sslrootcert=/tmp/untrusted", DB)
         for bad in ("", valid + "\n" + valid, valid.replace(sha, "f" * 64)):
-            with self.subTest(row=bad), patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=bad)):
+            with self.subTest(row=bad), patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=bad.encode())):
                 with self.assertRaises(staging_apply.StagingApplyError):
                     staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
         with patch.object(staging_apply.subprocess, "run") as runner:
@@ -115,6 +115,29 @@ class StagingApplyTests(unittest.TestCase):
                 with self.assertRaises(staging_apply.StagingApplyError):
                     staging_apply.run_readback(str(data), file, digest, db, env)
             runner.assert_not_called()
+
+    def test_readback_rejects_actor_carriage_return_at_subprocess_boundary(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, _, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"),
+               "READBACK_RECEIPT": str(root / "receipt"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "observe"}
+        output = f"0054_first.sql\t{sha}\t2026-11-16\tactor\r\n".encode()
+        real_run = subprocess.run
+
+        def fake_psql(argv, **kwargs):
+            return real_run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(%r)" % output],
+                            **kwargs)
+
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", side_effect=fake_psql):
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        self.assertFalse((root / "receipt").exists())
 
     # Finding 2: single mode refuses a mirror file before connecting.
     def test_single_mode_refuses_mirror_before_connecting(self):

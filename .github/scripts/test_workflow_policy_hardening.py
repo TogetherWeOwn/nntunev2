@@ -170,7 +170,7 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
             self.assertNotIn(event + ":", triggers)
         self.assertIn('"$WORKFLOW_REF" == refs/heads/main', text)
         self.assertIn("contents: read", text)
-        self.assertIn("name: staging", text)
+        self.assertIn("environment:\n      name: staging\n      deployment: false", text)
         self.assertEqual(text.count("persist-credentials: false"), 2)
         self.assertIn("ref: ${{ inputs.ref }}", text)
         self.assertIn("ref: ${{ github.sha }}", text)

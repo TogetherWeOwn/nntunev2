@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: staging
+      deployment: false
     steps:
       - name: Validate dispatch
         env:
