@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for worker_tools.py. Run: python3 <this file>."""
 
 from __future__ import annotations
@@ -17,7 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import worker_tools as wt
 
-GOOD_ENV = {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": "/t", "GITHUB_ENV": "/e", "GITHUB_PATH": "/p"}
+GOOD_ENV = {
+    "GITHUB_ACTIONS": "true",
+    "RUNNER_TEMP": "/t",
+    "GITHUB_ENV": "/e",
+    "GITHUB_PATH": "/p",
+}
 
 
 def tar_with(name: str, data: bytes, kind=tarfile.REGTYPE, mode="w:gz") -> bytes:
@@ -49,12 +53,14 @@ class ManifestAndLocks(unittest.TestCase):
                 directory = Path(tmp) / "workers" / worker
                 directory.mkdir(parents=True)
                 (directory / "Cargo.lock").write_text(
-                    '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
-                    '[[package]]\nname = "wasm-bindgen"\nversion = "0.2.129"\n')
+                    f'[[package]]\nname = "worker"\nversion = "{pins["worker-build"]["version"]}"\n'
+                    f'[[package]]\nname = "wasm-bindgen"\nversion = "{pins["wasm-bindgen-cli"]["version"]}"\n'
+                )
             wt.check_locks(pins, Path(tmp))
             (Path(tmp) / "workers/mb/Cargo.lock").write_text(
-                '[[package]]\nname = "worker"\nversion = "0.8.7"\n'
-                '[[package]]\nname = "wasm-bindgen"\nversion = "0.2.128"\n')
+                f'[[package]]\nname = "worker"\nversion = "{pins["worker-build"]["version"]}"\n'
+                '[[package]]\nname = "wasm-bindgen"\nversion = "0.0.0"\n'
+            )
             with self.assertRaises(ValueError):
                 wt.check_locks(pins, Path(tmp))
 
@@ -65,7 +71,9 @@ class Refusals(unittest.TestCase):
 
     def test_outside_actions(self):
         with self.assertRaises(RuntimeError):
-            wt.require_actions({**GOOD_ENV, "GITHUB_ACTIONS": "false"}, "linux", "x86_64")
+            wt.require_actions(
+                {**GOOD_ENV, "GITHUB_ACTIONS": "false"}, "linux", "x86_64"
+            )
 
     def test_wrong_platform(self):
         with self.assertRaises(RuntimeError):
@@ -81,7 +89,9 @@ class Refusals(unittest.TestCase):
     def test_install_refuses_before_work(self):
         calls = []
         with self.assertRaises(RuntimeError):
-            wt.install({}, dl=lambda *a: calls.append(a), run=lambda *a, **k: calls.append(a))
+            wt.install(
+                {}, dl=lambda *a: calls.append(a), run=lambda *a, **k: calls.append(a)
+            )
         self.assertEqual(calls, [])
 
 
@@ -103,8 +113,11 @@ class Checksums(unittest.TestCase):
 
     def crate_archive(self, extra=(), lock=True, version="1.0.0"):
         files = [
-            ("tool-x-1.0.0/Cargo.toml",
-             f'[package]\nname = "tool-x"\nversion = "{version}"\n'.encode(), tarfile.REGTYPE),
+            (
+                "tool-x-1.0.0/Cargo.toml",
+                f'[package]\nname = "tool-x"\nversion = "{version}"\n'.encode(),
+                tarfile.REGTYPE,
+            ),
             ("tool-x-1.0.0/src/main.rs", b"fn main() {}", tarfile.REGTYPE),
         ]
         if lock:
@@ -117,12 +130,16 @@ class Checksums(unittest.TestCase):
                 info.size = len(data) if kind == tarfile.REGTYPE else 0
                 if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
                     info.linkname = "Cargo.toml"
-                bundle.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+                bundle.addfile(
+                    info, io.BytesIO(data) if kind == tarfile.REGTYPE else None
+                )
         return buffer.getvalue()
 
     def install_archive(self, archive, root, run):
         pin = {"version": "1.0.0", "sha256": hashlib.sha256(archive).hexdigest()}
-        index = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}).encode()
+        index = json.dumps(
+            {"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}
+        ).encode()
         downloads = []
 
         def dl(url, limit):
@@ -144,8 +161,18 @@ class Checksums(unittest.TestCase):
                 self.assertEqual((source / "src/main.rs").read_bytes(), b"fn main() {}")
                 self.assertEqual((source / "Cargo.lock").read_bytes(), b"version = 4\n")
                 self.assertEqual(kwargs, {"cwd": wt.ROOT, "check": True})
-                self.assertEqual(cmd, ["cargo", "install", "--path", str(source), "--locked",
-                                       "--root", str(root / "installed")])
+                self.assertEqual(
+                    cmd,
+                    [
+                        "cargo",
+                        "install",
+                        "--path",
+                        str(source),
+                        "--locked",
+                        "--root",
+                        str(root / "installed"),
+                    ],
+                )
 
             downloads = self.install_archive(self.crate_archive(), root, run)
             self.assertEqual(len(calls), 1)
@@ -162,44 +189,79 @@ class Checksums(unittest.TestCase):
             ("tool-x-1.0.0/pipe", tarfile.FIFOTYPE),
             ("tool-x-1.0.0/Cargo.toml", tarfile.REGTYPE),
         ):
-            with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as tmp:
-                with self.assertRaises(ValueError):
-                    self.install_archive(self.crate_archive([(name, b"x", kind)]), Path(tmp),
-                                         lambda *a, **k: self.fail("must not build"))
+            with (
+                self.subTest(name=name, kind=kind),
+                tempfile.TemporaryDirectory() as tmp,
+                self.assertRaises(ValueError),
+            ):
+                self.install_archive(
+                    self.crate_archive([(name, b"x", kind)]),
+                    Path(tmp),
+                    lambda *a, **k: self.fail("must not build"),
+                )
 
     def test_crate_requires_matching_identity_and_lock(self):
-        for archive in (self.crate_archive(lock=False), self.crate_archive(version="2.0.0")):
+        for archive in (
+            self.crate_archive(lock=False),
+            self.crate_archive(version="2.0.0"),
+        ):
             with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-                self.install_archive(archive, Path(tmp),
-                                     lambda *a, **k: self.fail("must not build"))
+                self.install_archive(
+                    archive, Path(tmp), lambda *a, **k: self.fail("must not build")
+                )
 
     def test_crate_tamper_and_index_mismatch(self):
         crate = self.crate_archive()
         pin = {"version": "1.0.0", "sha256": hashlib.sha256(crate).hexdigest()}
-        index = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}).encode()
+        index = json.dumps(
+            {"vers": "1.0.0", "yanked": False, "cksum": pin["sha256"]}
+        ).encode()
 
         def make(body, idx):
             return lambda url, limit: idx if "index.crates.io" in url else body
 
         ran = []
         with tempfile.TemporaryDirectory() as tmp:
-            wt.install_crate("tool-x", pin, make(crate, index), Path(tmp), Path(tmp) / "i",
-                             run=lambda cmd, **k: ran.append(cmd))
+            wt.install_crate(
+                "tool-x",
+                pin,
+                make(crate, index),
+                Path(tmp),
+                Path(tmp) / "i",
+                run=lambda cmd, **k: ran.append(cmd),
+            )
         self.assertIn("--locked", ran[0])
         self.assertIn("--path", ran[0])
         self.assertNotIn("--version", ran[0])
         self.assertNotIn("tool-x", ran[0])
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_crate("tool-x", pin, make(b"tampered", index), Path(tmp), Path(tmp) / "i",
-                             run=lambda *a, **k: self.fail("must not build"))
+            wt.install_crate(
+                "tool-x",
+                pin,
+                make(b"tampered", index),
+                Path(tmp),
+                Path(tmp) / "i",
+                run=lambda *a, **k: self.fail("must not build"),
+            )
         bad = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": "0" * 64}).encode()
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_crate("tool-x", pin, make(crate, bad), Path(tmp), Path(tmp) / "i",
-                             run=lambda *a, **k: self.fail("must not build"))
+            wt.install_crate(
+                "tool-x",
+                pin,
+                make(crate, bad),
+                Path(tmp),
+                Path(tmp) / "i",
+                run=lambda *a, **k: self.fail("must not build"),
+            )
 
     def pins_for(self, archive: bytes):
-        return {"binaryen": {"version": "version_9", "asset": "b.tar.gz",
-                             "sha256": hashlib.sha256(archive).hexdigest()}}
+        return {
+            "binaryen": {
+                "version": "version_9",
+                "asset": "b.tar.gz",
+                "sha256": hashlib.sha256(archive).hexdigest(),
+            }
+        }
 
     def test_wasm_opt_tamper(self):
         archive = tar_with("binaryen-version_9/bin/wasm-opt", b"ELF")
@@ -215,22 +277,34 @@ class Checksums(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             wt.install_wasm_opt(pins, dl(archive + b"x"), Path(tmp), Path(tmp) / "i")
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_wasm_opt(pins, lambda u, l: b"0 other" if u.endswith(".sha256") else archive,
-                                Path(tmp), Path(tmp) / "i")
+            wt.install_wasm_opt(
+                pins,
+                lambda u, l: b"0 other" if u.endswith(".sha256") else archive,
+                Path(tmp),
+                Path(tmp) / "i",
+            )
 
     def test_wasm_opt_rejects_link_member(self):
         archive = tar_with("binaryen-version_9/bin/wasm-opt", b"", kind=tarfile.SYMTYPE)
         pins = self.pins_for(archive)
         sha = f"{pins['binaryen']['sha256']}  b.tar.gz".encode()
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_wasm_opt(pins, lambda u, l: sha if u.endswith(".sha256") else archive,
-                                Path(tmp), Path(tmp) / "i")
+            wt.install_wasm_opt(
+                pins,
+                lambda u, l: sha if u.endswith(".sha256") else archive,
+                Path(tmp),
+                Path(tmp) / "i",
+            )
 
     def test_esbuild(self):
         archive = tar_with("package/bin/esbuild", b"ELF")
-        integrity = "sha512-" + base64.b64encode(hashlib.sha512(archive).digest()).decode()
-        pins = {"runtime": {"esbuild": "0.28.2"},
-                "esbuild-npm": {"package": "@esbuild/linux-x64", "integrity": integrity}}
+        integrity = (
+            "sha512-" + base64.b64encode(hashlib.sha512(archive).digest()).decode()
+        )
+        pins = {
+            "runtime": {"esbuild": "0.28.2"},
+            "esbuild-npm": {"package": "@esbuild/linux-x64", "integrity": integrity},
+        }
         urls = []
 
         def dl(url, limit):
@@ -240,12 +314,18 @@ class Checksums(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = wt.install_esbuild(pins, dl, Path(tmp), Path(tmp) / "i")
             self.assertEqual(target.read_bytes(), b"ELF")
-        self.assertEqual(urls, ["https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz"])
+        self.assertEqual(
+            urls,
+            ["https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz"],
+        )
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_esbuild(pins, lambda u, l: archive + b"x", Path(tmp), Path(tmp) / "i")
+            wt.install_esbuild(
+                pins, lambda u, l: archive + b"x", Path(tmp), Path(tmp) / "i"
+            )
         wrong = tar_with("package/bin/other", b"ELF")
-        pins["esbuild-npm"]["integrity"] = "sha512-" + base64.b64encode(
-            hashlib.sha512(wrong).digest()).decode()
+        pins["esbuild-npm"]["integrity"] = (
+            "sha512-" + base64.b64encode(hashlib.sha512(wrong).digest()).decode()
+        )
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(KeyError):
             wt.install_esbuild(pins, lambda u, l: wrong, Path(tmp), Path(tmp) / "i")
 
@@ -282,14 +362,16 @@ class CheckBuild(unittest.TestCase):
         self.run_check()
 
     def test_ansi_emoji_and_crlf_log(self):
-        coloured = ["\x1b[1m\x1b[2m[INFO]\x1b[0m: \u2699\ufe0f. " + l.split(": ", 1)[1] + "\r"
-                    for l in self.lines]
+        coloured = [
+            "\x1b[1m\x1b[2m[INFO]\x1b[0m: \u2699\ufe0f. " + l.split(": ", 1)[1] + "\r"
+            for l in self.lines
+        ]
         self.run_check(coloured)
 
     def test_missing_override(self):
         for i in range(3):
             with self.assertRaises(ValueError):
-                self.run_check(self.lines[:i] + self.lines[i + 1:])
+                self.run_check(self.lines[:i] + self.lines[i + 1 :])
 
     def test_wrong_path(self):
         with self.assertRaises(ValueError):
@@ -305,7 +387,9 @@ class CheckBuild(unittest.TestCase):
             self.run_check(self.lines + ["[INFO]: Downloading Esbuild@0.28.2..."])
 
     def test_cargo_registry_download_is_not_tool_download(self):
-        self.run_check(self.lines + [" Downloading crates ...", "  Downloaded serde v1.0.228"])
+        self.run_check(
+            self.lines + [" Downloading crates ...", "  Downloaded serde v1.0.228"]
+        )
 
     def test_cache_dirt(self):
         (self.cache / "worker-build").mkdir()

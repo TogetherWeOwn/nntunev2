@@ -2,12 +2,12 @@
   "schema": 1,
   "scope": "all ordinary api, mb and ingest release builds; one canonical manifest",
   "worker-build": {
-    "version": "0.8.7",
-    "sha256": "1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222"
+    "version": "0.9.0",
+    "sha256": "bdcd75703783317d833b09c6724d5e4f642ad23804d8d14e3ac362e990c7cab7"
   },
   "wasm-bindgen-cli": {
-    "version": "0.2.129",
-    "sha256": "5fd044ed178958a277eeaf21f3d384287b0f4428d38c019141df01da9c03168c"
+    "version": "0.2.130",
+    "sha256": "c37f6904387d19a319525c74af274c73912f3871c35555aa49f3ea64ebb2fc7a"
   },
   "binaryen": {
     "version": "version_132",
