@@ -6,7 +6,7 @@ import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
-import { seekableIncludesStart } from '#lib/player/seekableIncludesStart.js';
+import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -21,12 +21,14 @@ function restartFixture() {
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
 		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
-		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
+		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
 		'currentAudioEvent', 'handleEnded', 'shortTitle'
 	]);
-	const handlers = parsed.statements.filter((node) =>
-		ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text)
-	).map((node) => node.getText(parsed)).join('\n');
+	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
+		node.name && names.has(node.name.text)
+	);
+	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
+	const handlers = declarations.map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -53,7 +55,7 @@ function restartFixture() {
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
-		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, seekableIncludesStart,
+		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable,
 		streamUrl: track.streamUrl,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};
@@ -98,8 +100,32 @@ function restartFixture() {
 	};
 	page.refresh();
 	expect(page.read().restartCanSeek).toBe(true);
-	return { page, media, writes, location, track };
+	return { page, media, writes, location, track, element };
 }
+
+test('restart reads mutable availability once per gesture', () => {
+	const { page, media, element, writes } = restartFixture();
+	let reads = 0;
+	Object.defineProperty(element, 'duration', { get: () => ++reads <= 2 ? 120 : NaN });
+	page.restart();
+	expect(reads).toBe(2);
+	expect(writes).toEqual([0]);
+	expect(media.position).toBe(0);
+	expect(page.read().restartStatus).toBe('Restarted Coral Night.');
+});
+
+test('a throwing availability getter still supersedes a pending share', () => {
+	const { page, media, location, element, writes } = restartFixture();
+	media.duration = NaN;
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	Object.defineProperty(element, 'duration', { get: () => { throw new Error('unreadable'); } });
+	page.restart();
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(page.read().restartStatus).toBe('Could not restart Coral Night.');
+	expect(writes).toEqual([]);
+});
 
 test('a new same-source share navigation supersedes an earlier restart marker', async () => {
 	const { page, media, location } = restartFixture();
