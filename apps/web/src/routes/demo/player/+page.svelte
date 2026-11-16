@@ -443,10 +443,6 @@
 	// store itself is fail-soft, so a corrupt key renders the empty state).
 	let recentStore: RecentlyPlayedStore | null = null;
 	let recentEntries = $state<RecentEntry[]>([]);
-	// Polite action-only feedback for history Add/Forget: empty until the
-	// first activation, never set on load, play, seek or timeupdate.
-	let recentFeedback = $state('');
-	let recentSection: HTMLElement | undefined = $state();
 
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
@@ -707,34 +703,6 @@
 			index = queue.tracks.length - 1;
 		}
 		selectAt(index);
-	}
-
-	/** Forget one history entry: queue, current media and resume are untouched. */
-	function forgetRecent(row: RecentRow, removedIndex: number): void {
-		if (!recentStore) return;
-		recentStore.forget(row.trackId);
-		refreshRecent();
-		recentFeedback = row.available
-			? `Forgot ${row.title} from recent history.`
-			: 'Forgot the unavailable entry from recent history.';
-		void focusAfterForget(removedIndex);
-	}
-
-	/**
-	 * Keep keyboard focus on an enabled surviving history control after a
-	 * row is removed: the row taking the removed slot, else the last row's
-	 * first action, else Clear when the list is empty.
-	 */
-	async function focusAfterForget(removedIndex: number): Promise<void> {
-		await tick();
-		const section = recentSection;
-		if (!section) return;
-		const rows = section.querySelectorAll('li[data-testid="recent-item"]');
-		const targetRow = rows[Math.min(removedIndex, rows.length - 1)];
-		const target =
-			targetRow?.querySelector('button:not([disabled])') ??
-			section.querySelector('[data-testid="recently-played-clear"]');
-		(target as HTMLElement | null)?.focus?.();
 	}
 
 	// A source gets its own element: an event queued by the browser before
@@ -2083,20 +2051,19 @@
 		</ul>
 	</section>
 
-	<section data-testid="recently-played" aria-label="Recently played" bind:this={recentSection}>
+	<section data-testid="recently-played" aria-label="Recently played">
 		<h2>Recently played</h2>
 		<p>
 			Demo session history — synthetic demo tracks only. Clearing the queue never wipes this
 			list; only Clear below does.
 		</p>
-		<p role="status">{recentFeedback}</p>
 		{#if recentTracks.length === 0}
 			<p data-testid="recently-played-empty">
 				Nothing played yet this demo session — press play to start your recent list.
 			</p>
 		{:else}
 			<ol>
-				{#each recentTracks as row, index (row.trackId)}
+				{#each recentTracks as row (row.trackId)}
 					<li class="recent-row" data-testid="recent-item" data-track-id={row.trackId}>
 						{row.title}{#if row.artist} — {row.artist}{/if}
 						<span data-testid="recent-played-at-{row.trackId}">{recentLabel(row.playedAt)}</span>
@@ -2109,15 +2076,6 @@
 								Replay {row.title}
 							</button>
 						{/if}
-						<button
-							type="button"
-							aria-label={row.available
-								? `Forget ${row.title} from recent history`
-								: `Forget unavailable entry ${row.trackId} from recent history`}
-							onclick={() => forgetRecent(row, index)}
-						>
-							Forget this entry
-						</button>
 					</li>
 				{/each}
 			</ol>
@@ -2379,7 +2337,8 @@
 	/* Recently-played row actions: a reachable touch floor on narrow
 	   screens (the row text still wraps, so nothing widens past the
 	   viewport). */
-	.recent-row button {
+	.recent-row button,
+	[data-testid='recently-played-clear'] {
 		min-height: 2.75rem;
 		min-width: 2.75rem;
 	}
