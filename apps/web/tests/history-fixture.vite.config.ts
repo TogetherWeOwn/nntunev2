@@ -36,7 +36,7 @@ export default defineConfig(async (env) => {
 			name: 'acceptance-history-live-store',
 			enforce: 'pre',
 			transform(code, id) {
-				if (normalizePath(id.split('?')[0]!) !== target) return;
+				if (normalizePath(id) !== target) return;
 				const cleanup = '\t\t\t// A copy settling after teardown must not resurrect state.';
 				if (code.split(anchor).length !== 2 || code.split(cleanup).length !== 2)
 					throw new Error('history fixture: route anchors missing or ambiguous');
