@@ -41,14 +41,14 @@ class CommitBarrier:
         elif self.state == "ready":
             self.state = "failed"
             raise BarrierError("message received after transaction completion")
-        elif frame[0:1] == b"E" or frame[0:1] == b"C":
-            self.state = "failed"
-            raise BarrierError("unexpected response after COMMIT")
         elif frame[0:1] == b"Z":
             if frame[5:] != b"I":
                 self.state = "failed"
                 raise BarrierError("transaction did not return to idle")
             self.state = "ready"
+        elif frame[0:1] not in (b"N", b"S", b"A"):
+            self.state = "failed"
+            raise BarrierError("unexpected response after COMMIT")
         if len(self.held) + len(frame) > self.max_held:
             self.state = "failed"
             raise BarrierError("held response exceeds limit")

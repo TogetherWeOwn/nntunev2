@@ -50,6 +50,27 @@ class CommitBarrierTests(unittest.TestCase):
                 with self.assertRaises(barrier.BarrierError):
                     gate.release()
 
+    def test_held_ancillary_messages_are_released_in_order(self):
+        gate = barrier.CommitBarrier()
+        messages = (frame(b"C", b"COMMIT\0"), frame(b"N", b"notice\0"),
+                    frame(b"S", b"key\0value\0"), frame(b"A", b"notification"),
+                    frame(b"Z", b"I"))
+        for message in messages:
+            self.assertEqual(gate.accept(message), b"")
+        self.assertEqual(gate.release(), b"".join(messages))
+
+    def test_incompatible_held_messages_fail_closed(self):
+        for message in (frame(b"D", b"\0\0"), frame(b"?")):
+            with self.subTest(message=message):
+                gate = barrier.CommitBarrier()
+                gate.accept(frame(b"C", b"COMMIT\0"))
+                with self.assertRaises(barrier.BarrierError):
+                    gate.accept(message)
+                with self.assertRaises(barrier.BarrierError):
+                    gate.accept(frame(b"Z", b"I"))
+                with self.assertRaises(barrier.BarrierError):
+                    gate.release()
+
     def test_held_response_is_bounded(self):
         gate = barrier.CommitBarrier(max_held=18)
         gate.accept(frame(b"C", b"COMMIT\0"))
