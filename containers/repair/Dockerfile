@@ -19,7 +19,7 @@ RUN curl -fsSL -o par2.tar.xz \
  && make -j"$(nproc)" --quiet \
  && install -m0755 par2 /usr/local/bin/par2
 
-FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS server
+FROM rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS server
 WORKDIR /src
 # The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
 # --locked`) and audited by cargo-deny. Copy the full (dockerignored)
