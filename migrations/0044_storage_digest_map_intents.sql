@@ -2,10 +2,10 @@ SET search_path = public, pg_catalog;
 
 -- Inactive identities only: insertion does not establish sealer origin, verification,
 -- completeness, provider authority, or eligibility. No runtime reads these rows.
-CREATE UNIQUE INDEX storage_object_intent_geometry_identity
+CREATE UNIQUE INDEX IF NOT EXISTS storage_object_intent_geometry_identity
     ON public.storage_object_intents (object_id, environment_id, library_id, plaintext_bytes);
 
-CREATE TABLE public.storage_digest_map_intents (
+CREATE TABLE IF NOT EXISTS public.storage_digest_map_intents (
     map_id UUID PRIMARY KEY CHECK (public.storage_is_uuid_v4(map_id)),
     object_id UUID NOT NULL UNIQUE,
     environment_id UUID NOT NULL,
@@ -18,7 +18,7 @@ CREATE TABLE public.storage_digest_map_intents (
         REFERENCES public.storage_object_intents (object_id, environment_id, library_id, plaintext_bytes) ON DELETE RESTRICT
 );
 
-CREATE TABLE public.storage_digest_map_page_intents (
+CREATE TABLE IF NOT EXISTS public.storage_digest_map_page_intents (
     map_id UUID NOT NULL,
     chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 1 AND 131072),
     page_index INTEGER NOT NULL CHECK (page_index >= 0 AND page_index < (chunk_count + 255) / 256),
@@ -29,9 +29,11 @@ CREATE TABLE public.storage_digest_map_page_intents (
     FOREIGN KEY (map_id, chunk_count) REFERENCES public.storage_digest_map_intents (map_id, chunk_count) ON DELETE RESTRICT
 );
 
+DROP TRIGGER IF EXISTS storage_digest_map_intent_append_only ON public.storage_digest_map_intents;
 CREATE TRIGGER storage_digest_map_intent_append_only BEFORE UPDATE OR DELETE OR TRUNCATE
     ON public.storage_digest_map_intents FOR EACH STATEMENT
     EXECUTE FUNCTION public.storage_object_intent_append_only();
+DROP TRIGGER IF EXISTS storage_digest_map_page_intent_append_only ON public.storage_digest_map_page_intents;
 CREATE TRIGGER storage_digest_map_page_intent_append_only BEFORE UPDATE OR DELETE OR TRUNCATE
     ON public.storage_digest_map_page_intents FOR EACH STATEMENT
     EXECUTE FUNCTION public.storage_object_intent_append_only();

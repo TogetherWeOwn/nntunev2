@@ -224,4 +224,4 @@ sha256 = "20aba6004de405fd9b3bd9c5c74e418d3f9ac0626058e5f4b6aac4218fa77787"
 [[migration]]
 file = "0044_storage_digest_map_intents.sql"
 target = "app"
-sha256 = "ce01351b0b5302b802aaf667a98d419d60666a51f6163a60040cd242ee0dc62e"
+sha256 = "512933c73aca98b0d809f0780428f218d8951f5fe1d319815188df6f54cf4c5d"
