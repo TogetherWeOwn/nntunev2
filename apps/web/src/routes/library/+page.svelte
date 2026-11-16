@@ -5,6 +5,7 @@
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
+	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -1643,19 +1644,8 @@
 			return;
 		}
 		const displayedIds = renderedItems.map((track) => track.id);
-		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
-		const survivors = new Set(selectedIds);
-		const nextId =
-			removedIndex < 0
-				? null
-				: (displayedIds.slice(removedIndex + 1).find((candidate) => survivors.has(candidate)) ?? null);
-		const previousId =
-			removedIndex <= 0
-				? null
-				: ([...displayedIds.slice(0, removedIndex)]
-						.reverse()
-						.find((candidate) => survivors.has(candidate)) ?? null);
+		const { nextId, previousId } = selectedRowRecoveryIds(displayedIds, id, selectedIds);
 		focusAfterSelectedRowRemoval(nextId, previousId);
 	}
 
