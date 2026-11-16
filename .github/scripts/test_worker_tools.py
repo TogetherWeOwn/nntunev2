@@ -55,13 +55,26 @@ class ManifestAndLocks(unittest.TestCase):
         self.assertEqual(repair["esbuild-npm"], ordinary["esbuild-npm"])
         with self.assertRaises(ValueError):
             wt.select_profile(manifest, "unknown")
-        with mock.patch.object(wt, "install") as install:
+        with (mock.patch.object(wt, "install") as install,
+              mock.patch("worker_rust_provenance.check_lock_identity") as check_lock,
+              mock.patch("worker_rust_provenance.verify_rust_toolchain") as verify_rust):
             self.assertEqual(wt.main(["worker_tools.py", "install"]), 0)
             install.assert_called_once_with()
+            check_lock.assert_called_once_with(manifest)
+            verify_rust.assert_called_once_with(manifest)
             install.reset_mock()
             self.assertEqual(wt.main(["worker_tools.py", "install", "repair"]), 0)
             install.assert_called_once_with(profile="repair")
             self.assertEqual(wt.main(["worker_tools.py", "install", "unknown"]), 2)
+            check_lock.assert_called_once()
+            verify_rust.assert_called_once()
+            with mock.patch.object(wt, "check_build") as check_build:
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log"]), 0)
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log", "repair"]), 0)
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log", "unknown"]), 2)
+                self.assertEqual(check_build.call_count, 2)
+                self.assertEqual(check_lock.call_count, 2)
+                self.assertEqual(verify_rust.call_count, 2)
 
     def test_repair_lock_selection_and_mismatch(self):
         pins, workers = wt.select_profile(wt.load_pins(), "repair")
