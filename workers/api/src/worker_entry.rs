@@ -2621,6 +2621,53 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn private_session_upsert(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-upsert").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn taste_list(
         &self,
         user_id: &str,
