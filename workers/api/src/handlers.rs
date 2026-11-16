@@ -675,6 +675,21 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Atomically replace the expiration for an exact owner/session pair.
+    /// Writers must fence the account against deletion and reject missing or
+    /// deleting accounts, invalid database values and storage failures.
+    /// Stores without a transactional implementation fail closed.
+    fn upsert_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (user_id, session_id, expires_at);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,
@@ -7384,6 +7399,8 @@ mod tests {
         fail_taste_read: RefCell<bool>,
         fail_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
+        private_sessions: RefCell<HashMap<(String, String), u64>>,
+        fail_private_session_write: RefCell<bool>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
         magic: RefCell<HashMap<String, MagicLinkRecord>>,
@@ -7699,7 +7716,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn private_session_upsert_is_scoped_and_fails_closed() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        for (owner, session, expiry) in [
+            ("alice", "session", 10),
+            ("alice", "Session", 20),
+            ("alice", "other", 30),
+            ("Alice", "session", 40),
+            ("alice", "session", 100),
+            ("alice", "session", 0),
+        ] {
+            block_on(store.upsert_private_session(owner, session, expiry)).unwrap();
+        }
+        let expected = HashMap::from([
+            (("alice".into(), "session".into()), 0),
+            (("alice".into(), "Session".into()), 20),
+            (("alice".into(), "other".into()), 30),
+            (("Alice".into(), "session".into()), 40),
+        ]);
+        assert_eq!(*store.private_sessions.borrow(), expected);
+        for (owner, session, expiry) in [
+            ("missing", "session", 1),
+            ("alice", "", 1),
+            ("alice", "bad\0id", 1),
+            ("alice", "session", u64::MAX),
+            ("alice", "session", 253_402_300_800),
+        ] {
+            assert!(block_on(store.upsert_private_session(owner, session, expiry)).is_err());
+        }
+        assert!(block_on(store.upsert_private_session("alice", &"x".repeat(129), 1)).is_err());
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.upsert_private_session("alice", "session", 1)).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.upsert_private_session("alice", "session", 1)).is_err());
+        assert_eq!(*store.private_sessions.borrow(), expected);
+    }
+
     impl Store for FakeStore {
+        async fn upsert_private_session(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            expires_at: u64,
+        ) -> Result<(), StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || [user_id, session_id]
+                    .iter()
+                    .any(|id| id.contains('\0') || !(1..=128).contains(&id.chars().count()))
+                || expires_at > 253_402_300_799
+            {
+                return Err(StoreError);
+            }
+            self.private_sessions
+                .borrow_mut()
+                .insert((user_id.into(), session_id.into()), expires_at);
+            Ok(())
+        }
         async fn like_delete(
             &self,
             user_id: &str,
