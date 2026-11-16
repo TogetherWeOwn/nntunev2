@@ -2,21 +2,21 @@
 #![cfg(feature = "postgres-tests")]
 
 use nntune_api::billing_reconcile::{
-    insert_paid_invoice_history_statement, reconcile_live_select_statement,
-    reconcile_lock_statement, reconcile_subscription, reconcile_target_select_statement,
-    store_reconciled_subscription_statement, LiveRow, PriceBinding, ReconcileInput,
-    ReconcileOutcome, RemoteSubscription,
+    reconcile_live_select_statement, reconcile_subscription, reconcile_target_select_statement,
+    LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
 };
 use nntune_api::stripe::{
     Invoice, InvoiceLine, InvoiceLinePeriod, InvoiceLines, InvoiceStatusTransitions, Subscription,
     SubscriptionItem, SubscriptionItems,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/billing_contention.rs"]
 mod billing_contention;
+#[path = "support/billing_legacy_write.rs"]
+mod billing_legacy_write;
 #[path = "support/billing_transaction_fixture.rs"]
 mod billing_transaction_fixture;
 
@@ -213,84 +213,7 @@ impl Fx {
         user: &str,
         outcome: &ReconcileOutcome,
     ) -> Result<(), tokio_postgres::Error> {
-        let tx = self.db.transaction().await?;
-        tx.query_typed(reconcile_lock_statement(), &[(&user, Type::TEXT)])
-            .await?;
-        let stmt = tx
-            .prepare_typed(
-                store_reconciled_subscription_statement(),
-                &[
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::BOOL,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::BOOL,
-                ],
-            )
-            .await?;
-        let r = &outcome.row;
-        let params: [&(dyn ToSql + Sync); 15] = [
-            &user,
-            &r.stripe_subscription_id,
-            &r.stripe_customer_id,
-            &r.stripe_item_id,
-            &r.stripe_price_id,
-            &r.plan_id,
-            &r.status,
-            &r.current_period_end_unix,
-            &r.cancel_at_period_end,
-            &r.paid_through_unix,
-            &r.paid_invoice_id,
-            &r.grace_until_unix,
-            &outcome.read_anchor,
-            &outcome.read_plan,
-            &outcome.explicit_stale,
-        ];
-        tx.query(&stmt, &params).await?;
-        let history = tx
-            .prepare_typed(
-                insert_paid_invoice_history_statement(),
-                &[
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::INT8,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::INT8,
-                ],
-            )
-            .await?;
-        for h in &outcome.history {
-            tx.execute(
-                &history,
-                &[
-                    &user,
-                    &h.stripe_invoice_id,
-                    &h.stripe_subscription_id,
-                    &h.plan_id,
-                    &h.period_start_unix,
-                    &h.period_end_unix,
-                    &h.amount_cents,
-                    &h.currency,
-                    &h.paid_at_unix,
-                ],
-            )
-            .await?;
-        }
-        tx.commit().await
+        billing_legacy_write::try_put(&mut self.db, user, outcome).await
     }
 
     async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
