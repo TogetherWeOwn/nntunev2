@@ -89,6 +89,48 @@ test('real mounted store clears without remount and records again', async ({ pag
 	expect(after.node).not.toBe(before.node);
 });
 
+test('ended native play records after clearing the same mounted store', async ({ page }) => {
+	await open(page);
+	// The fixture queue starts with Third Light first; put it last before ending it.
+	await page.getByTestId('queue-move-down-third-light').click();
+	await page.getByTestId('queue-select-third-light').click();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await page.getByTestId('player-next').click();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	const first = { trackId: 'third-light', playedAt: new Date('2026-01-01T12:00:00Z').getTime() };
+	const beforeEntries = [first, baseline[1]];
+	await expect(page.getByTestId('recent-item')).toHaveCount(2);
+	await expect(page.getByTestId('recent-item').first()).toHaveAttribute('data-track-id', 'third-light');
+	expect(await raw(page)).toBe(JSON.stringify(beforeEntries));
+	expect(JSON.parse((await raw(page))!)).toEqual(beforeEntries);
+	const before = await snapshot(page);
+
+	await clear(page);
+
+	await empty(page);
+	expect(await raw(page)).toBe('[]');
+	expect(JSON.parse((await raw(page))!)).toEqual([]);
+	expect(await snapshot(page)).toEqual(before);
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+
+	// Match the ordinary RP-B-25 fixture events; this is not decoder evidence.
+	await page.getByTestId('demo-audio').evaluate((el) => {
+		Object.defineProperty(el, 'paused', { value: false, configurable: true });
+		Object.defineProperty(el, 'ended', { value: false, configurable: true });
+		el.dispatchEvent(new Event('play'));
+		el.dispatchEvent(new Event('playing'));
+	});
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect(page.getByTestId('recent-item')).toHaveCount(1);
+	await expect(page.getByTestId('recent-item').first()).toHaveAttribute('data-track-id', 'third-light');
+	expect(await raw(page)).toBe(JSON.stringify([first]));
+	expect(JSON.parse((await raw(page))!)).toEqual([first]);
+	expect((await snapshot(page)).id).toBe(before.id);
+});
+
 for (const mode of ['writes', 'all'] as const) {
 	test(`loaded store remains empty with ${mode} denied and stale native bytes`, async ({ page }, info) => {
 		await open(page);
