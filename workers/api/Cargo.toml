@@ -59,7 +59,7 @@ futures-timer = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-util = "0.3"
-worker = "0.8"
+worker = "0.9"
 
 [features]
 postgres-tests = []

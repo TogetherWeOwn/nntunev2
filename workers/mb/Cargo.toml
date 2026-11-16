@@ -12,7 +12,7 @@ name = "nntune_mb"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "tokio-postgres"] }
+worker = { version = "0.9", features = ["http", "tokio-postgres"] }
 http = "1"
 # Hyperdrive Postgres client: `connect_raw` over the Worker socket with
 # the generated connection string (workers-rs `tokio-postgres` example).
