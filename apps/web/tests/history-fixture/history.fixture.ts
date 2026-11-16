@@ -135,9 +135,11 @@ test('a retained operation rejects after the route unmounts', async ({ page }) =
 	await expect(page).toHaveURL(/\/$/);
 	await expect.poll(() => page.evaluate(() => '__nntuneHistoryFixture' in window)).toBe(false);
 	expect(await page.evaluate(async () => {
-		try { await (window as Instrumented).__oldHistoryFixture!.clear(); return false; }
-		catch { return true; }
-	})).toBe(true);
+		const retained = (window as Instrumented).__oldHistoryFixture;
+		if (!retained) return 'missing retained fixture';
+		try { await retained.clear(); return 'operation resolved'; }
+		catch (error) { return error instanceof Error ? error.message : 'non-error rejection'; }
+	})).toBe('history fixture mount inactive');
 });
 
 test('real mutation stays in the originating tab', async ({ page }) => {
