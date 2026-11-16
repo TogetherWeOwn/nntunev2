@@ -33,11 +33,6 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 "rust-transcode": ("rustfmt,clippy", "wasm32-unknown-unknown"),
             },
             "coverage.yml": {"coverage": ("llvm-tools-preview", None)},
-            "deploy.yml": {
-                "staging-api": (None, "wasm32-unknown-unknown"),
-                "staging-mb": (None, "wasm32-unknown-unknown"),
-                "staging-ingest": (None, "wasm32-unknown-unknown"),
-            },
         }
         for path, jobs in expected.items():
             text = (WORKFLOWS / path).read_text()
@@ -51,6 +46,12 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                     if target:
                         command += f" --target {target}"
                     self.assertIn(command + "\n          rustup default stable\n", section)
+        deploy = (WORKFLOWS / "deploy.yml").read_text()
+        for name in ("staging-api", "staging-mb", "staging-ingest"):
+            with self.subTest(path="deploy.yml", job=name):
+                section = job(deploy, name)
+                self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)
+                self.assertNotIn("rustup toolchain install stable", section)
 
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
@@ -161,6 +162,26 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         # the credential is reached, while a started apply that fails
         # still records evidence.
         self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
+
+    def test_staging_readback_is_observation_only(self):
+        text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("workflow_dispatch:", triggers)
+        for event in ("pull_request", "push", "schedule"):
+            self.assertNotIn(event + ":", triggers)
+        self.assertIn('"$WORKFLOW_REF" == refs/heads/main', text)
+        self.assertIn("contents: read", text)
+        self.assertIn("environment:\n      name: staging\n      deployment: false", text)
+        self.assertEqual(text.count("persist-credentials: false"), 2)
+        self.assertIn("ref: ${{ inputs.ref }}", text)
+        self.assertIn("ref: ${{ github.sha }}", text)
+        self.assertIn("git -C data rev-parse HEAD", text)
+        self.assertIn("git -C trusted rev-parse HEAD", text)
+        self.assertEqual(text.count("staging_apply.py readback"), 1)
+        for forbidden in ("staging_apply.py apply", "apply_migration.py", "all-pending", "--record-only", "$GITHUB_ENV"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("path: readback-receipt.json", text)
+        self.assertIn("if-no-files-found: error", text)
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter

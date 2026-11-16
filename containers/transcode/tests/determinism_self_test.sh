@@ -12,7 +12,8 @@
 #    artifacts with identical SHA-256 (spec acceptance: same bytes/hash
 #    whichever path produced them);
 # 3. the artifact is ffprobe-valid Ogg Opus 64k: codec opus, 48 kHz,
-#    stereo, bitrate within the 64k envelope.
+#    stereo, bitrate within the 64k envelope;
+# 4. the fetched artifact fully decodes to non-silent five-second PCM.
 #
 # The fixture is synthesised with python3 (no host ffmpeg needed): a
 # 5 s 44.1 kHz stereo 16-bit WAV sine mix, so the encode also covers
@@ -140,5 +141,26 @@ if not 60000 <= bitrate <= 70000:
 print(f'Opus, 48000 Hz, stereo, Ogg, {duration:.4f}s, packet bitrate {bitrate:.0f} bit/s')
 PYEOF
 pass "ffprobe-valid opus-64"
+
+# 4. Decode the fetched bytes, not just the container's copy. Limit both
+# execution time and file output, and require a successful decoder exit.
+(
+  ulimit -f 1024 || exit 1
+  timeout 30s docker exec -i "$NAME" ffmpeg -v error -xerror -i pipe:0 \
+    -f s16le -acodec pcm_s16le -ac 2 -ar 48000 pipe:1 \
+    < "$tmp/artifact-a.ogg" > "$tmp/decoded.pcm" 2> "$tmp/decode.err"
+) || fail "full decode failed"
+python3 - "$tmp/decoded.pcm" <<'PYEOF' || fail "decoded PCM mismatch"
+import sys
+
+with open(sys.argv[1], 'rb') as handle:
+    pcm = handle.read()
+frame_bytes = 2 * 2  # stereo signed 16-bit PCM
+if len(pcm) % frame_bytes or not 4.9 * 48000 <= len(pcm) // frame_bytes <= 5.1 * 48000:
+    raise ValueError(f'not five seconds of stereo 48 kHz PCM: {len(pcm)} bytes')
+if not any(pcm):
+    raise ValueError('decoded PCM is silent')
+PYEOF
+pass "fetched artifact fully decodes to non-silent PCM"
 
 echo "self-test: all assertions passed"

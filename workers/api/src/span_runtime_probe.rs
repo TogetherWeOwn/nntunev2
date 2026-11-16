@@ -1,5 +1,8 @@
 //! Feature-gated real-workerd observations for the Worker span regression.
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use futures_util::future::join_all;
 use serde_json::{json, Value};
@@ -7,6 +10,14 @@ use worker::observability::{active_span, enter_span_async, in_current_span, star
 use worker::{event, Context, Delay, Env, Request, Response, Result};
 
 const TASKS: usize = 8;
+static ACTIVE_SCENARIOS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveScenario;
+impl Drop for ActiveScenario {
+    fn drop(&mut self) {
+        ACTIVE_SCENARIOS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn ident() -> Option<String> {
     active_span().map(|span| span.span_context().span_id)
@@ -31,8 +42,11 @@ async fn task(idx: usize, scoped: bool) -> Value {
 }
 
 async fn scenario(scoped: bool) -> Value {
+    ACTIVE_SCENARIOS.fetch_add(1, Ordering::SeqCst);
+    let _active = ActiveScenario;
     let root = ident();
     let tasks = join_all((0..TASKS).map(|idx| task(idx, scoped))).await;
+    let overlapping = ACTIVE_SCENARIOS.load(Ordering::SeqCst) > 1;
     let root_after = ident();
     let (mut child, child_expected) = if scoped {
         let span = start_span("child-probe");
@@ -47,7 +61,7 @@ async fn scenario(scoped: bool) -> Value {
     child["after"] = json!(ident());
     json!({
         "mode": if scoped { "scoped" } else { "unscoped" },
-        "root_after": root_after, "child_expected": child_expected,
+        "root_after": root_after, "child_expected": child_expected, "overlapping": overlapping,
         "observations": {"root": root, "tasks": tasks, "child": child}
     })
 }

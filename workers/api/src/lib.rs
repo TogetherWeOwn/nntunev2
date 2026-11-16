@@ -145,6 +145,18 @@ use nntune_subsonic::{
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+mod ledger_wasm_test {
+    use worker::wasm_bindgen::{self, prelude::*};
+
+    #[wasm_bindgen]
+    pub fn run_ledger_tests() {
+        assert_eq!(std::mem::size_of::<String>(), 12);
+        nntune_subsonic::construction_budget::tests::rounds_each_allocation_and_fails_closed_at_limit();
+        nntune_subsonic::construction_budget::tests::rejects_alignment_and_arithmetic_overflow_without_changing_charge();
+    }
+}
+
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
 #[cfg(not(all(

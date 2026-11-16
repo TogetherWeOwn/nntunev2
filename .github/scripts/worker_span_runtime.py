@@ -31,8 +31,8 @@ def check(cond, message):
 
 
 def observations(body, mode):
-    check(isinstance(body, dict) and body.keys() == {"mode", "root_after", "child_expected", "observations"}
-          and body["mode"] == mode, "bad response envelope")
+    check(isinstance(body, dict) and body.keys() == {"mode", "root_after", "child_expected", "overlapping", "observations"}
+          and body["mode"] == mode and type(body["overlapping"]) is bool, "bad response envelope")
     value = body["observations"]
     check(isinstance(value, dict) and value.keys() == {"root", "tasks", "child"},
           "bad observations")
@@ -48,8 +48,14 @@ def evaluate_scoped(bodies):
         value = observations(body, "scoped")
         evaluate_positive(value)
         check(value["child"]["before"] == body["child_expected"], "captured child span mismatch")
+        ids.append(value["root"])
         ids.extend(item["before"] for item in [*value["tasks"], value["child"]])
     check(len(set(ids)) == len(ids), "span ids collided across concurrent requests")
+
+
+def evaluate_burst(bodies):
+    evaluate_scoped(bodies)
+    check(any(body["overlapping"] for body in bodies), "requests did not overlap")
 
 
 def evaluate_negative(body):
@@ -150,7 +156,7 @@ def run(wrangler):
 
                 with ThreadPoolExecutor(REQUESTS) as pool:
                     bodies = list(pool.map(one, range(REQUESTS)))
-                evaluate_scoped(bodies)
+                evaluate_burst(bodies)
                 evaluate_negative(get(port, "unscoped"))
                 evaluate_scoped([get(port, "scoped")])
                 print(f"worker span runtime: ok (real workerd; requests={REQUESTS}; tasks={TASKS}; scoped/control/post-control passed)")
@@ -171,7 +177,7 @@ class SelfTest(unittest.TestCase):
         def sample(identity):
             return {"before": identity, "mid": identity, "end": identity, "after": "root"}
         return {"mode": "scoped" if scoped else "unscoped", "root_after": "root",
-                "child_expected": "child" if scoped else None, "observations": {"root": "root",
+                "child_expected": "child" if scoped else None, "overlapping": False, "observations": {"root": "root",
                                  "tasks": [sample(f"task-{i}" if scoped else "root")
                                            for i in range(TASKS)],
                                  "child": sample("child" if scoped else "root")}}
@@ -191,8 +197,17 @@ class SelfTest(unittest.TestCase):
     def test_concurrent_collision(self):
         body = self.body(True)
         evaluate_scoped([body])
-        with self.assertRaises(ValueError):
-            evaluate_scoped([body, body])
+        with self.assertRaisesRegex(ValueError, "requests did not overlap"):
+            evaluate_burst([body])
+        body["overlapping"] = True
+        evaluate_burst([body])
+        other = self.body(True)
+        for item in [*other["observations"]["tasks"], other["observations"]["child"]]:
+            for key in ("before", "mid", "end"):
+                item[key] += "-other"
+        other["child_expected"] += "-other"
+        with self.assertRaisesRegex(ValueError, "collided"):
+            evaluate_scoped([body, other])
         body["child_expected"] = "different-captured-span"
         with self.assertRaisesRegex(ValueError, "captured child span mismatch"):
             evaluate_scoped([body])

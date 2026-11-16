@@ -210,3 +210,8 @@ old_path = "migrations/0037_account_taste_and_privacy.sql"
 new_path = "migrations/0041_account_taste_and_privacy.sql"
 old_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
 new_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
+
+[[migration]]
+file = "0042_storage_namespaces.sql"
+target = "app"
+sha256 = "40e243b952f7fc289f0167cb118a3fcc5ec3b17c1b74b62424a2abd3477a88ab"
