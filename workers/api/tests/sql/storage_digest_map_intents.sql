@@ -38,7 +38,7 @@ SELECT pg_temp.expect_error(s, code) FROM (VALUES
     ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000001',257,2,decode(repeat('ab',32),'hex'))$q$, '23514'),
     ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000001',257,-1,decode(repeat('ab',32),'hex'))$q$, '23514'),
     ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000001',257,0,decode(repeat('ab',32),'hex'))$q$, '23505'),
-    ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000001',256,0,decode(repeat('ab',32),'hex'))$q$, '23503'),
+    ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000001',513,2,decode(repeat('ab',32),'hex'))$q$, '23503'),
     ($q$INSERT INTO public.storage_digest_map_page_intents (map_id,chunk_count,page_index,expected_hash) VALUES ('50000000-0000-4000-8000-000000000002',257,0,decode(repeat('ab',31),'hex'))$q$, '23514'),
     ($q$INSERT INTO public.storage_digest_map_intents (map_id,object_id,environment_id,library_id,plaintext_bytes) VALUES ('50000000-0000-4000-8000-000000000002','20000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-000000000001',1)$q$, '23505'),
     ($q$UPDATE public.storage_digest_map_intents SET plaintext_bytes = plaintext_bytes$q$, '23514'),
