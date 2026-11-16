@@ -25,7 +25,8 @@ impl ConstructionBudget {
     ///
     /// Pinned Rust's rust-src `vendor/dlmalloc-0.2.13/src/dlmalloc.rs` defines
     /// 8-byte alignment, 4-byte chunk overhead, and a 16-byte minimum chunk on
-    /// wasm32. Reject larger or invalid alignments rather than undercharge them.
+    /// wasm32. Add 8 bytes for an unsplittable remainder or the next small bin.
+    /// Reject larger or invalid alignments rather than undercharge them.
     pub fn charge(
         &mut self,
         capacity: usize,
@@ -40,6 +41,7 @@ impl ConstructionBudget {
             .and_then(|bytes| bytes.checked_add(4))
             .and_then(|bytes| bytes.checked_add(7))
             .map(|bytes| (bytes & !7).max(16))
+            .and_then(|bytes| bytes.checked_add(8))
             .and_then(|bytes| self.charged.checked_add(bytes))
             .filter(|total| *total <= self.limit)
             .ok_or(BudgetExceeded)?;
@@ -54,13 +56,13 @@ pub mod tests {
 
     #[cfg_attr(test, test)]
     pub fn rounds_each_allocation_and_fails_closed_at_limit() {
-        let mut budget = ConstructionBudget::new(56);
+        let mut budget = ConstructionBudget::new(80);
         assert_eq!(budget.charge(1, 1, 1), Ok(()));
         assert_eq!(budget.charge(12, 1, 4), Ok(()));
         assert_eq!(budget.charge(13, 1, 8), Ok(()));
-        assert_eq!(budget.charged(), 56);
+        assert_eq!(budget.charged(), 80);
         assert_eq!(budget.charge(1, 1, 1), Err(BudgetExceeded));
-        assert_eq!(budget.charged(), 56);
+        assert_eq!(budget.charged(), 80);
     }
 
     #[cfg_attr(test, test)]
@@ -81,6 +83,6 @@ pub mod tests {
                 Err(BudgetExceeded)
             );
         }
-        assert_eq!(budget.charged(), 16);
+        assert_eq!(budget.charged(), 24);
     }
 }

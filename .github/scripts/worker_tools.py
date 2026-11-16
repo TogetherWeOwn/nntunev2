@@ -3,7 +3,7 @@
 
 Usage:
   worker_tools.py install [repair]
-  worker_tools.py check-build <worker-build-log>
+  worker_tools.py check-build <worker-build-log> [repair]
 
 Pins live in .github/worker-toolchain.json, the single manifest. The install and
 log-check logic is adapted from the earlier qualification tooling, reduced to what
@@ -285,7 +285,8 @@ def main(argv: list[str]) -> int:
         install()
     elif argv[1:] == ["install", "repair"]:
         install(profile="repair")
-    elif argv[1:2] == ["check-build"] and len(argv) == 3:
+    elif (argv[1:2] == ["check-build"] and
+          (len(argv) == 3 or (len(argv) == 4 and argv[3] == "repair"))):
         check_build(argv[2])
     else:
         print(__doc__, file=sys.stderr)

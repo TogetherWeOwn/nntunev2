@@ -68,6 +68,13 @@ class ManifestAndLocks(unittest.TestCase):
             self.assertEqual(wt.main(["worker_tools.py", "install", "unknown"]), 2)
             check_lock.assert_called_once()
             verify_rust.assert_called_once()
+            with mock.patch.object(wt, "check_build") as check_build:
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log"]), 0)
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log", "repair"]), 0)
+                self.assertEqual(wt.main(["worker_tools.py", "check-build", "log", "unknown"]), 2)
+                self.assertEqual(check_build.call_count, 2)
+                self.assertEqual(check_lock.call_count, 2)
+                self.assertEqual(verify_rust.call_count, 2)
 
     def test_repair_lock_selection_and_mismatch(self):
         pins, workers = wt.select_profile(wt.load_pins(), "repair")
