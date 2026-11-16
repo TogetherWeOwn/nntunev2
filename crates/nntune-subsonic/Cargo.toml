@@ -8,3 +8,6 @@ license = "MIT"
 [lib]
 name = "nntune_subsonic"
 path = "src/lib.rs"
+
+[features]
+ledger-wasm-test = []

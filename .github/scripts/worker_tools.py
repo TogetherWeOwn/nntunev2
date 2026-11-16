@@ -267,6 +267,12 @@ def check_build(log_path: str, env=os.environ) -> None:
 
 
 def main(argv: list[str]) -> int:
+    if argv[1:2] in (["install"], ["check-build"]):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from worker_rust_provenance import check_lock_identity, verify_rust_toolchain
+        pins = load_pins()
+        check_lock_identity(pins)
+        verify_rust_toolchain(pins)
     if argv[1:2] == ["install"] and len(argv) == 2:
         install()
     elif argv[1:2] == ["check-build"] and len(argv) == 3:

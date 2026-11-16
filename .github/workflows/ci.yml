@@ -1687,10 +1687,8 @@ jobs:
           python3 -I .github/scripts/test_worker_tools.py
           python3 -I .github/scripts/test_worker_rust_provenance.py
           python3 -I .github/scripts/test_worker_build_workflow.py
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Prepare canonical Worker tools
         run: python3 -I .github/scripts/worker_tools.py install
       - name: Build ordinary Worker release bundles
@@ -1715,6 +1713,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
+      - name: Exercise construction ledger on wasm32 release
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/worker_rust_provenance.py verify-rust
+          cargo build --locked --release --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,ledger-wasm-test --target-dir "$RUNNER_TEMP/ledger-target"
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ledger-js" "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+          node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
       - name: Exercise staging body adapter in a synthetic WASM stream runtime
         run: |
           set -euo pipefail
