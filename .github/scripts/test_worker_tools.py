@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -38,6 +39,80 @@ class ManifestAndLocks(unittest.TestCase):
         self.assertEqual(pins["runtime"]["esbuild"], "0.28.2")
         self.assertNotIn("version", pins["esbuild-npm"])
         self.assertTrue(pins["esbuild-npm"]["integrity"].startswith("sha512-"))
+
+    def test_profile_selection_and_cli(self):
+        manifest = wt.load_pins()
+        ordinary, workers = wt.select_profile(manifest, "ordinary")
+        self.assertEqual(workers, wt.LOCKED_WORKERS)
+        self.assertEqual(ordinary["worker-build"]["version"], "0.8.7")
+        repair, workers = wt.select_profile(manifest, "repair")
+        self.assertEqual(workers, ("repair",))
+        self.assertEqual(repair["worker-build"], {
+            "version": "0.9.0", "sha256": "bdcd75703783317d833b09c6724d5e4f642ad23804d8d14e3ac362e990c7cab7"})
+        self.assertEqual(repair["wasm-bindgen-cli"], {
+            "version": "0.2.130", "sha256": "c37f6904387d19a319525c74af274c73912f3871c35555aa49f3ea64ebb2fc7a"})
+        self.assertEqual(repair["binaryen"], ordinary["binaryen"])
+        self.assertEqual(repair["esbuild-npm"], ordinary["esbuild-npm"])
+        with self.assertRaises(ValueError):
+            wt.select_profile(manifest, "unknown")
+        with (mock.patch.object(wt, "install") as install,
+              mock.patch("worker_rust_provenance.check_lock_identity") as check_lock,
+              mock.patch("worker_rust_provenance.verify_rust_toolchain") as verify_rust):
+            self.assertEqual(wt.main(["worker_tools.py", "install"]), 0)
+            install.assert_called_once_with()
+            check_lock.assert_called_once_with(manifest)
+            verify_rust.assert_called_once_with(manifest)
+            install.reset_mock()
+            self.assertEqual(wt.main(["worker_tools.py", "install", "repair"]), 0)
+            install.assert_called_once_with(profile="repair")
+            self.assertEqual(wt.main(["worker_tools.py", "install", "unknown"]), 2)
+            check_lock.assert_called_once()
+            verify_rust.assert_called_once()
+
+    def test_repair_lock_selection_and_mismatch(self):
+        pins, workers = wt.select_profile(wt.load_pins(), "repair")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "workers/repair"
+            directory.mkdir(parents=True)
+            lock = directory / "Cargo.lock"
+            def write_lock(worker, bindgen):
+                lock.write_text(f'[[package]]\nname = "worker"\nversion = "{worker}"\n'
+                                f'[[package]]\nname = "wasm-bindgen"\nversion = "{bindgen}"\n')
+            write_lock("0.9.0", "0.2.130")
+            wt.check_locks(pins, root, workers)
+            for worker, bindgen in (("0.8.7", "0.2.130"), ("0.9.0", "0.2.129")):
+                write_lock(worker, bindgen)
+                with self.assertRaises(ValueError):
+                    wt.check_locks(pins, root, workers)
+            lock.write_text('[[package]]\nname = "worker"\nversion = "0.9.0"\n')
+            with self.assertRaises(ValueError):
+                wt.check_locks(pins, root, workers)
+
+    def test_install_passes_selected_pins_to_verified_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {**GOOD_ENV, "RUNNER_TEMP": tmp,
+                   "GITHUB_ENV": str(root / "env"), "GITHUB_PATH": str(root / "path")}
+            installed = []
+            def crate(name, pin, dl, source, target, run):
+                installed.append((name, pin))
+            def executable(pins, dl, source, target):
+                return target / "bin/tool"
+            def run(cmd, **kwargs):
+                version = {"wasm-bindgen": "0.2.130", "tool": "0.28.2 version 132",
+                           "worker-build": "0.9.0"}[Path(cmd[0]).name]
+                return mock.Mock(stdout=version)
+            with mock.patch.object(wt, "require_actions"), mock.patch.object(wt, "check_locks") as locks, \
+                 mock.patch.object(wt, "install_crate", side_effect=crate), \
+                 mock.patch.object(wt, "install_wasm_opt", side_effect=executable), \
+                 mock.patch.object(wt, "install_esbuild", side_effect=executable), \
+                 mock.patch.object(wt.os, "access", return_value=True):
+                wt.install(env, run=run, profile="repair")
+            pins, workers = wt.select_profile(wt.load_pins(), "repair")
+            locks.assert_called_once_with(pins, workers=workers)
+            self.assertEqual(installed, [(name, pins[name]) for name in ("worker-build", "wasm-bindgen-cli")])
+            self.assertIn("WASM_OPT_BIN=", (root / "env").read_text())
 
     def test_repository_locks_agree(self):
         wt.check_locks(wt.load_pins())
@@ -192,10 +267,13 @@ class Checksums(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             wt.install_crate("tool-x", pin, make(b"tampered", index), Path(tmp), Path(tmp) / "i",
                              run=lambda *a, **k: self.fail("must not build"))
-        bad = json.dumps({"vers": "1.0.0", "yanked": False, "cksum": "0" * 64}).encode()
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            wt.install_crate("tool-x", pin, make(crate, bad), Path(tmp), Path(tmp) / "i",
-                             run=lambda *a, **k: self.fail("must not build"))
+        for entry in ({"vers": "1.0.0", "yanked": False, "cksum": "0" * 64},
+                      {"vers": "1.0.0", "yanked": True, "cksum": pin["sha256"]},
+                      {"vers": "2.0.0", "yanked": False, "cksum": pin["sha256"]}):
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+                wt.install_crate("tool-x", pin, make(crate, json.dumps(entry).encode()),
+                                 Path(tmp), Path(tmp) / "i",
+                                 run=lambda *a, **k: self.fail("must not build"))
 
     def pins_for(self, archive: bytes):
         return {"binaryen": {"version": "version_9", "asset": "b.tar.gz",
