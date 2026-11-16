@@ -90,7 +90,7 @@ test('real mounted store clears without remount and records again', async ({ pag
 });
 
 for (const mode of ['writes', 'all'] as const) {
-	test(`loaded store remains empty with ${mode} denied and stale native bytes`, async ({ page }) => {
+	test(`loaded store remains empty with ${mode} denied and stale native bytes`, async ({ page }, info) => {
 		await open(page);
 		await page.getByTestId('queue-select-demo-track').click();
 		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
@@ -102,7 +102,9 @@ for (const mode of ['writes', 'all'] as const) {
 		await clear(page);
 		await empty(page);
 		expect(await page.evaluate(() => (window as Instrumented).__nntuneHistoryFixture.entries())).toEqual([]);
-		expect(await raw(page)).toBe(bytes);
+		const afterBytes = await raw(page);
+		await info.attach(`denied-${mode}-bytes`, { body: JSON.stringify({ before: bytes, after: afterBytes }), contentType: 'application/json' });
+		expect(afterBytes).toBe(bytes);
 		expect(await snapshot(page)).toEqual(before);
 	});
 }
@@ -170,7 +172,9 @@ for (const colorScheme of ['light', 'dark'] as const) {
 			expect(box!.height).toBeGreaterThanOrEqual(24);
 			expect(box!.x).toBeGreaterThanOrEqual(0);
 			expect(box!.x + box!.width).toBeLessThanOrEqual(375);
-			await info.attach(`history-fixture-${colorScheme}`, { body: await page.getByTestId('recently-played').screenshot(), contentType: 'image/png' });
+			const screenshot = info.outputPath(`history-fixture-${colorScheme}.png`);
+			await page.getByTestId('recently-played').screenshot({ path: screenshot });
+			await info.attach(`history-fixture-${colorScheme}`, { path: screenshot, contentType: 'image/png' });
 			const before = await snapshot(page);
 			await clear(page);
 			await empty(page);
