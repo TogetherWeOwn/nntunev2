@@ -46,13 +46,27 @@ async fn client(populated: bool) -> Client {
     client
 }
 
-async fn private_client() -> Client {
-    let client = client(false).await;
+async fn private_client() -> Result<Client, String> {
+    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
+        .map_err(|e| e.to_string())?
+        .parse::<Config>()
+        .map_err(|e| e.to_string())?;
+    if config.get_dbname() != Some("nntune_ci")
+        || !config.get_hostaddrs().is_empty()
+        || !matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
+            if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+    {
+        return Err("disposable local database required".into());
+    }
+    let (client, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
     client
-        .batch_execute("SET search_path = pg_temp, public")
+        .batch_execute("SET statement_timeout = '3s'; SET search_path = pg_temp, public")
         .await
-        .unwrap();
-    client
+        .map_err(|e| e.to_string())?;
+    Ok(client)
 }
 
 async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>>) {
@@ -87,7 +101,7 @@ async fn private_session_upsert_rolls_back_after_mutation() {
         for (session, expiry, inject) in [("target", 30_u64, true), ("target", 40, false),
             ("target", 20, false), ("target", 10, true)] {
             let reached = Rc::new(Cell::new(false));
-            let store = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
             if inject {
                 let marker = reached.clone();
                 store.set_preflight_hook("private-session-upsert", Box::new(move || Box::pin(async move {
@@ -95,7 +109,7 @@ async fn private_session_upsert_rolls_back_after_mutation() {
                     Err(StoreError)
                 })));
             }
-            let outcome = store.private_session_upsert(&owner, session, expiry).await;
+            let outcome = store.upsert_private_session(&owner, session, expiry).await;
             if outcome.is_err() != inject || reached.get() != inject {
                 return Err(format!("unexpected outcome or hook reachability for expiry {expiry}"));
             }
@@ -119,24 +133,32 @@ async fn private_session_upsert_rolls_back_after_mutation() {
             (owner.as_str(), &"x".repeat(129), 1),
             (missing.as_str(), "target", 1),
         ] {
-            let store = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
-            if store.private_session_upsert(id, session, expiry).await.is_ok() {
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            if store.upsert_private_session(id, session, expiry).await.is_ok() {
                 return Err("invalid or missing-account upsert succeeded".into());
             }
         }
-        let failed = private_client().await;
+        // Shadow only the writer's relation to fail the mutation after the account fence.
+        let failed_mutation = private_client().await?;
+        failed_mutation.batch_execute("CREATE TEMP TABLE private_sessions (user_id TEXT)").await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(failed_mutation, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !matches!(store.upsert_private_session(&owner, "target", 99).await, Err(StoreError)) {
+            return Err("mutation failure did not return opaque store error".into());
+        }
+        drop(store);
+        let failed = private_client().await?;
         failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
         if failed.batch_execute("SELECT 1/0").await.is_ok() {
             return Err("database failure injection did not abort the transaction".into());
         }
         let store = catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
-        if !matches!(store.private_session_upsert(&owner, "target", 99).await, Err(StoreError)) {
+        if !matches!(store.upsert_private_session(&owner, "target", 99).await, Err(StoreError)) {
             return Err("database failure did not return opaque store error".into());
         }
         drop(store);
         observer.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
-        let store = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
-        if store.private_session_upsert(&owner, "target", 99).await.is_ok() {
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if store.upsert_private_session(&owner, "target", 99).await.is_ok() {
             return Err("deleting-account upsert succeeded".into());
         }
         let rows = observer.query("SELECT user_id,session_id,expires_at FROM public.private_sessions WHERE user_id IN ($1,$2) ORDER BY user_id,session_id", &[&owner, &other]).await.map_err(|e| e.to_string())?;
@@ -147,8 +169,8 @@ async fn private_session_upsert_rolls_back_after_mutation() {
         observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
         let wide = "é".repeat(128);
         for (session, expiry) in [("A", 0_u64), ("a", 1), (wide.as_str(), 2)] {
-            let store = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
-            store.private_session_upsert(&owner, session, expiry).await.map_err(|_| "valid session rejected".to_string())?;
+            let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+            store.upsert_private_session(&owner, session, expiry).await.map_err(|_| "valid session rejected".to_string())?;
             let row = observer.query_one("SELECT expires_at FROM public.private_sessions WHERE user_id = $1 AND session_id = $2", &[&owner, &session]).await.map_err(|e| e.to_string())?;
             if row.get::<_, i64>(0) != expiry as i64 { return Err("unexpected boundary expiration".into()); }
         }
@@ -186,28 +208,28 @@ async fn private_session_upsert_respects_account_fence() {
         }
         locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
         locker.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
-        let blocked = private_client().await;
+        let blocked = private_client().await?;
         let blocked_pid: i32 = blocked.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
         let locker_pid: i32 = locker.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
         let store = catalogue_store_for_postgres_test(blocked, false, Err(StoreError), Rc::new(Cell::new(0)));
-        let upsert = store.private_session_upsert(&owner, "absent", 10);
+        let upsert = store.upsert_private_session(&owner, "absent", 10);
         tokio::pin!(upsert);
         blocker_observer::observe_blocked(&observer, locker_pid, blocked_pid, upsert.as_mut()).await?;
-        let unrelated = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
-        unrelated.private_session_upsert(&other, "absent", 20).await.map_err(|_| "unrelated account blocked".to_string())?;
+        let unrelated = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        unrelated.upsert_private_session(&other, "absent", 20).await.map_err(|_| "unrelated account blocked".to_string())?;
         locker.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
         if upsert.await.is_ok() { return Err("upsert accepted committed deletion".into()); }
-        let store = catalogue_store_for_postgres_test(private_client().await, false, Err(StoreError), Rc::new(Cell::new(0)));
-        if store.private_session_upsert(&owner, "absent", 10).await.is_ok() {
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if store.upsert_private_session(&owner, "absent", 10).await.is_ok() {
             return Err("upsert accepted account after deletion fence committed".into());
         }
         observer.execute("UPDATE public.users SET deleting_at = NULL WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
         locker.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
         locker.query_one("SELECT id FROM public.users WHERE id = $1 FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
-        let blocked = private_client().await;
+        let blocked = private_client().await?;
         let blocked_pid: i32 = blocked.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
         let store = catalogue_store_for_postgres_test(blocked, false, Err(StoreError), Rc::new(Cell::new(0)));
-        let upsert = store.private_session_upsert(&owner, "absent", 10);
+        let upsert = store.upsert_private_session(&owner, "absent", 10);
         tokio::pin!(upsert);
         blocker_observer::observe_blocked(&observer, locker_pid, blocked_pid, upsert.as_mut()).await?;
         locker.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;

@@ -2621,7 +2621,7 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
-    async fn private_session_upsert(
+    async fn upsert_private_session(
         &self,
         user_id: &str,
         session_id: &str,
