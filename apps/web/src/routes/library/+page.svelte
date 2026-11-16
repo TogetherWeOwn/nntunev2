@@ -4,6 +4,7 @@
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
+	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -1685,7 +1686,7 @@
 
 
 	function interactionIds(id: string): string[] {
-		return selectedIds.includes(id) ? [...new Set(renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id))] : [id];
+		return projectInteractionIds(id, selectedIds, renderedItems);
 	}
 
 	// Re-resolve deferred actions after refresh without substituting another occurrence.
@@ -1702,8 +1703,7 @@
 	}
 
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
-		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : source;
-		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
+		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable);
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
 	}
