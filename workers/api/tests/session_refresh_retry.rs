@@ -99,6 +99,77 @@ fn production_cas_recovers_same_successor_without_extending_any_bound() {
 }
 
 #[test]
+fn production_cas_rollback_restores_state_and_allows_fresh_retry() {
+    let (mut db, old) = fixture();
+    let state = |db: &Connection| {
+        db.query_row(
+            "SELECT id, user_id, created_at, expires_at, rotation_counter, revoked, \
+             refresh_retry_hash, refresh_issued_at, refresh_claimed_at FROM sessions WHERE id = 's1'",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    let before = state(&db);
+    assert_eq!(before.3, (NOW + 3600) as i64);
+    assert_eq!((before.4, before.5), (0, false));
+    assert_eq!((&before.6, before.7, before.8), (&None, None, None));
+
+    let tx = db.transaction().unwrap();
+    let rolled_back = rotate(&tx, &old, "synthetic-digest-a", NOW + 10).unwrap();
+    assert_eq!(rolled_back.rotation_counter, 1);
+    assert_eq!(rolled_back.issued_at, NOW + 10);
+    assert_eq!(rolled_back.expires_at, NOW + 3610);
+    let during = state(&tx);
+    assert_eq!(
+        (during.3, during.4, during.5),
+        ((NOW + 3610) as i64, 1, false)
+    );
+    assert_eq!(during.6.as_deref(), Some("synthetic-digest-a"));
+    assert_eq!(
+        (during.7, during.8),
+        (Some((NOW + 10) as i64), Some((NOW + 10) as i64))
+    );
+    tx.rollback().unwrap();
+    assert_eq!(state(&db), before);
+
+    let successor = rotate(&db, &old, "synthetic-digest-b", NOW + 20).unwrap();
+    assert_eq!(successor.rotation_counter, 1);
+    assert_eq!(successor.issued_at, NOW + 20);
+    assert_eq!(successor.expires_at, NOW + 3620);
+    assert_ne!(successor, rolled_back);
+    let committed = state(&db);
+    assert_eq!(
+        (committed.3, committed.4, committed.5),
+        ((NOW + 3620) as i64, 1, false)
+    );
+    assert_eq!(committed.6.as_deref(), Some("synthetic-digest-b"));
+    assert_eq!(
+        (committed.7, committed.8),
+        (Some((NOW + 20) as i64), Some((NOW + 20) as i64))
+    );
+    assert_eq!(
+        rotate(&db, &old, "synthetic-digest-b", NOW + 21),
+        Some(successor)
+    );
+    assert_eq!(state(&db), committed);
+    assert!(rotate(&db, &old, "synthetic-digest-a", NOW + 21).is_none());
+    assert_eq!(state(&db), committed);
+}
+
+#[test]
 fn production_cas_rejects_mismatched_row_identity_and_old_expiry() {
     let (db, old) = fixture();
     let mut wrong_owner = old.clone();

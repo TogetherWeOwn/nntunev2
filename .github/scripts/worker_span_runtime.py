@@ -1,31 +1,6 @@
 #!/usr/bin/env python3
-"""Real-workerd regression: concurrent Worker 0.9 Rust span identity.
+"""Build and evaluate the feature-gated span probe in real local workerd."""
 
-Builds workers/api with the off-by-default `span-runtime-test` feature (test
-entry in src/span_runtime_probe.rs, exercising worker::observability
-enter_span_async / active_span / in_current_span; locked, existing
-workers/api/Cargo.lock), serves it with the pinned Wrangler `dev --local`
-(real workerd, loopback, no Cloudflare API, no secrets) and asserts, over
-concurrent overlapping requests:
-
-* direct per-task identity: before/mid/end span ids of a task are all present
-  and equal;
-* in_current_span: a future created inside a live span reports its id when
-  awaited outside that scope;
-* cross-task inequality: every task id differs, across all requests;
-* root restoration: outside the task span the identity is the root's again,
-  and the root is unchanged after the join;
-* negative control: the same evaluator MUST reject the `unscoped` probe,
-  which omits enter_span_async (no withActiveSpan propagation).
-
-Any build/start/timeout/shape failure exits non-zero. The existing
-workers/api/build is moved aside and restored. Usage:
-
-    python3 -I .github/scripts/worker_span_runtime.py --wrangler PATH
-    python3 -I .github/scripts/worker_span_runtime.py --self-test
-"""
-
-import argparse
 import json
 import os
 import shutil
@@ -36,104 +11,91 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.request
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "workers/api/tests"))
+from span_result import evaluate_positive, evaluate_negative as evaluate_root_only
+from process_group import shutdown_process_group
+from worker_routing_postgres_smoke import OPENER, find_wrangler
 
 ROOT = Path(__file__).resolve().parents[2]
 API = ROOT / "workers/api"
 TASKS, REQUESTS = 8, 6
-BUILD = ["worker-build", "--release", "--", "--locked", "--features", "span-runtime-test"]
-
-
-class Failure(Exception):
-    pass
 
 
 def check(cond, message):
     if not cond:
-        raise Failure(message)
+        raise ValueError(message)
 
 
-def evaluate(body, mode):
-    """Pure check of one probe response; raises Failure."""
-    check(isinstance(body, dict) and body.get("mode") == mode, "bad mode")
-    tasks = body.get("tasks")
-    check(isinstance(tasks, list) and len(tasks) == TASKS, "wrong task count")
-    root = body.get("root_before")
-    check(body.get("root_after") == root, "root span not restored after join")
-    ids = []
-    for t in tasks:
-        own = t.get("mid")
-        check(isinstance(own, str) and own and own != root, "task has no distinct active span")
-        for key in ("before", "end"):
-            check(t.get(key) == own, f"task identity lost at {key}")
-        expected = t.get("child_expected")
-        check(isinstance(expected, str) and expected and expected != root, "child has no distinct span")
-        check(t.get("child") == expected, "child identity lost outside its scope")
-        check(t.get("after_scope") == root and t.get("after_child") == root,
-              "root not restored after task scope")
-        ids.append(own)
-    check(len(set(ids)) == len(ids), "task span ids not distinct")
-    return ids
+def observations(body, mode):
+    check(isinstance(body, dict) and body.keys() == {"mode", "root_after", "child_expected", "observations"}
+          and body["mode"] == mode, "bad response envelope")
+    value = body["observations"]
+    check(isinstance(value, dict) and value.keys() == {"root", "tasks", "child"},
+          "bad observations")
+    check(isinstance(value["tasks"], list) and len(value["tasks"]) == TASKS,
+          "wrong task count")
+    check(body["root_after"] == value["root"], "root span not restored after join")
+    return value
 
 
 def evaluate_scoped(bodies):
     ids = []
     for body in bodies:
-        ids += evaluate(body, "scoped")
+        value = observations(body, "scoped")
+        evaluate_positive(value)
+        check(value["child"]["before"] == body["child_expected"], "captured child span mismatch")
+        ids.extend(item["before"] for item in [*value["tasks"], value["child"]])
     check(len(set(ids)) == len(ids), "span ids collided across concurrent requests")
 
 
 def evaluate_negative(body):
-    check(isinstance(body, dict) and body.get("mode") == "unscoped", "bad control mode")
-    root = body.get("root_before")
-    check(isinstance(root, str) and root, "control has no root span")
-    check(body.get("root_after") == root, "control root not restored")
-    tasks = body.get("tasks")
-    check(isinstance(tasks, list) and len(tasks) == TASKS, "wrong control task count")
-    for task in tasks:
-        check(isinstance(task, dict), "malformed control task")
-        for key in ("before", "mid", "end", "child", "after_scope", "after_child"):
-            check(task.get(key) == root, f"control did not retain root at {key}")
+    value = observations(body, "unscoped")
+    for item in [*value["tasks"], value["child"]]:
+        check(isinstance(item, dict) and item.keys() == {"before", "mid", "end", "after"},
+              "malformed control observation")
+        evaluate_root_only({"root": value["root"], **item})
+    try:
+        evaluate_positive(value)
+    except ValueError:
+        return
+    raise ValueError("positive evaluator accepted the unscoped control")
 
 
-def build(env):
+def build(env, output):
     subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1"],
                    cwd=API, env=env, stdout=subprocess.DEVNULL, check=True, timeout=300)
     log_path = Path(env["RUNNER_TEMP"]) / "worker-span-runtime.log"
     with log_path.open("w") as log:
-        r = subprocess.run(BUILD, cwd=API, env=env, stdout=log,
-                           stderr=subprocess.STDOUT, timeout=2400)
-    check(r.returncode == 0, f"span-runtime-test worker-build failed; see {log_path}")
+        result = subprocess.run(
+            ["worker-build", "--release", "--out-dir", str(output), "--", "--locked",
+             "--features", "span-runtime-test"],
+            cwd=API, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=2400)
+    check(result.returncode == 0, f"span-runtime-test worker-build failed; see {log_path}")
     subprocess.run([sys.executable, "-I", str(ROOT / ".github/scripts/worker_tools.py"),
                     "check-build", str(log_path)], cwd=ROOT, env=env, check=True, timeout=120)
     subprocess.run(["git", "diff", "--exit-code", "--", "Cargo.lock"],
                    cwd=API, env=env, check=True, timeout=120)
-    check((API / "build/worker/shim.mjs").is_file(), "worker-build produced no shim.mjs")
-
-
-def restore(existing, aside):
-    shutil.rmtree(existing, ignore_errors=True)
-    if aside.exists():
-        aside.rename(existing)
+    check((output / "worker/shim.mjs").is_file(), "worker-build produced no shim.mjs")
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def get(port, mode):
-    url = f"http://127.0.0.1:{port}/probe?mode={mode}"
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        check(resp.status == 200, f"{mode}: HTTP {resp.status}")
-        return json.load(resp)
+    with OPENER.open(f"http://127.0.0.1:{port}/probe?mode={mode}", timeout=60) as response:
+        check(response.status == 200, f"{mode}: HTTP {response.status}")
+        return json.load(response)
 
 
 CONFIG = """name = "nntune-span-runtime-test"
-main = "build/worker/shim.mjs"
+main = "bundle/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 workers_dev = false
 preview_urls = false
@@ -149,131 +111,126 @@ enabled = true
 
 def run(wrangler):
     env = dict(os.environ, CI="1", WRANGLER_SEND_METRICS="false", NO_COLOR="1")
-    existing = API / "build"
-    aside = API / "build.span-runtime-aside"
-    check(not aside.exists(), "stale build aside directory")
-    config = API / "wrangler.span-runtime.toml"
-    check(not config.exists(), "span runtime config already exists")
-    if existing.exists():
-        existing.rename(aside)
+    state = Path(tempfile.mkdtemp(prefix="worker-span-runtime-"))
     proc = None
     try:
-        build(env)
+        build(env, state / "bundle")
+        config = state / "wrangler.toml"
         config.write_text(CONFIG)
+        home = state / "home"
+        home.mkdir()
         port = free_port()
-        log = tempfile.TemporaryFile("w+")
-        proc = subprocess.Popen(
-            ["node", str(wrangler), "dev", "--config", str(config), "--local",
-             "--ip", "127.0.0.1", "--port", str(port), "--inspector-port", str(free_port())],
-            cwd=API, env=env, stdout=log, stderr=subprocess.STDOUT)
-        try:
-            deadline = time.time() + 180
-            while True:
-                check(proc.poll() is None, "wrangler/workerd exited early")
-                try:
-                    get(port, "scoped")
-                    break
-                except Failure:
-                    raise
-                except Exception:
-                    check(time.time() < deadline, "workerd did not become ready")
-                    time.sleep(1)
-            barrier = threading.Barrier(REQUESTS)
-
-            def one(_):
-                barrier.wait(timeout=30)
-                return get(port, "scoped")
-
-            with ThreadPoolExecutor(REQUESTS) as pool:
-                bodies = list(pool.map(one, range(REQUESTS)))
-            evaluate_scoped(bodies)
-            evaluate_negative(get(port, "unscoped"))
-            evaluate_scoped([get(port, "scoped")])  # still clean after the control
-            print("worker span runtime: ok (real workerd)")
-        except Failure:
-            log.seek(0)
-            sys.stdout.write(log.read()[-4000:])
-            raise
-        finally:
-            proc.terminate()
+        runtime_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+                       "XDG_CONFIG_HOME": str(home), "CI": "1", "NO_COLOR": "1",
+                       "WRANGLER_SEND_METRICS": "false"}
+        with tempfile.TemporaryFile("w+") as log:
+            proc = subprocess.Popen(
+                ["node", str(wrangler), "dev", "--config", str(config), "--local",
+                 "--persist-to", str(state / "data"), "--ip", "127.0.0.1",
+                 "--port", str(port), "--inspector-port", str(free_port())],
+                cwd=state, env=runtime_env, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True)
             try:
-                proc.wait(20)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                deadline = time.monotonic() + 180
+                while True:
+                    check(proc.poll() is None, "wrangler/workerd exited early")
+                    try:
+                        get(port, "scoped")
+                        break
+                    except ValueError:
+                        raise
+                    except Exception:
+                        check(time.monotonic() < deadline, "workerd did not become ready")
+                        time.sleep(1)
+                barrier = threading.Barrier(REQUESTS)
+
+                def one(_):
+                    barrier.wait(timeout=30)
+                    return get(port, "scoped")
+
+                with ThreadPoolExecutor(REQUESTS) as pool:
+                    bodies = list(pool.map(one, range(REQUESTS)))
+                evaluate_scoped(bodies)
+                evaluate_negative(get(port, "unscoped"))
+                evaluate_scoped([get(port, "scoped")])
+                print(f"worker span runtime: ok (real workerd; requests={REQUESTS}; tasks={TASKS}; scoped/control/post-control passed)")
+            except Exception:
+                log.seek(0)
+                sys.stdout.write(log.read()[-4000:])
+                raise
+            finally:
+                shutdown_process_group(proc)
+                proc = None
     finally:
-        config.unlink(missing_ok=True)
-        restore(existing, aside)
+        if proc is None:
+            shutil.rmtree(state)
 
 
 class SelfTest(unittest.TestCase):
-    def body(self, mode="scoped", ids=None, **over):
-        ids = ids or [f"s{i}" for i in range(TASKS)]
-        tasks = [{"before": i, "mid": i, "end": i, "child": i,
-                  "child_expected": i, "after_scope": "root", "after_child": "root"} for i in ids]
-        body = {"mode": mode, "root_before": "root", "root_after": "root", "tasks": tasks}
-        body.update(over)
-        return body
+    def body(self, scoped):
+        def sample(identity):
+            return {"before": identity, "mid": identity, "end": identity, "after": "root"}
+        return {"mode": "scoped" if scoped else "unscoped", "root_after": "root",
+                "child_expected": "child" if scoped else None, "observations": {"root": "root",
+                                 "tasks": [sample(f"task-{i}" if scoped else "root")
+                                           for i in range(TASKS)],
+                                 "child": sample("child" if scoped else "root")}}
 
-    def fails(self, body, mode="scoped"):
-        with self.assertRaises(Failure):
-            evaluate(body, mode)
+    def test_negative_control(self):
+        evaluate_negative(self.body(False))
+        with self.assertRaises(ValueError):
+            evaluate_scoped([{**self.body(False), "mode": "scoped"}])
+        with self.assertRaises(ValueError):
+            evaluate_negative(self.body(True))
+        body = self.body(False)
+        body["observations"]["tasks"][0] = dict.fromkeys(
+            ("root", "before", "mid", "end", "after"), "other")
+        with self.assertRaises(ValueError):
+            evaluate_negative(body)
 
-    def test_good_passes(self):
-        evaluate_scoped([self.body()])
+    def test_concurrent_collision(self):
+        body = self.body(True)
+        evaluate_scoped([body])
+        with self.assertRaises(ValueError):
+            evaluate_scoped([body, body])
+        body["child_expected"] = "different-captured-span"
+        with self.assertRaisesRegex(ValueError, "captured child span mismatch"):
+            evaluate_scoped([body])
 
-    def test_missing_propagation_fails(self):
-        self.fails(self.body(ids=["root"] * TASKS))  # no distinct span: unscoped shape
-
-    def test_cross_task_equality_fails(self):
-        self.fails(self.body(ids=["s"] * TASKS))
-
-    def test_lost_child_identity_fails(self):
-        b = self.body()
-        b["tasks"][3]["child"] = "other"
-        self.fails(b)
-
-    def test_midflight_drift_fails(self):
-        b = self.body()
-        b["tasks"][0]["end"] = "s1"
-        self.fails(b)
-
-    def test_unrestored_root_fails(self):
-        self.fails(self.body(root_after="leaked"))
-        b = self.body()
-        b["tasks"][2]["after_scope"] = "s2"
-        self.fails(b)
-
-    def test_cross_request_collision_fails(self):
-        with self.assertRaises(Failure):
-            evaluate_scoped([self.body(), self.body()])
-
-    def test_negative_control_must_be_rejected(self):
-        evaluate_negative(self.body(mode="unscoped", ids=["root"] * TASKS))
-        with self.assertRaises(Failure):
-            evaluate_negative(self.body(mode="unscoped"))
-        with self.assertRaises(Failure):
-            evaluate_negative({})
-        with self.assertRaises(Failure):
-            evaluate_negative(self.body(mode="unscoped", tasks=[]))
-
-
-def main(argv):
-    p = argparse.ArgumentParser()
-    p.add_argument("--wrangler")
-    p.add_argument("--self-test", action="store_true")
-    a = p.parse_args(argv)
-    if a.self_test:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
-        return 0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1
-    if not a.wrangler:
-        p.error("--wrangler is required")
-    try:
-        run(Path(a.wrangler).resolve(strict=True))
-    except Failure as e:
-        print(f"worker span runtime: FAIL: {e}", file=sys.stderr)
-        return 1
-    return 0
+    def test_failure_lifecycle(self):
+        for stage in ("build", "start", "request", "shutdown"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                api = Path(tmp)
+                (api / "build").mkdir()
+                original = api / "build/original"
+                original.write_text("original")
+                state = api / "runtime"
+                state.mkdir()
+                proc = mock.Mock()
+                proc.poll.return_value = None
+                with tempfile.TemporaryFile("w+") as log, \
+                     mock.patch.dict(globals(), API=api), \
+                     mock.patch(__name__ + ".tempfile.mkdtemp", return_value=str(state)), \
+                     mock.patch(__name__ + ".tempfile.TemporaryFile", return_value=log), \
+                     mock.patch(__name__ + ".build", side_effect=ValueError(stage) if stage == "build" else None), \
+                     mock.patch(__name__ + ".subprocess.Popen", side_effect=ValueError(stage) if stage == "start" else None, return_value=proc), \
+                     mock.patch(__name__ + ".get", side_effect=ValueError(stage)), \
+                     mock.patch(__name__ + ".shutdown_process_group", side_effect=ValueError(stage) if stage == "shutdown" else None) as shutdown:
+                    with self.assertRaises(ValueError):
+                        run(Path("wrangler"))
+                    self.assertEqual(shutdown.call_count, int(stage in ("request", "shutdown")))
+                    self.assertEqual(log.closed, stage != "build")
+                self.assertEqual(original.read_text(), "original")
+                self.assertEqual(state.exists(), stage == "shutdown")
+                if stage == "shutdown":
+                    self.assertTrue((state / "wrangler.toml").is_file())
+                    self.assertTrue((state / "home").is_dir())
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    if sys.argv[1:] == ["--self-test"]:
+        unittest.main(argv=[sys.argv[0]])
+    else:
+        if len(sys.argv) > 2:
+            raise SystemExit("usage: worker_span_runtime.py [WRANGLER] | --self-test")
+        run(find_wrangler(sys.argv[1] if len(sys.argv) == 2 else None))

@@ -9,6 +9,16 @@
     "version": "0.2.130",
     "sha256": "c37f6904387d19a319525c74af274c73912f3871c35555aa49f3ea64ebb2fc7a"
   },
+  "repair-profile": {
+    "worker-build": {
+      "version": "0.9.0",
+      "sha256": "bdcd75703783317d833b09c6724d5e4f642ad23804d8d14e3ac362e990c7cab7"
+    },
+    "wasm-bindgen-cli": {
+      "version": "0.2.130",
+      "sha256": "c37f6904387d19a319525c74af274c73912f3871c35555aa49f3ea64ebb2fc7a"
+    }
+  },
   "binaryen": {
     "version": "version_132",
     "asset": "binaryen-version_132-x86_64-linux.tar.gz",
@@ -50,6 +60,6 @@
     }
   },
   "locks": {
-    "workers/api/Cargo.lock": "f9e2e62dedf5137bef324a013f5602d4e13ed6c585344ff0372dee48b5180ae8"
+    "workers/api/Cargo.lock": "88cf9c9114506a0d423c279fef02e3f9926f1b3fd941dc43ebae92e40713ce5a"
   }
 }
