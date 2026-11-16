@@ -33,11 +33,6 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 "rust-transcode": ("rustfmt,clippy", "wasm32-unknown-unknown"),
             },
             "coverage.yml": {"coverage": ("llvm-tools-preview", None)},
-            "deploy.yml": {
-                "staging-api": (None, "wasm32-unknown-unknown"),
-                "staging-mb": (None, "wasm32-unknown-unknown"),
-                "staging-ingest": (None, "wasm32-unknown-unknown"),
-            },
         }
         for path, jobs in expected.items():
             text = (WORKFLOWS / path).read_text()
@@ -51,6 +46,12 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                     if target:
                         command += f" --target {target}"
                     self.assertIn(command + "\n          rustup default stable\n", section)
+        deploy = (WORKFLOWS / "deploy.yml").read_text()
+        for name in ("staging-api", "staging-mb", "staging-ingest"):
+            with self.subTest(path="deploy.yml", job=name):
+                section = job(deploy, name)
+                self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)
+                self.assertNotIn("rustup toolchain install stable", section)
 
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
