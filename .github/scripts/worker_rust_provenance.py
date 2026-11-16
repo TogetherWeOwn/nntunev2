@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import pwd
 import subprocess
@@ -70,11 +69,16 @@ def cargo_config_refusals(env, root: Path = ROOT) -> None:
                 raise ValueError(f"Cargo config {directory / name} may change the pinned Rust build")
 
 
-def load_std(env) -> dict:
-    path = env.get("RUST_STD_DIGESTS")
+def load_std(env, rust: dict) -> dict:
+    path = env.get("RUST_STD_ARCHIVE")
     if not path or not Path(path).is_file():
-        raise ValueError("verified wasm32 std digests are missing; run worker_rust_provenance.py rust first")
-    return json.loads(Path(path).read_text())
+        raise ValueError("verified wasm32 std archive is missing; run worker_rust_provenance.py rust first")
+    archive = Path(path)
+    if archive.stat().st_size > 60_000_000:
+        raise ValueError("wasm32 std archive exceeds the size limit")
+    data = verified(archive.read_bytes(), rust["rust-std-wasm32"]["xz-sha256"])
+    version, target = rust["version"], rust["target"]
+    return tar_files(data, f"rust-std-{version}-{target}/rust-std-{target}/lib/rustlib/{target}/lib/", 200_000_000)
 
 
 def parse_vv(text: str) -> dict:
@@ -84,10 +88,22 @@ def parse_vv(text: str) -> dict:
 def tar_files(archive: bytes, prefix: str, limit: int) -> dict:
     """sha256 of each regular file below prefix in an xz tarball; nothing is extracted."""
     found = {}
+    total = 0
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:xz") as bundle:
         for member in bundle:
-            if member.name.startswith(prefix) and member.isfile() and member.size <= limit:
-                found[member.name[len(prefix):]] = hashlib.sha256(bundle.extractfile(member).read()).hexdigest()
+            if not member.name.startswith(prefix):
+                continue
+            name = member.name[len(prefix):]
+            if not name or member.isdir():
+                continue
+            if (not member.isfile() or name in found or any(p in ("", ".", "..") for p in name.split("/"))):
+                raise ValueError("invalid or duplicate std archive member")
+            total += member.size
+            if total > limit:
+                raise ValueError("std archive exceeds the unpacked size limit")
+            found[name] = hashlib.sha256(bundle.extractfile(member).read()).hexdigest()
+    if not found:
+        raise ValueError("std archive contains no target library files")
     return found
 
 
@@ -127,11 +143,11 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_fi
                          root: Path = ROOT) -> None:
     """Fail closed unless the active toolchain is exactly the pinned tuple.
 
-    Installed wasm std is always compared to the verified digests (std_files or RUST_STD_DIGESTS)."""
+    Installed wasm std is compared to the pinned archive (or injected test digests)."""
     rust = pins["rust"]
     rust_env_refusals(env, rust["version"])
     cargo_config_refusals(env, root)
-    want = load_std(env) if std_files is None else std_files
+    want = load_std(env, rust) if std_files is None else std_files
 
     def out(*cmd):
         return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT, env=env).stdout
@@ -147,10 +163,18 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_fi
     if sysroot.name != f"{rust['version']}-{rust['host']}":
         raise ValueError("active sysroot is not the pinned toolchain")
     libdir = sysroot / "lib/rustlib" / rust["target"] / "lib"
+    if any(path.is_symlink() for path in (sysroot, sysroot / "lib", sysroot / "lib/rustlib",
+                                           sysroot / "lib/rustlib" / rust["target"], libdir)):
+        raise ValueError("installed wasm32 std contains a symbolic link")
     if not libdir.is_dir():
         raise ValueError("pinned wasm32 std is not installed")
+    files = list(libdir.rglob("*"))
+    if any(f.is_symlink() for f in files):
+        raise ValueError("installed wasm32 std contains a symbolic link")
+    if any(not f.is_file() and not f.is_dir() for f in files):
+        raise ValueError("installed wasm32 std contains a non-regular entry")
     have = {str(f.relative_to(libdir)): hashlib.sha256(f.read_bytes()).hexdigest()
-            for f in libdir.rglob("*") if f.is_file()}
+            for f in files if f.is_file()}
     if not want or want != have:
         raise ValueError("installed wasm32 std differs from the verified official archive")
 
@@ -162,22 +186,29 @@ def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
     env = {**env, "RUSTUP_TOOLCHAIN": rust["version"]}
     rust_env_refusals(env, rust["version"])
     t, v = rust["target"], rust["version"]
-    std_files = tar_files(verify_rust_source(pins, dl), f"rust-std-{v}-{t}/rust-std-{t}/lib/rustlib/{t}/lib/", 200_000_000)
+    archive = verify_rust_source(pins, dl)
+    std_files = tar_files(archive, f"rust-std-{v}-{t}/rust-std-{t}/lib/rustlib/{t}/lib/", 200_000_000)
     run(["rustup", "toolchain", "install", rust["version"], "--profile", "minimal",
          "--no-self-update", "--target", rust["target"]], check=True, cwd=ROOT, env=env)
     run(["rustup", "default", rust["version"]], check=True, cwd=ROOT, env=env)
-    digests = Path(env["RUNNER_TEMP"]) / "rust-std-digests.json"
-    digests.write_text(json.dumps(std_files, sort_keys=True))
+    archive_path = Path(env["RUNNER_TEMP"]) / "rust-std.tar.xz"
+    archive_path.write_bytes(archive)
     with open(env["GITHUB_ENV"], "a") as output:
-        output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\nRUST_STD_DIGESTS={digests}\n")
+        output.write(f"RUSTUP_TOOLCHAIN={rust['version']}\nRUST_STD_ARCHIVE={archive_path}\n")
     verify_rust_toolchain(pins, env, run, std_files)
     print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
+
+
+def verify_rust_boundary() -> None:
+    pins = load_pins()
+    check_lock_identity(pins)
+    verify_rust_toolchain(pins)
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["rust"]:
         install_rust()
     elif sys.argv[1:] == ["verify-rust"]:
-        verify_rust_toolchain(load_pins())
+        verify_rust_boundary()
     else:
         sys.exit("usage: worker_rust_provenance.py {rust|verify-rust}")
