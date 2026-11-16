@@ -138,14 +138,17 @@ async fn private_session_upsert_rolls_back_after_mutation() {
                 return Err("invalid or missing-account upsert succeeded".into());
             }
         }
-        // Shadow only the writer's relation to fail the mutation after the account fence.
+        // Lock only the session row, so the writer's account fence succeeds but its mutation times out.
+        observer.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        observer.query_one("SELECT session_id FROM public.private_sessions WHERE user_id = $1 AND session_id = 'target' FOR UPDATE", &[&owner]).await.map_err(|e| e.to_string())?;
         let failed_mutation = private_client().await?;
-        failed_mutation.batch_execute("CREATE TEMP TABLE private_sessions (user_id TEXT)").await.map_err(|e| e.to_string())?;
+        failed_mutation.batch_execute("SET lock_timeout = '200ms'").await.map_err(|e| e.to_string())?;
         let store = catalogue_store_for_postgres_test(failed_mutation, false, Err(StoreError), Rc::new(Cell::new(0)));
         if !matches!(store.upsert_private_session(&owner, "target", 99).await, Err(StoreError)) {
             return Err("mutation failure did not return opaque store error".into());
         }
         drop(store);
+        observer.batch_execute("ROLLBACK").await.map_err(|e| e.to_string())?;
         let failed = private_client().await?;
         failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
         if failed.batch_execute("SELECT 1/0").await.is_ok() {
