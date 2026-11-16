@@ -391,7 +391,12 @@ fn mint_path_statements_run_unnamed_through_query_typed() {
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
-    for name in ["user_by_email", "insert_user", "insert_session"] {
+    for name in [
+        "user_by_email",
+        "insert_user",
+        "insert_session",
+        "private_session_active",
+    ] {
         let piece = pieces
             .iter()
             .find(|piece| method_name(piece) == name)
