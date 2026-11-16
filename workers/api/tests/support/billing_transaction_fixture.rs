@@ -13,6 +13,18 @@ pub enum Class {
     AbsentEmpty,
 }
 
+#[derive(Debug)]
+pub enum FixtureError {
+    Postgres(tokio_postgres::Error),
+    Refusal(String),
+}
+
+impl From<&str> for FixtureError {
+    fn from(message: &str) -> Self {
+        Self::Refusal(message.into())
+    }
+}
+
 /// `schema` must be the Fx-generated identifier, never request or user input.
 pub fn fixed_sql(schema: &str) -> [String; 3] {
     assert!(
@@ -34,12 +46,9 @@ pub async fn run(
     schema: &str,
     user: &str,
     o: &ReconcileOutcome,
-) -> Result<Class, String> {
+) -> Result<Class, FixtureError> {
     let [lock, lookup, write] = fixed_sql(schema);
-    let e = |e: tokio_postgres::Error| match e.as_db_error() {
-        Some(db) => format!("{}: {}", db.code().code(), db.message()),
-        None => e.to_string(),
-    };
+    let e = FixtureError::Postgres;
     let tx = db
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
@@ -136,7 +145,7 @@ pub async fn run(
                 Class::Wrote
             }
             [] if own == Some(true) && stale => Class::OwnStale,
-            _ => return Err(format!("unrecognized write result: {} rows", rows.len())),
+            _ => return Err(FixtureError::Refusal(format!("unrecognized write result: {} rows", rows.len()))),
         }
     };
     let history = tx
