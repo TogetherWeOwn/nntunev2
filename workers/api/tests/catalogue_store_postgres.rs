@@ -59,6 +59,62 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 }
 
 #[tokio::test]
+async fn history_reader_decodes_metered_public_owner_rows() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let db = &accounts.observer;
+    let result: Result<(), String> = async {
+        let insert = "INSERT INTO public.stream_play_ledger (idempotency_key,user_id,track_id,period_month,stream_seconds,bytes_served,recorded_at) VALUES ($1,$2,$3,'2026-11',$4,$5,$6)";
+        for (key, user, track, seconds, bytes, time) in [
+            (format!("play:{owner}:track:public"), &owner, "track", 12_i32, 100_i64, 10_i64),
+            (format!("play:{owner}:track:private"), &owner, "track", 2, 100, 20),
+            (format!("play:{owner}:track:zero"), &owner, "track", 1, 0, 30),
+            (format!("play:{other}:track:foreign"), &other, "track", 3, 100, 40),
+            (format!("play:{other}:track:forged"), &owner, "track", 4, 100, 50),
+            (format!("play:{owner}:wrong:mismatch"), &owner, "track", 4, 100, 60),
+            (format!("play:{owner}:track:bad:extra"), &owner, "track", 4, 100, 70),
+            (format!("request:{owner}:track:search"), &owner, "track", 4, 100, 80),
+        ] {
+            db.execute(insert, &[&key, user, &track, &seconds, &bytes, &time]).await.map_err(|e| e.to_string())?;
+        }
+        let public = format!("play:{owner}:track:public");
+        db.execute(&format!("{insert} ON CONFLICT (idempotency_key) DO NOTHING"), &[&public, &owner, &"track", &12_i32, &100_i64, &10_i64]).await.map_err(|e| e.to_string())?;
+        let private = format!("play:{owner}:track:private");
+        db.execute("INSERT INTO public.private_plays (user_id,play_key,marked_at) VALUES ($1,$2,1)", &[&owner, &private]).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let rows = store.history_list(&owner).await.map_err(|_| "read failed")?;
+        if rows.len() != 1 || rows[0].play_id != "public" || rows[0].track_id != "track" || rows[0].played_at != 10 || rows[0].stream_seconds != 12 {
+            return Err(format!("incorrect owner history: {rows:?}"));
+        }
+        for i in 0..55_i64 {
+            let key = format!("play:{owner}:track:p{i:02}");
+            db.execute(insert, &[&key, &owner, &"track", &1_i32, &1_i64, &(100 + i)]).await.map_err(|e| e.to_string())?;
+        }
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        let rows = store.history_list(&owner).await.map_err(|_| "bounded read failed")?;
+        if rows.len() != 50 || rows[0].play_id != "p54" || rows[49].play_id != "p05" {
+            return Err("history order or cap incorrect".into());
+        }
+        db.execute("DELETE FROM public.users WHERE id = $1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !store.history_list(&owner).await.map_err(|_| "deleted read failed")?.is_empty() {
+            return Err("account cascade failed".into());
+        }
+        let store = catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if store.history_list(&other).await.map_err(|_| "other read failed")?.len() != 1 {
+            return Err("surviving owner history incorrect".into());
+        }
+        if store.history_list(&other).await.is_ok() {
+            return Err("connection failure must be opaque".into());
+        }
+        Ok(())
+    }.await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn private_session_upsert_rolls_back_after_mutation() {
     let accounts = disposable_accounts::Accounts::new(2).await;
     let owner = accounts.id(0).to_owned();
