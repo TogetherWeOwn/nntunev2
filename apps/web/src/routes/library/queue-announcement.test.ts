@@ -2,6 +2,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
@@ -91,6 +92,7 @@ function pageScript() {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare,
+		createPendingShareSeek,
 		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
