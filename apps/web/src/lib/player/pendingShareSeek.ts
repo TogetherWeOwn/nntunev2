@@ -44,8 +44,12 @@ export function createPendingShareSeek(
 			const target = pending, expectedRevision = revision;
 			if (writing || !target || target.appliedSeconds == null) return;
 			try {
+				const receipt = capture(element, target);
+				const current = () => pending === target && revision === expectedRevision &&
+					receipt.isCurrent() && pending === target && revision === expectedRevision;
+				if (!current()) return;
 				const position = element.currentTime;
-				if (pending === target && revision === expectedRevision && position !== target.appliedSeconds) clear();
+				if (current() && position !== target.appliedSeconds) clear();
 			} catch { /* retry later */ }
 		}
 	};

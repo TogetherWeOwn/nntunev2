@@ -90,6 +90,16 @@ test('replacement during the seeking observer getter survives retirement', () =>
 	expect(f.seek.current?.appliedSeconds).toBeNull();
 });
 
+test('owner invalidation during the seeking observer getter preserves the adjustment', () => {
+	const f = fixture(); f.seek.set(target); f.seek.apply(f.element);
+	Object.defineProperty(f.element, 'currentTime', {
+		get: () => { f.reattach(); return 4; }
+	});
+	f.seek.observeSeeking(f.element);
+	expect(f.seek.current?.seconds).toBe(90);
+	expect(f.seek.current?.appliedSeconds).toBe(90);
+});
+
 test('resume cancellation may invalidate the receipt before the write', () => {
 	const f = fixture(); f.seek.set(target);
 	f.onCancel(() => f.reattach());
