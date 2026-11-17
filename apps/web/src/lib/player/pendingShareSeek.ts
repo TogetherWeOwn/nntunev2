@@ -41,8 +41,12 @@ export function createPendingShareSeek(
 			}
 		},
 		observeSeeking(element: HTMLAudioElement) {
-			if (writing || !pending || pending.appliedSeconds == null) return;
-			try { if (element.currentTime !== pending.appliedSeconds) clear(); } catch { /* retry later */ }
+			const target = pending, expectedRevision = revision;
+			if (writing || !target || target.appliedSeconds == null) return;
+			try {
+				const position = element.currentTime;
+				if (pending === target && revision === expectedRevision && position !== target.appliedSeconds) clear();
+			} catch { /* retry later */ }
 		}
 	};
 }

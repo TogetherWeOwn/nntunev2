@@ -80,6 +80,16 @@ test('own synchronous seeking is ignored, a different native seek retires the ad
 	expect(f.seek.current).toBeNull();
 });
 
+test('replacement during the seeking observer getter survives retirement', () => {
+	const f = fixture(); f.seek.set(target); f.seek.apply(f.element);
+	Object.defineProperty(f.element, 'currentTime', {
+		get: () => { f.seek.set({ ...target, seconds: 12 }); return 4; }
+	});
+	f.seek.observeSeeking(f.element);
+	expect(f.seek.current?.seconds).toBe(12);
+	expect(f.seek.current?.appliedSeconds).toBeNull();
+});
+
 test('resume cancellation may invalidate the receipt before the write', () => {
 	const f = fixture(); f.seek.set(target);
 	f.onCancel(() => f.reattach());
