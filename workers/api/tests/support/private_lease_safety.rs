@@ -183,6 +183,10 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
                 return Err("incorrect seed".into());
             }
         }
+        let before_lease = db.query_one("SELECT session_id,track_id,play_id,epoch,expires_at,updated_at FROM public.playback_leases WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
+        let before_mark = db.query_one("SELECT play_key,marked_at FROM public.private_plays WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
+        let lease_snapshot: (String, String, String, i64, i64, i64) = (before_lease.get(0), before_lease.get(1), before_lease.get(2), before_lease.get(3), before_lease.get(4), before_lease.get(5));
+        let mark_snapshot: (String, i64) = (before_mark.get(0), before_mark.get(1));
         holder
             .batch_execute("BEGIN")
             .await
@@ -230,6 +234,11 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
         if pending.await.is_ok() {
             return Err("deleting account acquired lease".into());
         }
+        let after_lease = db.query_one("SELECT session_id,track_id,play_id,epoch,expires_at,updated_at FROM public.playback_leases WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
+        let after_mark = db.query_one("SELECT play_key,marked_at FROM public.private_plays WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
+        let current_lease: (String, String, String, i64, i64, i64) = (after_lease.get(0), after_lease.get(1), after_lease.get(2), after_lease.get(3), after_lease.get(4), after_lease.get(5));
+        let current_mark: (String, i64) = (after_mark.get(0), after_mark.get(1));
+        if current_lease != lease_snapshot || current_mark != mark_snapshot { return Err("deletion changed incumbent or retained mark".into()); }
         let rows = db
             .query(
                 "SELECT user_id,play_id,epoch FROM public.playback_leases WHERE user_id=ANY($1)",
