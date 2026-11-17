@@ -1864,6 +1864,26 @@ jobs:
           cargo build --locked --release --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,ledger-wasm-test --target-dir "$RUNNER_TEMP/ledger-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ledger-js" "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
           node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
+      - name: Reject a conflicting dependency global allocator in the ledger artifact graph
+        run: |
+          set -euo pipefail
+          probe=.github/fixtures/ledger-conflicting-allocator/probe
+          # Pin every shared dependency to the API lockfile; only the two
+          # path-only fixture packages are added to the seeded copy.
+          cp workers/api/Cargo.lock "$probe/Cargo.lock"
+          target="$RUNNER_TEMP/ledger-conflict-target"
+          build() {
+            cargo build --release --manifest-path "$probe/Cargo.toml" --target wasm32-unknown-unknown --target-dir "$target" "$@"
+          }
+          # Control: same graph without the conflicting dependency must build.
+          build
+          # Negative: the dependency's global allocator must fail the link.
+          set +e
+          build --features conflict 2>&1 | tee "$RUNNER_TEMP/ledger-conflict.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -Eq 'the `#\[global_allocator\]` in (conflicting_allocator_dep|nntune_api) conflicts with global allocator in: (nntune_api|conflicting_allocator_dep)' "$RUNNER_TEMP/ledger-conflict.log"
       - name: Exercise staging body adapter in a synthetic WASM stream runtime
         run: |
           set -euo pipefail
