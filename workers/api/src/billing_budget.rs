@@ -117,7 +117,10 @@ pub(crate) async fn test_budget() -> Result<(), &'static str> {
     let budget = BillingBudget {
         phase: Cell::new(Phase::Connect),
     };
-    if budget.connect(|| async { Err::<(), _>(StoreError) }).await.is_ok()
+    if budget
+        .connect(|| async { Err::<(), _>(StoreError) })
+        .await
+        .is_ok()
         || budget.connect(|| async { Ok(()) }).await.is_ok()
     {
         return Err("failed phase restarted");
