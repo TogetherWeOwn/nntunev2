@@ -1887,10 +1887,10 @@ jobs:
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
-      - name: Exercise empty owned socket guard in a separate test Worker
+      - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aFq 'owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:4|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi
