@@ -26,12 +26,24 @@ pub fn taste_delete_statement() -> &'static str {
     "WITH writer_fence AS MATERIALIZED (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE), deleted AS (DELETE FROM public.account_taste AS taste USING writer_fence WHERE taste.user_id = writer_fence.id AND taste.kind = $2 AND taste.target_id = $3 AND (NOT $4 OR taste.signal = 'love') RETURNING 1) SELECT EXISTS (SELECT 1 FROM deleted) FROM writer_fence"
 }
 
+/// Observation only: activation must recheck after acquiring the account fence.
+pub fn private_session_active_statement() -> &'static str {
+    "SELECT EXISTS (SELECT 1 FROM public.private_sessions WHERE user_id = $1 AND session_id = $2 AND expires_at > EXTRACT(EPOCH FROM statement_timestamp())) FROM public.users WHERE id = $1 AND deleting_at IS NULL AND char_length($2) BETWEEN 1 AND 128"
+}
+
 pub fn private_session_upsert_statement() -> &'static str {
     "INSERT INTO public.private_sessions (user_id, session_id, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id, session_id) DO UPDATE SET expires_at = EXCLUDED.expires_at"
 }
 
 pub fn private_session_delete_statement() -> &'static str {
     "DELETE FROM public.private_sessions WHERE user_id = $1 AND session_id = $2"
+}
+
+/// Bounded metered plays with identities bound to their ledger owner and track.
+/// Adapted from the history reader in PR #982; invalid identities are filtered
+/// before the limit so they cannot displace valid recent plays.
+pub fn history_list_statement() -> &'static str {
+    "SELECT idempotency_key, track_id, recorded_at, stream_seconds::bigint AS stream_seconds FROM public.stream_play_ledger AS ledger WHERE user_id = $1 AND bytes_served > 0 AND user_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND track_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND octet_length(user_id) <= 128 AND octet_length(track_id) <= 512 AND split_part(idempotency_key, ':', 4) COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND octet_length(split_part(idempotency_key, ':', 4)) <= 512 AND idempotency_key = 'play:' || user_id || ':' || track_id || ':' || split_part(idempotency_key, ':', 4) AND NOT EXISTS (SELECT 1 FROM public.private_plays AS private WHERE private.user_id = ledger.user_id AND private.play_key = ledger.idempotency_key) ORDER BY recorded_at DESC, idempotency_key COLLATE \"C\" DESC LIMIT 50"
 }
 
 /// A taste row as returned by a store; its fields are not validated here.
