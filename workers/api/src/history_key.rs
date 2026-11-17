@@ -20,10 +20,51 @@ pub fn play_id_from_key(idempotency_key: &str) -> Option<String> {
     }
 }
 
+/// Latest `marked_at` the database accepts (`private_plays` CHECK).
+pub const MAX_MARKED_AT: u64 = 253_402_300_799;
+
+/// Mirror of the DB boundary `marked_at >= 0 AND marked_at <= 253402300799`.
+pub fn valid_mark_time(marked_at: u64) -> bool {
+    marked_at <= MAX_MARKED_AT
+}
+
+/// Validate a canonical key against the server-provided owner and track.
+/// A valid binding alone is not evidence of a play or authority to issue one.
+/// Adapted from PR #982's preserved patch.
+pub fn matches_owner_track(key: &str, user: &str, track: &str) -> bool {
+    play_id_from_key(key)
+        .and_then(|play| crate::ledger::derive_play_idempotency_key(user, track, &play).ok())
+        .is_some_and(|expected| expected == key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::play_id_from_key;
+
     use crate::ledger::derive_play_idempotency_key;
+
+    #[test]
+    fn binding_requires_exact_owner_and_track() {
+        let key = "play:Alice:Track:Play";
+        assert!(super::matches_owner_track(key, "Alice", "Track"));
+        for (key, owner, track) in [
+            (key, "alice", "Track"),
+            (key, "Alice", "track"),
+            ("play:Bob:Track:Play", "Alice", "Track"),
+            ("play:Alice:Track:Play:extra", "Alice", "Track"),
+            ("play:Alice:Track:", "Alice", "Track"),
+        ] {
+            assert!(!super::matches_owner_track(key, owner, track));
+        }
+    }
+
+    #[test]
+    fn mark_time_matches_database_boundary() {
+        assert!(super::valid_mark_time(0));
+        assert!(super::valid_mark_time(253_402_300_799));
+        assert!(!super::valid_mark_time(253_402_300_800));
+        assert!(!super::valid_mark_time(u64::MAX));
+    }
 
     #[test]
     fn canonical_keys_preserve_opaque_play_id_and_maximum_lengths() {

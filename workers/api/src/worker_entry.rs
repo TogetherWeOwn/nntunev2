@@ -2621,6 +2621,54 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn mark_private_play(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+        marked_at: u64,
+    ) -> Result<(), StoreError> {
+        // Adapted from PR #982's preserved patch.
+        if !crate::history_key::matches_owner_track(key, user_id, track_id)
+            || !crate::history_key::valid_mark_time(marked_at)
+        {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                let rows = tx
+                    .query_typed(
+                        crate::preference_rows::private_play_mark_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&key, Type::TEXT),
+                            (&i64_of(marked_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-play-mark").await?;
+                tx.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn history_list(
         &self,
         user_id: &str,
