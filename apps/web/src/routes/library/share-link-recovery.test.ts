@@ -11,6 +11,7 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -55,7 +56,7 @@ function pageScript(search: string) {
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
-		resolveStreamUrl, resolveShareTarget, endTrackDrag,
+		resolveStreamUrl, resolveShareTarget, endTrackDrag, createPendingShareSeek,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
@@ -69,7 +70,7 @@ function pageScript(search: string) {
 			refresh, applyShareLink, resetShareAtAuthBoundary, selectTrack,
 			applyPendingShareSeek,
 			setAudio: (element) => { audioEl = element; },
-			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek, loadError })
+			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;

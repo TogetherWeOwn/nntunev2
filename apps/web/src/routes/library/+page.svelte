@@ -3,6 +3,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
+	import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -309,7 +310,7 @@
 		};
 		// Replays must also retire a deferred inbound-share seek on this source.
 		clearShareFeedback();
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		replaceQueue(result.queue);
 		const targetQueue = queue;
 		await tick();
@@ -366,12 +367,15 @@
 	// A link is consumed once per navigation, never replayed by Refresh or
 	// across an account boundary. Deferred seeks belong to one loaded source.
 	let handledShareSearch: string | null = null;
-	let pendingShareSeek: {
-		trackId: string;
-		streamUrl: string;
-		seconds: number;
-		appliedSeconds: number | null;
-	} | null = null;
+	const pendingShareSeek = createPendingShareSeek(
+		(element, target) => ({ isCurrent: () => {
+			const current = queueCurrentTrack(queue);
+			return shareAlive && element === audioEl && current?.id === target.trackId &&
+				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === audioEl &&
+				queueCurrentTrack(queue) === current;
+		} }),
+		(target) => restartSupersededSources.has(`${target.trackId}\n${target.streamUrl}`)
+	);
 	/**
 	 * Favorites export feedback. Exporting is read-only: the handlers only
 	 * snapshot `favoriteTracks` and write feedback here. The feedback is
@@ -466,7 +470,7 @@
 			if (state.loading || state.items.length === 0) {
 				clearShareFeedback();
 				clearFavoritesExportFeedback();
-				pendingShareSeek = null;
+				pendingShareSeek.clear();
 			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
@@ -642,7 +646,7 @@
 	function selectTrack(id: string, item = items.find((track) => track.id === id)): void {
 		if (!item) return;
 		clearShareFeedback();
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
 		replaceQueue(addTrack(queue, playableTrackFor(item)));
@@ -770,7 +774,7 @@
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			clearShareFeedback();
-			pendingShareSeek = null;
+			pendingShareSeek.clear();
 		}
 		resetRestartOnSourceChange(before, after);
 		queue = next;
@@ -810,7 +814,7 @@
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		queueShare.reset();
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
@@ -875,7 +879,7 @@
 		const search = window.location.search;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		shareInvalid = false;
 		const params = new URLSearchParams(search);
 		if (!params.has('track') && !params.has('t')) return;
@@ -902,36 +906,17 @@
 		if (!source) return;
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
-		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		const seekRevision = pendingShareSeek.set({ ...target, streamUrl: source });
 		// A same-source share skips the source-change reset; the share moves the
 		// position, so an earlier jump readout no longer describes it.
 		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
-		void tick().then(() => applyPendingShareSeek());
+		void tick().then(() => pendingShareSeek.apply(audioEl, seekRevision));
 	}
 
 	function applyPendingShareSeek(element = audioEl): void {
-		const pending = pendingShareSeek;
-		const current = queueCurrentTrack(queue);
-		if (!pending || !element || element !== audioEl || !shareAlive) return;
-		if (current?.id !== pending.trackId || resolveStreamUrl(current) !== pending.streamUrl) return;
-		// An explicit restart of this source supersedes the remembered
-		// share position: later metadata must not move it away from zero.
-		if (restartSupersededSources.has(`${pending.trackId}\n${pending.streamUrl}`)) {
-			pendingShareSeek = null;
-			return;
-		}
-		const knownDuration = Number.isFinite(element.duration) && element.duration >= 0;
-		const seconds = knownDuration ? Math.min(pending.seconds, element.duration) : pending.seconds;
-		try {
-			pending.appliedSeconds = seconds;
-			element.currentTime = seconds;
-			if (knownDuration) pendingShareSeek = null;
-		} catch {
-			// Some browsers require metadata first. Keep this source-fenced seek
-			// pending until its own metadata event, never play to force loading.
-		}
+		pendingShareSeek.apply(element);
 	}
 
 	function handleSeeking(event: Event): void {
@@ -948,12 +933,7 @@
 			lastJumpSeek = null;
 		}
 		// A listener's own seek wins over a pending late-duration adjustment.
-		if (
-			pendingShareSeek?.appliedSeconds != null &&
-			element.currentTime !== pendingShareSeek.appliedSeconds
-		) {
-			pendingShareSeek = null;
-		}
+		pendingShareSeek.observeSeeking(element);
 	}
 
 	// Media events re-evaluate restart availability from the live element.
@@ -1003,9 +983,7 @@
 		// The explicit gesture supersedes a pending share seek for this
 		// source even if the native write is refused: later metadata for
 		// the same source must never move the position to the share time.
-		if (pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === source) {
-			pendingShareSeek = null;
-		}
+		pendingShareSeek.supersede(current.id, source);
 		restartSupersededSources.add(`${current.id}\n${source}`);
 		// Native state can change after the last media event and before this click.
 		if (!restartIsAvailable(element)) {
@@ -1065,9 +1043,7 @@
 		const element = audioEl;
 		const current = queueCurrentTrack(queue);
 		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
-		if (live && pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === streamUrl) {
-			pendingShareSeek = null;
-		}
+		if (live) pendingShareSeek.supersede(current.id, streamUrl);
 		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
 		// A no-write outcome must not disown an earlier jump's queued event.
 		// handleSeeking still retires feedback at a different element or position.
@@ -1864,7 +1840,7 @@
 			if (audioEl && !audioEl.paused) audioEl.pause();
 			favoritesExport.destroy();
 			clearShareFeedback();
-			pendingShareSeek = null;
+			pendingShareSeek.clear();
 			restartSupersededSources.clear();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
