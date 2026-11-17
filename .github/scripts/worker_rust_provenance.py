@@ -344,5 +344,7 @@ if __name__ == "__main__":
         verify_rust_boundary()
     elif sys.argv[1:] == ["build-ledger"]:
         build_ledger()
+    elif sys.argv[1:] == ["verify-candidate-boundary"]:
+        sys.exit("candidate WASM boundary unproved: no admission certificate can be issued")
     else:
-        sys.exit("usage: worker_rust_provenance.py {rust|verify-rust|build-ledger}")
+        sys.exit("usage: worker_rust_provenance.py {rust|verify-rust|build-ledger|verify-candidate-boundary}")
