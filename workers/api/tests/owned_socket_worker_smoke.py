@@ -24,7 +24,7 @@ def main():
     routing.check(wasm.is_file() and shim.is_file(), "test Worker bundle missing")
     wrangler = routing.find_wrangler(None)
     wasm_bytes = wasm.read_bytes()
-    routing.check(b"owned-drive-ok:4" in wasm_bytes, "test entry marker missing from WASM")
+    routing.check(b"owned-drive-ok:5" in wasm_bytes, "test entry marker missing from WASM")
     print(f"test wasm sha256: {hashlib.sha256(wasm_bytes).hexdigest()}", flush=True)
     subprocess.run(["node", str(wrangler), "--version"], check=True, timeout=30)
     workerd = list((routing.ROOT / "apps/web/node_modules/.pnpm").glob("workerd@*/node_modules/workerd/bin/workerd"))
@@ -54,8 +54,8 @@ def main():
                     except OSError:
                         time.sleep(1)
                         continue
-                    routing.check(status == 200 and body == "owned-drive-ok:4", f"unexpected test response: {status} {body!r}")
-                    print("PASS: empty guard drop, total and phase precedence, co-poll/drop (empty registry), Worker timer", flush=True)
+                    routing.check(status == 200 and body == "owned-drive-ok:5", f"unexpected test response: {status} {body!r}")
+                    print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
             finally:

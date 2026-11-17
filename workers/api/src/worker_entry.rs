@@ -517,6 +517,51 @@ async fn query_playback_lease_row(
     }
 }
 
+/// Acquire on the caller's connection; refusal reads the incumbent on that same connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire_playback_lease_on(
+    client: &impl GenericClient,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    let rows = client
+        .query_typed(
+            crate::playback::playback_lease_acquire_statement(),
+            &[
+                (&user_id, Type::TEXT),
+                (&session_id, Type::TEXT),
+                (&track_id, Type::TEXT),
+                (&play_id, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&i64_of(now)?, Type::INT8),
+                (&takeover, Type::BOOL),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    match rows.first() {
+        Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
+            epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+        }),
+        // A vanished row (including a deletion-fence refusal) reads as retry-now.
+        None => {
+            let retry_after_secs = match query_playback_lease_row(client, user_id).await? {
+                Some(row) => row.retry_after_secs(now),
+                None => 0,
+            };
+            Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
+        }
+    }
+}
+
 /// Durable-slot budgets are bounded: a zero limit/window admits
 /// nothing, and the slot scan is capped at
 /// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
@@ -2669,6 +2714,35 @@ impl Store for PgStore {
         .await
     }
 
+    async fn private_play_marked(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+    ) -> Result<bool, StoreError> {
+        if !crate::history_key::matches_owner_track(key, user_id, track_id) {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_play_probe_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn history_list(
         &self,
         user_id: &str,
@@ -3668,41 +3742,10 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let rows = client
-                    .query_typed(
-                        crate::playback::playback_lease_acquire_statement(),
-                        &[
-                            (&user_id, Type::TEXT),
-                            (&session_id, Type::TEXT),
-                            (&track_id, Type::TEXT),
-                            (&play_id, Type::TEXT),
-                            (&i64_of(expires_at)?, Type::INT8),
-                            (&i64_of(now)?, Type::INT8),
-                            (&takeover, Type::BOOL),
-                        ],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                match rows.first() {
-                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
-                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
-                    }),
-                    // Zero rows: another session holds a live lease.
-                    // Read it (same connection, same budget) so the
-                    // 429 carries its real remaining TTL. A vanished
-                    // row (deleted mid-race) reads as retry-now.
-                    None => {
-                        let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
-                                Some(row) => row.retry_after_secs(now),
-                                None => 0,
-                            };
-                        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
-                    }
-                }
+                acquire_playback_lease_on(
+                    &client, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )

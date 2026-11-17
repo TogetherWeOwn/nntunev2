@@ -60,6 +60,7 @@ futures-timer = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-util = "0.3"
+tokio = { version = "1", features = ["io-util"] }
 worker = "0.9"
 
 [features]

@@ -214,8 +214,11 @@ pub async fn billing_owned_test_entry(
     if let Err(message) = billing_owned_socket::test_drive_owned() {
         return worker::Response::error(message, 500);
     }
+    if let Err(message) = billing_owned_socket::test_tracked_socket().await {
+        return worker::Response::error(message, 500);
+    }
     match billing_owned_socket::test_worker_timer().await {
-        Ok(()) => worker::Response::ok("owned-drive-ok:4"),
+        Ok(()) => worker::Response::ok("owned-drive-ok:5"),
         Err(message) => worker::Response::error(message, 500),
     }
 }

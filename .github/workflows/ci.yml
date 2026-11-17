@@ -723,7 +723,13 @@ jobs:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Check reservation fixture target admission offline
         run: bash workers/api/tests/test_storage_digest_target.sh
+      - name: Check scratch migration runner offline
+        run: bash workers/api/tests/test_migration_runner.sh
       - run: bash workers/api/tests/run_migration_tests.sh
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise hosted reservation race fixture
+        run: bash workers/api/tests/storage_digest_reservation_race.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Exercise exact staging schema SQL and verdict mutants on disposable PostgreSQL
@@ -1911,7 +1917,7 @@ jobs:
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:4|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi

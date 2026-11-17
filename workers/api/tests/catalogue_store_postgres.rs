@@ -257,6 +257,132 @@ async fn private_play_writer_serializes_with_account_deletion() {
 }
 
 #[tokio::test]
+async fn private_play_probe_is_owner_bound_and_fail_closed() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let db = &accounts.observer;
+    let result: Result<(), String> = async {
+        let key = format!("play:{owner}:Track:Play");
+        let other_key = format!("play:{other}:Track:Play");
+        let fresh = || async {
+            Ok::<_, String>(catalogue_store_for_postgres_test(
+                private_client().await?,
+                false,
+                Err(StoreError),
+                Rc::new(Cell::new(0)),
+            ))
+        };
+        if fresh()
+            .await?
+            .private_play_marked(&owner, "Track", &key)
+            .await
+            .map_err(|_| "probe")?
+        {
+            return Err("missing mark present".into());
+        }
+        db.execute(
+            "INSERT INTO public.private_plays (user_id, play_key, marked_at) VALUES ($1, $2, 11), ($3, $4, 33)",
+            &[&owner, &key, &other, &other_key],
+        ).await.map_err(|e| e.to_string())?;
+        if !fresh().await?.private_play_marked(&owner, "Track", &key).await.map_err(|_| "present probe")? {
+            return Err("seeded mark missing".into());
+        }
+        let missing = format!("{owner}-missing");
+        let missing_key = format!("play:{missing}:Track:Play");
+        for (id, track, candidate) in [
+            (&other, "Track", key.as_str()),
+            (&owner, "track", key.as_str()),
+            (&owner, "Track", "play:bad"),
+            (&missing, "Track", missing_key.as_str()),
+        ] {
+            if fresh()
+                .await?
+                .private_play_marked(id, track, candidate)
+                .await
+                .is_ok()
+            {
+                return Err("invalid binding accepted".into());
+            }
+        }
+        let lower = format!("play:{owner}:Track:play");
+        if fresh()
+            .await?
+            .private_play_marked(&owner, "Track", &lower)
+            .await
+            .map_err(|_| "case probe")?
+        {
+            return Err("case mismatch".into());
+        }
+        db.execute(
+            "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+            &[&owner],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if fresh()
+            .await?
+            .private_play_marked(&owner, "Track", &key)
+            .await
+            .is_ok()
+        {
+            return Err("deleting account accepted".into());
+        }
+        db.execute("DELETE FROM public.users WHERE id = $1", &[&owner])
+            .await
+            .map_err(|e| e.to_string())?;
+        if fresh()
+            .await?
+            .private_play_marked(&owner, "Track", &key)
+            .await
+            .is_ok()
+            || !fresh()
+                .await?
+                .private_play_marked(&other, "Track", &other_key)
+                .await
+                .map_err(|_| "survivor probe")?
+        {
+            return Err("cascade or survivor failed".into());
+        }
+        let count: i64 = db
+            .query_one(
+                "SELECT count(*) FROM public.private_plays WHERE user_id=$1",
+                &[&owner],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .get(0);
+        if count != 0 {
+            return Err("mark did not cascade".into());
+        }
+        let failed = private_client().await?;
+        failed
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = failed.batch_execute("SELECT 1/0").await;
+        let broken = catalogue_store_for_postgres_test(
+            failed,
+            false,
+            Err(StoreError),
+            Rc::new(Cell::new(0)),
+        );
+        if !matches!(
+            broken
+                .private_play_marked(&other, "Track", &other_key)
+                .await,
+            Err(StoreError)
+        ) {
+            return Err("failure not opaque".into());
+        }
+        Ok(())
+    }
+    .await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn private_session_active_observes_owner_and_server_time() {
     let accounts = disposable_accounts::Accounts::new(2).await;
     let owner = accounts.id(0).to_owned();
