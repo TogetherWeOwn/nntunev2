@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -30,6 +31,9 @@ def main():
     workerd = list((routing.ROOT / "apps/web/node_modules/.pnpm").glob("workerd@*/node_modules/workerd/bin/workerd"))
     routing.check(len(workerd) == 1, f"expected one workerd executable, got {len(workerd)}")
     subprocess.run([str(workerd[0]), "--version"], check=True, timeout=30)
+    settings = {"host": "127.0.0.1", "port": "5432", "user": "postgres",
+                "password": "ci-throwaway", "admin": "nntune_ci"}
+    print("PostgreSQL:", routing.psql(settings, "nntune_ci", "SHOW server_version", tuples=True), flush=True)
     with tempfile.TemporaryDirectory(prefix="owned-worker-smoke-") as directory:
         tmp = Path(directory)
         (tmp / "wrangler.toml").write_text(f'name = "owned-socket-test"\nmain = "{shim}"\ncompatibility_date = "2026-10-01"\n')
@@ -54,7 +58,20 @@ def main():
                     except OSError:
                         time.sleep(1)
                         continue
-                    routing.check(status == 200 and body == "owned-drive-ok:5", f"unexpected test response: {status} {body!r}")
+                    match = re.fullmatch(r"owned-drive-ok:5:([1-9][0-9]*):([1-9][0-9]*)", body)
+                    routing.check(status == 200 and match, f"unexpected test response: {status} {body!r}")
+                    pids = tuple(map(int, match.groups()))
+                    routing.check(pids[0] != pids[1], "expected two distinct database sessions")
+                    deadline = time.monotonic() + 10
+                    while True:
+                        remaining = routing.psql(settings, "nntune_ci", tuples=True, sql=(
+                            "SELECT count(*) FROM pg_stat_activity WHERE pid IN "
+                            f"({pids[0]}, {pids[1]}) AND application_name = 'owned_transport_test'"))
+                        if remaining == "0":
+                            break
+                        routing.check(time.monotonic() < deadline, "owned database sessions did not close")
+                        time.sleep(0.2)
+                    print("PASS: real Worker PostgreSQL sessions close after success and work deadline", flush=True)
                     print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break

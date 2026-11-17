@@ -220,8 +220,13 @@ pub async fn billing_owned_test_entry(
     if let Err(message) = worker_entry::billing_budget::test_budget().await {
         return worker::Response::error(message, 500);
     }
-    match billing_owned_socket::test_worker_timer().await {
-        Ok(()) => worker::Response::ok("owned-drive-ok:5"),
+    if let Err(message) = billing_owned_socket::test_worker_timer().await {
+        return worker::Response::error(message, 500);
+    }
+    match worker_entry::billing_budget::test_real_connection().await {
+        Ok((success, timeout)) => {
+            worker::Response::ok(format!("owned-drive-ok:5:{success}:{timeout}"))
+        }
         Err(message) => worker::Response::error(message, 500),
     }
 }

@@ -156,6 +156,63 @@ pub(super) async fn with_owned_connection<T: 'static>(
     .await
 }
 
+// The test Worker has no configurable destination; the hosted Actions harness
+// supplies the disposable service with these fixed loopback credentials.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
+    use std::rc::Rc;
+
+    const CONNECTION: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable application_name=owned_transport_test";
+    let success_pid = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(row.get::<_, i32>(0))
+            })
+        },
+    )
+    .await
+    .map_err(|_| "real connection failed")?;
+
+    let timeout_pid = Rc::new(Cell::new(0));
+    let started = Rc::new(Cell::new(0.0));
+    let observed = timeout_pid.clone();
+    let work_started = started.clone();
+    let result = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                observed.set(row.get::<_, i32>(0));
+                work_started.set(worker::js_sys::Date::now());
+                std::future::pending::<Result<(), StoreError>>().await
+            })
+        },
+    )
+    .await;
+    if result.is_ok()
+        || success_pid <= 0
+        || timeout_pid.get() <= 0
+        || worker::js_sys::Date::now() - started.get() < 8_000.0
+    {
+        return Err("real connection timeout did not occur after query start");
+    }
+    Ok((success_pid, timeout_pid.get()))
+}
+
 // Called only within a phase deadline, itself enclosed by the total deadline.
 async fn drive<T, E, D, F>(mut driver: Pin<&mut D>, operation: F) -> Result<T, StoreError>
 where
