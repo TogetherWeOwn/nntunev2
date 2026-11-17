@@ -37,6 +37,10 @@ SELECT pg_temp.expect_error(s, code) FROM (VALUES
     ($q$INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('20000000-0000-4000-8000-000000000099','00000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-000000000001',0,decode(repeat('ab',32),'hex'))$q$, '23514'),
     ($q$UPDATE public.storage_plaintext_digest_claim_intents SET plaintext_sha256 = plaintext_sha256$q$, '23514'),
     ($q$DELETE FROM public.storage_plaintext_digest_claim_intents$q$, '23514'),
-    ($q$TRUNCATE public.storage_plaintext_digest_claim_intents$q$, '23514')
+    ($q$TRUNCATE public.storage_digest_reservations$q$, '23514')
 ) AS cases(s, code);
+-- Isolate the claim guard: the referencing table must be included, but its
+-- own guard must not mask a missing claim-intent TRUNCATE trigger.
+ALTER TABLE public.storage_digest_reservations DISABLE TRIGGER storage_digest_reservations_no_delete;
+SELECT pg_temp.expect_error('TRUNCATE public.storage_plaintext_digest_claim_intents, public.storage_digest_reservations', '23514');
 ROLLBACK;

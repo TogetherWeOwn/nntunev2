@@ -721,6 +721,8 @@ jobs:
           fi
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Check reservation fixture target admission offline
+        run: bash workers/api/tests/test_storage_digest_target.sh
       - run: bash workers/api/tests/run_migration_tests.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
