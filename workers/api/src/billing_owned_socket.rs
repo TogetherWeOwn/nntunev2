@@ -131,19 +131,36 @@ pub(crate) fn test_drive_owned() -> Result<(), &'static str> {
         polled.set(true);
         Poll::Ready(Ok::<(), ()>(()))
     });
-    let mut task = Box::pin(drive_owned(guard, future::ready(()), future::ready(()),
-        future::ready(Ok::<(), ()>(())), operation));
-    if !matches!(task.as_mut().poll(&mut cx), Poll::Ready(Err(DriveError::Expired)))
-        || polled.get() || !registry.borrow().closed {
+    let mut task = Box::pin(drive_owned(
+        guard,
+        future::ready(()),
+        future::ready(()),
+        future::ready(Ok::<(), ()>(())),
+        operation,
+    ));
+    if !matches!(
+        task.as_mut().poll(&mut cx),
+        Poll::Ready(Err(DriveError::Expired))
+    ) || polled.get()
+        || !registry.borrow().closed
+    {
         return Err("total deadline did not win");
     }
 
     let guard = SocketGuard::default();
     let registry = guard.0.clone();
-    let mut task = Box::pin(drive_owned(guard, future::pending(), future::ready(()),
-        future::ready(Ok::<(), ()>(())), future::ready(Ok::<(), ()>(() ))));
-    if !matches!(task.as_mut().poll(&mut cx), Poll::Ready(Err(DriveError::PhaseExpired)))
-        || !registry.borrow().closed {
+    let mut task = Box::pin(drive_owned(
+        guard,
+        future::pending(),
+        future::ready(()),
+        future::ready(Ok::<(), ()>(())),
+        future::ready(Ok::<(), ()>(())),
+    ));
+    if !matches!(
+        task.as_mut().poll(&mut cx),
+        Poll::Ready(Err(DriveError::PhaseExpired))
+    ) || !registry.borrow().closed
+    {
         return Err("phase deadline did not win");
     }
 
@@ -151,10 +168,23 @@ pub(crate) fn test_drive_owned() -> Result<(), &'static str> {
     let registry = guard.0.clone();
     let driver_polled = Cell::new(false);
     let operation_polled = Cell::new(false);
-    let driver = poll_fn(|_| { driver_polled.set(true); Poll::Pending::<Result<(), ()>> });
-    let operation = poll_fn(|_| { operation_polled.set(driver_polled.get()); Poll::Pending::<Result<(), ()>> });
-    let mut task = Box::pin(drive_owned(guard, future::pending(), future::pending(), driver, operation));
-    if !task.as_mut().poll(&mut cx).is_pending() || !driver_polled.get() || !operation_polled.get() {
+    let driver = poll_fn(|_| {
+        driver_polled.set(true);
+        Poll::Pending::<Result<(), ()>>
+    });
+    let operation = poll_fn(|_| {
+        operation_polled.set(driver_polled.get());
+        Poll::Pending::<Result<(), ()>>
+    });
+    let mut task = Box::pin(drive_owned(
+        guard,
+        future::pending(),
+        future::pending(),
+        driver,
+        operation,
+    ));
+    if !task.as_mut().poll(&mut cx).is_pending() || !driver_polled.get() || !operation_polled.get()
+    {
         return Err("driver and operation were not co-polled in order");
     }
     drop(task);
@@ -172,6 +202,11 @@ pub(crate) async fn test_worker_timer() -> Result<(), &'static str> {
         std::future::pending(),
         std::future::pending::<Result<(), ()>>(),
         std::future::pending::<Result<(), ()>>(),
-    ).await;
-    if matches!(result, Err(DriveError::Expired)) { Ok(()) } else { Err("Worker timer did not expire") }
+    )
+    .await;
+    if matches!(result, Err(DriveError::Expired)) {
+        Ok(())
+    } else {
+        Err("Worker timer did not expire")
+    }
 }

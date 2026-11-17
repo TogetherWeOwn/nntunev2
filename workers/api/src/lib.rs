@@ -161,7 +161,10 @@ mod ledger_wasm_test {
 // whose database transport imports the Cloudflare-only sockets module.
 #[cfg(not(all(
     target_arch = "wasm32",
-    any(feature = "staging-body-wasm-test", feature = "billing-owned-wasm-test")
+    any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test"
+    )
 )))]
 #[worker::event(fetch)]
 pub async fn main(
