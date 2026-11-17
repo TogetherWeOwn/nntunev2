@@ -6,6 +6,7 @@ import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
+import { createQueueRevision } from '#lib/player/queueRevision.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -13,8 +14,8 @@ const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
 }) as Record<string, string>;
 
-// Exercise the real page handlers with mutable native getters. Lifecycle and
-// rendering are intentionally excluded here; the browser banks cover those.
+// Exercise the real page handlers and registered lifecycle with mutable native getters.
+// Rendering is covered by the browser banks.
 function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const source = sources['./+page.svelte'];
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
@@ -33,7 +34,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const seekState = parsed.statements.find((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((item) => item.name.getText(parsed) === 'pendingShareSeek'));
 	if (!seekState) throw new Error('Missing pending share transaction');
-	const handlers = [seekState, ...declarations].map((node) => node.getText(parsed)).join('\n');
+	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
+		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
+	if (!mount) throw new Error('Missing route mount');
+	const handlers = [seekState, ...declarations, mount].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -53,7 +57,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		},
 		getAttribute: (name: string) => name === 'src' ? track.streamUrl : null,
-		isConnected: true, ended: true, error: null,
+		isConnected: true, ended: true, paused: true, error: null,
 		volume: 0.6, muted: false, playbackRate: 1.25,
 		play: () => Promise.resolve()
 	};
@@ -69,7 +73,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		streamUrl: track.streamUrl,
+		createQueueRevision, streamUrl: track.streamUrl,
 		tick, window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -81,18 +85,29 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
-		let playEpoch = 0, endGeneration = 0, queueAnnouncementVersion = 0;
+		const queueRevision = createQueueRevision();
+		let endGeneration = 0, queueAnnouncementVersion = 0;
 		let repeat = 'off', playingElement = element;
+		let density, priorDocumentTitle = null, tabTitle = '';
+		let cleanup;
+		const onMount = (callback) => { cleanup = callback(); };
+		const readStoredDensity = () => 'comfortable', readStoredRepeat = () => 'off';
+		const handleAuthTransition = () => {}, recordFindQuery = () => {};
+		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
+		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
+		const endTrackDrag = () => {}, document = { title: '' };
+		const queueShare = { dispose() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
+		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		return {
 			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
-			move: moveQueuedTrack, clear: clearQueuedTracks,
+			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => handleSeeking({ currentTarget: target }), replaceQueue,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -103,6 +118,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		remove: (index: number) => void;
 		move: (from: number, to: number) => void;
 		clear: () => void;
+		cleanup: () => void;
 		trimPrevious: () => void;
 		trimUpcoming: () => void;
 		playQueued: (id: string) => Promise<void>;
@@ -285,6 +301,38 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
 });
 
+test('route cleanup fences an explicit play waiting for tick', async () => {
+	let resume!: () => void;
+	const { page, element } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
+	let plays = 0;
+	element.play = () => { plays += 1; return Promise.resolve(); };
+	const attempt = page.playQueued('coral');
+	page.cleanup();
+	const afterCleanup = page.read();
+	resume();
+	await attempt;
+	expect(plays).toBe(0);
+	expect(page.read().queueAnnouncement).toBe(afterCleanup.queueAnnouncement);
+	expect(page.read().queueAnnouncementVersion).toBe(afterCleanup.queueAnnouncementVersion);
+});
+
+test.each(['resolve', 'reject'] as const)('route cleanup fences deferred play %s', async (outcome) => {
+	const { page, element } = restartFixture();
+	let settle!: () => void;
+	element.play = () => new Promise<void>((resolve, reject) => {
+		settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
+	});
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	expect(settle).toBeTypeOf('function');
+	page.cleanup();
+	const afterCleanup = page.read();
+	settle();
+	await attempt;
+	expect(page.read().queueAnnouncement).toBe(afterCleanup.queueAnnouncement);
+	expect(page.read().queueAnnouncementVersion).toBe(afterCleanup.queueAnnouncementVersion);
+});
+
 test('an old share tick cannot apply a newer same-source share', async () => {
 	const resumes: Array<() => void> = [];
 	const { page, location, writes } = restartFixture(() => new Promise<void>((resolve) => { resumes.push(resolve); }));
@@ -331,6 +379,20 @@ test.each(['resolve', 'reject'] as const)('same-object replacement preserves def
 	expect(page.read().queueAnnouncement).toBe(outcome === 'resolve' ? 'Playing Coral Night.' : 'Selected Coral Night, paused: playback was blocked.');
 	expect(page.read().queueAnnouncementVersion).toBe(version + 1);
 	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+});
+
+test('same-source new-object replacement fences a deferred play rejection', async () => {
+	const { page, element } = restartFixture();
+	let rejectPlay!: (reason: Error) => void;
+	element.play = () => new Promise<void>((_resolve, reject) => { rejectPlay = reject; });
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	page.replaceQueue({ ...page.read().queue });
+	const afterEdit = page.read();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(page.read().queueAnnouncement).toBe(afterEdit.queueAnnouncement);
+	expect(page.read().queueAnnouncementVersion).toBe(afterEdit.queueAnnouncementVersion);
 });
 
 test('a jump readout clears on a same-source share and on a source change', async () => {
