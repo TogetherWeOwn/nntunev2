@@ -1675,6 +1675,14 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Resolve an owned or shared track, preferring an exact opaque job ID.
+    fn resolve_member_track(
+        &self,
+        _user_id: &str,
+        _target: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Catalogue slice-1 reads: the per-user ingest library plus
     /// the shared mirror collections. Read-only: implementations must not
     /// create users, ledger rows, or mirror entries. Owner scoping lives in
@@ -1920,6 +1928,58 @@ where
                 .collect();
             json_response(200, serde_json::json!({"items": items}))
         }
+        Err(_) => unavailable(),
+    }
+}
+
+// Prepared for direct testing only; preference routes remain unregistered.
+#[allow(dead_code)]
+async fn me_like_track<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{valid_target_id, TargetKind};
+    use crate::taste_signal::TasteSignal;
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !valid_target_id(target) {
+        return not_found();
+    }
+    let target = match ctx
+        .store
+        .resolve_member_track(&claims.user_id, target)
+        .await
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .taste_upsert(
+            &claims.user_id,
+            TargetKind::Track,
+            &target,
+            TasteSignal::Love,
+            None,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(row) => json_response(
+            200,
+            serde_json::json!({"target_id": target, "liked_at": row.created_at}),
+        ),
         Err(_) => unavailable(),
     }
 }
@@ -7506,6 +7566,7 @@ mod tests {
         taste_rows: RefCell<HashMap<(String, String, String), crate::preference_rows::TasteDbRow>>,
         fail_taste_read: RefCell<bool>,
         fail_taste_write: RefCell<bool>,
+        delete_before_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         private_sessions: RefCell<HashMap<(String, String), u64>>,
         fail_private_session_write: RefCell<bool>,
@@ -9185,6 +9246,9 @@ mod tests {
         ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
             use crate::taste_signal::TasteSignal;
             const MAX_TIME: u64 = 253_402_300_799;
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
             if *self.fail_taste_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -9351,6 +9415,34 @@ mod tests {
                         .as_deref()
                         .is_some_and(|id| id.eq_ignore_ascii_case(target)),
                 }))
+        }
+        async fn resolve_member_track(
+            &self,
+            user_id: &str,
+            target: &str,
+        ) -> Result<Option<String>, StoreError> {
+            if *self.fail_catalogue_reads.borrow() {
+                return Err(StoreError);
+            }
+            let rows = self.catalogue_library.borrow();
+            let members: Vec<_> = [user_id, ""]
+                .into_iter()
+                .filter_map(|key| rows.get(key))
+                .flatten()
+                .collect();
+            if members.iter().any(|row| row.job_id == target) {
+                return Ok(Some(target.to_owned()));
+            }
+            if crate::catalogue::is_catalogue_mbid(target)
+                && members.iter().any(|row| {
+                    row.recording_mbids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(target))
+                })
+            {
+                return Ok(Some(crate::target_identity::canonical_target_id(target)));
+            }
+            Ok(None)
         }
         async fn catalogue_library(
             &self,
@@ -14866,6 +14958,176 @@ mod tests {
         *h.store.fail_deleting_probe.borrow_mut() = true;
         assert_eq!(call(&req).body, unavailable().body);
         assert_eq!(call(&req).status, 503);
+    }
+
+    #[test]
+    fn unwired_like_write_checks_session_membership_and_fenced_replay() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mbid = "abcdefab-1234-1234-1234-abcdefabcdef";
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(mbid.into());
+        let uuid_job = "ABCDEFAB-5678-1234-1234-ABCDEFABCDEF";
+        let job_only = "ABCDEFAB-9999-1234-1234-ABCDEFABCDEF";
+        own.recording_mbids.push(uuid_job.to_ascii_lowercase());
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            vec![
+                own,
+                unmatched_library_row(uuid_job),
+                unmatched_library_row(job_only),
+            ],
+        );
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("bob".into(), vec![unmatched_library_row("Private")]);
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Shared")]);
+        let mut req = Request {
+            method: "PUT".into(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request, target: &str| block_on(me_like_track(&h.ctx(), req, target));
+        let first = call(&req, "Job_A");
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap(),
+            serde_json::json!({"target_id":"Job_A", "liked_at":NOW})
+        );
+        assert!(
+            first.set_cookie.is_none()
+                && first.retry_after.is_none()
+                && first.extra_headers.is_empty()
+        );
+        let mut later = h.ctx();
+        later.now += 100;
+        assert_eq!(
+            block_on(me_like_track(&later, &req, "Job_A")).body,
+            first.body
+        );
+        for (signal, until) in [(Hide, None), (Snooze, Some(NOW - 1))] {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, "Job_A", signal, until, NOW - 2),
+            )
+            .unwrap();
+            let result = block_on(me_like_track(&later, &req, "Job_A"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.body).unwrap()["liked_at"],
+                NOW + 100
+            );
+        }
+        let canonical = call(&req, &mbid.to_ascii_uppercase());
+        assert_eq!(canonical.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&canonical.body).unwrap()["target_id"],
+            mbid
+        );
+        let opaque = call(&req, uuid_job);
+        assert_eq!(opaque.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&opaque.body).unwrap()["target_id"],
+            uuid_job
+        );
+        assert!(h.store.taste_rows.borrow().contains_key(&(
+            "alice".into(),
+            "track".into(),
+            uuid_job.into()
+        )));
+        let recording = call(&req, &uuid_job.to_ascii_lowercase());
+        assert_eq!(recording.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recording.body).unwrap()["target_id"],
+            uuid_job.to_ascii_lowercase()
+        );
+        assert_eq!(call(&req, job_only).status, 200);
+        assert_eq!(call(&req, &job_only.to_ascii_lowercase()).status, 404);
+        assert_eq!(call(&req, "Shared").status, 200);
+        let missing = call(&req, "missing");
+        for target in [
+            "",
+            "bad/path",
+            "é",
+            "Private",
+            "job_a",
+            CAT_RELEASE,
+            &"a".repeat(513),
+        ] {
+            let response = call(&req, target);
+            assert_eq!(
+                (response.status, response.body),
+                (missing.status, missing.body.clone())
+            );
+        }
+        assert_eq!(missing.status, 404);
+        req.cookie = Some(bob.clone());
+        assert_eq!(call(&req, "Job_A").status, 404);
+        assert_eq!(call(&req, "Private").status, 200);
+        let bob_row = h
+            .store
+            .taste_rows
+            .borrow()
+            .get(&("bob".into(), "track".into(), "Private".into()))
+            .unwrap()
+            .clone();
+        req.cookie = Some(alice.clone());
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        for auth in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(auth.into());
+            assert_eq!(call(&req, "Job_A").status, 404);
+        }
+        req.authorization = None;
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(block_on(me_like_track(&expired, &req, "Job_A")).status, 401);
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_catalogue_reads.borrow_mut() = false;
+        *h.store.fail_taste_write.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_taste_write.borrow_mut() = false;
+        let before = h.store.taste_rows.borrow().clone();
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req, "Job_A");
+        assert_eq!(raced.status, 503);
+        assert_eq!(raced.body, unavailable().body);
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        let deleting = call(&req, "Job_A");
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        assert_eq!(
+            h.store
+                .taste_rows
+                .borrow()
+                .get(&("bob".into(), "track".into(), "Private".into()))
+                .unwrap(),
+            &bob_row
+        );
+        assert_eq!(bob_row.signal, Love.as_str());
     }
 
     #[test]

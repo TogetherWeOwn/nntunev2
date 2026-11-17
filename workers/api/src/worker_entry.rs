@@ -3187,6 +3187,31 @@ impl Store for PgStore {
         .await
     }
 
+    async fn resolve_member_track(
+        &self,
+        user_id: &str,
+        target: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::catalogue::resolve_member_track_statement(),
+                        &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
