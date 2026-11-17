@@ -280,6 +280,37 @@ mod postgres_tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    async fn bootstrap_overrides_session_isolation_and_commit_restores_limits() {
+        // Fixed disposable Actions service; never accept an arbitrary database URL.
+        let (mut client, connection) = tokio_postgres::connect(
+            "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable",
+            NoTls,
+        )
+        .await
+        .expect("connect disposable database");
+        let driver = tokio::spawn(connection);
+        client.batch_execute("SET default_transaction_isolation = 'repeatable read'; SET transaction_timeout = 30000; SET lock_timeout = 11000; SET statement_timeout = 12000; SET idle_in_transaction_session_timeout = 13000")
+            .await.unwrap();
+        let before = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let before: Vec<String> = (0..5).map(|i| before.get(i)).collect();
+        assert_eq!(before, ["repeatable read", "30s", "11s", "12s", "13s"]);
+
+        bootstrap_transaction(&mut client).await.expect("bootstrap");
+        let during = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let during: Vec<String> = (0..5).map(|i| during.get(i)).collect();
+        assert_eq!(during, ["read committed", "9s", "4s", "5s", "5s"]);
+        client.batch_execute("COMMIT").await.unwrap();
+        let after = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let after: Vec<String> = (0..5).map(|i| after.get(i)).collect();
+        assert_eq!(after, before);
+        drop(client);
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn bootstrap_sets_local_limits_and_rollback_restores_them() {
         // Fixed disposable Actions service; never accept an arbitrary database URL.
         let (mut client, connection) = tokio_postgres::connect(
