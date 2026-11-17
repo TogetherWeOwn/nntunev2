@@ -3,6 +3,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
+	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
@@ -68,8 +69,6 @@
 		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
-		formatQueueM3U,
-		formatQueueText,
 		keepCurrentAndUpcoming,
 		insertTracks,
 		insertTracksNext,
@@ -384,9 +383,25 @@
 	let favoritesExportStatus = $state('');
 	let favoritesExportFallback: string | null = $state(null);
 	let favoritesExportFeedbackKey: string | null = $state(null);
-	let favoritesExportGeneration = 0;
-	let favoritesExportAlive = true;
-	let favoritesDownloadUrl: string | null = null;
+	const favoritesExport = createFavoritesExport({
+		isEmpty: () => favoriteTracks.length === 0,
+		snapshot: favoritesExportSnapshot,
+		currentKey: currentFavoritesExportKey,
+		clearFeedback: () => {
+			favoritesExportStatus = '';
+			favoritesExportFallback = null;
+			favoritesExportFeedbackKey = null;
+		},
+		setFeedback: (key, status, fallback) => {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = status;
+			if (fallback !== undefined) favoritesExportFallback = fallback;
+		}
+	});
+	const clearFavoritesExportFeedback = favoritesExport.clear;
+	const releaseFavoritesDownload = favoritesExport.release;
+	const copyFavoritesText = favoritesExport.copy;
+	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
 	// Restart availability is live native state of the mounted matching
 	// element, re-evaluated on media events — never cached coordinates.
@@ -720,109 +735,6 @@
 		return favoritesExportSnapshot()
 			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
 			.join('\u0001');
-	}
-
-	function clearFavoritesExportFeedback(): void {
-		favoritesExportGeneration += 1;
-		favoritesExportStatus = '';
-		favoritesExportFallback = null;
-		favoritesExportFeedbackKey = null;
-	}
-
-	function releaseFavoritesDownload(): void {
-		if (favoritesDownloadUrl !== null) URL.revokeObjectURL(favoritesDownloadUrl);
-		favoritesDownloadUrl = null;
-	}
-
-	const FAVORITES_EXPORT_UNSAFE_ID =
-		'Could not export favorites: a favorite has an unsafe track id.';
-
-	async function copyFavoritesText(): Promise<void> {
-		clearFavoritesExportFeedback();
-		const generation = favoritesExportGeneration;
-		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
-		const snapshot = favoritesExportSnapshot();
-		const key = currentFavoritesExportKey();
-		let text: string;
-		try {
-			// formatQueueText never applies the shared id guard, so run the
-			// M3U formatter first (its output is discarded): an unsafe
-			// favorite id must refuse the copy before the clipboard is
-			// touched, for this action just as for the download.
-			formatQueueM3U(snapshot);
-			text = formatQueueText(snapshot);
-		} catch {
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
-			return;
-		}
-		try {
-			// Both the API getter and the write can fail. Neither is proof
-			// of a successful copy: expose selectable text instead.
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
-		} catch {
-			if (
-				!favoritesExportAlive ||
-				generation !== favoritesExportGeneration ||
-				currentFavoritesExportKey() !== key
-			) {
-				return;
-			}
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = 'Clipboard unavailable. Copy the favorites manually below.';
-			favoritesExportFallback = text;
-			return;
-		}
-		if (
-			!favoritesExportAlive ||
-			generation !== favoritesExportGeneration ||
-			currentFavoritesExportKey() !== key
-		) {
-			return;
-		}
-		favoritesExportFeedbackKey = key;
-		favoritesExportStatus = 'Copied favorites as text.';
-	}
-
-	function downloadFavoritesM3U(): void {
-		clearFavoritesExportFeedback();
-		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
-		const key = currentFavoritesExportKey();
-		let m3u: string;
-		try {
-			m3u = formatQueueM3U(favoritesExportSnapshot());
-		} catch {
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
-			return;
-		}
-		const link = document.createElement('a');
-		try {
-			// Retain at most one Blob URL until the next download or
-			// teardown, not an arbitrary timer while the browser may
-			// still be saving it.
-			releaseFavoritesDownload();
-			const blob = new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' });
-			favoritesDownloadUrl = URL.createObjectURL(blob);
-			link.href = favoritesDownloadUrl;
-			link.download = 'favorites.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			// The browser owns the save dialog: initiating it cannot
-			// prove that a file was saved to disk.
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus =
-				'Download started. Check your browser’s saved downloads for favorites.m3u.';
-		} catch {
-			releaseFavoritesDownload();
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus =
-				'Could not start the download. Try again or copy the favorites as text.';
-		} finally {
-			link.remove();
-		}
 	}
 
 	/**
@@ -1950,8 +1862,7 @@
 			endGeneration += 1;
 			playingElement = null;
 			if (audioEl && !audioEl.paused) audioEl.pause();
-			favoritesExportAlive = false;
-			releaseFavoritesDownload();
+			favoritesExport.destroy();
 			clearShareFeedback();
 			pendingShareSeek = null;
 			restartSupersededSources.clear();
