@@ -452,7 +452,7 @@ async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
         let error = restricted.query(nntune_api::preference_rows::private_session_active_statement(), &[&user, &"private"]).await.err().ok_or("privacy query unexpectedly allowed")?;
         if error.code() != Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) { return Err("unexpected privacy query fault".into()); }
         if acquire(restricted, &user, "private", "track", "query-error", now as u64, now as u64 + 45, true).await.is_ok() { return Err("query error accepted".into()); }
-        for (play, expiry) in [("mark-error", now as u64 + 45), ("lease-error", u64::MAX)] {
+        for (play, expiry) in [("mark-error", now as u64 + 45), ("lease-overflow", u64::MAX), ("lease-sql-error", 253_402_300_800)] {
             if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", play, now as u64, expiry, true).await.is_ok() { return Err(format!("{play} error accepted")); }
         }
         let row = db.query_one("SELECT session_id,play_id,epoch FROM public.playback_leases WHERE user_id=$1", &[&user]).await.map_err(|e| e.to_string())?;
