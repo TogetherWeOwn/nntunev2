@@ -762,6 +762,11 @@ jobs:
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test catalogue_store_postgres
+          bootstrap_test='worker_entry::billing_budget::postgres_tests::bootstrap_sets_local_limits_and_rollback_restores_them'
+          bootstrap_inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$bootstrap_test" -- --list)"
+          printf '%s\n' "$bootstrap_inventory"
+          printf '%s\n' "$bootstrap_inventory" | grep -Fx "$bootstrap_test: test"
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$bootstrap_test" -- --exact
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
           test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 23
