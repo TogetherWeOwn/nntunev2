@@ -14500,9 +14500,8 @@ mod tests {
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
         for mutation in [false, true] {
-            let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, mutation))
-                .ok()
-                .expect("valid session");
+            let (claims, _) =
+                block_on(preference_authenticate(&h.ctx(), &req, mutation)).expect("valid session");
             assert_eq!(claims.user_id, "alice");
         }
         req.cookie = Some(bob);
