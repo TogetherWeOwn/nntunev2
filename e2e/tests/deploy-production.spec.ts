@@ -436,7 +436,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
   // a stub npx first on PATH that replays fixture JSON (no network or install).
   // WRANGLER_VERSION is inherited as environment data, just as in Actions;
   // the exact checked-in script is executed without source substitutions.
-  async function runSeed(rawOutput: string, version = '4.153.0') {
+  async function runSeed(rawOutput: string, version = '4.159.0') {
     const bin = mkdtempSync(
       join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'seed-bin-'),
     );
@@ -503,7 +503,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     expect(script).toContain('"wrangler@${WRANGLER_VERSION:?}"');
     expect(script).not.toContain('${{');
     expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
-      'WRANGLER_VERSION: 4.153.0',
+      'WRANGLER_VERSION: 4.159.0',
     );
     // Pin the WORKER_NAME the seed step binds, the same way WRANGLER_VERSION
     // is pinned: the step must wire the production worker name, and the
@@ -537,7 +537,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     const args = result.argv.trim().split('\n');
     expect(args).toEqual([
       '--yes',
-      'wrangler@4.153.0',
+      'wrangler@4.159.0',
       'deployments',
       'list',
       '--env',

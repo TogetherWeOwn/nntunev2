@@ -136,6 +136,10 @@ mod logging_tests {
     }
 }
 
+// Test-only real-workerd span probe; absent unless `span-runtime-test` is on.
+#[cfg(all(target_arch = "wasm32", feature = "span-runtime-test"))]
+mod span_runtime_probe;
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
@@ -163,7 +167,8 @@ mod ledger_wasm_test {
     target_arch = "wasm32",
     any(
         feature = "staging-body-wasm-test",
-        feature = "billing-owned-wasm-test"
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
     )
 )))]
 #[worker::event(fetch)]
