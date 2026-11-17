@@ -32,7 +32,7 @@ spec.loader.exec_module(fixture)
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
 MANIFEST = ROOT / "migrations/manifest.toml"
-WRANGLER_VERSION = "4.159.0"
+WRANGLER_VERSION = "4.162.0"
 RP_ID = "example.test"
 ORIGIN = f"https://{RP_ID}"
 IDENT = re.compile(r"[A-Za-z0-9_]+")
