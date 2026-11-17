@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Runs only against the migration harness's disposable database.
+# Only the GitHub-hosted migration job's ephemeral service is supported.
 set -euo pipefail
-: "${DATABASE_URL:?scratch database required}"
+if [[ $# != 0 || ${GITHUB_ACTIONS:-} != true || ${RUNNER_ENVIRONMENT:-} != github-hosted || ${DATABASE_URL:-} != 'postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci' ]]; then
+  printf 'disposable GitHub-hosted migration database required\n' >&2; exit 1
+fi
+# Ignore inherited libpq configuration, including service files and host overrides.
 dir="$(mktemp -d)"
 trap 'jobs -pr | xargs -r kill; wait || :; rm -rf -- "$dir"' EXIT
-psql_run() { PGOPTIONS='-c search_path=public,pg_catalog -c statement_timeout=30000' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+psql_run() { env -i PATH="$PATH" PGAPPNAME="${PGAPPNAME:-}" PGOPTIONS='-c search_path=public,pg_catalog -c statement_timeout=30000' psql 'postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci?hostaddr=127.0.0.1' -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 psql_run <<'SQL'
 INSERT INTO public.storage_environments VALUES
