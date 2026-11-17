@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -15,9 +16,43 @@ routing = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(routing)
 
 
+def wait_for_sessions(settings, pids, *, clock=time.monotonic, sleep=time.sleep, observer=routing.psql):
+    deadline = clock() + 10
+    while True:
+        budget = deadline - clock()
+        routing.check(budget > 0, "owned database sessions did not close")
+        remaining = observer(settings, "nntune_ci", tuples=True, timeout=budget, sql=(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid IN "
+            f"({pids[0]}, {pids[1]}) AND application_name = 'owned_transport_test'"))
+        budget = deadline - clock()
+        routing.check(budget > 0, "owned database sessions did not close")
+        if remaining == "0":
+            return
+        sleep(min(0.2, budget))
+
+
+def check_observation_deadline():
+    def exercise(finish, should_pass):
+        ticks = iter((0, 0, finish))
+        def observer(*args, timeout, **kwargs):
+            routing.check(timeout == 10, "observer timeout did not use remaining budget")
+            return "0"
+        try:
+            wait_for_sessions({}, (1, 2), clock=lambda: next(ticks), observer=observer)
+        except routing.Failure as err:
+            if should_pass or str(err) != "owned database sessions did not close":
+                raise
+        else:
+            routing.check(should_pass, "late zero result was accepted")
+    exercise(9, True)
+    exercise(12, False)
+    print("PASS: observation deadline rejects a late zero result", flush=True)
+
+
 def main():
     routing.check(os.environ.get("GITHUB_ACTIONS") == "true" and
                   os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", "hosted Actions only")
+    check_observation_deadline()
     bundle = Path(os.environ["OWNED_TEST_BUNDLE"]).resolve()
     wasm = bundle / "index_bg.wasm"
     shim = bundle / "worker/shim.mjs"
@@ -30,6 +65,9 @@ def main():
     workerd = list((routing.ROOT / "apps/web/node_modules/.pnpm").glob("workerd@*/node_modules/workerd/bin/workerd"))
     routing.check(len(workerd) == 1, f"expected one workerd executable, got {len(workerd)}")
     subprocess.run([str(workerd[0]), "--version"], check=True, timeout=30)
+    settings = {"host": "127.0.0.1", "port": "5432", "user": "postgres",
+                "password": "ci-throwaway", "admin": "nntune_ci"}
+    print("PostgreSQL:", routing.psql(settings, "nntune_ci", "SHOW server_version", tuples=True), flush=True)
     with tempfile.TemporaryDirectory(prefix="owned-worker-smoke-") as directory:
         tmp = Path(directory)
         (tmp / "wrangler.toml").write_text(f'name = "owned-socket-test"\nmain = "{shim}"\ncompatibility_date = "2026-10-01"\n')
@@ -54,7 +92,12 @@ def main():
                     except OSError:
                         time.sleep(1)
                         continue
-                    routing.check(status == 200 and body == "owned-drive-ok:5", f"unexpected test response: {status} {body!r}")
+                    match = re.fullmatch(r"owned-drive-ok:5:([1-9][0-9]*):([1-9][0-9]*)", body)
+                    routing.check(status == 200 and match, f"unexpected test response: {status} {body!r}")
+                    pids = tuple(map(int, match.groups()))
+                    routing.check(pids[0] != pids[1], "expected two distinct database sessions")
+                    wait_for_sessions(settings, pids)
+                    print("PASS: real Worker PostgreSQL sessions close after success and work deadline", flush=True)
                     print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break

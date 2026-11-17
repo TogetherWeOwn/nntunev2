@@ -128,6 +128,7 @@ pub(super) async fn with_owned_connection<T: 'static>(
     work: impl for<'a> FnOnce(
         &'a mut tokio_postgres::Client,
     ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+    #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(),
 ) -> Result<T, StoreError> {
     use crate::billing_owned_socket::SocketGuard;
 
@@ -149,11 +150,76 @@ pub(super) async fn with_owned_connection<T: 'static>(
         budget
             .bootstrap_driven(connection.as_mut(), || bootstrap(&mut client))
             .await?;
-        budget
+        let result = budget
             .work_driven(connection.as_mut(), || work(&mut client))
-            .await
+            .await;
+        #[cfg(feature = "billing-owned-wasm-test")]
+        work_finished();
+        result
     })
     .await
+}
+
+// The test Worker has no configurable destination; the hosted Actions harness
+// supplies the disposable service with these fixed loopback credentials.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
+    use std::rc::Rc;
+
+    const CONNECTION: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable application_name=owned_transport_test";
+    let success_pid = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(row.get::<_, i32>(0))
+            })
+        },
+        || {},
+    )
+    .await
+    .map_err(|_| "real connection failed")?;
+
+    let timeout_pid = Rc::new(Cell::new(0));
+    let started = Rc::new(Cell::new(0.0));
+    let phase_finished = Rc::new(Cell::new(false));
+    let observed = timeout_pid.clone();
+    let work_started = started.clone();
+    let phase_observed = phase_finished.clone();
+    let result = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| {
+            Box::pin(async move {
+                work_started.set(worker::js_sys::Date::now());
+                let row = client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                observed.set(row.get::<_, i32>(0));
+                std::future::pending::<Result<(), StoreError>>().await
+            })
+        },
+        move || phase_observed.set(true),
+    )
+    .await;
+    if result.is_ok()
+        || success_pid <= 0
+        || timeout_pid.get() <= 0
+        || !phase_finished.get()
+        || worker::js_sys::Date::now() - started.get() < 8_000.0
+    {
+        return Err("real connection work phase did not expire after starting");
+    }
+    Ok((success_pid, timeout_pid.get()))
 }
 
 // Called only within a phase deadline, itself enclosed by the total deadline.
