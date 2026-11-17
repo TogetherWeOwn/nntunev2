@@ -83,6 +83,26 @@ jobs:
           set -euo pipefail
           python3 -E -s trusted/.github/scripts/staging_apply.py readback --data-root data --file "$MIGRATION_FILE" --expected-sha "$EXPECTED_SHA" --expect-database nntunev2_staging
 
+      - name: Audit complete staging ledger
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          DATA_REVISION: ${{ inputs.ref }}
+          TRUSTED_REVISION: ${{ github.sha }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+          AUDIT_RECEIPT: ledger-audit-receipt.json
+        run: |
+          set -euo pipefail
+          python3 -E -s trusted/.github/scripts/staging_apply.py audit --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --expected-sha "$EXPECTED_SHA" --expect-database nntunev2_staging
+
+      - name: Upload sanitized audit receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-ledger-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ledger-audit-receipt.json
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Upload sanitized readback receipt
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

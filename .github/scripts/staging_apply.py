@@ -278,6 +278,120 @@ def run_evidence(data_root, migration_file, applied_files, apply_outcome,
             "apply succeeded but no recorded row exists for: " + ", ".join(missing))
 
 
+def validate_ledger_audit(entries, rows, cutoff):
+    """Validate a complete app ledger against the pinned manifest prefix.
+
+    The caller must obtain rows from one read-only snapshot. A successful
+    comparison proves neither allocation nor writer exclusion.
+    """
+    if not FILE_RE.fullmatch(cutoff):
+        raise StagingApplyError("invalid ledger audit cutoff")
+    app = [entry for entry in entries if entry.get("target") == "app"]
+    names = [entry["file"] for entry in app]
+    if names.count(cutoff) != 1:
+        raise StagingApplyError("ledger audit cutoff is not an app migration")
+    expected = app[:names.index(cutoff) + 1]
+    accepted = {}
+    for index, entry in enumerate(expected):
+        for name in entry_names(entry):
+            if name in accepted:
+                raise StagingApplyError("ambiguous ledger manifest")
+            accepted[name] = (index, entry["sha256"])
+    if not isinstance(rows, list) or len(rows) > 4096:
+        raise StagingApplyError("invalid ledger audit evidence")
+    seen = set()
+    records = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 4:
+            raise StagingApplyError("invalid ledger audit evidence")
+        filename, digest, applied_at, applied_by = row
+        if (not isinstance(filename, str) or len(filename) > 255
+                or not FILE_RE.fullmatch(filename)
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(applied_at, str) or not 1 <= len(applied_at) <= 64
+                or not re.fullmatch(r"[0-9 :.+TZ-]+", applied_at)
+                or not isinstance(applied_by, str) or not 1 <= len(applied_by) <= 200
+                or not re.fullmatch(r"[A-Za-z0-9_.@+ -]+", applied_by)):
+            raise StagingApplyError("invalid ledger audit evidence")
+        identity = accepted.get(filename)
+        if identity is None or identity[1] != digest or identity[0] in seen:
+            raise StagingApplyError("ledger audit does not match manifest")
+        seen.add(identity[0])
+        records.append(dict(zip(("file", "sha256", "applied_at", "applied_by"), row)))
+    if len(seen) != len(expected):
+        raise StagingApplyError("ledger audit does not match manifest")
+    return records
+
+
+AUDIT_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT json_build_object('database', current_database(), 'rows', COALESCE(
+  (SELECT json_agg(json_build_array(
+     CASE WHEN length(file) <= 255 THEN file ELSE NULL END,
+     CASE WHEN length(sha256) <= 64 THEN sha256 ELSE NULL END,
+     CASE WHEN length(applied_at::text) <= 64 THEN applied_at::text ELSE NULL END,
+     CASE WHEN length(applied_by) <= 200 THEN applied_by ELSE NULL END))
+   FROM (SELECT file, sha256, applied_at, applied_by
+         FROM public.schema_migrations LIMIT 4097) AS ledger), '[]'::json));
+COMMIT;
+"""
+
+
+def run_ledger_audit(trusted_root, data_root, filename, expected_sha, expected_database, environ=None):
+    """Read a complete, bounded snapshot; never assert a writer window."""
+    source = _env(environ)
+    if (expected_database != "nntunev2_staging" or not FILE_RE.fullmatch(filename)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)):
+        raise StagingApplyError("invalid ledger audit scope")
+    entries = load_entries(data_root)
+    app = [entry for entry in entries if entry["target"] == "app"]
+    names = [entry["file"] for entry in app]
+    if names.count(filename) != 1 or app[names.index(filename)]["sha256"] != expected_sha:
+        raise StagingApplyError("ledger audit manifest identity mismatch")
+    prefix = app[:names.index(filename) + 1]
+    trusted_app = [entry for entry in load_entries(trusted_root) if entry["target"] == "app"]
+    if trusted_app[:len(prefix)] != prefix:
+        raise StagingApplyError("ledger audit trusted manifest mismatch")
+    for entry in prefix:
+        path = Path(data_root) / "migrations" / entry["file"]
+        if path.is_symlink() or not path.is_file():
+            raise StagingApplyError("ledger audit migration bytes mismatch")
+        with path.open("rb") as handle:
+            content = handle.read(migration_history.MAX_BLOB + 1)
+        if len(content) > migration_history.MAX_BLOB or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            raise StagingApplyError("ledger audit migration bytes mismatch")
+    for key, pattern in (("TRUSTED_REVISION", r"[0-9a-f]{40}"),
+                         ("DATA_REVISION", r"[0-9a-f]{40}"),
+                         ("GITHUB_RUN_ID", r"[0-9]{1,20}"),
+                         ("GITHUB_RUN_ATTEMPT", r"[0-9]{1,10}"),
+                         ("GITHUB_JOB", r"[A-Za-z0-9_-]{1,100}")):
+        if not re.fullmatch(pattern, source.get(key, "")):
+            raise StagingApplyError("invalid ledger audit provenance")
+    child = evidence_child_env(source.get(SECRET_ENV, ""), expected_database)
+    result = subprocess.run(
+        ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
+         "--no-align", "--set", "ON_ERROR_STOP=1"],
+        input=AUDIT_SQL, text=True, capture_output=True, timeout=60, env=child)
+    if result.returncode != 0 or len(result.stdout) > 2_000_000:
+        raise StagingApplyError("ledger audit read failed; details redacted")
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise StagingApplyError("invalid ledger audit evidence") from exc
+    if not isinstance(payload, dict) or set(payload) != {"database", "rows"} or payload["database"] != expected_database:
+        raise StagingApplyError("ledger audit target mismatch")
+    records = validate_ledger_audit(entries, payload["rows"], filename)
+    receipt = {"kind": "staging-ledger-audit", "database": expected_database,
+               "trusted_revision": source["TRUSTED_REVISION"], "data_revision": source["DATA_REVISION"],
+               "run_id": source["GITHUB_RUN_ID"], "run_attempt": source["GITHUB_RUN_ATTEMPT"],
+               "job": source["GITHUB_JOB"], "cutoff": filename, "rows": records,
+               "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    text = json.dumps(receipt, ensure_ascii=True, indent=2) + "\n"
+    Path(source["AUDIT_RECEIPT"]).write_text(text)
+    with open(source["GITHUB_STEP_SUMMARY"], "a") as handle:
+        handle.write("### Staging ledger audit (not allocation or writer-window evidence)\n\n```json\n")
+        handle.write(text + "```\n")
+
+
 def run_readback(data_root, filename, expected_sha, expected_database, environ=None):
     """Observe one exact ledger row; this path never invokes the migrator."""
     source = _env(environ)
@@ -314,7 +428,7 @@ def run_readback(data_root, filename, expected_sha, expected_database, environ=N
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("phase", choices=("apply", "evidence", "readback"))
+    parser.add_argument("phase", choices=("apply", "evidence", "readback", "audit"))
     parser.add_argument("--expected-sha", default="")
     parser.add_argument("--trusted-root", default="trusted")
     parser.add_argument("--data-root", default="data")
@@ -332,13 +446,16 @@ def main(argv=None):
         elif args.phase == "evidence":
             run_evidence(args.data_root, args.file, args.applied_files,
                          args.apply_outcome, args.expect_database)
-        else:
+        elif args.phase == "readback":
             run_readback(args.data_root, args.file, args.expected_sha, args.expect_database)
+        else:
+            run_ledger_audit(args.trusted_root, args.data_root, args.file,
+                             args.expected_sha, args.expect_database)
     except StagingApplyError as exc:
         print(f"migrations-staging-apply: {exc}", file=sys.stderr)
         return 1
     except Exception:
-        if args.phase != "readback":
+        if args.phase not in ("readback", "audit"):
             raise
         print("migrations-staging-apply: readback failed; details redacted", file=sys.stderr)
         return 1

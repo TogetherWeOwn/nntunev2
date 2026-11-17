@@ -66,6 +66,60 @@ class StagingApplyTests(unittest.TestCase):
             "import sys\nsys.exit(0)\n")
         return data, trusted, root
 
+    def test_ledger_audit_reads_one_snapshot_and_redacts_failures(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, trusted, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        (trusted / "migrations").mkdir()
+        (trusted / "migrations/manifest.toml").write_text(manifest_text().replace(APP_SHA, sha))
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), "AUDIT_RECEIPT": str(root / "audit"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
+        row = ["0054_first.sql", sha, "2026-11-17 04:00:00+00", "migrator"]
+        from unittest.mock import patch
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "rows": [row]}))
+        with patch.object(staging_apply.subprocess, "run", return_value=response) as runner:
+            staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("REPEATABLE READ READ ONLY", runner.call_args.kwargs["input"])
+        self.assertNotIn("secretpw", (root / "audit").read_text())
+        response.stdout = json.dumps({"database": "production", "rows": [row]})
+        with patch.object(staging_apply.subprocess, "run", return_value=response):
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        (trusted / "migrations/manifest.toml").write_text(renamed_manifest_text())
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+            runner.assert_not_called()
+
+    def test_ledger_audit_requires_complete_unique_app_prefix(self):
+        data, _, _ = self._roots(manifest_text())
+        entries = staging_apply.load_entries(data)
+        first = ["0054_first.sql", APP_SHA, "2026-11-17 04:00:00+00", "migrator"]
+        second = ["0055_second.sql", APP_SHA, "2026-11-17 04:01:00+00", "migrator"]
+        validate = staging_apply.validate_ledger_audit
+        self.assertEqual(len(validate(entries, [first, second], "0055_second.sql")), 2)
+        for rows in ([second], [first, first, second],
+                     [first, [second[0], "f" * 64, *second[2:]]],
+                     [first, second, ["0056_other.sql", APP_SHA, *first[2:]]],
+                     [first, [*second[:3], "bad\nactor"]]):
+            with self.subTest(rows=rows), self.assertRaises(staging_apply.StagingApplyError):
+                validate(entries, rows, "0055_second.sql")
+        with self.assertRaises(staging_apply.StagingApplyError):
+            validate(entries, [first], "0001_mb_mirror.sql")
+
+    def test_ledger_audit_accepts_exact_historical_alias_once(self):
+        data, _, _ = self._roots(renamed_manifest_text())
+        entries = staging_apply.load_entries(data)
+        old = ["0054_original.sql", APP_SHA, "2026-11-17 04:00:00+00", "migrator"]
+        new = ["0054_renamed.sql", APP_SHA, *old[2:]]
+        self.assertEqual(staging_apply.validate_ledger_audit(entries, [old], "0054_renamed.sql")[0]["file"], old[0])
+        with self.assertRaises(staging_apply.StagingApplyError):
+            staging_apply.validate_ledger_audit(entries, [old, new], "0054_renamed.sql")
+
     def test_readback_observes_exact_row_without_apply(self):
         contents = b"SELECT 1;\n"
         sha = hashlib.sha256(contents).hexdigest()
