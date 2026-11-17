@@ -20,10 +20,33 @@ pub fn play_id_from_key(idempotency_key: &str) -> Option<String> {
     }
 }
 
+/// Validate a canonical key against the server-provided owner and track.
+/// A valid binding alone is not evidence of a play or authority to issue one.
+pub fn matches_owner_track(key: &str, user: &str, track: &str) -> bool {
+    play_id_from_key(key)
+        .and_then(|play| crate::ledger::derive_play_idempotency_key(user, track, &play).ok())
+        .is_some_and(|expected| expected == key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::play_id_from_key;
     use crate::ledger::derive_play_idempotency_key;
+
+    #[test]
+    fn binding_requires_exact_owner_and_track() {
+        let key = "play:Alice:Track:Play";
+        assert!(super::matches_owner_track(key, "Alice", "Track"));
+        for (key, owner, track) in [
+            (key, "alice", "Track"),
+            (key, "Alice", "track"),
+            ("play:Bob:Track:Play", "Alice", "Track"),
+            ("play:Alice:Track:Play:extra", "Alice", "Track"),
+            ("play:Alice:Track:", "Alice", "Track"),
+        ] {
+            assert!(!super::matches_owner_track(key, owner, track));
+        }
+    }
 
     #[test]
     fn canonical_keys_preserve_opaque_play_id_and_maximum_lengths() {

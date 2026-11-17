@@ -2621,6 +2621,35 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn private_play_marked(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+    ) -> Result<bool, StoreError> {
+        if !crate::history_key::matches_owner_track(key, user_id, track_id) {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_play_probe_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn history_list(
         &self,
         user_id: &str,
