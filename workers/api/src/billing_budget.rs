@@ -114,6 +114,48 @@ impl BillingBudget {
     }
 }
 
+/// Inactive owned transport preparation. Callbacks must not spawn work or let
+/// database handles escape; transaction setup and outcome handling remain the
+/// responsibility of the future billing operation.
+#[cfg(target_arch = "wasm32")]
+pub(super) async fn with_owned_connection<T: 'static>(
+    host: &str,
+    port: u16,
+    connection_string: &str,
+    bootstrap: impl for<'a> FnOnce(
+        &'a mut tokio_postgres::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + 'a>>,
+    work: impl for<'a> FnOnce(
+        &'a mut tokio_postgres::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+) -> Result<T, StoreError> {
+    use crate::billing_owned_socket::SocketGuard;
+
+    BillingBudget::run(|budget| async move {
+        let guard = SocketGuard::default();
+        let (mut client, connection) = budget
+            .connect(|| async {
+                let socket = guard.open(host, port).map_err(|_| StoreError)?;
+                socket.opened().await.map_err(|_| StoreError)?;
+                let config: tokio_postgres::Config =
+                    connection_string.parse().map_err(|_| StoreError)?;
+                config
+                    .connect_raw(socket, guard.tls())
+                    .await
+                    .map_err(|_| StoreError)
+            })
+            .await?;
+        let mut connection = std::pin::pin!(connection);
+        budget
+            .bootstrap_driven(connection.as_mut(), || bootstrap(&mut client))
+            .await?;
+        budget
+            .work_driven(connection.as_mut(), || work(&mut client))
+            .await
+    })
+    .await
+}
+
 // Called only within a phase deadline, itself enclosed by the total deadline.
 async fn drive<T, E, D, F>(mut driver: Pin<&mut D>, operation: F) -> Result<T, StoreError>
 where

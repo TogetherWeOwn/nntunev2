@@ -84,6 +84,16 @@ pub(crate) struct TrackedSocket {
     owner: Rc<RefCell<Registry>>,
 }
 
+impl TrackedSocket {
+    pub(crate) async fn opened(&self) -> Result<(), io::Error> {
+        self.socket
+            .opened()
+            .await
+            .map(|_| ())
+            .map_err(|_| io::Error::other("socket open failed"))
+    }
+}
+
 impl AsyncRead for TrackedSocket {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -217,6 +227,29 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
     drop(task);
     if count(&fixture, "originalCloses") != 1.0 || count(&fixture, "observedRejections") != 1.0 {
         return Err("dropped future did not close its tracked socket");
+    }
+
+    // Exercise a real Worker timer cancelling an owned future. The handle is
+    // still synthetic; this does not establish network teardown or TLS trust.
+    let fixture = socket_fixture();
+    let owner = SocketGuard::default();
+    let socket = tracked(&owner, &fixture);
+    let result = drive_owned(
+        owner,
+        worker::Delay::from(std::time::Duration::from_millis(20)),
+        std::future::pending(),
+        std::future::pending::<Result<(), ()>>(),
+        async move {
+            let _socket = socket;
+            std::future::pending::<Result<(), ()>>().await
+        },
+    )
+    .await;
+    if !matches!(result, Err(DriveError::Expired))
+        || count(&fixture, "originalCloses") != 1.0
+        || count(&fixture, "observedRejections") != 1.0
+    {
+        return Err("Worker timer did not close the owned synthetic socket");
     }
 
     let fixture = socket_fixture();
