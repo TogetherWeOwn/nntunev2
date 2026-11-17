@@ -67,9 +67,16 @@ coalescing; a debug assertion by itself is not an independent proof. In
 particular, the linker-provided initial heap path (`wasm.rs` lines 17–31,
 88–96) donates the difference between linker symbols without rounding the
 length, while `init_top` (`dlmalloc.rs` lines 725–735) does not round its
-size. The required eight-byte alignment of those symbols for the candidate has
-not been established. Until that branch is proved or excluded, the alignment
-invariant and this charge remain provisional.
+size. For the initial segment, `sys_alloc` subtracts `top_foot_size` before
+`init_top`; that footprint is a multiple of eight. `init_top` aligns the chunk's
+user pointer, which is eight bytes past the chunk address on wasm32, so its
+resulting top address is also eight-aligned. Its end is `__heap_end` minus the
+footprint. Consequently, eight-byte alignment of `__heap_end` is sufficient for
+the initial top size to be a multiple of eight; alignment of `__heap_base`
+alone is neither necessary nor sufficient for that conclusion. The candidate's
+`__heap_end` alignment has not been established, nor have all later segment
+and coalescing invariants. Until those branches are proved or excluded, the
+alignment invariant and this charge remain provisional.
 The small-bin exact/next-bin path
 (lines 278–291) returns a chunk
 of `nb` or `nb + 8`; a larger small bin is split to `nb`. Both tree-bin
@@ -97,15 +104,18 @@ dependency. The synthetic `ledger-wasm-test` artifact explicitly selects
 `System`; Rust's duplicate-global-allocator diagnostic is intended to reject
 another active Rust declaration in its linked graph. That guard is not in the
 ordinary Worker build, does not cover direct allocator calls or custom arenas,
-and a dependency-level negative build case still needs to pass in Actions.
+and a dependency-level conflicting-allocator fixture passed in the Worker
+release job for the fixture change. That result does not certify a later candidate.
 Reliance on allocator symbol names in the final bundle requires proof that the
 build preserves those names; stripped names cannot prove absence.
-The existing build log checks do not verify the resulting WASM bytes. The current
-compiler check trusts `rustc -vV` and `cargo -vV` output; it does not authenticate
-the executable bytes or their host libraries. A substituted executable could
-report the pinned version and still compile different code. Candidate provenance
-must cover the actual compiler and build inputs as well as the output, under an
-explicit trusted build environment. No artifact identity is claimed here.
+The synthetic ledger CI build checks installed host components against the pinned
+channel archives and invokes the verified Cargo and compiler paths with a fresh
+output directory, then logs the resulting WASM digest. This is not a build
+certificate: extra loader inputs and changes between checking and use remain
+unaddressed, and the digest alone does not bind all build inputs to those bytes.
+Candidate provenance must cover the actual compiler and build inputs as well as
+the output, under an explicit trusted build environment. No candidate artifact
+identity is claimed here.
 
 Dispatch clones, response Value trees, rendering, database collection, and
 platform buffers require their own accounting. This inventory alone does not

@@ -144,6 +144,22 @@ def host_component_files(pins: dict, manifest_bytes: bytes, archives: dict) -> d
     return files
 
 
+def download_host_component_files(pins: dict, dl=download) -> dict:
+    """Fetch host components using only the authenticated channel manifest."""
+    rust = pins["rust"]
+    channel = rust["channel-manifest"]
+    manifest_bytes = verified(dl(channel["url"], 5_000_000), channel["sha256"])
+    manifest = tomllib.loads(manifest_bytes.decode())
+    archives = {}
+    for name in ("rustc", "cargo", "rust-std"):
+        package = manifest["pkg"][name]
+        if package["git_commit_hash"] != rust["commit"]:
+            raise ValueError(f"channel manifest {name} commit disagrees with pin")
+        target = package["target"][rust["host"]]
+        archives[name] = dl(target["xz_url"], 200_000_000)
+    return host_component_files(pins, manifest_bytes, archives)
+
+
 def verify_host_component_files(sysroot: Path, expected: dict) -> None:
     """Compare installed host files to archive digests, without following links.
 
@@ -217,7 +233,7 @@ def verify_rust_source(pins: dict, dl=download) -> bytes:
 
 
 def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_files: dict | None = None,
-                         root: Path = ROOT) -> None:
+                         root: Path = ROOT, executables: tuple[Path, Path] | None = None) -> None:
     """Fail closed unless the active toolchain is exactly the pinned tuple.
 
     Installed wasm std is compared to the pinned archive (or injected test digests)."""
@@ -229,14 +245,17 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_fi
     def out(*cmd):
         return run(list(cmd), check=True, capture_output=True, text=True, cwd=ROOT, env=env).stdout
 
-    rustc = parse_vv(out("rustc", "-vV"))
-    cargo = parse_vv(out("cargo", "-vV"))
+    rustc_bin, cargo_bin = (str(p) for p in executables) if executables else ("rustc", "cargo")
+    rustc = parse_vv(out(rustc_bin, "-vV"))
+    cargo = parse_vv(out(cargo_bin, "-vV"))
     if (rustc.get("release") != rust["version"] or rustc.get("commit-hash") != rust["commit"]
             or rustc.get("host") != rust["host"]):
         raise ValueError("active rustc is not the pinned release, commit and host")
     if cargo.get("host") != rust["host"] or cargo.get("commit-hash") != rust["cargo-commit"]:
         raise ValueError("active cargo is not the pinned cargo")
-    sysroot = Path(out("rustc", "--print", "sysroot").strip())
+    sysroot = Path(out(rustc_bin, "--print", "sysroot").strip())
+    if executables and sysroot != executables[0].parent.parent:
+        raise ValueError("compiler reports a different sysroot")
     if not sysroot.is_absolute() or sysroot.name != f"{rust['version']}-{rust['host']}":
         raise ValueError("active sysroot is not the pinned absolute toolchain")
     libdir = sysroot / "lib/rustlib" / rust["target"] / "lib"
@@ -276,10 +295,39 @@ def install_rust(env=os.environ, dl=download, run=subprocess.run) -> None:
     print(f"verified rust {rust['version']} {rust['commit']} {rust['host']} + {rust['target']}", flush=True)
 
 
-def verify_rust_boundary() -> None:
+def verify_rust_boundary(env=os.environ, dl=download, run=subprocess.run) -> tuple[Path, Path]:
     pins = load_pins()
+    rust = pins["rust"]
     check_lock_identity(pins)
-    verify_rust_toolchain(pins)
+    rust_env_refusals(env, rust["version"])
+    cargo_config_refusals(env)
+    home = Path(env.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    rustup_home = Path(env.get("RUSTUP_HOME") or home / ".rustup")
+    if not rustup_home.is_absolute():
+        raise ValueError("RUSTUP_HOME must be absolute")
+    sysroot = rustup_home / "toolchains" / f"{rust['version']}-{rust['host']}"
+    executables = verified_host_executables(sysroot, download_host_component_files(pins, dl))
+    verify_rust_toolchain(pins, env, run, executables=executables)
+    return executables
+
+
+def build_ledger(env=os.environ, dl=download, run=subprocess.run) -> None:
+    """Build the synthetic ledger with the just-verified compiler paths.
+
+    This is not a build certificate: loader inputs and check-to-use races remain.
+    """
+    require_actions(env)
+    temp = Path(env["RUNNER_TEMP"])
+    if not temp.is_absolute():
+        raise ValueError("RUNNER_TEMP must be absolute")
+    if os.path.lexists(temp / "ledger-target"):
+        raise ValueError("ledger target directory must not already exist")
+    rustc, cargo = verify_rust_boundary(env, dl, run)
+    run([str(cargo), "build", "--locked", "--release", "--manifest-path", "workers/api/Cargo.toml",
+         "--target", "wasm32-unknown-unknown", "--features", "staging-body-wasm-test,ledger-wasm-test",
+         "--target-dir", str(temp / "ledger-target")], check=True, cwd=ROOT, env={**env, "RUSTC": str(rustc)})
+    artifact = temp / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+    print(f"synthetic ledger wasm sha256 {hashlib.sha256(artifact.read_bytes()).hexdigest()}", flush=True)
 
 
 if __name__ == "__main__":
@@ -287,5 +335,7 @@ if __name__ == "__main__":
         install_rust()
     elif sys.argv[1:] == ["verify-rust"]:
         verify_rust_boundary()
+    elif sys.argv[1:] == ["build-ledger"]:
+        build_ledger()
     else:
-        sys.exit("usage: worker_rust_provenance.py {rust|verify-rust}")
+        sys.exit("usage: worker_rust_provenance.py {rust|verify-rust|build-ledger}")
