@@ -250,6 +250,37 @@ test('a reentrant subscription cannot publish an older operation hint', () => {
 	unsubscribe();
 });
 
+test('reentrant replacement suppresses the superseded removal announcement', () => {
+	const { page } = restartFixture();
+	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);
+	const version = page.read().queueAnnouncementVersion;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) page.replaceQueue(pine);
+	});
+	page.remove(0);
+	expect(page.read().queue).toBe(pine);
+	expect(page.read().queueAnnouncement).toBe('');
+	expect(page.read().queueAnnouncementVersion).toBe(version);
+	unsubscribe();
+});
+
+test('reentrant replacement prevents the superseded play attempt', async () => {
+	const { page, element } = restartFixture();
+	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);
+	let plays = 0;
+	element.play = () => { plays += 1; return Promise.resolve(); };
+	const original = page.read().queue;
+	const unsubscribe = page.subscribe((value) => {
+		if (value !== original && value !== pine) page.replaceQueue(pine);
+	});
+	await page.playQueued('coral');
+	expect(page.read().queue).toBe(pine);
+	expect(plays).toBe(0);
+	expect(page.read().queueAnnouncement).toBe('');
+	expect(page.read().queueAnnouncementVersion).toBe(0);
+	unsubscribe();
+});
+
 test.each(['move', 'remove', 'clear', 'select', 'trimPrevious', 'trimUpcoming'] as const)(
 	'%s publishes its real caller policy', (mode) => {
 		const { page, media, location, track } = restartFixture();

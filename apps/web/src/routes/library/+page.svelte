@@ -312,7 +312,7 @@
 		// Replays must also retire a deferred inbound-share seek on this source.
 		clearShareFeedback();
 		pendingShareSeek.clear();
-		replaceQueue(result.queue);
+		if (!replaceQueue(result.queue)) return;
 		const targetQueue = queue;
 		await tick();
 		const target = audioEl;
@@ -664,7 +664,7 @@
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)));
+		if (!replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)))) return;
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
 	}
 
@@ -692,7 +692,7 @@
 		// hydrates only its selected slot, preserving every other queued row.
 		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
 		base.tracks[index] = { ...target, streamUrl: source };
-		replaceQueue(selectQueueIndex(base, index));
+		if (!replaceQueue(selectQueueIndex(base, index))) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
 		await playSelectedTrack(target, source, counts);
 	}
@@ -754,7 +754,7 @@
 		}
 	}
 
-	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): void {
+	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): boolean {
 		const receipt = queueController.begin(next, kind);
 		const before = queueCurrentTrack(queueController.snapshot);
 		const after = queueCurrentTrack(next);
@@ -762,19 +762,20 @@
 			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
 			if (kind === 'replace') clearShareFeedback();
 			pendingShareSeek.clear();
-			if (!queueController.isCurrentOperation(receipt)) return;
+			if (!queueController.isCurrentOperation(receipt)) return false;
 		}
 		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
 			resetRestartOnSourceChange(before, after);
 		}
 		queueController.publish(next, receipt);
-		if (!queueController.isCurrentOperation(receipt)) return;
+		if (!queueController.isCurrentOperation(receipt)) return false;
 		if (kind === 'replace') queueAnnouncement = '';
 		syncMiniPlayerHint(next);
+		return queueController.isCurrentOperation(receipt);
 	}
 
-	function replaceQueue(next: QueueState): void {
-		commitQueue(next, 'replace');
+	function replaceQueue(next: QueueState): boolean {
+		return commitQueue(next, 'replace');
 	}
 
 	/** Mirror the current selection into the metadata-only mobile hint. */
@@ -889,9 +890,9 @@
 		// A newly consumed navigation must not inherit consent for the old arrangement.
 		queueConfirmGeneration += 1;
 		selectTrack(target.trackId);
-		replaceQueue(
+		if (!replaceQueue(
 			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))
-		);
+		)) return;
 		const source = resolveStreamUrl(queueCurrentTrack(queue));
 		if (!source) return;
 		// This navigation is a new gesture, not the seek that restart superseded.
@@ -1056,7 +1057,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
-		commitQueue(reordered, 'move');
+		if (!commitQueue(reordered, 'move')) return;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
@@ -1068,7 +1069,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
-		commitQueue(next, 'remove');
+		if (!commitQueue(next, 'remove')) return;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
 	}
@@ -1078,7 +1079,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
-		commitQueue(next, 'clear');
+		if (!commitQueue(next, 'clear')) return;
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1097,7 +1098,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
-		commitQueue(selected, 'select');
+		if (!commitQueue(selected, 'select')) return;
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
 	}
@@ -1111,7 +1112,7 @@
 		const source = resolveStreamUrl(target) || playableTrackFor(item).streamUrl;
 		const tracks = [...queue.tracks];
 		tracks[index] = { ...target, streamUrl: source };
-		replaceQueue(selectQueueIndex({ ...queue, tracks }, index));
+		if (!replaceQueue(selectQueueIndex({ ...queue, tracks }, index))) return;
 		await playSelectedTrack(target, source);
 	}
 
@@ -1122,7 +1123,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		commitQueue(trimmed, 'trim');
+		if (!commitQueue(trimmed, 'trim')) return;
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -1132,7 +1133,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		commitQueue(trimmed, 'trim');
+		if (!commitQueue(trimmed, 'trim')) return;
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
@@ -1479,7 +1480,7 @@
 
 	function appendSelectedIds(): void {
 		const result = appendSelection(queue, selectedIds, items);
-		replaceQueue(result.queue);
+		if (!replaceQueue(result.queue)) return;
 		appendFeedback = appendResultLabel(result.added, result.skipped);
 	}
 
@@ -1527,7 +1528,7 @@
 		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
 		const tracks = [...base.tracks];
 		tracks[index] = { ...target, streamUrl: source };
-		replaceQueue(selectQueueIndex({ ...base, tracks }, index));
+		if (!replaceQueue(selectQueueIndex({ ...base, tracks }, index))) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
 		await playSelectedTrack(target, source, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
@@ -1536,7 +1537,7 @@
 		const surviving = availableInteractionIds(ids, false, source);
 		if (!surviving.length) return;
 		const result = appendSelection(queue, surviving, source);
-		replaceQueue(result.queue);
+		if (!replaceQueue(result.queue)) return;
 		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
 	}
 
@@ -1572,7 +1573,7 @@
 		if (!surviving.length) return;
 		const next = insertTracksNext(queue, knownTracks(surviving, source));
 		if (next === queue) return;
-		replaceQueue(next);
+		if (!replaceQueue(next)) return;
 		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
 	}
 
@@ -1582,7 +1583,7 @@
 		const next = insertTracks(queue, knownTracks(ids, source), beforeId);
 		if (next === queue) return;
 		const added = next.tracks.length - queue.tracks.length;
-		replaceQueue(next);
+		if (!replaceQueue(next)) return;
 		queueAnnouncement = added ? `Added ${added} to the queue.` : 'Queue order updated.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1595,7 +1596,7 @@
 		});
 		const next = insertTracks(queue, tracks, beforeId);
 		if (next === queue) return;
-		replaceQueue(next);
+		if (!replaceQueue(next)) return;
 		queueAnnouncement = 'Queue order updated.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1609,7 +1610,7 @@
 		}
 		if (next === queue) return;
 		const removed = queue.tracks.length - next.tracks.length;
-		replaceQueue(next);
+		if (!replaceQueue(next)) return;
 		queueAnnouncement = `${removed} selected ${removed === 1 ? 'track removed' : 'tracks removed'} from queue.`;
 		queueAnnouncementVersion += 1;
 	}
