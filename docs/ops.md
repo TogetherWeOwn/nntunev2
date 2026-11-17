@@ -430,6 +430,15 @@ observation is not the original apply receipt and does not by itself satisfy the
 successful-apply merge evidence requirement above. The route does not authorize
 its own dispatch or any staging access.
 
+The optional `audit` mode instead compares the complete app ledger snapshot
+against the pinned manifest through the selected cutoff, rejecting missing,
+conflicting or later entries. Its sanitized `staging-ledger-audit-<run>-<attempt>`
+artifact is an observation, not an allocation reservation, an apply receipt or
+proof of an exclusive writer window. The default `readback` mode remains a
+single-row observation. Neither mode establishes admission expiry, writer drain,
+unknown-outcome reconciliation or crash-safe zero-idle restoration; these
+remain prerequisites for an authorized staging window, not claims of this route.
+
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
 90-second statement/idle-in-transaction and 10-second lock timeouts.
