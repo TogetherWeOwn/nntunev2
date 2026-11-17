@@ -9,10 +9,11 @@ psql_run() { PGOPTIONS='-c search_path=public,pg_catalog -c statement_timeout=30
 psql_run <<'SQL'
 INSERT INTO public.storage_environments VALUES
  ('01000000-0000-4000-8000-000000000001'), ('01000000-0000-4000-8000-000000000002');
+INSERT INTO public.users (id, email, created_at) VALUES ('digest-test-owner', 'digest-test@example.com', 1700000000);
 INSERT INTO public.storage_library_namespaces VALUES
  ('11000000-0000-4000-8000-000000000001','01000000-0000-4000-8000-000000000001',NULL),
  ('11000000-0000-4000-8000-000000000002','01000000-0000-4000-8000-000000000002',NULL),
- ('11000000-0000-4000-8000-000000000003','01000000-0000-4000-8000-000000000001',NULL);
+ ('11000000-0000-4000-8000-000000000003','01000000-0000-4000-8000-000000000001','digest-test-owner');
 INSERT INTO public.storage_object_intents
 SELECT ('21000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,
        ('31000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,
