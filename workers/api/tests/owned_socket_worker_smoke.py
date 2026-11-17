@@ -9,21 +9,35 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("routing", Path(__file__).with_name("worker_routing_postgres_smoke.py"))
-routing = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(routing)
+spec = importlib.util.spec_from_file_location("relay", Path(__file__).with_name("pg_commit_relay.py"))
+relay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(relay)
+routing = relay.load("worker_routing_postgres_smoke")
+BILLING_DB = relay.BILLING_DB
+
+
+def parse_pids(status, body, marker, count):
+    match = re.fullmatch(re.escape(marker) + r"(:[1-9][0-9]*)" * count, body)
+    routing.check(status == 200 and match, f"unexpected test response: {status} {body[:300]!r}")
+    pids = tuple(int(pid[1:]) for pid in match.groups())
+    routing.check(len(set(pids)) == count, "expected distinct database sessions")
+    return pids
 
 
 def wait_for_sessions(settings, pids, *, clock=time.monotonic, sleep=time.sleep, observer=routing.psql):
+    # Like the native contention checks, this observer is not a participant.
+    ids = ",".join(str(int(pid)) for pid in pids)
     deadline = clock() + 10
     while True:
         budget = deadline - clock()
         routing.check(budget > 0, "owned database sessions did not close")
-        remaining = observer(settings, "nntune_ci", tuples=True, timeout=budget, sql=(
-            "SELECT count(*) FROM pg_stat_activity WHERE pid IN "
-            f"({pids[0]}, {pids[1]}) AND application_name = 'owned_transport_test'"))
+        remaining = observer(settings, settings.get("admin", "nntune_ci"), tuples=True, timeout=budget, sql=(
+            f"SELECT (SELECT count(*) FROM pg_stat_activity WHERE pid IN ({ids})) + "
+            f"(SELECT count(*) FROM pg_locks WHERE pid IN ({ids}))"))
         budget = deadline - clock()
         routing.check(budget > 0, "owned database sessions did not close")
         if remaining == "0":
@@ -47,6 +61,30 @@ def check_observation_deadline():
     exercise(9, True)
     exercise(12, False)
     print("PASS: observation deadline rejects a late zero result", flush=True)
+
+
+@contextmanager
+def billing_database(settings):
+    admin = partial(routing.psql, settings, settings["admin"], timeout=10)
+    observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
+    admin(f"CREATE DATABASE {BILLING_DB}")
+    try:
+        for name in routing.app_migrations():
+            observe(stdin=(routing.ROOT / "migrations" / name).read_text())
+        yield observe
+    finally:
+        admin(f"DROP DATABASE {BILLING_DB}")
+
+
+def check_billing_ack(base, settings, observe):
+    with relay.commit_relay() as ack:
+        status, _, body = routing.http("POST", base + "/billing-ack-proof")
+        pids = parse_pids(status, body, "billing-ack-ok", 1)
+        ack.result(timeout=2)
+    wait_for_sessions(settings, pids)
+    actual = observe("SELECT id FROM users ORDER BY id", tuples=True)
+    routing.check(actual.splitlines() == ["withheld"], f"unexpected durable rows: {actual!r}")
+    print("PASS: withheld COMMIT; durable row and closed backend", flush=True)
 
 
 def main():
@@ -92,15 +130,14 @@ def main():
                     except OSError:
                         time.sleep(1)
                         continue
-                    match = re.fullmatch(r"owned-drive-ok:5:([1-9][0-9]*):([1-9][0-9]*)", body)
-                    routing.check(status == 200 and match, f"unexpected test response: {status} {body!r}")
-                    pids = tuple(map(int, match.groups()))
-                    routing.check(pids[0] != pids[1], "expected two distinct database sessions")
+                    pids = parse_pids(status, body, "owned-drive-ok:5", 2)
                     wait_for_sessions(settings, pids)
                     print("PASS: real Worker PostgreSQL sessions close after success and work deadline", flush=True)
                     print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
+                with billing_database(settings) as observe:
+                    check_billing_ack(f"http://127.0.0.1:{port}", settings, observe)
             finally:
                 routing.process_group.shutdown_process_group(proc)
     return 0
@@ -109,6 +146,7 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (routing.Failure, OSError, subprocess.SubprocessError, KeyError) as err:
+    except (routing.Failure, relay.ProtocolError, relay.barrier.BarrierError,
+            OSError, subprocess.SubprocessError, KeyError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         sys.exit(1)

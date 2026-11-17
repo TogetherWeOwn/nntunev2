@@ -274,6 +274,41 @@ pub(crate) async fn test_transaction_bootstrap() -> Result<(), &'static str> {
     ).await.map_err(|_| "Worker transaction bootstrap failed")
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) const BILLING_FIXTURE: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=billing_ack_test";
+
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_commit_ack() -> Result<i32, &'static str> {
+    let prepared_pid = std::rc::Rc::new(Cell::new(0));
+    let observed = prepared_pid.clone();
+    let result = with_owned_connection(
+        "127.0.0.1",
+        15432,
+        BILLING_FIXTURE,
+        |client| Box::pin(bootstrap_transaction(client)),
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "INSERT INTO users (id,email,created_at) VALUES ('withheld','withheld',0) RETURNING pg_backend_pid()",
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                prepared_pid.set(row.get::<_, i32>(0));
+                client.batch_execute("COMMIT").await.map_err(|_| StoreError)
+            })
+        },
+        || {},
+    )
+    .await;
+    let pid = observed.get();
+    if pid <= 0 || result.is_ok() {
+        return Err("withheld COMMIT did not fail after a successful insert");
+    }
+    Ok(pid)
+}
+
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
 mod postgres_tests {
     use super::bootstrap_transaction;
