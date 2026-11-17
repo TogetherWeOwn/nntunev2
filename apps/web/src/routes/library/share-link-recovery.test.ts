@@ -12,7 +12,7 @@ import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
-import { createQueueRevision } from '#lib/player/queueRevision.js';
+import { createQueueController } from '#lib/player/queueController.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -37,12 +37,15 @@ function pageScript(search: string) {
 		if (ts.isImportDeclaration(statement)) return false;
 		if (!ts.isVariableStatement(statement)) return true;
 		return !statement.declarationList.declarations.some((declaration) => {
+			if (declaration.name.getText(parsed) === 'queue') return false;
 			const value = declaration.initializer;
 			return value && ts.isCallExpression(value) &&
 				(value.expression.getText(parsed) === '$derived' ||
 				 value.expression.getText(parsed) === '$derived.by');
 		});
-	}).map((statement) => statement.getText(parsed)).join('\n');
+	}).map((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+		(declaration) => declaration.name.getText(parsed) === 'queue'
+	) ? 'let queue; queueController.subscribe((value) => { queue = value; });' : statement.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -50,7 +53,7 @@ function pageScript(search: string) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createQueueRevision,
+		createQueueShare, createQueueController,
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,

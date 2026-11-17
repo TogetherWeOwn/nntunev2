@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { createQueueRevision } from '#lib/player/queueRevision.js';
+	import { createQueueController } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
@@ -165,7 +165,8 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	let queue: QueueState = $state(createQueue([]));
+	const queueController = createQueueController(createQueue([]));
+	const queue = $derived($queueController);
 	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
@@ -240,7 +241,7 @@
 	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
-	const queueRevision = createQueueRevision();
+	const queueRevision = queueController;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -754,18 +755,20 @@
 	}
 
 	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): void {
-		if (kind !== 'replace' || next !== queue) queueRevision.revoke();
-		const before = queueCurrentTrack(queue);
+		const receipt = queueController.begin(next, kind);
+		const before = queueCurrentTrack(queueController.snapshot);
 		const after = queueCurrentTrack(next);
 		if ((kind === 'replace' || kind === 'select') &&
 			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
 			if (kind === 'replace') clearShareFeedback();
 			pendingShareSeek.clear();
+			if (!queueController.isCurrentOperation(receipt)) return;
 		}
 		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
 			resetRestartOnSourceChange(before, after);
 		}
-		queue = next;
+		queueController.publish(next, receipt);
+		if (!queueController.isCurrentOperation(receipt)) return;
 		if (kind === 'replace') queueAnnouncement = '';
 		syncMiniPlayerHint(next);
 	}
