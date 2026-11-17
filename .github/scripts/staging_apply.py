@@ -208,7 +208,7 @@ def evidence_child_env(raw, expected_database):
         "PGCONNECT_TIMEOUT": "10",
         "PGOPTIONS": ("-c default_transaction_read_only=on "
                       "-c statement_timeout=30000 -c lock_timeout=10000 "
-                      "-c search_path=public,pg_catalog"),
+                      "-c search_path=pg_catalog"),
     }
 
 
@@ -311,7 +311,7 @@ def validate_ledger_audit(entries, rows, cutoff):
                 or not isinstance(applied_at, str) or not 1 <= len(applied_at) <= 64
                 or not re.fullmatch(r"[0-9 :.+TZ-]+", applied_at)
                 or not isinstance(applied_by, str) or not 1 <= len(applied_by) <= 200
-                or not re.fullmatch(r"[A-Za-z0-9_.@+ -]+", applied_by)):
+                or not re.fullmatch(r"[A-Za-z0-9_.@+ ()-]+", applied_by)):
             raise StagingApplyError("invalid ledger audit evidence")
         identity = accepted.get(filename)
         if identity is None or identity[1] != digest or identity[0] in seen:

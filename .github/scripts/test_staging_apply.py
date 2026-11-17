@@ -84,6 +84,8 @@ class StagingApplyTests(unittest.TestCase):
             staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
         self.assertEqual(runner.call_count, 1)
         self.assertIn("REPEATABLE READ READ ONLY", runner.call_args.kwargs["input"])
+        self.assertIn("-c search_path=pg_catalog", runner.call_args.kwargs["env"]["PGOPTIONS"])
+        self.assertNotIn("public", runner.call_args.kwargs["env"]["PGOPTIONS"])
         self.assertNotIn("secretpw", (root / "audit").read_text())
         response.stdout = json.dumps({"database": "production", "rows": [row]})
         with patch.object(staging_apply.subprocess, "run", return_value=response):
@@ -102,6 +104,8 @@ class StagingApplyTests(unittest.TestCase):
         second = ["0055_second.sql", APP_SHA, "2026-11-17 04:01:00+00", "migrator"]
         validate = staging_apply.validate_ledger_audit
         self.assertEqual(len(validate(entries, [first, second], "0055_second.sql")), 2)
+        historical = [*first[:3], "backfill-2026-11-03 (operator-verified)"]
+        self.assertEqual(validate(entries, [historical, second], "0055_second.sql")[0]["applied_by"], historical[3])
         for rows in ([second], [first, first, second],
                      [first, [second[0], "f" * 64, *second[2:]]],
                      [first, second, ["0056_other.sql", APP_SHA, *first[2:]]],
