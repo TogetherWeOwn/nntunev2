@@ -688,6 +688,16 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Err(StoreError) }
     }
+    /// Observation only; not authority to issue a play grant. Activation must
+    /// atomically fence, refresh privacy, mark/probe, acquire and commit.
+    fn private_play_marked(
+        &self,
+        _user_id: &str,
+        _track_id: &str,
+        _key: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Observe an exact private session using server time. This is not authority
     /// to issue a play; activation must recheck under the account fence.
     fn private_session_active(
@@ -7962,6 +7972,50 @@ mod tests {
         assert!(block_on(store.private_session_active("alice", "Session")).is_err());
     }
 
+    #[test]
+    fn private_play_marks_are_exact_bound_and_fail_closed() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        let key = "play:alice:Track:Play";
+        assert!(!block_on(store.private_play_marked("alice", "Track", key)).unwrap());
+        store
+            .private_play_marks
+            .borrow_mut()
+            .insert(("alice".into(), key.into()));
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).unwrap());
+        assert!(
+            !block_on(store.private_play_marked("alice", "Track", "play:alice:Track:play"))
+                .unwrap()
+        );
+        assert!(
+            !block_on(store.private_play_marked("Alice", "Track", "play:Alice:Track:Play"))
+                .unwrap()
+        );
+        for (owner, track, key) in [
+            ("Alice", "Track", key),
+            ("alice", "track", key),
+            ("alice", "Track", "play:alice:Track:"),
+            ("missing", "Track", "play:missing:Track:Play"),
+        ] {
+            assert!(block_on(store.private_play_marked(owner, track, key)).is_err());
+        }
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).is_err());
+        assert_eq!(store.private_play_marks.borrow().len(), 1);
+    }
+
     impl Store for FakeStore {
         async fn mark_private_play(
             &self,
@@ -7982,6 +8036,25 @@ mod tests {
                 .borrow_mut()
                 .insert((user_id.into(), key.into()));
             Ok(())
+        }
+
+        async fn private_play_marked(
+            &self,
+            user_id: &str,
+            track_id: &str,
+            key: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !crate::history_key::matches_owner_track(key, user_id, track_id)
+            {
+                return Err(StoreError);
+            }
+            Ok(self
+                .private_play_marks
+                .borrow()
+                .contains(&(user_id.into(), key.into())))
         }
 
         async fn private_session_active(
