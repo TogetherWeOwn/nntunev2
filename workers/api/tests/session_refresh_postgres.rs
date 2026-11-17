@@ -13,6 +13,8 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/blocker_observer.rs"]
 mod blocker_observer;
+#[path = "support/disposable_accounts.rs"]
+mod disposable_accounts;
 #[path = "support/private_account_fence.rs"]
 mod private_account_fence;
 
@@ -227,6 +229,149 @@ impl Fixture {
         .await
         .expect("cross deadline while the row remains locked");
     }
+}
+
+async fn lease_connection() -> Client {
+    let db = disposable_accounts::connect().await;
+    db.batch_execute("SET search_path TO pg_temp, public")
+        .await
+        .unwrap();
+    db
+}
+
+#[tokio::test]
+async fn production_lease_connection_seam_and_adapter() {
+    use nntune_api::handlers::Store;
+    use nntune_api::playback::LeaseAcquire::{Acquired, Held};
+    use nntune_api::worker_entry::{
+        acquire_playback_lease_on, session_retry_store_for_postgres_test,
+    };
+
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let user = accounts.id(0);
+    let mut db = lease_connection().await;
+    let tx = db.transaction().await.unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&tx, user, "s1", "t1", "p1", 10, 55, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 1 }
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.playback_leases WHERE user_id=$1",
+            &[&user]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s1", "t1", "p1", 10, 55, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 1 }
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "s2", "t2", "p2", 20, 65, false)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 35
+        }
+    );
+    let row = db.query_one("SELECT session_id, track_id, play_id, epoch, expires_at, updated_at FROM public.playback_leases WHERE user_id=$1", &[&user]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, i64>(5)
+        ),
+        ("s1".into(), "t1".into(), "p1".into(), 1, 55, 10)
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s2", "t2", "p2", 20, 65, true)
+            .await
+            .unwrap(),
+        Acquired { epoch: 2 }
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "s3", "t3", "p3", 65, 100, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 3 }
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s3", "t4", "p4", 66, 110, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 4 }
+    );
+    assert!(
+        acquire_playback_lease_on(&db, user, "s3", "t4", "p4", u64::MAX, 110, false)
+            .await
+            .is_err()
+    );
+    assert!(
+        acquire_playback_lease_on(&db, user, "", "t4", "p4", 67, 111, true)
+            .await
+            .is_err()
+    );
+    db.execute(
+        "UPDATE public.users SET deleting_at=1 WHERE id=$1",
+        &[&user],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s5", "t5", "p5", 67, 112, true)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 43
+        }
+    );
+    let row = db.query_one("SELECT session_id, track_id, play_id, epoch, expires_at, updated_at FROM public.playback_leases WHERE user_id=$1", &[&user]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, i64>(5)
+        ),
+        ("s3".into(), "t4".into(), "p4".into(), 4, 110, 66)
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert!(store
+        .acquire_playback_lease(user, "s1", "t1", "p1", u64::MAX, 110, false)
+        .await
+        .is_err());
+    db.batch_execute("CREATE TEMP TABLE playback_leases (LIKE public.playback_leases); CREATE UNIQUE INDEX ON playback_leases(user_id)")
+        .await
+        .unwrap();
+    db.execute(
+        "INSERT INTO playback_leases VALUES ($1, 's1', 't1', 'p1', -1, 110, 1)",
+        &[&user],
+    )
+    .await
+    .unwrap();
+    assert!(
+        acquire_playback_lease_on(&db, user, "s2", "t2", "p2", 1, 50, false)
+            .await
+            .is_err()
+    );
+    accounts.cleanup().await;
 }
 
 struct NoExternalIo;
