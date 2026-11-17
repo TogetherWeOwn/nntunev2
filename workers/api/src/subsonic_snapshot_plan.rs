@@ -11,6 +11,9 @@ use nntune_subsonic::library::{Album, Artist, Song, NOW};
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
 use crate::subsonic_dispatch::{FLAC_CONTENT_TYPE, FLAC_SUFFIX};
 
+#[path = "subsonic_raw_fixture_plan.rs"]
+mod raw_fixture_plan;
+
 fn vec_of<T>(b: &mut ConstructionBudget, n: usize) -> Result<(), BudgetExceeded> {
     if n == 0 || std::mem::size_of::<T>() == 0 {
         return Ok(());

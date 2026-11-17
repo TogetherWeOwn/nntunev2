@@ -55,7 +55,7 @@ def main():
                         time.sleep(1)
                         continue
                     routing.check(status == 200 and body == "owned-drive-ok:4", f"unexpected test response: {status} {body!r}")
-                    print("PASS: total and phase precedence, co-poll/drop (empty registry), Worker timer", flush=True)
+                    print("PASS: empty guard drop, total and phase precedence, co-poll/drop (empty registry), Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
             finally:

@@ -1890,7 +1890,7 @@ jobs:
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aFq 'owned-drive-ok:4' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:4|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi

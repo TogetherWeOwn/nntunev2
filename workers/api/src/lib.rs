@@ -192,6 +192,9 @@ pub async fn billing_owned_test_entry(
     _env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if !billing_owned_socket::test_empty_guard_drop() {
+        return worker::Response::error("empty guard drop failed", 500);
+    }
     if let Err(message) = billing_owned_socket::test_drive_owned() {
         return worker::Response::error(message, 500);
     }

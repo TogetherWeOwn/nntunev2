@@ -1588,6 +1588,14 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<crate::preference_rows::TasteDbRow>, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Read metered public history for the authenticated owner. Callers must
+    /// retain the deleting-account read fence before invoking this inert method.
+    fn history_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// List taste for the owner. Callers must retain the deleting-account read fence.
     fn taste_list(
         &self,
@@ -7567,6 +7575,8 @@ mod tests {
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
+        private_play_marks: RefCell<HashSet<(String, String)>>,
+        fail_history_read: RefCell<bool>,
         /// Catalogue slice-1 fixtures: joined library rows by user id plus
         /// the shared mirror collections and per-release track lists.
         /// Tests seed these in store (query) order; the bound and the
@@ -7734,6 +7744,53 @@ mod tests {
             pairs.dedup();
             pairs
         }
+    }
+
+    #[test]
+    fn history_fake_only_returns_public_metered_bound_plays() {
+        let store = FakeStore::default();
+        let mut windows = store.play_windows.borrow_mut();
+        for i in 0..55 {
+            let window = crate::ledger::prepare_play_window(
+                "alice",
+                "track",
+                &format!("p{i:02}"),
+                100,
+                None,
+                None,
+                i,
+            )
+            .unwrap();
+            windows.insert(window.idempotency_key.clone(), window);
+        }
+        let mut private =
+            crate::ledger::prepare_play_window("alice", "track", "private", 100, None, None, 100)
+                .unwrap();
+        store
+            .private_play_marks
+            .borrow_mut()
+            .insert(("alice".into(), private.idempotency_key.clone()));
+        windows.insert(private.idempotency_key.clone(), private.clone());
+        private.idempotency_key = "play:bob:track:forged".into();
+        windows.insert(private.idempotency_key.clone(), private.clone());
+        private.idempotency_key = "play:alice:track:zero".into();
+        private.bytes_served = 0;
+        windows.insert(private.idempotency_key.clone(), private);
+        let foreign =
+            crate::ledger::prepare_play_window("bob", "track", "foreign", 100, None, None, 200)
+                .unwrap();
+        windows.insert(foreign.idempotency_key.clone(), foreign);
+        drop(windows);
+        let rows = block_on(store.history_list("alice")).unwrap();
+        assert_eq!(rows.len(), 50);
+        assert_eq!(rows[0].play_id, "p54");
+        assert_eq!(rows[49].play_id, "p05");
+        assert_eq!(
+            block_on(store.history_list("bob")).unwrap()[0].play_id,
+            "foreign"
+        );
+        *store.fail_history_read.borrow_mut() = true;
+        assert!(block_on(store.history_list("alice")).is_err());
     }
 
     #[test]
@@ -8962,6 +9019,49 @@ mod tests {
                 .borrow()
                 .get(&(user_id.into(), kind.as_str().into(), target.into()))
                 .cloned())
+        }
+        async fn history_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError> {
+            if *self.fail_history_read.borrow() {
+                return Err(StoreError);
+            }
+            let marks = self.private_play_marks.borrow();
+            let mut rows: Vec<_> = self
+                .play_windows
+                .borrow()
+                .values()
+                .filter_map(|window| {
+                    let play_id = crate::history_key::play_id_from_key(&window.idempotency_key)?;
+                    if window.user_id != user_id
+                        || window.bytes_served == 0
+                        || marks.contains(&(user_id.to_owned(), window.idempotency_key.clone()))
+                        || crate::ledger::derive_play_idempotency_key(
+                            user_id,
+                            &window.track_id,
+                            &play_id,
+                        )
+                        .ok()
+                        .as_deref()
+                            != Some(window.idempotency_key.as_str())
+                    {
+                        return None;
+                    }
+                    Some((
+                        window.recorded_at,
+                        window.idempotency_key.clone(),
+                        crate::preference_rows::HistoryDbRow {
+                            play_id,
+                            track_id: window.track_id.clone(),
+                            played_at: i64::try_from(window.recorded_at).ok()?,
+                            stream_seconds: i64::try_from(window.stream_seconds).ok()?,
+                        },
+                    ))
+                })
+                .collect();
+            rows.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+            Ok(rows.into_iter().take(50).map(|(_, _, row)| row).collect())
         }
         async fn taste_list(
             &self,

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the standalone Worker Rust provenance verifier."""
 import hashlib
-import json
+import io
+import os
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,17 +92,65 @@ class RustPin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.sysroot(tmp)
             lib = root / "lib/rustlib" / rust["target"] / "lib"
-            digests = Path(tmp) / "digests.json"
-            env = {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_HOME": str(Path(tmp) / ".cargo"), "RUST_STD_DIGESTS": str(digests)}
+            archive = Path(tmp) / "std.tar.xz"
+            prefix = f"rust-std-{rust['version']}-{rust['target']}/rust-std-{rust['target']}/lib/rustlib/{rust['target']}/lib/"
+            with tarfile.open(archive, "w:xz") as bundle:
+                entry = tarfile.TarInfo(prefix + "libcore.rlib")
+                entry.size = 4
+                bundle.addfile(entry, io.BytesIO(b"core"))
+            rust["rust-std-wasm32"]["xz-sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            env = {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_HOME": str(Path(tmp) / ".cargo"), "RUST_STD_ARCHIVE": str(archive)}
             (lib / "libcore.rlib").write_bytes(b"core")
-            digests.write_text(json.dumps({"libcore.rlib": hashlib.sha256(b"core").hexdigest()}))
             with patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=tmp)):
                 wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
                 (lib / "libcore.rlib").write_bytes(b"tampered")
                 with self.assertRaises(ValueError):
                     wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                (lib / "libcore.rlib").unlink()
+                with self.assertRaises(ValueError):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
                 (lib / "libcore.rlib").write_bytes(b"core")
-                digests.unlink()
+                extra = lib / "unexpected.rlib"
+                extra.write_bytes(b"extra")
+                with self.assertRaises(ValueError):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                extra.unlink()
+                (lib / "libcore.rlib").unlink()
+                external = Path(tmp) / "external.rlib"
+                external.write_bytes(b"core")
+                (lib / "libcore.rlib").symlink_to(external)
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                (lib / "libcore.rlib").unlink()
+                (lib / "libcore.rlib").write_bytes(b"core")
+                moved = lib.with_name("actual-lib")
+                lib.rename(moved)
+                lib.symlink_to(moved, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                lib.unlink()
+                moved.rename(lib)
+                target_dir = lib.parent
+                moved_target = target_dir.with_name("actual-target")
+                target_dir.rename(moved_target)
+                target_dir.symlink_to(moved_target, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                target_dir.unlink()
+                moved_target.rename(target_dir)
+                fifo = lib / "unexpected-fifo"
+                os.mkfifo(fifo)
+                with self.assertRaisesRegex(ValueError, "non-regular entry"):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                fifo.unlink()
+                archive.write_bytes(b"forged")
+                with self.assertRaises(ValueError):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                archive.unlink()
+                with self.assertRaises(ValueError):
+                    wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
+                env.pop("RUST_STD_ARCHIVE")
+                env["RUST_STD_DIGESTS"] = str(Path(tmp) / "forged.json")
                 with self.assertRaises(ValueError):
                     wt.verify_rust_toolchain(pins, env, self.fake_run(root), None, Path(tmp))
 
@@ -140,7 +190,7 @@ class RustPin(unittest.TestCase):
                 calls.append(cmd[0])
                 self.assertEqual(kwargs["env"], expected)
                 return fake(cmd, **kwargs)
-            with patch.dict("os.environ", {"RUSTUP_HOME": str(Path(tmp) / "ambient")}), patch.object(wt, "require_actions"), patch.object(wt, "verify_rust_source"), patch.object(wt, "tar_files", return_value={"a.rlib": hashlib.sha256(b"a").hexdigest()}):
+            with patch.dict("os.environ", {"RUSTUP_HOME": str(Path(tmp) / "ambient")}), patch.object(wt, "require_actions"), patch.object(wt, "verify_rust_source", return_value=b"verified archive"), patch.object(wt, "tar_files", return_value={"a.rlib": hashlib.sha256(b"a").hexdigest()}):
                 wt.install_rust(env, run=run)
             self.assertEqual(calls, ["rustup", "rustup", "rustc", "cargo", "rustc"])
 
@@ -162,6 +212,39 @@ class RustPin(unittest.TestCase):
         pins["locks"] = {}
         with self.assertRaises(ValueError):
             wt.check_lock_identity(pins)
+
+    def test_candidate_verification_refuses_changed_lock_before_toolchain_probe(self):
+        pins = wt.load_pins()
+        pins["locks"]["workers/api/Cargo.lock"] = "0" * 64
+        with patch.object(wt, "load_pins", return_value=pins), patch.object(wt, "verify_rust_toolchain") as probe:
+            with self.assertRaises(ValueError):
+                wt.verify_rust_boundary()
+            probe.assert_not_called()
+
+    def test_std_archive_refuses_ambiguous_or_incomplete_members(self):
+        def archive(entries):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w:xz") as bundle:
+                for name, kind, data in entries:
+                    entry = tarfile.TarInfo("lib/" + name)
+                    entry.type = kind
+                    if kind == tarfile.REGTYPE:
+                        entry.size = len(data)
+                        bundle.addfile(entry, io.BytesIO(data))
+                    else:
+                        entry.linkname = "target"
+                        bundle.addfile(entry)
+            return output.getvalue()
+
+        regular = tarfile.REGTYPE
+        cases = [[], [("a", regular, b"a"), ("a", regular, b"b")],
+                 [("../a", regular, b"a")], [("a", tarfile.SYMTYPE, b"")],
+                 [("a", regular, b"12"), ("b", regular, b"34")]]
+        for entries in cases:
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                wt.tar_files(archive(entries), "lib/", 3)
+        self.assertEqual(wt.tar_files(archive([("a", regular, b"a")]), "lib/", 3),
+                         {"a": hashlib.sha256(b"a").hexdigest()})
 
     def test_source_refuses_tampered_manifest(self):
         with self.assertRaises(ValueError):
