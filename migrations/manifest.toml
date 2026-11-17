@@ -234,4 +234,4 @@ sha256 = "72f290344655562f7fafef39d18c18f679e1b13635f0e622612afca57a76cf47"
 [[migration]]
 file = "0046_storage_digest_reservations.sql"
 target = "app"
-sha256 = "2ec31f59c8eaaec5a43c2d66db50843a6979f8e60f74f1e74437daf21866fbac"
+sha256 = "2c73d6cdb8e6f3b49ce510ead0dd0e45c01e55bc497d0677bfc444e55c46c53b"

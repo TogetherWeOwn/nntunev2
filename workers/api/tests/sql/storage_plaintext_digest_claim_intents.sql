@@ -37,6 +37,6 @@ SELECT pg_temp.expect_error(s, code) FROM (VALUES
     ($q$INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('20000000-0000-4000-8000-000000000099','00000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-000000000001',0,decode(repeat('ab',32),'hex'))$q$, '23514'),
     ($q$UPDATE public.storage_plaintext_digest_claim_intents SET plaintext_sha256 = plaintext_sha256$q$, '23514'),
     ($q$DELETE FROM public.storage_plaintext_digest_claim_intents$q$, '23514'),
-    ($q$TRUNCATE public.storage_plaintext_digest_claim_intents$q$, '23514')
+    ($q$TRUNCATE public.storage_plaintext_digest_claim_intents, public.storage_digest_reservations$q$, '23514')
 ) AS cases(s, code);
 ROLLBACK;

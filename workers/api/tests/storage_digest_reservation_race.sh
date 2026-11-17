@@ -3,24 +3,25 @@
 set -euo pipefail
 : "${DATABASE_URL:?scratch database required}"
 dir="$(mktemp -d)"
-trap 'rm -rf -- "$dir"' EXIT
-psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+trap 'jobs -pr | xargs -r kill; wait || :; rm -rf -- "$dir"' EXIT
+psql_run() { PGOPTIONS='-c search_path=public,pg_catalog -c statement_timeout=30000' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 psql_run <<'SQL'
 INSERT INTO public.storage_environments VALUES
  ('01000000-0000-4000-8000-000000000001'), ('01000000-0000-4000-8000-000000000002');
 INSERT INTO public.storage_library_namespaces VALUES
  ('11000000-0000-4000-8000-000000000001','01000000-0000-4000-8000-000000000001',NULL),
- ('11000000-0000-4000-8000-000000000002','01000000-0000-4000-8000-000000000002',NULL);
+ ('11000000-0000-4000-8000-000000000002','01000000-0000-4000-8000-000000000002',NULL),
+ ('11000000-0000-4000-8000-000000000003','01000000-0000-4000-8000-000000000001',NULL);
 INSERT INTO public.storage_object_intents
 SELECT ('21000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,
        ('31000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,
        CASE WHEN i=9 THEN '01000000-0000-4000-8000-000000000002' ELSE '01000000-0000-4000-8000-000000000001' END::uuid,
-       CASE WHEN i=9 THEN '11000000-0000-4000-8000-000000000002' ELSE '11000000-0000-4000-8000-000000000001' END::uuid,
-       '41000000-0000-4000-8000-000000000001', 1, 65, decode(repeat('ab',48),'hex')
-FROM generate_series(1,9) AS i;
+       CASE WHEN i=9 THEN '11000000-0000-4000-8000-000000000002' WHEN i=10 THEN '11000000-0000-4000-8000-000000000003' ELSE '11000000-0000-4000-8000-000000000001' END::uuid,
+       '41000000-0000-4000-8000-000000000001', CASE WHEN i=12 THEN 2 ELSE 1 END, CASE WHEN i=12 THEN 66 ELSE 65 END, decode(repeat('ab',48),'hex')
+FROM generate_series(1,14) AS i;
 INSERT INTO public.storage_plaintext_digest_claim_intents
-SELECT object_id,environment_id,library_id,plaintext_bytes,decode(repeat('ab',32),'hex')
+SELECT object_id,environment_id,library_id,plaintext_bytes,decode(repeat(CASE WHEN object_id::text LIKE '%000000000011' THEN 'cd' WHEN object_id::text LIKE '%000000000013' OR object_id::text LIKE '%000000000014' THEN 'ef' ELSE 'ab' END,32),'hex')
 FROM public.storage_object_intents WHERE object_id::text LIKE '21000000-%';
 SQL
 
@@ -45,10 +46,15 @@ DECLARE old_holder UUID; next_holder UUID; old_generation BIGINT; new_generation
 BEGIN
  SELECT object_id,generation INTO STRICT old_holder,old_generation FROM public.storage_digest_reservations;
  SELECT object_id INTO STRICT next_holder FROM public.storage_plaintext_digest_claim_intents
- WHERE environment_id='01000000-0000-4000-8000-000000000001' AND object_id<>old_holder LIMIT 1;
+ WHERE object_id BETWEEN '21000000-0000-4000-8000-000000000001' AND '21000000-0000-4000-8000-000000000008' AND object_id<>old_holder LIMIT 1;
  IF public.reserve_storage_digest(next_holder,3600) IS NOT NULL THEN RAISE EXCEPTION 'active holder lost'; END IF;
  IF public.reserve_storage_digest('21000000-0000-4000-8000-000000000099',3600) IS NOT NULL THEN RAISE EXCEPTION 'unknown claim reserved'; END IF;
- IF public.reserve_storage_digest('21000000-0000-4000-8000-000000000009',3600) IS DISTINCT FROM 1 THEN RAISE EXCEPTION 'namespace blocked'; END IF;
+ IF public.reserve_storage_digest('21000000-0000-4000-8000-000000000009',3600) IS DISTINCT FROM 1 THEN RAISE EXCEPTION 'environment blocked'; END IF;
+ FOR i IN 10..12 LOOP
+   IF public.reserve_storage_digest(('21000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,3600) IS DISTINCT FROM 1 THEN
+     RAISE EXCEPTION 'library, digest or length blocked: %', i;
+   END IF;
+ END LOOP;
  -- Expire without wall-clock sleeps; preserve the row and its fencing generation.
  UPDATE public.storage_digest_reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE object_id=old_holder;
  IF public.release_storage_digest(old_holder,old_generation) THEN RAISE EXCEPTION 'expired holder released'; END IF;
@@ -59,5 +65,45 @@ BEGIN
  IF NOT public.release_storage_digest(next_holder,new_generation) THEN RAISE EXCEPTION 'failure release failed'; END IF;
  IF public.release_storage_digest(next_holder,new_generation) THEN RAISE EXCEPTION 'release repeated'; END IF;
  IF public.reserve_storage_digest(old_holder,3600) IS DISTINCT FROM new_generation+1 THEN RAISE EXCEPTION 'released claim not reacquired'; END IF;
+ BEGIN
+   UPDATE public.storage_digest_reservations SET generation=1 WHERE object_id=old_holder;
+   RAISE EXCEPTION 'generation rollback accepted';
+ EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN
+   UPDATE public.storage_digest_reservations SET plaintext_bytes=plaintext_bytes+1 WHERE object_id=old_holder;
+   RAISE EXCEPTION 'key change accepted';
+ EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN
+   DELETE FROM public.storage_digest_reservations;
+   RAISE EXCEPTION 'delete accepted';
+ EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN
+   PERFORM public.reserve_storage_digest(old_holder,0);
+   RAISE EXCEPTION 'invalid duration accepted';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
 SQL
+
+# Hold an uncommitted first insert until a second session is demonstrably blocked.
+mkfifo "$dir/input"
+exec 3<>"$dir/input"
+psql_run <"$dir/input" >"$dir/holder" &
+holder=$!
+printf "BEGIN; SELECT public.reserve_storage_digest('21000000-0000-4000-8000-000000000013', 1);\n\\! touch '%s/ready'\n" "$dir" >&3
+for _ in {1..100}; do [[ -e "$dir/ready" ]] && break; sleep 0.1; done
+[[ -e "$dir/ready" ]] || { printf 'holder did not start\n' >&2; exit 1; }
+PGAPPNAME=digest_contender psql_run -Atc "BEGIN; SELECT public.reserve_storage_digest('21000000-0000-4000-8000-000000000014', 3); SELECT expires_at > clock_timestamp() FROM public.storage_digest_reservations WHERE object_id='21000000-0000-4000-8000-000000000014'; COMMIT" >"$dir/contender" &
+contender=$!
+blocked=0
+for _ in {1..100}; do
+  if [[ "$(psql_run -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name='digest_contender' AND wait_event_type='Lock'")" == 1 ]]; then blocked=1; break; fi
+  sleep 0.1
+done
+[[ "$blocked" == 1 ]] || { printf 'contender did not block\n' >&2; exit 1; }
+# The wait exceeds the lease duration, then rollback removes the conflicting insert.
+psql_run -c 'SELECT pg_sleep(4)' >/dev/null
+printf 'ROLLBACK;\n\\q\n' >&3
+exec 3>&-
+wait "$holder"
+wait "$contender"
+[[ "$(<"$dir/contender")" == $'1\nt' ]] || { printf 'rollback contender did not win an unexpired lease\n' >&2; exit 1; }
