@@ -5,6 +5,7 @@ import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -28,7 +29,10 @@ function restartFixture() {
 		node.name && names.has(node.name.text)
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
-	const handlers = declarations.map((node) => node.getText(parsed)).join('\n');
+	const seekState = parsed.statements.find((node) => ts.isVariableStatement(node) &&
+		node.declarationList.declarations.some((item) => item.name.getText(parsed) === 'pendingShareSeek'));
+	if (!seekState) throw new Error('Missing pending share transaction');
+	const handlers = [seekState, ...declarations].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -55,14 +59,14 @@ function restartFixture() {
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
-		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable,
+		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek,
 		streamUrl: track.streamUrl,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), audioEl = element;
 		let loading = false, loadError = null, libraryUnavailable = false;
-		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
+		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
@@ -77,7 +81,7 @@ function restartFixture() {
 			seeking: (target = element) => handleSeeking({ currentTarget: target }),			replaceQueue,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue, jumpStatus })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;

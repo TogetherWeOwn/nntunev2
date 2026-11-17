@@ -6,6 +6,7 @@ import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
@@ -50,7 +51,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
+		groupLibraryItems, queueCurrentTrack, resolveStreamUrl, createPendingShareSeek,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value

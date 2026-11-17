@@ -4,6 +4,7 @@ import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack a
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -47,7 +48,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	}).outputText;
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
-		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle, createPendingShareSeek,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
