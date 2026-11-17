@@ -21,8 +21,9 @@ def consume_sealed(candidate: bytes, verify, command: list[str], *, cwd, env, ru
     The child must open its final argument as the input file. This makes no claim
     about where candidate came from or what the consumer does.
     """
-    if not isinstance(candidate, bytes) or not candidate or len(candidate) > MAX_CANDIDATE_BYTES:
+    if type(candidate) is not bytes or not candidate or len(candidate) > MAX_CANDIDATE_BYTES:
         raise ValueError("invalid candidate bytes")
+    command = list(command)
     if not command or not os.path.isabs(command[0]):
         raise ValueError("consumer must be an absolute executable path")
     fd = os.memfd_create("worker-candidate", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
