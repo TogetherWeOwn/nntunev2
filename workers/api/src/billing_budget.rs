@@ -4,7 +4,9 @@
 //! deliberately not reclaimed. The outer deadline must enclose every phase.
 
 use std::cell::Cell;
-use std::future::Future;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
+use std::task::Poll;
 
 use crate::handlers::StoreError;
 use crate::worker_entry::with_deadline;
@@ -70,6 +72,31 @@ impl BillingBudget {
             .await
     }
 
+    /// Keep the same driver in the request while each active phase races its timer.
+    pub(super) async fn bootstrap_driven<T, E, D, F>(
+        &self,
+        driver: Pin<&mut D>,
+        operation: impl FnOnce() -> F,
+    ) -> Result<T, StoreError>
+    where
+        D: Future<Output = Result<(), E>>,
+        F: Future<Output = Result<T, StoreError>>,
+    {
+        self.bootstrap(|| drive(driver, operation())).await
+    }
+
+    pub(super) async fn work_driven<T, E, D, F>(
+        &self,
+        driver: Pin<&mut D>,
+        operation: impl FnOnce() -> F,
+    ) -> Result<T, StoreError>
+    where
+        D: Future<Output = Result<(), E>>,
+        F: Future<Output = Result<T, StoreError>>,
+    {
+        self.work(|| drive(driver, operation())).await
+    }
+
     async fn phase<T, F: Future<Output = Result<T, StoreError>>>(
         &self,
         expected: Phase,
@@ -85,6 +112,22 @@ impl BillingBudget {
         self.phase.set(next);
         Ok(result)
     }
+}
+
+// Called only within a phase deadline, itself enclosed by the total deadline.
+async fn drive<T, E, D, F>(mut driver: Pin<&mut D>, operation: F) -> Result<T, StoreError>
+where
+    D: Future<Output = Result<(), E>>,
+    F: Future<Output = Result<T, StoreError>>,
+{
+    let mut operation = std::pin::pin!(operation);
+    poll_fn(|cx| {
+        if driver.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(StoreError));
+        }
+        operation.as_mut().poll(cx)
+    })
+    .await
 }
 
 #[cfg(feature = "billing-owned-wasm-test")]
@@ -105,6 +148,51 @@ pub(crate) async fn test_budget() -> Result<(), &'static str> {
     })
     .await
     .map_err(|_| "budget phase sequence failed")?;
+
+    let polls = Cell::new(0);
+    BillingBudget::run(|budget| async move {
+        budget.connect(|| async { Ok(()) }).await?;
+        let driver = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Pending::<Result<(), ()>>
+        });
+        let mut driver = std::pin::pin!(driver);
+        budget
+            .bootstrap_driven(driver.as_mut(), || async {
+                if polls.get() != 1 {
+                    return Err(StoreError);
+                }
+                Ok(())
+            })
+            .await?;
+        budget
+            .work_driven(driver.as_mut(), || async {
+                if polls.get() != 2 {
+                    return Err(StoreError);
+                }
+                Ok(())
+            })
+            .await
+    })
+    .await
+    .map_err(|_| "phase driver was not co-polled")?;
+
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Bootstrap),
+    };
+    let mut failed_driver = std::pin::pin!(future::ready(Err::<(), ()>(())));
+    let operation_polled = Cell::new(false);
+    if budget
+        .bootstrap_driven(failed_driver.as_mut(), || async {
+            operation_polled.set(true);
+            Ok(())
+        })
+        .await
+        .is_ok()
+        || operation_polled.get()
+    {
+        return Err("driver failure did not stop operation");
+    }
 
     let budget = BillingBudget {
         phase: Cell::new(Phase::Connect),
