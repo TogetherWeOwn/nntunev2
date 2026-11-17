@@ -1892,6 +1892,38 @@ where
     }
 }
 
+// Adapted from the preference collection handler in PR #982. This is not
+// registered with dispatch; activation requires a separate change.
+#[allow(dead_code)]
+async fn me_likes_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.likes_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "created_at": row.created_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
@@ -14741,6 +14773,126 @@ mod tests {
                     .status,
                 404
             );
+        }
+    }
+
+    #[test]
+    fn unwired_likes_handler_is_owner_scoped_and_fail_closed() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/likes".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(me_likes_list(&h.ctx(), req));
+        let empty = call(&req);
+        assert_eq!(empty.status, 200);
+        assert_eq!(empty.body, r#"{"items":[]}"#);
+        assert!(empty.set_cookie.is_none());
+        assert!(empty.retry_after.is_none());
+        assert!(empty.extra_headers.is_empty());
+        for i in 1..=501 {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, &format!("Job-{i}"), Love, None, i),
+            )
+            .unwrap();
+        }
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "hidden", Hide, None, 999),
+        )
+        .unwrap();
+        block_on(
+            h.store
+                .taste_upsert("bob", Track, "foreign", Love, None, 1000),
+        )
+        .unwrap();
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 500);
+        assert_eq!(
+            items[0],
+            serde_json::json!({"kind":"track", "target_id":"Job-501", "created_at":501})
+        );
+        assert_eq!(items[499]["target_id"], "Job-2");
+        assert!(items
+            .windows(2)
+            .all(|w| w[0]["created_at"].as_i64() >= w[1]["created_at"].as_i64()));
+        assert!(items
+            .iter()
+            .all(|item| item["target_id"] != "foreign" && item["target_id"] != "hidden"));
+        req.cookie = Some(bob);
+        let switched: serde_json::Value = serde_json::from_str(&call(&req).body).unwrap();
+        assert_eq!(
+            switched,
+            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "created_at":1000}]})
+        );
+        req.cookie = Some(alice.clone());
+        for authorization in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(authorization.into());
+            assert_eq!(call(&req).status, 404);
+        }
+        req.authorization = None;
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some("__Host-nntune-session=invalid".into());
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(block_on(me_likes_list(&expired, &req)).status, 401);
+        *h.store.fail_taste_read.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.body, unavailable().body);
+        *h.store.fail_taste_read.borrow_mut() = false;
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req).body, unavailable().body);
+        assert_eq!(call(&req).status, 503);
+    }
+
+    #[test]
+    fn preference_paths_remain_unregistered() {
+        let h = harness();
+        for path in [
+            "/v1/me/likes",
+            "/v1/me/likes/import",
+            "/v1/me/likes/track/example",
+            "/v1/me/taste",
+            "/v1/me/taste/track/example",
+            "/v1/me/history",
+            "/v1/me/private-session",
+        ] {
+            assert!(!is_known_path(path), "{path}");
+            assert!(!options_preflight_served(path), "{path}");
+            for method in ["GET", "PUT", "POST", "DELETE", "OPTIONS"] {
+                assert_eq!(
+                    crate::native_rest::scope_for_operation(method, path),
+                    crate::native_rest::RouteDecision::Deny
+                );
+                assert_eq!(
+                    h.call_full(method, path, None, None, Some(ORIGIN)).status,
+                    404,
+                    "{method} {path}"
+                );
+            }
         }
     }
 
