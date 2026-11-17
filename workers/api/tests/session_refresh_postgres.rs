@@ -21,6 +21,8 @@ mod private_account_fence;
 mod private_lease_deletion;
 #[path = "support/private_lease_ordering.rs"]
 mod private_lease_ordering;
+#[path = "support/private_lease_safety.rs"]
+mod private_lease_safety;
 
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const SIGNING_KEY: &[u8] = b"synthetic-test-key-0123456789abcdef";
