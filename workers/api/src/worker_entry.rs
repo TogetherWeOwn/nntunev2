@@ -37,7 +37,7 @@ use crate::handlers::{
 };
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
-mod billing_budget;
+pub(crate) mod billing_budget;
 
 use crate::session::SessionRecord;
 use crate::vault::{

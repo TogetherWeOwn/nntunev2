@@ -86,3 +86,53 @@ impl BillingBudget {
         Ok(result)
     }
 }
+
+#[cfg(feature = "billing-owned-wasm-test")]
+pub(crate) async fn test_budget() -> Result<(), &'static str> {
+    use std::{future, task::Context};
+
+    if CONNECT_MS + BOOTSTRAP_MS + WORK_MS != TOTAL_MS || WORK_MS != 9_000 {
+        return Err("budget reservations do not sum to total");
+    }
+    BillingBudget::run(|budget| async move {
+        budget.connect(|| async { Ok(()) }).await?;
+        budget.bootstrap(|| async { Ok(()) }).await?;
+        budget.work(|| async { Ok(()) }).await?;
+        if budget.work(|| async { Ok(()) }).await.is_ok() {
+            return Err(StoreError);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "budget phase sequence failed")?;
+
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Connect),
+    };
+    if budget.bootstrap(|| async { Ok(()) }).await.is_ok()
+        || budget.connect(|| async { Ok(()) }).await.is_ok()
+    {
+        return Err("out-of-order phase did not fail closed");
+    }
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Connect),
+    };
+    if budget.connect(|| async { Err::<(), _>(StoreError) }).await.is_ok()
+        || budget.connect(|| async { Ok(()) }).await.is_ok()
+    {
+        return Err("failed phase restarted");
+    }
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Connect),
+    };
+    let mut phase = Box::pin(budget.connect(|| future::pending::<Result<(), StoreError>>()));
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    if phase.as_mut().poll(&mut cx).is_ready() {
+        return Err("pending phase completed");
+    }
+    drop(phase);
+    if budget.connect(|| async { Ok(()) }).await.is_ok() {
+        return Err("cancelled phase restarted");
+    }
+    Ok(())
+}
