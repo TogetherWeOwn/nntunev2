@@ -1844,6 +1844,31 @@ fn account_deleting_response() -> Response {
     }
 }
 
+// Prepared for future preference handlers; not admitted by dispatch. The
+// deletion probe is a precheck, not a substitute for a transactional fence.
+#[allow(dead_code)]
+async fn preference_authenticate<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    mutation: bool,
+) -> Result<(SessionClaims, String), Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.authorization.is_some() {
+        return Err(not_found());
+    }
+    let pair = ctx.authenticate(req, mutation).await?;
+    match ctx.store.account_deleting(&pair.0.user_id).await {
+        Ok(false) => Ok(pair),
+        Ok(true) => Err(account_deleting_response()),
+        Err(_) => Err(unavailable()),
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
@@ -7493,6 +7518,7 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
+        fail_deleting_probe: RefCell<bool>,
         /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
@@ -9259,6 +9285,9 @@ mod tests {
                 .unwrap_or_default())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_deleting_probe.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
@@ -14452,6 +14481,112 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         cookie_of(&resp)
+    }
+
+    #[test]
+    fn preference_authentication_is_session_only_and_fail_closed() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/likes".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        for mutation in [false, true] {
+            let (claims, _) =
+                block_on(preference_authenticate(&h.ctx(), &req, mutation)).expect("valid session");
+            assert_eq!(claims.user_id, "alice");
+        }
+        req.cookie = Some(bob);
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .ok()
+                .unwrap()
+                .0
+                .user_id,
+            "bob"
+        );
+        req.cookie = Some(alice.clone());
+        req.origin = Some("https://wrong.example".into());
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, true))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.origin = Some(ORIGIN.into());
+        req.authorization = Some("Bearer ntk_test".into());
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            404
+        );
+        req.authorization = None;
+        req.cookie = None;
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.cookie = Some(format!("{}=invalid", alice.split('=').next().unwrap()));
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(
+            block_on(preference_authenticate(&expired, &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = block_on(preference_authenticate(&h.ctx(), &req, false))
+            .err()
+            .unwrap();
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        let unavailable_response = block_on(preference_authenticate(&h.ctx(), &req, false))
+            .err()
+            .unwrap();
+        assert_eq!(unavailable_response.body, unavailable().body);
+        assert_eq!(unavailable_response.status, 503);
+        for path in [
+            "/v1/me/likes",
+            "/v1/me/taste",
+            "/v1/me/history",
+            "/v1/me/private-session",
+        ] {
+            assert_eq!(
+                h.call_full("GET", path, None, req.cookie.clone(), Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                h.call_full("OPTIONS", path, None, None, Some(ORIGIN))
+                    .status,
+                404
+            );
+        }
     }
 
     const PLAY_SECRET: &[u8] = b"test-play-grant-secret-32-bytes-long!";
