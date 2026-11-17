@@ -2621,6 +2621,41 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn history_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::history_list_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.history_list"))?;
+                rows.iter()
+                    .map(|row| {
+                        let key: String = row.try_get("idempotency_key").map_err(|_| StoreError)?;
+                        let play_id =
+                            crate::history_key::play_id_from_key(&key).ok_or(StoreError)?;
+                        Ok(crate::preference_rows::HistoryDbRow {
+                            play_id,
+                            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+                            played_at: row.try_get("recorded_at").map_err(|_| StoreError)?,
+                            stream_seconds: row
+                                .try_get("stream_seconds")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn private_session_active(
         &self,
         user_id: &str,

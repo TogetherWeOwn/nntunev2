@@ -39,6 +39,13 @@ pub fn private_session_delete_statement() -> &'static str {
     "DELETE FROM public.private_sessions WHERE user_id = $1 AND session_id = $2"
 }
 
+/// Bounded metered plays with identities bound to their ledger owner and track.
+/// Adapted from the history reader in PR #982; invalid identities are filtered
+/// before the limit so they cannot displace valid recent plays.
+pub fn history_list_statement() -> &'static str {
+    "SELECT idempotency_key, track_id, recorded_at, stream_seconds::bigint AS stream_seconds FROM public.stream_play_ledger AS ledger WHERE user_id = $1 AND bytes_served > 0 AND user_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND track_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND octet_length(user_id) <= 128 AND octet_length(track_id) <= 512 AND split_part(idempotency_key, ':', 4) COLLATE \"C\" ~ '^[A-Za-z0-9_-]+$' AND octet_length(split_part(idempotency_key, ':', 4)) <= 512 AND idempotency_key = 'play:' || user_id || ':' || track_id || ':' || split_part(idempotency_key, ':', 4) AND NOT EXISTS (SELECT 1 FROM public.private_plays AS private WHERE private.user_id = ledger.user_id AND private.play_key = ledger.idempotency_key) ORDER BY recorded_at DESC, idempotency_key COLLATE \"C\" DESC LIMIT 50"
+}
+
 /// A taste row as returned by a store; its fields are not validated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TasteDbRow {
