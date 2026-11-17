@@ -741,18 +741,7 @@
 			.join('\u0001');
 	}
 
-	/**
-	 * Swap the queue for any change that is not a move. The move
-	 * announcement names a track and its position, so every other edit
-	 * invalidates it; clearing it here also keeps a previous account's
-	 * track title from lingering across the auth-boundary clears below.
-	 */
-	/**
-	 * A current-source change invalidates the restart outcome and its
-	 * availability snapshot, whichever queue edit caused it — including
-	 * the direct-assign handlers that bypass replaceQueue, so a stale
-	 * "Restarted …" can never describe the new current track.
-	 */
+	/** Reset restart and jump feedback when an edit changes the current source. */
 	function resetRestartOnSourceChange(
 		before: Track | null | undefined,
 		after: Track | null | undefined
@@ -764,30 +753,28 @@
 		}
 	}
 
-	function replaceQueue(next: QueueState): void {
-		// A no-op replacement (same queue object: Next on the last track,
-		// a duplicate row tap) still clears a stale move announcement —
-		// pinned by the queue-announcement banks — but must not fence a
-		// pending play() outcome: the selection it describes is unchanged.
-		if (next !== queue) playEpoch += 1;
+	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): void {
+		if (kind !== 'replace' || next !== queue) playEpoch += 1;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
-		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
-			clearShareFeedback();
+		if ((kind === 'replace' || kind === 'select') &&
+			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
+			if (kind === 'replace') clearShareFeedback();
 			pendingShareSeek.clear();
 		}
-		resetRestartOnSourceChange(before, after);
+		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
+			resetRestartOnSourceChange(before, after);
+		}
 		queue = next;
-		queueAnnouncement = '';
+		if (kind === 'replace') queueAnnouncement = '';
 		syncMiniPlayerHint(next);
 	}
 
-	/**
-	 * Mirror the queue's current selection into the mobile mini-player hint.
-	 * Direct-assign queue edits bypass replaceQueue, so each of them calls
-	 * this after mutating the queue; an emptied queue clears the hint.
-	 * Metadata only — display title/artist, never audio or playback state.
-	 */
+	function replaceQueue(next: QueueState): void {
+		commitQueue(next, 'replace');
+	}
+
+	/** Mirror the current selection into the metadata-only mobile hint. */
 	function syncMiniPlayerHint(next: QueueState): void {
 		const current = queueCurrentTrack(next);
 		if (current) {
@@ -1066,9 +1053,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
-		playEpoch += 1;
-		queue = reordered;
-		syncMiniPlayerHint(reordered);
+		commitQueue(reordered, 'move');
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
@@ -1080,12 +1065,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
-		playEpoch += 1;
-		// Removing the current row advances the current source; the restart
-		// outcome for the removed track must not carry onto its successor.
-		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
-		queue = next;
-		syncMiniPlayerHint(next);
+		commitQueue(next, 'remove');
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
 	}
@@ -1095,9 +1075,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
-		playEpoch += 1;
-		queue = next;
-		syncMiniPlayerHint(next);
+		commitQueue(next, 'clear');
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1116,15 +1094,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
-		playEpoch += 1;
-		const before = queueCurrentTrack(queue);
-		const after = queueCurrentTrack(selected);
-		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
-			pendingShareSeek.clear();
-		}
-		resetRestartOnSourceChange(before, after);
-		queue = selected;
-		syncMiniPlayerHint(selected);
+		commitQueue(selected, 'select');
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
 	}
@@ -1149,9 +1119,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		playEpoch += 1;
-		queue = trimmed;
-		syncMiniPlayerHint(trimmed);
+		commitQueue(trimmed, 'trim');
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -1161,9 +1129,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		playEpoch += 1;
-		queue = trimmed;
-		syncMiniPlayerHint(trimmed);
+		commitQueue(trimmed, 'trim');
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 

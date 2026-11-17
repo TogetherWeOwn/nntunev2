@@ -25,10 +25,11 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue',
+		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue', 'commitQueue',
 		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
-	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
+	const functions = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) => handlers.has(node.name?.text ?? ''));
+	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
 	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'playEpoch']);
