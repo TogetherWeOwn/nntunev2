@@ -1934,6 +1934,39 @@ where
 
 // Prepared for direct testing only; preference routes remain unregistered.
 #[allow(dead_code)]
+async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.taste_list(&claims.user_id, ctx.now).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "signal": row.signal,
+                        "until": row.snooze_until,
+                        "updated_at": row.updated_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+// Prepared for direct testing only; preference routes remain unregistered.
+#[allow(dead_code)]
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -15005,6 +15038,123 @@ mod tests {
         *h.store.fail_deleting_probe.borrow_mut() = true;
         assert_eq!(call(&req).body, unavailable().body);
         assert_eq!(call(&req).status, 503);
+    }
+
+    #[test]
+    fn unwired_taste_list_is_bounded_owner_scoped_and_fail_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/taste?user_id=bob".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request| block_on(me_taste_list(&h.ctx(), req));
+        let empty = call(&req);
+        assert_eq!(
+            (empty.status, empty.body.as_str()),
+            (200, r#"{"items":[]}"#)
+        );
+        assert!(empty.set_cookie.is_none() && empty.retry_after.is_none());
+        assert!(empty.extra_headers.is_empty());
+        for i in 1..=501 {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, &format!("Job-{i}"), Love, None, i),
+            )
+            .unwrap();
+        }
+        let now = h.ctx().now;
+        for (owner, kind, id, signal, until, updated) in [
+            ("alice", Release, "release", Love, None, 502),
+            ("alice", Track, "dislike", Dislike, None, 503),
+            ("alice", Track, "hide", Hide, None, 504),
+            ("alice", Track, "ban", Ban, None, 505),
+            ("alice", Track, "past", Snooze, Some(now - 1), 506),
+            ("alice", Track, "equal", Snooze, Some(now), 507),
+            ("alice", Track, "future", Snooze, Some(now + 1), 508),
+            ("bob", Track, "foreign", Love, None, 999),
+        ] {
+            block_on(
+                h.store
+                    .taste_upsert(owner, kind, id, signal, until, updated),
+            )
+            .unwrap();
+        }
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
+        block_on(
+            h.store
+                .upsert_private_session("alice", &claims.session_id, h.ctx().now + 60),
+        )
+        .unwrap();
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 500);
+        assert_eq!(
+            items[0],
+            serde_json::json!({"kind":"track", "target_id":"future", "signal":"snooze", "until":now + 1, "updated_at":508})
+        );
+        for (index, kind, id, signal, updated) in [
+            (1, "track", "ban", "ban", 505),
+            (2, "track", "hide", "hide", 504),
+            (3, "track", "dislike", "dislike", 503),
+            (4, "release", "release", "love", 502),
+        ] {
+            assert_eq!(
+                items[index],
+                serde_json::json!({"kind":kind, "target_id":id, "signal":signal, "until":null, "updated_at":updated})
+            );
+        }
+        assert_eq!(
+            items[5],
+            serde_json::json!({"kind":"track", "target_id":"Job-501", "signal":"love", "until":null, "updated_at":501})
+        );
+        assert_eq!(items[499]["target_id"], "Job-7");
+        assert!(items
+            .windows(2)
+            .all(|w| w[0]["updated_at"].as_i64() >= w[1]["updated_at"].as_i64()));
+        assert!(items.iter().all(
+            |item| !["past", "equal", "foreign"].contains(&item["target_id"].as_str().unwrap())
+        ));
+        req.cookie = Some(bob);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call(&req).body).unwrap(),
+            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "signal":"love", "until":null, "updated_at":999}]})
+        );
+        req.cookie = Some(alice.clone());
+        req.authorization = Some("Bearer anything".into());
+        assert_eq!(call(&req).status, 404);
+        req.authorization = None;
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some("__Host-nntune-session=invalid".into());
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(block_on(me_taste_list(&expired, &req)).status, 401);
+        *h.store.fail_taste_read.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!((failure.status, failure.body), (503, unavailable().body));
+        *h.store.fail_taste_read.borrow_mut() = false;
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!((failure.status, failure.body), (503, unavailable().body));
     }
 
     #[test]
