@@ -69,6 +69,9 @@ staging-body-wasm-test = []
 # Only for a separately bundled test Worker; never enabled in releases.
 billing-owned-wasm-test = []
 ledger-wasm-test = ["nntune-subsonic/ledger-wasm-test"]
+# Test-only real-workerd entry for Worker 0.9 span identity; replaces `main`
+# in that build only (`.github/scripts/worker_span_runtime.py`). No lock change.
+span-runtime-test = []
 
 [[test]]
 name = "session_refresh_postgres"
