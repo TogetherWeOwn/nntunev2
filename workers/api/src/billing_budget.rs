@@ -255,6 +255,31 @@ pub(crate) async fn test_budget() -> Result<(), &'static str> {
     {
         return Err("failed phase restarted");
     }
+    // Exercise expiry and destruction inside the actual Worker, without waiting
+    // for the production connect allowance or relying on a native mock timer.
+    struct DropMarker<'a>(&'a Cell<bool>);
+    impl Drop for DropMarker<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let dropped = Cell::new(false);
+    let budget = BillingBudget {
+        phase: Cell::new(Phase::Connect),
+    };
+    if budget
+        .phase(Phase::Connect, Phase::Bootstrap, 10, || async {
+            let _marker = DropMarker(&dropped);
+            future::pending::<Result<(), StoreError>>().await
+        })
+        .await
+        .is_ok()
+        || !dropped.get()
+        || budget.connect(|| async { Ok(()) }).await.is_ok()
+    {
+        return Err("Worker phase expiry did not drop work and fail closed");
+    }
+
     let budget = BillingBudget {
         phase: Cell::new(Phase::Connect),
     };
