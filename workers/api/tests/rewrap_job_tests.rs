@@ -19,7 +19,6 @@ use nntune_api::rotation::{
     MAX_ROW_ATTEMPTS, ROTATION_RUNS_DDL,
 };
 use nntune_api::vault::{decrypt_vault, encrypt_vault, VaultBlob};
-use rand::RngCore;
 use rusqlite::{params, Connection};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -44,9 +43,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn random_key() -> [u8; 32] {
-    let mut key = [0; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    key
+    rand::random()
 }
 
 fn migrations_dir() -> PathBuf {
