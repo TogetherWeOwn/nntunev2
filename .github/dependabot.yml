@@ -83,6 +83,33 @@ updates:
       prefix: "chore"
       include: "scope"
 
+  # Standalone allocator-conflict fixture crates.
+  - package-ecosystem: "cargo"
+    directory: "/.github/fixtures/ledger-conflicting-allocator/conflicting-allocator-dep"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "cargo"
+    directory: "/.github/fixtures/ledger-conflicting-allocator/probe"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
   # Standalone worker crates (vault crypto: aes-gcm, hmac; base64).
   - package-ecosystem: "cargo"
     directory: "/workers/api"
