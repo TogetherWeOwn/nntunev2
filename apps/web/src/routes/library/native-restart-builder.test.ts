@@ -6,6 +6,7 @@ import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
+import { createQueueRevision } from '#lib/player/queueRevision.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -69,7 +70,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		streamUrl: track.streamUrl,
+		createQueueRevision, streamUrl: track.streamUrl,
 		tick, window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -81,7 +82,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
-		let playEpoch = 0, endGeneration = 0, queueAnnouncementVersion = 0;
+		const queueRevision = createQueueRevision();
+		let endGeneration = 0, queueAnnouncementVersion = 0;
 		let repeat = 'off', playingElement = element;
 		${compiled}
 		return {
@@ -92,7 +94,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			seeking: (target = element) => handleSeeking({ currentTarget: target }), replaceQueue,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -331,6 +333,20 @@ test.each(['resolve', 'reject'] as const)('same-object replacement preserves def
 	expect(page.read().queueAnnouncement).toBe(outcome === 'resolve' ? 'Playing Coral Night.' : 'Selected Coral Night, paused: playback was blocked.');
 	expect(page.read().queueAnnouncementVersion).toBe(version + 1);
 	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+});
+
+test('same-source new-object replacement fences a deferred play rejection', async () => {
+	const { page, element } = restartFixture();
+	let rejectPlay!: (reason: Error) => void;
+	element.play = () => new Promise<void>((_resolve, reject) => { rejectPlay = reject; });
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	page.replaceQueue({ ...page.read().queue });
+	const afterEdit = page.read();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(page.read().queueAnnouncement).toBe(afterEdit.queueAnnouncement);
+	expect(page.read().queueAnnouncementVersion).toBe(afterEdit.queueAnnouncementVersion);
 });
 
 test('a jump readout clears on a same-source share and on a source change', async () => {
