@@ -7900,7 +7900,10 @@ mod tests {
         }
         let key = "play:alice:Track:Play";
         assert!(!block_on(store.private_play_marked("alice", "Track", key)).unwrap());
-        store.private_play_marks.borrow_mut().insert(("alice".into(), key.into()));
+        store
+            .private_play_marks
+            .borrow_mut()
+            .insert(("alice".into(), key.into()));
         assert!(block_on(store.private_play_marked("alice", "Track", key)).unwrap());
         assert!(
             !block_on(store.private_play_marked("alice", "Track", "play:alice:Track:play"))
