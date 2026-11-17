@@ -167,6 +167,23 @@ def verify_host_component_files(sysroot: Path, expected: dict) -> None:
             raise ValueError(f"installed host component differs from archive: {name}")
 
 
+def verified_host_executables(sysroot: Path, expected: dict) -> tuple[Path, Path]:
+    """Return explicit compiler paths only after checking their host components.
+
+    Expected digests must come from host_component_files, not a caller assertion.
+    This does not authenticate extra loader inputs, prevent check-to-use changes,
+    or bind a subsequent build. A caller must invoke these paths directly in a
+    separately guarded build.
+    """
+    if not {"bin/rustc", "bin/cargo"}.issubset(expected):
+        raise ValueError("host components lack compiler or cargo")
+    verify_host_component_files(sysroot, expected)
+    rustc, cargo = sysroot / "bin/rustc", sysroot / "bin/cargo"
+    if not os.access(rustc, os.X_OK) or not os.access(cargo, os.X_OK):
+        raise ValueError("host compiler or cargo is not executable")
+    return rustc, cargo
+
+
 def verify_rust_source(pins: dict, dl=download) -> bytes:
     """Check the official channel manifest, rust-src and wasm std against the pins.
 
