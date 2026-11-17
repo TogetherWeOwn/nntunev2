@@ -1887,6 +1887,19 @@ jobs:
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
+      - name: Exercise empty owned socket guard in a separate test Worker
+        run: |
+          set -euo pipefail
+          if grep -aFq 'owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
+            printf '%s\n' 'test entry marker found in release WASM' >&2
+            exit 1
+          fi
+          mv workers/api/build "$RUNNER_TEMP/api-release-build"
+          (cd workers/api && worker-build --release -- --locked --features billing-owned-wasm-test) 2>&1 | tee "$RUNNER_TEMP/worker-owned-test.log"
+          python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-owned-test.log"
+          mv workers/api/build "$RUNNER_TEMP/api-owned-test-build"
+          mv "$RUNNER_TEMP/api-release-build" workers/api/build
+          OWNED_TEST_BUNDLE="$RUNNER_TEMP/api-owned-test-build" python3 -I workers/api/tests/owned_socket_worker_smoke.py
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
