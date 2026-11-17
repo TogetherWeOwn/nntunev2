@@ -52,8 +52,24 @@ alone does not establish that binding or enable nonempty construction.
 For a fresh nonzero allocation with alignment at most eight, wasm `System`
 (`library/std/src/sys/alloc/wasm.rs`) calls dlmalloc's `malloc`; the wrapper
 (`library/vendor/dlmalloc-0.2.13/src/lib.rs`) selects `malloc`, not `memalign`.
-In `src/dlmalloc.rs`, `request2size` rounds `requested + 4` up to eight with
-minimum 16 (`request2size`, lines 247–253). The small-bin exact/next-bin path
+In `src/dlmalloc.rs`, wasm32 gives a four-byte `usize` and pointer, so the
+four-field `Chunk` is 16 bytes (`Chunk`, lines 61–67), `malloc_alignment` is
+8 and `chunk_overhead` is 4 (lines 145–152). `min_chunk_size` aligns the
+chunk size to eight (lines 174–176), and `pad_request` aligns the request plus
+the overhead (lines 202–204). Thus `request2size` selects
+`max(16, align_up(requested + 4, 8))` (lines 179–181, 247–253). Chunk sizes
+and split remainders are multiples of eight: small-bin indices encode multiples
+of eight (lines 50, 206–212), and the tree and designated-victim split paths
+subtract the aligned request from an aligned free chunk. The latter relies on
+the allocator's chunk invariants, including those maintained by free and
+coalescing; a debug assertion by itself is not an independent proof. In
+particular, the linker-provided initial heap path (`wasm.rs` lines 17–31,
+88–96) donates the difference between linker symbols without rounding the
+length, while `init_top` (`dlmalloc.rs` lines 725–735) does not round its
+size. The required eight-byte alignment of those symbols for the candidate has
+not been established. Until that branch is proved or excluded, the alignment
+invariant and this charge remain provisional.
+The small-bin exact/next-bin path
 (lines 278–291) returns a chunk
 of `nb` or `nb + 8`; a larger small bin is split to `nb`. Both tree-bin
 paths split to `nb` or consume a remainder below the 16-byte minimum

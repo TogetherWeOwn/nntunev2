@@ -39,6 +39,32 @@ class RustPin(unittest.TestCase):
         (root / "lib/rustlib" / rust["target"] / "lib").mkdir(parents=True)
         return root
 
+    def test_verified_host_executables_refuse_missing_or_changed_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "toolchain"
+            (root / "bin").mkdir(parents=True)
+            rustc, cargo = root / "bin/rustc", root / "bin/cargo"
+            rustc.write_bytes(b"rustc")
+            cargo.write_bytes(b"cargo")
+            rustc.chmod(0o755)
+            cargo.chmod(0o755)
+            expected = {"bin/rustc": hashlib.sha256(b"rustc").hexdigest(),
+                        "bin/cargo": hashlib.sha256(b"cargo").hexdigest()}
+            self.assertEqual(wt.verified_host_executables(root, expected), (rustc, cargo))
+            with self.assertRaises(ValueError):
+                wt.verified_host_executables(root, {"bin/rustc": expected["bin/rustc"]})
+            cargo.write_bytes(b"changed")
+            with self.assertRaises(ValueError):
+                wt.verified_host_executables(root, expected)
+            cargo.write_bytes(b"cargo")
+            cargo.chmod(0o644)
+            with self.assertRaises(ValueError):
+                wt.verified_host_executables(root, expected)
+            cargo.unlink()
+            cargo.symlink_to(rustc)
+            with self.assertRaises(ValueError):
+                wt.verified_host_executables(root, expected)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
