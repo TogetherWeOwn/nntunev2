@@ -59,10 +59,13 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		${compiled}
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
+			replaceQueue, subscribe: queueController.subscribe,
 			read: () => ({ queue, announcement: queueAnnouncement })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;
+		replaceQueue: (queue: QueueState) => boolean;
+		subscribe: (callback: (queue: QueueState) => void) => () => void;
 		read: () => { queue: QueueState; announcement: string };
 	};
 }
@@ -80,6 +83,18 @@ test('queues shelf favorites in star order, not library/title order, with displa
 	expect(page.read().announcement).toMatch(/queued 3.*0 already queued/i);
 	expect(readMiniPlayerHint()?.trackId).toBe('mike');
 	expect(readMiniPlayerHint()?.title).toBe('Mike Song');
+});
+
+test('reentrant replacement stops the superseded favorites action', () => {
+	const page = pageActions(['mike', 'alpha'], createQueue([]), 'Earlier outcome');
+	const newer = createQueue([{ id: 'zulu', title: 'Zulu Song', artist: '', streamUrl: '' }]);
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.some((track) => track.id === 'mike')) page.replaceQueue(newer);
+	});
+	page.queueAll();
+	expect(page.read().queue).toBe(newer);
+	expect(page.read().announcement).toBe('');
+	unsubscribe();
 });
 
 test('keeps already queued tracks in place and preserves a non-first current selection', () => {

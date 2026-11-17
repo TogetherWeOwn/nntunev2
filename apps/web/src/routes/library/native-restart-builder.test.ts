@@ -250,6 +250,25 @@ test('a reentrant subscription cannot publish an older operation hint', () => {
 	unsubscribe();
 });
 
+test('reentrant replacement during share append prevents the older navigation', async () => {
+	const { page, location, writes } = restartFixture();
+	page.replaceQueue(createQueue([]));
+	const newer = selectTrack(createQueue([
+		{ id: 'coral', title: 'Coral Night', artist: '', streamUrl: '/test-audio/coral' },
+		{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }
+	]), 1);
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 1 && value.tracks[0].id === 'coral') page.replaceQueue(newer);
+	});
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(page.read().queue).toBe(newer);
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(writes).toEqual([]);
+	unsubscribe();
+});
+
 test('reentrant replacement suppresses the superseded removal announcement', () => {
 	const { page } = restartFixture();
 	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);

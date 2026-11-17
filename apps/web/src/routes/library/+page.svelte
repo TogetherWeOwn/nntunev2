@@ -644,13 +644,13 @@
 		};
 	}
 
-	function selectTrack(id: string, item = items.find((track) => track.id === id)): void {
-		if (!item) return;
+	function selectTrack(id: string, item = items.find((track) => track.id === id)): boolean {
+		if (!item) return false;
 		clearShareFeedback();
 		pendingShareSeek.clear();
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
-		replaceQueue(addTrack(queue, playableTrackFor(item)));
+		return replaceQueue(addTrack(queue, playableTrackFor(item)));
 	}
 
 	/**
@@ -726,7 +726,9 @@
 		const before = queue.tracks.length;
 		// Use the shelf's resolved star order and the same deduping path as
 		// individual taps. No persistence, playback, or account lookup here.
-		for (const track of favoriteTracks) selectTrack(track.id, track);
+		for (const track of favoriteTracks) {
+			if (!selectTrack(track.id, track)) return;
+		}
 		const added = queue.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
 	}
@@ -889,7 +891,7 @@
 		}
 		// A newly consumed navigation must not inherit consent for the old arrangement.
 		queueConfirmGeneration += 1;
-		selectTrack(target.trackId);
+		if (!selectTrack(target.trackId)) return;
 		if (!replaceQueue(
 			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))
 		)) return;
