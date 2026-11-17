@@ -138,7 +138,7 @@ function pageScript() {
 		resolveStreamUrl: () => null,
 		onMount: () => {},
 		tick: () => Promise.resolve(),
-		$state: <T>(value: T) => value,
+		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}

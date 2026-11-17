@@ -348,7 +348,7 @@
 	// An outcome belongs to the queue it was produced for: any queue or
 	// selection change swaps the queue object and hides it (no effect needed).
 	let queueShareOutcome: { status: string; fallbackUrl: string | null; forQueue: QueueState | null } =
-		$state({ status: '', fallbackUrl: null, forQueue: null });
+		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queue,
 		getPosition: () => audioEl?.currentTime,
