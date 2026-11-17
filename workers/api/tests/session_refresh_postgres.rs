@@ -17,6 +17,8 @@ mod blocker_observer;
 mod disposable_accounts;
 #[path = "support/private_account_fence.rs"]
 mod private_account_fence;
+#[path = "support/private_lease_deletion.rs"]
+mod private_lease_deletion;
 #[path = "support/private_lease_ordering.rs"]
 mod private_lease_ordering;
 
