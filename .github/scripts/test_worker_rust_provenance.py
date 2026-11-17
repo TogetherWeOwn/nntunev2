@@ -91,6 +91,26 @@ class RustPin(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symbolic link"):
                 wt.verify_rust_toolchain(pins, env, self.fake_run(alias / root.name), std, Path(tmp))
 
+    def test_toolchain_probes_use_explicit_executables(self):
+        pins = wt.load_pins()
+        env = {"RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(wt.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(Path(tmp) / "h"))):
+            root = self.sysroot(tmp)
+            (root / "lib/rustlib" / pins["rust"]["target"] / "lib/a.rlib").write_bytes(b"a")
+            paths = (root / "bin/rustc", root / "bin/cargo")
+            fake = self.fake_run(root)
+            calls = []
+            def run(cmd, **kwargs):
+                calls.append(cmd[0])
+                return fake([Path(cmd[0]).name, *cmd[1:]], **kwargs)
+            wt.verify_rust_toolchain(pins, env, run, {"a.rlib": hashlib.sha256(b"a").hexdigest()},
+                                     Path(tmp), paths)
+            self.assertEqual(calls, [str(paths[0]), str(paths[1]), str(paths[0])])
+            fake = self.fake_run(Path(tmp) / "other")
+            with self.assertRaisesRegex(ValueError, "different sysroot"):
+                wt.verify_rust_toolchain(pins, env, run, {"a.rlib": hashlib.sha256(b"a").hexdigest()},
+                                         Path(tmp), paths)
+
     def test_toolchain_probes_use_validated_environment(self):
         pins = wt.load_pins()
         env = {"RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
@@ -247,6 +267,57 @@ class RustPin(unittest.TestCase):
         with self.assertRaises(ValueError):
             wt.check_lock_identity(pins)
 
+    def test_candidate_checks_host_components_before_explicit_probes(self):
+        pins = wt.load_pins()
+        env = {"HOME": "/home/build", "RUSTUP_TOOLCHAIN": pins["rust"]["version"]}
+        root = Path("/home/build/.rustup/toolchains") / f"{pins['rust']['version']}-{pins['rust']['host']}"
+        paths = (root / "bin/rustc", root / "bin/cargo")
+        with patch.object(wt, "load_pins", return_value=pins), \
+             patch.object(wt, "check_lock_identity"), patch.object(wt, "cargo_config_refusals"), \
+             patch.object(wt, "download_host_component_files", return_value={"verified": "digest"}) as fetch, \
+             patch.object(wt, "verified_host_executables", return_value=paths) as host, \
+             patch.object(wt, "verify_rust_toolchain") as probe:
+            wt.verify_rust_boundary(env)
+            fetch.assert_called_once()
+            host.assert_called_once_with(root, {"verified": "digest"})
+            self.assertEqual(probe.call_args.kwargs["executables"], paths)
+            host.side_effect = ValueError("changed host")
+            probe.reset_mock()
+            with self.assertRaisesRegex(ValueError, "changed host"):
+                wt.verify_rust_boundary(env)
+            probe.assert_not_called()
+
+    def test_ledger_build_uses_verified_paths_and_refuses_reused_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"RUNNER_TEMP": tmp}
+            rustc, cargo = Path("/pinned/bin/rustc"), Path("/pinned/bin/cargo")
+            artifact = Path(tmp) / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+            calls = []
+
+            def run(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b"wasm")
+
+            with patch.object(wt, "require_actions"), \
+                 patch.object(wt, "verify_rust_boundary", return_value=(rustc, cargo)) as verify:
+                wt.build_ledger(env, run=run)
+                self.assertEqual(calls[0][0][0], str(cargo))
+                self.assertEqual(calls[0][0], [str(cargo), "build", "--locked", "--release", "--manifest-path",
+                                              "workers/api/Cargo.toml", "--target", "wasm32-unknown-unknown",
+                                              "--features", "staging-body-wasm-test,ledger-wasm-test",
+                                              "--target-dir", str(Path(tmp) / "ledger-target")])
+                self.assertEqual(calls[0][1]["env"]["RUSTC"], str(rustc))
+                with self.assertRaisesRegex(ValueError, "must not already exist"):
+                    wt.build_ledger(env, run=run)
+                self.assertEqual(verify.call_count, 1)
+                self.assertEqual(len(calls), 1)
+
+        with patch.object(wt, "require_actions"), \
+             patch.object(wt, "verify_rust_boundary", side_effect=ValueError("bad provenance")):
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "bad provenance"):
+                wt.build_ledger({"RUNNER_TEMP": tmp}, run=lambda *args, **kwargs: self.fail("build ran"))
+
     def test_candidate_verification_refuses_changed_lock_before_toolchain_probe(self):
         pins = wt.load_pins()
         pins["locks"]["workers/api/Cargo.lock"] = "0" * 64
@@ -302,11 +373,20 @@ class RustPin(unittest.TestCase):
         manifest = "".join(
             f'[pkg.{name}]\ngit_commit_hash = "{rust["commit"]}"\n'
             f'[pkg.{name}.target.{host}]\nxz_hash = "{hashlib.sha256(archives[name]).hexdigest()}"\n'
+            f'xz_url = "https://example.invalid/{name}"\n'
             for name in paths
         ).encode()
         rust["channel-manifest"]["sha256"] = hashlib.sha256(manifest).hexdigest()
         result = wt.host_component_files(pins, manifest, archives)
         self.assertEqual(set(result), set(paths.values()))
+        urls = {rust["channel-manifest"]["url"]: manifest,
+                **{f"https://example.invalid/{name}": data for name, data in archives.items()}}
+        self.assertEqual(wt.download_host_component_files(pins, lambda url, limit: urls[url]), result)
+        with self.assertRaises(ValueError):
+            wt.download_host_component_files(pins, lambda url, limit: b"tampered")
+        bad = {**urls, "https://example.invalid/cargo": b"tampered"}
+        with self.assertRaises(ValueError):
+            wt.download_host_component_files(pins, lambda url, limit: bad[url])
         with self.assertRaises(ValueError):
             wt.host_component_files(pins, manifest + b" ", archives)
         for name in paths:

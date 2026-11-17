@@ -1866,8 +1866,7 @@ jobs:
       - name: Exercise construction ledger on wasm32 release
         run: |
           set -euo pipefail
-          python3 -I .github/scripts/worker_rust_provenance.py verify-rust
-          cargo build --locked --release --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,ledger-wasm-test --target-dir "$RUNNER_TEMP/ledger-target"
+          python3 -I .github/scripts/worker_rust_provenance.py build-ledger
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ledger-js" "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
           node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
       - name: Reject a conflicting dependency global allocator in the ledger artifact graph
