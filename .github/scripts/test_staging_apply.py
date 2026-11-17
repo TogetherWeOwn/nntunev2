@@ -77,7 +77,7 @@ class StagingApplyTests(unittest.TestCase):
                "GITHUB_STEP_SUMMARY": str(root / "summary"), "AUDIT_RECEIPT": str(root / "audit"),
                "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
-        row = ["0054_first.sql", sha, "2026-11-17 04:00:00+00", "migrator"]
+        row = ["0054_first.sql", sha, "2026-11-17 04:00:00+00", "release:operator```<tag>\x7fé"]
         from unittest.mock import patch
         response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "rows": [row]}))
         with patch.object(staging_apply.subprocess, "run", return_value=response) as runner:
@@ -86,7 +86,13 @@ class StagingApplyTests(unittest.TestCase):
         self.assertIn("REPEATABLE READ READ ONLY", runner.call_args.kwargs["input"])
         self.assertIn("-c search_path=pg_catalog", runner.call_args.kwargs["env"]["PGOPTIONS"])
         self.assertNotIn("public", runner.call_args.kwargs["env"]["PGOPTIONS"])
-        self.assertNotIn("secretpw", (root / "audit").read_text())
+        receipt_text = (root / "audit").read_text()
+        self.assertNotIn("secretpw", receipt_text)
+        self.assertEqual(json.loads(receipt_text)["rows"][0]["applied_by"], "[redacted]")
+        self.assertNotIn(row[3], receipt_text)
+        summary = (root / "summary").read_text()
+        self.assertEqual(summary.count("```"), 2)
+        self.assertEqual(json.loads(summary.split("```json\n")[1].split("```\n")[0])["rows"][0]["applied_by"], "[redacted]")
         response.stdout = json.dumps({"database": "production", "rows": [row]})
         with patch.object(staging_apply.subprocess, "run", return_value=response):
             with self.assertRaises(staging_apply.StagingApplyError):
@@ -104,6 +110,8 @@ class StagingApplyTests(unittest.TestCase):
         second = ["0055_second.sql", APP_SHA, "2026-11-17 04:01:00+00", "migrator"]
         validate = staging_apply.validate_ledger_audit
         self.assertEqual(len(validate(entries, [first, second], "0055_second.sql")), 2)
+        actor = [*first[:3], "release:operator"]
+        self.assertEqual(validate(entries, [actor, second], "0055_second.sql")[0]["applied_by"], actor[3])
         historical = [*first[:3], "backfill-2026-11-03 (operator-verified)"]
         self.assertEqual(validate(entries, [historical, second], "0055_second.sql")[0]["applied_by"], historical[3])
         for rows in ([second], [first, first, second],

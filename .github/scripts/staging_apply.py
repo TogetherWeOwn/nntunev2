@@ -311,13 +311,16 @@ def validate_ledger_audit(entries, rows, cutoff):
                 or not isinstance(applied_at, str) or not 1 <= len(applied_at) <= 64
                 or not re.fullmatch(r"[0-9 :.+TZ-]+", applied_at)
                 or not isinstance(applied_by, str) or not 1 <= len(applied_by) <= 200
-                or not re.fullmatch(r"[A-Za-z0-9_.@+ ()-]+", applied_by)):
+                or any(ord(ch) < 0x20 for ch in applied_by)):
             raise StagingApplyError("invalid ledger audit evidence")
         identity = accepted.get(filename)
         if identity is None or identity[1] != digest or identity[0] in seen:
             raise StagingApplyError("ledger audit does not match manifest")
         seen.add(identity[0])
-        records.append(dict(zip(("file", "sha256", "applied_at", "applied_by"), row)))
+        # The writer accepts broader text than the public receipt can safely render.
+        actor = applied_by if re.fullmatch(r"[A-Za-z0-9_.@+: ()-]+", applied_by) else "[redacted]"
+        records.append(dict(zip(("file", "sha256", "applied_at", "applied_by"),
+                                (filename, digest, applied_at, actor))))
     if len(seen) != len(expected):
         raise StagingApplyError("ledger audit does not match manifest")
     return records
