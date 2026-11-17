@@ -75,6 +75,9 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
             .map_err(|e| e.to_string())?;
         let waiter = connection().await?;
         let (holder_pid, waiter_pid) = (pid(&holder).await?, pid(&waiter).await?);
+        // Start before the future is polled, so both its overall deadline and
+        // the later PostgreSQL statement deadline must still be unexpired.
+        let started = std::time::Instant::now();
         let pending = acquire(
             waiter,
             &a,
@@ -108,6 +111,9 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
             .map_err(|e| e.to_string())?;
         if pending.await.is_ok() {
             return Err("deleting account acquired lease".into());
+        }
+        if started.elapsed() >= Duration::from_millis(nntune_api::vault::TOTAL_TIMEOUT_MS) {
+            return Err("deleting account rejection may have been a timeout".into());
         }
         let after_lease = db.query_one("SELECT session_id,track_id,play_id,epoch,expires_at,updated_at FROM public.playback_leases WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
         let after_mark = db.query_one("SELECT play_key,marked_at FROM public.private_plays WHERE user_id=$1", &[&a]).await.map_err(|e| e.to_string())?;
