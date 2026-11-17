@@ -398,6 +398,10 @@
 			if (fallback !== undefined) favoritesExportFallback = fallback;
 		}
 	});
+	const clearFavoritesExportFeedback = favoritesExport.clear;
+	const releaseFavoritesDownload = favoritesExport.release;
+	const copyFavoritesText = favoritesExport.copy;
+	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
 	// Restart availability is live native state of the mounted matching
 	// element, re-evaluated on media events — never cached coordinates.
@@ -732,11 +736,6 @@
 			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
 			.join('\u0001');
 	}
-
-	const clearFavoritesExportFeedback = favoritesExport.clear;
-	const releaseFavoritesDownload = favoritesExport.release;
-	const copyFavoritesText = favoritesExport.copy;
-	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
 	/**
 	 * Swap the queue for any change that is not a move. The move
