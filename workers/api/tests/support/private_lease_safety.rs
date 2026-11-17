@@ -146,10 +146,10 @@ async fn private_delivery_is_hidden_from_history_not_metering() {
 
 #[tokio::test]
 async fn acquisition_is_account_scoped_and_loses_to_deletion() {
+    let holder = connection().await.unwrap();
     let accounts = disposable_accounts::Accounts::new(2).await;
     let (a, b) = (accounts.id(0).to_owned(), accounts.id(1).to_owned());
     let db = &accounts.observer;
-    let holder = connection().await.unwrap();
     let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(20), async {
         let now: i64 = db
             .query_one(
