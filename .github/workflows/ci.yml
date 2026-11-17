@@ -173,6 +173,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test advisory expiry guard
+        run: python3 .github/scripts/test_check_advisory_expiry.py
+      - name: Enforce advisory expiry
+        run: python3 .github/scripts/check_advisory_expiry.py
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
