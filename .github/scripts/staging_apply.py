@@ -327,7 +327,13 @@ def validate_ledger_audit(entries, rows, cutoff):
 
 
 AUDIT_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
-SELECT json_build_object('database', current_database(), 'rows', COALESCE(
+SET LOCAL row_security = off;
+SET LOCAL DateStyle = 'ISO, YMD';
+SELECT json_build_object('database', current_database(),
+  'plain_table', EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'schema_migrations' AND c.relkind = 'r'
+      AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent = c.oid)),
+  'rows', COALESCE(
   (SELECT json_agg(json_build_array(
      CASE WHEN length(file) <= 255 THEN file ELSE NULL END,
      CASE WHEN length(sha256) <= 64 THEN sha256 ELSE NULL END,
@@ -380,7 +386,8 @@ def run_ledger_audit(trusted_root, data_root, filename, expected_sha, expected_d
         payload = json.loads(result.stdout)
     except (ValueError, TypeError) as exc:
         raise StagingApplyError("invalid ledger audit evidence") from exc
-    if not isinstance(payload, dict) or set(payload) != {"database", "rows"} or payload["database"] != expected_database:
+    if (not isinstance(payload, dict) or set(payload) != {"database", "plain_table", "rows"}
+            or payload["database"] != expected_database or payload["plain_table"] is not True):
         raise StagingApplyError("ledger audit target mismatch")
     records = validate_ledger_audit(entries, payload["rows"], filename)
     receipt = {"kind": "staging-ledger-audit", "database": expected_database,

@@ -6,11 +6,13 @@ endpoint, create a fresh fixture database, and refuse to reuse an existing one.
 The deployment SQL and its verdict parser run unchanged; only provider discovery
 and the connection environment are replaced with this isolated fixture.
 """
+import json
 import os
 import subprocess
 from unittest.mock import patch
 
 import staging_api_schema_gate as gate
+import staging_apply
 
 
 TEST_URL = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci"
@@ -181,6 +183,34 @@ def assert_verdict(env, name):
     assert actual == expected, f"{name}: expected verdict {expected}, got {actual}"
 
 
+def assert_audit_snapshot(env):
+    exec_sql(env, PUBLIC_TABLE + """
+        CREATE ROLE audit_fixture_reader;
+        GRANT SELECT ON public.schema_migrations TO audit_fixture_reader;
+        ALTER TABLE public.schema_migrations ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY audit_fixture_filter ON public.schema_migrations
+            FOR SELECT TO audit_fixture_reader USING (file = '0002_alpha.sql');
+    """)
+    try:
+        prefix = "SET ROLE audit_fixture_reader; SET DateStyle = 'SQL, DMY';\n"
+        filtered = psql(ARGS, input=prefix + "SELECT count(*) FROM public.schema_migrations;",
+                        env=env, text=True, capture_output=True, timeout=15)
+        assert filtered.stdout.strip() == "1", "RLS fixture did not filter rows"
+        refused = subprocess.run(ARGS, input=prefix + staging_apply.AUDIT_SQL,
+                                 env=env, text=True, capture_output=True, timeout=15)
+        assert refused.returncode != 0, "audit accepted row-filtered evidence"
+        exec_sql(env, "ALTER TABLE public.schema_migrations DISABLE ROW LEVEL SECURITY;")
+        result = psql(ARGS, input=prefix + staging_apply.AUDIT_SQL,
+                      env=env, text=True, capture_output=True, timeout=15)
+        payload = json.loads(result.stdout)
+        assert payload['plain_table'] is True and len(payload['rows']) == 2
+        for row in payload['rows']:
+            assert staging_apply.re.fullmatch(r"[0-9 :.+TZ-]+", row[2]), row[2]
+    finally:
+        exec_sql(env, DROP_TABLE + "DROP ROLE audit_fixture_reader;")
+    print("staging-ledger-audit-postgres: passed RLS refusal and DateStyle")
+
+
 def main():
     if (os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("SCHEMA_GATE_TEST_DATABASE_URL") != TEST_URL):
@@ -196,6 +226,7 @@ def main():
     exec_sql(env, "CREATE DATABASE nntunev2_staging;")
     fixture_env = {**env, "PGDATABASE": "nntunev2_staging"}
     try:
+        assert_audit_snapshot(fixture_env)
         for name in FIXTURES:
             assert_verdict(fixture_env, name)
             print(f"staging-schema-postgres: passed {name}")

@@ -79,11 +79,18 @@ class StagingApplyTests(unittest.TestCase):
                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
         row = ["0054_first.sql", sha, "2026-11-17 04:00:00+00", "release:operator```<tag>\x7fé"]
         from unittest.mock import patch
-        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "rows": [row]}))
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "plain_table": True, "rows": [row]}))
         with patch.object(staging_apply.subprocess, "run", return_value=response) as runner:
             staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
         self.assertEqual(runner.call_count, 1)
         self.assertIn("REPEATABLE READ READ ONLY", runner.call_args.kwargs["input"])
+        self.assertIn("SET LOCAL row_security = off", runner.call_args.kwargs["input"])
+        self.assertIn("SET LOCAL DateStyle = 'ISO, YMD'", runner.call_args.kwargs["input"])
+        for plain_table in (False, None, 1):
+            response.stdout = json.dumps({"database": DB, "plain_table": plain_table, "rows": [row]})
+            with patch.object(staging_apply.subprocess, "run", return_value=response):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
         self.assertIn("-c search_path=pg_catalog", runner.call_args.kwargs["env"]["PGOPTIONS"])
         self.assertNotIn("public", runner.call_args.kwargs["env"]["PGOPTIONS"])
         receipt_text = (root / "audit").read_text()
