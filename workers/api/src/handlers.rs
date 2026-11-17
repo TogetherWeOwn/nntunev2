@@ -1984,6 +1984,50 @@ where
     }
 }
 
+// Prepared for direct testing only; preference routes remain unregistered.
+#[allow(dead_code)]
+async fn me_unlike_track<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{valid_target_id, TargetKind};
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !valid_target_id(target) {
+        return not_found();
+    }
+    let target = match ctx
+        .store
+        .resolve_member_track(&claims.user_id, target)
+        .await
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .like_delete(&claims.user_id, TargetKind::Track, &target)
+        .await
+    {
+        Ok(_) => json_response(
+            200,
+            serde_json::json!({"target_id": target, "liked": false}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
@@ -7814,6 +7858,9 @@ mod tests {
             target: &str,
             love_only: bool,
         ) -> Result<bool, StoreError> {
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
             if *self.fail_taste_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -15128,6 +15175,154 @@ mod tests {
             &bob_row
         );
         assert_eq!(bob_row.signal, Love.as_str());
+    }
+
+    #[test]
+    fn unwired_unlike_preserves_other_signals_and_fails_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mbid = "abcdefab-1234-1234-1234-abcdefabcdef";
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(mbid.into());
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![own, unmatched_library_row("CaseJob")]);
+        h.store.catalogue_library.borrow_mut().insert(
+            "bob".into(),
+            vec![
+                unmatched_library_row("Job_A"),
+                unmatched_library_row("Private"),
+            ],
+        );
+        let mut req = Request {
+            method: "DELETE".into(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request, target: &str| block_on(me_unlike_track(&h.ctx(), req, target));
+        for (user, kind) in [("alice", Track), ("alice", Release), ("bob", Track)] {
+            block_on(h.store.taste_upsert(user, kind, "Job_A", Love, None, NOW)).unwrap();
+        }
+        let first = call(&req, "Job_A");
+        assert_eq!(first.status, 200);
+        assert_eq!(first.body, r#"{"liked":false,"target_id":"Job_A"}"#);
+        assert!(
+            first.set_cookie.is_none()
+                && first.retry_after.is_none()
+                && first.extra_headers.is_empty()
+        );
+        let alice_track = ("alice".into(), "track".into(), "Job_A".into());
+        assert!(!h.store.taste_rows.borrow().contains_key(&alice_track));
+        assert_eq!(call(&req, "Job_A").body, first.body);
+        assert!(!h.store.taste_rows.borrow().contains_key(&alice_track));
+        for (user, kind) in [("alice", Release), ("bob", Track)] {
+            assert_eq!(
+                h.store.taste_rows.borrow()[&(user.into(), kind.as_str().into(), "Job_A".into())]
+                    .signal,
+                "love"
+            );
+        }
+        for (signal, until) in [
+            (Dislike, None),
+            (Hide, None),
+            (Ban, None),
+            (Snooze, Some(NOW - 1)),
+        ] {
+            let row = block_on(
+                h.store
+                    .taste_upsert("alice", Track, "Job_A", signal, until, NOW),
+            )
+            .unwrap();
+            assert_eq!(call(&req, "Job_A").body, first.body);
+            assert_eq!(
+                h.store.taste_rows.borrow()[&("alice".into(), "track".into(), "Job_A".into())],
+                row
+            );
+        }
+        block_on(h.store.taste_upsert("alice", Track, mbid, Love, None, NOW)).unwrap();
+        let canonical = call(&req, &mbid.to_ascii_uppercase());
+        assert!(!h.store.taste_rows.borrow().contains_key(&(
+            "alice".into(),
+            "track".into(),
+            mbid.into()
+        )));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&canonical.body).unwrap(),
+            serde_json::json!({"target_id": mbid, "liked": false})
+        );
+        assert_eq!(call(&req, "CaseJob").status, 200);
+        let missing = call(&req, "missing");
+        assert_eq!(missing.status, 404);
+        for target in [
+            "",
+            "bad/path",
+            "é",
+            "Private",
+            "casejob",
+            CAT_RELEASE,
+            &"a".repeat(513),
+        ] {
+            let response = call(&req, target);
+            assert_eq!(
+                (response.status, response.body),
+                (missing.status, missing.body.clone())
+            );
+        }
+        req.cookie = Some(bob);
+        assert_eq!(call(&req, "Private").status, 200);
+        assert_eq!(call(&req, "CaseJob").body, missing.body);
+        req.cookie = Some(alice.clone());
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        for auth in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(auth.into());
+            assert_eq!(call(&req, "Job_A").status, 404);
+        }
+        req.authorization = None;
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(
+            block_on(me_unlike_track(&expired, &req, "Job_A")).status,
+            401
+        );
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Job_A", Love, None, NOW),
+        )
+        .unwrap();
+        let before = h.store.taste_rows.borrow().clone();
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_catalogue_reads.borrow_mut() = false;
+        *h.store.fail_taste_write.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_taste_write.borrow_mut() = false;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req, "Job_A");
+        assert_eq!((raced.status, raced.body), (503, unavailable().body));
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        assert_eq!(call(&req, "Job_A").status, 409);
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
     }
 
     #[test]
