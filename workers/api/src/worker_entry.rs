@@ -35,6 +35,10 @@ use crate::handlers::{
     ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
     QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
+#[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
+#[path = "billing_budget.rs"]
+mod billing_budget;
+
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
