@@ -115,6 +115,148 @@ async fn history_reader_decodes_metered_public_owner_rows() {
 }
 
 #[tokio::test]
+async fn private_play_writer_is_owner_bound_idempotent_and_atomic() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let db = &accounts.observer;
+    let result: Result<(), String> = async {
+        let fresh = || async { Ok::<_, String>(catalogue_store_for_postgres_test(private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)))) };
+        let key = format!("play:{owner}:Track:Play");
+        let other_key = format!("play:{other}:Track:Play");
+        for at in [0, 22] {
+            fresh().await?.mark_private_play(&owner, "Track", &key, at).await.map_err(|_| "mark failed")?;
+        }
+        fresh().await?.mark_private_play(&other, "Track", &other_key, 253_402_300_799).await.map_err(|_| "upper boundary failed")?;
+        let timestamp: i64 = db.query_one("SELECT marked_at FROM public.private_plays WHERE user_id=$1 AND play_key=$2", &[&owner, &key]).await.map_err(|e| e.to_string())?.get(0);
+        if timestamp != 0 { return Err("replay changed timestamp".into()); }
+        let lower = format!("play:{owner}:Track:play");
+        fresh().await?.mark_private_play(&owner, "Track", &lower, 1).await.map_err(|_| "case-sensitive mark failed")?;
+        let count: i64 = db.query_one("SELECT count(*) FROM public.private_plays WHERE user_id=$1 AND play_key IN ($2,$3)", &[&owner, &key, &lower]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 2 { return Err("distinct case keys collapsed".into()); }
+        let missing = format!("{owner}-missing");
+        let missing_key = format!("play:{missing}:Track:Play");
+        for (id, track, candidate, at) in [(&other, "Track", key.as_str(), 1), (&owner, "track", key.as_str(), 1), (&owner, "Track", "play:bad", 1), (&missing, "Track", missing_key.as_str(), 1), (&owner, "Track", key.as_str(), 253_402_300_800)] {
+            if fresh().await?.mark_private_play(id, track, candidate, at).await.is_ok() { return Err("invalid write accepted".into()); }
+        }
+        let failed_key = format!("play:{owner}:Track:rollback");
+        let failing = fresh().await?;
+        let reached = Rc::new(Cell::new(false));
+        let marker = reached.clone();
+        failing.set_preflight_hook("private-play-mark", Box::new(move || Box::pin(async move { marker.set(true); Err(StoreError) })));
+        if failing.mark_private_play(&owner, "Track", &failed_key, 1).await.is_ok() || !reached.get() { return Err("rollback hook not reached".into()); }
+        let count: i64 = db.query_one("SELECT count(*) FROM public.private_plays WHERE user_id=$1 AND play_key=$2", &[&owner, &failed_key]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 0 { return Err("failed write persisted".into()); }
+        db.execute("UPDATE public.users SET deleting_at=now() WHERE id=$1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let unreachable = fresh().await?;
+        let reached = Rc::new(Cell::new(false));
+        let marker = reached.clone();
+        unreachable.set_preflight_hook("private-play-mark", Box::new(move || Box::pin(async move { marker.set(true); Ok(()) })));
+        if unreachable.mark_private_play(&owner, "Track", &key, 1).await.is_ok() || reached.get() { return Err("deleting account reached mutation hook".into()); }
+        db.execute("DELETE FROM public.users WHERE id=$1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let counts = db.query_one("SELECT count(*) FILTER (WHERE user_id=$1), count(*) FILTER (WHERE user_id=$2) FROM public.private_plays", &[&owner, &other]).await.map_err(|e| e.to_string())?;
+        if counts.get::<_, i64>(0) != 0 || counts.get::<_, i64>(1) != 1 { return Err("cascade or owner isolation failed".into()); }
+        let failed = private_client().await?;
+        failed.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
+        let _ = failed.batch_execute("SELECT 1/0").await;
+        let broken = catalogue_store_for_postgres_test(failed, false, Err(StoreError), Rc::new(Cell::new(0)));
+        if !matches!(broken.mark_private_play(&other, "Track", &other_key, 1).await, Err(StoreError)) { return Err("store failure was not opaque".into()); }
+        Ok(())
+    }.await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn private_play_writer_serializes_with_account_deletion() {
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let owner = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let observer = &accounts.observer;
+    let locker = client(false).await;
+    let result: Result<(), String> = async {
+        for deleting in [false, true] {
+            locker
+                .batch_execute("BEGIN")
+                .await
+                .map_err(|e| e.to_string())?;
+            if deleting {
+                locker
+                    .execute(
+                        "UPDATE public.users SET deleting_at=now() WHERE id=$1",
+                        &[&owner],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                locker
+                    .query_one(
+                        "SELECT id FROM public.users WHERE id=$1 FOR UPDATE",
+                        &[&owner],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let locker_pid: i32 = locker
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            let writer = private_client().await?;
+            let writer_pid: i32 = writer
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            let store = catalogue_store_for_postgres_test(
+                writer,
+                false,
+                Err(StoreError),
+                Rc::new(Cell::new(0)),
+            );
+            let key = format!("play:{owner}:Track:race{deleting}");
+            let mark = store.mark_private_play(&owner, "Track", &key, 1);
+            tokio::pin!(mark);
+            blocker_observer::observe_blocked(observer, locker_pid, writer_pid, mark.as_mut())
+                .await?;
+            let unrelated = catalogue_store_for_postgres_test(
+                private_client().await?,
+                false,
+                Err(StoreError),
+                Rc::new(Cell::new(0)),
+            );
+            unrelated
+                .mark_private_play(&other, "Track", &format!("play:{other}:Track:race"), 1)
+                .await
+                .map_err(|_| "unrelated writer blocked")?;
+            locker
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|e| e.to_string())?;
+            if mark.await.is_ok() == deleting {
+                return Err("wrong outcome after lock release".into());
+            }
+            let count: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM public.private_plays WHERE user_id=$1 AND play_key=$2",
+                    &[&owner, &key],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            if count != i64::from(!deleting) {
+                return Err("wrong persisted race outcome".into());
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let _ = locker.batch_execute("ROLLBACK").await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn private_session_active_observes_owner_and_server_time() {
     let accounts = disposable_accounts::Accounts::new(2).await;
     let owner = accounts.id(0).to_owned();

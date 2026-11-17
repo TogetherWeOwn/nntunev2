@@ -26,6 +26,14 @@ pub fn taste_delete_statement() -> &'static str {
     "WITH writer_fence AS MATERIALIZED (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE), deleted AS (DELETE FROM public.account_taste AS taste USING writer_fence WHERE taste.user_id = writer_fence.id AND taste.kind = $2 AND taste.target_id = $3 AND (NOT $4 OR taste.signal = 'love') RETURNING 1) SELECT EXISTS (SELECT 1 FROM deleted) FROM writer_fence"
 }
 
+/// Inert exact-owner idempotent mark, adapted from the private-play writer in
+/// PR #982. The account fence yields no row for a missing or deleting owner;
+/// a replay inserts nothing and keeps the first mark. A mark is never
+/// authority to issue a grant.
+pub fn private_play_mark_statement() -> &'static str {
+    "WITH writer_fence AS MATERIALIZED (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE), inserted AS (INSERT INTO public.private_plays (user_id, play_key, marked_at) SELECT id, $2, $3 FROM writer_fence ON CONFLICT (user_id, play_key) DO NOTHING RETURNING 1) SELECT EXISTS (SELECT 1 FROM inserted) FROM writer_fence"
+}
+
 /// Observation only: activation must recheck after acquiring the account fence.
 pub fn private_session_active_statement() -> &'static str {
     "SELECT EXISTS (SELECT 1 FROM public.private_sessions WHERE user_id = $1 AND session_id = $2 AND expires_at > EXTRACT(EPOCH FROM statement_timestamp())) FROM public.users WHERE id = $1 AND deleting_at IS NULL AND char_length($2) BETWEEN 1 AND 128"
