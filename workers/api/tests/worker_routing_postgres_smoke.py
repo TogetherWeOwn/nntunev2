@@ -134,7 +134,7 @@ def check_ping(status, ctype, body):
           "unauthenticated /rest/ping must fail")
 
 
-def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
+def psql(s, db, sql=None, stdin=None, tuples=False, *, timeout=300, **variables):
     args = [shutil.which("psql") or "psql", "-h", s["host"], "-p", s["port"], "-U", s["user"],
             "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db]
     args += ["-A", "-t"] if tuples else []
@@ -143,7 +143,7 @@ def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
     args += ["-c", sql] if sql is not None else []
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": s["password"],
            "PGOPTIONS": "-c search_path=public,pg_catalog", "PGCONNECT_TIMEOUT": "10"}
-    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=300)
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=timeout)
     check(p.returncode == 0, f"psql failed: {p.stderr.strip()[:300]}")
     return p.stdout.strip()
 
