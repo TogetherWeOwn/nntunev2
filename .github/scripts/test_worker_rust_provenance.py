@@ -3,6 +3,7 @@
 import hashlib
 import io
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -452,6 +453,23 @@ class RustPin(unittest.TestCase):
             for invalid in ({}, {"../external": "x"}, {"/external": "x"}):
                 with self.assertRaises(ValueError):
                     wt.verify_host_component_files(root, invalid)
+
+    def test_candidate_boundary_refuses_even_with_claimed_provenance(self):
+        script = str(Path(wt.__file__).resolve())
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "std.tar.xz"
+            for content in (None, b"claimed provenance", b"changed provenance"):
+                with self.subTest(content=content):
+                    if content is not None:
+                        archive.write_bytes(content)
+                    result = subprocess.run(
+                        [sys.executable, script, "verify-candidate-boundary"],
+                        env={**os.environ, "RUST_STD_ARCHIVE": str(archive)},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("candidate WASM boundary unproved", result.stderr)
+                    self.assertEqual(result.stdout, "")
 
     def test_source_refuses_tampered_manifest(self):
         with self.assertRaises(ValueError):
