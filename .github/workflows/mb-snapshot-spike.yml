@@ -47,7 +47,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WRANGLER_VERSION: 4.159.0
+  WRANGLER_VERSION: 4.162.0
   RUST_IMAGE: rust:1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8
   PG_IMAGE: postgres:18-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
 

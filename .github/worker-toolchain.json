@@ -25,9 +25,9 @@
     "sha256": "195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572"
   },
   "runtime": {
-    "wrangler": "4.159.0",
-    "miniflare": "5.20261109.0-beta",
-    "workerd": "1.20261109.1",
+    "wrangler": "4.162.0",
+    "miniflare": "5.20261113.0-beta",
+    "workerd": "1.20261113.1",
     "esbuild": "0.28.2"
   },
   "esbuild-npm": {
