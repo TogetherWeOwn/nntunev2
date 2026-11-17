@@ -77,6 +77,47 @@ alone is neither necessary nor sufficient for that conclusion. The candidate's
 `__heap_end` alignment has not been established, nor have all later segment
 and coalescing invariants. Until those branches are proved or excluded, the
 alignment invariant and this charge remain provisional.
+The specific unresolved branch is successful linker donation: `wasm.rs`
+`preexisting_chunk_from_linker` returns `(__heap_base, __heap_end - __heap_base)`
+when the nonzero ordered range is large enough, and `try_donate_preexisting`
+returns it at most once (lines 17–31, 39–48, 88–98). No rounding or runtime
+check of `__heap_end` occurs on that branch. The canonical manifest pins the
+compiler, target and source archives, but is not itself a constraint on that
+symbol in a linked candidate. As conditional linker evidence, upstream LLVM
+22.1.8's wasm linker [rounds the final memory pointer to the configured page
+size and assigns it to `__heap_end`](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/lld/wasm/Writer.cpp#L430-L477).
+Its [page-size option](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/lld/wasm/Driver.cpp#L639-L644)
+accepts both 65536 and 1: the former suffices, the latter does not establish
+this alignment. The installed compiler reports LLVM 22.1.8, but that does not
+bind the actual candidate linker to this upstream source or its effective
+options. The candidate needs linker identity, options, symbol resolution and
+artifact binding, or another proof of the condition. If donation is not taken,
+`memory_grow` returns 64 KiB-page multiples; even its final-address-space
+adjustment subtracts 16 bytes (lines 50–74, 121–123), preserving eight-byte
+alignment.
+
+The later paths have the following conditional induction, not an independent
+base case (all line references below are to `dlmalloc.rs`):
+
+- Contiguous extension of the segment containing top adds `tsize` to both
+  segment and top sizes before `init_top` (lines 415–427). Growth sizes above
+  preserve an aligned top size; they do not repair an unaligned one.
+- A prepended segment (`sys_alloc` lines 430–438) aligns both new and old
+  first chunk addresses. `prepend_alloc` computes their difference less `nb`
+  and merges that remainder with top, the designated victim, or a free chunk
+  (lines 745–777). Those additions preserve alignment only if the merged
+  chunk already has it.
+- A noncontiguous segment becomes top through `add_segment` and `init_top`
+  (lines 787–813). Page-grown segment ends satisfy the same end-alignment
+  condition. The old top's binned portion is the difference of aligned chunk
+  addresses, or there is no such portion (lines 799–804, 837–844).
+- `free` coalesces with the previous boundary-tag chunk, then with top,
+  designated victim, or the next ordinary free chunk before binning
+  (lines 1211–1283). Aligned sizes remain aligned under these additions;
+  this cannot establish alignment when an earlier segment did not have it.
+  The WASM system allocator refuses partial and whole releases (`wasm.rs`
+  lines 105–114), so those release operations cannot alter this argument.
+
 The small-bin exact/next-bin path
 (lines 278–291) returns a chunk
 of `nb` or `nb + 8`; a larger small bin is split to `nb`. Both tree-bin
