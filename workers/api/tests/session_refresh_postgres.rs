@@ -247,7 +247,7 @@ async fn production_lease_connection_seam_and_adapter() {
         acquire_playback_lease_on, session_retry_store_for_postgres_test,
     };
 
-    let accounts = disposable_accounts::Accounts::new(1).await;
+    let accounts = disposable_accounts::Accounts::new(2).await;
     let user = accounts.id(0);
     let mut db = lease_connection().await;
     let tx = db.transaction().await.unwrap();
@@ -327,7 +327,7 @@ async fn production_lease_connection_seam_and_adapter() {
             .is_err()
     );
     db.execute(
-        "UPDATE public.users SET deleting_at=1 WHERE id=$1",
+        "UPDATE public.users SET deleting_at=now() WHERE id=$1",
         &[&user],
     )
     .await
@@ -351,6 +351,21 @@ async fn production_lease_connection_seam_and_adapter() {
             row.get::<_, i64>(5)
         ),
         ("s3".into(), "t4".into(), "p4".into(), 4, 110, 66)
+    );
+    let deleted_user = accounts.id(1);
+    db.execute(
+        "UPDATE public.users SET deleting_at=now() WHERE id=$1",
+        &[&deleted_user],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&db, deleted_user, "s1", "t1", "p1", 1, 50, false)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 0
+        }
     );
     let store = session_retry_store_for_postgres_test(lease_connection().await);
     assert!(store
