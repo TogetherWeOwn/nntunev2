@@ -289,7 +289,8 @@ class RustPin(unittest.TestCase):
 
     def test_ledger_build_uses_verified_paths_and_refuses_reused_target(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env = {"RUNNER_TEMP": tmp}
+            env = {"RUNNER_TEMP": tmp, "HOME": tmp, "RUSTUP_TOOLCHAIN": wt.load_pins()["rust"]["version"],
+                   "PATH": "/untrusted", "UNRELATED_BUILD_INPUT": "injected"}
             rustc, cargo = Path("/pinned/bin/rustc"), Path("/pinned/bin/cargo")
             artifact = Path(tmp) / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
             calls = []
@@ -307,7 +308,11 @@ class RustPin(unittest.TestCase):
                                               "workers/api/Cargo.toml", "--target", "wasm32-unknown-unknown",
                                               "--features", "staging-body-wasm-test,ledger-wasm-test",
                                               "--target-dir", str(Path(tmp) / "ledger-target")])
-                self.assertEqual(calls[0][1]["env"]["RUSTC"], str(rustc))
+                child = calls[0][1]["env"]
+                self.assertEqual(child["RUSTC"], str(rustc))
+                self.assertEqual(child["PATH"], "/usr/bin:/bin")
+                self.assertNotIn("UNRELATED_BUILD_INPUT", child)
+                self.assertEqual(verify.call_args.args[0], {k: v for k, v in child.items() if k != "RUSTC"})
                 with self.assertRaisesRegex(ValueError, "must not already exist"):
                     wt.build_ledger(env, run=run)
                 self.assertEqual(verify.call_count, 1)
@@ -316,7 +321,17 @@ class RustPin(unittest.TestCase):
         with patch.object(wt, "require_actions"), \
              patch.object(wt, "verify_rust_boundary", side_effect=ValueError("bad provenance")):
             with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "bad provenance"):
-                wt.build_ledger({"RUNNER_TEMP": tmp}, run=lambda *args, **kwargs: self.fail("build ran"))
+                wt.build_ledger({"RUNNER_TEMP": tmp, "HOME": tmp, "RUSTUP_TOOLCHAIN": "1.98.1"},
+                                run=lambda *args, **kwargs: self.fail("build ran"))
+
+    def test_ledger_refuses_override_before_verification_or_build(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(wt, "require_actions"), \
+             patch.object(wt, "verify_rust_boundary") as verify:
+            for key in ("RUSTFLAGS", "LD_PRELOAD", "CARGO_BUILD_TARGET"):
+                env = {"RUNNER_TEMP": tmp, "HOME": tmp, "RUSTUP_TOOLCHAIN": "1.98.1", key: "injected"}
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                    wt.build_ledger(env, run=lambda *args, **kwargs: self.fail("build ran"))
+            verify.assert_not_called()
 
     def test_candidate_verification_refuses_changed_lock_before_toolchain_probe(self):
         pins = wt.load_pins()

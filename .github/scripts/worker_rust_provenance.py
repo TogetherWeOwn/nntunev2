@@ -322,10 +322,17 @@ def build_ledger(env=os.environ, dl=download, run=subprocess.run) -> None:
         raise ValueError("RUNNER_TEMP must be absolute")
     if os.path.lexists(temp / "ledger-target"):
         raise ValueError("ledger target directory must not already exist")
-    rustc, cargo = verify_rust_boundary(env, dl, run)
+    # Reject known overrides before constructing a minimal child environment.
+    # Host executables and loader inputs are still trusted, not authenticated.
+    rust_env_refusals(env, load_pins()["rust"]["version"])
+    cargo_config_refusals(env)
+    child = {key: env[key] for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
+                                       "RUST_STD_ARCHIVE") if key in env}
+    child.update({"PATH": "/usr/bin:/bin", "CARGO_INCREMENTAL": "0"})
+    rustc, cargo = verify_rust_boundary(child, dl, run)
     run([str(cargo), "build", "--locked", "--release", "--manifest-path", "workers/api/Cargo.toml",
          "--target", "wasm32-unknown-unknown", "--features", "staging-body-wasm-test,ledger-wasm-test",
-         "--target-dir", str(temp / "ledger-target")], check=True, cwd=ROOT, env={**env, "RUSTC": str(rustc)})
+         "--target-dir", str(temp / "ledger-target")], check=True, cwd=ROOT, env={**child, "RUSTC": str(rustc)})
     artifact = temp / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
     print(f"synthetic ledger wasm sha256 {hashlib.sha256(artifact.read_bytes()).hexdigest()}", flush=True)
 

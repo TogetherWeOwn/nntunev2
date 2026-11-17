@@ -110,12 +110,16 @@ Reliance on allocator symbol names in the final bundle requires proof that the
 build preserves those names; stripped names cannot prove absence.
 The synthetic ledger CI build checks installed host components against the pinned
 channel archives and invokes the verified Cargo and compiler paths with a fresh
-output directory, then logs the resulting WASM digest. This is not a build
-certificate: extra loader inputs and changes between checking and use remain
-unaddressed, and the digest alone does not bind all build inputs to those bytes.
-Candidate provenance must cover the actual compiler and build inputs as well as
-the output, under an explicit trusted build environment. No candidate artifact
-identity is claimed here.
+output directory, then logs the resulting WASM digest. Its probes and build use
+a minimal environment rather than inheriting arbitrary runner variables, and
+known compiler and loader overrides are refused before verification. This is not
+a build certificate: `/usr/bin` tools, dynamic loader inputs, dependency sources
+and build scripts remain outside an authenticated, immutable build environment;
+files may also change between checking and use. The digest alone does not bind
+those inputs to the bytes. The ordinary candidate build is a different path and
+has no coupled compiler, allocator, configuration and artifact evidence. Until
+that boundary is established and the allocator argument is complete, nonempty
+admission remains closed; no candidate artifact identity is claimed here.
 
 Dispatch clones, response Value trees, rendering, database collection, and
 platform buffers require their own accounting. This inventory alone does not
