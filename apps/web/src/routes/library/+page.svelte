@@ -1141,9 +1141,12 @@
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
 		playEpoch += 1;
-		// Direct selection always changes the current source (reselecting
-		// the current row returned above), so restart state resets here.
-		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
+		const before = queueCurrentTrack(queue);
+		const after = queueCurrentTrack(selected);
+		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			pendingShareSeek = null;
+		}
+		resetRestartOnSourceChange(before, after);
 		queue = selected;
 		syncMiniPlayerHint(selected);
 		const title = target.title?.trim() ? target.title : target.id;

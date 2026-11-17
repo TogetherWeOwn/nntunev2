@@ -139,6 +139,29 @@ test('a new same-source share navigation supersedes an earlier restart marker', 
 	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral']);
 });
 
+test('direct queue selection retires a pending share adjustment across a round trip', async () => {
+	const { page, media, location, writes } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(writes).toEqual([45]);
+	expect(page.read().pendingShareSeek).not.toBeNull();
+
+	page.select(0);
+	page.select(-1);
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	page.select(1);
+	expect(page.read().pendingShareSeek).toBeNull();
+	page.select(0);
+	media.position = 12;
+	media.duration = 20;
+	page.applyPendingShareSeek();
+	expect(media.position).toBe(12);
+	expect(writes).toEqual([45]);
+});
+
 test('a jump readout clears on a same-source share and on a source change', async () => {
 	const { page, media, location } = restartFixture();
 	page.jump('forward');
