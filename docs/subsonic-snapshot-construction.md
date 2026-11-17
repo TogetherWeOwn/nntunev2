@@ -57,10 +57,11 @@ four-field `Chunk` is 16 bytes (`Chunk`, lines 61–67), `malloc_alignment` is
 8 and `chunk_overhead` is 4 (lines 145–152). `min_chunk_size` aligns the
 chunk size to eight (lines 174–176), and `pad_request` aligns the request plus
 the overhead (lines 202–204). Thus `request2size` selects
-`max(16, align_up(requested + 4, 8))` (lines 179–181, 247–253). Chunk sizes
-and split remainders are multiples of eight: small-bin indices encode multiples
-of eight (lines 50, 206–212), and the tree and designated-victim split paths
-subtract the aligned request from an aligned free chunk. The latter relies on
+`max(16, align_up(requested + 4, 8))` (lines 179–181, 247–253). Small-bin
+indices encode multiples of eight (lines 50, 206–212), and the tree and
+designated-victim split paths subtract the aligned request from a free chunk.
+The resulting remainder is a multiple of eight only if that chunk is aligned;
+this relies on
 the allocator's chunk invariants, including those maintained by free and
 coalescing; a debug assertion by itself is not an independent proof. In
 particular, the linker-provided initial heap path (`wasm.rs` lines 17–31,

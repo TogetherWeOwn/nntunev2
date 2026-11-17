@@ -147,6 +147,10 @@ mod logging_tests {
     }
 }
 
+// Test-only real-workerd span probe; absent unless `span-runtime-test` is on.
+#[cfg(all(target_arch = "wasm32", feature = "span-runtime-test"))]
+mod span_runtime_probe;
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
@@ -170,7 +174,14 @@ mod ledger_wasm_test {
 
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
-#[cfg(not(all(target_arch = "wasm32", feature = "staging-body-wasm-test")))]
+#[cfg(not(all(
+    target_arch = "wasm32",
+    any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    )
+)))]
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,
@@ -187,6 +198,26 @@ pub async fn main(
         return subsonic_response(&mut req).await;
     }
     worker_entry::dispatch(req, env).await
+}
+
+// This entry exists only in the separately bundled runtime-test Worker.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[worker::event(fetch)]
+pub async fn billing_owned_test_entry(
+    _req: worker::Request,
+    _env: worker::Env,
+    _ctx: worker::Context,
+) -> worker::Result<worker::Response> {
+    if !billing_owned_socket::test_empty_guard_drop() {
+        return worker::Response::error("empty guard drop failed", 500);
+    }
+    if let Err(message) = billing_owned_socket::test_drive_owned() {
+        return worker::Response::error(message, 500);
+    }
+    match billing_owned_socket::test_worker_timer().await {
+        Ok(()) => worker::Response::ok("owned-drive-ok:4"),
+        Err(message) => worker::Response::error(message, 500),
+    }
 }
 
 /// True when this request targets the Subsonic `/rest/*` surface.

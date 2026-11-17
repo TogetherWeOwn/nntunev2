@@ -47,4 +47,5 @@ for f in "${tests[@]}"; do
     -v audio_manifest_store_sql="$(<"$root/workers/ingest/src/audio_manifest_store.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
+bash "$root/workers/api/tests/storage_digest_reservation_race.sh"
 echo "migration tests passed"

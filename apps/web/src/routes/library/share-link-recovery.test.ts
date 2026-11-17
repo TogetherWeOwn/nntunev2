@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
+import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { loadRecentFinds } from '#lib/library/recent-finds.js';
@@ -46,6 +48,8 @@ function pageScript(search: string) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
+		createQueueShare,
+		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
