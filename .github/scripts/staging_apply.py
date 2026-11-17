@@ -317,10 +317,9 @@ def validate_ledger_audit(entries, rows, cutoff):
         if identity is None or identity[1] != digest or identity[0] in seen:
             raise StagingApplyError("ledger audit does not match manifest")
         seen.add(identity[0])
-        # The writer accepts broader text than the public receipt can safely render.
-        actor = applied_by if re.fullmatch(r"[A-Za-z0-9_.@+: ()-]+", applied_by) else "[redacted]"
+        # Actor text is unrestricted and must not cross the evidence boundary.
         records.append(dict(zip(("file", "sha256", "applied_at", "applied_by"),
-                                (filename, digest, applied_at, actor))))
+                                (filename, digest, applied_at, "[redacted]"))))
     if len(seen) != len(expected):
         raise StagingApplyError("ledger audit does not match manifest")
     return records

@@ -42,7 +42,7 @@ jobs:
       actions: read # Nested OSV reads same-run comparison artifacts.
       contents: read
       security-events: write # Nested OSV uploads comparison SARIF.
-    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@c05610872587137c3c492b7025f02585a1b8ba7d # v0.11.0
 
   rust-test:
     name: rust test (native)
@@ -173,6 +173,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test advisory expiry guard
+        run: python3 .github/scripts/test_check_advisory_expiry.py
+      - name: Enforce advisory expiry
+        run: python3 .github/scripts/check_advisory_expiry.py
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
@@ -1343,9 +1347,9 @@ jobs:
     name: e2e-lint
     runs-on: ubuntu-latest
     # Preinstalled browsers + OS libraries avoid per-job apt mirror stalls.
-    # v1.65.0-noble image index verified 2026-11-16. Re-pin with
+    # v1.65.1-noble image index verified 2026-11-17. Re-pin with
     # e2e/package-lock.json; the offline image test rejects version drift.
-    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
+    container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1574,7 +1578,7 @@ jobs:
     # setup/headroom. Re-measure when the reported suite exceeds
     # 25 minutes or the test count passes ~1,800; re-pin the container
     # with the web lock; test_ci_web_e2e_timeout.py pins this value.
-    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
+    container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 45
     defaults:
       run:
@@ -1681,7 +1685,7 @@ jobs:
   history-fixture:
     name: history-fixture
     runs-on: ubuntu-latest
-    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
+    container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
       run:
@@ -1727,7 +1731,7 @@ jobs:
   web-a11y:
     name: web-a11y
     runs-on: ubuntu-latest
-    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
+    container: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
     timeout-minutes: 15
     defaults:
       run:

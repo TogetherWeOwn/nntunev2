@@ -32,7 +32,7 @@ spec.loader.exec_module(fixture)
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
 MANIFEST = ROOT / "migrations/manifest.toml"
-WRANGLER_VERSION = "4.159.0"
+WRANGLER_VERSION = "4.162.0"
 RP_ID = "example.test"
 ORIGIN = f"https://{RP_ID}"
 IDENT = re.compile(r"[A-Za-z0-9_]+")
@@ -134,7 +134,7 @@ def check_ping(status, ctype, body):
           "unauthenticated /rest/ping must fail")
 
 
-def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
+def psql(s, db, sql=None, stdin=None, tuples=False, *, timeout=300, **variables):
     args = [shutil.which("psql") or "psql", "-h", s["host"], "-p", s["port"], "-U", s["user"],
             "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db]
     args += ["-A", "-t"] if tuples else []
@@ -143,7 +143,7 @@ def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
     args += ["-c", sql] if sql is not None else []
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": s["password"],
            "PGOPTIONS": "-c search_path=public,pg_catalog", "PGCONNECT_TIMEOUT": "10"}
-    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=300)
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=timeout)
     check(p.returncode == 0, f"psql failed: {p.stderr.strip()[:300]}")
     return p.stdout.strip()
 

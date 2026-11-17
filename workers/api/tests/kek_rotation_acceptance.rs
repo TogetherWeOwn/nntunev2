@@ -1,5 +1,4 @@
 use nntune_api::vault::{decrypt_vault, encrypt_vault, rewrap_dek, VaultBlob};
-use rand::RngCore;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection};
 use std::fs;
@@ -16,9 +15,7 @@ const PER_VERSION_PROGRESS_QUERY: &str = "SELECT kek_version, COUNT(*) AS row_co
 const CONDITIONAL_REWRAP_UPDATE: &str = "UPDATE provider_vaults\n      SET kek_version = $new, dek_wrapped = $w,\n          dek_wrapped_nonce = $n, updated_at = $now,\n          rewrapped_at = $now\n    WHERE user_id = $u AND kek_version = $old\n      AND dek_wrapped = $captured_wrapped\n      AND dek_wrapped_nonce = $captured_wrapped_nonce;";
 
 fn random_test_key() -> [u8; 32] {
-    let mut key = [0; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    key
+    rand::random()
 }
 
 fn test_only_kek_by_version(
