@@ -21,12 +21,13 @@ export function createQueueController(initial: QueueState) {
 		get revision() { return revision.revision; },
 		subscribe: store.subscribe,
 		begin(next: QueueState, kind: QueueCommitKind): number {
+			if (kind === 'replace' && next === snapshot) return operation;
 			const receipt = ++operation;
-			if (kind !== 'replace' || next !== snapshot) revision.revoke();
+			revision.revoke();
 			return receipt;
 		},
 		publish(next: QueueState, receipt: number): void {
-			if (!isCurrentOperation(receipt)) return;
+			if (!isCurrentOperation(receipt) || snapshot === next) return;
 			snapshot = next;
 			store.set(next);
 		},

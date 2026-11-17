@@ -300,6 +300,47 @@ test('reentrant replacement prevents the superseded play attempt', async () => {
 	unsubscribe();
 });
 
+test('a clear subscriber invoking the share handler leaves the share selection and pending seek final', () => {
+	const { page, media, location } = restartFixture();
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	let reacted = 0;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) { reacted += 1; page.applyShareLink(); }
+	});
+	const version = page.read().queueAnnouncementVersion;
+	page.clear();
+	const after = page.read();
+	expect(reacted).toBe(1);
+	expect(after.queue.tracks.map((track) => track.id)).toEqual(['coral']);
+	expect(currentTrack(after.queue)?.id).toBe('coral');
+	expect(after.pendingShareSeek).toMatchObject({ trackId: 'coral', streamUrl: '/test-audio/coral', seconds: 45 });
+	expect(after.queueAnnouncement).toBe('');
+	expect(after.queueAnnouncementVersion).toBe(version);
+	unsubscribe();
+});
+
+test('a selection subscriber replacing with the same object delivers once and still starts playback', async () => {
+	const { page, element } = restartFixture();
+	const pine = { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' };
+	page.replaceQueue({ tracks: [pine, { id: 'coral', title: 'Coral Night', artist: '', streamUrl: '' }], currentIndex: 0 });
+	let plays = 0, deliveries = 0, replaced = 0;
+	element.play = () => { plays += 1; return Promise.resolve(); };
+	const unsubscribe = page.subscribe((value) => {
+		deliveries += 1;
+		if (value.currentIndex === 1) { replaced += 1; page.replaceQueue(value); }
+	});
+	await page.playQueued('coral');
+	// One initial delivery plus the single selection; the same-object replace publishes nothing.
+	expect(deliveries).toBe(2);
+	expect(replaced).toBe(1);
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(plays).toBe(1);
+	expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
+	expect(page.read().queueAnnouncementVersion).toBe(1);
+	unsubscribe();
+});
+
 test.each(['move', 'remove', 'clear', 'select', 'trimPrevious', 'trimUpcoming'] as const)(
 	'%s publishes its real caller policy', (mode) => {
 		const { page, media, location, track } = restartFixture();

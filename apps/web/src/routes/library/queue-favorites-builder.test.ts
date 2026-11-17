@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
+import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
@@ -59,12 +59,13 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		${compiled}
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
-			replaceQueue, subscribe: queueController.subscribe,
+			replaceQueue, commitQueue, subscribe: queueController.subscribe,
 			read: () => ({ queue, announcement: queueAnnouncement })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;
 		replaceQueue: (queue: QueueState) => boolean;
+	commitQueue: (queue: QueueState, kind: 'clear') => boolean;
 		subscribe: (callback: (queue: QueueState) => void) => () => void;
 		read: () => { queue: QueueState; announcement: string };
 	};
@@ -135,4 +136,19 @@ test('repeated activation replaces the outcome and does not duplicate or reorder
 	page.queueAll();
 	expect(page.read().queue).toBe(queued);
 	expect(page.read().announcement).toMatch(/^queued 0.*2 already queued/i);
+});
+
+test('a clear subscriber running multi-row queueFavorites leaves its queue and count final', () => {
+	const original = createQueue([{ id: 'other', title: 'Other', artist: '', streamUrl: '' }]);
+	const page = pageActions(['mike', 'zulu', 'alpha'], original, 'Earlier outcome');
+	let reacted = 0;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) { reacted += 1; page.queueAll(); }
+	});
+	expect(page.commitQueue(clearQueue(original), 'clear')).toBe(false);
+	expect(reacted).toBe(1);
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['mike', 'zulu', 'alpha']);
+	expect(page.read().queue.currentIndex).toBe(0);
+	expect(page.read().announcement).toMatch(/^queued 3 favorites, 0 already queued/i);
+	unsubscribe();
 });
