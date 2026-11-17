@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { createQueueRevision } from '#lib/player/queueRevision.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
@@ -239,8 +240,7 @@
 	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
-	// Bumped by every queue edit; fences late play-from-top outcomes.
-	let playEpoch = 0;
+	const queueRevision = createQueueRevision();
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -698,12 +698,12 @@
 
 	/** One explicit playback attempt; queue edits and newer plays fence its result. */
 	async function playSelectedTrack(target: Track, source: string, suffix = ''): Promise<void> {
-		const epoch = ++playEpoch;
+		const receipt = queueRevision.revoke();
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (source) {
 			await tick();
-			if (epoch !== playEpoch) return;
+			if (!queueRevision.isCurrent(receipt)) return;
 			const element = audioEl;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			if (element) {
@@ -714,7 +714,7 @@
 					// Selected-but-paused is the truthful fallback; no retry.
 				}
 			}
-			if (epoch !== playEpoch) return;
+			if (!queueRevision.isCurrent(receipt)) return;
 		}
 		queueAnnouncement = suffix ? `${lead} ${suffix}` : lead;
 		queueAnnouncementVersion += 1;
@@ -754,7 +754,7 @@
 	}
 
 	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): void {
-		if (kind !== 'replace' || next !== queue) playEpoch += 1;
+		if (kind !== 'replace' || next !== queue) queueRevision.revoke();
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if ((kind === 'replace' || kind === 'select') &&
@@ -1803,6 +1803,7 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			queueRevision.destroy();
 			queueShare.dispose();
 			endGeneration += 1;
 			playingElement = null;
