@@ -56,9 +56,14 @@ class RustPin(unittest.TestCase):
             std = {"a.rlib": hashlib.sha256(b"a").hexdigest()}
             wt.verify_rust_toolchain(pins, env, self.fake_run(root), std, Path(tmp))
             for run in (self.fake_run(root, commit="0" * 40), self.fake_run(root, release="1.98.0"),
-                        self.fake_run(Path(tmp) / "stable-x86_64-unknown-linux-gnu")):
+                        self.fake_run(Path(tmp) / "stable-x86_64-unknown-linux-gnu"),
+                        self.fake_run(Path(root.name))):
                 with self.assertRaises(ValueError):
                     wt.verify_rust_toolchain(pins, env, run, std, Path(tmp))
+            alias = Path(tmp) / "linked-parent"
+            alias.symlink_to(Path(tmp), target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verify_rust_toolchain(pins, env, self.fake_run(alias / root.name), std, Path(tmp))
 
     def test_toolchain_probes_use_validated_environment(self):
         pins = wt.load_pins()
@@ -81,6 +86,9 @@ class RustPin(unittest.TestCase):
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS": "x"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "CARGO_INCREMENTAL": "1"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTC_WRAPPER": "w"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "LD_PRELOAD": "/tmp/library.so"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "LD_LIBRARY_PATH": "/tmp/lib"},
+                    {"RUSTUP_TOOLCHAIN": "1.98.1", "DYLD_INSERT_LIBRARIES": "/tmp/library.dylib"},
                     {"RUSTUP_TOOLCHAIN": "1.98.1", "RUSTUP_DIST_SERVER": "x", "RUSTUP_UPDATE_ROOT": "x"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 wt.rust_env_refusals(bad, "1.98.1")
@@ -245,6 +253,84 @@ class RustPin(unittest.TestCase):
                 wt.tar_files(archive(entries), "lib/", 3)
         self.assertEqual(wt.tar_files(archive([("a", regular, b"a")]), "lib/", 3),
                          {"a": hashlib.sha256(b"a").hexdigest()})
+
+    def test_host_component_digests_require_pinned_manifest_and_archives(self):
+        pins = wt.load_pins()
+        rust = pins["rust"]
+        version, host = rust["version"], rust["host"]
+        archives = {}
+        paths = {"rustc": "bin/rustc", "cargo": "bin/cargo",
+                 "rust-std": f"lib/rustlib/{host}/lib/libstd.rlib"}
+        for name, path in paths.items():
+            component = f"rust-std-{host}" if name == "rust-std" else name
+            prefix = f"{name}-{version}-{host}/{component}/"
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w:xz") as bundle:
+                entry = tarfile.TarInfo(prefix + path)
+                entry.size = len(name)
+                bundle.addfile(entry, io.BytesIO(name.encode()))
+                metadata = tarfile.TarInfo(prefix + "manifest.in")
+                metadata.size = len(name)
+                bundle.addfile(metadata, io.BytesIO(name.encode()))
+            archives[name] = output.getvalue()
+        manifest = "".join(
+            f'[pkg.{name}]\ngit_commit_hash = "{rust["commit"]}"\n'
+            f'[pkg.{name}.target.{host}]\nxz_hash = "{hashlib.sha256(archives[name]).hexdigest()}"\n'
+            for name in paths
+        ).encode()
+        rust["channel-manifest"]["sha256"] = hashlib.sha256(manifest).hexdigest()
+        result = wt.host_component_files(pins, manifest, archives)
+        self.assertEqual(set(result), set(paths.values()))
+        with self.assertRaises(ValueError):
+            wt.host_component_files(pins, manifest + b" ", archives)
+        for name in paths:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                wt.host_component_files(pins, manifest, {**archives, name: b"tampered"})
+        with self.assertRaises(ValueError):
+            wt.host_component_files(pins, manifest, {"rustc": archives["rustc"]})
+        with self.assertRaises(ValueError):
+            wt.host_component_files(pins, manifest, {**archives, "extra": b""})
+
+    def test_host_files_must_match_and_cannot_follow_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "toolchain"
+            binary = root / "bin/rustc"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"rustc")
+            expected = {"bin/rustc": hashlib.sha256(b"rustc").hexdigest()}
+            wt.verify_host_component_files(root, expected)
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verify_host_component_files(alias, expected)
+            parent_alias = Path(tmp) / "parent-alias"
+            parent_alias.symlink_to(Path(tmp), target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verify_host_component_files(parent_alias / root.name, expected)
+            with self.assertRaises(ValueError):
+                wt.verify_host_component_files(Path("relative"), expected)
+            binary.write_bytes(b"changed")
+            with self.assertRaises(ValueError):
+                wt.verify_host_component_files(root, expected)
+            binary.unlink()
+            with self.assertRaises(ValueError):
+                wt.verify_host_component_files(root, expected)
+            external = Path(tmp) / "external"
+            external.write_bytes(b"rustc")
+            binary.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verify_host_component_files(root, expected)
+            binary.unlink()
+            binary.parent.rmdir()
+            external_dir = Path(tmp) / "external-bin"
+            external_dir.mkdir()
+            (external_dir / "rustc").write_bytes(b"rustc")
+            binary.parent.symlink_to(external_dir, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verify_host_component_files(root, expected)
+            for invalid in ({}, {"../external": "x"}, {"/external": "x"}):
+                with self.assertRaises(ValueError):
+                    wt.verify_host_component_files(root, invalid)
 
     def test_source_refuses_tampered_manifest(self):
         with self.assertRaises(ValueError):

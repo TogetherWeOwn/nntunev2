@@ -27,7 +27,9 @@ RUST_ENV_EXACT = {"RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_
                   "CARGO_BUILD_RUSTDOCFLAGS", "CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR",
                   "CARGO_UNSTABLE_BUILD_STD", "CARGO", "RUSTUP_HOME_OVERRIDE",
                   "RUSTUP_DIST_SERVER", "RUSTUP_UPDATE_ROOT"}
-RUST_ENV_PREFIXES = ("CARGO_TARGET_", "CARGO_PROFILE_", "CARGO_UNSTABLE_", "CARGO_BUILD_")
+# Loader overrides can replace code even when the compiler files match the pins.
+RUST_ENV_PREFIXES = ("CARGO_TARGET_", "CARGO_PROFILE_", "CARGO_UNSTABLE_", "CARGO_BUILD_",
+                     "LD_", "DYLD_")
 RUST_ENV_ALLOWED = {"CARGO_BUILD_JOBS"}
 
 
@@ -107,6 +109,64 @@ def tar_files(archive: bytes, prefix: str, limit: int) -> dict:
     return found
 
 
+def host_component_files(pins: dict, manifest_bytes: bytes, archives: dict) -> dict:
+    """Derive host component digests only from the pinned channel and archives.
+
+    This is not yet a build certificate: callers must also bind these files to
+    the executables actually used and to the resulting artifact.
+    """
+    rust = pins["rust"]
+    manifest = tomllib.loads(verified(manifest_bytes, rust["channel-manifest"]["sha256"]).decode())
+    if set(archives) != {"rustc", "cargo", "rust-std"}:
+        raise ValueError("missing or unexpected host components")
+    files = {}
+    for name in ("rustc", "cargo", "rust-std"):
+        package = manifest["pkg"][name]
+        if package["git_commit_hash"] != rust["commit"]:
+            raise ValueError(f"channel manifest {name} commit disagrees with pin")
+        target = package["target"][rust["host"]]
+        data = archives[name]
+        if len(data) > 200_000_000:
+            raise ValueError("host component archive exceeds size limit")
+        verified(data, target["xz_hash"])
+        component = f"rust-std-{rust['host']}" if name == "rust-std" else name
+        prefix = f"{name}-{rust['version']}-{rust['host']}/{component}/"
+        entries = tar_files(data, prefix, 1_000_000_000)
+        # Component-local rust-installer metadata, not a sysroot file.
+        entries.pop("manifest.in", None)
+        if files.keys() & entries.keys():
+            raise ValueError("host component archives contain overlapping paths")
+        files.update(entries)
+    if not {"bin/rustc", "bin/cargo"}.issubset(files):
+        raise ValueError("host component archives lack compiler or cargo")
+    if not any(p.startswith(f"lib/rustlib/{rust['host']}/lib/") for p in files):
+        raise ValueError("host component archives lack host std")
+    return files
+
+
+def verify_host_component_files(sysroot: Path, expected: dict) -> None:
+    """Compare installed host files to archive digests, without following links.
+
+    This checks archive members only: extra files, executable selection and build
+    inputs still need separate checks before this can certify a build.
+    """
+    if not expected or not sysroot.is_absolute() or not sysroot.is_dir():
+        raise ValueError("missing host component files or invalid sysroot")
+    if any(path.is_symlink() for path in (sysroot, *sysroot.parents)):
+        raise ValueError("host sysroot path contains a symbolic link")
+    for name, digest in expected.items():
+        parts = name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ValueError("invalid host component path")
+        current = sysroot
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("installed host component contains a symbolic link")
+        if not current.is_file() or hashlib.sha256(current.read_bytes()).hexdigest() != digest:
+            raise ValueError(f"installed host component differs from archive: {name}")
+
+
 def verify_rust_source(pins: dict, dl=download) -> bytes:
     """Check the official channel manifest, rust-src and wasm std against the pins.
 
@@ -160,10 +220,10 @@ def verify_rust_toolchain(pins: dict, env=os.environ, run=subprocess.run, std_fi
     if cargo.get("host") != rust["host"] or cargo.get("commit-hash") != rust["cargo-commit"]:
         raise ValueError("active cargo is not the pinned cargo")
     sysroot = Path(out("rustc", "--print", "sysroot").strip())
-    if sysroot.name != f"{rust['version']}-{rust['host']}":
-        raise ValueError("active sysroot is not the pinned toolchain")
+    if not sysroot.is_absolute() or sysroot.name != f"{rust['version']}-{rust['host']}":
+        raise ValueError("active sysroot is not the pinned absolute toolchain")
     libdir = sysroot / "lib/rustlib" / rust["target"] / "lib"
-    if any(path.is_symlink() for path in (sysroot, sysroot / "lib", sysroot / "lib/rustlib",
+    if any(path.is_symlink() for path in (*sysroot.parents, sysroot, sysroot / "lib", sysroot / "lib/rustlib",
                                            sysroot / "lib/rustlib" / rust["target"], libdir)):
         raise ValueError("installed wasm32 std contains a symbolic link")
     if not libdir.is_dir():
