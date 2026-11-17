@@ -2061,6 +2061,94 @@ where
     }
 }
 
+// Prepared for direct testing only; preference routes remain unregistered.
+#[allow(dead_code)]
+async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+    use crate::taste_signal::{valid_snooze_seconds, TasteSignal};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        kind: String,
+        target_id: String,
+        signal: String,
+        #[serde(default, deserialize_with = "present_seconds")]
+        snooze_seconds: Option<u64>,
+    }
+    // Distinguish omission from explicit null, which is never a duration.
+    fn present_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        u64::deserialize(d).map(Some)
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let invalid = || validation_failed("invalid taste signal request");
+    // Serde structs can also deserialize from arrays; require an object here.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid();
+    }
+    let Some(body) = parse_body::<Body>(req) else {
+        return invalid();
+    };
+    let (Some(kind), Some(signal)) = (
+        TargetKind::parse(&body.kind),
+        TasteSignal::parse(&body.signal),
+    ) else {
+        return invalid();
+    };
+    let until = match (signal, body.snooze_seconds) {
+        (TasteSignal::Snooze, Some(seconds)) if valid_snooze_seconds(seconds) => {
+            let Some(expiry) = ctx.now.checked_add(seconds) else {
+                return unavailable();
+            };
+            Some(expiry)
+        }
+        (TasteSignal::Snooze, _) | (_, Some(_)) => return invalid(),
+        (_, None) => None,
+    };
+    let owner = &claims.user_id;
+    let target = match kind {
+        TargetKind::Track if valid_target_id(&body.target_id) => {
+            ctx.store.resolve_member_track(owner, &body.target_id).await
+        }
+        TargetKind::Release if crate::catalogue::is_catalogue_mbid(&body.target_id) => {
+            let target = canonical_target_id(&body.target_id);
+            ctx.store
+                .catalogue_member_target(owner, kind, &target)
+                .await
+                .map(|member| member.then_some(target))
+        }
+        _ => return not_found(),
+    };
+    let target = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .taste_upsert(owner, kind, &target, signal, until, ctx.now)
+        .await
+    {
+        Ok(row) => json_response(
+            200,
+            serde_json::json!({
+                "kind": row.kind, "target_id": row.target_id, "signal": row.signal, "until": row.snooze_until,
+            }),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
@@ -15473,6 +15561,212 @@ mod tests {
         assert_eq!(call(&req, "Job_A").status, 409);
         *h.store.fail_deleting_probe.borrow_mut() = true;
         assert_eq!(call(&req, "Job_A").body, unavailable().body);
+    }
+
+    fn taste_put_request(h: &Harness, user: &str) -> Request {
+        let email = format!("{user}@example.com");
+        seed_user(h, user, &email);
+        Request {
+            method: "PUT".into(),
+            path: "/v1/me/taste".into(),
+            cookie: Some(magic_login(h, &email)),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"kind":"track","target_id":"Job_A","signal":"love"}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unwired_taste_put_replaces_and_replays_with_server_time() {
+        use serde_json::json;
+        let h = harness();
+        let stored = |owner: &str| {
+            h.store.taste_rows.borrow()[&(owner.into(), "track".into(), "Job_A".into())].clone()
+        };
+        let mut req = taste_put_request(&h, "alice");
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, true)).unwrap();
+        block_on(
+            h.store
+                .upsert_private_session("alice", &claims.session_id, NOW + 3600),
+        )
+        .unwrap();
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Job_A")]);
+        for (offset, signal, seconds, created) in [
+            (0, "love", None, 0),
+            (1, "love", None, 0),
+            (2, "dislike", None, 0),
+            (3, "hide", None, 0),
+            (4, "ban", None, 0),
+            (5, "snooze", Some(60), 0),
+            (65, "love", None, 65),
+            (66, "love", None, 65),
+            (67, "snooze", Some(2_592_000), 65),
+        ] {
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            let mut body = json!({"kind":"track", "target_id":"Job_A", "signal":signal});
+            if let Some(seconds) = seconds {
+                body["snooze_seconds"] = json!(seconds);
+            }
+            req.body = body.to_string().into_bytes();
+            let res = block_on(me_taste_put(&ctx, &req));
+            let until = seconds.map(|s| ctx.now + s);
+            let expected =
+                json!({"kind":"track", "target_id":"Job_A", "signal":signal, "until":until});
+            assert_eq!((res.status, res.body), (200, expected.to_string()));
+            assert!(res.set_cookie.is_none());
+            assert!(res.retry_after.is_none());
+            assert!(res.extra_headers.is_empty());
+            let row = stored("alice");
+            assert_eq!(row.signal, signal);
+            assert_eq!(row.snooze_until, until.map(|t| t as i64));
+            assert_eq!(row.created_at, (NOW + created) as i64);
+            assert_eq!(row.updated_at, ctx.now as i64);
+        }
+        let alice_row = stored("alice");
+        let bob = taste_put_request(&h, "bob");
+        assert_eq!(block_on(me_taste_put(&h.ctx(), &bob)).status, 200);
+        assert_eq!(stored("bob").signal, "love");
+        assert_eq!(stored("alice"), alice_row);
+    }
+
+    #[test]
+    fn unwired_taste_put_resolves_only_visible_kind_specific_targets() {
+        use serde_json::json;
+        let h = harness();
+        let req = taste_put_request(&h, "alice");
+        let job = "ABCDEFAB-5678-1234-1234-ABcDEFABCDEF";
+        let recording = job.to_ascii_lowercase();
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(recording.clone());
+        let mut foreign = matched_library_row("Foreign", CAT_REC_A, 1);
+        let foreign_release = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee";
+        foreign.release_mbid = Some(foreign_release.into());
+        let mut library = h.store.catalogue_library.borrow_mut();
+        library.insert("alice".into(), vec![own, unmatched_library_row(job)]);
+        library.insert("bob".into(), vec![foreign]);
+        drop(library);
+        let call = |kind: &str, target: &str| {
+            let mut req = req.clone();
+            req.body = json!({"kind":kind, "target_id":target, "signal":"hide"})
+                .to_string()
+                .into_bytes();
+            block_on(me_taste_put(&h.ctx(), &req))
+        };
+        for (kind, input, resolved) in [
+            ("track", "Job_A", "Job_A"),
+            ("track", job, job),
+            ("track", &job.to_ascii_uppercase(), &recording),
+            ("release", &CAT_RELEASE.to_ascii_uppercase(), CAT_RELEASE),
+        ] {
+            let res = call(kind, input);
+            assert_eq!(res.status, 200);
+            assert_eq!(
+                res.body,
+                json!({"kind":kind, "target_id":resolved, "signal":"hide", "until":null})
+                    .to_string()
+            );
+            assert!(h.store.taste_rows.borrow().contains_key(&(
+                "alice".into(),
+                kind.into(),
+                resolved.into()
+            )));
+        }
+        let before = h.store.taste_rows.borrow().clone();
+        for (kind, target) in [
+            ("track", "missing"),
+            ("track", "Foreign"),
+            ("track", "job_a"),
+            ("track", "bad/path"),
+            ("track", ""),
+            ("release", "Job_A"),
+            ("release", foreign_release),
+            ("release", &recording),
+        ] {
+            let res = call(kind, target);
+            assert_eq!(
+                (res.status, res.body),
+                (404, not_found().body),
+                "{kind} {target}"
+            );
+        }
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        for (kind, target) in [("track", "Job_A"), ("release", CAT_RELEASE)] {
+            let res = call(kind, target);
+            assert_eq!((res.status, res.body), (503, unavailable().body));
+        }
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+    }
+
+    #[test]
+    fn unwired_taste_put_rejects_invalid_bodies_and_fails_closed() {
+        let h = harness();
+        let mut req = taste_put_request(&h, "alice");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let call = |req: &Request| block_on(me_taste_put(&h.ctx(), req));
+        let valid = req.body.clone();
+        for body in [
+            "{",
+            "null",
+            r#"["track","Job_A","love"]"#,
+            r#"{"kind":"track","signal":"love"}"#,
+            r#"{"kind":"track","target_id":1,"signal":"love"}"#,
+            r#"{"kind":"Track","target_id":"Job_A","signal":"love"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"Love"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","user_id":"bob"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","extra":true}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","signal":"ban"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":59}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":2592001}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":60.5}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":"60"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":null}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","snooze_seconds":60}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","snooze_seconds":null}"#,
+        ] {
+            req.body = body.as_bytes().to_vec();
+            let res = call(&req);
+            assert_eq!(res.status, 422, "{body}");
+            assert!(res.body.contains("validation_failed"));
+        }
+        req.body = valid;
+        let cookie = req.cookie.take();
+        assert_eq!(call(&req).status, 401);
+        req.cookie = cookie;
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.authorization = Some("Bearer ntk_test".into());
+        let bearer = call(&req);
+        assert_eq!((bearer.status, bearer.body), (404, not_found().body));
+        req.authorization = None;
+        for flag in [
+            &h.store.fail_deleting_probe,
+            &h.store.fail_taste_write,
+            &h.store.delete_before_taste_write,
+        ] {
+            flag.replace(true);
+            let res = call(&req);
+            assert_eq!((res.status, res.body), (503, unavailable().body));
+            assert!(h.store.taste_rows.borrow().is_empty());
+            flag.replace(false);
+        }
+        let deleting = call(&req);
+        assert_eq!(
+            (deleting.status, deleting.body),
+            (409, account_deleting_response().body)
+        );
+        assert!(h.store.taste_rows.borrow().is_empty());
     }
 
     #[test]
