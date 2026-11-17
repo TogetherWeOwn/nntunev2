@@ -1,0 +1,20 @@
+[package]
+name = "ledger-conflict-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace: CI-only negative fixture, never part of the product
+# build. CI seeds its Cargo.lock from workers/api/Cargo.lock.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nntune-api = { path = "../../../../workers/api", features = ["staging-body-wasm-test", "ledger-wasm-test"] }
+conflicting-allocator-dep = { path = "../conflicting-allocator-dep", optional = true }
+
+[features]
+# Adds a dependency that declares a second Rust global allocator.
+conflict = ["dep:conflicting-allocator-dep"]

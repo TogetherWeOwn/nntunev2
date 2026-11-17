@@ -12,6 +12,17 @@
 //! credentials resolve through the unmounted async core and the additive
 //! `subsonic_credentials` schema; legacy `subsonic_clients` is never promoted.
 
+// The synthetic ledger artifact selects the pinned wasm System allocator. A
+// second active Rust global allocator in its linked graph is a compiler error.
+// This feature is not the ordinary Worker build or an admission certificate.
+#[cfg(all(
+    feature = "ledger-wasm-test",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+#[global_allocator]
+static LEDGER_ALLOCATOR: std::alloc::System = std::alloc::System;
+
 pub mod account_deletion;
 pub mod admin;
 pub mod admin_ingest;
