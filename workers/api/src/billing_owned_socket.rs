@@ -59,6 +59,20 @@ impl SocketGuard {
     }
 }
 
+// Observes only an empty registry; no socket is opened or closed here.
+#[cfg(feature = "billing-owned-wasm-test")]
+pub(crate) fn test_empty_guard_drop() -> bool {
+    let guard = SocketGuard::default();
+    let registry = guard.0.clone();
+    let initially_empty = {
+        let state = registry.borrow();
+        !state.closed && state.sockets.is_empty()
+    };
+    drop(guard);
+    let state = registry.borrow();
+    initially_empty && state.closed && state.sockets.is_empty()
+}
+
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let mut registry = self.0.borrow_mut();
