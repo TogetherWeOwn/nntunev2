@@ -26,6 +26,11 @@ targets = [
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+  # chrono is unmaintained (informational, no known vulnerability); required by
+  # the workers-rs worker crate. Org-wide owner exception 2026-11-17; review by 2027-02-17.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no known vulnerability); required by workers-rs worker crate; org-wide owner exception 2026-11-17; review by 2027-02-17" },
+]
 # A yanked dependency (e.g. inout 0.2.3, fixed by updating) must fail the
 # gate: silently building on yanked code is not acceptable.
 yanked = "deny"
