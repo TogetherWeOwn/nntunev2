@@ -348,9 +348,9 @@ pub(crate) const BILLING_FIXTURE: &str = "host=127.0.0.1 user=postgres password=
 // Standalone transport control; this does not invoke billing reconciliation.
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 pub(crate) async fn test_deadline_after_write() -> Result<i32, &'static str> {
-    let pid = std::rc::Rc::new(Cell::new(0));
+    let ready_pid = std::rc::Rc::new(Cell::new(0));
     let expired = std::rc::Rc::new(Cell::new(false));
-    let observed_pid = pid.clone();
+    let observed_ready_pid = ready_pid.clone();
     let observed_expiry = expired.clone();
     let result = with_owned_connection(
         "127.0.0.1",
@@ -361,18 +361,20 @@ pub(crate) async fn test_deadline_after_write() -> Result<i32, &'static str> {
             let row = client.query_one(
                 "INSERT INTO public.users (id,email,created_at) VALUES ('deadline_probe','deadline_probe',0) RETURNING pg_backend_pid()", &[],
             ).await.map_err(|_| StoreError)?;
-            observed_pid.set(row.get::<_, i32>(0));
+            let backend_pid = row.get::<_, i32>(0);
             let row = client.query_one("SELECT count(*) FROM public.users WHERE id = 'deadline_probe'", &[]).await.map_err(|_| StoreError)?;
             if row.get::<_, i64>(0) != 1 { return Err(StoreError); }
             client.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+            // Expiry only proves Worker cleanup once PostgreSQL has acknowledged both settings.
+            observed_ready_pid.set(backend_pid);
             std::future::pending::<Result<(), StoreError>>().await
         }),
         move |was_expired| observed_expiry.set(was_expired),
     ).await;
-    if result.is_ok() || !expired.get() || pid.get() <= 0 {
-        return Err("write control did not reach the Worker deadline");
+    if result.is_ok() || !expired.get() || ready_pid.get() <= 0 {
+        return Err("write control did not reach the Worker deadline after setup");
     }
-    Ok(pid.get())
+    Ok(ready_pid.get())
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]

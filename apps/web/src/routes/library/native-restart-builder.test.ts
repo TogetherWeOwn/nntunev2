@@ -7,6 +7,7 @@ import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -73,11 +74,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		createQueueController, streamUrl: track.streamUrl,
+		createQueueController, createMediaController, streamUrl: track.streamUrl,
 		tick, window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
-		let items = [track], queue = createQueue(items), audioEl = element;
+		let items = [track], queue = createQueue(items), mediaRevision = 0;
+		const media = createMediaController();
+		media.attach(element);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
@@ -86,6 +89,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
 		const queueController = createQueueController(queue);
+		const library = queueController.prepareLibrary(items);
+		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		let endGeneration = 0, queueAnnouncementVersion = 0;
@@ -107,10 +112,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => handleSeeking({ currentTarget: target }), replaceQueue,
-			subscribe: queueController.subscribe,
+			subscribe: queueController.subscribe, attach: () => media.attach(element), currentAudio: () => media.audio,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -127,6 +132,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		playQueued: (id: string) => Promise<void>;
 		seeking: (target?: unknown) => void;
 		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
+		attach: () => () => void;
+		currentAudio: () => unknown;
 		subscribe: (callback: (queue: ReturnType<typeof createQueue>) => void) => () => void;
 		end: (mode: 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
@@ -138,6 +145,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			queue: ReturnType<typeof createQueue>;
 			jumpStatus: string;
 			playEpoch: number;
+			mediaRevision: number;
 			queueAnnouncement: string;
 			queueAnnouncementVersion: number;
 		};
@@ -200,6 +208,7 @@ test('direct queue selection retires a pending share adjustment across a round t
 	page.select(1);
 	expect(page.read().pendingShareSeek).toBeNull();
 	page.select(0);
+	page.attach();
 	media.position = 12;
 	media.duration = 20;
 	page.applyPendingShareSeek();
@@ -234,7 +243,25 @@ test('same-source replacement preserves pending share but only a new object fenc
 	expect(page.read().pendingShareSeek).toBe(before.pendingShareSeek);
 	page.replaceQueue({ ...before.queue });
 	expect(page.read().playEpoch).toBe(before.playEpoch + 1);
+	expect(page.read().mediaRevision).toBe(before.mediaRevision);
 	expect(page.read().pendingShareSeek).toBe(before.pendingShareSeek);
+});
+
+test('a new URL for the same ID retires the attachment before queue publication', () => {
+	const { page, element } = restartFixture();
+	const original = page.read().queue;
+	const next = createQueue(original.tracks.map((track) => ({ ...track, streamUrl: '/test-audio/new' })));
+	const staleCleanup = page.attach();
+	const observed: unknown[] = [];
+	const unsubscribe = page.subscribe(() => observed.push(page.currentAudio()));
+	page.replaceQueue(next);
+	page.replaceQueue(original);
+	expect(observed).toEqual([element, undefined, undefined]);
+	expect(page.read().mediaRevision).toBe(2);
+	page.attach();
+	staleCleanup();
+	expect(page.currentAudio()).toBe(element);
+	unsubscribe();
 });
 
 test('a reentrant subscription cannot publish an older operation hint', () => {
@@ -330,7 +357,9 @@ test('a selection subscriber replacing with the same object delivers once and st
 		deliveries += 1;
 		if (value.currentIndex === 1) { replaced += 1; page.replaceQueue(value); }
 	});
-	await page.playQueued('coral');
+	const attempt = page.playQueued('coral');
+	page.attach();
+	await attempt;
 	// One initial delivery plus the single selection; the same-object replace publishes nothing.
 	expect(deliveries).toBe(2);
 	expect(replaced).toBe(1);

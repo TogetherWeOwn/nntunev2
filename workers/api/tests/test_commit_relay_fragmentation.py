@@ -14,8 +14,13 @@ relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
 
 
-STARTUP_PARAMS = b"user\0postgres\0database\0nntune_billing_ack\0\0"
-STARTUP = struct.pack("!II", len(STARTUP_PARAMS) + 8, 196608) + STARTUP_PARAMS
+def startup(database):
+    params = b"user\0postgres\0database\0" + database + b"\0\0"
+    return struct.pack("!II", len(params) + 8, 196608) + params
+
+
+STARTUP = startup(b"nntune_billing_ack")
+NATIVE_STARTUP = startup(b"nntune_ci")
 
 
 def frame(kind, body):
@@ -26,9 +31,10 @@ def fragments(feed, data):
     return [message for byte in data for message in feed(bytes([byte]))]
 
 
-def drained_transaction():
-    exchange = relay.CommitExchange()
-    exchange.frontend(STARTUP)
+def drained_transaction(exchange=None, startup_frame=STARTUP):
+    if exchange is None:
+        exchange = relay.CommitExchange()
+    exchange.frontend(startup_frame)
     exchange.backend(frame(b"Z", b"I"))
     exchange.frontend(frame(b"Q", b"BEGIN\0"))
     exchange.backend(frame(b"Z", b"T"))
@@ -111,6 +117,47 @@ class CommitRelayFragmentation(unittest.TestCase):
         self.assertEqual(fragments(exchange.backend, response), [])
         self.assertTrue(exchange.withheld)
         self.assertEqual(bytes(exchange.gate.held), response)
+
+    def test_billing_and_native_startup_targets_are_distinct(self):
+        for exchange, wrong_startup in ((relay.CommitExchange(), NATIVE_STARTUP),
+                                        (relay.NativeExchange(), STARTUP)):
+            with self.assertRaises(relay.ProtocolError):
+                exchange.frontend(wrong_startup)
+
+    def test_native_guard_rejects_before_creating_listener(self):
+        hosted = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}
+        for env in (
+            {"NNTUNE_TEST_DATABASE_URL": relay.NATIVE_CI_URL},
+            dict(hosted, NNTUNE_TEST_DATABASE_URL=relay.NATIVE_CI_URL + "?hostaddr=203.0.113.10"),
+            dict(hosted, NNTUNE_TEST_DATABASE_URL=relay.NATIVE_CI_URL.replace("nntune_ci", relay.BILLING_DB)),
+        ):
+            with (
+                self.subTest(env=env),
+                patch.dict(relay.os.environ, env, clear=True),
+                patch.object(relay.sys, "argv", ["relay", "--native-ci"]),
+                patch.object(relay.socket, "socket") as listener,
+                self.assertRaises(SystemExit),
+            ):
+                relay.native_main()
+            listener.assert_not_called()
+
+    def test_native_commit_tag_alone_is_not_proof(self):
+        exchange = drained_transaction(relay.NativeExchange(), NATIVE_STARTUP)
+        exchange.frontend(frame(b"Q", b"COMMIT\0"))
+        self.assertEqual(fragments(exchange.backend, frame(b"C", b"COMMIT\0")), [])
+        self.assertFalse(exchange.withheld)
+        self.assertEqual(fragments(exchange.backend, frame(b"Z", b"I")), [])
+        self.assertTrue(exchange.withheld)
+
+    def test_native_rejects_rollback_tag_without_tripping_fault(self):
+        exchange = drained_transaction(relay.NativeExchange(), NATIVE_STARTUP)
+        exchange.frontend(frame(b"Q", b"COMMIT\0"))
+        rollback, ready = frame(b"C", b"ROLLBACK\0"), frame(b"Z", b"I")
+        self.assertEqual(fragments(exchange.backend, rollback), [rollback])
+        self.assertFalse(exchange.rejection_drained)
+        self.assertEqual(fragments(exchange.backend, ready), [ready])
+        self.assertTrue(exchange.rejection_drained)
+        self.assertFalse(exchange.withheld)
 
     def test_commit_before_previous_response_drains_is_rejected(self):
         exchange = drained_transaction()

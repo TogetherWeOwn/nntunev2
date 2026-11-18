@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { createQueueController } from '#lib/player/queueController.js';
+	import { createQueueController, type QueueCommitKind, type QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
+	import { createMediaController } from '#lib/player/mediaController.js';
 	import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
@@ -258,7 +259,9 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
-	let audioEl: HTMLAudioElement | undefined = $state();
+	const media = createMediaController();
+	// A source round trip before Svelte flushes must not revive a retired node.
+	let mediaRevision = $state(0);
 	// Native completion pauses before `ended`; retain intent only for that
 	// element, never for a manual pause, replaced source or account.
 	let playingElement: HTMLAudioElement | null = null;
@@ -267,7 +270,7 @@
 	function currentAudioEvent(event: Event): HTMLAudioElement | null {
 		const element = event.currentTarget as HTMLAudioElement | null;
 		const source = resolveStreamUrl(queueCurrentTrack(queueController.snapshot));
-		return shareAlive && element && element === audioEl && element.isConnected &&
+		return shareAlive && element && element === media.audio && element.isConnected &&
 			source && element.getAttribute('src') === source ? element : null;
 	}
 
@@ -315,7 +318,7 @@
 		if (!replaceQueue(result.queue)) return;
 		const targetQueue = queueController.snapshot;
 		await tick();
-		const target = audioEl;
+		const target = media.audio;
 		const track = queueCurrentTrack(queueController.snapshot);
 		if (!shareAlive || generation !== endGeneration || queueController.snapshot !== targetQueue ||
 			!target || !target.isConnected || !track ||
@@ -328,7 +331,7 @@
 			jumpStatus = '';
 			playingElement = target;
 			await target.play();
-			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
+			if (!shareAlive || generation !== endGeneration || target !== media.audio ||
 				queueController.snapshot !== targetQueue || playingElement !== target) return;
 			queueAnnouncement = `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.`;
 			queueAnnouncementVersion += 1;
@@ -351,7 +354,7 @@
 		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queueController.snapshot,
-		getPosition: () => audioEl?.currentTime,
+		getPosition: () => media.audio?.currentTime,
 		getOrigin: () => window.location.origin,
 		getClipboard: clipboardWriter,
 		shortTitle,
@@ -371,8 +374,8 @@
 	const pendingShareSeek = createPendingShareSeek(
 		(element, target) => ({ isCurrent: () => {
 			const current = queueCurrentTrack(queueController.snapshot);
-			return shareAlive && element === audioEl && current?.id === target.trackId &&
-				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === audioEl &&
+			return shareAlive && element === media.audio && current?.id === target.trackId &&
+				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === media.audio &&
 				queueCurrentTrack(queueController.snapshot) === current;
 		} }),
 		(target) => restartSupersededSources.has(`${target.trackId}\n${target.streamUrl}`)
@@ -475,23 +478,12 @@
 				clearFavoritesExportFeedback();
 				pendingShareSeek.clear();
 			}
-			// The queue is per-account: drop tracks the new library no longer
-			// contains, so a 401/403/404 or auth transition cannot leak the
-			// previous account's queue into the next session's Retry. The
-			// current track stays current when it survives the refresh.
 			if (!isCurrent()) return;
-			if (authoritative && queueController.snapshot.tracks.length > 0) {
-				const queue = queueController.snapshot;
-				const ids = new Set(state.items.map((track) => track.id));
-				const kept = queue.tracks.filter((track) => ids.has(track.id));
-				if (kept.length !== queue.tracks.length) {
-					queueConfirmGeneration += 1;
-					const currentId = queueCurrentTrack(queue)?.id ?? null;
-					const rebuilt = createQueue(kept);
-					const index =
-						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
-				}
+			if (authoritative) {
+				const { next, sources } = queueController.prepareLibrary(state.items);
+				if (next !== queueController.snapshot) queueConfirmGeneration += 1;
+				if (state.loadError && state.items.length === 0) queueAnnouncement = '';
+				commitQueue(next, 'replace', { sources, isCurrent });
 			}
 			// Queue publication can reenter the route and revoke this receipt.
 			if (!isCurrent()) return;
@@ -629,7 +621,8 @@
 	// A separate one-parameter mapper (no positional flag), so a bare
 	// `.map(...)` reference can never bind the array index to it.
 	function playableTrackFor(item: LibraryItem): Track {
-		return { ...queuedTrackFor(item), streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl }) };
+		const streamUrl = resolveStreamUrl({ streamUrl: item.streamUrl });
+		return { ...queuedTrackFor(item), streamUrl: queueController.hasLibrarySource(item.id, streamUrl) ? streamUrl : '' };
 	}
 
 	/**
@@ -646,7 +639,7 @@
 	}
 
 	function selectTrack(id: string, item = items.find((track) => track.id === id)): boolean {
-		if (!item) return false;
+		if (!item || !queueController.hasLibraryTrack(id)) return false;
 		clearShareFeedback();
 		pendingShareSeek.clear();
 		// Preserve append-only row selection; only an inbound link explicitly
@@ -663,7 +656,8 @@
 	 * metadata-only, never audible playback.
 	 */
 	function addDisplayedTracksToQueue(): void {
-		const missing = missingDisplayedTracks(renderedItems, new Set(queueController.snapshot.tracks.map((track) => track.id)));
+		const missing = missingDisplayedTracks(renderedItems, new Set(queueController.snapshot.tracks.map((track) => track.id)))
+			.filter((item) => queueController.hasLibraryTrack(item.id));
 		if (missing.length === 0) return;
 		if (!replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)))) return;
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
@@ -680,33 +674,38 @@
 	 */
 	async function playDisplayedFromTop(): Promise<void> {
 		if (playDisplayedDisabled) return;
-		const missing = missingDisplayedTracks(renderedItems, new Set(queueController.snapshot.tracks.map((track) => track.id)));
-		const skipped = missingDisplayedTracks(renderedItems, new Set()).length - missing.length;
+		const displayed = renderedItems.filter((item) => queueController.hasLibraryTrack(item.id));
+		const missing = missingDisplayedTracks(displayed, new Set(queueController.snapshot.tracks.map((track) => track.id)));
+		const skipped = missingDisplayedTracks(displayed, new Set()).length - missing.length;
 		// Appended IDs are new and unique, so one lookup finds the first
 		// appended track, or the first displayed track's existing slot.
-		const first = missing[0] ?? renderedItems[0];
+		const first = missing[0] ?? displayed[0];
 		const base = appendMissingTracks(missing.map(playableTrackFor));
 		const index = base.tracks.findIndex((track) => track.id === first?.id);
 		const target = base.tracks[index];
 		if (!target) return;
 		// Bulk-added slots are metadata-only. This explicit play gesture
 		// hydrates only its selected slot, preserving every other queued row.
-		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
-		base.tracks[index] = { ...target, streamUrl: source };
+		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
+		if (!evidence) return;
+		base.tracks[index] = { ...target, streamUrl: evidence.streamUrl };
 		if (!replaceQueue(selectQueueIndex(base, index))) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await playSelectedTrack(target, source, counts);
+		await playSelectedTrack(target, evidence, counts);
 	}
 
-	/** One explicit playback attempt; queue edits and newer plays fence its result. */
-	async function playSelectedTrack(target: Track, source: string, suffix = ''): Promise<void> {
+	/** One explicit playback attempt, fenced by queue and source receipts. */
+	async function playSelectedTrack(
+		target: Track, { streamUrl, isCurrent }: QueuedPlaySource, suffix = ''
+	): Promise<void> {
+		if (!isCurrent()) return;
 		const receipt = queueRevision.revoke();
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
-		if (source) {
+		if (streamUrl) {
 			await tick();
-			if (!queueRevision.isCurrent(receipt)) return;
-			const element = audioEl;
+			if (!queueRevision.isCurrent(receipt) || !isCurrent()) return;
+			const element = media.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			if (element) {
 				try {
@@ -716,7 +715,7 @@
 					// Selected-but-paused is the truthful fallback; no retry.
 				}
 			}
-			if (!queueRevision.isCurrent(receipt)) return;
+			if (!queueRevision.isCurrent(receipt) || !isCurrent()) return;
 		}
 		queueAnnouncement = suffix ? `${lead} ${suffix}` : lead;
 		queueAnnouncementVersion += 1;
@@ -760,22 +759,37 @@
 		}
 	}
 
-	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): boolean {
-		const receipt = queueController.begin(next, kind);
+	function commitQueue(
+		next: QueueState,
+		kind: QueueCommitKind,
+		library?: Pick<ReturnType<typeof queueController.prepareLibrary>, 'sources'> & { isCurrent: () => boolean }
+	): boolean {
+		if (library && !library.isCurrent()) return false;
+		const receipt = queueController.begin(next, kind, !!library);
+		if (library && next === queueController.snapshot) {
+			queueController.publish(next, receipt, library.sources);
+			return true;
+		}
 		const before = queueCurrentTrack(queueController.snapshot);
 		const after = queueCurrentTrack(next);
 		if ((kind === 'replace' || kind === 'select') &&
 			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
 			if (kind === 'replace') clearShareFeedback();
 			pendingShareSeek.clear();
-			if (!queueController.isCurrentOperation(receipt)) return false;
+			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
 		}
 		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
 			resetRestartOnSourceChange(before, after);
 		}
+		if (before?.id !== after?.id || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
+			mediaRevision += 1;
+			playingElement = null;
+			media.reset();
+			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
+		}
 		if (kind === 'replace') queueAnnouncement = '';
-		queueController.publish(next, receipt);
-		if (!queueController.isCurrentOperation(receipt)) return false;
+		queueController.publish(next, receipt, library?.sources);
+		if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
 		syncMiniPlayerHint(next);
 		return queueController.isCurrentOperation(receipt);
 	}
@@ -807,7 +821,8 @@
 	function resetShareAtAuthBoundary(): void {
 		endGeneration += 1;
 		playingElement = null;
-		if (audioEl && !audioEl.paused) audioEl.pause();
+		mediaRevision += 1;
+		media.reset();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		queueShare.reset();
@@ -845,7 +860,7 @@
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
-			current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+			current?.id === id && resolveStreamUrl(current) ? media.audio?.currentTime : 0;
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
 		let url: string;
 		try {
@@ -910,10 +925,10 @@
 		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
-		void tick().then(() => pendingShareSeek.apply(audioEl, seekRevision));
+		void tick().then(() => pendingShareSeek.apply(media.audio, seekRevision));
 	}
 
-	function applyPendingShareSeek(element = audioEl): void {
+	function applyPendingShareSeek(element = media.audio): void {
 		pendingShareSeek.apply(element);
 	}
 
@@ -939,7 +954,7 @@
 	// nodes can never enable, disable, or complete a restart.
 	function refreshRestartAvailability(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		if (!element || element !== audioEl || !shareAlive) return;
+		if (!element || element !== media.audio || !shareAlive) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		if (!current || resolveStreamUrl(current) !== element.getAttribute('src')) {
 			restartCanSeek = false;
@@ -963,7 +978,7 @@
 	 * The gesture supersedes any pending inbound-share seek for the source.
 	 */
 	function restartCurrentTrack(): void {
-		const element = audioEl;
+		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
 		if (!element || !current) return;
 		const source = resolveStreamUrl(current);
@@ -1038,7 +1053,7 @@
 	 * events cannot move the position to the share time.
 	 */
 	function jumpRelative(direction: JumpDirection): void {
-		const element = audioEl;
+		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
 		if (live) pendingShareSeek.supersede(current.id, streamUrl);
@@ -1119,13 +1134,13 @@
 		if (loading || libraryUnavailable) return;
 		const index = queue.tracks.findIndex((track) => track.id === id);
 		const target = queue.tracks[index];
-		const item = items.find((track) => track.id === id);
-		if (!target || !item) return;
-		const source = resolveStreamUrl(target) || playableTrackFor(item).streamUrl;
+		if (!target) return;
+		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
+		if (!evidence) return;
 		const tracks = [...queue.tracks];
-		tracks[index] = { ...target, streamUrl: source };
+		tracks[index] = { ...target, streamUrl: evidence.streamUrl };
 		if (!replaceQueue(selectQueueIndex({ ...queue, tracks }, index))) return;
-		await playSelectedTrack(target, source);
+		await playSelectedTrack(target, evidence);
 	}
 
 	function trimPreviousTracks(): void {
@@ -1494,7 +1509,7 @@
 
 	function appendSelectedIds(): void {
 		const queue = queueController.snapshot;
-		const result = appendSelection(queue, selectedIds, items);
+		const result = appendSelection(queue, selectedIds.filter(queueController.hasLibraryTrack), items);
 		if (!replaceQueue(result.queue)) return;
 		appendFeedback = appendResultLabel(result.added, result.skipped);
 	}
@@ -1519,7 +1534,8 @@
 
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
 		const queue = queueController.snapshot;
-		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable);
+		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable)
+			.filter(queueController.hasLibraryTrack);
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
 	}
@@ -1542,12 +1558,13 @@
 		const index = base.tracks.findIndex((track) => track.id === first.id);
 		const target = base.tracks[index];
 		if (!target) return;
-		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
+		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
+		if (!evidence) return;
 		const tracks = [...base.tracks];
-		tracks[index] = { ...target, streamUrl: source };
+		tracks[index] = { ...target, streamUrl: evidence.streamUrl };
 		if (!replaceQueue(selectQueueIndex({ ...base, tracks }, index))) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await playSelectedTrack(target, source, (counts + missingInteractionLabel(ids, surviving)).trim());
+		await playSelectedTrack(target, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1583,7 +1600,7 @@
 		if (loading || libraryUnavailable) return [];
 		return ids.flatMap((id) => {
 			const item = source.find((item) => item.id === id);
-			return item ? [queuedTrackFor(item)] : [];
+			return item && queueController.hasLibraryTrack(id) ? [queuedTrackFor(item)] : [];
 		});
 	}
 
@@ -1758,14 +1775,12 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		// Clear the queue and this tab's identity label at the auth boundary
-		// even before the refresher's state lands; the onStateChange
-		// reconcile above is the backstop for the queue.
+		// The refresher's auth reset clears queue membership and evidence together.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			resetShareAtAuthBoundary();
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
-			replaceQueue(clearQueue(queueController.snapshot));
+			// Queue and source evidence are cleared by the refresher notification.
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
@@ -1792,7 +1807,7 @@
 		resetShareAtAuthBoundary();
 		clearFavoritesExportFeedback();
 		releaseFavoritesDownload();
-		replaceQueue(clearQueue(queueController.snapshot));
+		// Queue and source evidence are cleared by the refresher notification.
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
@@ -1834,7 +1849,7 @@
 			queueShare.dispose();
 			endGeneration += 1;
 			playingElement = null;
-			if (audioEl && !audioEl.paused) audioEl.pause();
+			media.destroy();
 			favoritesExport.destroy();
 			clearShareFeedback();
 			pendingShareSeek.clear();
@@ -2365,9 +2380,9 @@
 				</p>
 			{/if}
 			<div class="nt-library-player-controls">
-				{#key `${currentTrack?.id}:${streamUrl}`}
+				{#key mediaRevision}
 					<audio
-						bind:this={audioEl}
+						{@attach media.attach}
 						data-testid="audio-player"
 						controls
 						src={streamUrl}

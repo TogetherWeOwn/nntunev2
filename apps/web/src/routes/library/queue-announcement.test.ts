@@ -4,6 +4,7 @@ import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
@@ -95,7 +96,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare,
-		createPendingShareSeek, createQueueController,
+		createPendingShareSeek, createQueueController, createMediaController,
 		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,

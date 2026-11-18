@@ -454,6 +454,24 @@ def verified_host_executables(sysroot: Path, expected: dict) -> tuple[Path, Path
     return rustc, cargo
 
 
+def verified_host_linker(sysroot: Path, expected: dict, host: str) -> Path:
+    """Check the archive-derived linker file, not its selection by a build.
+
+    This does not bind an invocation, prevent later replacement, or establish
+    linker semantics. Expected digests must come from host_component_files.
+    """
+    if not isinstance(host, str) or not host or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in host):
+        raise ValueError("invalid host triple")
+    name = f"lib/rustlib/{host}/bin/rust-lld"
+    if name not in expected:
+        raise ValueError("host components lack linker")
+    verify_host_component_files(sysroot, expected)
+    linker = sysroot / name
+    if not os.access(linker, os.X_OK):
+        raise ValueError("host linker is not executable")
+    return linker
+
+
 def verify_rust_source(pins: dict, dl=download) -> bytes:
     """Check the official channel manifest, rust-src and wasm std against the pins.
 
