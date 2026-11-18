@@ -5,18 +5,21 @@
 //! These are the implementer's integration tests: a rusqlite fixture stands
 //! in for the PlanetScale/Hyperdrive vault (same `provider_vaults` columns
 //! via migrations 0002 + 0015, same claim/CAS semantics), and the fake
-//! executes the job's SQL consts so drift between the job and the normative
-//! runbook fails loudly. Fixtures are synthetic only (public repo: never
+//! executes the historical fixture SQL. Drift from the original runbook
+//! SQL fails loudly. Fixtures are synthetic only (public repo: never
 //! real secrets, never real user ids); keys are random per test.
 //!
 //! Independent acceptance coverage lives with the Test Author; this file
 //! must not collide with their `*_acceptance.rs` files.
 
+#[path = "support/historical_vault_rotation_sql.rs"]
+mod historical_vault_rotation_sql;
+
+use historical_vault_rotation_sql::{CAS_REWRAP_SQL, CLAIM_BATCH_SQL};
 use nntune_api::handlers::{Config, StoreError};
 use nntune_api::rotation::{
     CasRewrapOutcome, JobError, KekSource, PassReport, RewrapClaim, RewrapParams, RewrapStore,
-    RewrappedEnvelope, RunRecord, CAS_REWRAP_SQL, CLAIM_BATCH_SQL, MAX_BATCH_LIMIT,
-    MAX_ROW_ATTEMPTS, ROTATION_RUNS_DDL,
+    RewrappedEnvelope, RunRecord, MAX_BATCH_LIMIT, MAX_ROW_ATTEMPTS, ROTATION_RUNS_DDL,
 };
 use nntune_api::vault::{decrypt_vault, encrypt_vault, VaultBlob};
 use rusqlite::{params, Connection};
@@ -555,7 +558,7 @@ fn job_sql_consts_match_the_runbook_claim_and_cas_contract() {
     assert_eq!(
         CAS_REWRAP_SQL,
         &section_6[update_start..update_start + update_end + 1],
-        "job CAS SQL drifted from the normative §6 UPDATE"
+        "CAS SQL drifted from the §6 UPDATE"
     );
 }
 

@@ -1,8 +1,9 @@
 # KEK Rotation + Versioning (F-VAULT-02)
 
-Owner: CISO · Status: design (normative for the vault implementation;
-the vault PR may not merge until the CISO gate verifies this design at
-its exact head — see `threat-model.md` §8).
+Owner: CISO · Status: historical design for the pre-purge user-provider vault.
+The vault rotation, compromise, and restore steps are not for post-purge
+schemas. The retained SQL is a test reference, not an operator procedure
+or a basis for changing shared KEKs still used by active consumers.
 
 ## 0. Goal
 
@@ -226,8 +227,8 @@ in-memory cursors). The runner core HAS landed — `run_rewrap_pass` in
 against a synthetic staging-equivalent store — but no scheduled trigger
 invokes it yet (§8): no Workflow/Queue consumer wires it to Hyperdrive,
 the `rotation_runs` production DDL is fixture-validated only, and no
-production migration exists. This section stays the normative contract
-the trigger must follow.
+production migration exists. The SQL below documents the historical
+contract exercised by the SQLite fixtures, not a post-purge store.
 
 ```sql
 -- claim a batch (cursor = last user_id, never OFFSET on a hot table;
@@ -364,12 +365,12 @@ they would either wedge the pass or vanish into `rows_failed`),
 poison), and `updated_at` (stuck-pass detection) — with a partial-unique
 `(env, to_version)` open-run index as the ≤1-concurrent-pass guard. The
 DDL is fixture-validated only; production DDL, Hyperdrive store wiring,
-and the scheduled trigger land together with the trigger card.
+and the scheduled trigger were never wired for the legacy vault.
 
-## 7. Runbook (operator copy-paste)
+## 7. Runbook (historical vault procedure)
 
-> **NOT EXECUTABLE end to end — do not run the steps below in an
-> incident.** The versioned KEK map HAS landed — `Config::kek_by_version`
+> **Historical, not executable end to end. Do not run these vault steps
+> in an incident or against a post-purge schema.** The versioned KEK map HAS landed — `Config::kek_by_version`
 > + `Config::with_prior_keks` (`workers/api/src/handlers.rs`) over
 > `VAULT_KEK_V<N>` per-version secrets + the `VAULT_KEK_CURRENT`
 > write-version var (`kek_set_from_lookup`,
@@ -384,7 +385,7 @@ and the scheduled trigger land together with the trigger card.
 > 5–7): routine KEK rotation still cannot be executed end to end. On
 > suspected or confirmed KEK exposure, report it through GitHub's
 > private vulnerability reporting (see `SECURITY.md`); §10 is
-> design-only and has no runner. Today's executable containment is:
+> design-only and has no runner. The pre-purge containment design was:
 > legacy mode —
 > replace `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single
 > KEK so rows pinned to the exposed version fail closed; versioned
@@ -401,7 +402,7 @@ and the scheduled trigger land together with the trigger card.
 |---|---|---|
 | Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
 | Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
-| KEK (routine re-wrap, §§5–6 below) | ❌ No — runner core landed but no scheduled trigger, no `rotation_runs` production DDL, no Hyperdrive store wiring (versioned KEK map + `CURRENT` flip landed; steps 5–7 still need the trigger) | `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` read in `worker_entry.rs` (`kek_set_from_lookup`), `kek_by_version` in `handlers.rs`, legacy pair still supported; `run_rewrap_pass` + `RewrapStore` + `rotation_runs` DDL in `workers/api/src/rotation.rs` (fixture-proven, no production migration; **not executable end to end**) |
+| Legacy vault KEK (routine re-wrap, §§5–6) | ❌ No — runner core landed but no scheduled trigger, no `rotation_runs` production DDL, no Hyperdrive store wiring (versioned KEK map + `CURRENT` flip landed; steps 5–7 still need the trigger) | `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` read in `worker_entry.rs` (`kek_set_from_lookup`), `kek_by_version` in `handlers.rs`, legacy pair still supported; `run_rewrap_pass` + `RewrapStore` in `workers/api/src/rotation.rs`; vault claim/CAS SQL is test-only (**not executable end to end**) |
 | KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | versioned map as above; per-row re-key still needs its own runner — the landed §6 core only re-wraps (**not implemented**) |
 | Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
 

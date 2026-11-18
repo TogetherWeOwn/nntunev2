@@ -166,9 +166,12 @@ forward-only (§4).
    `docs/adr/0002-data-model.md` forbids). If the damage was caused by a
    bad migration, include its forward correction in this pass. Blocked
    until the per-database runner/record prerequisite (§2 step 3) lands.
-5. **Vault/KEK pass before writes reopen.** Restored rows may pin older
-   `kek_version` values. Per `docs/security/kek-rotation.md` §5 invariant
-   3 and §7 RESTORE: confirm the KEK versions the restored rows need are
+5. **Historical vault/KEK pass (pre-purge app schema only).** After
+   forward convergence to a post-purge schema, record this vault step as
+   not applicable; do not reintroduce purged rows or change shared keys.
+   This does not waive verification for active KEK consumers. On a
+   pre-purge restore, per `docs/security/kek-rotation.md` §5 invariant 3
+   and §7 RESTORE, confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The
    versioned KEK map (`VAULT_KEK_V<N>` per-version secrets +
@@ -189,13 +192,14 @@ forward-only (§4).
    have landed fixture-proven, but no scheduled trigger, production
    DDL, or Hyperdrive wiring exists yet
    (`docs/security/kek-rotation.md` §7 banner, §8 gate items): a
-   restore that needs rows re-wrapped forward (rather than merely read
-   at their pinned versions) is blocked until they land. Retired key material stays in the operator store until the
+   pre-purge restore requiring forward re-wrap cannot use this fixture-only
+   runner. Retired key material stays in the operator store until the
    retire-after date (latest of re-wrap-complete + one window, oldest
    restorable backup/PITR horizon expiry) — a restore never justifies
    deleting key material early.
 6. **Cutover (authorized promotion, not a redeploy).** Only after steps
-   3–5 are recorded green: repoint the serving Hyperdrive binding to the
+   3–4 are recorded green and step 5 is documented as green or not
+   applicable: repoint the serving Hyperdrive binding to the
    restored-and-converged target through the authorized host path —
    app database: `HYPERDRIVE_ID_STAGING` (`nntunev2-staging` config; prod
    `HYPERDRIVE_ID_PROD` stays reserved) — or promote/rename the restore
@@ -255,8 +259,8 @@ migration files to force convergence.
   applied-migration record, §2 step 3) equals the pre-incident head plus
   any forward corrections; `migrations_gate.py` green on the head
   (repository-side check only — it does not prove database state, §4).
-- KEK re-wrap complete (app database only; blocked until the §3.5
-  re-wrap runner prerequisite lands): `SELECT count(*) FROM
+- Historical vault re-wrap verification (pre-purge app schema only;
+  not applicable after purge, see §3.5): `SELECT count(*) FROM
   provider_vaults WHERE kek_version < <VAULT_KEK_CURRENT>` reads 0 twice
   (two consecutive passes, current = the `VAULT_KEK_CURRENT` write
   version), per the rotation invariant; retire-after date re-recorded
@@ -279,7 +283,7 @@ migration files to force convergence.
 | New restore target name (§3.2) | name only, no URL/secret |
 | Read-only verification queries + outcomes (§3.3) | expressions + outcomes only |
 | Forward-convergence list (migrations re-applied, §3.4) | numbers + manifest head |
-| KEK re-wrap result (counts ×2, §3.5) | |
+| Legacy vault re-wrap disposition (§3.5) | counts ×2 if applicable; otherwise schema basis for N/A |
 | Cutover record (binding repoint/promote, §3.6) | mechanism + time |
 | Health + E2E run URLs (§3.7) | URLs to runs only |
 | Old-target retention + deletion gate (§3.8) | |
