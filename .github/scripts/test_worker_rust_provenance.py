@@ -66,6 +66,37 @@ class RustPin(unittest.TestCase):
             with self.assertRaises(ValueError):
                 wt.verified_host_executables(root, expected)
 
+    def test_wasm_section_framing_is_bounded_and_not_validation(self):
+        magic = b"\0asm\x01\0\0\0"
+        self.assertEqual(wt.wasm_sections(magic), [])
+        self.assertEqual(wt.wasm_sections(magic + b"\x00\x01a\x06\x02bc"),
+                         [(0, b"a"), (6, b"bc")])
+        self.assertEqual(wt.wasm_sections(magic + b"\x00\x80\x01" + b"x" * 128),
+                         [(0, b"x" * 128)])
+        for module in (b"", b"\0asm\x02\0\0\0", magic + b"\x00", magic + b"\x00\x80",
+                       magic + b"\x00\xff\xff\xff\xff\x10", magic + b"\x00\x02a",
+                       magic + b"\x00\x80\x80\x80\x80\x80\x00", magic + b"\x00\x00" * 10_001):
+            with self.subTest(module=module):
+                with self.assertRaises(ValueError):
+                    wt.wasm_sections(module)
+
+    def test_inspect_i32_globals_is_restricted_and_does_not_resolve_indices(self):
+        self.assertEqual(wt.inspect_i32_globals(b"\x00"), [])
+        self.assertEqual(wt.inspect_i32_globals(
+            b"\x03\x7f\x00\x41\x00\x0b\x7f\x01\x41\x7f\x0b"
+            b"\x7f\x00\x41\xff\xff\xff\xff\x07\x0b"),
+            [(False, 0), (True, 0xffffffff), (False, 0x7fffffff)])
+        self.assertEqual(wt.inspect_i32_globals(b"\x01\x7f\x00\x41\x80\x80\x80\x80\x78\x0b"),
+                         [(False, 0x80000000)])
+        for payload in (b"", b"\x01", b"\x00\x00", b"\x01\x7e\x00\x41\x00\x0b",
+                        b"\x01\x7f\x02\x41\x00\x0b", b"\x01\x7f\x00\x23\x00\x0b",
+                        b"\x01\x7f\x00\x41\x80", b"\x01\x7f\x00\x41\x00",
+                        b"\x01\x7f\x00\x41\xff\xff\xff\xff\x08\x0b",
+                        b"\x01\x7f\x00\x41\x80\x80\x80\x80\x80\x00\x0b",
+                        b"\x91\x4e"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_i32_globals(payload)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
