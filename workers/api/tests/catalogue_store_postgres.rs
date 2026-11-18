@@ -1622,7 +1622,19 @@ async fn subsonic_snapshot_accepts_exact_cap_track_page() {
         ).await.unwrap();
         let attempts = Rc::new(Cell::new(0));
         let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+        let reached = Rc::new(Cell::new(false));
+        let marker = reached.clone();
+        store.set_preflight_hook(
+            "track",
+            Box::new(move || {
+                Box::pin(async move {
+                    marker.set(true);
+                    Ok(())
+                })
+            }),
+        );
         let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+        assert!(reached.get(), "track fetch boundary must be reachable");
         assert_eq!(
             result.unwrap().2.len(),
             2,
@@ -1653,8 +1665,17 @@ async fn subsonic_snapshot_rejects_over_cap_pages_in_query() {
             "INSERT INTO mb_release SELECT g::uuid, 'R', 'Album', 2001, CASE WHEN $2 THEN g::uuid ELSE $3::text::uuid END FROM unnest($1::text[]) AS g",
             &[&ids, &distinct_artists, &ids[0]],
         ).await.unwrap();
-        let (result, attempts) = snapshot_of(app, mirror, 2).await;
-        assert!(result.is_err(), "{rows} rows over cap 2 must fail closed");
+        let phase = if distinct_artists {
+            "artist"
+        } else {
+            "release"
+        };
+        let (accepted, reached, attempts) = snapshot_fetch_boundary(app, mirror, 2, phase).await;
+        assert!(!accepted, "{rows} rows over cap 2 must fail closed");
+        assert!(
+            !reached,
+            "{phase} fetch must not be reached after rejection"
+        );
         assert_eq!(attempts, 1);
     }
     let recordings: Vec<String> = (1..=3_u32).map(|n| synthetic_uuid(3, n)).collect();
@@ -1679,8 +1700,9 @@ async fn subsonic_snapshot_rejects_over_cap_pages_in_query() {
         &format!("INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, position::smallint FROM unnest($1::text[]) WITH ORDINALITY AS tracks(g, position)"),
         &[&recordings],
     ).await.unwrap();
-    let (result, _) = snapshot_of(app, mirror, 2).await;
-    assert!(result.is_err(), "3 tracks over cap 2 must fail closed");
+    let (accepted, reached, _) = snapshot_fetch_boundary(app, mirror, 2, "track").await;
+    assert!(!accepted, "3 tracks over cap 2 must fail closed");
+    assert!(!reached, "track fetch must not be reached after rejection");
 }
 
 #[tokio::test]
@@ -1712,7 +1734,24 @@ async fn subsonic_snapshot_accepts_exact_cap_artist_and_release_pages() {
             )).await.unwrap();
             let attempts = Rc::new(Cell::new(0));
             let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+            let reached = Rc::new(Cell::new(false));
+            let marker = reached.clone();
+            let phase = if distinct_artists {
+                "artist"
+            } else {
+                "release"
+            };
+            store.set_preflight_hook(
+                phase,
+                Box::new(move || {
+                    Box::pin(async move {
+                        marker.set(true);
+                        Ok(())
+                    })
+                }),
+            );
             let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+            assert!(reached.get(), "{phase} fetch boundary must be reachable");
             let (artists, releases, tracks) = result.unwrap();
             assert_eq!(artists.len(), if distinct_artists { 2 } else { 1 });
             assert_eq!(releases.len(), 2);
@@ -1852,6 +1891,32 @@ async fn sized_fixture(n: u32, lens: FieldLens, filler: &str) -> (Client, Client
         .await
         .unwrap();
     (app, mirror)
+}
+
+async fn snapshot_fetch_boundary(
+    app: Client,
+    mirror: Client,
+    cap: i64,
+    phase: &'static str,
+) -> (bool, bool, usize) {
+    let attempts = Rc::new(Cell::new(0));
+    let reached = Rc::new(Cell::new(false));
+    let marker = reached.clone();
+    let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+    store.set_preflight_hook(
+        phase,
+        Box::new(move || {
+            Box::pin(async move {
+                marker.set(true);
+                Ok(())
+            })
+        }),
+    );
+    let accepted = store
+        .subsonic_snapshot_catalogue_with_cap("u1", cap)
+        .await
+        .is_ok();
+    (accepted, reached.get(), attempts.get())
 }
 
 async fn snapshot_of(
@@ -2030,12 +2095,15 @@ async fn snapshot_membership_sentinels_reject_before_mirror() {
                     &[&ids],
                 ).await.unwrap();
             }
-            let (result, attempts) = snapshot_of(app, mirror_client().await, 2).await;
-            assert_eq!(
-                result.is_ok(),
-                count <= 4,
-                "pair={pair_mode}, count={count}"
-            );
+            let phase = if pair_mode {
+                "membership-pairs"
+            } else {
+                "membership-release"
+            };
+            let (accepted, reached, attempts) =
+                snapshot_fetch_boundary(app, mirror_client().await, 2, phase).await;
+            assert_eq!(accepted, count <= 4, "pair={pair_mode}, count={count}");
+            assert_eq!(reached, count <= 4, "{phase} fetch boundary, count={count}");
             if count > 4 {
                 assert_eq!(attempts, 0);
             }

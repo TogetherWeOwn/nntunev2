@@ -1211,6 +1211,8 @@ impl PgStore {
                     })?
                     .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-release").await?;
                 let member = tx
                     .query_typed(
                         &releases_sql,
@@ -1248,6 +1250,8 @@ impl PgStore {
                     })?
                     .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-pairs").await?;
                 let pairs = tx
                     .query_typed(
                         &pairs_sql,
