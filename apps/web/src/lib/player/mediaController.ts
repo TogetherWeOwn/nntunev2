@@ -1,3 +1,6 @@
+import { selectTrack, type QueueState } from './queue.js';
+import type { createQueueController, QueuedPlaySource } from './queueController.js';
+
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
 type NativeObservations = {
@@ -7,6 +10,14 @@ type NativeObservations = {
 	seeking: (audio: HTMLAudioElement) => void;
 	metadata: (audio: HTMLAudioElement) => void;
 	position: (audio: HTMLAudioElement) => void;
+};
+
+type PlaySelection = {
+	revision: Pick<ReturnType<typeof createQueueController>, 'revoke' | 'isCurrent'>;
+	commit: (queue: QueueState) => boolean;
+	flush: () => Promise<void>;
+	announce: (message: string) => void;
+	bumpAnnouncement: () => void;
 };
 
 // Queued native events belong to the element, not to a receipt or controller.
@@ -27,7 +38,49 @@ export function createMediaController() {
 		pause(previous?.audio);
 	}
 
+	async function playSelected(
+		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, deps: PlaySelection
+	): Promise<void> {
+		const target = base.tracks[index];
+		if (!target || destroyed || !source.isCurrent()) return;
+		const { streamUrl } = source;
+		const tracks = [...base.tracks];
+		tracks[index] = { ...target, streamUrl };
+		if (!deps.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
+
+		const receipt = deps.revision.revoke();
+		let attachment = current;
+		const ownsAttempt = () => !destroyed && deps.revision.isCurrent(receipt) && source.isCurrent();
+		const isCurrent = () => ownsAttempt() && current === attachment;
+		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
+		let lead = `Selected ${title}; no stream to play.`;
+		if (streamUrl) {
+			await deps.flush();
+			// A source change retires the old node before commit. In that case
+			// flush mounts its replacement; a surviving node keeps its receipt.
+			if (!ownsAttempt() || (attachment && !isCurrent())) return;
+			attachment = current;
+			const audio = attachment?.audio;
+			lead = `Selected ${title}, paused: playback was blocked.`;
+			try {
+				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && isCurrent()) {
+					const play = audio.play;
+					if (!isCurrent()) return;
+					await play.call(audio);
+					lead = `Playing ${title}.`;
+				}
+			} catch {
+				// No retry and no pause or selection change on a retired receipt.
+				if (isCurrent() && attachment) attachment.playing = false;
+			}
+		}
+		if (!isCurrent()) return;
+		deps.announce(suffix ? `${lead} ${suffix}` : lead);
+		if (isCurrent()) deps.bumpAnnouncement();
+	}
+
 	return {
+		playSelected,
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {

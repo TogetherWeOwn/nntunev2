@@ -80,9 +80,16 @@ alignment invariant and this charge remain provisional.
 The specific unresolved branch is successful linker donation: `wasm.rs`
 `preexisting_chunk_from_linker` returns `(__heap_base, __heap_end - __heap_base)`
 when the nonzero ordered range is large enough, and `try_donate_preexisting`
-returns it at most once (lines 17–31, 39–48, 88–98). No rounding or runtime
-check of `__heap_end` occurs on that branch. The canonical manifest pins the
-compiler, target and source archives, but is not itself a constraint on that
+returns it at most once (lines 17–31, 39–48, 88–98). Its atomic flag is set
+on the first nonzero system allocation attempt even if the range is too small;
+a later smaller request therefore cannot take that donation. The compared size
+is not the caller's requested allocation: `sys_alloc` adds the top footprint
+and alignment to the padded chunk size, then rounds to `DEFAULT_GRANULARITY`
+(`dlmalloc.rs` lines 384–392). A fitting range for an assumed size does not
+establish the first system request or the flag's state for a candidate. No
+rounding or runtime check of `__heap_end` occurs on the donation branch. The
+canonical manifest pins the compiler, target and source archives, but is not
+itself a constraint on that
 symbol in a linked candidate. As conditional linker evidence, upstream LLVM
 22.1.8's wasm linker [rounds the final memory pointer to the configured page
 size and assigns it to `__heap_end`](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/lld/wasm/Writer.cpp#L430-L477).
