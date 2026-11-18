@@ -15271,7 +15271,7 @@ mod tests {
             "/v1/me/likes",
             "/v1/me/taste",
             "/v1/me/history",
-            "/v1/me/private-session",
+            "/v1/me/private-session/",
         ] {
             assert_eq!(
                 h.call_full("GET", path, None, req.cookie.clone(), Some(ORIGIN))
