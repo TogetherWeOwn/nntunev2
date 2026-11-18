@@ -1,10 +1,8 @@
 //! Disposable Worker-only control for the real reconciliation store.
 use super::{billing_budget, MirrorBinding, PgStore, Store, StoreError};
 use crate::billing_reconcile::{PaidInvoiceRow, ReconcileOutcome, ReconciledRow};
-
 const CONNECTION: &str =
     "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable";
-
 async fn fixture(setup: bool) -> Result<(), StoreError> {
     billing_budget::with_owned_connection(
         "127.0.0.1", 5432, CONNECTION,
@@ -36,11 +34,9 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
         |_| {},
     ).await
 }
-
 async fn deadline_after_writes(outcome: &ReconcileOutcome) -> Result<(), StoreError> {
     use futures_util::future::{select, Either};
     use std::time::Duration;
-
     let expired = std::rc::Rc::new(std::cell::Cell::new(false));
     let store = PgStore {
         env: None,
@@ -103,7 +99,6 @@ async fn deadline_after_writes(outcome: &ReconcileOutcome) -> Result<(), StoreEr
     ).await?;
     fixture(false).await
 }
-
 fn test_outcome() -> ReconcileOutcome {
     let history = |invoice: &str, amount| PaidInvoiceRow {
         stripe_invoice_id: invoice.into(),
@@ -139,7 +134,6 @@ fn test_outcome() -> ReconcileOutcome {
         read_anchor: None,
     }
 }
-
 pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     fixture(true)
         .await

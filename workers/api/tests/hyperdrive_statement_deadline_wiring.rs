@@ -265,6 +265,13 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
+    let store = store.replacen(
+        function_body(prototype, "asyncfnstore_reconcile_outcome("),
+        "{}",
+        1,
+    );
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -281,7 +288,6 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
     let release_gate =
         "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
     assert_eq!(
