@@ -1196,6 +1196,8 @@ impl PgStore {
                     "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_releases_statement()
                 );
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-release").await?;
                 let member = tx
                     .query_typed(
                         &releases_sql,
@@ -1222,6 +1224,8 @@ impl PgStore {
                      FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_track_pairs_statement()
                 );
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-pairs").await?;
                 let pairs = tx
                     .query_typed(
                         &pairs_sql,

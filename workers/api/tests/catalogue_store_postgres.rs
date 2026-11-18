@@ -1810,6 +1810,45 @@ async fn sized_fixture(n: u32, lens: FieldLens, filler: &str) -> (Client, Client
     (app, mirror)
 }
 
+fn mark_fetch_boundary(
+    store: &impl SubsonicSnapshotCatalogueStore,
+    phase: &'static str,
+) -> Rc<Cell<bool>> {
+    let reached = Rc::new(Cell::new(false));
+    let marker = reached.clone();
+    store.set_preflight_hook(
+        phase,
+        Box::new(move || {
+            Box::pin(async move {
+                marker.set(true);
+                Ok(())
+            })
+        }),
+    );
+    reached
+}
+
+#[tokio::test]
+async fn snapshot_fetch_markers_are_reachable_on_admitted_rows() {
+    for phase in [
+        "membership-release",
+        "membership-pairs",
+        "artist",
+        "release",
+        "track",
+    ] {
+        let (app, mirror) = sized_fixture(1, SHORT, "x").await;
+        let attempts = Rc::new(Cell::new(0));
+        let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts);
+        let reached = mark_fetch_boundary(&store, phase);
+        store
+            .subsonic_snapshot_catalogue_with_cap("u1", 3)
+            .await
+            .unwrap();
+        assert!(reached.get(), "{phase} fetch boundary must be reachable");
+    }
+}
+
 async fn snapshot_of(
     app: Client,
     mirror: Client,
