@@ -752,8 +752,14 @@ struct PgStore {
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_connect: Option<Box<dyn Fn() -> TestConnectFuture>>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+type TestConnectFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<tokio_postgres::Client, StoreError>>>>;
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
@@ -870,6 +876,7 @@ pub fn catalogue_store_for_postgres_test(
             MirrorBinding::Unconfigured
         },
         test_client: std::cell::RefCell::new(Some(app)),
+        test_connect: None,
         test_mirror: Some(CatalogueTestMirror {
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
@@ -891,6 +898,25 @@ pub fn session_retry_store_for_postgres_test(
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
+        test_mirror: None,
+    }
+}
+
+/// Test-only connection acquisition for dispatch paths that call several
+/// production Store methods. Each checkout must be from the disposable DB.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn playback_store_for_postgres_test<F, Fut>(connect: F) -> impl Store + SingleUseStore
+where
+    F: Fn() -> Fut + 'static,
+    Fut: Future<Output = Result<tokio_postgres::Client, StoreError>> + 'static,
+{
+    PgStore {
+        env: None,
+        trace_id: "postgres-playback-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        test_client: std::cell::RefCell::new(None),
+        test_connect: Some(Box::new(move || Box::pin(connect()))),
         test_mirror: None,
     }
 }
@@ -913,6 +939,7 @@ pub async fn private_aware_lease_for_postgres_test(
         trace_id: "postgres-private-lease-test".into(),
         mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
         test_mirror: None,
     }
     .acquire_private_aware_lease(
@@ -1327,6 +1354,10 @@ impl PgStore {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
             return Ok(client);
+        }
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        if let Some(connect) = &self.test_connect {
+            return connect().await;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -6894,6 +6925,8 @@ pub async fn subsonic_mount(
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_connect: None,
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_mirror: None,
     };
     let now_millis = worker::Date::now().as_millis();
@@ -7083,6 +7116,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_connect: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },
