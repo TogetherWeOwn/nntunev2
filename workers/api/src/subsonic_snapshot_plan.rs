@@ -194,6 +194,19 @@ impl<'a> OwnedRawRows<'a> {
         })
     }
 
+    fn build(
+        self,
+        work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+    ) -> Result<Snapshot, BudgetExceeded> {
+        construct_snapshot(
+            self.budget,
+            &self.artists,
+            &self.releases,
+            &self.tracks,
+            work,
+        )
+    }
+
     fn rows(&self) -> (&[ArtistDbRow], &[ReleaseDbRow], &[TrackDbRow]) {
         (&self.artists, &self.releases, &self.tracks)
     }
@@ -223,6 +236,23 @@ pub fn build_bounded_snapshot(
 ) -> Result<Snapshot, BudgetExceeded> {
     reject_unproven_rows(artists, releases, tracks)?;
     construct_snapshot(budget, artists, releases, tracks, work)
+}
+
+/// Copy bounded rows into an owned receipt and construct a snapshot without
+/// retaining the input slices. The caller must bound the database query and
+/// the memory occupied by its input rows separately. This does not mount the
+/// adapter or bound allocator capacity; discard the budget on any error.
+pub fn build_owned_bounded_snapshot(
+    budget: &mut ConstructionBudget,
+    artists: &[ArtistDbRow],
+    releases: &[ReleaseDbRow],
+    tracks: &[TrackDbRow],
+    work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+    per_row: usize,
+    total: usize,
+) -> Result<Snapshot, BudgetExceeded> {
+    OwnedRawRows::try_copy_bounded(budget, artists, releases, tracks, work, per_row, total)?
+        .build(work)
 }
 
 fn construct_snapshot(
@@ -460,7 +490,44 @@ mod tests {
     }
 
     #[test]
-    fn owned_copy_checks_bytes_and_work_before_copying() {
+    fn owned_entry_copies_rows_and_rejects_short_limits() {
+        let artists = [artist("a", "n", "s"), artist("a", "n", "s")];
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        let snapshot =
+            build_owned_bounded_snapshot(&mut budget, &artists, &[], &[], work, 3, 10).unwrap();
+        assert_eq!(snapshot.0.len(), 2);
+        let detached = {
+            let temporary = [artist("a", "n", "s")];
+            build_owned_bounded_snapshot(&mut budget, &temporary, &[], &[], work, 3, 5).unwrap()
+        };
+        assert_eq!(detached.0[0].id, "a");
+        assert_eq!(detached.0[0].name, "n");
+        for (per_row, total) in [(2, 10), (3, 9)] {
+            let mut budget = ConstructionBudget::new(usize::MAX);
+            assert!(build_owned_bounded_snapshot(
+                &mut budget,
+                &artists,
+                &[],
+                &[],
+                work,
+                per_row,
+                total
+            )
+            .is_err());
+            assert_eq!(budget.charged(), 0);
+        }
+        let mut exhausted = ConstructionBudget::new(0);
+        assert!(
+            build_owned_bounded_snapshot(&mut exhausted, &artists, &[], &[], work, 3, 10).is_err()
+        );
+    }
+
+    #[test]
+    fn owned_rows_precharge_raw_and_output_before_copying() {
         let artists = [artist("a", "n", "s"), artist("a", "n", "s")];
         let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
             comparisons: usize::MAX,
@@ -468,7 +535,7 @@ mod tests {
         };
         for (per_row, total, accepted) in [(3, 10, true), (2, 10, false), (3, 9, false)] {
             let mut budget = ConstructionBudget::new(usize::MAX);
-            match OwnedRawRows::try_copy_bounded(
+            let result = OwnedRawRows::try_copy_bounded(
                 &mut budget,
                 &artists,
                 &[],
@@ -476,11 +543,13 @@ mod tests {
                 work,
                 per_row,
                 total,
-            ) {
+            );
+            match result {
                 Ok(receipt) => {
                     assert!(accepted);
                     assert_eq!(receipt.rows().0.len(), 2);
-                    assert_eq!(receipt.rows().0[0].sort_name, "s");
+                    let snapshot = receipt.build(work).unwrap();
+                    assert_eq!(snapshot.0.len(), 2);
                 }
                 Err(_) => {
                     assert!(!accepted);
@@ -488,21 +557,142 @@ mod tests {
                 }
             }
         }
-        let no_work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+    }
+
+    #[test]
+    fn owned_rows_enforce_output_row_and_total_byte_boundaries() {
+        let releases = [release("r", None)];
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let raw = releases[0].mbid.len() + releases[0].title.len();
+        let output = raw + NOW.len();
+        for (per_row, total, accepted) in [
+            (output, raw + output, true),
+            (output - 1, raw + output, false),
+            (output, raw + output - 1, false),
+        ] {
+            let mut budget = ConstructionBudget::new(usize::MAX);
+            let result = OwnedRawRows::try_copy_bounded(
+                &mut budget,
+                &[],
+                &releases,
+                &[],
+                work,
+                per_row,
+                total,
+            );
+            match result {
+                Ok(receipt) => {
+                    assert!(accepted);
+                    assert_eq!(receipt.build(work).unwrap().1.len(), 1);
+                }
+                Err(_) => {
+                    assert!(!accepted);
+                    assert_eq!(budget.charged(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_snapshot_matches_mapper_with_duplicate_tracks_at_byte_limit() {
+        let artists = [artist("a", "N", "sort"), artist("a", "L", "last")];
+        let releases = [release("r", Some(("a", "N")))];
+        let mut tracks = [track("r"), track("r")];
+        tracks[0].artist_mbid = Some("a".into());
+        tracks[0].artist_name = Some("N".into());
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        // Raw: artists 12, release 4, tracks 8 + 6. Output: artists 4,
+        // release 8 + NOW, tracks 9 + 7 plus their fixed strings.
+        let fixed = FLAC_CONTENT_TYPE.len() + FLAC_SUFFIX.len() + NOW.len();
+        let total = 12 + 4 + 8 + 6 + 4 + 8 + NOW.len() + 9 + 7 + 2 * fixed;
+        let per_row = total;
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        let receipt = OwnedRawRows::try_copy_bounded(
+            &mut budget,
+            &artists,
+            &releases,
+            &tracks,
+            work,
+            per_row,
+            total,
+        )
+        .unwrap();
+        let actual = receipt.build(work).unwrap();
+        let expected = crate::subsonic_dispatch::build_snapshot(&artists, &releases, &tracks);
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+
+        let mut short = ConstructionBudget::new(usize::MAX);
+        assert!(OwnedRawRows::try_copy_bounded(
+            &mut short,
+            &artists,
+            &releases,
+            &tracks,
+            work,
+            per_row,
+            total - 1,
+        )
+        .is_err());
+        assert_eq!(short.charged(), 0);
+    }
+
+    #[test]
+    fn owned_rows_reject_unbounded_preflight_work_before_copying() {
+        let artists = [artist("a", "n", "s"), artist("b", "n", "s")];
+        let releases = [release("r", Some(("a", "n")))];
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
             comparisons: 0,
             artist_row_probes: 0,
         };
         let mut budget = ConstructionBudget::new(usize::MAX);
-        assert!(
-            OwnedRawRows::try_copy_bounded(&mut budget, &artists, &[], &[], no_work, 3, 10)
-                .is_err()
-        );
+        assert!(OwnedRawRows::try_copy_bounded(
+            &mut budget,
+            &artists,
+            &releases,
+            &[],
+            work,
+            usize::MAX,
+            usize::MAX
+        )
+        .is_err());
         assert_eq!(budget.charged(), 0);
-        let mut exhausted = ConstructionBudget::new(0);
-        assert!(
-            OwnedRawRows::try_copy_bounded(&mut exhausted, &artists, &[], &[], work, 3, 10)
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn owned_rows_fail_closed_when_construction_budget_is_exhausted() {
+        let artists = [artist("a", "n", "s")];
+        let mut budget = ConstructionBudget::new(0);
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let result = OwnedRawRows::try_copy_bounded(&mut budget, &artists, &[], &[], work, 3, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn owned_build_refuses_output_when_only_raw_copy_fits() {
+        let artists = [artist("a", "n", "s")];
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let mut probe = ConstructionBudget::new(usize::MAX);
+        {
+            let receipt =
+                OwnedRawRows::try_copy_bounded(&mut probe, &artists, &[], &[], work, 3, 5).unwrap();
+            assert_eq!(receipt.rows().0.len(), 1);
+        }
+        let raw_charge = probe.charged();
+        let mut exact_raw = ConstructionBudget::new(raw_charge);
+        let receipt =
+            OwnedRawRows::try_copy_bounded(&mut exact_raw, &artists, &[], &[], work, 3, 5).unwrap();
+        assert!(receipt.build(work).is_err());
     }
 
     #[test]
