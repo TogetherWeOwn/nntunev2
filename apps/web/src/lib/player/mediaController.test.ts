@@ -16,6 +16,59 @@ test('feedback that retires the attempt cannot also bump its live region', async
 	expect(bumpAnnouncement).not.toHaveBeenCalled();
 });
 
+test.each(['availability', 'position', 'assignment', 'readback'] as const)(
+	'restart suppresses stale work after a same-node reattachment during %s', (phase) => {
+		const media = createMediaController();
+		let position = 30;
+		const native = {
+			isConnected: true, getAttribute: () => '/coral', play: vi.fn(), pause: vi.fn(), load: vi.fn(),
+			get currentTime() {
+				if (phase === (position === 0 ? 'readback' : 'position')) media.attach(audio);
+				return position;
+			},
+			set currentTime(value: number) {
+				position = value;
+				if (phase === 'assignment') media.attach(audio);
+			}
+		};
+		const audio = native as unknown as HTMLAudioElement;
+		const staleCleanup = media.attach(audio);
+		const assigned = vi.fn(), publish = vi.fn();
+		media.restart('/coral', 'Coral', {
+			supersedeShare: () => () => true,
+			available: () => { if (phase === 'availability') media.attach(audio); return true; },
+			assigned, publish
+		});
+		staleCleanup();
+		expect(media.audio).toBe(audio);
+		expect(position).toBe(phase === 'assignment' || phase === 'readback' ? 0 : 30);
+		expect(assigned).toHaveBeenCalledTimes(phase === 'readback' ? 1 : 0);
+		expect(publish).not.toHaveBeenCalled();
+		for (const method of [native.play, native.pause, native.load]) expect(method).not.toHaveBeenCalled();
+	}
+);
+
+test('only the newer restart on an unchanged receipt can seek and publish', () => {
+	const media = createMediaController();
+	const seek = vi.fn();
+	const native = {
+		isConnected: true, getAttribute: () => '/coral',
+		get currentTime() { return seek.mock.calls.length ? 0 : 30; },
+		set currentTime(value: number) { seek(value); }
+	};
+	media.attach(native as unknown as HTMLAudioElement);
+	const receipt = media.attachment;
+	const assigned = vi.fn(), publish = vi.fn();
+	const deps = { supersedeShare: () => () => true, available: () => true, assigned, publish };
+	media.restart('/coral', 'Older', {
+		...deps, available: () => { media.restart('/coral', 'Newer', deps); return true; }
+	});
+	expect(media.attachment).toBe(receipt);
+	expect(seek).toHaveBeenCalledExactlyOnceWith(0);
+	expect(assigned).toHaveBeenCalledOnce();
+	expect(publish).toHaveBeenCalledExactlyOnceWith('Restarted Newer.', true);
+});
+
 test('cleanup belongs to the attachment, even when the same node is attached twice', () => {
 	const media = createMediaController();
 	const pause = vi.fn(() => expect(media.audio).toBeUndefined());

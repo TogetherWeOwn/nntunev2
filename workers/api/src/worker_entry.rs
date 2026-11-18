@@ -39,6 +39,9 @@ use crate::handlers::{
 #[path = "billing_budget.rs"]
 pub(crate) mod billing_budget;
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_cancel_control.rs"]
+mod billing_cancel_control;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[path = "billing_deadline_test.rs"]
 pub(crate) mod billing_deadline_test;
 
@@ -754,6 +757,9 @@ struct PgStore {
     mirror_binding: MirrorBinding,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    cancel_token_observer:
+        Option<std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::CancelToken>>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1196,6 +1202,8 @@ impl PgStore {
                     "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_releases_statement()
                 );
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-release").await?;
                 let member = tx
                     .query_typed(
                         &releases_sql,
@@ -1222,6 +1230,8 @@ impl PgStore {
                      FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_track_pairs_statement()
                 );
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-pairs").await?;
                 let pairs = tx
                     .query_typed(
                         &pairs_sql,
@@ -5445,14 +5455,19 @@ impl Store for PgStore {
             #[cfg(feature = "billing-owned-wasm-test")]
             let (host, port, connection_string) = (
                 "127.0.0.1".to_owned(),
-                5432,
+                if self.trace_id == "worker-cancel-test" { 15433 } else { 5432 },
                 "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
             );
             billing_budget::with_owned_connection(
                 &host,
                 port,
                 &connection_string,
-                |client| Box::pin(billing_budget::bootstrap_transaction(client)),
+                |client| {
+                    if let Some(observer) = &self.cancel_token_observer {
+                        *observer.borrow_mut() = Some(client.cancel_token());
+                    }
+                    Box::pin(billing_budget::bootstrap_transaction(client))
+                },
                 move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
                 |expired| {
                     if let Some(observer) = &self.work_deadline_observer {
@@ -5642,16 +5657,14 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // One EXISTS probe over the same established states
-                // the reaper protects (`unverified_user_filter`):
-                // credential, any session row (a completed sign-in
-                // leaves one, revoked or not), vault, or a promoted
-                // (non-member) role. A missing user row is simply
-                // never-admitted.
+                // Established states protected by `unverified_user_filter`:
+                // a credential, any session (even revoked), the legacy
+                // vault marker, or a promoted (non-member) role. A missing
+                // user is never admitted.
                 let sql = format!(
                     "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
                      OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
-                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND legacy_vault_established) \
                      OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
                     member = crate::admin::ROLE_MEMBER
                 );
@@ -7131,6 +7144,8 @@ pub async fn subsonic_mount(
         mirror_binding: MirrorBinding::from_env(&env),
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         work_deadline_observer: None,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        cancel_token_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -7325,6 +7340,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
             work_deadline_observer: None,
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            cancel_token_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]

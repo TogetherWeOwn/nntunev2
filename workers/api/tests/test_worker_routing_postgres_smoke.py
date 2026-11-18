@@ -26,6 +26,7 @@ class Helpers(unittest.TestCase):
         s = smoke.pg_settings(ENV)
         cfg = tomllib.loads(smoke.wrangler_toml(smoke.conn_string(s, "nntune_smoke_ab"), SHA))
         self.assertIn("p%40ss%2Fw", cfg["hyperdrive"][0]["localConnectionString"])
+        self.assertEqual(cfg["vars"]["INVITES_REQUIRED"], "1")
         self.assertNotIn("build", cfg)
 
     def test_fail_closed_settings(self):
@@ -65,7 +66,7 @@ class Helpers(unittest.TestCase):
             with self.subTest(drop_error=drop_error, remove_error=remove_error), \
                  patch.object(smoke, "prerequisites", return_value=(settings, Path("wrangler"), SHA)), \
                  patch.object(smoke.tempfile, "mkdtemp", return_value="/tmp/fake"), \
-                 patch.object(smoke, "psql", side_effect=[None, None, None, drop_error]), \
+                 patch.object(smoke, "psql", side_effect=[None, None, drop_error]), \
                  patch.object(smoke, "app_migrations", return_value=[]), \
                  patch.object(Path, "write_text"), patch.object(Path, "read_text", return_value=""), \
                  patch.object(Path, "mkdir"), \
