@@ -811,6 +811,20 @@ test('restart clears an earlier jump position readout', () => {
 	expect(page.read().jumpStatus).toBe('');
 });
 
+test('a native source check that throws after assignment cannot preserve the prior jump readout', () => {
+	const { page, media, element, writes, track } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	element.getAttribute = () => {
+		if (media.position === 0) throw new Error('unreadable source after assignment');
+		return track.streamUrl;
+	};
+	page.restart();
+	expect(writes).toEqual([40, 0]);
+	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
 test('unreadable restart readback reports failure without restoring the retired jump readout', () => {
 	const { page, media, element, writes } = restartFixture();
 	page.jump('forward');

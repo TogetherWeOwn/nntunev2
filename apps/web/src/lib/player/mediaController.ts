@@ -126,10 +126,11 @@ export function createMediaController() {
 					const atStart = Math.abs(position) <= 0.05;
 					if (atStart) words = 'Already at the start of';
 					audio.currentTime = 0;
-					if (!matches()) return;
-					deps.assigned();
+					// Retire feedback for the old position before another native read.
 					if (!isCurrent()) return;
+					deps.assigned();
 					if (!atStart) {
+						if (!matches()) return;
 						const readback = audio.currentTime;
 						if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) words = 'Restarted';
 					}
