@@ -1594,7 +1594,7 @@ async fn mirror_client() -> Client {
 }
 
 #[tokio::test]
-async fn subsonic_snapshot_rejects_a_capped_query_result() {
+async fn subsonic_snapshot_accepts_exact_cap_track_page() {
     for cap in [2, 3] {
         let recordings = vec![
             "00000001-0000-4000-8000-000000000001".to_string(),
@@ -1622,18 +1622,81 @@ async fn subsonic_snapshot_rejects_a_capped_query_result() {
         ).await.unwrap();
         let attempts = Rc::new(Cell::new(0));
         let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+        let reached = mark_fetch_boundary(&store, "track");
         let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
-        if cap == 2 {
-            assert!(result.is_err(), "a full SQL page must fail closed");
-        } else {
-            assert_eq!(result.unwrap().2.len(), 2, "a partial page is complete");
-        }
+        assert!(reached.get(), "track fetch boundary must be reachable");
+        assert_eq!(
+            result.unwrap().2.len(),
+            2,
+            "a page at or below cap is complete"
+        );
         assert_eq!(attempts.get(), 1);
     }
 }
 
+/// Over-cap (cap+1 and beyond) mirror pages are refused by the in-database
+/// preflight count, for each of the artist, release and track reads.
 #[tokio::test]
-async fn subsonic_snapshot_rejects_capped_artist_and_release_pages() {
+async fn subsonic_snapshot_rejects_over_cap_pages_in_query() {
+    // 3 member releases stay under the membership cap (4) and reach the mirror.
+    for (distinct_artists, rows) in [(true, 3_u32), (true, 4), (false, 3), (false, 4)] {
+        let ids: Vec<String> = (1..=rows).map(|n| synthetic_uuid(2, n)).collect();
+        let app = client(false).await;
+        app.execute(
+            "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) SELECT 'u1', r, r, ARRAY[]::text[] FROM unnest($1::text[]) AS r",
+            &[&ids],
+        ).await.unwrap();
+        let mirror = mirror_client().await;
+        mirror.execute(
+            "INSERT INTO mb_artist SELECT g::uuid, 'A', 'A', 'Person', 'US' FROM unnest($1::text[]) AS g",
+            &[&ids],
+        ).await.unwrap();
+        mirror.execute(
+            "INSERT INTO mb_release SELECT g::uuid, 'R', 'Album', 2001, CASE WHEN $2 THEN g::uuid ELSE $3::text::uuid END FROM unnest($1::text[]) AS g",
+            &[&ids, &distinct_artists, &ids[0]],
+        ).await.unwrap();
+        let phase = if distinct_artists {
+            "artist"
+        } else {
+            "release"
+        };
+        let (accepted, reached, attempts) = snapshot_fetch_boundary(app, mirror, 2, phase).await;
+        assert!(!accepted, "{rows} rows over cap 2 must fail closed");
+        assert!(
+            !reached,
+            "{phase} fetch must not be reached after rejection"
+        );
+        assert_eq!(attempts, 1);
+    }
+    let recordings: Vec<String> = (1..=3_u32).map(|n| synthetic_uuid(3, n)).collect();
+    let app = client(false).await;
+    app.execute(
+        "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'tracks', $1, $2)",
+        &[&SNAPSHOT_RELEASE, &recordings],
+    ).await.unwrap();
+    let mirror = mirror_client().await;
+    mirror.batch_execute(&format!(
+        "INSERT INTO mb_artist VALUES ('{SNAPSHOT_ARTIST}', 'Artist', 'Artist', 'Person', 'US');
+         INSERT INTO mb_release VALUES ('{SNAPSHOT_RELEASE}', 'Album', 'Album', 2001, '{SNAPSHOT_ARTIST}');"
+    )).await.unwrap();
+    mirror
+        .execute(
+            "INSERT INTO mb_recording SELECT g::uuid, 'Song', 1000 FROM unnest($1::text[]) AS g",
+            &[&recordings],
+        )
+        .await
+        .unwrap();
+    mirror.execute(
+        &format!("INSERT INTO mb_track SELECT '{SNAPSHOT_RELEASE}'::uuid, g::uuid, 1, position::smallint FROM unnest($1::text[]) WITH ORDINALITY AS tracks(g, position)"),
+        &[&recordings],
+    ).await.unwrap();
+    let (accepted, reached, _) = snapshot_fetch_boundary(app, mirror, 2, "track").await;
+    assert!(!accepted, "3 tracks over cap 2 must fail closed");
+    assert!(!reached, "track fetch must not be reached after rejection");
+}
+
+#[tokio::test]
+async fn subsonic_snapshot_accepts_exact_cap_artist_and_release_pages() {
     const SECOND_ARTIST: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
     const SECOND_RELEASE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
     // Two artists exercise the first query; one artist and two releases
@@ -1661,18 +1724,18 @@ async fn subsonic_snapshot_rejects_capped_artist_and_release_pages() {
             )).await.unwrap();
             let attempts = Rc::new(Cell::new(0));
             let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
-            let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
-            if cap == 2 {
-                assert!(
-                    result.is_err(),
-                    "a full artist or release page must fail closed"
-                );
+            let phase = if distinct_artists {
+                "artist"
             } else {
-                let (artists, releases, tracks) = result.unwrap();
-                assert_eq!(artists.len(), if distinct_artists { 2 } else { 1 });
-                assert_eq!(releases.len(), 2);
-                assert!(tracks.is_empty());
-            }
+                "release"
+            };
+            let reached = mark_fetch_boundary(&store, phase);
+            let result = store.subsonic_snapshot_catalogue_with_cap("u1", cap).await;
+            assert!(reached.get(), "{phase} fetch boundary must be reachable");
+            let (artists, releases, tracks) = result.unwrap();
+            assert_eq!(artists.len(), if distinct_artists { 2 } else { 1 });
+            assert_eq!(releases.len(), 2);
+            assert!(tracks.is_empty());
             assert_eq!(attempts.get(), 1);
         }
     }
@@ -1826,6 +1889,22 @@ fn mark_fetch_boundary(
         }),
     );
     reached
+}
+
+async fn snapshot_fetch_boundary(
+    app: Client,
+    mirror: Client,
+    cap: i64,
+    phase: &'static str,
+) -> (bool, bool, usize) {
+    let attempts = Rc::new(Cell::new(0));
+    let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+    let reached = mark_fetch_boundary(&store, phase);
+    let accepted = store
+        .subsonic_snapshot_catalogue_with_cap("u1", cap)
+        .await
+        .is_ok();
+    (accepted, reached.get(), attempts.get())
 }
 
 #[tokio::test]
@@ -2011,29 +2090,74 @@ async fn synthetic_fixture_round_trips_complete_catalogue() {
 #[tokio::test]
 async fn snapshot_membership_sentinels_reject_before_mirror() {
     for pair_mode in [false, true] {
-        for count in [3_u32, 4, 5] {
+        // Expose the four exact-cap members in two batches so each mirror
+        // page stays within its separate cap of two rows.
+        for (count, visible) in [(3_u32, 0..0), (4, 0..2), (4, 2..4), (5, 0..0)] {
             let ids: Vec<String> = (1..=count).map(|n| synthetic_uuid(1, n)).collect();
+            let visible = &ids[visible];
             let app = client(false).await;
-            if pair_mode {
+            let mirror = mirror_client().await;
+            let phase = if pair_mode {
                 app.execute(
                     "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'pairs', $1, $2)",
                     &[&SNAPSHOT_RELEASE, &ids],
                 ).await.unwrap();
+                mirror.execute(
+                    "INSERT INTO mb_release VALUES ($1::text::uuid, 'Album', 'Album', 2001, NULL)",
+                    &[&SNAPSHOT_RELEASE],
+                ).await.unwrap();
+                mirror.execute(
+                    "INSERT INTO mb_recording SELECT g::uuid, 'Song', 1000 FROM unnest($1::text[]) AS g",
+                    &[&visible],
+                ).await.unwrap();
+                mirror.execute(
+                    "INSERT INTO mb_track SELECT $1::text::uuid, g::uuid, 1, position::smallint FROM unnest($2::text[]) WITH ORDINALITY AS tracks(g, position)",
+                    &[&SNAPSHOT_RELEASE, &visible],
+                ).await.unwrap();
+                "membership-pairs"
             } else {
                 app.execute(
                     "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) SELECT 'u1', r, r, ARRAY[]::text[] FROM unnest($1::text[]) AS r",
                     &[&ids],
                 ).await.unwrap();
-            }
-            let (result, attempts) = snapshot_of(app, mirror_client().await, 2).await;
-            assert_eq!(result.is_ok(), count < 4, "pair={pair_mode}, count={count}");
-            if count >= 4 {
-                assert_eq!(attempts, 0);
+                mirror.execute(
+                    "INSERT INTO mb_release SELECT r::uuid, 'Album', 'Album', 2001, NULL FROM unnest($1::text[]) AS r",
+                    &[&visible],
+                ).await.unwrap();
+                "membership-release"
+            };
+            let attempts = Rc::new(Cell::new(0));
+            let store = catalogue_store_for_postgres_test(app, true, Ok(mirror), attempts.clone());
+            let reached = mark_fetch_boundary(&store, phase);
+            let result = store.subsonic_snapshot_catalogue_with_cap("u1", 2).await;
+            assert_eq!(
+                reached.get(),
+                count <= 4,
+                "{phase} fetch boundary, count={count}"
+            );
+            if count > 4 {
+                assert!(result.is_err(), "{phase} must reject the sentinel");
+                assert_eq!(attempts.get(), 0);
+            } else {
+                let (_, releases, tracks) = result.unwrap();
+                let mut returned: Vec<_> = if pair_mode {
+                    tracks
+                        .into_iter()
+                        .map(|track| {
+                            assert_eq!(track.release_mbid, SNAPSHOT_RELEASE);
+                            track.recording_mbid
+                        })
+                        .collect()
+                } else {
+                    releases.into_iter().map(|release| release.mbid).collect()
+                };
+                returned.sort_unstable();
+                assert_eq!(returned.as_slice(), visible, "{phase}, count={count}");
             }
         }
     }
     let app = client(false).await;
-    let malformed: Vec<String> = (0..4).map(|n| format!("invalid-{n}")).collect();
+    let malformed: Vec<String> = (0..5).map(|n| format!("invalid-{n}")).collect();
     app.execute(
         "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES ('u1', 'flood', $1, $2)",
         &[&SNAPSHOT_RELEASE, &malformed],
