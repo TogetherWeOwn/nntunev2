@@ -47,6 +47,7 @@ pub mod audio_selection;
 pub mod audio_tags;
 pub mod caller_auth;
 pub mod checkpoint;
+pub mod digest_candidate_identity;
 pub mod dispatch;
 pub mod fixtures;
 pub mod indexer_fetch;
