@@ -86,6 +86,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
 		const queueController = createQueueController(queue);
+		const library = queueController.prepareLibrary(items);
+		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		let endGeneration = 0, queueAnnouncementVersion = 0;
