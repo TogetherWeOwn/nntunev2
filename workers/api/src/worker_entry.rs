@@ -1186,6 +1186,8 @@ impl PgStore {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
                 let membership_cap = cap.checked_mul(2).filter(|n| *n > 0).ok_or(StoreError)?;
+                let membership_limit = membership_cap.checked_add(1).ok_or(StoreError)?;
+                let limit = cap.checked_add(1).ok_or(StoreError)?;
                 let mut client = self.connect().await?;
                 let tx = client.build_transaction()
                     .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
@@ -1196,10 +1198,23 @@ impl PgStore {
                     "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_releases_statement()
                 );
+                // Count at most cap + 1 rows in the database; reject the
+                // sentinel before transferring membership rows.
+                let admitted: bool = tx
+                    .query_typed(
+                        &subsonic_page_probe(&releases_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
                 let member = tx
                     .query_typed(
                         &releases_sql,
-                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
@@ -1222,10 +1237,21 @@ impl PgStore {
                      FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_track_pairs_statement()
                 );
+                let admitted: bool = tx
+                    .query_typed(
+                        &subsonic_page_probe(&pairs_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
                 let pairs = tx
                     .query_typed(
                         &pairs_sql,
-                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
@@ -1253,8 +1279,9 @@ impl PgStore {
                 let artist_preflight = subsonic_text_preflight(
                     crate::catalogue::artists_list_statement(),
                     &["mbid", "name", "sort_name", "type", "country"],
+                    "$2",
                 );
-                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1262,7 +1289,7 @@ impl PgStore {
                 let artist_rows = tx
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
@@ -1279,8 +1306,9 @@ impl PgStore {
                 let release_preflight = subsonic_text_preflight(
                     crate::catalogue::releases_list_statement(),
                     &["mbid", "title", "release_type", "artist_mbid", "artist_name"],
+                    "$2",
                 );
-                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1288,7 +1316,7 @@ impl PgStore {
                 let release_rows = tx
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
@@ -1302,8 +1330,9 @@ impl PgStore {
                 let track_preflight = subsonic_text_preflight(
                     crate::catalogue::tracks_list_statement(),
                     &["release_mbid", "recording_mbid", "title", "release_title", "artist_mbid", "artist_name"],
+                    "$3",
                 );
-                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1314,7 +1343,7 @@ impl PgStore {
                         &[
                             (&pair_releases, Type::TEXT_ARRAY),
                             (&pair_recordings, Type::TEXT_ARRAY),
-                            (&cap, Type::INT8),
+                            (&limit, Type::INT8),
                         ],
                     )
                     .await
@@ -6995,7 +7024,9 @@ const SUBSONIC_SNAPSHOT_CAP: i64 = 1_024;
 
 // Only static, developer-owned column names and statements may be passed.
 // Numeric aggregation avoids overflow even for pathological stored values.
-fn subsonic_text_preflight(statement: &str, columns: &[&str]) -> String {
+// `cap_param` is the statement's LIMIT placeholder, bound to cap + 1.
+// A full sentinel page is refused inside the database before row transfer.
+fn subsonic_text_preflight(statement: &str, columns: &[&str], cap_param: &str) -> String {
     let lengths: Vec<String> = columns
         .iter()
         .map(|column| format!("COALESCE(octet_length({column}), 0)::bigint"))
@@ -7007,16 +7038,21 @@ fn subsonic_text_preflight(statement: &str, columns: &[&str]) -> String {
         .join(" AND ");
     let row_bytes = lengths.join(" + ");
     format!(
-        "SELECT COALESCE(bool_and({per_field}), true) AND \
+        "SELECT count(*) < {cap_param}::bigint AND \
+         COALESCE(bool_and({per_field}), true) AND \
          COALESCE(sum(({row_bytes})::numeric), 0) <= 262144 \
          FROM ({statement}) AS snapshot_rows"
     )
 }
 
-// A full page may have been truncated. Refuse it rather than serve a
-// potentially incomplete catalogue; the check precedes membership filtering.
+// The membership LIMIT is cap + 1; a full sentinel page is over cap.
+fn subsonic_page_probe(statement: &str) -> String {
+    format!("SELECT count(*) < $2::bigint FROM (SELECT 1 FROM ({statement}) AS probe_rows LIMIT $2) AS page")
+}
+
+// A sentinel row means the page exceeds the admitted cap.
 fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError> {
-    if cap <= 0 || len >= cap as usize {
+    if cap <= 0 || len > cap as usize {
         Err(StoreError)
     } else {
         Ok(())
@@ -7400,11 +7436,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_snapshot_page_fails_closed() {
+    fn over_cap_snapshot_page_fails_closed() {
         let cap = SUBSONIC_SNAPSHOT_CAP as usize;
         assert!(require_complete_snapshot_page(0, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
-        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
+        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
     }
 
