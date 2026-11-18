@@ -437,8 +437,8 @@ def run_readback(data_root, filename, expected_sha, expected_database, environ=N
 
 CENSUS_GUARD = (
     "0051_purge_legacy_provider_credentials.sql",
-    "18f916f086bf0a4743f428bf70fab238a3212901",
-    "7c0b0aa5a5dd623e387ea345bfdbde052894f1caf20c6d844c4e6579b37c15f9",
+    "10c9e67b73c59efed95c2c693fd2fd1971dbf2e6",
+    "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca",
 )
 # A reviewed (observation-only secret env name, staging app host, port, role)
 # must be pinned in source and wired only into the protected census step.
@@ -452,7 +452,7 @@ SELECT current_database() = 'nntunev2_staging'
 SELECT (SELECT count(*) FROM public.user_cache_grants),
        (SELECT count(DISTINCT u.id) FROM public.providers AS p
         JOIN public.users AS u ON u.id = p.user_id
-        WHERE u.role = 'member' AND u.deleting_at IS NULL AND NOT u.legacy_vault_established
+        WHERE NOT u.legacy_vault_established
           AND NOT EXISTS (SELECT 1 FROM public.sessions AS s WHERE s.user_id = u.id)
           AND NOT EXISTS (SELECT 1 FROM public.webauthn_credentials AS c WHERE c.user_id = u.id)),
        to_char(transaction_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
@@ -492,12 +492,12 @@ def run_census(filename, guard_sha, database, environ=None):
     row = re.fullmatch(r"([0-9]{1,19})\t([0-9]{1,19})\t([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\n", result.stdout)
     if result.returncode != 0 or not row:
         raise StagingApplyError("purge census read failed or target not verified; details redacted")
-    grants, members, utc = row.groups()
+    grants, owners, utc = row.groups()
     receipt = {"target": "app", "database": database, "guard_head": source["DATA_REVISION"],
                "guard_sha256": guard_sha, "trusted_revision": source["TRUSTED_REVISION"],
                "run_id": source["GITHUB_RUN_ID"], "run_attempt": source["GITHUB_RUN_ATTEMPT"],
                "job": source["GITHUB_JOB"], "observed_at_utc": utc,
-               "user_cache_grants": int(grants), "provider_owning_members": int(members)}
+               "user_cache_grants": int(grants), "provider_owners_without_account_evidence": int(owners)}
     text = json.dumps(receipt, indent=2) + "\n"
     Path("purge-census-receipt.json").write_text(text)
     with open(source["GITHUB_STEP_SUMMARY"], "a") as handle:

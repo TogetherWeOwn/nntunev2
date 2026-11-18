@@ -212,24 +212,30 @@ def assert_audit_snapshot(env):
 
 
 def assert_purge_census(env):
-    # Members 1–3 count despite youth, duplicate providers and transient protections;
-    # 4–9 cover the exclusions (marked, deleting, revoked, passkey, role, no provider).
+    # Count young users 1–3 once each, even with duplicate providers or transient protections.
+    # Exclude marked owner 4, revoked session owner 6, passkey owner 7,
+    # non-owner 9, and active session owner 10.
     exec_sql(env, """
         CREATE TABLE public.users (id int, role text, deleting_at timestamptz,
             legacy_vault_established bool, created_at timestamptz);
         INSERT INTO public.users SELECT i, CASE WHEN i = 8 THEN 'admin' ELSE 'member' END,
-            CASE WHEN i = 5 THEN now() END, i = 4, now() FROM generate_series(1, 9) AS i;
-        CREATE TABLE public.providers AS SELECT i AS user_id FROM generate_series(1, 8) AS i
-            UNION ALL SELECT 1;
+            CASE WHEN i = 5 THEN now() END, i = 4, now() FROM generate_series(1, 10) AS i;
+        CREATE TABLE public.providers (user_id int);
+        INSERT INTO public.providers VALUES (1), (1), (2), (3), (4), (6), (7), (10);
         CREATE TABLE public.user_cache_grants AS SELECT i FROM generate_series(1, 2) AS i;
-        CREATE TABLE public.sessions AS SELECT 6 AS user_id, true AS revoked;
+        CREATE TABLE public.sessions (user_id int, revoked bool);
+        INSERT INTO public.sessions VALUES (6, true), (10, false);
         CREATE TABLE public.webauthn_credentials AS SELECT 7 AS user_id;
         CREATE TABLE public.auth_challenges AS SELECT 2 AS user_id, now() + interval '1h' AS expires_at;
         CREATE TABLE public.magic_link_tokens AS SELECT 3 AS user_id, now() + interval '1h' AS expires_at;
     """)
     options = dict(input=staging_apply.CENSUS_SQL, text=True, capture_output=True, timeout=15)
-    output = psql(ARGS + ["-F", "\t"], env=env, **options).stdout
-    assert staging_apply.re.fullmatch(r"2\t3\t[0-9T:Z-]+\n", output), "unexpected census aggregates"
+    for added_owner, expected in ((None, 3), (8, 4), (5, 5)):
+        # The admin and deletion-fenced owner must each increase the count.
+        if added_owner is not None:
+            exec_sql(env, f"INSERT INTO public.providers VALUES ({added_owner});")
+        output = psql(ARGS + ["-F", "\t"], env=env, **options).stdout
+        assert staging_apply.re.fullmatch(rf"2\t{expected}\t[0-9T:Z-]+\n", output), "unexpected census aggregates"
     wrong_db = psql(ARGS, env={**env, "PGDATABASE": "nntune_ci"}, **options)
     assert not wrong_db.stdout, "census counted rows without verifying the database"
     print("staging-purge-census-postgres: passed exact query and database refusal")

@@ -101,6 +101,8 @@ class StagingApplyTests(unittest.TestCase):
             with patch.dict(os.environ, active, clear=True):
                 self.assertEqual(staging_apply.main([
                     "purge-census", "--file", filename, "--expected-sha", sha, "--expect-database", DB]), 0)
+            self.assertIn("REPEATABLE READ READ ONLY", query.call_args.kwargs["input"])
+            self.assertIn("SET LOCAL row_security = off", query.call_args.kwargs["input"])
             child = query.call_args.kwargs["env"]
             self.assertEqual((child["PGSSLMODE"], child["PGGSSENCMODE"]), ("verify-full", "disable"))
             self.assertFalse({"PGHOSTADDR", staging_apply.SECRET_ENV} & child.keys())
@@ -108,7 +110,7 @@ class StagingApplyTests(unittest.TestCase):
             self.assertEqual(query.call_args.kwargs["timeout"], 60)
         expected = dict(target="app", database=DB, guard_head=head, guard_sha256=sha, trusted_revision="a" * 40,
                         run_id="123", run_attempt="2", job="readback", observed_at_utc="2026-11-18T20:00:00Z",
-                        user_cache_grants=3, provider_owning_members=2)
+                        user_cache_grants=3, provider_owners_without_account_evidence=2)
         self.assertEqual(json.loads(receipt.read_text()), expected)
         self.assertIn(receipt.read_text(), (root / "summary").read_text())
 
