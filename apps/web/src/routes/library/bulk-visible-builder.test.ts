@@ -8,6 +8,7 @@ import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from 
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
@@ -33,7 +34,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision', 'playingElement']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -57,7 +58,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
 		groupLibraryItems, queueCurrentTrack, resolveStreamUrl, createPendingShareSeek,
-		queueController,
+		queueController, createMediaController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value

@@ -4,6 +4,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
+	import { createMediaController } from '#lib/player/mediaController.js';
 	import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
@@ -258,7 +259,9 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
-	let audioEl: HTMLAudioElement | undefined = $state();
+	const media = createMediaController();
+	// A source round trip before Svelte flushes must not revive a retired node.
+	let mediaRevision = $state(0);
 	// Native completion pauses before `ended`; retain intent only for that
 	// element, never for a manual pause, replaced source or account.
 	let playingElement: HTMLAudioElement | null = null;
@@ -267,7 +270,7 @@
 	function currentAudioEvent(event: Event): HTMLAudioElement | null {
 		const element = event.currentTarget as HTMLAudioElement | null;
 		const source = resolveStreamUrl(queueCurrentTrack(queueController.snapshot));
-		return shareAlive && element && element === audioEl && element.isConnected &&
+		return shareAlive && element && element === media.audio && element.isConnected &&
 			source && element.getAttribute('src') === source ? element : null;
 	}
 
@@ -315,7 +318,7 @@
 		if (!replaceQueue(result.queue)) return;
 		const targetQueue = queueController.snapshot;
 		await tick();
-		const target = audioEl;
+		const target = media.audio;
 		const track = queueCurrentTrack(queueController.snapshot);
 		if (!shareAlive || generation !== endGeneration || queueController.snapshot !== targetQueue ||
 			!target || !target.isConnected || !track ||
@@ -328,7 +331,7 @@
 			jumpStatus = '';
 			playingElement = target;
 			await target.play();
-			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
+			if (!shareAlive || generation !== endGeneration || target !== media.audio ||
 				queueController.snapshot !== targetQueue || playingElement !== target) return;
 			queueAnnouncement = `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.`;
 			queueAnnouncementVersion += 1;
@@ -351,7 +354,7 @@
 		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queueController.snapshot,
-		getPosition: () => audioEl?.currentTime,
+		getPosition: () => media.audio?.currentTime,
 		getOrigin: () => window.location.origin,
 		getClipboard: clipboardWriter,
 		shortTitle,
@@ -371,8 +374,8 @@
 	const pendingShareSeek = createPendingShareSeek(
 		(element, target) => ({ isCurrent: () => {
 			const current = queueCurrentTrack(queueController.snapshot);
-			return shareAlive && element === audioEl && current?.id === target.trackId &&
-				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === audioEl &&
+			return shareAlive && element === media.audio && current?.id === target.trackId &&
+				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === media.audio &&
 				queueCurrentTrack(queueController.snapshot) === current;
 		} }),
 		(target) => restartSupersededSources.has(`${target.trackId}\n${target.streamUrl}`)
@@ -702,7 +705,7 @@
 		if (streamUrl) {
 			await tick();
 			if (!queueRevision.isCurrent(receipt) || !isCurrent()) return;
-			const element = audioEl;
+			const element = media.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			if (element) {
 				try {
@@ -778,6 +781,12 @@
 		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
 			resetRestartOnSourceChange(before, after);
 		}
+		if (before?.id !== after?.id || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
+			mediaRevision += 1;
+			playingElement = null;
+			media.reset();
+			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
+		}
 		if (kind === 'replace') queueAnnouncement = '';
 		queueController.publish(next, receipt, library?.sources);
 		if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
@@ -812,7 +821,8 @@
 	function resetShareAtAuthBoundary(): void {
 		endGeneration += 1;
 		playingElement = null;
-		if (audioEl && !audioEl.paused) audioEl.pause();
+		mediaRevision += 1;
+		media.reset();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		queueShare.reset();
@@ -850,7 +860,7 @@
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
-			current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+			current?.id === id && resolveStreamUrl(current) ? media.audio?.currentTime : 0;
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
 		let url: string;
 		try {
@@ -915,10 +925,10 @@
 		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
-		void tick().then(() => pendingShareSeek.apply(audioEl, seekRevision));
+		void tick().then(() => pendingShareSeek.apply(media.audio, seekRevision));
 	}
 
-	function applyPendingShareSeek(element = audioEl): void {
+	function applyPendingShareSeek(element = media.audio): void {
 		pendingShareSeek.apply(element);
 	}
 
@@ -944,7 +954,7 @@
 	// nodes can never enable, disable, or complete a restart.
 	function refreshRestartAvailability(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		if (!element || element !== audioEl || !shareAlive) return;
+		if (!element || element !== media.audio || !shareAlive) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		if (!current || resolveStreamUrl(current) !== element.getAttribute('src')) {
 			restartCanSeek = false;
@@ -968,7 +978,7 @@
 	 * The gesture supersedes any pending inbound-share seek for the source.
 	 */
 	function restartCurrentTrack(): void {
-		const element = audioEl;
+		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
 		if (!element || !current) return;
 		const source = resolveStreamUrl(current);
@@ -1043,7 +1053,7 @@
 	 * events cannot move the position to the share time.
 	 */
 	function jumpRelative(direction: JumpDirection): void {
-		const element = audioEl;
+		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
 		if (live) pendingShareSeek.supersede(current.id, streamUrl);
@@ -1839,7 +1849,7 @@
 			queueShare.dispose();
 			endGeneration += 1;
 			playingElement = null;
-			if (audioEl && !audioEl.paused) audioEl.pause();
+			media.destroy();
 			favoritesExport.destroy();
 			clearShareFeedback();
 			pendingShareSeek.clear();
@@ -2370,9 +2380,9 @@
 				</p>
 			{/if}
 			<div class="nt-library-player-controls">
-				{#key `${currentTrack?.id}:${streamUrl}`}
+				{#key mediaRevision}
 					<audio
-						bind:this={audioEl}
+						{@attach media.attach}
 						data-testid="audio-player"
 						controls
 						src={streamUrl}
