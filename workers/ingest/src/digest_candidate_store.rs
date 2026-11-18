@@ -360,5 +360,24 @@ mod tests {
             rows[0].get::<_, Vec<u8>>(3),
             candidate_hashes(&intent, &manifest).unwrap()[0]
         );
+
+        // A duplicate is a refusal, not evidence that an ambiguous write is safe to retry.
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &intent,
+                &manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::Permanent)
+        );
+        let persisted = db.query_one(
+            "SELECT (SELECT count(*) FROM public.storage_digest_map_intents WHERE map_id = $1::text::uuid), (SELECT count(*) FROM public.storage_digest_map_page_intents WHERE map_id = $1::text::uuid), (SELECT expected_hash FROM public.storage_digest_map_page_intents WHERE map_id = $1::text::uuid AND page_index = 0)",
+            &[&uuid(&intent.map_id)],
+        ).await.unwrap();
+        assert_eq!(persisted.get::<_, i64>(0), 1);
+        assert_eq!(persisted.get::<_, i64>(1), 1);
+        assert_eq!(persisted.get::<_, Vec<u8>>(2), rows[0].get::<_, Vec<u8>>(3));
     }
 }
