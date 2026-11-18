@@ -25,22 +25,68 @@ tests=("$root"/workers/api/tests/sql/*.sql)
 [ "${#migrations[@]}" -gt 0 ] || { echo "no migrations found" >&2; exit 1; }
 [ "${#tests[@]}" -gt 0 ] || { echo "no sql tests found" >&2; exit 1; }
 
+sql_dir="$root/workers/api/tests/sql"
+pre_purge_tests=(legacy_vault_established.sql reconcile_legacy_vault_cohort.sql
+  refresh_legacy_vault_cohort.sql library_artifacts.sql)
+purge_seed="$sql_dir/purge_legacy_provider_credentials_seed.sql"
+purge_check="$sql_dir/purge_legacy_provider_credentials_check.sql"
+
+replay_migrations() {
+  local f
+  for f in "$@"; do
+    # 0006 has an unconditional ADD COLUMN. The 0021 seed names
+    # columns and a table that 0026 drops. Do not edit applied files.
+    case "${f##*/}" in
+      0006_account_deletion.sql|0021_billing_schema.sql) continue ;;
+    esac
+    psql_run -f "$f"
+  done
+}
+
+check_purge_upgrade() {
+  local migration=$1 fixture expected output
+  for fixture in grants vault owner; do
+    case "$fixture" in
+      grants) expected='cache grants are not empty' ;;
+      vault) expected='a vault owner lacks the account marker' ;;
+      owner) expected='provider owners would lose reaping protection' ;;
+    esac
+    if output=$(psql_run -1 -v purge_case="$fixture" -f "$purge_seed" -f "$migration" 2>&1); then
+      printf 'purge unexpectedly accepted %s\n' "$fixture" >&2
+      return 1
+    fi
+    printf '%s\n' "$output"
+    [[ "$output" == *"legacy provider purge refused: $expected"* ]] || return 1
+  done
+  # Exercise the real migration with legacy ciphertext and retained rows,
+  # then roll back the successful fixture to leave a clean install.
+  psql_run -v purge_case=allow -c 'BEGIN;' -f "$purge_seed" -f "$migration" \
+    -f "$purge_check" -c 'ROLLBACK;'
+}
+
+replay=()
+declare -A historical_test=()
 for f in "${migrations[@]}"; do
+  if [[ "${f##*/}" == 0051_purge_legacy_provider_credentials.sql ]]; then
+    # The one-way contract requires the old relations to exist. Verify the
+    # replay-safe prefix and its historical fixtures before removing them.
+    replay_migrations "${replay[@]}"
+    replay=()
+    for fixture in "${pre_purge_tests[@]}"; do
+      echo "test (pre-purge): $fixture"
+      psql_run -f "$sql_dir/$fixture"
+      historical_test["$sql_dir/$fixture"]=1
+    done
+    check_purge_upgrade "$f"
+  else
+    replay+=("$f")
+  fi
   echo "migrate: ${f#"$root"/}"
   psql_run -f "$f"
 done
-# Reapply replay-safe migrations to prove they are clean no-ops. Migration 0006
-# predates this check and has an unconditional ADD COLUMN; applied migrations
-# are immutable, so it is intentionally excluded from the replay pass.
-# Migration 0021 is excluded for a different reason: migration 0026 drops
-# columns its seed INSERT names (and the usage_ledger table it creates), and
-# applied migrations cannot be edited, so 0021 cannot re-run after 0026.
-for f in "${migrations[@]}"; do
-  [[ "${f##*/}" == "0006_account_deletion.sql" ]] && continue
-  [[ "${f##*/}" == "0021_billing_schema.sql" ]] && continue
-  psql_run -f "$f"
-done
+replay_migrations "${replay[@]}"
 for f in "${tests[@]}"; do
+  [[ -n "${historical_test[$f]:-}" || "$f" == "$purge_seed" || "$f" == "$purge_check" ]] && continue
   echo "test:    ${f#"$root"/}"
   psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
     -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" \
