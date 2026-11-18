@@ -497,11 +497,40 @@ class VerifyTests(Base):
 
     def test_conflict_partitions_share_the_actions_network_deadline(self):
         empty = io.BytesIO(json.dumps(page("workflow_runs", [])).encode())
-        with patch.object(sa.time, "monotonic", side_effect=[100, 100, 220]):
+        with patch.object(sa.time, "monotonic", side_effect=[100, 100, 219, 220]):
             actions = sa.Actions(REPO, "synthetic-token")
             with patch.object(actions.opener, "open", return_value=empty) as open_:
                 self.refused("time budget exhausted", actions.conflicts, str(WORKFLOW_ID), NOW)
                 self.assertEqual(open_.call_count, 1)
+
+    def test_final_actions_response_must_finish_before_deadline(self):
+        w = World()
+        routes = w.routes()
+        now = 100
+        candidate_reads = 0
+
+        class FinalResponse(io.BytesIO):
+            def read(self, size=-1):
+                nonlocal now
+                now = 220
+                return super().read(size)
+
+        def open_(request, timeout):
+            nonlocal candidate_reads
+            route = request.full_url.removeprefix(actions.base)
+            data = routes[route]
+            body = data if isinstance(data, bytes) else json.dumps(data).encode()
+            if route == f"runs/{RUN_ID}":
+                candidate_reads += 1
+                if candidate_reads == 2:
+                    return FinalResponse(body)
+            return io.BytesIO(body)
+
+        with patch.object(sa.time, "monotonic", side_effect=lambda: now):
+            actions = sa.Actions(REPO, "synthetic-token")
+            with patch.object(actions.opener, "open", side_effect=open_):
+                self.refused("time budget exhausted", w.verify_with_actions, actions)
+        self.assertEqual(candidate_reads, 2)
 
     def test_older_unresolved_run_is_discovered_independently(self):
         w = World()

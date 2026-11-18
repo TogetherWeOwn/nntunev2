@@ -367,6 +367,7 @@ class Actions:
         try:
             with self.opener.open(request, timeout=min(15, remaining)) as response:
                 data = response.read(limit + 1)
+            require(time.monotonic() < self.deadline, "Actions discovery time budget exhausted")
             require(len(data) <= limit, "Actions response exceeds bounds")
             return data
         except (urllib.error.URLError, TimeoutError):
