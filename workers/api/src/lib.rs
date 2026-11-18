@@ -220,6 +220,12 @@ pub async fn billing_owned_test_entry(
             Err(message) => worker::Response::error(message, 500),
         };
     }
+    if req.method() == worker::Method::Post && req.path() == "/billing-deadline-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_deadline().await {
+            Ok(()) => worker::Response::ok("billing-deadline-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
     if !billing_owned_socket::test_empty_guard_drop() {
         return worker::Response::error("empty guard drop failed", 500);
     }
