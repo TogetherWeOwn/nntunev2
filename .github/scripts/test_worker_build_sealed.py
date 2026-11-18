@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the inert pinned-build to sealed-consumer experiment."""
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,43 @@ class BuildSealedTests(unittest.TestCase):
                     with self.assertRaises(error):
                         probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
                 run.assert_not_called()
+
+    def test_probe_magic_check_does_not_validate_or_authenticate_candidate(self):
+        # A truncated section passes the probe's header-only check. A mocked
+        # consumer accepts it to demonstrate the verifier's limited guarantee.
+        candidate = b"\x00asm\x01\x00\x00\x00\x01"
+
+        def build(*, env):
+            artifact = Path(env["RUNNER_TEMP"]) / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(candidate)
+
+        run = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]
+        ):
+            probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("pass_fds", run.call_args_list[0].kwargs)
+
+    def test_probe_does_not_authenticate_path_consumers(self):
+        # Real executables can ignore the sealed input and report success.
+        def build(*, env):
+            artifact = Path(env["RUNNER_TEMP"]) / "ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"\x00asm\x01\x00\x00\x00\x01")
+
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory) / "tools"
+            tools.mkdir()
+            marker = Path(directory) / "executed"
+            for name in ("wasm-bindgen", "node"):
+                executable = tools / name
+                executable.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(name)} >> {shlex.quote(str(marker))}\n")
+                executable.chmod(0o755)
+            probe.experiment(Path(directory) / "output", env={"PATH": str(tools)}, build=build)
+            self.assertEqual(marker.read_text().splitlines(), ["wasm-bindgen", "node"])
+            self.assertFalse((Path(directory) / "output/nntune_api.js").exists())
 
     def test_bindgen_failure_prevents_node(self):
         def build(*, env):
