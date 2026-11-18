@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'svelte/server';
 import type { LibraryItem } from '#lib/library/cache.js';
-import type { LibraryRefreshState, LibraryRefresherDeps } from '#lib/library/refresh.js';
+import type { LibraryRefresherDeps } from '#lib/library/refresh.js';
 import {
 	addTrack, createQueue, currentTrack, selectTrack, type Track
 } from '#lib/player/queue.js';
@@ -34,7 +34,7 @@ import {
  * U04–07 are passing controls for the existing append semantics the build reuses.
  */
 
-const snapshot = vi.hoisted(() => ({ value: null as LibraryRefreshState | null }));
+const snapshot = vi.hoisted(() => ({ value: null as Parameters<NonNullable<LibraryRefresherDeps['onStateChange']>> | null }));
 
 vi.mock('#lib/library/refresh.js', async (importOriginal) => {
 	const real = await importOriginal<typeof import('#lib/library/refresh.js')>();
@@ -42,7 +42,7 @@ vi.mock('#lib/library/refresh.js', async (importOriginal) => {
 		...real,
 		createLibraryRefresher(deps: LibraryRefresherDeps) {
 			const refresher = real.createLibraryRefresher(deps);
-			if (snapshot.value) deps.onStateChange?.(snapshot.value);
+			if (snapshot.value) deps.onStateChange?.(...snapshot.value);
 			return refresher;
 		}
 	};
@@ -54,7 +54,8 @@ async function renderLoaded(items: LibraryItem[]): Promise<string> {
 	const real = await vi.importActual<typeof import('#lib/library/refresh.js')>('#lib/library/refresh.js');
 	const refresher = real.createLibraryRefresher({
 		sessionStorage: () => null,
-		invalidateLibraryCache: () => {}
+		invalidateLibraryCache: () => {},
+		onStateChange: (...args) => { snapshot.value = args; }
 	});
 	await refresher.refresh(async () => new Response(JSON.stringify(items), {
 		status: 200, headers: { 'Content-Type': 'application/json' }
@@ -62,7 +63,6 @@ async function renderLoaded(items: LibraryItem[]): Promise<string> {
 	expect(refresher.state.loading, 'real refresher must finish before assertions').toBe(false);
 	expect(refresher.state.loadError, 'fixture must pass production library validation').toBeNull();
 	expect(refresher.state.items).toEqual(items);
-	snapshot.value = refresher.state;
 	try {
 		return render(Library).body;
 	} finally {
