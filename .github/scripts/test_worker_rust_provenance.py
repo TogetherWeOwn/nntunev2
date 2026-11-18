@@ -602,7 +602,7 @@ class RustPin(unittest.TestCase):
             expected = {name: hashlib.sha256(b"linker").hexdigest()}
             self.assertEqual(wt.verified_host_linker(root, expected, host), linker)
             for invalid in ("", "../other", "a/b", None):
-                with self.assertRaises(ValueError):
+                with self.subTest(host=invalid), self.assertRaisesRegex(ValueError, "^invalid host triple$"):
                     wt.verified_host_linker(root, expected, invalid)
             with self.assertRaisesRegex(ValueError, "lack linker"):
                 wt.verified_host_linker(root, {}, host)
