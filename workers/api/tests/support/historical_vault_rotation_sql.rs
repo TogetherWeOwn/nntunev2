@@ -1,6 +1,4 @@
-//! Pre-purge SQLite fixture SQL for the legacy provider vault.
-//! The claim and CAS match the historical SQL in the KEK runbook §6.
-//! This is compiled only into the re-wrap integration tests.
+//! Test-only SQLite fixture for the pre-purge vault claim/CAS SQL in the KEK runbook §6.
 
 pub const CLAIM_BATCH_SQL: &str = "SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
   FROM provider_vaults
