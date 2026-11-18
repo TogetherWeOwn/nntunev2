@@ -15588,9 +15588,10 @@ mod tests {
         let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, true)).unwrap();
         block_on(
             h.store
-                .upsert_private_session("alice", &claims.session_id, NOW + 3600),
+                .upsert_private_session("alice", &claims.session_id, 253_402_300_799),
         )
         .unwrap();
+        assert!(block_on(h.store.private_session_active("alice", &claims.session_id)).unwrap());
         h.store
             .catalogue_library
             .borrow_mut()
