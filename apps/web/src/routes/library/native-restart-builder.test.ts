@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, naturalEndPolicy, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
@@ -26,7 +26,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
-		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelectedTrack'
+		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -494,6 +494,51 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
 });
 
+test('native play access cannot start an attempt retired by a queue edit', async () => {
+	const { page, element } = restartFixture();
+	let plays = 0;
+	let afterEdit: ReturnType<typeof page.read> | undefined;
+	Object.defineProperty(element, 'play', { get() {
+		page.remove(0);
+		afterEdit = page.read();
+		return () => { plays += 1; return Promise.resolve(); };
+	} });
+	await page.playQueued('coral');
+	expect(plays).toBe(0);
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(page.read()).toEqual(afterEdit);
+});
+
+test.each(['detached', 'wrong source'] as const)('queued Play refuses a %s attachment', async (target) => {
+	const { page, element } = restartFixture();
+	element.isConnected = target !== 'detached';
+	if (target === 'wrong source') element.getAttribute = () => '/test-audio/pine';
+	const play = vi.spyOn(element, 'play');
+	await page.playQueued('coral');
+	expect(play).not.toHaveBeenCalled();
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(page.read().queueAnnouncement).toBe('Selected Coral Night, paused: playback was blocked.');
+	expect(page.read().queueAnnouncementVersion).toBe(1);
+});
+
+test('a late rejection cannot report against a replacement attachment at the same source', async () => {
+	const { page, element, remount } = restartFixture();
+	let rejectPlay!: (reason: Error) => void;
+	element.play = () => new Promise<void>((_resolve, reject) => { rejectPlay = reject; });
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	const replacement = remount();
+	replacement.paused = false;
+	replacement.dispatchEvent(new Event('playing'));
+	expect(page.nativeIntent().playing).toBe(true);
+	const before = page.read();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(page.currentAudio()).toBe(replacement);
+	expect(page.nativeIntent().playing).toBe(true);
+	expect(page.read()).toEqual(before);
+});
+
 test('route cleanup fences an explicit play waiting for tick', async () => {
 	let resume!: () => void;
 	const { page, element } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
@@ -562,6 +607,9 @@ test.each(['resolve', 'reject'] as const)('a queue edit fences deferred play %s'
 
 test.each(['resolve', 'reject'] as const)('same-object replacement preserves deferred play %s', async (outcome) => {
 	const { page, element } = restartFixture();
+	element.paused = false;
+	element.dispatchEvent(new Event('playing'));
+	expect(page.nativeIntent().playing).toBe(true);
 	let settle!: () => void;
 	element.play = () => new Promise<void>((resolve, reject) => {
 		settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
@@ -573,6 +621,7 @@ test.each(['resolve', 'reject'] as const)('same-object replacement preserves def
 	settle();
 	await attempt;
 	expect(page.read().queueAnnouncement).toBe(outcome === 'resolve' ? 'Playing Coral Night.' : 'Selected Coral Night, paused: playback was blocked.');
+	expect(page.nativeIntent().playing).toBe(outcome === 'resolve');
 	expect(page.read().queueAnnouncementVersion).toBe(version + 1);
 	expect(currentTrack(page.read().queue)?.id).toBe('coral');
 });
