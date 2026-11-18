@@ -1090,21 +1090,36 @@ writes automatically, and an observer success alone is not verified recovery.
 
 ### Production seed precondition (one-time)
 
-The production lane (`.github/workflows/deploy-production.yml`) promotes
-through the shared gradual-promote action, whose automatic-rollback target is
-the latest production deployment and which refuses unless that deployment is
-a single Worker version at 100%. There is currently no active production
-NNTune Worker deployment, so the very first promotion cannot satisfy that
-precondition on its own. Before the first promotion, an authorized executor
-must seed production once: make one full deploy of the web frontend to
-production (for example `wrangler deploy --env production` from the launch
-SHA, run from `apps/web`) with the `nntune.com` apex custom domain (repo
-variable `PRODUCTION_DOMAIN`) attached and `www` redirecting to the apex,
-leaving a single 100% deployment. The lane enforces this before
-uploading anything: its seed step lists production deployments and refuses
-with these instructions when no single-version 100% deployment exists, so a
-first run fails with guidance instead of orphaning an uploaded version inside
-the promotion action. Re-dispatch the lane after seeding.
+The first rollback target is a binding-free maintenance Worker, not a direct
+application deploy. Do not bypass the production lane to seed the app.
+
+1. **Release Manager:** Accept the exact launch SHA after M1, staging
+   admission, Security → QA, exact-head CI and migration ledger review.
+   Explicitly accept the maintenance seed, hostname attachment and rollback.
+2. **DevOps / GitHub custodian:** Verify the production Environment protection
+   and credential scopes. After independent Release Manager acceptance, set
+   `PRODUCTION_ACCEPTED_SHA` **only** in that Environment, never as a repo or org
+   variable. Both modes require this exact SHA, in addition to staging admission.
+   Dispatch `deploy-production.yml` on `main` with that SHA and
+   `mode=bootstrap-maintenance`. Cloudflare creates an unbound Worker under a
+   unique name, deploys maintenance only to that new immutable ID, then renames
+   it to `nntune-web`. Cloudflare returns a conflict if the destination exists;
+   the workflow never writes through that name, attaches a host or tags.
+   On conflict or ambiguous failure, stop. The Cloudflare custodian reconciles
+   the logged scratch name/ID against the canonical Worker before any retry or
+   cleanup; never delete by name or assume a failed rename did not take effect.
+3. **Cloudflare custodian / DevOps:** Record the seed's 100% version ID.
+   Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
+   route conflicts; attach the host to `nntune-web` without displacing routing.
+   Record the non-cacheable, non-indexable maintenance 503 probe.
+4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
+   for the same accepted SHA. The gradual action uses the lockfile-installed
+   Wrangler for promotion and automatic stage rollback. On final smoke
+   failure, use the same CLI and production credentials:
+   `pnpm --dir apps/web exec wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes`.
+   Verify 100% on that version, maintenance 503 on `/` and `/api/build`, and
+   no tag. Retry only with current release admission. The GitHub custodian
+   clears `PRODUCTION_ACCEPTED_SHA` after the authorized window closes.
 
 ### Production Worker secret-shape gate
 

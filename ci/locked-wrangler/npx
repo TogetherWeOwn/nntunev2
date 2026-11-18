@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+# Narrow adapter for the pinned gradual-promote action; never invoke npm.
+if [ "${1-}" != wrangler ]; then
+    printf '%s\n' 'Only the lockfile-installed Wrangler is available in this step' >&2
+    exit 1
+fi
+shift
+exec "${GITHUB_WORKSPACE:?}/apps/web/node_modules/.bin/wrangler" "$@"
