@@ -360,5 +360,34 @@ mod tests {
             rows[0].get::<_, Vec<u8>>(3),
             candidate_hashes(&intent, &manifest).unwrap()[0]
         );
+
+        // A duplicate is a refusal, not evidence that an ambiguous write is safe to retry.
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &intent,
+                &manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::Permanent)
+        );
+        // An expired or fenced reservation also returns Permanent. Check the lease
+        // after the call so that path cannot satisfy the duplicate assertion.
+        let reservation_is_live: bool = db.query_one(
+            "SELECT EXISTS (SELECT FROM public.storage_digest_reservations WHERE object_id = $1::text::uuid AND environment_id = $2::text::uuid AND library_id = $3::text::uuid AND generation = $4 AND expires_at > clock_timestamp())",
+            &[&ids[2], &ids[0], &ids[1], &intent.reservation_generation],
+        ).await.unwrap().get(0);
+        assert!(
+            reservation_is_live,
+            "duplicate write must use a live reservation"
+        );
+        let persisted = db.query_one(
+            "SELECT (SELECT count(*) FROM public.storage_digest_map_intents WHERE map_id = $1::text::uuid), (SELECT count(*) FROM public.storage_digest_map_page_intents WHERE map_id = $1::text::uuid), (SELECT expected_hash FROM public.storage_digest_map_page_intents WHERE map_id = $1::text::uuid AND page_index = 0)",
+            &[&uuid(&intent.map_id)],
+        ).await.unwrap();
+        assert_eq!(persisted.get::<_, i64>(0), 1);
+        assert_eq!(persisted.get::<_, i64>(1), 1);
+        assert_eq!(persisted.get::<_, Vec<u8>>(2), rows[0].get::<_, Vec<u8>>(3));
     }
 }
