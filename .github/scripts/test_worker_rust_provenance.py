@@ -97,6 +97,46 @@ class RustPin(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 wt.inspect_i32_globals(payload)
 
+    def test_inspect_function_only_imports_rejects_other_kinds(self):
+        self.assertEqual(wt.inspect_function_only_imports(b"\x00"), 0)
+        self.assertEqual(wt.inspect_function_only_imports(b"\x01\x03env\x01f\x00\x80\x01"), 1)
+        for payload in (b"", b"\x00\x00", b"\x01", b"\x01\x02a", b"\x01\x01\xff\x00\x00\x00",
+                        b"\x01\x00\x00", b"\x01\x00\x00\x00",
+                        b"\x01\x00\x00\x00\xff\xff\xff\xff\x10", b"\x91\x4e",
+                        *(b"\x01\x00\x00" + bytes([kind]) + b"\x00" for kind in (1, 2, 3, 4))):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_function_only_imports(payload)
+
+    def test_inspect_exports_keeps_module_indices_without_resolving_imports(self):
+        self.assertEqual(wt.inspect_exports(b"\x00"), {})
+        self.assertEqual(wt.inspect_exports(
+            b"\x02\x0b__heap_base\x03\x81\x01\x06memory\x02\x00"),
+            {"__heap_base": (3, 129), "memory": (2, 0)})
+        for payload in (b"", b"\x00\x00", b"\x01", b"\x01\x02a", b"\x01\x01\xff\x03\x00",
+                        b"\x01\x01a", b"\x01\x01a\x04\x00", b"\x01\x01a\x03",
+                        b"\x01\x01a\x03\xff\xff\xff\xff\x10",
+                        b"\x02\x01a\x03\x00\x01a\x00\x00", b"\x91\x4e"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_exports(payload)
+
+    def test_inspect_memory_section_is_restricted_and_not_module_validation(self):
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x00\x00"), (0, None))
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x01\x01\x80\x80\x04"),
+                         (1, 65536))
+        for payload in (b"", b"\x00", b"\x02\x00\x01\x00\x01", b"\x01\x02\x01",
+                        b"\x01\x04\x01", b"\x01\x00", b"\x01\x01\x02\x01",
+                        b"\x01\x00\x81\x80\x04", b"\x01\x00\x01\x00",
+                        b"\x01\x00\xff\xff\xff\xff\x10",
+                        b"\x01\x00\x80\x80\x80\x80\x80\x00"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_memory_section(payload)
+
+    def test_inspect_memory_section_requires_a_single_byte_limits_flag(self):
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x01\x81\x00\x82\x00"), (1, 2))
+        for payload in (b"\x01", b"\x01\x80\x00\x01", b"\x01\x81\x00\x01\x02"):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "unsupported memory limits"):
+                wt.inspect_memory_section(payload)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
@@ -413,6 +453,10 @@ class RustPin(unittest.TestCase):
                 entry = tarfile.TarInfo(prefix + path)
                 entry.size = len(name)
                 bundle.addfile(entry, io.BytesIO(name.encode()))
+                if name == "rustc":
+                    linker = tarfile.TarInfo(prefix + f"lib/rustlib/{host}/bin/rust-lld")
+                    linker.size = len(b"linker")
+                    bundle.addfile(linker, io.BytesIO(b"linker"))
                 metadata = tarfile.TarInfo(prefix + "manifest.in")
                 metadata.size = len(name)
                 bundle.addfile(metadata, io.BytesIO(name.encode()))
@@ -425,7 +469,9 @@ class RustPin(unittest.TestCase):
         ).encode()
         rust["channel-manifest"]["sha256"] = hashlib.sha256(manifest).hexdigest()
         result = wt.host_component_files(pins, manifest, archives)
-        self.assertEqual(set(result), set(paths.values()))
+        linker_path = f"lib/rustlib/{host}/bin/rust-lld"
+        self.assertEqual(set(result), set(paths.values()) | {linker_path})
+        self.assertEqual(result[linker_path], hashlib.sha256(b"linker").hexdigest())
         urls = {rust["channel-manifest"]["url"]: manifest,
                 **{f"https://example.invalid/{name}": data for name, data in archives.items()}}
         self.assertEqual(wt.download_host_component_files(pins, lambda url, limit: urls[url]), result)
