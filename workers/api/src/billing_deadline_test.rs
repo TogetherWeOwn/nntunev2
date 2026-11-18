@@ -204,7 +204,17 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
                 worker::Delay::from(Duration::from_millis(50)).await;
             }
             if !disappeared {
-                worker::console_log!("cancellation backend state, wait type, wait event, transaction age seconds: {:?}", last_state);
+                phase.set(match last_state {
+                    Some((Some(state), Some(kind), Some(event), _))
+                        if state == "active" && kind == "Lock" && event == "advisory" =>
+                    {
+                        "cancellation backend remained blocked on advisory lock"
+                    }
+                    Some((Some(state), _, _, _)) if state == "idle in transaction" => {
+                        "cancellation backend remained idle in transaction"
+                    }
+                    _ => "cancellation backend remained present in another state",
+                });
                 return Err(StoreError);
             }
             phase.set("cancellation rollback row check failed");
