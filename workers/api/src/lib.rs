@@ -214,6 +214,12 @@ pub async fn billing_owned_test_entry(
             Err(message) => worker::Response::error(message, 500),
         };
     }
+    if req.method() == worker::Method::Post && req.path() == "/owned-write-deadline-proof" {
+        return match worker_entry::billing_budget::test_deadline_after_write().await {
+            Ok(pid) => worker::Response::ok(format!("owned-write-deadline-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
     if !billing_owned_socket::test_empty_guard_drop() {
         return worker::Response::error("empty guard drop failed", 500);
     }

@@ -345,6 +345,36 @@ pub(crate) async fn test_transaction_bootstrap() -> Result<(), &'static str> {
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 pub(crate) const BILLING_FIXTURE: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=billing_ack_test";
 
+// Standalone transport control; this does not invoke billing reconciliation.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_deadline_after_write() -> Result<i32, &'static str> {
+    let pid = std::rc::Rc::new(Cell::new(0));
+    let expired = std::rc::Rc::new(Cell::new(false));
+    let observed_pid = pid.clone();
+    let observed_expiry = expired.clone();
+    let result = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        BILLING_FIXTURE,
+        |client| Box::pin(bootstrap_transaction(client)),
+        move |client| Box::pin(async move {
+            let row = client.query_one(
+                "INSERT INTO public.users (id,email,created_at) VALUES ('deadline_probe','deadline_probe',0) RETURNING pg_backend_pid()", &[],
+            ).await.map_err(|_| StoreError)?;
+            observed_pid.set(row.get::<_, i32>(0));
+            let row = client.query_one("SELECT count(*) FROM public.users WHERE id = 'deadline_probe'", &[]).await.map_err(|_| StoreError)?;
+            if row.get::<_, i64>(0) != 1 { return Err(StoreError); }
+            client.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+            std::future::pending::<Result<(), StoreError>>().await
+        }),
+        move |was_expired| observed_expiry.set(was_expired),
+    ).await;
+    if result.is_ok() || !expired.get() || pid.get() <= 0 {
+        return Err("write control did not reach the Worker deadline");
+    }
+    Ok(pid.get())
+}
+
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 pub(crate) async fn test_commit_ack() -> Result<i32, &'static str> {
     let prepared_pid = std::rc::Rc::new(Cell::new(0));
