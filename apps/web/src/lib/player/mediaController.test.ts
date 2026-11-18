@@ -48,6 +48,27 @@ test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 	}
 );
 
+test('only the newer restart on an unchanged receipt can seek and publish', () => {
+	const media = createMediaController();
+	const seek = vi.fn();
+	const native = {
+		isConnected: true, getAttribute: () => '/coral',
+		get currentTime() { return seek.mock.calls.length ? 0 : 30; },
+		set currentTime(value: number) { seek(value); }
+	};
+	media.attach(native as unknown as HTMLAudioElement);
+	const receipt = media.attachment;
+	const assigned = vi.fn(), publish = vi.fn();
+	const deps = { supersedeShare: () => () => true, available: () => true, assigned, publish };
+	media.restart('/coral', 'Older', {
+		...deps, available: () => { media.restart('/coral', 'Newer', deps); return true; }
+	});
+	expect(media.attachment).toBe(receipt);
+	expect(seek).toHaveBeenCalledExactlyOnceWith(0);
+	expect(assigned).toHaveBeenCalledOnce();
+	expect(publish).toHaveBeenCalledExactlyOnceWith('Restarted Newer.', true);
+});
+
 test('cleanup belongs to the attachment, even when the same node is attached twice', () => {
 	const media = createMediaController();
 	const pause = vi.fn(() => expect(media.audio).toBeUndefined());

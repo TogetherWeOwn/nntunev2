@@ -212,6 +212,23 @@ test('a throwing native source check cannot preserve a pending share', async () 
 	expect(writes).toEqual([]);
 });
 
+test.each(['duration', 'range start'] as const)('restart stops availability reads after retirement during %s', (phase) => {
+	const { page, element, remount, writes } = restartFixture();
+	const readPosition = vi.fn(() => 30);
+	const readEnd = vi.fn(() => 120);
+	Object.defineProperties(element, {
+		duration: { get() { if (phase === 'duration') remount(); return 120; } },
+		currentTime: { get: readPosition },
+		seekable: { get: () => ({ length: 1, start: () => { remount(); return 0; }, end: readEnd }) }
+	});
+	page.restart();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(readPosition).toHaveBeenCalledTimes(phase === 'duration' ? 0 : 1);
+	expect(readEnd).not.toHaveBeenCalled();
+	expect(writes).toEqual([]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
 test('a position getter cannot write through a reentrant source change', () => {
 	const { page, element, writes } = restartFixture();
 	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));

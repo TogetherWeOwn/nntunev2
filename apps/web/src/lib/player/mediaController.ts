@@ -22,7 +22,7 @@ type PlaySelection = {
 
 type RestartSelection = {
 	supersedeShare: () => () => boolean;
-	available: (audio: HTMLAudioElement) => boolean;
+	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
 	assigned: () => void;
 	publish: (message: string, available: boolean) => void;
 };
@@ -119,8 +119,8 @@ export function createMediaController() {
 		let words = 'Could not restart';
 		let available = false;
 		try {
-			available = deps.available(audio);
-			if (available && isCurrent()) {
+			available = deps.available(audio, matches);
+			if (available && matches()) {
 				const position = audio.currentTime;
 				if (Number.isFinite(position) && matches()) {
 					const atStart = Math.abs(position) <= 0.05;
