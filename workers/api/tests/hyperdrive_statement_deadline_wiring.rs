@@ -6,8 +6,9 @@
 //! Builder contract: PgStore::bounded(operation, timeout_ms) races one store
 //! operation against the shared with_deadline helper, expiring to the opaque
 //! StoreError. Every `Store for PgStore` method and `SingleUseStore::claim`
-//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
-//! async block contains that method's connects — self.connect(), the
+//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS, directly
+//! or through a helper that owns the whole operation. The async block
+//! contains that method's connects — self.connect(), the
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).
@@ -290,6 +291,16 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
                 body,
                 format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
                 "{name} must delegate its entire operation to the bounded helper"
+            );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
             );
         } else {
             assert_bounded(piece, name);
