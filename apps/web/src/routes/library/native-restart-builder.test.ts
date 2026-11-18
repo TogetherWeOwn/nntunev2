@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, naturalEndPolicy, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
@@ -26,7 +26,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
-		'currentAudioEvent', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelectedTrack'
+		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -46,21 +46,34 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const location = { search: '' };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
-	const element = {
-		get duration() { return media.duration; },
-		get currentTime() { return media.position; },
+	class NativeAudio extends EventTarget {
+		readonly listeners = new Map<string, EventListener>();
+		override addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions) {
+			if (typeof listener === 'function') this.listeners.set(type, listener);
+			super.addEventListener(type, listener, options);
+		}
+		get duration() { return media.duration; }
+		get currentTime() { return media.position; }
 		set currentTime(value: number) {
 			writes.push(value);
 			if (media.refuse) throw new Error('native seek refused');
 			media.position = value;
-		},
+		}
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
-		},
-		getAttribute: (name: string) => name === 'src' ? track.streamUrl : null,
-		isConnected: true, ended: true, paused: true, error: null,
-		volume: 0.6, muted: false, playbackRate: 1.25,
-		play: () => Promise.resolve()
+		}
+		getAttribute = (name: string) => name === 'src' ? track.streamUrl : null;
+		isConnected = true; ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
+		volume = 0.6; muted = false; playbackRate = 1.25;
+		play = () => Promise.resolve();
+		pause() { this.paused = true; }
+	}
+	let element = new NativeAudio();
+	const capture = (type: string) => {
+		const target = element;
+		const listener = target.listeners.get(type);
+		if (!listener) throw new Error(`Missing native listener: ${type}`);
+		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
 	const trackedPendingShareSeek: typeof createPendingShareSeek = (...args) => {
@@ -75,12 +88,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
 		createQueueController, createMediaController, streamUrl: track.streamUrl,
-		tick, window: { location }, element, track
+		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), mediaRevision = 0;
 		const media = createMediaController();
-		media.attach(element);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
@@ -94,7 +106,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		let endGeneration = 0, queueAnnouncementVersion = 0;
-		let repeat = 'off', playingElement = element;
+		let repeat = 'off';
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
 		const onMount = (callback) => { cleanup = callback(); };
@@ -107,14 +119,16 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		return {
+			detach: attachNativeAudio(element),
 			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
-			seeking: (target = element) => handleSeeking({ currentTarget: target }), replaceQueue,
-			subscribe: queueController.subscribe, attach: () => media.attach(element), currentAudio: () => media.audio,
-			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
-			refresh: () => refreshRestartAvailability({ currentTarget: element }),
+			seeking: (target = element) => capture('seeking')(target), replaceQueue,
+			subscribe: queueController.subscribe, attach: attachNativeAudio, currentAudio: () => media.audio,
+			nativeIntent: () => ({ playing: media.attachment?.playing, endGeneration }),
+			end: (mode) => { repeat = mode; return capture('ended')(); },
+			refresh: () => capture('timeupdate')(),
 			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
@@ -132,8 +146,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		playQueued: (id: string) => Promise<void>;
 		seeking: (target?: unknown) => void;
 		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
-		attach: () => () => void;
+		attach: (audio: NativeAudio) => () => void;
+		detach: () => void;
 		currentAudio: () => unknown;
+		nativeIntent: () => { playing: boolean | undefined; endGeneration: number };
 		subscribe: (callback: (queue: ReturnType<typeof createQueue>) => void) => () => void;
 		end: (mode: 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
@@ -152,7 +168,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	};
 	page.refresh();
 	expect(page.read().restartCanSeek).toBe(true);
-	return { page, media, writes, location, track, element, observeClear: (callback: () => void) => { onClear = callback; } };
+	const remount = () => { const next = new NativeAudio(); page.attach(next); return element = next; };
+	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
 }
 
 test('restart reads mutable availability once per gesture', () => {
@@ -192,7 +209,7 @@ test('a new same-source share navigation supersedes an earlier restart marker', 
 });
 
 test('direct queue selection retires a pending share adjustment across a round trip', async () => {
-	const { page, media, location, writes } = restartFixture();
+	const { page, media, location, writes, remount } = restartFixture();
 	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
 	media.duration = Number.NaN;
 	location.search = '?track=coral&t=45';
@@ -208,7 +225,7 @@ test('direct queue selection retires a pending share adjustment across a round t
 	page.select(1);
 	expect(page.read().pendingShareSeek).toBeNull();
 	page.select(0);
-	page.attach();
+	remount();
 	media.position = 12;
 	media.duration = 20;
 	page.applyPendingShareSeek();
@@ -248,20 +265,60 @@ test('same-source replacement preserves pending share but only a new object fenc
 });
 
 test('a new URL for the same ID retires the attachment before queue publication', () => {
-	const { page, element } = restartFixture();
+	const { page, element, remount } = restartFixture();
 	const original = page.read().queue;
 	const next = createQueue(original.tracks.map((track) => ({ ...track, streamUrl: '/test-audio/new' })));
-	const staleCleanup = page.attach();
 	const observed: unknown[] = [];
 	const unsubscribe = page.subscribe(() => observed.push(page.currentAudio()));
 	page.replaceQueue(next);
 	page.replaceQueue(original);
 	expect(observed).toEqual([element, undefined, undefined]);
 	expect(page.read().mediaRevision).toBe(2);
-	page.attach();
-	staleCleanup();
-	expect(page.currentAudio()).toBe(element);
+	const replacement = remount();
+	page.detach();
+	expect(page.currentAudio()).toBe(replacement);
 	unsubscribe();
+});
+
+test('queued and captured events from a retired node cannot change its same-source replacement', () => {
+	const { page, element, media, capture, remount } = restartFixture();
+	const [play, pause, error, ended, seeking, progress] =
+		['play', 'pause', 'error', 'ended', 'seeking', 'progress'].map(capture);
+	const queued: Event[] = [];
+	element.paused = false;
+	element.pause = () => { element.paused = true; queued.push(new Event('timeupdate'), new Event('pause')); };
+	page.detach();
+	const replacement = remount();
+	page.detach();
+	element.paused = replacement.paused = false;
+	play();
+	expect(page.nativeIntent().playing).toBe(false);
+	replacement.dispatchEvent(new Event('playing'));
+	page.jump('forward');
+	const before = page.nativeIntent();
+	expect(before.playing).toBe(true);
+	expect(() => page.attach(element)).toThrow(/fresh audio element/);
+	expect(page.currentAudio()).toBe(replacement);
+	element.paused = replacement.paused = true;
+	pause();
+	element.error = { code: 3, message: 'decode failed' };
+	error();
+	element.error = null;
+	media.position = 80;
+	media.duration = NaN;
+	seeking();
+	progress();
+	expect(queued).toHaveLength(2);
+	for (const event of queued) element.dispatchEvent(event);
+	element.ended = true;
+	ended();
+	expect(page.nativeIntent()).toEqual(before);
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	expect(page.read().restartCanSeek).toBe(true);
+	replacement.dispatchEvent(new Event('timeupdate'));
+	expect(page.read().restartCanSeek).toBe(false);
+	replacement.dispatchEvent(new Event('pause'));
+	expect(page.nativeIntent()).toEqual({ playing: false, endGeneration: before.endGeneration + 1 });
 });
 
 test('a reentrant subscription cannot publish an older operation hint', () => {
@@ -348,17 +405,16 @@ test('a clear subscriber invoking the share handler leaves the share selection a
 });
 
 test('a selection subscriber replacing with the same object delivers once and still starts playback', async () => {
-	const { page, element } = restartFixture();
+	const { page, remount } = restartFixture();
 	const pine = { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' };
 	page.replaceQueue({ tracks: [pine, { id: 'coral', title: 'Coral Night', artist: '', streamUrl: '' }], currentIndex: 0 });
 	let plays = 0, deliveries = 0, replaced = 0;
-	element.play = () => { plays += 1; return Promise.resolve(); };
 	const unsubscribe = page.subscribe((value) => {
 		deliveries += 1;
 		if (value.currentIndex === 1) { replaced += 1; page.replaceQueue(value); }
 	});
 	const attempt = page.playQueued('coral');
-	page.attach();
+	remount().play = () => { plays += 1; return Promise.resolve(); };
 	await attempt;
 	// One initial delivery plus the single selection; the same-object replace publishes nothing.
 	expect(deliveries).toBe(2);
@@ -438,6 +494,51 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
 });
 
+test('native play access cannot start an attempt retired by a queue edit', async () => {
+	const { page, element } = restartFixture();
+	let plays = 0;
+	let afterEdit: ReturnType<typeof page.read> | undefined;
+	Object.defineProperty(element, 'play', { get() {
+		page.remove(0);
+		afterEdit = page.read();
+		return () => { plays += 1; return Promise.resolve(); };
+	} });
+	await page.playQueued('coral');
+	expect(plays).toBe(0);
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(page.read()).toEqual(afterEdit);
+});
+
+test.each(['detached', 'wrong source'] as const)('queued Play refuses a %s attachment', async (target) => {
+	const { page, element } = restartFixture();
+	element.isConnected = target !== 'detached';
+	if (target === 'wrong source') element.getAttribute = () => '/test-audio/pine';
+	const play = vi.spyOn(element, 'play');
+	await page.playQueued('coral');
+	expect(play).not.toHaveBeenCalled();
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(page.read().queueAnnouncement).toBe('Selected Coral Night, paused: playback was blocked.');
+	expect(page.read().queueAnnouncementVersion).toBe(1);
+});
+
+test('a late rejection cannot report against a replacement attachment at the same source', async () => {
+	const { page, element, remount } = restartFixture();
+	let rejectPlay!: (reason: Error) => void;
+	element.play = () => new Promise<void>((_resolve, reject) => { rejectPlay = reject; });
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	const replacement = remount();
+	replacement.paused = false;
+	replacement.dispatchEvent(new Event('playing'));
+	expect(page.nativeIntent().playing).toBe(true);
+	const before = page.read();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(page.currentAudio()).toBe(replacement);
+	expect(page.nativeIntent().playing).toBe(true);
+	expect(page.read()).toEqual(before);
+});
+
 test('route cleanup fences an explicit play waiting for tick', async () => {
 	let resume!: () => void;
 	const { page, element } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
@@ -506,6 +607,9 @@ test.each(['resolve', 'reject'] as const)('a queue edit fences deferred play %s'
 
 test.each(['resolve', 'reject'] as const)('same-object replacement preserves deferred play %s', async (outcome) => {
 	const { page, element } = restartFixture();
+	element.paused = false;
+	element.dispatchEvent(new Event('playing'));
+	expect(page.nativeIntent().playing).toBe(true);
 	let settle!: () => void;
 	element.play = () => new Promise<void>((resolve, reject) => {
 		settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
@@ -517,6 +621,7 @@ test.each(['resolve', 'reject'] as const)('same-object replacement preserves def
 	settle();
 	await attempt;
 	expect(page.read().queueAnnouncement).toBe(outcome === 'resolve' ? 'Playing Coral Night.' : 'Selected Coral Night, paused: playback was blocked.');
+	expect(page.nativeIntent().playing).toBe(outcome === 'resolve');
 	expect(page.read().queueAnnouncementVersion).toBe(version + 1);
 	expect(currentTrack(page.read().queue)?.id).toBe('coral');
 });
@@ -650,16 +755,44 @@ test('restart at the start clears an earlier boundary readout', () => {
 });
 
 for (const mode of ['one', 'queue'] as const) {
-	test(`same-source repeat ${mode} clears an earlier jump readout`, async () => {
-		const { page, media } = restartFixture();
+	test(`LIBREP-U03 native ended replays under repeat ${mode} and clears an earlier jump readout`, async () => {
+		const { page, media, element, capture } = restartFixture();
 		page.jump('forward');
 		expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+		element.paused = false;
+		capture('play')();
 		media.position = media.duration;
+		element.ended = element.paused = true;
+		capture('pause')();
 		await page.end(mode);
 		expect(media.position).toBe(0);
 		expect(page.read().jumpStatus).toBe('');
+		expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
 	});
 }
+
+test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat cannot cross a reattachment during %s', async (phase) => {
+	let resume!: () => void;
+	const pending = new Promise<void>((resolve, reject) => {
+		resume = phase === 'play rejection' ? () => reject(new Error('native play refused')) : resolve;
+	});
+	const { page, element, media, capture, remount } = restartFixture(() => phase === 'tick' ? pending : Promise.resolve());
+	element.play = () => pending;
+	element.paused = false;
+	capture('play')();
+	media.position = media.duration;
+	element.ended = element.paused = true;
+	const repeat = page.end('one');
+	await Promise.resolve();
+	const replacement = remount();
+	replacement.paused = false;
+	capture('play')();
+	resume();
+	await repeat;
+	expect(media.position).toBe(phase === 'tick' ? media.duration : 0);
+	expect(page.read().queueAnnouncement).toBe('');
+	expect(page.nativeIntent().playing).toBe(true);
+});
 
 test('source-preserving queue edits retain the current jump readout', () => {
 	const { page, media } = restartFixture();

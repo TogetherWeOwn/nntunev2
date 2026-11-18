@@ -193,10 +193,6 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
             }
             phase.set("cancellation advisory wait not observed");
             let pid = waiting_pid.ok_or(StoreError)?;
-            match select(operation.as_mut(), Box::pin(super::billing_cancel_control::observe_no_cancel(client, pid))).await {
-                Either::Left(_) => return Err(StoreError),
-                Either::Right((result, _)) => result.map_err(|_| StoreError)?,
-            }
             let token = cancel_token.borrow_mut().take().ok_or(StoreError)?;
             drop(operation);
             super::billing_cancel_control::send_cancel(&token).await.map_err(|_| StoreError)?;

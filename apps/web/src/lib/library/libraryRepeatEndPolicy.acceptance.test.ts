@@ -159,16 +159,17 @@ describe('library repeat hooks are declared in the library markup', () => {
 	});
 
 	it('LIBREP-U03 wires the native ended event on the library audio', () => {
+		const audio = routeSource().match(/<audio\b[^>]*\sdata-testid="audio-player"(?=\s|>)[^>]*>/)?.[0];
 		expect(
-			routeSource(),
+			audio ?? '',
 			note(
 				'LIBREP-U03',
-				'the library markup handles the audio ended event via onended',
-				'no ended handler',
+				'the library audio player uses the attachment that registers native ended',
+				'missing audio player or native audio attachment',
 				'ended_handler_missing',
-				'Builder adds onended to the library <audio> and routes it through naturalEndPolicy (no parallel end-policy).'
+				'Builder wires attachNativeAudio on the library <audio> and routes ended through naturalEndPolicy (no parallel end-policy).'
 			)
-		).toContain('onended');
+		).toMatch(/\s\{@attach\s+attachNativeAudio\s*\}(?=\s|>)/);
 	});
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {

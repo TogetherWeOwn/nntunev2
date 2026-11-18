@@ -287,6 +287,21 @@ def check_heap_range(base: int, end: int, initial_pages: int) -> None:
         raise ValueError("linker heap end is not eight-byte aligned")
 
 
+def linker_donation_fits(base: int, end: int, initial_pages: int, requested: int) -> bool:
+    """Model the size predicate for a possible first linker donation, not admission.
+
+    `requested` is the system allocation size, not the user allocation size:
+    dlmalloc rounds and adds its own overhead before calling the system allocator.
+    The values and request are not authenticated here. A true result does not
+    prove the one-shot donation was available or taken, allocator invariants,
+    or candidate provenance.
+    """
+    check_heap_range(base, end, initial_pages)
+    if type(requested) is not int or not 0 < requested <= 0xffff_ffff:
+        raise ValueError("invalid wasm32 system allocation request")
+    return end - base >= requested
+
+
 def check_lock_identity(pins: dict, root: Path = ROOT) -> None:
     locks = pins.get("locks", {})
     if set(locks) != {"workers/api/Cargo.lock"}:
