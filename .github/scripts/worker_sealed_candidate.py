@@ -28,10 +28,11 @@ def snapshot_build_output(path) -> bytes:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_CANDIDATE_BYTES:
             raise ValueError("invalid candidate output file")
-        with os.fdopen(fd, "rb", closefd=False) as output:
-            candidate = output.read(MAX_CANDIDATE_BYTES + 1)
-        if len(candidate) != info.st_size:
-            raise ValueError("candidate output size changed while reading")
+        # Reject short reads and probe for growth without buffered read-ahead.
+        with os.fdopen(fd, "rb", buffering=0, closefd=False) as output:
+            candidate = output.read(info.st_size)
+            if len(candidate) != info.st_size or output.read(1):
+                raise ValueError("candidate output size changed while reading")
         return candidate
     finally:
         os.close(fd)
@@ -40,13 +41,15 @@ def snapshot_build_output(path) -> bytes:
 def experiment_build_and_consume(build, verify, command, *, cwd, env, run=subprocess.run) -> str:
     """Exercise a fresh output path through inspection and consumption.
 
-    The callback must finish writing before returning. This experiment does not
-    authenticate the callback, its tools or environment, nor exclude concurrent
-    mutation by another process. It must not be used as an admission certificate.
+    The callback must finish writing and return None on success, or raise on
+    failure. This experiment does not authenticate the callback, its tools or
+    environment, nor exclude concurrent mutation by another process. It must not
+    be used as an admission certificate.
     """
     with tempfile.TemporaryDirectory(prefix="worker-candidate-") as directory:
         output = Path(directory) / "candidate.wasm"
-        build(output)
+        if build(output) is not None:
+            raise ValueError("build callback must return None on success and raise on failure")
         candidate = snapshot_build_output(output)
         return consume_sealed(candidate, verify, command, cwd=cwd, env=env, run=run)
 
