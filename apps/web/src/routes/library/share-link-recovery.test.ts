@@ -16,6 +16,7 @@ import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
 import { createMediaController } from '#lib/player/mediaController.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
+import { survivingInteractionIds } from './interactionSelection.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -59,6 +60,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
+		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
@@ -73,7 +75,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
-		let renderedItems;
+		let renderedItems, playDisplayedDisabled = false;
 		return {
 			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
@@ -83,6 +85,9 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
 			setAudio: media.attach,
 			currentAudio: () => media.audio,
+			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
+			playIds: () => playLibraryIds(['coral']),
+			feedback: () => [queueAnnouncement, queueAnnouncementVersion],
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
 	`)(...Object.values(bindings)) as {
@@ -92,8 +97,12 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
 		applyPendingShareSeek: () => void;
-		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void>; pause?: () => void }) => void;
-	currentAudio: () => unknown;
+		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
+			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
+		currentAudio: () => unknown;
+		playTop: () => Promise<void>;
+		playIds: () => Promise<void>;
+		feedback: () => [string, number];
 		playQueuedTrack: (id: string) => Promise<void>;
 		addDisplayed: () => void;
 		subscribe: (callback: (queue: queueFunctions.QueueState) => void) => () => void;
@@ -108,6 +117,10 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			loadError: string | null;
 		};
 	};
+}
+
+function playableAudio(play: () => Promise<void>, src = ITEMS[0].streamUrl) {
+	return { currentTime: 0, duration: 60, paused: true, isConnected: true, getAttribute: () => src, play };
 }
 
 function serve(payload: { id: string; title: string; streamUrl?: string }[] = ITEMS) {
@@ -204,10 +217,33 @@ test('refresh replaces source evidence without hydrating metadata until queued P
 	expect(latest?.isCurrent()).toBe(true);
 	const play = vi.fn(async () => {});
 	const attempt = page.playQueuedTrack('coral');
-	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+	page.setAudio(playableAudio(play, updated[0].streamUrl));
 	await attempt;
 	expect(page.read().queue.tracks[0].streamUrl).toBe(updated[0].streamUrl);
 	expect(play).toHaveBeenCalledTimes(1);
+});
+
+test.each(['playTop', 'playIds'] as const)('%s hydrates before play and ignores an off-account rejection', async (gesture) => {
+	serve();
+	const page = pageScript('');
+	await page.refresh();
+	page.addDisplayed();
+	expect(page.read().queue.tracks[0].streamUrl).toBe('');
+	let rejectPlay!: (reason: Error) => void;
+	const play = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectPlay = reject; }));
+	const attempt = page[gesture]();
+	expect(queueFunctions.currentTrack(page.read().queue)?.streamUrl).toBe(ITEMS[0].streamUrl);
+	expect(play).not.toHaveBeenCalled();
+	page.setAudio(playableAudio(play));
+	await Promise.resolve();
+	expect(play).toHaveBeenCalledOnce();
+	page.handleLocalAuthTransition();
+	expect(page.read().queue.tracks).toEqual([]);
+	const afterAuth = page.feedback();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(play).toHaveBeenCalledOnce();
+	expect(page.feedback()).toEqual(afterAuth);
 });
 
 test('same-queue evidence replacement revokes an explicit Play waiting for flush', async () => {
@@ -218,7 +254,7 @@ test('same-queue evidence replacement revokes an explicit Play waiting for flush
 	await page.refresh();
 	page.selectTrack('coral');
 	const play = vi.fn(async () => {});
-	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+	page.setAudio(playableAudio(play));
 	const pending = page.playQueuedTrack('coral');
 	expect(tick).toHaveBeenCalledOnce();
 	const queue = page.read().queue;
@@ -263,7 +299,7 @@ for (const streamUrl of [undefined, '/test-audio/new']) {
 		expect(old?.isCurrent()).toBe(false);
 		expect(page.source('coral')?.streamUrl).toBe(streamUrl ?? '');
 		const play = vi.fn(async () => {});
-		page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+		page.setAudio(playableAudio(play));
 		await page.playQueuedTrack('coral');
 		expect(page.read().queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
 		expect(play).toHaveBeenCalledOnce();
