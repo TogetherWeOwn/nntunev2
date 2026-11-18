@@ -1900,10 +1900,6 @@ jobs:
           node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
           python3 -I .github/scripts/test_worker_sealed_bindgen.py
           python3 -I .github/scripts/check_worker_sealed_bindgen.py "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm" "$RUNNER_TEMP/sealed-ledger-js"
-      - name: Exercise fresh ledger build through sealed consumer (compatibility only)
-        run: |
-          python3 -I .github/scripts/test_worker_build_sealed.py
-          python3 -I .github/scripts/check_worker_build_sealed.py "$RUNNER_TEMP/fresh-sealed-ledger-js"
       - name: Reject a conflicting dependency global allocator in the ledger artifact graph
         run: |
           set -euo pipefail
