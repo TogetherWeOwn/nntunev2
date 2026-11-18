@@ -29,6 +29,8 @@ class CloseObserverTest(unittest.TestCase):
                 self.assertFalse(closed.is_set())
             result.result(timeout=2)
             self.assertTrue(closed.is_set())
+            peer.settimeout(2)
+            self.assertEqual(peer.recv(1), b"")
 
     def test_upstream_eof_is_not_client_eof(self):
         upstream, peer = socket.socketpair()
