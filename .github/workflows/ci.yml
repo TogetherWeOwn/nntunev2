@@ -1242,6 +1242,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Unit-test recovery admission (offline synthetic evidence only)
+        run: python3 -B ci/test_recovery_admission.py
       - name: Unit-test the receipt archive bounds
         run: python3 ci/test_read_promotion_receipt.py
       - name: Unit-test gate incident reporting (offline API fixtures)
