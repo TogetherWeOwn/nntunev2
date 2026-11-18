@@ -13,10 +13,14 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/blocker_observer.rs"]
 mod blocker_observer;
+#[path = "support/commit_ack_fault.rs"]
+mod commit_ack_fault;
 #[path = "support/disposable_accounts.rs"]
 mod disposable_accounts;
 #[path = "support/private_account_fence.rs"]
 mod private_account_fence;
+#[path = "support/private_lease_commit_ack.rs"]
+mod private_lease_commit_ack;
 #[path = "support/private_lease_deletion.rs"]
 mod private_lease_deletion;
 #[path = "support/private_lease_ordering.rs"]
