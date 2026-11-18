@@ -86,10 +86,13 @@ async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
 }
 
 #[tokio::test]
-async fn dispatched_lost_commit_ack_withholds_grant_and_keeps_the_committed_mark() {
+async fn dispatched_acquisition_faults_withhold_grant_and_distinguish_commit_outcomes() {
     use super::commit_ack_fault::{CommitAckFault, CommitOutcome};
     use super::playback_dispatch::playback_client;
+    use futures_util::FutureExt;
     use nntune_api::worker_entry::playback_store_for_postgres_test;
+    use std::panic::{resume_unwind, AssertUnwindSafe};
+    use tokio::time::timeout;
 
     with_playback_account(async |fx| {
         let store = playback_store();
@@ -100,21 +103,56 @@ async fn dispatched_lost_commit_ack_withholds_grant_and_keeps_the_committed_mark
         let toggle = fx.request("PUT", "/v1/me/private-session", json!({"session_id": "replacement", "enabled": true}));
         assert_eq!(dispatch(&store, &fx.cfg, fx.now, &toggle).await.status, 200);
 
+        let takeover = async |track, client, now| {
+            let client = Cell::new(Some(client));
+            let checkouts = Cell::new(0);
+            let faulted = playback_store_for_postgres_test(move || {
+                let nth = checkouts.get() + 1;
+                checkouts.set(nth);
+                // Session, deletion, holder, subscription, caps and usage precede acquisition.
+                let injected = (nth == 7).then(|| client.take().unwrap());
+                async { match injected { Some(client) => Ok(client), None => playback_client().await } }
+            });
+            let request = fx.request("POST", "/v1/plays", json!({"track_id": track, "session_id": "replacement", "takeover": true}));
+            let response = dispatch(&faulted, &fx.cfg, now, &request).await;
+            assert_eq!(response.status, 503, "{track}");
+            assert!(serde_json::from_str::<Value>(&response.body).unwrap().get("grant").is_none());
+        };
+
+        // Fault only this fixture's prospective marks; server-minted play IDs need not be known.
+        let tag = format!("dispatch_fault_{}", fx.user.replace('-', ""));
+        let rejected = timeout(Duration::from_secs(20), AssertUnwindSafe(async {
+            fx.observer.batch_execute(&format!("
+                CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'synthetic privacy fault'; END $$;
+                CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW
+                WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'mark-fault') EXECUTE FUNCTION public.{tag}();
+                CREATE CONSTRAINT TRIGGER {tag}_commit AFTER INSERT ON public.private_plays DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+                WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'commit-fault') EXECUTE FUNCTION public.{tag}();",
+                fx.user, fx.user)).await.unwrap();
+            let beat = fx.request("POST", "/v1/plays/heartbeat", json!({"session_id": "incumbent", "play_id": issued["play_id"], "lease_epoch": issued["lease_epoch"]}));
+            for (offset, track, expected) in [(1, "mark-fault", CommitOutcome::Unproven), (3, "commit-fault", CommitOutcome::Rejected)] {
+                let now = fx.now + offset;
+                let (client, fault) = CommitAckFault::start().await.unwrap();
+                takeover(track, client, now).await;
+                assert_eq!(fault.finish().await.unwrap(), expected, "{track}");
+                assert!(fx.observer.query("SELECT 1 FROM public.private_plays WHERE user_id=$1", &[&fx.user]).await.unwrap().is_empty());
+                let response = dispatch(&store, &fx.cfg, now + 1, &beat).await;
+                assert_eq!(response.status, 200);
+                assert_eq!(serde_json::from_str::<Value>(&response.body).unwrap(), json!({"lease": "active", "lease_epoch": issued["lease_epoch"], "lease_expires_at": now + 1 + nntune_api::playback::LEASE_TTL_SECS}));
+            }
+        }).catch_unwind()).await;
+        timeout(Duration::from_secs(5), fx.observer.batch_execute(&format!(
+            "DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP TRIGGER IF EXISTS {tag}_commit ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}();"
+        ))).await.unwrap().unwrap();
+        if let Err(panic) = rejected.expect("rollback cases timed out") {
+            resume_unwind(panic);
+        }
+
         let (client, fault) = CommitAckFault::start().await.unwrap();
-        let client = std::cell::RefCell::new(Some(client));
-        let checkouts = Cell::new(0);
-        let faulted = playback_store_for_postgres_test(move || {
-            let nth = checkouts.get() + 1;
-            checkouts.set(nth);
-            // Session, deletion, holder, subscription, caps and usage precede acquisition.
-            let client = (nth == 7).then(|| client.borrow_mut().take().unwrap());
-            async { match client { Some(client) => Ok(client), None => playback_client().await } }
-        });
-        let takeover = fx.request("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "replacement", "takeover": true}));
-        let response = dispatch(&faulted, &fx.cfg, fx.now, &takeover).await;
+        let now = fx.now + 5;
+        takeover(TRACK, client, now).await;
         assert_eq!(fault.finish().await.unwrap(), CommitOutcome::Withheld);
-        assert_eq!(response.status, 503);
-        assert!(serde_json::from_str::<Value>(&response.body).unwrap().get("grant").is_none());
 
         let row = fx.observer.query_one(
             "SELECT session_id, track_id, play_id, epoch, expires_at, play_key, marked_at FROM public.playback_leases JOIN public.private_plays USING (user_id) WHERE user_id=$1",
@@ -124,9 +162,9 @@ async fn dispatched_lost_commit_ack_withholds_grant_and_keeps_the_committed_mark
         assert_ne!(Some(play), issued["play_id"].as_str());
         assert_eq!((row.get::<_, &str>(0), row.get::<_, &str>(1)), ("replacement", TRACK));
         assert_eq!(row.get::<_, i64>(3), issued["lease_epoch"].as_i64().unwrap() + 1);
-        assert_eq!(row.get::<_, i64>(4), (fx.now + nntune_api::playback::LEASE_TTL_SECS) as i64);
+        assert_eq!(row.get::<_, i64>(4), (now + nntune_api::playback::LEASE_TTL_SECS) as i64);
         assert_eq!(row.get::<_, &str>(5), derive_play_idempotency_key(fx.user, TRACK, play).unwrap());
-        assert_eq!(row.get::<_, i64>(6), fx.now as i64);
+        assert_eq!(row.get::<_, i64>(6), now as i64);
     }).await;
 }
 
