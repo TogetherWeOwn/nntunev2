@@ -4,8 +4,9 @@ import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
-import { loadRecentFinds } from '#lib/library/recent-finds.js';
+import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
+import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
+import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
@@ -13,6 +14,7 @@ import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -53,13 +55,14 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createQueueController,
+		createQueueShare, createQueueController, createMediaController,
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
+		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag, createPendingShareSeek,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
@@ -72,21 +75,25 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 	return new Function(...Object.keys(bindings), `${compiled}
 		let renderedItems;
 		return {
-			refresh, applyShareLink, resetShareAtAuthBoundary, selectTrack,
+			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
+			requiresSignIn: () => refresher.state.requiresSignIn,
 			applyPendingShareSeek, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
-			setAudio: (element) => { audioEl = element; },
+			setAudio: media.attach,
+			currentAudio: () => media.audio,
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
 		applyShareLink: () => void;
-		resetShareAtAuthBoundary: () => void;
+		handleLocalAuthTransition: () => void;
+		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
 		applyPendingShareSeek: () => void;
-		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void> }) => void;
+		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void>; pause?: () => void }) => void;
+	currentAudio: () => unknown;
 		playQueuedTrack: (id: string) => Promise<void>;
 		addDisplayed: () => void;
 		subscribe: (callback: (queue: queueFunctions.QueueState) => void) => () => void;
@@ -196,8 +203,9 @@ test('refresh replaces source evidence without hydrating metadata until queued P
 	expect(page.read().queue).toBe(queued);
 	expect(latest?.isCurrent()).toBe(true);
 	const play = vi.fn(async () => {});
+	const attempt = page.playQueuedTrack('coral');
 	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
-	await page.playQueuedTrack('coral');
+	await attempt;
 	expect(page.read().queue.tracks[0].streamUrl).toBe(updated[0].streamUrl);
 	expect(play).toHaveBeenCalledTimes(1);
 });
@@ -275,7 +283,17 @@ test('queue publication exposes new evidence before a reentrant auth boundary', 
 		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
 		expect(page.source('kelp')).toBeNull();
 		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
-		page.endSession();
+		const pause = vi.fn(() => {
+			expect(page.currentAudio()).toBeUndefined();
+			// Queue retirement alone would pause after the refresher changed state.
+			expect(page.requiresSignIn()).toBe(false);
+			expect(page.read().queue).toBe(queue);
+		});
+		page.setAudio({ currentTime: 0, duration: 60, paused: false, pause });
+		page.handleLocalAuthTransition();
+		expect(pause).toHaveBeenCalledOnce();
+		expect(page.currentAudio()).toBeUndefined();
+		expect(page.requiresSignIn()).toBe(true);
 	});
 	serve([{ ...ITEMS[0], streamUrl: '/test-audio/new' }]);
 	await page.refresh();

@@ -38,6 +38,9 @@ use crate::handlers::{
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
 pub(crate) mod billing_budget;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_deadline_test.rs"]
+pub(crate) mod billing_deadline_test;
 
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -749,11 +752,19 @@ struct PgStore {
     env: Option<Env>,
     trace_id: String,
     mirror_binding: MirrorBinding,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_connect: Option<Box<dyn Fn() -> TestConnectFuture>>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+type TestConnectFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<tokio_postgres::Client, StoreError>>>>;
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
@@ -870,6 +881,7 @@ pub fn catalogue_store_for_postgres_test(
             MirrorBinding::Unconfigured
         },
         test_client: std::cell::RefCell::new(Some(app)),
+        test_connect: None,
         test_mirror: Some(CatalogueTestMirror {
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
@@ -891,6 +903,25 @@ pub fn session_retry_store_for_postgres_test(
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
+        test_mirror: None,
+    }
+}
+
+/// Test-only connection acquisition for dispatch paths that call several
+/// production Store methods. Each checkout must be from the disposable DB.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn playback_store_for_postgres_test<F, Fut>(connect: F) -> impl Store + SingleUseStore
+where
+    F: Fn() -> Fut + 'static,
+    Fut: Future<Output = Result<tokio_postgres::Client, StoreError>> + 'static,
+{
+    PgStore {
+        env: None,
+        trace_id: "postgres-playback-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        test_client: std::cell::RefCell::new(None),
+        test_connect: Some(Box::new(move || Box::pin(connect()))),
         test_mirror: None,
     }
 }
@@ -913,6 +944,7 @@ pub async fn private_aware_lease_for_postgres_test(
         trace_id: "postgres-private-lease-test".into(),
         mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
         test_mirror: None,
     }
     .acquire_private_aware_lease(
@@ -1327,6 +1359,10 @@ impl PgStore {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
             return Ok(client);
+        }
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        if let Some(connect) = &self.test_connect {
+            return connect().await;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -5154,6 +5190,7 @@ impl Store for PgStore {
         .await
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     async fn store_reconcile_outcome(
         &self,
         user_id: &str,
@@ -5225,6 +5262,207 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        use crate::billing_store_classification::{
+            classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget,
+        };
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        let row = &outcome.row;
+        if outcome
+            .history
+            .iter()
+            .any(|history| history.stripe_subscription_id != row.stripe_subscription_id)
+        {
+            return Err(failed());
+        }
+        async fn apply(
+            transaction: &mut tokio_postgres::Client,
+            user_id: String,
+            outcome: crate::billing_reconcile::ReconcileOutcome,
+            deadline_probe: bool,
+        ) -> Result<(), StoreError> {
+            let row = &outcome.row;
+            let failed = || StoreError;
+            let work = async {
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_lock_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                transaction
+                    .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
+                    .await
+                    .map_err(|_| failed())?;
+                let observed_rows = transaction
+                    .query_typed(
+                        crate::billing_transaction_sql::LOOKUP_TARGET,
+                        &[
+                            (&row.stripe_subscription_id, Type::TEXT),
+                            (&row.paid_through_unix, Type::INT8),
+                            (&row.paid_invoice_id, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let decoded = observed_rows
+                    .iter()
+                    .map(|found| {
+                        Ok((
+                            found.try_get::<_, String>("user_id")?,
+                            found.try_get::<_, String>("stripe_subscription_id")?,
+                            found.try_get::<_, bool>("predicate_stale")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+                    .map_err(|_| failed())?;
+                let observed = decoded
+                    .iter()
+                    .map(|(owner, key, predicate_stale)| ObservedTarget {
+                        identity: Identity {
+                            user_id: owner,
+                            subscription_id: key,
+                        },
+                        predicate_stale: *predicate_stale,
+                    })
+                    .collect::<Vec<_>>();
+                let requested = Identity {
+                    user_id: &user_id,
+                    subscription_id: &row.stripe_subscription_id,
+                };
+                let target = classify_target(&requested, &observed).map_err(|_| failed())?;
+                if outcome.explicit_stale {
+                    classify_explicit_stale(&target, outcome.history.is_empty())
+                        .map_err(|_| failed())?;
+                } else {
+                    let written = transaction
+                        .query_typed(
+                            crate::billing_transaction_sql::WRITE_SUBSCRIPTION,
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&row.stripe_subscription_id, Type::TEXT),
+                                (&row.stripe_customer_id, Type::TEXT),
+                                (&row.stripe_item_id, Type::TEXT),
+                                (&row.stripe_price_id, Type::TEXT),
+                                (&row.plan_id, Type::TEXT),
+                                (&row.status, Type::TEXT),
+                                (&row.current_period_end_unix, Type::INT8),
+                                (&row.cancel_at_period_end, Type::BOOL),
+                                (&row.paid_through_unix, Type::INT8),
+                                (&row.paid_invoice_id, Type::TEXT),
+                                (&row.grace_until_unix, Type::INT8),
+                                (&outcome.read_anchor, Type::TEXT),
+                                (&outcome.read_plan, Type::TEXT),
+                                (&outcome.explicit_stale, Type::BOOL),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                    let returned = written
+                        .iter()
+                        .map(|found| {
+                            Ok((
+                                found.try_get::<_, String>("user_id")?,
+                                found.try_get::<_, String>("stripe_subscription_id")?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+                        .map_err(|_| failed())?;
+                    let returned = returned
+                        .iter()
+                        .map(|(owner, key)| Identity {
+                            user_id: owner,
+                            subscription_id: key,
+                        })
+                        .collect::<Vec<_>>();
+                    classify_write(&requested, &target, &returned).map_err(|_| failed())?;
+                }
+                for history in &outcome.history {
+                    transaction
+                        .query_typed(
+                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&history.stripe_invoice_id, Type::TEXT),
+                                (&history.stripe_subscription_id, Type::TEXT),
+                                (&history.plan_id, Type::TEXT),
+                                (&history.period_start_unix, Type::INT8),
+                                (&history.period_end_unix, Type::INT8),
+                                (&history.amount_cents, Type::INT8),
+                                (&history.currency, Type::TEXT),
+                                (&history.paid_at_unix, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                }
+                // The deadline probe runs only after all billing writes.
+                if deadline_probe {
+                    let written = transaction.query_one(
+                        "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
+                    ).await.map_err(|_| failed())?;
+                    if written.get::<_, i64>(0) != 1 || written.get::<_, i64>(1) != 2 {
+                        return Err(failed());
+                    }
+                    transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| failed())?;
+                    // Readiness follows acknowledgement of the timeout settings.
+                    transaction
+                        .batch_execute("SELECT pg_advisory_xact_lock(781349053)")
+                        .await
+                        .map_err(|_| failed())?;
+                    std::future::pending::<()>().await;
+                }
+                Ok::<(), StoreError>(())
+            };
+            // A failed COMMIT acknowledgement remains an unknown outcome.
+            match work.await {
+                Ok(()) => {
+                    transaction
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(|_| failed())?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = transaction.batch_execute("ROLLBACK").await;
+                    Err(error)
+                }
+            }
+        }
+        let user_id = user_id.to_owned();
+        let outcome = outcome.clone();
+        let deadline_probe = self.trace_id == "worker-deadline-test";
+        #[cfg(target_arch = "wasm32")]
+        let result = {
+            #[cfg(feature = "billing-owned-wasm-test")]
+            let (host, port, connection_string) = (
+                "127.0.0.1".to_owned(),
+                5432,
+                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+            );
+            billing_budget::with_owned_connection(
+                &host,
+                port,
+                &connection_string,
+                |client| Box::pin(billing_budget::bootstrap_transaction(client)),
+                move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
+                |expired| {
+                    if let Some(observer) = &self.work_deadline_observer {
+                        observer.set(expired);
+                    }
+                },
+            )
+            .await
+        };
+        result.map_err(|_| failed())
     }
 
     async fn open_checkout_operation(
@@ -6891,8 +7129,12 @@ pub async fn subsonic_mount(
         env: Some(env.clone()),
         trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
         mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        work_deadline_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_connect: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_mirror: None,
     };
@@ -7081,8 +7323,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             env: Some(env.clone()),
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            work_deadline_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_connect: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },

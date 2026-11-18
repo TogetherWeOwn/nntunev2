@@ -153,6 +153,33 @@ async function expectNoErrors(page: Page, errors: string[]) {
 		'No unhandled rejection from asynchronous playback').toEqual([]);
 }
 
+test('a same-flush queue source round trip replaces the rendered audio host', async ({ page }) => {
+	await openLibrary(page);
+	await enqueue(page, ['lib-coral', 'lib-pine']);
+	await playCurrent(page);
+	const player = page.getByTestId('audio-player');
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	const oldAudio = (await player.elementHandle())!;
+	const coral = await page.getByRole('button', { name: 'Select Coral Night', exact: true }).elementHandle();
+	const pine = await page.getByRole('button', { name: 'Select Pine Morning', exact: true }).elementHandle();
+
+	// Both real queue events run on one JS stack, with no render between them.
+	expect(await oldAudio.evaluate((node, { coral, pine }) => {
+		pine!.click();
+		coral!.click();
+		return { connected: node.isConnected, paused: (node as HTMLAudioElement).paused };
+	}, { coral, pine })).toEqual({ connected: true, paused: true });
+	await expect(player).toHaveCount(1);
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	await expect.poll(() => oldAudio.evaluate((node) => node.isConnected)).toBe(false);
+
+	// Route-owned Play now must find the replacement through the attachment.
+	await page.getByTestId('queue-item').getByRole('button', { name: 'More actions for Coral Night', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await expect(player).toHaveJSProperty('paused', false);
+	expect(await plays(page)).toHaveLength(2);
+});
+
 test('pending automatic play is silent and auth teardown pauses its connected native audio', async ({ page }) => {
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));

@@ -240,3 +240,13 @@ sha256 = "2c73d6cdb8e6f3b49ce510ead0dd0e45c01e55bc497d0677bfc444e55c46c53b"
 file = "0047_storage_digest_candidate_batch.sql"
 target = "app"
 sha256 = "d2be227b0921f715fceab9233314ca1a612a4c5342d8eeab4800aebfc24b9c26"
+
+[[migration]]
+file = "0048_legacy_vault_established.sql"
+target = "app"
+sha256 = "52736113f25cd0aa6a5af161f02f8f2fa546140da61f3dd5cf4560206a4a868d"
+
+[[migration]]
+file = "0049_reconcile_legacy_vault_cohort.sql"
+target = "app"
+sha256 = "3a3ef5862778cdf66e558cd23ca727d93384d3ddf0211c9c8f9bb08b56f4758b"
