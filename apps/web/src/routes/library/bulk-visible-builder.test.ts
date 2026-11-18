@@ -34,7 +34,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision', 'playingElement']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));

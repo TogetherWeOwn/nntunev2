@@ -36,7 +36,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
 		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision', 'playingElement'
+		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
