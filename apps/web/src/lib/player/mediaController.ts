@@ -20,12 +20,30 @@ type PlaySelection = {
 	bumpAnnouncement: () => void;
 };
 
+type RestartSelection = {
+	supersedeShare: () => () => boolean;
+	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
+	assigned: () => void;
+	publish: (message: string, available: boolean) => void;
+};
+
+function describeRestart(words: string, title: string): string {
+	const suffix = ` ${title}.`;
+	if (words.length + suffix.length <= 99) return `${words}${suffix}`;
+	let end = 97 - words.length;
+	// Never cut between the halves of a surrogate pair.
+	const last = title.charCodeAt(end - 1);
+	if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+	return `${words} ${title.slice(0, end)}…`;
+}
+
 // Queued native events belong to the element, not to a receipt or controller.
 const mountedAudio = new WeakSet<HTMLAudioElement>();
 
 export function createMediaController() {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
+	let restartIntent = 0;
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -79,8 +97,53 @@ export function createMediaController() {
 		if (isCurrent()) deps.bumpAnnouncement();
 	}
 
+	function restart(source: string, title: string, deps: RestartSelection): void {
+		if (destroyed) return;
+		const attachment = current;
+		const intent = ++restartIntent;
+		// Supersede before any native read, including an unavailable or refused seek.
+		const selectionIsCurrent = deps.supersedeShare();
+		if (!attachment) return;
+		const { audio } = attachment;
+		const isCurrent = () => current === attachment && restartIntent === intent && selectionIsCurrent();
+		const matches = () => {
+			try {
+				return isCurrent() && audio.getAttribute('src') === source && isCurrent() &&
+					audio.isConnected && isCurrent();
+			} catch {
+				return false;
+			}
+		};
+		if (!matches()) return;
+
+		let words = 'Could not restart';
+		let available = false;
+		try {
+			available = deps.available(audio, matches);
+			if (available && matches()) {
+				const position = audio.currentTime;
+				if (Number.isFinite(position) && matches()) {
+					const atStart = Math.abs(position) <= 0.05;
+					if (atStart) words = 'Already at the start of';
+					audio.currentTime = 0;
+					// Queue edits can revoke readback without retiring the old position feedback.
+					if (current === attachment) deps.assigned();
+					if (!atStart) {
+						if (!matches()) return;
+						const readback = audio.currentTime;
+						if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) words = 'Restarted';
+					}
+				}
+			}
+		} catch {
+			// Unreadable positions and refused assignments cannot prove a restart.
+		}
+		if (matches()) deps.publish(describeRestart(words, title), available);
+	}
+
 	return {
 		playSelected,
+		restart,
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {

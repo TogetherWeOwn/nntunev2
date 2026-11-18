@@ -919,82 +919,31 @@
 		restartStatusVersion += 1;
 	}
 
-	/**
-	 * Explicit restart: seek the currently mounted matching element to zero
-	 * and claim success only on readback. Touches nothing but currentTime,
-	 * so paused/playing intent, source, queue/current identity, rate and
-	 * volume survive; never calls play/pause/load, never advances tracks,
-	 * and needs no keyboard shortcut. A throwing or silently-ignoring
-	 * setter is a truthful failure, not success inferred from the write.
-	 * The gesture supersedes any pending inbound-share seek for the source.
-	 */
 	function restartCurrentTrack(): void {
-		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
-		if (!element || !current) return;
+		if (!shareAlive || !current) return;
 		const source = resolveStreamUrl(current);
-		if (!source || element.getAttribute('src') !== source) return;
-		const title = current.title?.trim() ? current.title : current.id;
-		const withTitle = (words: string): string => {
-			const suffix = ` ${title}.`;
-			if (words.length + suffix.length <= 99) return `${words}${suffix}`;
-			let end = 97 - words.length;
-			// Never cut between the halves of a surrogate pair.
-			const last = title.charCodeAt(end - 1);
-			if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-			return `${words} ${title.slice(0, end)}…`;
-		};
-		// The explicit gesture supersedes a pending share seek for this
-		// source even if the native write is refused: later metadata for
-		// the same source must never move the position to the share time.
-		pendingShareSeek.supersede(current.id, source);
-		restartSupersededSources.add(`${current.id}\n${source}`);
-		// Native state can change after the last media event and before this click.
-		if (!restartIsAvailable(element)) {
-			restartCanSeek = false;
-			setRestartStatus(withTitle('Could not restart'));
-			return;
-		}
-		let position = Number.NaN;
-		try {
-			position = element.currentTime;
-		} catch {
-			// Handled below: an unreadable position cannot restart.
-		}
-		if (!Number.isFinite(position)) {
-			setRestartStatus(withTitle('Could not restart'));
-			return;
-		}
-		if (Math.abs(position) <= 0.05) {
-			try {
-				element.currentTime = 0;
-				jumpStatus = '';
-			} catch {
-				// Already at the start; a refusal changes nothing there.
+		if (!source) return;
+		const revision = mediaRevision;
+		const queueRevision = queueController.revision;
+		const jumpVersion = jumpStatusVersion;
+		media.restart(source, current.title?.trim() ? current.title : current.id, {
+			supersedeShare: () => {
+				pendingShareSeek.supersede(current.id, source);
+				restartSupersededSources.add(`${current.id}\n${source}`);
+				const seekRevision = pendingShareSeek.revision;
+				return () => shareAlive && revision === mediaRevision && queueRevision === queueController.revision &&
+					seekRevision === pendingShareSeek.revision && jumpVersion === jumpStatusVersion;
+			},
+			available: restartIsAvailable,
+			assigned: () => {
+				if (shareAlive && revision === mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
+			},
+			publish: (message, available) => {
+				if (!available) restartCanSeek = false;
+				setRestartStatus(message);
 			}
-			setRestartStatus(withTitle('Already at the start of'));
-			return;
-		}
-		let refused = false;
-		try {
-			element.currentTime = 0;
-			jumpStatus = '';
-		} catch {
-			refused = true;
-		}
-		let readback = Number.NaN;
-		if (!refused) {
-			try {
-				readback = element.currentTime;
-			} catch {
-				// Handled below: no readback means no success claim.
-			}
-		}
-		setRestartStatus(
-			!refused && Number.isFinite(readback) && Math.abs(readback) <= 0.05
-				? withTitle('Restarted')
-				: withTitle('Could not restart')
-		);
+		});
 	}
 
 	/**

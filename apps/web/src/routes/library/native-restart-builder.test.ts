@@ -25,7 +25,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'commitQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
 		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
-		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
+		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
 		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
@@ -115,12 +115,14 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
 		const endTrackDrag = () => {}, document = { title: '' };
-		const queueShare = { dispose() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
+		let queueExportAuthGeneration = 0;
+		const queueShare = { dispose() {}, reset() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		return {
 			detach: attachNativeAudio(element),
 			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
+			resetAuth: resetShareAtAuthBoundary,
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
@@ -133,6 +135,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
+		resetAuth: () => void;
 		applyShareLink: () => void;
 		applyPendingShareSeek: () => void;
 		jump: (direction: 'back' | 'forward') => void;
@@ -194,6 +197,107 @@ test('a throwing availability getter still supersedes a pending share', () => {
 	expect(page.read().pendingShareSeek).toBeNull();
 	expect(page.read().restartStatus).toBe('Could not restart Coral Night.');
 	expect(writes).toEqual([]);
+});
+
+test('a throwing native source check cannot preserve a pending share', async () => {
+	const { page, location, element, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	element.getAttribute = () => { throw new Error('unreadable source'); };
+	page.restart();
+	await Promise.resolve();
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(page.read().restartStatusVersion).toBe(0);
+	expect(writes).toEqual([]);
+});
+
+test.each(['duration', 'range start'] as const)('restart stops availability reads after retirement during %s', (phase) => {
+	const { page, element, remount, writes } = restartFixture();
+	const readPosition = vi.fn(() => 30);
+	const readEnd = vi.fn(() => 120);
+	Object.defineProperties(element, {
+		duration: { get() { if (phase === 'duration') remount(); return 120; } },
+		currentTime: { get: readPosition },
+		seekable: { get: () => ({ length: 1, start: () => { remount(); return 0; }, end: readEnd }) }
+	});
+	page.restart();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(readPosition).toHaveBeenCalledTimes(phase === 'duration' ? 0 : 1);
+	expect(readEnd).not.toHaveBeenCalled();
+	expect(writes).toEqual([]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a position getter cannot write through a reentrant source change', () => {
+	const { page, element, writes } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (++reads === 2) page.select(1);
+		return 30;
+	}, set: (value: number) => writes.push(value) });
+	page.restart();
+	expect(currentTrack(page.read().queue)?.id).toBe('pine');
+	expect(writes).toEqual([]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test.each([false, true])('restart with a queue edit during assignment (newer jump: %s)', (newerJump) => {
+	const { page, element, media } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	const read = vi.fn(() => media.position);
+	Object.defineProperty(element, 'currentTime', { get: read, set(value: number) {
+		if (value === 0) page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+		media.position = value;
+		if (value === 0 && newerJump) page.jump('forward');
+		if (value === 0) read.mockClear();
+	} });
+	page.restart();
+	expect(page.currentAudio()).toBe(element);
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral', 'pine']);
+	expect(media.position).toBe(newerJump ? 10 : 0);
+	expect(page.read().jumpStatus).toBe(newerJump ? 'Forward 10 seconds, now at 0:10.' : '');
+	expect(read).not.toHaveBeenCalled();
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a setter that crosses the account boundary cannot retire new jump feedback or read back', () => {
+	const { page, element, remount, writes } = restartFixture();
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get: () => { reads += 1; return 30; }, set(value: number) {
+		writes.push(value);
+		page.resetAuth();
+		remount();
+		page.jump('forward');
+	} });
+	page.restart();
+	expect(reads).toBe(2);
+	expect(writes).toEqual([0, 40]);
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	expect(page.read().restartCanSeek).toBe(false);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('restart retires jump feedback before readback can start a newer same-source share', async () => {
+	const { page, element, location, media, writes } = restartFixture();
+	page.jump('forward');
+	let jumpAtReadback: string | undefined;
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (++reads === 3) {
+			jumpAtReadback = page.read().jumpStatus;
+			location.search = '?track=coral&t=42';
+			page.applyShareLink();
+		}
+		return media.position;
+	}, set(value: number) { writes.push(value); media.position = value; } });
+	page.restart();
+	await Promise.resolve();
+	expect(jumpAtReadback).toBe('');
+	expect(writes).toEqual([40, 0, 42]);
+	expect(page.read().restartStatusVersion).toBe(0);
 });
 
 test('a new same-source share navigation supersedes an earlier restart marker', async () => {
@@ -741,6 +845,33 @@ test('restart clears an earlier jump position readout', () => {
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 	page.restart();
 	expect(media.position).toBe(0);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a native source check that throws after assignment cannot preserve the prior jump readout', () => {
+	const { page, media, element, writes, track } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	element.getAttribute = () => {
+		if (media.position === 0) throw new Error('unreadable source after assignment');
+		return track.streamUrl;
+	};
+	page.restart();
+	expect(writes).toEqual([40, 0]);
+	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('unreadable restart readback reports failure without restoring the retired jump readout', () => {
+	const { page, media, element, writes } = restartFixture();
+	page.jump('forward');
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (media.position === 0) throw new Error('unreadable position');
+		return media.position;
+	}, set(value: number) { writes.push(value); media.position = value; } });
+	page.restart();
+	expect(writes).toEqual([40, 0]);
+	expect(page.read().restartStatus).toBe('Could not restart Coral Night.');
 	expect(page.read().jumpStatus).toBe('');
 });
 
