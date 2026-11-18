@@ -5291,11 +5291,6 @@ impl Store for PgStore {
             let row = &outcome.row;
             let failed = || StoreError;
             let work = async {
-                // Per-user advisory lock (participant ordering only; not
-                // ownership evidence), then, as its own command and before
-                // any subscription read/DML or history, the table exclusion.
-                // Order: settings -> advisory -> table exclusion ->
-                // classification/write -> history -> COMMIT.
                 transaction
                     .query_typed(
                         crate::billing_reconcile::reconcile_lock_statement(),
@@ -5307,9 +5302,6 @@ impl Store for PgStore {
                     .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
                     .await
                     .map_err(|_| failed())?;
-                // Fresh global-key observation after the lock command
-                // completed: no owner filter, no row lock. The stale
-                // predicate is evaluated by PostgreSQL.
                 let observed_rows = transaction
                     .query_typed(
                         crate::billing_transaction_sql::LOOKUP_TARGET,
@@ -5346,18 +5338,11 @@ impl Store for PgStore {
                     user_id: &user_id,
                     subscription_id: &row.stripe_subscription_id,
                 };
-                // Foreign, mismatched or multiple results are refused here,
-                // before any subscription or history write; absence is
-                // protected absence, never owned-target evidence.
                 let target = classify_target(&requested, &observed).map_err(|_| failed())?;
                 if outcome.explicit_stale {
-                    // No upsert, INSERT, self-UPDATE or other subscription
-                    // mutation for explicit stale proof.
                     classify_explicit_stale(&target, outcome.history.is_empty())
                         .map_err(|_| failed())?;
                 } else {
-                    // SQL, unique and FK errors propagate; they are never
-                    // reclassified as a history-only success.
                     let written = transaction
                         .query_typed(
                             crate::billing_transaction_sql::WRITE_SUBSCRIPTION,
@@ -5419,9 +5404,7 @@ impl Store for PgStore {
                         .await
                         .map_err(|_| failed())?;
                 }
-                // The disposable test pauses after the actual writes. Disable only
-                // server-side idle/transaction timers so the Worker work deadline,
-                // rather than a PostgreSQL timeout, is the observed failure.
+                // The deadline probe runs only after all billing writes.
                 if deadline_probe {
                     let written = transaction.query_one(
                         "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
@@ -5430,7 +5413,7 @@ impl Store for PgStore {
                         return Err(failed());
                     }
                     transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| failed())?;
-                    // Publish readiness only after the timeout settings are acknowledged.
+                    // Readiness follows acknowledgement of the timeout settings.
                     transaction
                         .batch_execute("SELECT pg_advisory_xact_lock(781349053)")
                         .await
@@ -5439,10 +5422,8 @@ impl Store for PgStore {
                 }
                 Ok::<(), StoreError>(())
             };
+            // A failed COMMIT acknowledgement remains an unknown outcome.
             match work.await {
-                // Success is reported only after the acknowledged COMMIT.
-                // A lost acknowledgement is unsuccessful/unknown (it may
-                // have committed); no rollback is claimed or retried.
                 Ok(()) => {
                     transaction
                         .batch_execute("COMMIT")
@@ -5451,7 +5432,6 @@ impl Store for PgStore {
                     Ok(())
                 }
                 Err(error) => {
-                    // The Worker-owned socket also closes if rollback is cancelled.
                     let _ = transaction.batch_execute("ROLLBACK").await;
                     Err(error)
                 }
@@ -5462,7 +5442,6 @@ impl Store for PgStore {
         let deadline_probe = self.trace_id == "worker-deadline-test";
         #[cfg(target_arch = "wasm32")]
         let result = {
-            // The separately bundled test Worker can reach only its disposable service.
             #[cfg(feature = "billing-owned-wasm-test")]
             let (host, port, connection_string) = (
                 "127.0.0.1".to_owned(),

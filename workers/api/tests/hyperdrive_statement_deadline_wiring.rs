@@ -281,8 +281,29 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    for piece in &pieces {
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&n| n == "store_reconcile_outcome")
+            .count(),
+        2
+    );
+    for gate in [prototype_gate, release_gate] {
+        assert_eq!(
+            store
+                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
+                .count(),
+            1
+        );
+    }
+    for (index, piece) in pieces.iter().enumerate() {
         let name = method_name(piece);
+        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
+            continue;
+        }
         if matches!(name, "like_delete" | "taste_delete") {
             let love_only = name == "like_delete";
             let body = function_body(piece, name);
