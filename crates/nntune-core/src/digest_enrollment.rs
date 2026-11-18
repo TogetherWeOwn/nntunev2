@@ -41,6 +41,27 @@ pub struct OriginManifest {
 }
 
 impl OriginManifest {
+    /// Match trusted application identities and the exact origin header before
+    /// exposing sealer-derived hashes for inactive candidate storage. This is
+    /// not a reservation check, trusted enrollment, or authorization to reuse.
+    pub fn candidate_page_hashes(
+        &self,
+        identities: &[[u8; 16]; 5],
+        plaintext_len: u64,
+        map_id: &[u8; 16],
+        header: &[u8; 48],
+    ) -> Option<&[[u8; 32]]> {
+        if self.geometry.plaintext_len() != plaintext_len
+            || &self.map_id != map_id
+            || &self.header != header
+            || context_hash(identities, self.geometry, header)? != self.context
+            || self.rows.len() != self.geometry.pages() as usize
+        {
+            return None;
+        }
+        Some(&self.rows)
+    }
+
     pub(crate) fn geometry(&self) -> DigestGeometry {
         self.geometry
     }
@@ -251,11 +272,54 @@ mod tests {
                 manifest.context,
                 context_hash(&ids, geometry, &header).unwrap()
             );
-            assert_eq!(manifest.rows.len(), geometry.pages() as usize);
-            for (row, page) in manifest.rows.iter().zip(&pages) {
+            let hashes = manifest
+                .candidate_page_hashes(&ids, length, &id(6), &header)
+                .unwrap();
+            assert_eq!(hashes.len(), geometry.pages() as usize);
+            for (row, page) in hashes.iter().zip(&pages) {
                 assert_eq!(*row, page_hash(page).unwrap());
             }
+            for index in 0..ids.len() {
+                let mut changed = ids;
+                changed[index][0] ^= 1;
+                assert!(manifest
+                    .candidate_page_hashes(&changed, length, &id(6), &header)
+                    .is_none());
+            }
+            assert!(manifest
+                .candidate_page_hashes(&ids, length + 1, &id(6), &header)
+                .is_none());
+            assert!(manifest
+                .candidate_page_hashes(&ids, length, &id(7), &header)
+                .is_none());
+            let mut changed_header = header;
+            changed_header[0] ^= 1;
+            assert!(manifest
+                .candidate_page_hashes(&ids, length, &id(6), &changed_header)
+                .is_none());
         }
+    }
+
+    #[test]
+    fn candidate_view_rejects_incomplete_or_extra_rows() {
+        let ids = [id(1), id(2), id(3), id(4), id(5)];
+        let mut builder = DigestEnrollment::new(1, ids, id(6)).unwrap();
+        let header = builder.header().to_bytes();
+        builder.seal_chunk(&[42]).unwrap();
+        let mut manifest = builder.finish().ok().unwrap();
+        let hash = manifest.rows[0];
+        assert_eq!(
+            manifest.candidate_page_hashes(&ids, 1, &id(6), &header),
+            Some(&[hash][..])
+        );
+        manifest.rows.clear();
+        assert!(manifest
+            .candidate_page_hashes(&ids, 1, &id(6), &header)
+            .is_none());
+        manifest.rows.extend([hash, hash]);
+        assert!(manifest
+            .candidate_page_hashes(&ids, 1, &id(6), &header)
+            .is_none());
     }
 
     #[test]

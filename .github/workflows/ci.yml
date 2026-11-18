@@ -1848,6 +1848,7 @@ jobs:
         run: |
           python3 -I .github/scripts/test_worker_tools.py
           python3 -I .github/scripts/test_worker_rust_provenance.py
+          python3 -I .github/scripts/test_worker_sealed_candidate.py
           python3 -I .github/scripts/test_worker_build_workflow.py
       - name: Install pinned Worker Rust
         run: python3 -I .github/scripts/worker_rust_provenance.py rust
@@ -1881,6 +1882,8 @@ jobs:
           python3 -I .github/scripts/worker_rust_provenance.py build-ledger
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ledger-js" "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm"
           node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
+          python3 -I .github/scripts/test_worker_sealed_bindgen.py
+          python3 -I .github/scripts/check_worker_sealed_bindgen.py "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm" "$RUNNER_TEMP/sealed-ledger-js"
       - name: Reject a conflicting dependency global allocator in the ledger artifact graph
         run: |
           set -euo pipefail

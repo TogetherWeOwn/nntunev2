@@ -141,8 +141,10 @@ def run(listener, stop):
                         if stop.is_set() or time.monotonic() >= deadline:
                             raise ProtocolError("relay cancelled or timed out")
                         dest.sendall(frame)
-        # Never release the barrier. Leaving both contexts closes the real
-        # backend and the Worker transport before returning success.
+        # The server's readiness snapshot may predate queued frontend input.
+        if select.select((client,), [], [], 0)[0]:
+            raise ProtocolError("frontend data after COMMIT")
+        # Close both connections without releasing the barrier.
 
 
 @contextmanager
