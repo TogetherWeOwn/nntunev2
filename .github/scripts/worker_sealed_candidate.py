@@ -2,15 +2,53 @@
 """Experimental immutable consumer input; not a build provenance certificate.
 
 The caller must authenticate the build, verifier, consumer and environment. This
-helper is deliberately not connected to candidate admission or the CI workflow.
+helper is used by CI compatibility experiments, not candidate admission.
 """
 import fcntl
 import hashlib
 import os
+import stat
 import subprocess
+import tempfile
+from pathlib import Path
 
 MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+
+
+def snapshot_build_output(path) -> bytes:
+    """Read a bounded regular output without following its final symlink.
+
+    This does not authenticate the build or protect parent directories or a
+    concurrently modified file. The caller must control those separately; the
+    returned bytes can be passed to consume_sealed for inspection and consumption.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_CANDIDATE_BYTES:
+            raise ValueError("invalid candidate output file")
+        with os.fdopen(fd, "rb", closefd=False) as output:
+            candidate = output.read(MAX_CANDIDATE_BYTES + 1)
+        if len(candidate) != info.st_size:
+            raise ValueError("candidate output size changed while reading")
+        return candidate
+    finally:
+        os.close(fd)
+
+
+def experiment_build_and_consume(build, verify, command, *, cwd, env, run=subprocess.run) -> str:
+    """Exercise a fresh output path through inspection and consumption.
+
+    The callback must finish writing before returning. This experiment does not
+    authenticate the callback, its tools or environment, nor exclude concurrent
+    mutation by another process. It must not be used as an admission certificate.
+    """
+    with tempfile.TemporaryDirectory(prefix="worker-candidate-") as directory:
+        output = Path(directory) / "candidate.wasm"
+        build(output)
+        candidate = snapshot_build_output(output)
+        return consume_sealed(candidate, verify, command, cwd=cwd, env=env, run=run)
 
 
 def consume_sealed(candidate: bytes, verify, command: list[str], *, cwd, env, run=subprocess.run) -> str:
