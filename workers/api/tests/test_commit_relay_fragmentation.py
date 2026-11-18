@@ -1,6 +1,7 @@
 """Fragmented protocol control for the disposable COMMIT relay."""
 
 import importlib.util
+import socket
 import struct
 import unittest
 from pathlib import Path
@@ -24,6 +25,15 @@ def fragments(feed, data):
 
 
 class CommitRelayFragmentation(unittest.TestCase):
+    def test_relay_exit_before_connection_releases_listener(self):
+        with relay.commit_relay() as result:
+            pass
+        with self.assertRaises(relay.ProtocolError):
+            result.result(timeout=1)
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 15432))
+
     def test_fragmented_commit_and_response_are_withheld(self):
         exchange = relay.CommitExchange()
         params = b"user\0postgres\0database\0nntune_billing_ack\0\0"
