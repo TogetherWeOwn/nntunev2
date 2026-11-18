@@ -46,6 +46,19 @@ class CommitRelayFragmentation(unittest.TestCase):
         self.assertTrue(exchange.withheld)
         self.assertEqual(bytes(exchange.gate.held), response)
 
+    def test_commit_with_trailing_partial_frame_is_rejected(self):
+        exchange = relay.CommitExchange()
+        params = b"user\0postgres\0database\0nntune_billing_ack\0\0"
+        startup = struct.pack("!II", len(params) + 8, 196608) + params
+        exchange.frontend(startup)
+        exchange.backend(frame(b"Z", b"I"))
+        exchange.frontend(frame(b"Q", b"BEGIN\0"))
+        exchange.backend(frame(b"Z", b"T"))
+
+        with self.assertRaises(relay.ProtocolError):
+            exchange.frontend(frame(b"Q", b"COMMIT\0") + b"Q")
+        self.assertIsNone(exchange.gate)
+
 
 if __name__ == "__main__":
     unittest.main()
