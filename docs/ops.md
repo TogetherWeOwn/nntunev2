@@ -439,6 +439,19 @@ single-row observation. Neither mode establishes admission expiry, writer drain,
 unknown-outcome reconciliation or crash-safe zero-idle restoration; these
 remain prerequisites for an authorized staging window, not claims of this route.
 
+`purge-census` stays disabled until reviewed code pins the independently approved SELECT-only
+staging app endpoint and role (no ledger/runtime fallback) and the purge owner's exact guard
+head/digest. No guard ref is checked out. The receipt reports `user_cache_grants` (all rows)
+and `provider_owners_without_account_evidence` (distinct provider owners without a vault marker,
+passkey or session, even a revoked one). Role, deletion fence, age, challenges and magic links do
+not affect the count. Before relying on it, confirm both predicates against the exact final reviewed
+`0051_purge_legacy_provider_credentials.sql`. This is not proof of vault markers, locked-guard success
+or caller drain.
+
+After separate dispatch approval, retrieve `staging-purge-census-<run>-<attempt>` (seven days)
+from a successful protected `main` job. Match `purge-census-receipt.json` to its run/job/attempt,
+trusted revision and reviewed guard. Unknown, stale or nonzero is NO-GO. A merge produces no receipt.
+
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
 90-second statement/idle-in-transaction and 10-second lock timeouts.

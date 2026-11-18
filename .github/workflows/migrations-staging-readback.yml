@@ -9,6 +9,7 @@ on:
         options:
           - readback
           - audit
+          - purge-census
         default: readback
         required: true
       ref:
@@ -55,6 +56,7 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]
 
       - name: Check out data only
+        if: ${{ inputs.mode != 'purge-census' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -70,11 +72,18 @@ jobs:
 
       - name: Verify revisions
         env:
+          MODE: ${{ inputs.mode }}
           DATA_REF: ${{ inputs.ref }}
           TRUSTED_REF: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
-          test "$(git -C data rev-parse HEAD)" = "$DATA_REF"
+          if [[ "$MODE" == purge-census ]]; then
+            test "$REF_PROTECTED" = true && test "$WORKFLOW_SHA" = "$TRUSTED_REF" || exit 1
+          else
+            test "$(git -C data rev-parse HEAD)" = "$DATA_REF"
+          fi
           test "$(git -C trusted rev-parse HEAD)" = "$TRUSTED_REF"
           command -v psql >/dev/null
           test -r /etc/ssl/certs/ca-certificates.crt
@@ -120,5 +129,26 @@ jobs:
         with:
           name: staging-ledger-readback-${{ github.run_id }}-${{ github.run_attempt }}
           path: readback-receipt.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Observe staging purge census
+        if: ${{ inputs.mode == 'purge-census' }}
+        env:
+          # Source-only: no independently approved SELECT binding is wired.
+          DATA_REVISION: ${{ inputs.ref }}
+          TRUSTED_REVISION: ${{ github.sha }}
+          MIGRATION_FILE: ${{ inputs.file }}
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          python3 -E -s trusted/.github/scripts/staging_apply.py purge-census --file "$MIGRATION_FILE" --expected-sha "$EXPECTED_SHA" --expect-database nntunev2_staging
+
+      - name: Upload sanitized purge census receipt
+        if: ${{ inputs.mode == 'purge-census' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-purge-census-${{ github.run_id }}-${{ github.run_attempt }}
+          path: purge-census-receipt.json
           retention-days: 7
           if-no-files-found: error

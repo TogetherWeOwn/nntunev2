@@ -435,9 +435,78 @@ def run_readback(data_root, filename, expected_sha, expected_database, environ=N
         handle.write(text + "```\n")
 
 
+CENSUS_GUARD = (
+    "0051_purge_legacy_provider_credentials.sql",
+    "10c9e67b73c59efed95c2c693fd2fd1971dbf2e6",
+    "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca",
+)
+# A reviewed (observation-only secret env name, staging app host, port, role)
+# must be pinned in source and wired only into the protected census step.
+CENSUS_BINDING = None
+CENSUS_SQL = r"""BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL row_security = off;
+\getenv census_role PGUSER
+SELECT current_database() = 'nntunev2_staging'
+   AND session_user = :'census_role' AND current_user = :'census_role' AS census_target_ok \gset
+\if :census_target_ok
+SELECT (SELECT count(*) FROM public.user_cache_grants),
+       (SELECT count(DISTINCT u.id) FROM public.providers AS p
+        JOIN public.users AS u ON u.id = p.user_id
+        WHERE NOT u.legacy_vault_established
+          AND NOT EXISTS (SELECT 1 FROM public.sessions AS s WHERE s.user_id = u.id)
+          AND NOT EXISTS (SELECT 1 FROM public.webauthn_credentials AS c WHERE c.user_id = u.id)),
+       to_char(transaction_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
+\endif
+COMMIT;
+"""
+
+
+def run_census(filename, guard_sha, database, environ=None):
+    source = _env(environ)
+    if (database != "nntunev2_staging"
+            or (filename, source.get("DATA_REVISION"), guard_sha) != CENSUS_GUARD):
+        raise StagingApplyError("purge census scope or guard mismatch")
+    for key, pattern in (("TRUSTED_REVISION", r"[0-9a-f]{40}"),
+                         ("GITHUB_RUN_ID", r"[0-9]{1,20}"),
+                         ("GITHUB_RUN_ATTEMPT", r"[0-9]{1,10}"),
+                         ("GITHUB_JOB", r"[A-Za-z0-9_-]{1,100}")):
+        if not re.fullmatch(pattern, source.get(key, "")):
+            raise StagingApplyError("invalid purge census provenance")
+    if CENSUS_BINDING is None:
+        raise StagingApplyError("no approved staging app census binding")
+    secret_env, host, port, role = CENSUS_BINDING
+    if secret_env == SECRET_ENV or not source.get(secret_env):
+        raise StagingApplyError("no approved staging app census binding")
+    try:
+        child = evidence_child_env(source[secret_env], database)
+    except (StagingApplyError, ValueError):
+        raise StagingApplyError("invalid purge census binding; details redacted") from None
+    if (child["PGHOST"], child["PGPORT"], child["PGUSER"]) != (host, str(port), role) or not child["PGPASSWORD"]:
+        raise StagingApplyError("purge census binding mismatch; details redacted")
+    child["PGGSSENCMODE"] = "disable"
+    child["PGOPTIONS"] += " -c idle_in_transaction_session_timeout=10000"
+    result = subprocess.run(
+        ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only", "--no-align",
+         "--field-separator", "\t", "--set", "ON_ERROR_STOP=1"],
+        input=CENSUS_SQL, text=True, capture_output=True, timeout=60, env=child)
+    row = re.fullmatch(r"([0-9]{1,19})\t([0-9]{1,19})\t([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\n", result.stdout)
+    if result.returncode != 0 or not row:
+        raise StagingApplyError("purge census read failed or target not verified; details redacted")
+    grants, owners, utc = row.groups()
+    receipt = {"target": "app", "database": database, "guard_head": source["DATA_REVISION"],
+               "guard_sha256": guard_sha, "trusted_revision": source["TRUSTED_REVISION"],
+               "run_id": source["GITHUB_RUN_ID"], "run_attempt": source["GITHUB_RUN_ATTEMPT"],
+               "job": source["GITHUB_JOB"], "observed_at_utc": utc,
+               "user_cache_grants": int(grants), "provider_owners_without_account_evidence": int(owners)}
+    text = json.dumps(receipt, indent=2) + "\n"
+    Path("purge-census-receipt.json").write_text(text)
+    with open(source["GITHUB_STEP_SUMMARY"], "a") as handle:
+        handle.write("### Staging purge census\n\n```json\n" + text + "```\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("phase", choices=("apply", "evidence", "readback", "audit"))
+    parser.add_argument("phase", choices=("apply", "evidence", "readback", "audit", "purge-census"))
     parser.add_argument("--expected-sha", default="")
     parser.add_argument("--trusted-root", default="trusted")
     parser.add_argument("--data-root", default="data")
@@ -457,14 +526,16 @@ def main(argv=None):
                          args.apply_outcome, args.expect_database)
         elif args.phase == "readback":
             run_readback(args.data_root, args.file, args.expected_sha, args.expect_database)
-        else:
+        elif args.phase == "audit":
             run_ledger_audit(args.trusted_root, args.data_root, args.file,
                              args.expected_sha, args.expect_database)
+        else:
+            run_census(args.file, args.expected_sha, args.expect_database)
     except StagingApplyError as exc:
         print(f"migrations-staging-apply: {exc}", file=sys.stderr)
         return 1
     except Exception:
-        if args.phase not in ("readback", "audit"):
+        if args.phase not in ("readback", "audit", "purge-census"):
             raise
         print("migrations-staging-apply: readback failed; details redacted", file=sys.stderr)
         return 1
