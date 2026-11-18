@@ -97,6 +97,22 @@ impl BillingBudget {
         self.work(|| drive(driver, operation())).await
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    async fn work_driven_classified<T, E, D, F>(
+        &self,
+        driver: Pin<&mut D>,
+        operation: impl FnOnce() -> F,
+    ) -> Result<T, PhaseFailure>
+    where
+        D: Future<Output = Result<(), E>>,
+        F: Future<Output = Result<T, StoreError>>,
+    {
+        self.phase_classified(Phase::Work, Phase::Finished, WORK_MS, || {
+            drive(driver, operation())
+        })
+        .await
+    }
+
     async fn phase<T, F: Future<Output = Result<T, StoreError>>>(
         &self,
         expected: Phase,
@@ -104,14 +120,44 @@ impl BillingBudget {
         duration_ms: u64,
         operation: impl FnOnce() -> F,
     ) -> Result<T, StoreError> {
+        self.phase_classified(expected, next, duration_ms, operation)
+            .await
+            .map_err(|_| StoreError)
+    }
+
+    async fn phase_classified<T, F: Future<Output = Result<T, StoreError>>>(
+        &self,
+        expected: Phase,
+        next: Phase,
+        duration_ms: u64,
+        operation: impl FnOnce() -> F,
+    ) -> Result<T, PhaseFailure> {
         if self.phase.replace(Phase::Running) != expected {
-            return Err(StoreError);
+            return Err(PhaseFailure::Operation);
         }
         // A cancelled or failed phase remains Running and cannot be restarted.
-        let result = with_deadline(async { operation().await }, duration_ms, StoreError).await?;
+        let result = phase_deadline(operation, duration_ms).await?;
         self.phase.set(next);
         Ok(result)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PhaseFailure {
+    Expired,
+    Operation,
+}
+
+// Keep the timer outcome separate from an operation or driver error until the
+// caller deliberately maps both to the public, fail-closed store error.
+async fn phase_deadline<T, F: Future<Output = Result<T, StoreError>>>(
+    operation: impl FnOnce() -> F,
+    duration_ms: u64,
+) -> Result<T, PhaseFailure> {
+    with_deadline(async { Ok::<_, ()>(operation().await) }, duration_ms, ())
+        .await
+        .map_err(|_| PhaseFailure::Expired)?
+        .map_err(|_| PhaseFailure::Operation)
 }
 
 /// Start the future billing transaction with conservative work-phase limits.
@@ -147,7 +193,7 @@ pub(super) async fn with_owned_connection<T: 'static>(
     work: impl for<'a> FnOnce(
         &'a mut tokio_postgres::Client,
     ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
-    #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(),
+    #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(bool),
 ) -> Result<T, StoreError> {
     use crate::billing_owned_socket::SocketGuard;
 
@@ -169,11 +215,18 @@ pub(super) async fn with_owned_connection<T: 'static>(
         budget
             .bootstrap_driven(connection.as_mut(), || bootstrap(&mut client))
             .await?;
+        #[cfg(not(feature = "billing-owned-wasm-test"))]
         let result = budget
             .work_driven(connection.as_mut(), || work(&mut client))
             .await;
         #[cfg(feature = "billing-owned-wasm-test")]
-        work_finished();
+        let result = {
+            let result = budget
+                .work_driven_classified(connection.as_mut(), || work(&mut client))
+                .await;
+            work_finished(matches!(result, Err(PhaseFailure::Expired)));
+            result.map_err(|_| StoreError)
+        };
         result
     })
     .await
@@ -200,10 +253,25 @@ pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
                 Ok(row.get::<_, i32>(0))
             })
         },
-        || {},
+        |_| {},
     )
     .await
     .map_err(|_| "real connection failed")?;
+
+    let failure_observed = Rc::new(Cell::new(None));
+    let failure_signal = failure_observed.clone();
+    let failure = with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |_| Box::pin(async { Err::<(), _>(StoreError) }),
+        move |expired| failure_signal.set(Some(expired)),
+    )
+    .await;
+    if failure.is_ok() || failure_observed.get() != Some(false) {
+        return Err("operation error was classified as deadline expiry");
+    }
 
     let timeout_pid = Rc::new(Cell::new(0));
     let started = Rc::new(Cell::new(0.0));
@@ -227,7 +295,7 @@ pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
                 std::future::pending::<Result<(), StoreError>>().await
             })
         },
-        move || phase_observed.set(true),
+        move |expired| phase_observed.set(expired),
     )
     .await;
     if result.is_ok()
@@ -270,8 +338,43 @@ pub(crate) async fn test_transaction_bootstrap() -> Result<(), &'static str> {
                 Ok(())
             })
         },
-        || {},
+        |_| {},
     ).await.map_err(|_| "Worker transaction bootstrap failed")
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) const BILLING_FIXTURE: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=billing_ack_test";
+
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_commit_ack() -> Result<i32, &'static str> {
+    let prepared_pid = std::rc::Rc::new(Cell::new(0));
+    let observed = prepared_pid.clone();
+    let result = with_owned_connection(
+        "127.0.0.1",
+        15432,
+        BILLING_FIXTURE,
+        |client| Box::pin(bootstrap_transaction(client)),
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "INSERT INTO users (id,email,created_at) VALUES ('withheld','withheld',0) RETURNING pg_backend_pid()",
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                prepared_pid.set(row.get::<_, i32>(0));
+                client.batch_execute("COMMIT").await.map_err(|_| StoreError)
+            })
+        },
+        |_| {},
+    )
+    .await;
+    let pid = observed.get();
+    if pid <= 0 || result.is_ok() {
+        return Err("withheld COMMIT did not fail after a successful insert");
+    }
+    Ok(pid)
 }
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -447,6 +550,17 @@ pub(crate) async fn test_budget() -> Result<(), &'static str> {
     {
         return Err("failed phase restarted");
     }
+    // An operation failure must never be mistaken for a Worker timer firing.
+    if !matches!(
+        phase_deadline(|| async { Err::<(), _>(StoreError) }, 100).await,
+        Err(PhaseFailure::Operation)
+    ) || !matches!(
+        phase_deadline(future::pending::<Result<(), StoreError>>, 10).await,
+        Err(PhaseFailure::Expired)
+    ) {
+        return Err("phase failure classification was incorrect");
+    }
+
     // Exercise expiry and destruction inside the actual Worker, without waiting
     // for the production connect allowance or relying on a native mock timer.
     struct DropMarker<'a>(&'a Cell<bool>);

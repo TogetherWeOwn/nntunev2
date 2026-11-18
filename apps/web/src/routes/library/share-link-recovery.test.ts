@@ -24,7 +24,7 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  * Only lifecycle/storage and Svelte state cells are substituted. Browser cases
  * in library-share-link-lifecycle.spec.ts cover navigation and rendered media.
  */
-function pageScript(search: string) {
+function pageScript(search: string, tick = () => Promise.resolve()) {
 	vi.stubGlobal('window', { location: { search } });
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
@@ -65,14 +65,18 @@ function pageScript(search: string) {
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		afterNavigate: () => {},
-		tick: () => Promise.resolve(),
+		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
+		let renderedItems;
 		return {
 			refresh, applyShareLink, resetShareAtAuthBoundary, selectTrack,
-			applyPendingShareSeek,
+			applyPendingShareSeek, playQueuedTrack, subscribe: queueController.subscribe,
+			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
+			source: queueController.sourceForQueuedPlay,
+			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
 			setAudio: (element) => { audioEl = element; },
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
@@ -82,7 +86,13 @@ function pageScript(search: string) {
 		resetShareAtAuthBoundary: () => void;
 		selectTrack: (id: string) => void;
 		applyPendingShareSeek: () => void;
-		setAudio: (element: { currentTime: number; duration: number }) => void;
+		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void> }) => void;
+		playQueuedTrack: (id: string) => Promise<void>;
+		addDisplayed: () => void;
+		subscribe: (callback: (queue: queueFunctions.QueueState) => void) => () => void;
+		source: ReturnType<typeof createQueueController>['sourceForQueuedPlay'];
+		endSession: () => void;
+		dispose: () => void;
 		read: () => {
 			queue: queueFunctions.QueueState;
 			shareInvalid: boolean;
@@ -93,7 +103,7 @@ function pageScript(search: string) {
 	};
 }
 
-function serve(payload = ITEMS) {
+function serve(payload: { id: string; title: string; streamUrl?: string }[] = ITEMS) {
 	vi.stubGlobal('fetch', async () => new Response(JSON.stringify(payload), {
 		headers: { 'content-type': 'application/json' }
 	}));
@@ -165,6 +175,129 @@ test('a successfully loaded empty library rejects the target and does not replay
 	await page.refresh();
 	expect(page.read().queue.tracks).toEqual([]);
 });
+
+test('refresh replaces source evidence without hydrating metadata until queued Play', async () => {
+	serve();
+	const page = pageScript('');
+	await page.refresh();
+	page.addDisplayed();
+	const queued = page.read().queue;
+	const old = page.source('coral');
+	const updated = [{ ...ITEMS[0], streamUrl: '/test-audio/new' }];
+	serve(updated);
+	await page.refresh();
+	expect(page.read().queue).toBe(queued);
+	expect(queued.tracks[0].streamUrl).toBe('');
+	expect(old?.isCurrent()).toBe(false);
+
+	vi.stubGlobal('fetch', async () => new Response(null, { status: 503 }));
+	const latest = page.source('coral');
+	await page.refresh();
+	expect(page.read().queue).toBe(queued);
+	expect(latest?.isCurrent()).toBe(true);
+	const play = vi.fn(async () => {});
+	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+	await page.playQueuedTrack('coral');
+	expect(page.read().queue.tracks[0].streamUrl).toBe(updated[0].streamUrl);
+	expect(play).toHaveBeenCalledTimes(1);
+});
+
+test('same-queue evidence replacement revokes an explicit Play waiting for flush', async () => {
+	serve();
+	let flush!: () => void;
+	const tick = vi.fn(() => new Promise<void>((resolve) => { flush = resolve; }));
+	const page = pageScript('', tick);
+	await page.refresh();
+	page.selectTrack('coral');
+	const play = vi.fn(async () => {});
+	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+	const pending = page.playQueuedTrack('coral');
+	expect(tick).toHaveBeenCalledOnce();
+	const queue = page.read().queue;
+	await page.refresh();
+	expect(page.read().queue).toBe(queue);
+	flush();
+	await pending;
+	expect(play).not.toHaveBeenCalled();
+});
+
+for (const status of [200, 401, 403]) {
+	test(`authoritative ${status} removal invalidates queued Play across a re-add`, async () => {
+		serve();
+		const page = pageScript('');
+		await page.refresh();
+		page.selectTrack('coral');
+		const old = page.source('coral');
+		vi.stubGlobal('fetch', async () => new Response(status === 200 ? '[]' : null, { status }));
+		await page.refresh();
+		expect(page.read().queue.tracks).toEqual([]);
+		expect(page.source('coral')).toBeNull();
+		serve([{ ...ITEMS[0], streamUrl: undefined }]);
+		await page.refresh();
+		expect(page.read().queue.tracks).toEqual([]);
+		expect(page.source('coral')?.isCurrent()).toBe(true);
+		expect(page.source('coral', ITEMS[0].streamUrl)?.streamUrl).toBe('');
+		expect(old?.isCurrent()).toBe(false);
+	});
+}
+
+for (const streamUrl of [undefined, '/test-audio/new']) {
+	test(`queued Play retains its source when the refresh ${streamUrl ? 'changes' : 'omits'} the displayed URL`, async () => {
+		serve();
+		const page = pageScript('');
+		await page.refresh();
+		page.selectTrack('coral');
+		const queue = page.read().queue;
+		const old = page.source('coral');
+		serve([{ ...ITEMS[0], streamUrl }]);
+		await page.refresh();
+		expect(page.read().queue).toBe(queue);
+		expect(old?.isCurrent()).toBe(false);
+		expect(page.source('coral')?.streamUrl).toBe(streamUrl ?? '');
+		const play = vi.fn(async () => {});
+		page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+		await page.playQueuedTrack('coral');
+		expect(page.read().queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
+		expect(play).toHaveBeenCalledOnce();
+	});
+}
+
+test('queue publication exposes new evidence before a reentrant auth boundary', async () => {
+	serve([...ITEMS, { id: 'kelp', title: 'Kelp', streamUrl: '/test-audio/kelp' }]);
+	const page = pageScript('');
+	await page.refresh();
+	page.selectTrack('kelp');
+	page.selectTrack('coral');
+	let reentered = false;
+	const stop = page.subscribe((queue) => {
+		if (reentered || queue.tracks.length !== 1) return;
+		reentered = true;
+		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
+		expect(page.source('kelp')).toBeNull();
+		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
+		page.endSession();
+	});
+	serve([{ ...ITEMS[0], streamUrl: '/test-audio/new' }]);
+	await page.refresh();
+	stop();
+	expect(reentered).toBe(true);
+	expect(page.source('coral')).toBeNull();
+	expect(page.read().queue.tracks).toEqual([]);
+});
+
+for (const boundary of ['endSession', 'dispose'] as const) {
+	test(`late response cannot authorize a source after ${boundary}`, async () => {
+		let respond!: (response: Response) => void;
+		vi.stubGlobal('fetch', () => new Promise<Response>((resolve) => { respond = resolve; }));
+		const page = pageScript('');
+		const pending = page.refresh();
+		page[boundary]();
+		respond(new Response(JSON.stringify(ITEMS)));
+		await pending;
+		expect(page.source('coral')).toBeNull();
+		expect(page.read().queue.tracks).toEqual([]);
+	});
+}
 
 for (const status of [401, 403]) {
 	test(`${status} invalidation still fences the link from the next account's Retry`, async () => {

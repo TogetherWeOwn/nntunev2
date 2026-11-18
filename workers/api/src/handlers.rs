@@ -1900,6 +1900,68 @@ where
     }
 }
 
+// Adapted from PR #982. Do not register without privacy-aware new-play acquisition.
+#[allow(dead_code)]
+async fn me_private_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    const TTL_SECS: u64 = 21_600;
+    // Fits the signed epoch column and its tighter CHECK in migration 0041.
+    const MAX_EXPIRY: u64 = 253_402_300_799;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        session_id: String,
+        enabled: bool,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let invalid = || validation_failed("invalid private session request");
+    // Serde structs also accept positional arrays without this object check.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid();
+    }
+    let Some(body) = parse_body::<Body>(req) else {
+        return invalid();
+    };
+    let session_id = body.session_id;
+    // The private-session writers bind the ID as PostgreSQL TEXT.
+    if !valid_client_session_id(&session_id) || session_id.contains('\0') {
+        return invalid();
+    }
+
+    let owner = &claims.user_id;
+    let result = if body.enabled {
+        let Some(expiry) = ctx.now.checked_add(TTL_SECS).filter(|&t| t <= MAX_EXPIRY) else {
+            return unavailable();
+        };
+        ctx.store
+            .upsert_private_session(owner, &session_id, expiry)
+            .await
+            .map(|()| Some(expiry))
+    } else {
+        ctx.store
+            .delete_private_session(owner, &session_id)
+            .await
+            .map(|()| None)
+    };
+    match result {
+        Ok(private_until) => json_response(
+            200,
+            serde_json::json!({"session_id": session_id, "private_until": private_until}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 // Adapted from the preference collection handler in PR #982. This is not
 // registered with dispatch; activation requires a separate change.
 #[allow(dead_code)]
@@ -2092,6 +2154,123 @@ where
         ),
         Err(_) => unavailable(),
     }
+}
+
+// Adapted from PR #982. Activation, including the route-specific body cap, is separate.
+#[allow(dead_code)]
+async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+    use crate::taste_signal::TasteSignal::Love;
+    use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
+    use std::{fmt, marker::PhantomData};
+
+    // Serde's derived structs also accept positional arrays. Require maps
+    // without losing the derived checks for duplicate and unknown fields.
+    struct Object<T>(T);
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct ObjectVisitor<T>(PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+                type Value = Object<T>;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                    T::deserialize(MapAccessDeserializer::new(map)).map(Object)
+                }
+            }
+            d.deserialize_map(ObjectVisitor(PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        items: Vec<Object<Item>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Item {
+        kind: String,
+        target_id: String,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(Object(Body { items })) = parse_body(req) else {
+        return validation_failed("invalid likes import body");
+    };
+    if items.len() > 500 {
+        return validation_failed("too many likes import items");
+    }
+
+    let owner = &claims.user_id;
+    let (mut added, mut already) = (0, 0);
+    let mut rejected = Vec::new();
+    for Object(Item { kind, target_id }) in items {
+        let mut reject = |reason| {
+            rejected.push(serde_json::json!({
+                "target_id": target_id.chars().take(64).collect::<String>(), "reason": reason,
+            }));
+        };
+        let kind = match TargetKind::parse(&kind) {
+            Some(TargetKind::Track) if valid_target_id(&target_id) => TargetKind::Track,
+            Some(TargetKind::Release) if crate::catalogue::is_catalogue_mbid(&target_id) => {
+                TargetKind::Release
+            }
+            _ => {
+                reject("invalid");
+                continue;
+            }
+        };
+        let target = match kind {
+            TargetKind::Track => ctx.store.resolve_member_track(owner, &target_id).await,
+            TargetKind::Release => {
+                let target = canonical_target_id(&target_id);
+                ctx.store
+                    .catalogue_member_target(owner, kind, &target)
+                    .await
+                    .map(|member| member.then_some(target))
+            }
+        };
+        let target = match target {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                reject("not_member");
+                continue;
+            }
+            Err(_) => return unavailable(),
+        };
+        let Ok(prior) = ctx.store.taste_get(owner, kind, &target).await else {
+            return unavailable();
+        };
+        // Even a replay goes through the deletion-fenced writer.
+        if ctx
+            .store
+            .taste_upsert(owner, kind, &target, Love, None, ctx.now)
+            .await
+            .is_err()
+        {
+            return unavailable();
+        }
+        if prior.is_some_and(|row| row.signal == Love.as_str()) {
+            already += 1;
+        } else {
+            added += 1;
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({"added": added, "already": already, "rejected": rejected}),
+    )
 }
 
 // Prepared for direct testing only; preference routes remain unregistered.
@@ -7817,14 +7996,24 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PreferenceFailure {
+        Member,
+        Read,
+        Write,
+    }
+
     #[derive(Default)]
     struct FakeStore {
         taste_rows: RefCell<HashMap<(String, String, String), crate::preference_rows::TasteDbRow>>,
+        taste_write_attempts: std::cell::Cell<usize>,
+        preference_failure: std::cell::Cell<Option<(PreferenceFailure, &'static str)>>,
         fail_taste_read: RefCell<bool>,
         fail_taste_write: RefCell<bool>,
         delete_before_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         private_sessions: RefCell<HashMap<(String, String), u64>>,
+        private_session_write_attempts: std::cell::Cell<usize>,
         fail_private_session_write: RefCell<bool>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
@@ -8517,6 +8706,8 @@ mod tests {
             session_id: &str,
             expires_at: u64,
         ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
             if *self.fail_private_session_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -9560,6 +9751,8 @@ mod tests {
             user_id: &str,
             session_id: &str,
         ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
             if *self.fail_private_session_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -9583,6 +9776,11 @@ mod tests {
         ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
             use crate::taste_signal::TasteSignal;
             const MAX_TIME: u64 = 253_402_300_799;
+            self.taste_write_attempts
+                .set(self.taste_write_attempts.get() + 1);
+            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
+                return Err(StoreError);
+            }
             if self.delete_before_taste_write.replace(false) {
                 self.deleting_users.borrow_mut().insert(user_id.into());
             }
@@ -9625,7 +9823,9 @@ mod tests {
             kind: crate::target_identity::TargetKind,
             target: &str,
         ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
-            if *self.fail_taste_read.borrow() {
+            if *self.fail_taste_read.borrow()
+                || self.preference_failure.get() == Some((PreferenceFailure::Read, target))
+            {
                 return Err(StoreError);
             }
             Ok(self
@@ -9729,7 +9929,9 @@ mod tests {
             if kind == TargetKind::Release && !crate::catalogue::is_catalogue_mbid(target) {
                 return Ok(false);
             }
-            if *self.fail_catalogue_reads.borrow() {
+            if *self.fail_catalogue_reads.borrow()
+                || self.preference_failure.get() == Some((PreferenceFailure::Member, target))
+            {
                 return Err(StoreError);
             }
             let rows = self.catalogue_library.borrow();
@@ -9758,7 +9960,9 @@ mod tests {
             user_id: &str,
             target: &str,
         ) -> Result<Option<String>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
+            if *self.fail_catalogue_reads.borrow()
+                || self.preference_failure.get() == Some((PreferenceFailure::Member, target))
+            {
                 return Err(StoreError);
             }
             let rows = self.catalogue_library.borrow();
@@ -16079,6 +16283,430 @@ mod tests {
         let deleting = (409, account_deleting_response().body);
         assert_eq!(call(&req, track_body), deleting);
         assert_eq!(*h.store.taste_rows.borrow(), before);
+    }
+
+    fn private_session_request(
+        ctx: &Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns>,
+        owner: &str,
+    ) -> Request {
+        let login = block_on(ctx.start_session(owner)).unwrap();
+        Request {
+            method: "PUT".into(),
+            path: "/v1/me/private-session".into(),
+            cookie: Some(cookie_of(&login)),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"session_id":"s","enabled":true}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unwired_private_session_toggles_only_the_current_owner() {
+        use serde_json::json;
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let mut ctx = h.ctx();
+        let alice = private_session_request(&ctx, "alice");
+        let bob = private_session_request(&ctx, "bob");
+        let session_id = "é".repeat(64); // The play contract caps bytes, not characters.
+        let play = crate::ledger::prepare_play_window(
+            "alice",
+            "track",
+            "private",
+            100,
+            Some(100),
+            Some(30_000),
+            NOW,
+        )
+        .unwrap();
+        let key = &play.idempotency_key;
+        block_on(h.store.record_play_window(&play)).unwrap();
+        let history = || block_on(h.store.history_list("alice")).unwrap();
+        assert_eq!(history()[0].play_id, "private");
+        block_on(h.store.mark_private_play("alice", "track", key, NOW)).unwrap();
+        let windows = h.store.play_windows.borrow().clone();
+        let billed = h.store.stream_seconds.borrow().clone();
+        assert_eq!(billed[&("alice".into(), play.period_month.clone())], 30);
+
+        let initial = Some(NOW + 21_600);
+        let refreshed = Some(NOW + 21_610);
+        let bob_until = Some(NOW + 21_620);
+        for (request, enabled, offset, alice_row, bob_row, until) in [
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 10, refreshed, None, refreshed),
+            (&bob, true, 20, refreshed, bob_until, bob_until),
+            (&alice, false, 30, None, bob_until, None),
+            (&alice, false, 40, None, bob_until, None),
+            (&bob, false, 50, None, None, None),
+        ] {
+            let mut req = request.clone();
+            req.body = json!({"session_id": session_id, "enabled": enabled})
+                .to_string()
+                .into_bytes();
+            ctx.now = NOW + offset;
+            let res = block_on(me_private_session(&ctx, &req));
+            let expected = json!({"session_id": session_id, "private_until": until});
+            assert_eq!((res.status, res.body), (200, expected.to_string()));
+            let expected: HashMap<_, _> = [("alice", alice_row), ("bob", bob_row)]
+                .into_iter()
+                .filter_map(|(owner, expiry)| {
+                    expiry.map(|t| ((owner.to_string(), session_id.clone()), t))
+                })
+                .collect();
+            assert_eq!(*h.store.private_sessions.borrow(), expected);
+            assert!(block_on(h.store.private_play_marked("alice", "track", key)).unwrap());
+            assert!(history().is_empty());
+            assert_eq!(*h.store.play_windows.borrow(), windows);
+            assert_eq!(*h.store.stream_seconds.borrow(), billed);
+        }
+    }
+
+    #[test]
+    fn unwired_private_session_rejects_without_mutating_rows() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let ctx = h.ctx();
+        let mut req = private_session_request(&ctx, "alice");
+        assert_eq!(block_on(me_private_session(&ctx, &req)).status, 200);
+        let saved = h.store.private_sessions.borrow().clone();
+        assert_eq!(saved[&("alice".into(), "s".into())], NOW + 21_600);
+        let check = |req: &Request, status, attempts| {
+            let res = block_on(me_private_session(&ctx, req));
+            assert_eq!(res.status, status, "request body: {:?}", req.body);
+            if status == 503 {
+                assert_eq!(res.body, unavailable().body);
+            } else if status == 409 {
+                assert_eq!(res.body, account_deleting_response().body);
+            }
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+            assert_eq!(h.store.private_session_write_attempts.get(), attempts);
+        };
+        for body in [
+            r#"["s",false]"#,
+            "null",
+            "{",
+            r#"{"session_id":"s"}"#,
+            r#"{"enabled":false}"#,
+            r#"{"session_id":1,"enabled":true}"#,
+            r#"{"session_id":"s","enabled":"false"}"#,
+            r#"{"session_id":"s","enabled":null}"#,
+            r#"{"session_id":"s","enabled":true,"enabled":false}"#,
+            r#"{"session_id":"s","enabled":false,"user_id":"bob"}"#,
+            r#"{"session_id":"","enabled":false}"#,
+            r#"{"session_id":"s\u0000","enabled":true}"#,
+            r#"{"session_id":"s\u0000","enabled":false}"#,
+            &format!(r#"{{"session_id":"{}x","enabled":true}}"#, "é".repeat(64)),
+        ] {
+            req.body = body.as_bytes().to_vec();
+            check(&req, 422, 1);
+        }
+        req.body = br#"{"session_id":"s","enabled":false}"#.to_vec();
+        let cookie = req.cookie.take();
+        check(&req, 401, 1);
+        req.authorization = Some("Bearer ntk_test".into());
+        check(&req, 404, 1);
+        req.cookie = cookie;
+        check(&req, 404, 1);
+        req.authorization = None;
+        req.origin = Some("https://wrong.example".into());
+        check(&req, 401, 1);
+        req.origin = None;
+        check(&req, 401, 1);
+        req.origin = Some(ORIGIN.into());
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        check(&req, 409, 1);
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        check(&req, 503, 1);
+        *h.store.fail_deleting_probe.borrow_mut() = false;
+        *h.store.fail_private_session_write.borrow_mut() = true;
+        check(&req, 503, 2);
+        req.body = br#"{"session_id":"new","enabled":true}"#.to_vec();
+        check(&req, 503, 3);
+    }
+
+    #[test]
+    fn unwired_private_session_checks_expiry_before_writing() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let max = 253_402_300_799;
+        let mut ctx = h.ctx();
+        ctx.now = max - 21_600;
+        let req = private_session_request(&ctx, "alice");
+        let res = block_on(me_private_session(&ctx, &req));
+        let expected = serde_json::json!({"session_id": "s", "private_until": max});
+        assert_eq!((res.status, res.body), (200, expected.to_string()));
+        let saved = HashMap::from([(("alice".into(), "s".into()), max)]);
+        assert_eq!(*h.store.private_sessions.borrow(), saved);
+        for now in [max - 21_599, i64::MAX as u64, u64::MAX - 1] {
+            ctx.now = now;
+            let req = private_session_request(&ctx, "alice");
+            let res = block_on(me_private_session(&ctx, &req));
+            assert_eq!(
+                (res.status, res.body),
+                (503, unavailable().body),
+                "now={now}"
+            );
+            assert_eq!(h.store.private_session_write_attempts.get(), 1);
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+        }
+    }
+
+    fn likes_import_request(h: &Harness) -> Request {
+        seed_user(h, "alice", "alice@example.com");
+        Request {
+            method: "POST".into(),
+            path: "/v1/me/likes/import".into(),
+            cookie: Some(magic_login(h, "alice@example.com")),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        }
+    }
+
+    fn import_item(kind: &str, target_id: &str) -> serde_json::Value {
+        serde_json::json!({"kind": kind, "target_id": target_id})
+    }
+
+    fn assert_import(resp: Response, added: usize, already: usize, rejected: &[serde_json::Value]) {
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap(),
+            serde_json::json!({"added": added, "already": already, "rejected": rejected})
+        );
+    }
+
+    #[test]
+    fn unwired_likes_import_rejects_bad_structure_and_auth_before_writing() {
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job")]);
+        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let valid = r#"{"kind":"track","target_id":"Job"}"#;
+        for body in [
+            "{",
+            "{}",
+            "null",
+            r#"{"items":{}}"#,
+            r#"{"items":null}"#,
+            &format!("[[{valid}]]"),
+            &format!(r#"{{"items":[{valid}],"user_id":"bob"}}"#),
+            &format!(r#"{{"items":[{valid}],"items":[]}}"#),
+            &format!(r#"{{"items":[{valid}]}} []"#),
+        ] {
+            req.body = body.as_bytes().to_vec();
+            assert_eq!(call(&req).status, 422, "{body}");
+        }
+        for item in [
+            "null",
+            "{}",
+            r#"["track","Job"]"#,
+            r#"{"kind":"track"}"#,
+            r#"{"target_id":"Job"}"#,
+            r#"{"kind":true,"target_id":"Job"}"#,
+            r#"{"kind":"track","target_id":7}"#,
+            r#"{"kind":"track","target_id":"Job","user_id":"bob"}"#,
+            r#"{"kind":"track","target_id":"Job","target_id":"Job"}"#,
+        ] {
+            req.body = format!(r#"{{"items":[{valid},{item}]}}"#).into_bytes();
+            assert_eq!(call(&req).status, 422, "{item}");
+        }
+        req.body = format!(r#"{{"items":[{valid}]}}"#).into_bytes();
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.authorization = Some("Bearer ntk_test".into());
+        assert_eq!(call(&req).status, 404);
+        req.cookie = None;
+        assert_eq!(call(&req).status, 404);
+        req.authorization = None;
+        assert_eq!(call(&req).status, 401);
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    #[test]
+    fn unwired_likes_import_bounds_batch_and_rejection_echo() {
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        req.body = br#"{"items":[]}"#.to_vec();
+        assert_import(call(&req), 0, 0, &[]);
+        let targets: Vec<_> = (0..500)
+            .map(|i| format!("{}{:03}", "A".repeat(509), i))
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            targets.iter().map(|id| unmatched_library_row(id)).collect(),
+        );
+        let mut items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
+        items.push(items[0].clone());
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert_eq!(call(&req).status, 422);
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+        items.pop();
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert!(req.body.len() > 32 * 1024);
+        assert_import(call(&req), 500, 0, &[]);
+        let saved = h.store.taste_rows.borrow().clone();
+        assert_eq!(saved.len(), 500);
+        assert!(targets
+            .iter()
+            .all(|id| saved[&("alice".into(), "track".into(), id.clone())].signal == "love"));
+        let prefix = "\"\\\n😀".repeat(16); // 64 Unicode scalar values, with JSON escapes.
+        let mut invalid = vec![import_item("track", &format!("{prefix}discarded")); 499];
+        invalid.push(import_item("track", &"A".repeat(513)));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": invalid})).unwrap();
+        let mut rejected = vec![serde_json::json!({"target_id": prefix, "reason": "invalid"}); 499];
+        rejected.push(serde_json::json!({"target_id": "A".repeat(64), "reason": "invalid"}));
+        assert_import(call(&req), 0, 0, &rejected);
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+        assert_eq!(h.store.taste_write_attempts.get(), 500);
+    }
+
+    #[test]
+    fn unwired_likes_import_resolves_members_and_replays_per_owner() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::Snooze;
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        seed_user(&h, "bob", "bob@example.com");
+        let job = "ABCDEFAB-1234-1234-1234-ABCDEFABCDEF";
+        let recording = "abcdefab-4321-4321-4321-abcdefabcdef";
+        let mut own = matched_library_row(job, recording, 1);
+        own.recording_mbids.push(recording.into());
+        h.store.catalogue_library.borrow_mut().extend([
+            ("alice".into(), vec![own]),
+            ("bob".into(), vec![unmatched_library_row("Private")]),
+            ("".into(), vec![unmatched_library_row("Shared")]),
+        ]);
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, job, Snooze, Some(NOW + 60), NOW - 1),
+        )
+        .unwrap();
+        let items = [
+            import_item("track", job),
+            import_item("track", &job.to_ascii_lowercase()),
+            import_item("release", "not-an-mbid"),
+            import_item("track", "Private"),
+            import_item("artist", CAT_RELEASE),
+            import_item("release", &CAT_RELEASE.to_ascii_uppercase()),
+            import_item("track", &recording.to_ascii_uppercase()),
+            import_item("track", "Shared"),
+            import_item("track", job),
+        ];
+        let rejected = [
+            (job.to_ascii_lowercase().as_str(), "not_member"),
+            ("not-an-mbid", "invalid"),
+            ("Private", "not_member"),
+            (CAT_RELEASE, "invalid"),
+        ]
+        .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert_import(block_on(me_likes_import(&h.ctx(), &req)), 4, 1, &rejected);
+        let mut later = h.ctx();
+        later.now += 60;
+        assert_import(block_on(me_likes_import(&later, &req)), 0, 5, &rejected);
+        let get = |owner, kind, id| block_on(h.store.taste_get(owner, kind, id)).unwrap();
+        for (kind, id) in [
+            (Track, job),
+            (Track, recording),
+            (Track, "Shared"),
+            (Release, CAT_RELEASE),
+        ] {
+            let row = get("alice", kind, id).unwrap();
+            assert_eq!(
+                (row.signal.as_str(), row.created_at, row.snooze_until),
+                ("love", NOW as i64, None)
+            );
+        }
+        assert_eq!(h.store.taste_rows.borrow().len(), 4);
+        req.cookie = Some(magic_login(&h, "bob@example.com"));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
+        assert_import(
+            block_on(me_likes_import(&later, &req)),
+            2,
+            0,
+            &[serde_json::json!({"target_id": job, "reason": "not_member"})],
+        );
+        assert_eq!(
+            get("alice", Track, "Shared").unwrap().created_at,
+            NOW as i64
+        );
+        for id in ["Shared", "Private"] {
+            let row = get("bob", Track, id).unwrap();
+            assert_eq!(
+                (row.signal.as_str(), row.created_at),
+                ("love", later.now as i64)
+            );
+        }
+        assert!(get("alice", Track, "Private").is_none());
+        assert_eq!(h.store.taste_rows.borrow().len(), 6);
+    }
+
+    #[test]
+    fn unwired_likes_import_fails_closed_and_retries_partial_writes() {
+        use PreferenceFailure::{Member, Read, Write};
+        for fault in [
+            (Member, "Second"),
+            (Member, CAT_RELEASE),
+            (Read, "Second"),
+            (Write, "Second"),
+        ] {
+            let h = harness();
+            let mut req = likes_import_request(&h);
+            h.store.catalogue_library.borrow_mut().insert(
+                "alice".into(),
+                vec![
+                    unmatched_library_row("First"),
+                    matched_library_row("Second", CAT_REC_A, 1),
+                    unmatched_library_row("Last"),
+                ],
+            );
+            let second = if fault.1 == CAT_RELEASE {
+                import_item("release", CAT_RELEASE)
+            } else {
+                import_item("track", "Second")
+            };
+            req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
+            h.store.preference_failure.set(Some(fault));
+            let failed = block_on(me_likes_import(&h.ctx(), &req));
+            assert_eq!((failed.status, failed.body), (503, unavailable().body));
+            let key = ("alice".into(), "track".into(), "First".into());
+            let saved = h.store.taste_rows.borrow().clone();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[&key].signal, "love");
+            h.store.preference_failure.set(None);
+            let mut later = h.ctx();
+            later.now += 1;
+            assert_import(block_on(me_likes_import(&later, &req)), 2, 1, &[]);
+            let recovered = h.store.taste_rows.borrow().clone();
+            assert_eq!(recovered.len(), 3);
+            assert!(recovered.values().all(|row| row.signal == "love"));
+            assert_eq!(recovered[&key].created_at, saved[&key].created_at);
+            let writes = h.store.taste_write_attempts.get();
+            h.store.delete_before_taste_write.replace(true);
+            let raced = block_on(me_likes_import(&later, &req));
+            assert_eq!((raced.status, raced.body), (503, unavailable().body));
+            let deleting = block_on(me_likes_import(&later, &req));
+            assert_eq!(
+                (deleting.status, deleting.body),
+                (409, account_deleting_response().body)
+            );
+            assert_eq!(*h.store.taste_rows.borrow(), recovered);
+            assert_eq!(h.store.taste_write_attempts.get(), writes + 1);
+        }
     }
 
     #[test]

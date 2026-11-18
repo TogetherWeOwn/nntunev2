@@ -1238,6 +1238,8 @@ jobs:
           node-version: 24
       - name: Unit-test the promotion receipt proof
         run: node --test ci/test-release-promotion-proof.cjs
+      - name: Exercise first-release admission, maintenance seed and rollback (offline)
+        run: node --test ci/test-production-maintenance.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
       - name: Unit-test the receipt archive bounds
@@ -1548,6 +1550,20 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - name: Dry-run the first-release maintenance Worker (no deployment)
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: pnpm exec wrangler deploy --config ../../ci/production-maintenance/wrangler.toml --dry-run --outdir "$RUNNER_TEMP/production-maintenance"
+      - name: Check the locked Wrangler command used by automatic rollback (no deployment)
+        working-directory: .
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          export PATH="$GITHUB_WORKSPACE/ci/locked-wrangler:$PATH"
+          wrangler_version="$(npx wrangler --version)"
+          printf 'Locked Wrangler: %s\n' "$wrangler_version"
+          test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
+          timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
       - name: Exclude history instrumentation from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
@@ -1926,13 +1942,14 @@ jobs:
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
           python3 -I workers/api/tests/test_pg_protocol_frames.py
           python3 -I workers/api/tests/test_pg_commit_barrier.py
+          python3 -I workers/api/tests/test_commit_relay_fragmentation.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi

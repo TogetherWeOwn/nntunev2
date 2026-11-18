@@ -231,6 +231,62 @@ def inspect_memory_section(payload: bytes) -> tuple[int, int | None]:
     return initial, maximum
 
 
+def inspect_exported_heap_values(module: bytes, base_name: str, end_name: str) -> tuple[int, int, int]:
+    """Resolve two immutable i32 exports and memory limits from the same bytes.
+
+    This restricted inspection is not WASM validation, proof of linker symbol
+    meaning, artifact authentication, or admission. Unsupported modules fail.
+    """
+    if not base_name or not end_name or base_name == end_name:
+        raise ValueError("distinct export names are required")
+    # Data-count precedes code despite its numerical section id.
+    order = {section: rank for rank, section in enumerate((1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 10, 11))}
+    sections = {}
+    previous = -1
+    for section, payload in wasm_sections(module):
+        if section == 0:
+            continue
+        if section not in order or order[section] <= previous:
+            raise ValueError("unsupported, duplicate, or out-of-order WASM section")
+        previous = order[section]
+        sections[section] = payload
+    if not {5, 6, 7}.issubset(sections):
+        raise ValueError("memory, globals and exports are required")
+    if 2 in sections:
+        inspect_function_only_imports(sections[2])
+    initial, _ = inspect_memory_section(sections[5])
+    globals_ = inspect_i32_globals(sections[6])
+    exports = inspect_exports(sections[7])
+    indices = []
+    for name in (base_name, end_name):
+        descriptor = exports.get(name)
+        if descriptor is None or descriptor[0] != 3 or descriptor[1] >= len(globals_):
+            raise ValueError("missing or invalid global export")
+        index = descriptor[1]
+        if globals_[index][0]:
+            raise ValueError("global export must be immutable")
+        indices.append(index)
+    if indices[0] == indices[1]:
+        raise ValueError("heap exports must be distinct globals")
+    return globals_[indices[0]][1], globals_[indices[1]][1], initial
+
+
+def check_heap_range(base: int, end: int, initial_pages: int) -> None:
+    """Check necessary donation conditions, not artifact provenance or admission.
+
+    Inputs must eventually come from an authenticated, immutable same-link record.
+    This arithmetic check alone cannot establish what a candidate actually linked.
+    """
+    if any(type(value) is not int for value in (base, end, initial_pages)):
+        raise ValueError("heap bounds and page count must be integers")
+    if not (0 < base < end <= 0xffff_ffff):
+        raise ValueError("invalid wasm32 linker heap range")
+    if not (0 < initial_pages <= 65536 and end <= initial_pages * 65536):
+        raise ValueError("linker heap exceeds initial linear memory")
+    if end % 8:
+        raise ValueError("linker heap end is not eight-byte aligned")
+
+
 def check_lock_identity(pins: dict, root: Path = ROOT) -> None:
     locks = pins.get("locks", {})
     if set(locks) != {"workers/api/Cargo.lock"}:
@@ -396,6 +452,24 @@ def verified_host_executables(sysroot: Path, expected: dict) -> tuple[Path, Path
     if not os.access(rustc, os.X_OK) or not os.access(cargo, os.X_OK):
         raise ValueError("host compiler or cargo is not executable")
     return rustc, cargo
+
+
+def verified_host_linker(sysroot: Path, expected: dict, host: str) -> Path:
+    """Check the archive-derived linker file, not its selection by a build.
+
+    This does not bind an invocation, prevent later replacement, or establish
+    linker semantics. Expected digests must come from host_component_files.
+    """
+    if not isinstance(host, str) or not host or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in host):
+        raise ValueError("invalid host triple")
+    name = f"lib/rustlib/{host}/bin/rust-lld"
+    if name not in expected:
+        raise ValueError("host components lack linker")
+    verify_host_component_files(sysroot, expected)
+    linker = sysroot / name
+    if not os.access(linker, os.X_OK):
+        raise ValueError("host linker is not executable")
+    return linker
 
 
 def verify_rust_source(pins: dict, dl=download) -> bytes:

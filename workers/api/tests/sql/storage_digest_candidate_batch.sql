@@ -11,6 +11,27 @@ INSERT INTO public.storage_plaintext_digest_claim_intents
 SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('ab',32),'hex')
 FROM public.storage_object_intents;
 SELECT public.reserve_storage_digest('20000000-0000-4000-8000-000000000001', 3600);
+
+-- Keep the first-generation success case from leaving rows for the fencing cases.
+SAVEPOINT first_generation_candidate;
+DO $$
+DECLARE
+    env UUID := '00000000-0000-4000-8000-000000000001';
+    lib UUID := '10000000-0000-4000-8000-000000000001';
+    obj UUID := '20000000-0000-4000-8000-000000000001';
+    map UUID := '50000000-0000-4000-8000-000000000001';
+    h BYTEA := decode(repeat('ab',32),'hex');
+BEGIN
+    PERFORM public.store_storage_digest_candidate(env, lib, obj, map, 1, ARRAY[h, decode(repeat('cd',32),'hex')]);
+    IF (SELECT count(*) FROM public.storage_digest_map_page_intents WHERE map_id = map) <> 2
+       OR NOT EXISTS (SELECT FROM public.storage_digest_map_page_intents WHERE map_id = map AND page_index = 0 AND entry_count = 256 AND expected_hash = h)
+       OR NOT EXISTS (SELECT FROM public.storage_digest_map_page_intents WHERE map_id = map AND page_index = 1 AND entry_count = 1 AND expected_hash = decode(repeat('cd',32),'hex')) THEN
+        RAISE EXCEPTION 'first-generation candidate batch is incomplete or reordered';
+    END IF;
+END $$;
+ROLLBACK TO SAVEPOINT first_generation_candidate;
+RELEASE SAVEPOINT first_generation_candidate;
+
 DO $$
 DECLARE
     env UUID := '00000000-0000-4000-8000-000000000001';
@@ -55,8 +76,8 @@ BEGIN
     IF public.reserve_storage_digest(obj, 3600) IS DISTINCT FROM 2 THEN
         RAISE EXCEPTION 'reservation generation did not advance';
     END IF;
-    IF public.release_storage_digest(obj, 1) THEN
-        RAISE EXCEPTION 'stale release changed the current reservation';
+    IF public.release_storage_digest(obj, 1) IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'stale release did not return false';
     END IF;
     rejected := false;
     BEGIN
@@ -69,6 +90,7 @@ BEGIN
     END IF;
     PERFORM public.store_storage_digest_candidate(env, lib, obj, map, 2, ARRAY[h, decode(repeat('cd',32),'hex')]);
     IF (SELECT count(*) FROM public.storage_digest_map_page_intents WHERE map_id = map) <> 2
+       OR NOT EXISTS (SELECT FROM public.storage_digest_map_page_intents WHERE map_id = map AND page_index = 0 AND entry_count = 256 AND expected_hash = h)
        OR NOT EXISTS (SELECT FROM public.storage_digest_map_page_intents WHERE map_id = map AND page_index = 1 AND entry_count = 1 AND expected_hash = decode(repeat('cd',32),'hex')) THEN
         RAISE EXCEPTION 'candidate batch is incomplete or reordered';
     END IF;
