@@ -41,6 +41,11 @@ BEGIN
         RAISE EXCEPTION 'legacy provider purge refused: provider owners would lose reaping protection';
     END IF;
 
+    -- Removing the foreign keys also drops triggers on their parent tables.
+    -- Take those exclusive locks only after the guards pass, without waiting
+    -- behind active account or cache readers.
+    LOCK TABLE public.users, public.cache_objects IN ACCESS EXCLUSIVE MODE NOWAIT;
+
     -- Drop the referencing table first. RESTRICT leaves unexpected
     -- dependants intact and aborts all drops in this transaction.
     DROP TABLE public.user_cache_grants RESTRICT;

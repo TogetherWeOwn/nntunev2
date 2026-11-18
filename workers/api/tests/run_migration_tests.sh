@@ -43,8 +43,32 @@ replay_migrations() {
   done
 }
 
+check_purge_reader_contention() (
+  local migration=$1 table=$2 reader_pid reader_out reader_in ready output
+  # Hold the same lock as a reader in a separate session. The SELECT on
+  # that session acknowledges lock acquisition before we attempt the drop.
+  coproc PURGE_READER { psql_run -At; }
+  reader_pid=$PURGE_READER_PID
+  reader_out=${PURGE_READER[0]}
+  reader_in=${PURGE_READER[1]}
+  printf "BEGIN; SET LOCAL idle_in_transaction_session_timeout = '30s';\nLOCK TABLE public.%s IN ACCESS SHARE MODE NOWAIT;\nSELECT 'reader-ready';\n" "$table" >&"$reader_in"
+  read -r -t 10 -u "$reader_out" ready
+  [[ "$ready" == reader-ready ]]
+  if output=$(psql_run -1 -v VERBOSITY=verbose -c "SET LOCAL lock_timeout = '2s';" -f "$migration" 2>&1); then
+    printf 'purge unexpectedly accepted a reader on %s\n' "$table" >&2
+    return 1
+  fi
+  printf 'purge with a reader on %s: %s\n' "$table" "$output"
+  printf 'ROLLBACK;\n\\q\n' >&"$reader_in"
+  wait "$reader_pid"
+  # A queued drop also reports 55P03, but its message is a lock timeout.
+  [[ "$output" == *'55P03: could not obtain lock on relation'* ]]
+)
+
 check_purge_upgrade() {
   local migration=$1 fixture expected output
+  check_purge_reader_contention "$migration" users
+  check_purge_reader_contention "$migration" cache_objects
   for fixture in grants vault owner; do
     case "$fixture" in
       grants) expected='cache grants are not empty' ;;

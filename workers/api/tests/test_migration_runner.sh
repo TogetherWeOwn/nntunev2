@@ -11,6 +11,17 @@ if [[ -n "${PSQL_EXIT:-}" ]]; then
   exit "$PSQL_EXIT"
 fi
 case " $* " in
+  *' -At '*)
+    while IFS= read -r line; do
+      case "$line" in
+        "SELECT 'reader-ready';") printf '%s\n' reader-ready ;;
+        '\q') exit 0 ;;
+      esac
+    done
+    exit 0 ;;
+  *' -1 -v VERBOSITY=verbose '*)
+    printf 'ERROR: 55P03: could not obtain lock on relation\n' >&2
+    exit 3 ;;
   *' -1 -v purge_case=grants '*) reason='cache grants are not empty' ;;
   *' -1 -v purge_case=vault '*) reason='a vault owner lacks the account marker' ;;
   *' -1 -v purge_case=owner '*) reason='provider owners would lose reaping protection' ;;
@@ -27,6 +38,9 @@ env -i PATH="$dir:$PATH" DATABASE_URL=postgresql://scratch/db PSQL_LOG="$dir/cal
 grep -q 'migration tests passed' "$dir/output"
 grep -q 'migrations/0001_' "$dir/calls"
 grep -q 'workers/api/tests/sql/' "$dir/calls"
+for table in users cache_objects; do
+  grep -Fq "purge with a reader on $table: ERROR: 55P03: could not obtain lock on relation" "$dir/output"
+done
 for reason in 'cache grants are not empty' 'a vault owner lacks the account marker' \
   'provider owners would lose reaping protection'; do
   grep -Fq "legacy provider purge refused: $reason" "$dir/output"

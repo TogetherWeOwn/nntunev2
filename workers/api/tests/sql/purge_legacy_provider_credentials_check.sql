@@ -20,4 +20,30 @@ BEGIN
                        AND content_hash = repeat('0', 64)) THEN
         RAISE EXCEPTION 'purge modified unrelated account, authentication, ingest, catalogue, or cache state';
     END IF;
+
+    -- Retained media must still enforce its CHECK and both storage-parent
+    -- FKs after the neighboring grant constraints have been removed.
+    BEGIN
+        UPDATE track_media SET bitrate = 0 WHERE source_job_id = 'job_purge_fixture';
+        RAISE EXCEPTION 'purged schema accepted non-positive media bitrate';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        DELETE FROM cache_objects WHERE content_hash = repeat('0', 64);
+        RAISE EXCEPTION 'purged schema allowed deleting a referenced cache object';
+    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
+        NULL;
+    END;
+    BEGIN
+        DELETE FROM ingest_jobs WHERE id = 'job_purge_fixture';
+        RAISE EXCEPTION 'purged schema allowed deleting a referenced ingest job';
+    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
+        NULL;
+    END;
+    IF (SELECT count(*) FROM pg_indexes
+        WHERE schemaname = 'public' AND tablename = 'track_media'
+          AND indexname IN ('idx_track_media_hash', 'idx_track_media_track', 'idx_track_media_job')) <> 3 THEN
+        RAISE EXCEPTION 'purge removed retained media access-path indexes';
+    END IF;
 END $$;
