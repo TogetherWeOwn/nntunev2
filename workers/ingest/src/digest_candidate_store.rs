@@ -197,6 +197,29 @@ mod tests {
         );
         assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
 
+        // An independently sealed manifest with the same identities must not
+        // match an intent bound to a different origin header.
+        let mut other_origin = DigestEnrollment::new(1, identities, id(26)).unwrap();
+        let other_header = other_origin.header().to_bytes();
+        assert_ne!(other_header, header);
+        other_origin.seal_chunk(&[42]).unwrap();
+        let other_manifest = other_origin.finish().ok().unwrap();
+        let other_intent = CandidateIntent {
+            header: other_header,
+            ..intent
+        };
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &other_intent,
+                &other_manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::MissingOrFenced)
+        );
+        assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
+
         let mut other_ids = identities;
         other_ids[4] = id(27);
         let mut other_builder = DigestEnrollment::new(1, other_ids, id(26)).unwrap();
@@ -219,6 +242,47 @@ mod tests {
             Err(CandidateError::MissingOrFenced)
         );
         assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
+
+        // Match the sealed header and every DB identity except provider version.
+        other_ids[2] = id(28);
+        other_ids[3] = id(29);
+        let other_strings = other_ids.map(|value| uuid(&value));
+        let mut provider_origin = DigestEnrollment::new(1, other_ids, id(30)).unwrap();
+        let provider_header = provider_origin.header().to_bytes();
+        provider_origin.seal_chunk(&[42]).unwrap();
+        let provider_manifest = provider_origin.finish().ok().unwrap();
+        let provider_intent = CandidateIntent {
+            identities: other_ids,
+            map_id: id(30),
+            header: provider_header,
+            ..intent
+        };
+        db.batch_execute(&format!(
+            "INSERT INTO public.storage_object_intents VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', 1, 65, decode('{5}', 'hex'));
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('cd',32),'hex') FROM public.storage_object_intents WHERE object_id = '{0}';",
+            other_strings[2], other_strings[3], ids[0], ids[1], ids[4], hex::encode(provider_header)
+        )).await.unwrap();
+        let provider_generation: i64 = db
+            .query_one(
+                "SELECT public.reserve_storage_digest($1::text::uuid, 3600)",
+                &[&other_strings[2]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(provider_generation, 1);
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &provider_intent,
+                &provider_manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::MissingOrFenced)
+        );
+        assert_no_candidate(&db, &other_strings[2], &uuid(&provider_intent.map_id)).await;
+
         intent.reservation_generation = 2;
         assert_eq!(
             store_with_deadline(
