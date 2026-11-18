@@ -1933,7 +1933,8 @@ where
         return invalid();
     };
     let session_id = body.session_id;
-    if !valid_client_session_id(&session_id) {
+    // The private-session writers bind the ID as PostgreSQL TEXT.
+    if !valid_client_session_id(&session_id) || session_id.contains('\0') {
         return invalid();
     }
 
@@ -16147,6 +16148,8 @@ mod tests {
             r#"{"session_id":"s","enabled":true,"enabled":false}"#,
             r#"{"session_id":"s","enabled":false,"user_id":"bob"}"#,
             r#"{"session_id":"","enabled":false}"#,
+            r#"{"session_id":"s\u0000","enabled":true}"#,
+            r#"{"session_id":"s\u0000","enabled":false}"#,
             &format!(r#"{{"session_id":"{}x","enabled":true}}"#, "é".repeat(64)),
         ] {
             req.body = body.as_bytes().to_vec();
