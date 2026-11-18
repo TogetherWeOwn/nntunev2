@@ -1,6 +1,8 @@
 //! Disposable-PostgreSQL controls for private acquisition through Store.
-use super::disposable_accounts;
-use nntune_api::handlers::{self, Request, Store, StoreError};
+use super::playback_dispatch::{playback_store, with_playback_account, TRACK};
+use super::{dispatch, disposable_accounts};
+use nntune_api::handlers::{Store, StoreError};
+use nntune_api::ledger::{derive_play_idempotency_key, period_month_for_timestamp};
 use nntune_api::playback::LeaseAcquire::Acquired;
 use nntune_api::worker_entry::{
     catalogue_store_for_postgres_test, private_aware_lease_for_postgres_test as acquire,
@@ -24,122 +26,108 @@ async fn store() -> Result<impl Store, String> {
     ))
 }
 
-async fn dispatch(
-    now: u64,
-    connections: usize,
-    method: &str,
-    path: &str,
-    cookie: Option<&str>,
-    body: Value,
-) -> Result<Value, String> {
-    use super::{NoExternalIo, SIGNING_KEY};
-    use nntune_api::{meter_sink, worker_entry::request_store_for_postgres_test};
-    let mut clients = Vec::new();
-    for _ in 0..connections {
-        clients.push(connection().await?);
-    }
-    let store = request_store_for_postgres_test(clients);
-    let origin = "https://app.example.test";
-    let cfg = handlers::Config::new(
-        "app.example.test",
-        origin,
-        SIGNING_KEY.to_vec(),
-        [0; 32],
-        1,
-        3600,
-        false,
-        false,
-        None,
-    )
-    .map_err(|_| "test configuration")?
-    .with_play_grant_secret(SIGNING_KEY.to_vec())
-    .with_meter_sink_secret(SIGNING_KEY.to_vec());
-    let ctx = handlers::Ctx {
-        cfg: &cfg,
-        store: &store,
-        mailer: &NoExternalIo,
-        dialer: &NoExternalIo,
-        dns: &NoExternalIo,
-        now,
-        source_ip: "127.0.0.1".into(),
-        stripe: &nntune_api::stripe::NoStripeTransport,
-    };
-    let body = body.to_string().into_bytes();
-    let authorization = (path == meter_sink::SINK_PATH)
-        .then(|| meter_sink::authorization_header(Some(SIGNING_KEY), now, &body))
-        .flatten();
-    let response = handlers::handle(
-        &ctx,
-        &Request {
-            method: method.into(),
-            path: path.into(),
-            cookie: cookie.map(str::to_owned),
-            origin: Some(origin.into()),
-            authorization,
-            stripe_signature: None,
-            body,
-        },
-    )
-    .await;
-    if response.status != 200 {
-        return Err(format!("{method} {path}: status {}", response.status));
-    }
-    serde_json::from_str(&response.body).map_err(|_| format!("{path}: invalid response"))
+#[tokio::test]
+async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
+    with_playback_account(async |fx| {
+        let store = playback_store();
+        let call = async |method, path, body| {
+            let request = fx.request(method, path, body);
+            let response = dispatch(&store, &fx.cfg, fx.now, &request).await;
+            assert_eq!(response.status, 200, "{method} {path}");
+            serde_json::from_str::<Value>(&response.body).unwrap()
+        };
+        let play = async |id: &Value| {
+            let issued = call("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "player", "play_id": id})).await;
+            assert!(issued["grant"].as_str().is_some_and(|grant| !grant.is_empty()));
+            issued
+        };
+        let toggle = async |enabled| call("PUT", "/v1/me/private-session", json!({"session_id": "player", "enabled": enabled})).await;
+        let key = |issued: &Value| derive_play_idempotency_key(fx.user, TRACK, issued["play_id"].as_str().unwrap()).unwrap();
+        let marked = async |key: &str| store.private_play_marked(fx.user, TRACK, key).await.unwrap();
+        let deliver = async |issued: &Value| {
+            let batch = fx.delivered_batch(issued);
+            let ack = dispatch(&store, &fx.cfg, fx.now, &batch).await;
+            assert_eq!(ack.status, 200);
+            assert_eq!(serde_json::from_str::<Value>(&ack.body).unwrap(), json!({"accepted": [issued["play_id"]], "fenced": [], "rejected": []}));
+        };
+        let same_lease = |start: &Value, resumed: Value| {
+            assert_eq!(resumed["play_id"], start["play_id"]);
+            assert_eq!(resumed["lease_epoch"], start["lease_epoch"]);
+        };
+
+        let public = play(&Value::Null).await;
+        toggle(true).await;
+        let resumed = play(&public["play_id"]).await;
+        same_lease(&public, resumed);
+        assert!(!marked(&key(&public)).await);
+        deliver(&public).await;
+
+        let private = play(&Value::Null).await;
+        let private_key = key(&private);
+        assert!(marked(&private_key).await, "mark must commit before delivery");
+        fx.observer.execute("UPDATE public.private_sessions SET expires_at=$2 WHERE user_id=$1 AND session_id='player'", &[&fx.user, &(fx.now as i64 - 1)]).await.unwrap();
+        same_lease(&private, play(&private["play_id"]).await);
+        toggle(false).await;
+        same_lease(&private, play(&private["play_id"]).await);
+        assert!(marked(&private_key).await, "expiry and disable must retain the mark");
+        deliver(&private).await;
+
+        let grant_only = play(&Value::Null).await;
+        assert!(!marked(&key(&grant_only)).await);
+        let rows = fx.observer.query("SELECT idempotency_key, bytes_served, stream_seconds FROM public.stream_play_ledger WHERE user_id=$1", &[&fx.user]).await.unwrap();
+        assert_eq!(rows.len(), 2, "grant-only play must not create a ledger row");
+        let private_row = rows.iter().find(|row| row.get::<_, &str>(0) == private_key).unwrap();
+        assert_eq!((private_row.get::<_, i64>(1), private_row.get::<_, i32>(2)), (80_000, 2));
+        assert_eq!(store.monthly_stream_seconds(fx.user, &period_month_for_timestamp(fx.now)).await.unwrap(), 4);
+        let history = store.history_list(fx.user).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(Some(history[0].play_id.as_str()), public["play_id"].as_str());
+    }).await;
 }
 
 #[tokio::test]
-async fn dispatched_private_grant_and_meter_keep_history_and_billing_distinct() {
-    use nntune_api::{meter_sink::SINK_PATH, session::SessionClaims};
-    let accounts = disposable_accounts::Accounts::new(1).await;
-    let (db, user) = (&accounts.observer, accounts.id(0));
-    let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(30), async {
-        let now: i64 = db.query_one("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint", &[]).await.map_err(|e| e.to_string())?.get(0);
-        let sid = format!("session-{user}");
-        db.execute("INSERT INTO public.sessions(id,user_id,created_at,expires_at) VALUES($1,$2,$3,$4)", &[&sid, &user, &now, &(now + 3_600)]).await.map_err(|e| e.to_string())?;
-        db.execute("INSERT INTO public.subscriptions (user_id,stripe_subscription_id,stripe_customer_id,stripe_subscription_item_id,stripe_price_id,plan_id,status,paid_through_at) VALUES($1,$1,$1,$1,'test','plus','active',now()+interval '1 hour')", &[&user]).await.map_err(|e| e.to_string())?;
-        let now = now as u64;
-        let token = super::token(&SessionClaims { session_id: sid, user_id: user.into(), created_at: now, issued_at: now, expires_at: now + 3_600, rotation_counter: 0 });
-        let cookie = format!("{}={token}", super::COOKIE_NAME);
-        let play = |id: Value| dispatch(now, if id.is_null() { 7 } else { 4 }, "POST", "/v1/plays", Some(&cookie), json!({"track_id":"track","session_id":"client","play_id":id}));
-        let toggle = |enabled| dispatch(now, 3, "PUT", "/v1/me/private-session", Some(&cookie), json!({"session_id":"client","enabled":enabled}));
-        let public = play(Value::Null).await?;
-        toggle(true).await?;
-        let public_resumed = play(public["play_id"].clone()).await?;
-        let private = play(Value::Null).await?;
-        db.execute("UPDATE public.private_sessions SET expires_at=$2 WHERE user_id=$1 AND session_id='client'", &[&user, &(now as i64 - 1)]).await.map_err(|e| e.to_string())?;
-        let expired_resumed = play(private["play_id"].clone()).await?;
-        toggle(false).await?;
-        let disabled_resumed = play(private["play_id"].clone()).await?;
-        for (start, resumed) in [(&public, public_resumed), (&private, expired_resumed), (&private, disabled_resumed)] {
-            if resumed["play_id"] != start["play_id"] || resumed["lease_epoch"] != start["lease_epoch"] { return Err("continuation changed the holder".into()); }
-        }
-        let grant_only = play(Value::Null).await?;
-        let mut windows = Vec::new();
-        for (play, private, bytes) in [(&public, false, 96_000), (&private, true, 48_000), (&grant_only, false, 0)] {
-            let id = play["play_id"].as_str().ok_or("missing play id")?;
-            if play["grant"].as_str().is_none() { return Err("missing grant".into()); }
-            let key = format!("play:{user}:track:{id}");
-            if store().await?.private_play_marked(user, "track", &key).await.map_err(|_| "mark read failed")? != private {
-                return Err("wrong committed mark before delivery".into());
-            }
-            if bytes != 0 {
-                windows.push(json!({"user_id": user,"track_id":"track","play_id":id,"union_bytes":bytes,"started_at":now}));
-            }
-        }
-        let ack = dispatch(now, 2, "POST", SINK_PATH, None, json!({"windows":windows})).await?;
-        if ack != json!({"accepted":[public["play_id"],private["play_id"]],"fenced":[],"rejected":[]}) { return Err("meter did not acknowledge both deliveries".into()); }
-        let month = nntune_api::ledger::period_month_for_timestamp(now);
-        let key = format!("play:{user}:track:{}", private["play_id"].as_str().ok_or("missing private id")?);
-        let row = db.query_one("SELECT bytes_served, stream_seconds FROM public.stream_play_ledger WHERE idempotency_key=$1", &[&key]).await.map_err(|e| e.to_string())?;
-        if row.get::<_, i64>(0) != 48_000 || row.get::<_, i32>(1) != 1 || store().await?.monthly_stream_seconds(user, &month).await.map_err(|_| "usage read failed")? != 3 {
-            return Err("private delivery was not billed".into());
-        }
-        let history = store().await?.history_list(user).await.map_err(|_| "history read failed")?;
-        if history.len() != 1 || Some(history[0].play_id.as_str()) != public["play_id"].as_str() { return Err("private or grant-only play leaked into history".into()); }
-        Ok(())
-    }).await.unwrap_or_else(|_| Err("dispatched privacy/meter test timed out".into()));
-    accounts.cleanup().await;
-    result.unwrap();
+async fn dispatched_lost_commit_ack_withholds_grant_and_keeps_the_committed_mark() {
+    use super::commit_ack_fault::{CommitAckFault, CommitOutcome};
+    use super::playback_dispatch::playback_client;
+    use nntune_api::worker_entry::playback_store_for_postgres_test;
+
+    with_playback_account(async |fx| {
+        let store = playback_store();
+        let incumbent = fx.request("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "incumbent"}));
+        let issued = dispatch(&store, &fx.cfg, fx.now, &incumbent).await;
+        assert_eq!(issued.status, 200);
+        let issued: Value = serde_json::from_str(&issued.body).unwrap();
+        let toggle = fx.request("PUT", "/v1/me/private-session", json!({"session_id": "replacement", "enabled": true}));
+        assert_eq!(dispatch(&store, &fx.cfg, fx.now, &toggle).await.status, 200);
+
+        let (client, fault) = CommitAckFault::start().await.unwrap();
+        let client = std::cell::RefCell::new(Some(client));
+        let checkouts = Cell::new(0);
+        let faulted = playback_store_for_postgres_test(move || {
+            let nth = checkouts.get() + 1;
+            checkouts.set(nth);
+            // Session, deletion, holder, subscription, caps and usage precede acquisition.
+            let client = (nth == 7).then(|| client.borrow_mut().take().unwrap());
+            async { match client { Some(client) => Ok(client), None => playback_client().await } }
+        });
+        let takeover = fx.request("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "replacement", "takeover": true}));
+        let response = dispatch(&faulted, &fx.cfg, fx.now, &takeover).await;
+        assert_eq!(fault.finish().await.unwrap(), CommitOutcome::Withheld);
+        assert_eq!(response.status, 503);
+        assert!(serde_json::from_str::<Value>(&response.body).unwrap().get("grant").is_none());
+
+        let row = fx.observer.query_one(
+            "SELECT session_id, track_id, play_id, epoch, expires_at, play_key, marked_at FROM public.playback_leases JOIN public.private_plays USING (user_id) WHERE user_id=$1",
+            &[&fx.user],
+        ).await.unwrap();
+        let play: &str = row.get(2);
+        assert_ne!(Some(play), issued["play_id"].as_str());
+        assert_eq!((row.get::<_, &str>(0), row.get::<_, &str>(1)), ("replacement", TRACK));
+        assert_eq!(row.get::<_, i64>(3), issued["lease_epoch"].as_i64().unwrap() + 1);
+        assert_eq!(row.get::<_, i64>(4), (fx.now + nntune_api::playback::LEASE_TTL_SECS) as i64);
+        assert_eq!(row.get::<_, &str>(5), derive_play_idempotency_key(fx.user, TRACK, play).unwrap());
+        assert_eq!(row.get::<_, i64>(6), fx.now as i64);
+    }).await;
 }
 
 #[tokio::test]
