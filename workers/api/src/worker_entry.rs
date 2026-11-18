@@ -5404,16 +5404,14 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // One EXISTS probe over the same established states
-                // the reaper protects (`unverified_user_filter`):
-                // credential, any session row (a completed sign-in
-                // leaves one, revoked or not), vault, or a promoted
-                // (non-member) role. A missing user row is simply
-                // never-admitted.
+                // Established states protected by `unverified_user_filter`:
+                // a credential, any session (even revoked), the legacy
+                // vault marker, or a promoted (non-member) role. A missing
+                // user is never admitted.
                 let sql = format!(
                     "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
                      OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
-                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND legacy_vault_established) \
                      OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
                     member = crate::admin::ROLE_MEMBER
                 );

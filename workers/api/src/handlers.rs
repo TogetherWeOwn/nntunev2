@@ -126,12 +126,9 @@ const MAIL_PER_IP_PER_HOUR: u64 = 30;
 const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
 const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
 /// Unverified-signup retention: a user row that still holds no credential
-/// and no other account activity (vault, session, unexpired magic link or
-/// register challenge) after this is a never-completed signup;
-/// `register_start` reaps such rows best-effort (their challenges expire
-/// within 5 minutes and are pruned with them). Magic-only accounts (session
-/// without a passkey yet) and vault owners are never reaped: their
-/// vault/session/magic rows exempt them.
+/// or establishment evidence (legacy vault marker, session, unexpired magic
+/// link or register challenge) after this is a never-completed signup.
+/// `register_start` reaps such rows and prunes expired challenges.
 const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
 /// Fixed scope key for the fleet-wide auth-start and mail budgets.
 const GLOBAL_SCOPE_KEY: &str = "global";
@@ -141,7 +138,7 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// `worker_entry`) and the statement-shape test below. The purpose literal must stay
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
-/// unexpired register challenges, vaults, sessions, unexpired magic links)
+/// unexpired register challenges, legacy vault marker, sessions, unexpired magic links)
 /// must stay in sync with the `FakeStore` mirror. Accounts with a
 /// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
 /// are owned by the deletion executor, and their `delete_operations`
@@ -164,8 +161,7 @@ fn unverified_user_filter() -> String {
                          WHERE auth_challenges.user_id = users.id \
                            AND auth_challenges.purpose = '{PURPOSE_REGISTER}' \
                            AND auth_challenges.expires_at > $3) \
-         AND NOT EXISTS (SELECT 1 FROM provider_vaults \
-                         WHERE provider_vaults.user_id = users.id) \
+         AND NOT users.legacy_vault_established \
          AND NOT EXISTS (SELECT 1 FROM sessions \
                          WHERE sessions.user_id = users.id) \
          AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
@@ -1234,15 +1230,13 @@ pub trait Store {
     }
     /// Whether the account was ever admitted past signup: it holds a
     /// passkey credential, a session row (current or revoked — a
-    /// completed sign-in leaves one), or a provider vault, or it
-    /// carries a non-member role (promotion is an admission act; the
-    /// reaper's `unverified_user_filter` protects the same states).
+    /// completed sign-in leaves one), the legacy vault marker, or a
+    /// non-member role; the reaper protects these same states.
     /// The magic-finish invite gate refuses only accounts for which
     /// this is false — a never-admitted signup in progress — so
     /// established magic-only members keep signing in after
     /// `INVITES_REQUIRED` flips. The default checks credentials only;
-    /// production and the test fake override it with the full legacy
-    /// predicate (sessions, role and remaining encrypted rows included).
+    /// production and the test fake override it with the full predicate.
     fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Ok(!self.credentials_for_user(user_id).await?.is_empty()) }
     }
@@ -4085,8 +4079,8 @@ where
     // would complete a signup with no invite consumed. Refuse
     // generically WITHOUT spending the token, so the legitimate
     // enrollment at register/finish can still use it. "Never
-    // admitted" is the full reaper-protected predicate (no
-    // credential AND no prior session AND no vault AND member role),
+    // admitted" means no credential, no prior session, no legacy
+    // vault marker, and member role,
     // NOT mere credential-lessness: magic-only accounts are an
     // established state, and gating on credentials alone would lock
     // those members out the moment invites flip on, with
@@ -8037,10 +8031,8 @@ mod tests {
         fail_subsonic_write: RefCell<bool>,
         revoke_session_before_mint: RefCell<bool>,
         fail_bulk_revoke: RefCell<bool>,
-        /// User ids that still own a legacy `provider_vaults` row. The
-        /// product no longer reads or writes vaults; the reaper and
-        /// magic admission keep protecting these accounts.
-        legacy_vault_users: RefCell<HashSet<String>>,
+        /// Users with `legacy_vault_established` set.
+        legacy_vault_established: RefCell<HashSet<String>>,
         audits: RefCell<Vec<AuditEvent>>,
         /// Mirror of `users.role` (migration 0028): an absent entry is
         /// the column default (`member`) for an existing user.
@@ -9268,8 +9260,8 @@ mod tests {
             ttl_secs: u64,
             protected_user_id: Option<&str>,
         ) -> Result<(), StoreError> {
-            // Mirror `reap_unverified_users_sql`: magic-only accounts (session
-            // without a passkey yet) and vault owners are never reaped.
+            // Mirror `reap_unverified_users_sql`: a prior session or legacy
+            // vault marker protects the account even without a passkey.
             let cutoff = now.saturating_sub(ttl_secs);
             let credentialed: HashSet<String> = self
                 .credentials
@@ -9284,7 +9276,7 @@ mod tests {
                 .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
-            let vault_owners: HashSet<String> = self.legacy_vault_users.borrow().clone();
+            let marked_users: HashSet<String> = self.legacy_vault_established.borrow().clone();
             let session_owners: HashSet<String> = self
                 .sessions
                 .borrow()
@@ -9312,7 +9304,7 @@ mod tests {
                     || admins.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
-                    || vault_owners.contains(&user.id)
+                    || marked_users.contains(&user.id)
                     || session_owners.contains(&user.id)
                     || magic_owners.contains(&user.id)
                     || protected_user_id == Some(user.id.as_str())
@@ -10112,8 +10104,8 @@ mod tests {
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
             // Mirror the production EXISTS probe: credential, any
-            // session row, vault, or a non-member role (an absent
-            // `user_roles` entry is the `member` column default).
+            // session row, legacy vault marker, or non-member role
+            // (an absent `user_roles` entry defaults to `member`).
             let admitted = self
                 .credentials
                 .borrow()
@@ -10124,7 +10116,7 @@ mod tests {
                     .borrow()
                     .values()
                     .any(|s| s.user_id == user_id)
-                || self.legacy_vault_users.borrow().contains(user_id)
+                || self.legacy_vault_established.borrow().contains(user_id)
                 || self
                     .user_roles
                     .borrow()
@@ -22077,7 +22069,7 @@ mod tests {
     fn magic_finish_invite_gate_keeps_established_magic_only_members_signed_in() {
         // Regression (review round 1): the gate must refuse only
         // never-admitted accounts. A magic-only member — no passkey,
-        // but a prior session or a vault, the states the reaper
+        // but a prior session or legacy vault marker, the states the reaper
         // protects — keeps signing in by email once invites are
         // required; gating on credential-lessness alone locked them
         // out at the flip with no way back in.
@@ -22099,17 +22091,17 @@ mod tests {
         let cookie = magic_login(&h, "magic-session@example.com");
         assert!(!cookie.is_empty());
 
-        // Established via a vault, with no credential and no session.
+        // Established via the legacy marker, with no credential or session.
         seed_user(&h, "u-magic-vault", "magic-vault@example.com");
         h.store
-            .legacy_vault_users
+            .legacy_vault_established
             .borrow_mut()
             .insert("u-magic-vault".to_string());
         let cookie = magic_login(&h, "magic-vault@example.com");
         assert!(!cookie.is_empty());
 
         // The bypass stays closed in the same posture: a fresh
-        // account with none of credential/session/vault is still
+        // account with no credential, session or marker is still
         // refused generically and its token stays unspent.
         seed_user(&h, "u-fresh", "fresh-signup@example.com");
         let start = h.call(
@@ -24732,7 +24724,7 @@ mod tests {
         for predicate in [
             "NOT EXISTS (SELECT 1 FROM webauthn_credentials",
             "NOT EXISTS (SELECT 1 FROM auth_challenges",
-            "NOT EXISTS (SELECT 1 FROM provider_vaults",
+            "AND NOT users.legacy_vault_established",
             "NOT EXISTS (SELECT 1 FROM sessions",
             "NOT EXISTS (SELECT 1 FROM magic_link_tokens",
         ] {
@@ -24764,18 +24756,14 @@ mod tests {
     }
 
     #[test]
-    fn register_start_reaper_preserves_magic_only_vault_and_inbox() {
-        // CRITICAL pin: `magic_finish` issues a session with no credential
-        // check and the register inbox email carries a redeemable magic link,
-        // while `provider_vaults.user_id ... ON DELETE CASCADE` destroys a
-        // vault saved under that session. A stale magic-only account (session
-        // + vault, no passkey) and a stale inbox-only account (unexpired
-        // magic, no session yet) must both survive a later `register_start`
-        // for another email; a truly abandoned signup must still be reaped.
+    fn register_start_reaper_preserves_session_marker_and_inbox() {
+        // A session, a legacy marker and an unexpired magic link each protect
+        // an old account independently. A truly abandoned signup is reaped.
         let h = harness();
         let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
         for (id, email) in [
             ("magic-only", "magic-only@example.com"),
+            ("marker-only", "marker-only@example.com"),
             ("inbox-only", "inbox-only@example.com"),
             ("abandoned", "abandoned2@example.com"),
         ] {
@@ -24786,22 +24774,19 @@ mod tests {
             }))
             .unwrap();
         }
-        let (_, magic_only_record) =
-            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW).expect("issue");
-        block_on(h.store.insert_magic(&magic_only_record)).unwrap();
         block_on(h.store.insert_session(&SessionRecord {
             id: "sess-magic-only".to_string(),
             user_id: "magic-only".to_string(),
             created_at: NOW,
             expires_at: NOW + 3600,
             rotation_counter: 0,
-            revoked: false,
+            revoked: true,
         }))
         .unwrap();
         h.store
-            .legacy_vault_users
+            .legacy_vault_established
             .borrow_mut()
-            .insert("magic-only".to_string());
+            .insert("marker-only".to_string());
         let (_, inbox_record) =
             auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
@@ -24815,7 +24800,13 @@ mod tests {
             block_on(h.store.user_by_email("magic-only@example.com"))
                 .unwrap()
                 .is_some(),
-            "magic-only account with session/vault must survive reaping"
+            "magic-only account with a revoked session must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("marker-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "an account with only the legacy marker must survive reaping"
         );
         assert!(
             block_on(h.store.user_by_email("inbox-only@example.com"))
@@ -24828,10 +24819,6 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "truly abandoned signup must still be reaped"
-        );
-        assert!(
-            h.store.legacy_vault_users.borrow().contains("magic-only"),
-            "surviving legacy vault marker must not cascade-delete"
         );
     }
 
@@ -26542,7 +26529,7 @@ mod tests {
         );
         assert!(h.dialer.seen.borrow().is_empty(), "no probe dial");
         assert!(
-            h.store.legacy_vault_users.borrow().is_empty(),
+            h.store.legacy_vault_established.borrow().is_empty(),
             "no vault state is created"
         );
     }
