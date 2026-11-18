@@ -488,6 +488,8 @@ class VerifyTests(Base):
             (first, recent, "outside requested creation dates"),
             (first, dict(oldest, created_at="2026-09-12T23:59:59Z"), "outside requested creation dates"),
             (first, dict(oldest, event="workflow_dispatch"), "outside requested workflow scope"),
+            (first, dict(oldest, head_branch="other"), "outside requested workflow scope"),
+            (first, dict(oldest, workflow_id=WORKFLOW_ID + 1), "outside requested workflow scope"),
         ):
             with self.subTest(reason=reason, wrong=wrong):
                 invalid = FakeActions({**routes, route: page("workflow_runs", [wrong])})
