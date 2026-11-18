@@ -1550,6 +1550,10 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - name: Dry-run the first-release maintenance Worker (no deployment)
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: pnpm exec wrangler deploy --config ../../ci/production-maintenance/wrangler.toml --dry-run --outdir "$RUNNER_TEMP/production-maintenance"
       - name: Exclude history instrumentation from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
@@ -1923,11 +1927,6 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
-      - name: Dry-run the first-release maintenance Worker (no deployment)
-        working-directory: apps/web
-        env:
-          WRANGLER_SEND_METRICS: 'false'
-        run: pnpm exec wrangler deploy --config ../../ci/production-maintenance/wrangler.toml --dry-run --outdir "$RUNNER_TEMP/production-maintenance"
       - name: Exercise Worker routing with disposable PostgreSQL
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
