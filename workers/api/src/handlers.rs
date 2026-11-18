@@ -1900,6 +1900,67 @@ where
     }
 }
 
+// Adapted from PR #982. Do not register without privacy-aware new-play acquisition.
+#[allow(dead_code)]
+async fn me_private_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    const TTL_SECS: u64 = 21_600;
+    // Fits the signed epoch column and its tighter CHECK in migration 0041.
+    const MAX_EXPIRY: u64 = 253_402_300_799;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        session_id: String,
+        enabled: bool,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let invalid = || validation_failed("invalid private session request");
+    // Serde structs also accept positional arrays without this object check.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid();
+    }
+    let Some(body) = parse_body::<Body>(req) else {
+        return invalid();
+    };
+    let session_id = body.session_id;
+    if !valid_client_session_id(&session_id) {
+        return invalid();
+    }
+
+    let owner = &claims.user_id;
+    let result = if body.enabled {
+        let Some(expiry) = ctx.now.checked_add(TTL_SECS).filter(|&t| t <= MAX_EXPIRY) else {
+            return unavailable();
+        };
+        ctx.store
+            .upsert_private_session(owner, &session_id, expiry)
+            .await
+            .map(|()| Some(expiry))
+    } else {
+        ctx.store
+            .delete_private_session(owner, &session_id)
+            .await
+            .map(|()| None)
+    };
+    match result {
+        Ok(private_until) => json_response(
+            200,
+            serde_json::json!({"session_id": session_id, "private_until": private_until}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 // Adapted from the preference collection handler in PR #982. This is not
 // registered with dispatch; activation requires a separate change.
 #[allow(dead_code)]
@@ -7792,6 +7853,7 @@ mod tests {
         delete_before_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
         private_sessions: RefCell<HashMap<(String, String), u64>>,
+        private_session_write_attempts: std::cell::Cell<usize>,
         fail_private_session_write: RefCell<bool>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
@@ -8406,6 +8468,8 @@ mod tests {
             session_id: &str,
             expires_at: u64,
         ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
             if *self.fail_private_session_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -9449,6 +9513,8 @@ mod tests {
             user_id: &str,
             session_id: &str,
         ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
             if *self.fail_private_session_write.borrow()
                 || !self.users.borrow().contains_key(user_id)
                 || self.deleting_users.borrow().contains(user_id)
@@ -15968,6 +16034,174 @@ mod tests {
         let deleting = (409, account_deleting_response().body);
         assert_eq!(call(&req, track_body), deleting);
         assert_eq!(*h.store.taste_rows.borrow(), before);
+    }
+
+    fn private_session_request(
+        ctx: &Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns>,
+        owner: &str,
+    ) -> Request {
+        let login = block_on(ctx.start_session(owner)).unwrap();
+        Request {
+            method: "PUT".into(),
+            path: "/v1/me/private-session".into(),
+            cookie: Some(cookie_of(&login)),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"session_id":"s","enabled":true}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unwired_private_session_toggles_only_the_current_owner() {
+        use serde_json::json;
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let mut ctx = h.ctx();
+        let alice = private_session_request(&ctx, "alice");
+        let bob = private_session_request(&ctx, "bob");
+        let session_id = "é".repeat(64); // The play contract caps bytes, not characters.
+        let play = crate::ledger::prepare_play_window(
+            "alice",
+            "track",
+            "private",
+            100,
+            Some(100),
+            Some(30_000),
+            NOW,
+        )
+        .unwrap();
+        let key = &play.idempotency_key;
+        block_on(h.store.record_play_window(&play)).unwrap();
+        let history = || block_on(h.store.history_list("alice")).unwrap();
+        assert_eq!(history()[0].play_id, "private");
+        block_on(h.store.mark_private_play("alice", "track", key, NOW)).unwrap();
+        let windows = h.store.play_windows.borrow().clone();
+        let billed = h.store.stream_seconds.borrow().clone();
+        assert_eq!(billed[&("alice".into(), play.period_month.clone())], 30);
+
+        let initial = Some(NOW + 21_600);
+        let refreshed = Some(NOW + 21_610);
+        let bob_until = Some(NOW + 21_620);
+        for (request, enabled, offset, alice_row, bob_row, until) in [
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 10, refreshed, None, refreshed),
+            (&bob, true, 20, refreshed, bob_until, bob_until),
+            (&alice, false, 30, None, bob_until, None),
+            (&alice, false, 40, None, bob_until, None),
+            (&bob, false, 50, None, None, None),
+        ] {
+            let mut req = request.clone();
+            req.body = json!({"session_id": session_id, "enabled": enabled})
+                .to_string()
+                .into_bytes();
+            ctx.now = NOW + offset;
+            let res = block_on(me_private_session(&ctx, &req));
+            let expected = json!({"session_id": session_id, "private_until": until});
+            assert_eq!((res.status, res.body), (200, expected.to_string()));
+            let expected: HashMap<_, _> = [("alice", alice_row), ("bob", bob_row)]
+                .into_iter()
+                .filter_map(|(owner, expiry)| {
+                    expiry.map(|t| ((owner.to_string(), session_id.clone()), t))
+                })
+                .collect();
+            assert_eq!(*h.store.private_sessions.borrow(), expected);
+            assert!(block_on(h.store.private_play_marked("alice", "track", key)).unwrap());
+            assert!(history().is_empty());
+            assert_eq!(*h.store.play_windows.borrow(), windows);
+            assert_eq!(*h.store.stream_seconds.borrow(), billed);
+        }
+    }
+
+    #[test]
+    fn unwired_private_session_rejects_without_mutating_rows() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let ctx = h.ctx();
+        let mut req = private_session_request(&ctx, "alice");
+        assert_eq!(block_on(me_private_session(&ctx, &req)).status, 200);
+        let saved = h.store.private_sessions.borrow().clone();
+        assert_eq!(saved[&("alice".into(), "s".into())], NOW + 21_600);
+        let check = |req: &Request, status, attempts| {
+            let res = block_on(me_private_session(&ctx, req));
+            assert_eq!(res.status, status, "request body: {:?}", req.body);
+            if status == 503 {
+                assert_eq!(res.body, unavailable().body);
+            } else if status == 409 {
+                assert_eq!(res.body, account_deleting_response().body);
+            }
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+            assert_eq!(h.store.private_session_write_attempts.get(), attempts);
+        };
+        for body in [
+            r#"["s",false]"#,
+            "null",
+            "{",
+            r#"{"session_id":"s"}"#,
+            r#"{"enabled":false}"#,
+            r#"{"session_id":1,"enabled":true}"#,
+            r#"{"session_id":"s","enabled":"false"}"#,
+            r#"{"session_id":"s","enabled":null}"#,
+            r#"{"session_id":"s","enabled":true,"enabled":false}"#,
+            r#"{"session_id":"s","enabled":false,"user_id":"bob"}"#,
+            r#"{"session_id":"","enabled":false}"#,
+            &format!(r#"{{"session_id":"{}x","enabled":true}}"#, "é".repeat(64)),
+        ] {
+            req.body = body.as_bytes().to_vec();
+            check(&req, 422, 1);
+        }
+        req.body = br#"{"session_id":"s","enabled":false}"#.to_vec();
+        let cookie = req.cookie.take();
+        check(&req, 401, 1);
+        req.authorization = Some("Bearer ntk_test".into());
+        check(&req, 404, 1);
+        req.cookie = cookie;
+        check(&req, 404, 1);
+        req.authorization = None;
+        req.origin = Some("https://wrong.example".into());
+        check(&req, 401, 1);
+        req.origin = None;
+        check(&req, 401, 1);
+        req.origin = Some(ORIGIN.into());
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        check(&req, 409, 1);
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        check(&req, 503, 1);
+        *h.store.fail_deleting_probe.borrow_mut() = false;
+        *h.store.fail_private_session_write.borrow_mut() = true;
+        check(&req, 503, 2);
+        req.body = br#"{"session_id":"new","enabled":true}"#.to_vec();
+        check(&req, 503, 3);
+    }
+
+    #[test]
+    fn unwired_private_session_checks_expiry_before_writing() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let max = 253_402_300_799;
+        let mut ctx = h.ctx();
+        ctx.now = max - 21_600;
+        let req = private_session_request(&ctx, "alice");
+        let res = block_on(me_private_session(&ctx, &req));
+        let expected = serde_json::json!({"session_id": "s", "private_until": max});
+        assert_eq!((res.status, res.body), (200, expected.to_string()));
+        let saved = HashMap::from([(("alice".into(), "s".into()), max)]);
+        assert_eq!(*h.store.private_sessions.borrow(), saved);
+        for now in [max - 21_599, i64::MAX as u64, u64::MAX - 1] {
+            ctx.now = now;
+            let req = private_session_request(&ctx, "alice");
+            let res = block_on(me_private_session(&ctx, &req));
+            assert_eq!(
+                (res.status, res.body),
+                (503, unavailable().body),
+                "now={now}"
+            );
+            assert_eq!(h.store.private_session_write_attempts.get(), 1);
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+        }
     }
 
     #[test]
