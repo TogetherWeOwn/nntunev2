@@ -157,6 +157,17 @@ def main():
                     print("PASS: billing deadline after writes rolled back", flush=True)
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    url = f"http://127.0.0.1:{port}/billing-cancel-proof"
+                    status, _, body = routing.http("POST", url)
+                    routing.check(status == 200 and body == "billing-cancel-ok", body)
+                    print(
+                        "PASS: in-flight billing prototype cancellation rolled back",
+                        flush=True,
+                    )
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
             finally:
                 routing.process_group.shutdown_process_group(proc)
     return 0

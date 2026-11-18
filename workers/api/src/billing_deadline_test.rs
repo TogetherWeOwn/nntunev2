@@ -24,6 +24,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                 ] {
                     client.batch_execute(migration).await.map_err(|_| StoreError)?;
                 }
+                client.batch_execute("CREATE FUNCTION public.worker_billing_cancel_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.stripe_invoice_id = 'in_worker_cancel' THEN PERFORM pg_advisory_xact_lock(781349052); END IF; RETURN NEW; END $$; CREATE TRIGGER worker_billing_cancel_barrier BEFORE INSERT ON public.paid_invoice_history FOR EACH ROW EXECUTE FUNCTION public.worker_billing_cancel_barrier()").await.map_err(|_| StoreError)?;
                 client.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('worker_fault_user','worker-fault@example.test',1786032000); COMMIT").await.map_err(|_| StoreError)?;
             } else {
                 let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
@@ -141,4 +142,71 @@ pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     deadline_after_writes(&test_outcome())
         .await
         .map_err(|_| "billing deadline after writes control failed")
+}
+
+async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), StoreError> {
+    use futures_util::future::{select, Either};
+    use std::time::Duration;
+
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| Box::pin(async move {
+            client.batch_execute("SELECT pg_advisory_lock(781349052)").await.map_err(|_| StoreError)?;
+            let store = PgStore {
+                env: None,
+                trace_id: "worker-cancel-test".into(),
+                mirror_binding: MirrorBinding::Unconfigured,
+                work_deadline_observer: None,
+            };
+            let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", &outcome));
+            let mut waiting_pid = None;
+            for _ in 0..40 {
+                let observation = Box::pin(async {
+                    let rows = client.query(
+                        "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name = 'owned_billing_reconcile_test' AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND pg_backend_pid() = ANY(pg_blocking_pids(pid))", &[]
+                    ).await.map_err(|_| StoreError)?;
+                    if rows.len() > 1 { return Err(StoreError); }
+                    let pid = rows.first().map(|row| row.get::<_, i32>(0));
+                    if pid.is_none() { worker::Delay::from(Duration::from_millis(50)).await; }
+                    Ok(pid)
+                });
+                match select(operation.as_mut(), observation).await {
+                    Either::Left(_) => return Err(StoreError),
+                    Either::Right((result, _)) => {
+                        if let Some(pid) = result? { waiting_pid = Some(pid); break; }
+                    }
+                }
+            }
+            let pid = waiting_pid.ok_or(StoreError)?;
+            // Drop the actual reconciliation future only after observing its blocked backend.
+            drop(operation);
+            let mut disappeared = false;
+            for _ in 0..40 {
+                let present: bool = client.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid = $1)", &[&pid]
+                ).await.map_err(|_| StoreError)?.get(0);
+                if !present { disappeared = true; break; }
+                worker::Delay::from(Duration::from_millis(50)).await;
+            }
+            if !disappeared { return Err(StoreError); }
+            let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
+            if row.get::<_, i64>(0) != 0 || row.get::<_, i64>(1) != 0 { return Err(StoreError); }
+            client.batch_execute("SELECT pg_advisory_unlock(781349052)").await.map_err(|_| StoreError)?;
+            Ok(())
+        }),
+        |_| {},
+    ).await
+}
+
+pub(crate) async fn test_reconcile_cancel() -> Result<(), &'static str> {
+    fixture(true)
+        .await
+        .map_err(|_| "billing fixture setup failed")?;
+    let mut outcome = test_outcome();
+    outcome.history[1].stripe_invoice_id = "in_worker_cancel".into();
+    outcome.row.paid_invoice_id = Some("in_worker_cancel".into());
+    cancel_in_flight(outcome)
+        .await
+        .map_err(|_| "billing cancellation control failed")
 }
