@@ -1,4 +1,6 @@
 """Executed tests for the staging-apply driver (finding 5 coverage)."""
+import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -63,6 +65,181 @@ class StagingApplyTests(unittest.TestCase):
         (trusted / ".github/scripts/apply_migration.py").write_text(
             "import sys\nsys.exit(0)\n")
         return data, trusted, root
+
+    def test_ledger_audit_reads_one_snapshot_and_redacts_failures(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, trusted, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        (trusted / "migrations").mkdir()
+        (trusted / "migrations/manifest.toml").write_text(manifest_text().replace(APP_SHA, sha))
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), "AUDIT_RECEIPT": str(root / "audit"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
+        row = ["0054_first.sql", sha, "2026-11-17 04:00:00+00", "release:operator```<tag>\x7fé"]
+        from unittest.mock import patch
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "plain_table": True, "rows": [row]}))
+        with patch.object(staging_apply.subprocess, "run", return_value=response) as runner:
+            staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        self.assertEqual(runner.call_count, 1)
+        self.assertIn("REPEATABLE READ READ ONLY", runner.call_args.kwargs["input"])
+        self.assertIn("SET LOCAL row_security = off", runner.call_args.kwargs["input"])
+        self.assertIn("SET LOCAL DateStyle = 'ISO, YMD'", runner.call_args.kwargs["input"])
+        for plain_table in (False, None, 1):
+            response.stdout = json.dumps({"database": DB, "plain_table": plain_table, "rows": [row]})
+            with patch.object(staging_apply.subprocess, "run", return_value=response):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        self.assertIn("-c search_path=pg_catalog", runner.call_args.kwargs["env"]["PGOPTIONS"])
+        self.assertNotIn("public", runner.call_args.kwargs["env"]["PGOPTIONS"])
+        receipt_text = (root / "audit").read_text()
+        self.assertNotIn("secretpw", receipt_text)
+        self.assertEqual(json.loads(receipt_text)["rows"][0]["applied_by"], "[redacted]")
+        self.assertNotIn(row[3], receipt_text)
+        summary = (root / "summary").read_text()
+        self.assertEqual(summary.count("```"), 2)
+        self.assertEqual(json.loads(summary.split("```json\n")[1].split("```\n")[0])["rows"][0]["applied_by"], "[redacted]")
+        response.stdout = json.dumps({"database": "production", "rows": [row]})
+        with patch.object(staging_apply.subprocess, "run", return_value=response):
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+        (trusted / "migrations/manifest.toml").write_text(renamed_manifest_text())
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
+            runner.assert_not_called()
+
+    def test_ledger_audit_never_publishes_actor_text(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        manifest = manifest_text().replace(APP_SHA, sha)
+        data, trusted, root = self._roots(manifest)
+        for name in ("0054_first.sql", "0055_second.sql"):
+            (data / "migrations" / name).write_bytes(contents)
+        (trusted / "migrations").mkdir()
+        (trusted / "migrations/manifest.toml").write_text(manifest)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), "AUDIT_RECEIPT": str(root / "audit"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
+        actors = ("sample-actor-one", "opaqueActor123456789")
+        rows = [[name, sha, "2026-11-17 04:00:00+00", actor]
+                for name, actor in zip(("0054_first.sql", "0055_second.sql"), actors)]
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "plain_table": True, "rows": rows}))
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", return_value=response):
+            staging_apply.run_ledger_audit(trusted, data, rows[-1][0], sha, DB, env)
+        for path in (root / "audit", root / "summary"):
+            text = path.read_text()
+            for actor in actors:
+                self.assertNotIn(actor, text)
+            self.assertEqual(text.count('"applied_by": "[redacted]"'), 2)
+            for row in rows:
+                self.assertIn(row[0], text)
+                self.assertIn(row[1], text)
+
+    def test_ledger_audit_requires_complete_unique_app_prefix(self):
+        data, _, _ = self._roots(manifest_text())
+        entries = staging_apply.load_entries(data)
+        first = ["0054_first.sql", APP_SHA, "2026-11-17 04:00:00+00", "migrator"]
+        second = ["0055_second.sql", APP_SHA, "2026-11-17 04:01:00+00", "migrator"]
+        validate = staging_apply.validate_ledger_audit
+        self.assertEqual(len(validate(entries, [first, second], "0055_second.sql")), 2)
+        actor = [*first[:3], "release:operator"]
+        self.assertEqual(validate(entries, [actor, second], "0055_second.sql")[0]["applied_by"], "[redacted]")
+        historical = [*first[:3], "backfill-2026-11-03 (operator-verified)"]
+        self.assertEqual(validate(entries, [historical, second], "0055_second.sql")[0]["applied_by"], "[redacted]")
+        for rows in ([second], [first, first, second],
+                     [first, [second[0], "f" * 64, *second[2:]]],
+                     [first, second, ["0056_other.sql", APP_SHA, *first[2:]]],
+                     [first, [*second[:3], "bad\nactor"]]):
+            with self.subTest(rows=rows), self.assertRaises(staging_apply.StagingApplyError):
+                validate(entries, rows, "0055_second.sql")
+        with self.assertRaises(staging_apply.StagingApplyError):
+            validate(entries, [first], "0001_mb_mirror.sql")
+
+    def test_ledger_audit_accepts_exact_historical_alias_once(self):
+        data, _, _ = self._roots(renamed_manifest_text())
+        entries = staging_apply.load_entries(data)
+        old = ["0054_original.sql", APP_SHA, "2026-11-17 04:00:00+00", "migrator"]
+        new = ["0054_renamed.sql", APP_SHA, *old[2:]]
+        self.assertEqual(staging_apply.validate_ledger_audit(entries, [old], "0054_renamed.sql")[0]["file"], old[0])
+        with self.assertRaises(staging_apply.StagingApplyError):
+            staging_apply.validate_ledger_audit(entries, [old, new], "0054_renamed.sql")
+
+    def test_readback_observes_exact_row_without_apply(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, _, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"),
+               "READBACK_RECEIPT": str(root / "receipt"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "observe"}
+        valid = f"0054_first.sql\t{sha}\t2026-11-16 01:02:03+00\tactor"
+        calls = []
+
+        def fake_psql(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout=valid.encode())
+
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", side_effect=fake_psql), \
+             patch.object(staging_apply, "apply_files", side_effect=AssertionError("apply reached")):
+            staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        receipt = json.loads((root / "receipt").read_text())
+        self.assertEqual(receipt["applied_by"], "actor")
+        self.assertEqual(receipt["kind"], "staging-ledger-readback")
+        self.assertIn("not original apply", (root / "summary").read_text())
+        self.assertEqual(len(calls), 1)
+        argv, kw = calls[0]
+        self.assertEqual(argv[0], "psql")
+        self.assertNotIn("secretpw", str(argv))
+        self.assertEqual(kw["env"]["PGSSLMODE"], "verify-full")
+        self.assertIn("default_transaction_read_only=on", kw["env"]["PGOPTIONS"])
+        self.assertTrue(kw["input"].startswith(b"SELECT file, sha256, applied_at, applied_by"))
+        self.assertNotIn("secretpw", (root / "receipt").read_text())
+        with patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=URL_REQUIRE)):
+            with self.assertRaises(staging_apply.StagingApplyError) as error:
+                staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+            self.assertNotIn("secretpw", str(error.exception))
+        with self.assertRaises(staging_apply.StagingApplyError):
+            staging_apply.evidence_child_env(URL_REQUIRE + "&sslrootcert=/tmp/untrusted", DB)
+        for bad in ("", valid + "\n" + valid, valid.replace(sha, "f" * 64)):
+            with self.subTest(row=bad), patch.object(staging_apply.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=bad.encode())):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        with patch.object(staging_apply.subprocess, "run") as runner:
+            for file, digest, db in (("../oops", sha, DB), ("0054_first.sql", "f" * 64, DB),
+                                     ("0054_first.sql", sha, "production")):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_readback(str(data), file, digest, db, env)
+            runner.assert_not_called()
+
+    def test_readback_rejects_actor_carriage_return_at_subprocess_boundary(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        data, _, root = self._roots(manifest_text().replace(APP_SHA, sha))
+        (data / "migrations/0054_first.sql").write_bytes(contents)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"),
+               "READBACK_RECEIPT": str(root / "receipt"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "observe"}
+        output = f"0054_first.sql\t{sha}\t2026-11-16\tactor\r\n".encode()
+        real_run = subprocess.run
+
+        def fake_psql(argv, **kwargs):
+            return real_run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(%r)" % output],
+                            **kwargs)
+
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", side_effect=fake_psql):
+            with self.assertRaises(staging_apply.StagingApplyError):
+                staging_apply.run_readback(str(data), "0054_first.sql", sha, DB, env)
+        self.assertFalse((root / "receipt").exists())
 
     # Finding 2: single mode refuses a mirror file before connecting.
     def test_single_mode_refuses_mirror_before_connecting(self):
@@ -146,7 +323,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp"}
         calls = []
 
@@ -213,7 +390,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp",
                "FAKE_SECRET": "spike-value", "GITHUB_TOKEN": "spike"}
         staging_apply.apply_files(str(trusted), str(data),
@@ -233,7 +410,7 @@ class StagingApplyTests(unittest.TestCase):
         output = root / "outputs.txt"
         output.write_text("")
         env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
-               "GITHUB_OUTPUT": str(output),
+               "GITHUB_OUTPUT": str(output), "APPLY_PROGRESS": str(root / "progress"),
                "PATH": os.environ["PATH"], "HOME": "/tmp"}
         seen = []
 

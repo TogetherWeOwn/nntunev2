@@ -777,6 +777,11 @@ pub fn member_track_target_statement() -> &'static str {
     "SELECT 1 FROM library WHERE (user_id = $1 OR user_id IS NULL) AND (job_id = $2 OR ($2 ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' AND EXISTS (SELECT 1 FROM unnest(recording_mbids) AS m WHERE lower(m) = lower($2)))) LIMIT 1"
 }
 
+/// Resolve exact job IDs before recording MBIDs, in one membership snapshot.
+pub fn resolve_member_track_statement() -> &'static str {
+    "SELECT CASE WHEN EXISTS (SELECT 1 FROM library WHERE (user_id = $1 OR user_id IS NULL) AND job_id = $2) THEN $2 WHEN $2 ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' AND EXISTS (SELECT 1 FROM library l, unnest(l.recording_mbids) AS m WHERE (l.user_id = $1 OR l.user_id IS NULL) AND lower(m) = lower($2)) THEN lower($2) ELSE NULL END AS target_id"
+}
+
 /// Select the catalogue membership authority. Track callers bind the original
 /// target; release callers must validate with [`is_catalogue_mbid`] and bind
 /// the canonical target, just as the catalogue detail path does.

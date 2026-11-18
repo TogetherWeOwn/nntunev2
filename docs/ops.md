@@ -417,6 +417,28 @@ comparison, not PR text, is the source of truth for what staging has:
 merging a migration that staging lacks turns `staging-api` red until it
 is applied and recorded.
 
+For a separately authorized observation, `migrations-staging-readback` accepts
+an exact data commit, app migration basename and expected SHA256, dispatched
+from protected `main` under the same staging environment policy. It checks the
+manifest and bytes, then reads one matching ledger row without applying or
+bootstrapping anything. Its summary and `staging-ledger-readback-<run>-<attempt>`
+Actions artifact contain the four observed fields and observation provenance.
+List artifacts for the run with GitHub's Actions artifacts API, select the exact
+run-and-attempt name, and download its ZIP via the artifact API; verify its run,
+producer, digest and expiry before reading the single receipt member. A fresh
+observation is not the original apply receipt and does not by itself satisfy the
+successful-apply merge evidence requirement above. The route does not authorize
+its own dispatch or any staging access.
+
+The optional `audit` mode instead compares the complete app ledger snapshot
+against the pinned manifest through the selected cutoff, rejecting missing,
+conflicting or later entries. Its sanitized `staging-ledger-audit-<run>-<attempt>`
+artifact is an observation, not an allocation reservation, an apply receipt or
+proof of an exclusive writer window. The default `readback` mode remains a
+single-row observation. Neither mode establishes admission expiry, writer drain,
+unknown-outcome reconciliation or crash-safe zero-idle restoration; these
+remain prerequisites for an authorized staging window, not claims of this route.
+
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
 90-second statement/idle-in-transaction and 10-second lock timeouts.

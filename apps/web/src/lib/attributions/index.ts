@@ -18,7 +18,7 @@ function runtimePackage(
 /** Direct web build/test tools: classified, but not claimed as shipped runtime packages. */
 export const WEB_TOOL_PACKAGES = [
 	'@axe-core/playwright', '@playwright/test', '@sveltejs/vite-plugin-svelte',
-	'svelte-check', 'terser', 'typescript', 'vite', 'vitest'
+	'svelte-check', 'terser', 'typescript', 'vite', 'vitest', 'wrangler'
 ] as const;
 
 /** First-party, JSON-serializable inventory; see docs/attributions.md for scope and upkeep. */

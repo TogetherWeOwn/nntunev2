@@ -32,7 +32,7 @@ spec.loader.exec_module(fixture)
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
 MANIFEST = ROOT / "migrations/manifest.toml"
-WRANGLER_VERSION = "4.153.0"
+WRANGLER_VERSION = "4.162.0"
 RP_ID = "example.test"
 ORIGIN = f"https://{RP_ID}"
 IDENT = re.compile(r"[A-Za-z0-9_]+")
@@ -134,7 +134,7 @@ def check_ping(status, ctype, body):
           "unauthenticated /rest/ping must fail")
 
 
-def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
+def psql(s, db, sql=None, stdin=None, tuples=False, *, timeout=300, **variables):
     args = [shutil.which("psql") or "psql", "-h", s["host"], "-p", s["port"], "-U", s["user"],
             "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db]
     args += ["-A", "-t"] if tuples else []
@@ -143,7 +143,7 @@ def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
     args += ["-c", sql] if sql is not None else []
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": s["password"],
            "PGOPTIONS": "-c search_path=public,pg_catalog", "PGCONNECT_TIMEOUT": "10"}
-    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=300)
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=timeout)
     check(p.returncode == 0, f"psql failed: {p.stderr.strip()[:300]}")
     return p.stdout.strip()
 
@@ -174,6 +174,11 @@ def find_wrangler(explicit):
     return found[0].resolve()
 
 
+def check_source_phase_bundle(index):
+    check(re.search(r"\bimport\s+source\s+\w+\s+from\s*['\"]\./index_bg\.wasm['\"]", index),
+          "generated Worker bundle is missing its source-phase Wasm import")
+
+
 def prerequisites(args):
     check(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
           "run only on a GitHub-hosted Actions runner with its disposable PostgreSQL service")
@@ -184,6 +189,7 @@ def prerequisites(args):
     wrangler = find_wrangler(args.wrangler or os.environ.get("NNTUNE_WRANGLER"))
     check(BUNDLE.is_file() and (BUNDLE.parent.parent / "index_bg.wasm").is_file(),
           "missing prebuilt Worker bundle (worker-build --release -- --locked in workers/api)")
+    check_source_phase_bundle((BUNDLE.parent.parent / "index.js").read_text())
     sha = os.environ.get("GITHUB_SHA", "")
     return s, wrangler, sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "0123456789abcdef0123456789abcdef01234567"
 

@@ -1,8 +1,15 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { createQueueRevision } from '#lib/player/queueRevision.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+	import { createQueueShare } from '#lib/player/queueShare.js';
+	import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
+	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
+	import { restartIsAvailable } from './restartAvailability.js';
+	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
+	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -64,8 +71,6 @@
 		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
-		formatQueueM3U,
-		formatQueueText,
 		keepCurrentAndUpcoming,
 		insertTracks,
 		insertTracksNext,
@@ -235,8 +240,7 @@
 	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
-	// Bumped by every queue edit; fences late play-from-top outcomes.
-	let playEpoch = 0;
+	const queueRevision = createQueueRevision();
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -306,7 +310,7 @@
 		};
 		// Replays must also retire a deferred inbound-share seek on this source.
 		clearShareFeedback();
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		replaceQueue(result.queue);
 		const targetQueue = queue;
 		await tick();
@@ -344,7 +348,16 @@
 	// selection change swaps the queue object and hides it (no effect needed).
 	let queueShareOutcome: { status: string; fallbackUrl: string | null; forQueue: QueueState | null } =
 		$state({ status: '', fallbackUrl: null, forQueue: null });
-	let queueShareGeneration = 0;
+	const queueShare = createQueueShare({
+		getQueue: () => queue,
+		getPosition: () => audioEl?.currentTime,
+		getOrigin: () => window.location.origin,
+		getClipboard: clipboardWriter,
+		shortTitle,
+		onOutcome: (status, fallbackUrl, forQueue) => {
+			queueShareOutcome = { status, fallbackUrl, forQueue };
+		}
+	});
 	const queueShareStatus = $derived(
 		queueShareOutcome.forQueue === queue ? queueShareOutcome.status : ''
 	);
@@ -354,12 +367,15 @@
 	// A link is consumed once per navigation, never replayed by Refresh or
 	// across an account boundary. Deferred seeks belong to one loaded source.
 	let handledShareSearch: string | null = null;
-	let pendingShareSeek: {
-		trackId: string;
-		streamUrl: string;
-		seconds: number;
-		appliedSeconds: number | null;
-	} | null = null;
+	const pendingShareSeek = createPendingShareSeek(
+		(element, target) => ({ isCurrent: () => {
+			const current = queueCurrentTrack(queue);
+			return shareAlive && element === audioEl && current?.id === target.trackId &&
+				resolveStreamUrl(current) === target.streamUrl && shareAlive && element === audioEl &&
+				queueCurrentTrack(queue) === current;
+		} }),
+		(target) => restartSupersededSources.has(`${target.trackId}\n${target.streamUrl}`)
+	);
 	/**
 	 * Favorites export feedback. Exporting is read-only: the handlers only
 	 * snapshot `favoriteTracks` and write feedback here. The feedback is
@@ -371,9 +387,25 @@
 	let favoritesExportStatus = $state('');
 	let favoritesExportFallback: string | null = $state(null);
 	let favoritesExportFeedbackKey: string | null = $state(null);
-	let favoritesExportGeneration = 0;
-	let favoritesExportAlive = true;
-	let favoritesDownloadUrl: string | null = null;
+	const favoritesExport = createFavoritesExport({
+		isEmpty: () => favoriteTracks.length === 0,
+		snapshot: favoritesExportSnapshot,
+		currentKey: currentFavoritesExportKey,
+		clearFeedback: () => {
+			favoritesExportStatus = '';
+			favoritesExportFallback = null;
+			favoritesExportFeedbackKey = null;
+		},
+		setFeedback: (key, status, fallback) => {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = status;
+			if (fallback !== undefined) favoritesExportFallback = fallback;
+		}
+	});
+	const clearFavoritesExportFeedback = favoritesExport.clear;
+	const releaseFavoritesDownload = favoritesExport.release;
+	const copyFavoritesText = favoritesExport.copy;
+	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
 	// Restart availability is live native state of the mounted matching
 	// element, re-evaluated on media events — never cached coordinates.
@@ -438,7 +470,7 @@
 			if (state.loading || state.items.length === 0) {
 				clearShareFeedback();
 				clearFavoritesExportFeedback();
-				pendingShareSeek = null;
+				pendingShareSeek.clear();
 			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
@@ -614,7 +646,7 @@
 	function selectTrack(id: string, item = items.find((track) => track.id === id)): void {
 		if (!item) return;
 		clearShareFeedback();
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
 		replaceQueue(addTrack(queue, playableTrackFor(item)));
@@ -666,12 +698,12 @@
 
 	/** One explicit playback attempt; queue edits and newer plays fence its result. */
 	async function playSelectedTrack(target: Track, source: string, suffix = ''): Promise<void> {
-		const epoch = ++playEpoch;
+		const receipt = queueRevision.revoke();
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (source) {
 			await tick();
-			if (epoch !== playEpoch) return;
+			if (!queueRevision.isCurrent(receipt)) return;
 			const element = audioEl;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			if (element) {
@@ -682,7 +714,7 @@
 					// Selected-but-paused is the truthful fallback; no retry.
 				}
 			}
-			if (epoch !== playEpoch) return;
+			if (!queueRevision.isCurrent(receipt)) return;
 		}
 		queueAnnouncement = suffix ? `${lead} ${suffix}` : lead;
 		queueAnnouncementVersion += 1;
@@ -709,121 +741,7 @@
 			.join('\u0001');
 	}
 
-	function clearFavoritesExportFeedback(): void {
-		favoritesExportGeneration += 1;
-		favoritesExportStatus = '';
-		favoritesExportFallback = null;
-		favoritesExportFeedbackKey = null;
-	}
-
-	function releaseFavoritesDownload(): void {
-		if (favoritesDownloadUrl !== null) URL.revokeObjectURL(favoritesDownloadUrl);
-		favoritesDownloadUrl = null;
-	}
-
-	const FAVORITES_EXPORT_UNSAFE_ID =
-		'Could not export favorites: a favorite has an unsafe track id.';
-
-	async function copyFavoritesText(): Promise<void> {
-		clearFavoritesExportFeedback();
-		const generation = favoritesExportGeneration;
-		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
-		const snapshot = favoritesExportSnapshot();
-		const key = currentFavoritesExportKey();
-		let text: string;
-		try {
-			// formatQueueText never applies the shared id guard, so run the
-			// M3U formatter first (its output is discarded): an unsafe
-			// favorite id must refuse the copy before the clipboard is
-			// touched, for this action just as for the download.
-			formatQueueM3U(snapshot);
-			text = formatQueueText(snapshot);
-		} catch {
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
-			return;
-		}
-		try {
-			// Both the API getter and the write can fail. Neither is proof
-			// of a successful copy: expose selectable text instead.
-			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
-			await navigator.clipboard.writeText(text);
-		} catch {
-			if (
-				!favoritesExportAlive ||
-				generation !== favoritesExportGeneration ||
-				currentFavoritesExportKey() !== key
-			) {
-				return;
-			}
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = 'Clipboard unavailable. Copy the favorites manually below.';
-			favoritesExportFallback = text;
-			return;
-		}
-		if (
-			!favoritesExportAlive ||
-			generation !== favoritesExportGeneration ||
-			currentFavoritesExportKey() !== key
-		) {
-			return;
-		}
-		favoritesExportFeedbackKey = key;
-		favoritesExportStatus = 'Copied favorites as text.';
-	}
-
-	function downloadFavoritesM3U(): void {
-		clearFavoritesExportFeedback();
-		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
-		const key = currentFavoritesExportKey();
-		let m3u: string;
-		try {
-			m3u = formatQueueM3U(favoritesExportSnapshot());
-		} catch {
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
-			return;
-		}
-		const link = document.createElement('a');
-		try {
-			// Retain at most one Blob URL until the next download or
-			// teardown, not an arbitrary timer while the browser may
-			// still be saving it.
-			releaseFavoritesDownload();
-			const blob = new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' });
-			favoritesDownloadUrl = URL.createObjectURL(blob);
-			link.href = favoritesDownloadUrl;
-			link.download = 'favorites.m3u';
-			link.hidden = true;
-			document.body.append(link);
-			link.click();
-			// The browser owns the save dialog: initiating it cannot
-			// prove that a file was saved to disk.
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus =
-				'Download started. Check your browser’s saved downloads for favorites.m3u.';
-		} catch {
-			releaseFavoritesDownload();
-			favoritesExportFeedbackKey = key;
-			favoritesExportStatus =
-				'Could not start the download. Try again or copy the favorites as text.';
-		} finally {
-			link.remove();
-		}
-	}
-
-	/**
-	 * Swap the queue for any change that is not a move. The move
-	 * announcement names a track and its position, so every other edit
-	 * invalidates it; clearing it here also keeps a previous account's
-	 * track title from lingering across the auth-boundary clears below.
-	 */
-	/**
-	 * A current-source change invalidates the restart outcome and its
-	 * availability snapshot, whichever queue edit caused it — including
-	 * the direct-assign handlers that bypass replaceQueue, so a stale
-	 * "Restarted …" can never describe the new current track.
-	 */
+	/** Reset restart and jump feedback when an edit changes the current source. */
 	function resetRestartOnSourceChange(
 		before: Track | null | undefined,
 		after: Track | null | undefined
@@ -835,30 +753,28 @@
 		}
 	}
 
-	function replaceQueue(next: QueueState): void {
-		// A no-op replacement (same queue object: Next on the last track,
-		// a duplicate row tap) still clears a stale move announcement —
-		// pinned by the queue-announcement banks — but must not fence a
-		// pending play() outcome: the selection it describes is unchanged.
-		if (next !== queue) playEpoch += 1;
+	function commitQueue(next: QueueState, kind: 'replace' | 'move' | 'remove' | 'clear' | 'select' | 'trim'): void {
+		if (kind !== 'replace' || next !== queue) queueRevision.revoke();
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
-		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
-			clearShareFeedback();
-			pendingShareSeek = null;
+		if ((kind === 'replace' || kind === 'select') &&
+			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
+			if (kind === 'replace') clearShareFeedback();
+			pendingShareSeek.clear();
 		}
-		resetRestartOnSourceChange(before, after);
+		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
+			resetRestartOnSourceChange(before, after);
+		}
 		queue = next;
-		queueAnnouncement = '';
+		if (kind === 'replace') queueAnnouncement = '';
 		syncMiniPlayerHint(next);
 	}
 
-	/**
-	 * Mirror the queue's current selection into the mobile mini-player hint.
-	 * Direct-assign queue edits bypass replaceQueue, so each of them calls
-	 * this after mutating the queue; an emptied queue clears the hint.
-	 * Metadata only — display title/artist, never audio or playback state.
-	 */
+	function replaceQueue(next: QueueState): void {
+		commitQueue(next, 'replace');
+	}
+
+	/** Mirror the current selection into the metadata-only mobile hint. */
 	function syncMiniPlayerHint(next: QueueState): void {
 		const current = queueCurrentTrack(next);
 		if (current) {
@@ -878,28 +794,14 @@
 		shareFallbackUrl = null;
 	}
 
-	/**
-	 * Drop visible queue-share feedback. Only a new activation or the auth
-	 * boundary supersedes a pending write (`supersede`); a queue edit merely
-	 * clears what is shown, and the late completion re-checks its row.
-	 */
-	function clearQueueShareFeedback(supersede = false): void {
-		if (supersede) queueShareGeneration += 1;
-		setQueueShareOutcome('', null);
-	}
-
-	function setQueueShareOutcome(status: string, fallbackUrl: string | null): void {
-		queueShareOutcome = { status, fallbackUrl, forQueue: queue };
-	}
-
 	function resetShareAtAuthBoundary(): void {
 		endGeneration += 1;
 		playingElement = null;
 		if (audioEl && !audioEl.paused) audioEl.pause();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
-		clearQueueShareFeedback(true);
-		pendingShareSeek = null;
+		queueShare.reset();
+		pendingShareSeek.clear();
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
@@ -925,53 +827,6 @@
 		// would announce a lone surrogate before the ellipsis.
 		const points = Array.from(title);
 		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
-	}
-
-	/**
-	 * Copy the browse-format link for one queued row. Never selects, seeks,
-	 * plays, fetches or persists; the position is read live and only for the
-	 * current track, so a queued row is never stamped with another track's
-	 * time. A row that left the queue before the write finished reports
-	 * unavailable instead of a stale success.
-	 */
-	async function copyQueuedTrackLink(id: string): Promise<void> {
-		clearQueueShareFeedback(true);
-		const generation = queueShareGeneration;
-		const queued = queue.tracks.find((track) => track.id === id);
-		if (!queued) {
-			setQueueShareOutcome('Link unavailable — that track is no longer in the queue.', null);
-			return;
-		}
-		const title = shortTitle(queued.title?.trim() ? queued.title : queued.id);
-		const unavailable = `Link unavailable — ${title} is no longer in the queue.`;
-		const current = queueCurrentTrack(queue);
-		const position = current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
-		const seconds = typeof position === 'number' && Number.isFinite(position) && position >= 0 ? position : 0;
-		let url: string;
-		try {
-			url = `${window.location.origin}/library?${buildShareQuery(id, seconds)}`;
-		} catch {
-			setQueueShareOutcome(unavailable, null);
-			return;
-		}
-		const clipboard = clipboardWriter();
-		if (!clipboard) {
-			setQueueShareOutcome('', url);
-			return;
-		}
-		let written = true;
-		try {
-			await clipboard.writeText(url);
-		} catch {
-			written = false;
-		}
-		if (!shareAlive || generation !== queueShareGeneration) return;
-		if (!queue.tracks.some((track) => track.id === id)) {
-			setQueueShareOutcome(unavailable, null);
-			return;
-		}
-		if (written) setQueueShareOutcome(`Copied link for ${title}.`, null);
-		else setQueueShareOutcome('', url);
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
@@ -1011,7 +866,7 @@
 		const search = window.location.search;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
-		pendingShareSeek = null;
+		pendingShareSeek.clear();
 		shareInvalid = false;
 		const params = new URLSearchParams(search);
 		if (!params.has('track') && !params.has('t')) return;
@@ -1038,36 +893,17 @@
 		if (!source) return;
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
-		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		const seekRevision = pendingShareSeek.set({ ...target, streamUrl: source });
 		// A same-source share skips the source-change reset; the share moves the
 		// position, so an earlier jump readout no longer describes it.
 		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
-		void tick().then(() => applyPendingShareSeek());
+		void tick().then(() => pendingShareSeek.apply(audioEl, seekRevision));
 	}
 
 	function applyPendingShareSeek(element = audioEl): void {
-		const pending = pendingShareSeek;
-		const current = queueCurrentTrack(queue);
-		if (!pending || !element || element !== audioEl || !shareAlive) return;
-		if (current?.id !== pending.trackId || resolveStreamUrl(current) !== pending.streamUrl) return;
-		// An explicit restart of this source supersedes the remembered
-		// share position: later metadata must not move it away from zero.
-		if (restartSupersededSources.has(`${pending.trackId}\n${pending.streamUrl}`)) {
-			pendingShareSeek = null;
-			return;
-		}
-		const knownDuration = Number.isFinite(element.duration) && element.duration >= 0;
-		const seconds = knownDuration ? Math.min(pending.seconds, element.duration) : pending.seconds;
-		try {
-			pending.appliedSeconds = seconds;
-			element.currentTime = seconds;
-			if (knownDuration) pendingShareSeek = null;
-		} catch {
-			// Some browsers require metadata first. Keep this source-fenced seek
-			// pending until its own metadata event, never play to force loading.
-		}
+		pendingShareSeek.apply(element);
 	}
 
 	function handleSeeking(event: Event): void {
@@ -1084,30 +920,7 @@
 			lastJumpSeek = null;
 		}
 		// A listener's own seek wins over a pending late-duration adjustment.
-		if (
-			pendingShareSeek?.appliedSeconds != null &&
-			element.currentTime !== pendingShareSeek.appliedSeconds
-		) {
-			pendingShareSeek = null;
-		}
-	}
-
-	// True when position 0 lies inside a native seekable range. Any unreadable
-	// or non-finite range bound is unusable media, never an exception.
-	function seekableIncludesStart(element: HTMLAudioElement): boolean {
-		try {
-			const ranges = element.seekable;
-			for (let index = 0; index < ranges.length; index += 1) {
-				const start = ranges.start(index);
-				const end = ranges.end(index);
-				if (Number.isFinite(start) && Number.isFinite(end) && start <= 0 && end >= 0) {
-					return true;
-				}
-			}
-		} catch {
-			// Fall through: an unreadable range set cannot restart.
-		}
-		return false;
+		pendingShareSeek.observeSeeking(element);
 	}
 
 	// Media events re-evaluate restart availability from the live element.
@@ -1122,19 +935,6 @@
 			return;
 		}
 		restartCanSeek = restartIsAvailable(element);
-	}
-
-	function restartIsAvailable(element: HTMLAudioElement): boolean {
-		try {
-			return (
-				Number.isFinite(element.duration) &&
-				element.duration > 0 &&
-				Number.isFinite(element.currentTime) &&
-				seekableIncludesStart(element)
-			);
-		} catch {
-			return false;
-		}
 	}
 
 	function setRestartStatus(text: string): void {
@@ -1170,9 +970,7 @@
 		// The explicit gesture supersedes a pending share seek for this
 		// source even if the native write is refused: later metadata for
 		// the same source must never move the position to the share time.
-		if (pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === source) {
-			pendingShareSeek = null;
-		}
+		pendingShareSeek.supersede(current.id, source);
 		restartSupersededSources.add(`${current.id}\n${source}`);
 		// Native state can change after the last media event and before this click.
 		if (!restartIsAvailable(element)) {
@@ -1232,9 +1030,7 @@
 		const element = audioEl;
 		const current = queueCurrentTrack(queue);
 		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
-		if (live && pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === streamUrl) {
-			pendingShareSeek = null;
-		}
+		if (live) pendingShareSeek.supersede(current.id, streamUrl);
 		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
 		// A no-write outcome must not disown an earlier jump's queued event.
 		// handleSeeking still retires feedback at a different element or position.
@@ -1257,9 +1053,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
-		playEpoch += 1;
-		queue = reordered;
-		syncMiniPlayerHint(reordered);
+		commitQueue(reordered, 'move');
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
@@ -1271,12 +1065,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
-		playEpoch += 1;
-		// Removing the current row advances the current source; the restart
-		// outcome for the removed track must not carry onto its successor.
-		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
-		queue = next;
-		syncMiniPlayerHint(next);
+		commitQueue(next, 'remove');
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
 	}
@@ -1286,9 +1075,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
-		playEpoch += 1;
-		queue = next;
-		syncMiniPlayerHint(next);
+		commitQueue(next, 'clear');
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1307,12 +1094,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
-		playEpoch += 1;
-		// Direct selection always changes the current source (reselecting
-		// the current row returned above), so restart state resets here.
-		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
-		queue = selected;
-		syncMiniPlayerHint(selected);
+		commitQueue(selected, 'select');
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
 	}
@@ -1337,9 +1119,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		playEpoch += 1;
-		queue = trimmed;
-		syncMiniPlayerHint(trimmed);
+		commitQueue(trimmed, 'trim');
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -1349,9 +1129,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		playEpoch += 1;
-		queue = trimmed;
-		syncMiniPlayerHint(trimmed);
+		commitQueue(trimmed, 'trim');
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
@@ -1672,19 +1450,8 @@
 			return;
 		}
 		const displayedIds = renderedItems.map((track) => track.id);
-		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
-		const survivors = new Set(selectedIds);
-		const nextId =
-			removedIndex < 0
-				? null
-				: (displayedIds.slice(removedIndex + 1).find((candidate) => survivors.has(candidate)) ?? null);
-		const previousId =
-			removedIndex <= 0
-				? null
-				: ([...displayedIds.slice(0, removedIndex)]
-						.reverse()
-						.find((candidate) => survivors.has(candidate)) ?? null);
+		const { nextId, previousId } = selectedRowRecoveryIds(displayedIds, id, selectedIds);
 		focusAfterSelectedRowRemoval(nextId, previousId);
 	}
 
@@ -1715,7 +1482,7 @@
 
 
 	function interactionIds(id: string): string[] {
-		return selectedIds.includes(id) ? [...new Set(renderedItems.filter((item) => selectedIds.includes(item.id)).map((item) => item.id))] : [id];
+		return projectInteractionIds(id, selectedIds, renderedItems);
 	}
 
 	// Re-resolve deferred actions after refresh without substituting another occurrence.
@@ -1732,8 +1499,7 @@
 	}
 
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
-		const available = loading || libraryUnavailable ? [] : queued ? queue.tracks : source;
-		const surviving = [...new Set(ids)].filter((id) => available.some((track) => track.id === id));
+		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable);
 		if (!surviving.length) announceInteraction('That track is no longer available.');
 		return surviving;
 	}
@@ -2037,13 +1803,14 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			queueRevision.destroy();
+			queueShare.dispose();
 			endGeneration += 1;
 			playingElement = null;
 			if (audioEl && !audioEl.paused) audioEl.pause();
-			favoritesExportAlive = false;
-			releaseFavoritesDownload();
+			favoritesExport.destroy();
 			clearShareFeedback();
-			pendingShareSeek = null;
+			pendingShareSeek.clear();
 			restartSupersededSources.clear();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
@@ -2518,7 +2285,7 @@
 				onclear={clearQueuedTracks}
 				onselect={selectQueuedTrack}
 				onplaynow={(id) => void playQueuedTrack(id)}
-				oncopylink={(id) => void copyQueuedTrackLink(id)}
+				oncopylink={(id) => void queueShare.copy(id)}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>

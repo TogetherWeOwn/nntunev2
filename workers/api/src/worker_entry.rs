@@ -35,6 +35,10 @@ use crate::handlers::{
     ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
     QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
+#[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
+#[path = "billing_budget.rs"]
+pub(crate) mod billing_budget;
+
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -517,6 +521,51 @@ async fn query_playback_lease_row(
     }
 }
 
+/// Acquire on the caller's connection; refusal reads the incumbent on that same connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire_playback_lease_on(
+    client: &impl GenericClient,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    let rows = client
+        .query_typed(
+            crate::playback::playback_lease_acquire_statement(),
+            &[
+                (&user_id, Type::TEXT),
+                (&session_id, Type::TEXT),
+                (&track_id, Type::TEXT),
+                (&play_id, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&i64_of(now)?, Type::INT8),
+                (&takeover, Type::BOOL),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    match rows.first() {
+        Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
+            epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+        }),
+        // A vanished row (including a deletion-fence refusal) reads as retry-now.
+        None => {
+            let retry_after_secs = match query_playback_lease_row(client, user_id).await? {
+                Some(row) => row.retry_after_secs(now),
+                None => 0,
+            };
+            Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
+        }
+    }
+}
+
 /// Durable-slot budgets are bounded: a zero limit/window admits
 /// nothing, and the slot scan is capped at
 /// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
@@ -846,6 +895,32 @@ pub fn session_retry_store_for_postgres_test(
     }
 }
 
+/// Exercise the unwired PgStore method with a disposable connection only.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+pub async fn private_aware_lease_for_postgres_test(
+    client: tokio_postgres::Client,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+    PgStore {
+        env: None,
+        trace_id: "postgres-private-lease-test".into(),
+        mirror_binding: MirrorBinding::Configured,
+        test_client: std::cell::RefCell::new(Some(client)),
+        test_mirror: None,
+    }
+    .acquire_private_aware_lease(
+        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+    )
+    .await
+}
+
 /// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
 /// code only, never the message/detail (which can carry host/role strings).
 /// `tokio_postgres::Error` extracts the real code; test stubs return fixed
@@ -862,6 +937,103 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
+    /// including when the session has no privacy row yet.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    async fn acquire_private_aware_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+        Self::bounded(
+            async {
+                let key = format!("play:{user_id}:{track_id}:{play_id}");
+                if !crate::history_key::matches_owner_track(&key, user_id, track_id)
+                    || !crate::history_key::valid_mark_time(now)
+                {
+                    return Err(StoreError);
+                }
+                let mut client = self.connect().await?;
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if tx
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                let rows = tx
+                    .query_typed(
+                        crate::preference_rows::private_session_active_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                let private: bool = rows[0].try_get(0).map_err(|_| StoreError)?;
+                if private {
+                    let rows = tx
+                        .query_typed(
+                            crate::preference_rows::private_play_mark_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&key, Type::TEXT),
+                                (&i64_of(now)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    if rows.len() != 1 {
+                        return Err(StoreError);
+                    }
+                    let rows = tx
+                        .query_typed(
+                            crate::preference_rows::private_play_probe_statement(),
+                            &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    if rows.len() != 1 || !rows[0].try_get::<_, bool>(0).map_err(|_| StoreError)? {
+                        return Err(StoreError);
+                    }
+                }
+                let result = acquire_playback_lease_on(
+                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                )
+                .await?;
+                if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
+                    tx.commit().await.map_err(|_| StoreError)?;
+                    Ok((result, private))
+                } else {
+                    tx.rollback().await.map_err(|_| StoreError)?;
+                    Ok((result, false))
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     /// Race a store operation against the caller's budget, expiring to the
     /// opaque `StoreError`. Every `Store` method runs its connect plus
     /// statements inside this seam with the vault total: Hyperdrive pools
@@ -2621,6 +2793,240 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn mark_private_play(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+        marked_at: u64,
+    ) -> Result<(), StoreError> {
+        // Adapted from PR #982's preserved patch.
+        if !crate::history_key::matches_owner_track(key, user_id, track_id)
+            || !crate::history_key::valid_mark_time(marked_at)
+        {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                let rows = tx
+                    .query_typed(
+                        crate::preference_rows::private_play_mark_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&key, Type::TEXT),
+                            (&i64_of(marked_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-play-mark").await?;
+                tx.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_play_marked(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+    ) -> Result<bool, StoreError> {
+        if !crate::history_key::matches_owner_track(key, user_id, track_id) {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_play_probe_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn history_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::history_list_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.history_list"))?;
+                rows.iter()
+                    .map(|row| {
+                        let key: String = row.try_get("idempotency_key").map_err(|_| StoreError)?;
+                        let play_id =
+                            crate::history_key::play_id_from_key(&key).ok_or(StoreError)?;
+                        Ok(crate::preference_rows::HistoryDbRow {
+                            play_id,
+                            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+                            played_at: row.try_get("recorded_at").map_err(|_| StoreError)?,
+                            stream_seconds: row
+                                .try_get("stream_seconds")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_session_active_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn upsert_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-upsert").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn delete_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_delete_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-delete").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn taste_list(
         &self,
         user_id: &str,
@@ -2775,6 +3181,31 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
                 Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn resolve_member_track(
+        &self,
+        user_id: &str,
+        target: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::catalogue::resolve_member_track_statement(),
+                        &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("target_id").map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -3463,41 +3894,10 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let rows = client
-                    .query_typed(
-                        crate::playback::playback_lease_acquire_statement(),
-                        &[
-                            (&user_id, Type::TEXT),
-                            (&session_id, Type::TEXT),
-                            (&track_id, Type::TEXT),
-                            (&play_id, Type::TEXT),
-                            (&i64_of(expires_at)?, Type::INT8),
-                            (&i64_of(now)?, Type::INT8),
-                            (&takeover, Type::BOOL),
-                        ],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                match rows.first() {
-                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
-                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
-                    }),
-                    // Zero rows: another session holds a live lease.
-                    // Read it (same connection, same budget) so the
-                    // 429 carries its real remaining TTL. A vanished
-                    // row (deleted mid-race) reads as retry-now.
-                    None => {
-                        let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
-                                Some(row) => row.retry_after_secs(now),
-                                None => 0,
-                            };
-                        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
-                    }
-                }
+                acquire_playback_lease_on(
+                    &client, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -3617,7 +4017,7 @@ impl Store for PgStore {
                             &window.user_id,
                             &window.track_id,
                             &window.period_month,
-                            &i64_of(window.stream_seconds)?,
+                            &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
                             &i64_of(window.bytes_served)?,
                             &i64_of(window.recorded_at)?,
                             &file_bytes,

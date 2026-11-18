@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
+import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { loadRecentFinds } from '#lib/library/recent-finds.js';
@@ -9,6 +11,8 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
+import { createQueueRevision } from '#lib/player/queueRevision.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -46,12 +50,14 @@ function pageScript(search: string) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
+		createQueueShare, createQueueRevision,
+		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
-		resolveStreamUrl, resolveShareTarget, endTrackDrag,
+		resolveStreamUrl, resolveShareTarget, endTrackDrag, createPendingShareSeek,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
@@ -65,7 +71,7 @@ function pageScript(search: string) {
 			refresh, applyShareLink, resetShareAtAuthBoundary, selectTrack,
 			applyPendingShareSeek,
 			setAudio: (element) => { audioEl = element; },
-			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek, loadError })
+			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;

@@ -12,6 +12,17 @@
 //! credentials resolve through the unmounted async core and the additive
 //! `subsonic_credentials` schema; legacy `subsonic_clients` is never promoted.
 
+// The synthetic ledger artifact selects the pinned wasm System allocator. A
+// second active Rust global allocator in its linked graph is a compiler error.
+// This feature is not the ordinary Worker build or an admission certificate.
+#[cfg(all(
+    feature = "ledger-wasm-test",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+#[global_allocator]
+static LEDGER_ALLOCATOR: std::alloc::System = std::alloc::System;
+
 pub mod account_deletion;
 pub mod admin;
 pub mod admin_ingest;
@@ -19,6 +30,9 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+mod billing_owned_socket;
 pub mod billing_reconcile;
 pub mod billing_store_classification;
 pub mod billing_sweep;
@@ -53,6 +67,7 @@ pub mod subsonic_config;
 pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
+pub mod subsonic_snapshot_plan;
 pub mod target_identity;
 pub mod taste_signal;
 pub mod vault;
@@ -132,6 +147,10 @@ mod logging_tests {
     }
 }
 
+// Test-only real-workerd span probe; absent unless `span-runtime-test` is on.
+#[cfg(all(target_arch = "wasm32", feature = "span-runtime-test"))]
+mod span_runtime_probe;
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
@@ -155,7 +174,14 @@ mod ledger_wasm_test {
 
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
-#[cfg(not(all(target_arch = "wasm32", feature = "staging-body-wasm-test")))]
+#[cfg(not(all(
+    target_arch = "wasm32",
+    any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    )
+)))]
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,
@@ -172,6 +198,40 @@ pub async fn main(
         return subsonic_response(&mut req).await;
     }
     worker_entry::dispatch(req, env).await
+}
+
+// This entry exists only in the separately bundled runtime-test Worker.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[worker::event(fetch)]
+pub async fn billing_owned_test_entry(
+    _req: worker::Request,
+    _env: worker::Env,
+    _ctx: worker::Context,
+) -> worker::Result<worker::Response> {
+    if !billing_owned_socket::test_empty_guard_drop() {
+        return worker::Response::error("empty guard drop failed", 500);
+    }
+    if let Err(message) = billing_owned_socket::test_drive_owned() {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = billing_owned_socket::test_tracked_socket().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = worker_entry::billing_budget::test_budget().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = worker_entry::billing_budget::test_transaction_bootstrap().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = billing_owned_socket::test_worker_timer().await {
+        return worker::Response::error(message, 500);
+    }
+    match worker_entry::billing_budget::test_real_connection().await {
+        Ok((success, timeout)) => {
+            worker::Response::ok(format!("owned-drive-ok:5:{success}:{timeout}"))
+        }
+        Err(message) => worker::Response::error(message, 500),
+    }
 }
 
 /// True when this request targets the Subsonic `/rest/*` surface.
