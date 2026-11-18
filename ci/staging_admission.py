@@ -398,6 +398,7 @@ class Actions:
                     "incomplete or exhausted workflow_runs listing")
             total = count
             for run in batch:
+                require(isinstance(run, dict), "invalid workflow_runs row")
                 rid = decimal(run.get("id"))
                 require(rid not in seen, "incomplete or exhausted workflow_runs listing")
                 seen.add(rid)
@@ -412,17 +413,35 @@ class Actions:
         # execution (including waiting/approval) to 35 days. Include 66 days
         # before the receipt opening, rounded down, plus ALL unresolved runs
         # independently of creation time. See staging-admission.md for sources.
-        cutoff = (opening - timedelta(days=66)).astimezone(timezone.utc).date().isoformat()
+        cutoff = opening.astimezone(timezone.utc).date() - timedelta(days=66)
         base = f"workflows/{workflow_id}/runs?branch=main&event=push"
-        queries = [f"{base}&created=%3E%3D{cutoff}"]
-        queries.extend(f"{base}&status={status}" for status in PENDING_RUN_STATES)
         found = {}
-        for query in queries:
-            for run in self.runs(query):
-                rid = decimal(run.get("id"))
-                require(rid not in found or found[rid] == run,
-                        "staging run changed during conflict discovery")
-                found[rid] = run
+
+        def record(run):
+            require(run.get("head_branch") == "main" and run.get("event") == "push"
+                    and decimal(run.get("workflow_id")) == workflow_id,
+                    "staging run outside requested workflow scope")
+            rid = decimal(run.get("id"))
+            require(rid not in found or found[rid] == run,
+                    "staging run changed during conflict discovery")
+            found[rid] = run
+
+        # GitHub date ranges include both UTC dates. Use two closed 22-day
+        # slices and one open tail to cover exactly the old query's horizon,
+        # including pushes after the journey opened, under one shared deadline.
+        for offset in (0, 22, 44):
+            first = cutoff + timedelta(days=offset)
+            last = first + timedelta(days=21) if offset < 44 else None
+            created = f"{first}..{last}" if last else f"%3E%3D{first}"
+            for run in self.runs(f"{base}&created={created}"):
+                day = timestamp(run.get("created_at")).astimezone(timezone.utc).date()
+                require(day >= first and (last is None or day <= last),
+                        "staging run outside requested creation dates")
+                record(run)
+        for status in PENDING_RUN_STATES:
+            for run in self.runs(f"{base}&status={status}"):
+                require(run.get("status") == status, "staging run outside requested status")
+                record(run)
         return list(found.values())
 
 
@@ -522,7 +541,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     # Per-lane locks are not a reservation. Discover recent/rerunnable runs
     # and every unresolved run, not the workflow's entire lifetime history.
     for other in actions.conflicts(workflow_id, opening):
-        if other.get("event") != "push" or other.get("head_sha") == sha:
+        if other.get("head_sha") == sha:
             continue
         require(other.get("status") in (*PENDING_RUN_STATES, "completed"),
                 "unclassified conflicting staging run")
