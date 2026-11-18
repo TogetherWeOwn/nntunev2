@@ -131,7 +131,7 @@ serialization cannot leak one.
    # JSONL, not the tab-delimited text a bare COPY (SELECT …) emits
    # (every such row would fail closed as Shape). Key names must match
    # the verifier's row shape exactly.
-   psql "$RESTORE_DSN" -t -A -c "COPY (SELECT row_to_json(t) FROM (SELECT 'global' AS user_id, \
+   psql "$RESTORE_DSN" -t -A -c "COPY (SELECT row_to_json(t) FROM (SELECT 'shared:track-source' AS user_id, \
      track_id::text AS row_key, \
      nzb_ref_envelope_version AS envelope_version, \
      nzb_ref_payload_format AS payload_format, nzb_ref_kek_version AS kek_version, \
@@ -145,8 +145,7 @@ serialization cannot leak one.
    ```
    Post-migration-0027 notes: `track_sources` has no `user_id` column
    (one global slot per `track_id`), no `row_key` column, and the
-   ciphertext column is `nzb_ref_encrypted`. `'global'` is the sealer's
-   tagged global `owner_scope` per ADR 0002 and `track_id::text` the
+   ciphertext column is `nzb_ref_encrypted`. The sealer uses `shared:track-source` as `owner_scope` and `track_id::text` as
    `row_key`; both must equal the seal-time AAD inputs (pinned where
    the pipeline seals) — any mismatch fails closed as failed rows,
    never as a silent pass. The export lives in a `0700` scratch dir,

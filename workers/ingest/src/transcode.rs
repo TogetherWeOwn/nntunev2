@@ -29,13 +29,24 @@
 //! contract, so their bytes and hashes coincide by construction.
 //! Source bytes are only ever read, never modified.
 //!
+//! Publication helpers use one
+//! idempotent statement each, all converging on redelivery. This step
+//! publishes only the content-global row:
+//!
 //! - [`upsert_cache_object_sql`] — the content-global blob row. No
 //!   writer fence: the row carries no user identity and an orphaned
 //!   blob is swept, never served.
 //! - [`upsert_track_media_sql`] — the per-user mapping with
 //!   `format='opus'`, `bitrate=64` as SQL literals (the profile is
 //!   pinned in the statement, not in a caller-supplied value).
-//!   This mapping remains unwired.
+//!
+//! The unwired mapping selects through the standard `writer_fence`
+//! (`users` row `FOR SHARE` while `deleting_at IS NULL`), so
+//! publication cannot repopulate library state after deletion is
+//! scheduled. A zero-row write is either a benign replay
+//! (`ON CONFLICT DO NOTHING` converged) or a fenced account; the
+//! mapping contract separates them with a PK select plus
+//! [`classify_publish_zero_rows`], never by assuming.
 //!
 //! Runtime: the `Transcoding` step (`run_transcode_step` in
 //! `queue_consumer.rs`) dispatches one recorded input per delivery through

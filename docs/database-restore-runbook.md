@@ -166,10 +166,12 @@ forward-only (§4).
    `docs/adr/0002-data-model.md` forbids). If the damage was caused by a
    bad migration, include its forward correction in this pass. Blocked
    until the per-database runner/record prerequisite (§2 step 3) lands.
-5. **Verify active KEK consumers before cutover (app only).** Confirm every
-   active envelope opens (`track_sources`: [offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment));
-   record results in §6. Mark only the historical vault pass N/A after purge; never
-   reintroduce purged rows or change shared keys. For a pre-purge vault,
+5. **Verify active KEK consumers before cutover (app only).** Reconcile read-only counts on the isolated target
+   against the expected forward-converged snapshot. Record matched zero as no envelopes to open, never infer it from an empty export.
+   For nonzero counts, open every envelope at its stored KEK version: `track_sources` via [offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment);
+   active Subsonic tokens via an approved verifier using the `subsonic_auth.rs` token context (owner and credential ID).
+   Record only counts and outcomes in §6. Hold on any failed query, export, mismatch, or missing or failed verification.
+   After purge, mark only the vault pass N/A; never restore purged rows or change shared keys. For a pre-purge vault,
    confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The

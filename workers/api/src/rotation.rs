@@ -1,8 +1,8 @@
 //! Bounded/resumable KEK re-wrap job (`docs/security/kek-rotation.md` §6).
 //!
 //! This is the executable runner core for routine rotation phase 3: it
-//! re-wraps the DEK only — payload and nonces preserved — through its
-//! store's claim/CAS contract. What runs today, over any [`RewrapStore`]:
+//! re-wraps the DEK only — payload and nonces preserved — through the §6
+//! claim/CAS contract. What runs today, over any [`RewrapStore`]:
 //!
 //! - cursor-based batch claims (`kek_version < to`, `user_id > cursor`,
 //!   never `OFFSET`), at most [`MAX_BATCH_LIMIT`] rows per batch;

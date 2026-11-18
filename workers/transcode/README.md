@@ -9,7 +9,7 @@ The no-route Worker that fronts the `opus-64` transcode Container
   (Sources: `wrangler.toml:15,18` and the `NOT YET DEPLOYED` header
   `:11-13`; `src/runtime.rs:129-147`;
   `workers/ingest/wrangler.toml:147-152` (service binding);
-  `workers/ingest/src/transcode.rs:74-79` (binding contract), `:302-303` (`call_transcode`).)
+  `workers/ingest/src/transcode.rs:85-90` (binding contract), `:313-314` (`call_transcode`).)
 - **One Durable Object per job.** Requests are validated, then routed
   to `TranscodeContainer` (`id_from_name(job_id)`), so a job's encodes
   serialise behind one object and one Container. The object refuses
@@ -68,7 +68,7 @@ itself are operator actions. Until then `wrangler.toml` is the deploy
 contract and ingest stays unable to finish a `Transcoding` job (its
 consumer also remains disabled).
 (Sources: `wrangler.toml:11-13`;
-`workers/ingest/src/transcode.rs:302-388` (`call_transcode`) —
+`workers/ingest/src/transcode.rs:313-399` (`call_transcode`) —
 binding, transport and body-read failure is `Retry`, never a terminal
 outcome.)
 
