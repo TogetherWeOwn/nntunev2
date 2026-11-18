@@ -103,7 +103,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 	};
 }
 
-function serve(payload = ITEMS) {
+function serve(payload: { id: string; title: string; streamUrl?: string }[] = ITEMS) {
 	vi.stubGlobal('fetch', async () => new Response(JSON.stringify(payload), {
 		headers: { 'content-type': 'application/json' }
 	}));
@@ -232,23 +232,48 @@ for (const status of [200, 401, 403]) {
 		await page.refresh();
 		expect(page.read().queue.tracks).toEqual([]);
 		expect(page.source('coral')).toBeNull();
-		serve();
+		serve([{ ...ITEMS[0], streamUrl: undefined }]);
 		await page.refresh();
 		expect(page.read().queue.tracks).toEqual([]);
 		expect(page.source('coral')?.isCurrent()).toBe(true);
+		expect(page.source('coral', ITEMS[0].streamUrl)?.streamUrl).toBe('');
 		expect(old?.isCurrent()).toBe(false);
 	});
 }
 
+for (const streamUrl of [undefined, '/test-audio/new']) {
+	test(`queued Play retains its source when the refresh ${streamUrl ? 'changes' : 'omits'} the displayed URL`, async () => {
+		serve();
+		const page = pageScript('');
+		await page.refresh();
+		page.selectTrack('coral');
+		const queue = page.read().queue;
+		const old = page.source('coral');
+		serve([{ ...ITEMS[0], streamUrl }]);
+		await page.refresh();
+		expect(page.read().queue).toBe(queue);
+		expect(old?.isCurrent()).toBe(false);
+		expect(page.source('coral')?.streamUrl).toBe(streamUrl ?? '');
+		const play = vi.fn(async () => {});
+		page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
+		await page.playQueuedTrack('coral');
+		expect(page.read().queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
+		expect(play).toHaveBeenCalledOnce();
+	});
+}
+
 test('queue publication exposes new evidence before a reentrant auth boundary', async () => {
-	serve();
+	serve([...ITEMS, { id: 'kelp', title: 'Kelp', streamUrl: '/test-audio/kelp' }]);
 	const page = pageScript('');
 	await page.refresh();
+	page.selectTrack('kelp');
 	page.selectTrack('coral');
 	let reentered = false;
 	const stop = page.subscribe((queue) => {
-		if (reentered || queue.tracks[0]?.streamUrl !== '') return;
+		if (reentered || queue.tracks.length !== 1) return;
 		reentered = true;
+		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
+		expect(page.source('kelp')).toBeNull();
 		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
 		page.endSession();
 	});

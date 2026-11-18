@@ -43,13 +43,9 @@ export function createQueueController(initial: QueueState) {
 				sources.set(item.id, urls);
 			}
 			const currentId = currentTrack(snapshot)?.id;
-			const tracks = snapshot.tracks.flatMap((track) => {
-				const urls = sources.get(track.id);
-				if (!urls) return [];
-				return [!track.streamUrl || urls.has(track.streamUrl) ? track : { ...track, streamUrl: '' }];
-			});
-			if (tracks.length === snapshot.tracks.length &&
-				tracks.every((track, index) => track === snapshot.tracks[index])) {
+			// Refresh controls membership and fallback evidence, not a surviving slot's source.
+			const tracks = snapshot.tracks.filter((track) => sources.has(track.id));
+			if (tracks.length === snapshot.tracks.length) {
 				return { next: snapshot, sources };
 			}
 			const selected = tracks.findIndex((track) => track.id === currentId);
@@ -58,12 +54,17 @@ export function createQueueController(initial: QueueState) {
 		hasLibraryTrack(id: string): boolean {
 			return alive && librarySources.has(id);
 		},
+		hasLibrarySource(id: string, streamUrl: string): boolean {
+			return alive && librarySources.get(id)?.has(streamUrl) === true;
+		},
 		sourceForQueuedPlay(id: string, preferred?: string): QueuedPlaySource | null {
 			const evidence = librarySources;
 			const urls = evidence.get(id);
 			if (!alive || !urls) return null;
+			const usePreferred = preferred !== undefined && (urls.has(preferred) ||
+				(preferred !== '' && snapshot.tracks.some((track) => track.id === id && resolveStreamUrl(track) === preferred)));
 			return {
-				streamUrl: preferred !== undefined && urls.has(preferred) ? preferred : (urls.values().next().value ?? ''),
+				streamUrl: usePreferred ? preferred : (urls.values().next().value ?? ''),
 				isCurrent: () => alive && librarySources === evidence
 			};
 		},

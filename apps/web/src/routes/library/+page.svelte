@@ -619,8 +619,7 @@
 	// `.map(...)` reference can never bind the array index to it.
 	function playableTrackFor(item: LibraryItem): Track {
 		const streamUrl = resolveStreamUrl({ streamUrl: item.streamUrl });
-		const source = queueController.sourceForQueuedPlay(item.id, streamUrl);
-		return { ...queuedTrackFor(item), streamUrl: source?.streamUrl === streamUrl ? streamUrl : '' };
+		return { ...queuedTrackFor(item), streamUrl: queueController.hasLibrarySource(item.id, streamUrl) ? streamUrl : '' };
 	}
 
 	/**
