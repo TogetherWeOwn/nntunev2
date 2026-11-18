@@ -389,5 +389,74 @@ mod tests {
         assert_eq!(persisted.get::<_, i64>(0), 1);
         assert_eq!(persisted.get::<_, i64>(1), 1);
         assert_eq!(persisted.get::<_, Vec<u8>>(2), rows[0].get::<_, Vec<u8>>(3));
+
+        // Exercise the actual adapter across a page boundary, including the
+        // partial final page, rather than only the one-page case above.
+        let multi_ids = [id(31), id(32), id(33), id(34), id(35)];
+        let multi_uuids = multi_ids.map(|value| uuid(&value));
+        let length = 256 * 65536 + 1;
+        let mut multi = DigestEnrollment::new(length, multi_ids, id(36)).unwrap();
+        let multi_header = multi.header().to_bytes();
+        let chunk = vec![42; 65536];
+        for _ in 0..256 {
+            multi.seal_chunk(&chunk).unwrap();
+        }
+        multi.seal_chunk(&[42]).unwrap();
+        let multi_manifest = multi.finish().ok().unwrap();
+        let multi_intent = CandidateIntent {
+            identities: multi_ids,
+            plaintext_len: length,
+            map_id: id(36),
+            header: multi_header,
+            reservation_generation: 1,
+        };
+        db.batch_execute(&format!(
+            "INSERT INTO public.storage_environments VALUES ('{0}');
+             INSERT INTO public.storage_library_namespaces VALUES ('{1}', '{0}', NULL);
+             INSERT INTO public.storage_object_intents VALUES ('{2}', '{3}', '{0}', '{1}', '{4}', {5}, {6}, decode('{7}', 'hex'));
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('cd',32),'hex') FROM public.storage_object_intents WHERE object_id = '{2}';",
+            multi_uuids[0], multi_uuids[1], multi_uuids[2], multi_uuids[3], multi_uuids[4],
+            length, length + 48 + 257 * 16, hex::encode(multi_header)
+        )).await.unwrap();
+        let generation: i64 = db
+            .query_one(
+                "SELECT public.reserve_storage_digest($1::text::uuid, 3600)",
+                &[&multi_uuids[2]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(generation, multi_intent.reservation_generation);
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &multi_intent,
+                &multi_manifest,
+                std::future::pending()
+            )
+            .await,
+            Ok(())
+        );
+        let multi_row = db.query_one(
+            "SELECT object_id = $2::text::uuid AND environment_id = $3::text::uuid AND library_id = $4::text::uuid, plaintext_bytes, chunk_count, page_count FROM public.storage_digest_map_intents WHERE map_id = $1::text::uuid",
+            &[&uuid(&multi_intent.map_id), &multi_uuids[2], &multi_uuids[0], &multi_uuids[1]],
+        ).await.unwrap();
+        assert!(multi_row.get::<_, bool>(0));
+        assert_eq!(multi_row.get::<_, i64>(1), length as i64);
+        assert_eq!(multi_row.get::<_, i32>(2), 257);
+        assert_eq!(multi_row.get::<_, i32>(3), 2);
+        let multi_rows = db.query(
+            "SELECT page_index, chunk_count, entry_count, expected_hash FROM public.storage_digest_map_page_intents WHERE map_id = $1::text::uuid ORDER BY page_index",
+            &[&uuid(&multi_intent.map_id)],
+        ).await.unwrap();
+        let expected = candidate_hashes(&multi_intent, &multi_manifest).unwrap();
+        assert_eq!(multi_rows.len(), 2);
+        assert_eq!(expected.len(), 2);
+        for (index, row) in multi_rows.iter().enumerate() {
+            assert_eq!(row.get::<_, i32>(0), index as i32);
+            assert_eq!(row.get::<_, i32>(1), 257);
+            assert_eq!(row.get::<_, i32>(2), if index == 0 { 256 } else { 1 });
+            assert_eq!(row.get::<_, Vec<u8>>(3), expected[index]);
+        }
     }
 }
