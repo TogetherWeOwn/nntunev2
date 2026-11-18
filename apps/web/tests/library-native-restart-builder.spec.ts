@@ -118,17 +118,20 @@ test('the restart button cannot seek a source retired during the position read',
 	const selectPine = queueRow(page, 'rb-pine').getByRole('button', { name: 'Select Pine Morning' });
 	await selectPine.evaluate((button) => { button.id = 'restart-test-select-pine'; });
 	await audio(page).evaluate((el) => {
-		let reads = 0;
+		let armed = false, reads = 0;
+		document.querySelector('[data-testid="library-restart"]')!.addEventListener('click', () => { armed = true; }, { capture: true, once: true });
 		document.body.dataset.restartWrites = '0';
 		Object.defineProperty(el, 'currentTime', {
 			get() {
-				if (++reads === 2) document.getElementById('restart-test-select-pine')?.click();
+				if (armed && ++reads === 2) document.getElementById('restart-test-select-pine')?.click();
 				return 30;
 			},
 			set: () => { document.body.dataset.restartWrites = '1'; },
 			configurable: true
 		});
 	});
+	await signalMedia(page);
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
 	await restartButton(page).click();
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
 	await expect(page.locator('body')).toHaveAttribute('data-restart-writes', '0');
