@@ -24,6 +24,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                 ] {
                     client.batch_execute(migration).await.map_err(|_| StoreError)?;
                 }
+                client.batch_execute("CREATE FUNCTION public.worker_billing_cancel_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.stripe_invoice_id = 'in_worker_cancel' THEN PERFORM pg_advisory_xact_lock(781349052); END IF; RETURN NEW; END $$; CREATE TRIGGER worker_billing_cancel_barrier BEFORE INSERT ON public.paid_invoice_history FOR EACH ROW EXECUTE FUNCTION public.worker_billing_cancel_barrier()").await.map_err(|_| StoreError)?;
                 client.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('worker_fault_user','worker-fault@example.test',1786032000); COMMIT").await.map_err(|_| StoreError)?;
             } else {
                 let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
@@ -43,6 +44,7 @@ async fn deadline_after_writes(outcome: &ReconcileOutcome) -> Result<(), StoreEr
         trace_id: "worker-deadline-test".into(),
         mirror_binding: MirrorBinding::Unconfigured,
         work_deadline_observer: Some(expired.clone()),
+        cancel_token_observer: None,
     };
     let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", outcome));
     let observe = billing_budget::with_owned_connection(
@@ -141,4 +143,104 @@ pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     deadline_after_writes(&test_outcome())
         .await
         .map_err(|_| "billing deadline after writes control failed")
+}
+
+async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str> {
+    use futures_util::future::{select, Either};
+    use std::time::Duration;
+
+    let phase = std::rc::Rc::new(std::cell::Cell::new(
+        "cancellation observer connection failed",
+    ));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| Box::pin(async move {
+            phase.set("cancellation observer lock failed");
+            client.batch_execute("SELECT pg_advisory_lock(781349052)").await.map_err(|_| StoreError)?;
+            let cancel_token = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let store = PgStore {
+                env: None,
+                trace_id: "worker-cancel-test".into(),
+                mirror_binding: MirrorBinding::Unconfigured,
+                work_deadline_observer: None,
+                cancel_token_observer: Some(cancel_token.clone()),
+            };
+            super::billing_cancel_control::within_blocked_window(|| async {
+            let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", &outcome));
+            let mut waiting_pid = None;
+            phase.set("cancellation wait observation failed");
+            for _ in 0..40 {
+                let observation = Box::pin(async {
+                    let rows = client.query(
+                        "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name = 'owned_billing_reconcile_test' AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND pg_backend_pid() = ANY(pg_blocking_pids(pid))", &[]
+                    ).await.map_err(|_| StoreError)?;
+                    if rows.len() > 1 { return Err(StoreError); }
+                    let pid = rows.first().map(|row| row.get::<_, i32>(0));
+                    if pid.is_none() { worker::Delay::from(Duration::from_millis(50)).await; }
+                    Ok(pid)
+                });
+                match select(operation.as_mut(), observation).await {
+                    Either::Left((result, _)) => {
+                        phase.set(if result.is_ok() { "cancellation operation completed early" } else { "cancellation operation failed early" });
+                        return Err(StoreError);
+                    }
+                    Either::Right((result, _)) => {
+                        if let Some(pid) = result? { waiting_pid = Some(pid); break; }
+                    }
+                }
+            }
+            phase.set("cancellation advisory wait not observed");
+            let pid = waiting_pid.ok_or(StoreError)?;
+            let token = cancel_token.borrow_mut().take().ok_or(StoreError)?;
+            drop(operation);
+            super::billing_cancel_control::send_cancel(&token).await.map_err(|_| StoreError)?;
+            let mut disappeared = false;
+            let mut last_state = None;
+            for _ in 0..40 {
+                phase.set("cancellation backend observation query failed or timed out");
+                let row = client.query_opt(
+                    "SELECT state, wait_event_type, wait_event, EXTRACT(EPOCH FROM (clock_timestamp() - xact_start))::bigint FROM pg_catalog.pg_stat_activity WHERE pid = $1", &[&pid]
+                ).await.map_err(|_| StoreError)?;
+                let Some(row) = row else { disappeared = true; break; };
+                last_state = Some((row.get::<_, Option<String>>(0), row.get::<_, Option<String>>(1), row.get::<_, Option<String>>(2), row.get::<_, Option<i64>>(3)));
+                phase.set("cancellation backend remained present during observation");
+                worker::Delay::from(Duration::from_millis(50)).await;
+            }
+            if !disappeared {
+                phase.set(match last_state {
+                    Some((Some(state), Some(kind), Some(event), _))
+                        if state == "active" && kind == "Lock" && event == "advisory" =>
+                    {
+                        "cancellation backend remained blocked on advisory lock"
+                    }
+                    Some((Some(state), _, _, _)) if state == "idle in transaction" => {
+                        "cancellation backend remained idle in transaction"
+                    }
+                    _ => "cancellation backend remained present in another state",
+                });
+                return Err(StoreError);
+            }
+            phase.set("cancellation rollback row check failed");
+            let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
+            if row.get::<_, i64>(0) != 0 || row.get::<_, i64>(1) != 0 { return Err(StoreError); }
+            Ok(())
+            }, StoreError).await?;
+            phase.set("cancellation observer unlock failed");
+            client.batch_execute("SELECT pg_advisory_unlock(781349052)").await.map_err(|_| StoreError)?;
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
+}
+
+pub(crate) async fn test_reconcile_cancel() -> Result<(), &'static str> {
+    fixture(true)
+        .await
+        .map_err(|_| "billing fixture setup failed")?;
+    let mut outcome = test_outcome();
+    outcome.history[1].stripe_invoice_id = "in_worker_cancel".into();
+    outcome.row.paid_invoice_id = Some("in_worker_cancel".into());
+    cancel_in_flight(outcome).await
 }

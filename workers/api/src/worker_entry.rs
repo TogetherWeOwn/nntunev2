@@ -39,6 +39,9 @@ use crate::handlers::{
 #[path = "billing_budget.rs"]
 pub(crate) mod billing_budget;
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_cancel_control.rs"]
+mod billing_cancel_control;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[path = "billing_deadline_test.rs"]
 pub(crate) mod billing_deadline_test;
 
@@ -754,6 +757,9 @@ struct PgStore {
     mirror_binding: MirrorBinding,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    cancel_token_observer:
+        Option<std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::CancelToken>>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -5445,14 +5451,19 @@ impl Store for PgStore {
             #[cfg(feature = "billing-owned-wasm-test")]
             let (host, port, connection_string) = (
                 "127.0.0.1".to_owned(),
-                5432,
+                if self.trace_id == "worker-cancel-test" { 15433 } else { 5432 },
                 "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
             );
             billing_budget::with_owned_connection(
                 &host,
                 port,
                 &connection_string,
-                |client| Box::pin(billing_budget::bootstrap_transaction(client)),
+                |client| {
+                    if let Some(observer) = &self.cancel_token_observer {
+                        *observer.borrow_mut() = Some(client.cancel_token());
+                    }
+                    Box::pin(billing_budget::bootstrap_transaction(client))
+                },
                 move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
                 |expired| {
                     if let Some(observer) = &self.work_deadline_observer {
@@ -7129,6 +7140,8 @@ pub async fn subsonic_mount(
         mirror_binding: MirrorBinding::from_env(&env),
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         work_deadline_observer: None,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        cancel_token_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -7323,6 +7336,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
             work_deadline_observer: None,
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            cancel_token_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
