@@ -1,4 +1,6 @@
 -- Repeat the 0048 backfill just before the separate admission cutover.
+SET search_path = public, pg_catalog;
+
 UPDATE public.users AS u
 SET legacy_vault_established = TRUE
 WHERE NOT u.legacy_vault_established

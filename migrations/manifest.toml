@@ -249,4 +249,4 @@ sha256 = "52736113f25cd0aa6a5af161f02f8f2fa546140da61f3dd5cf4560206a4a868d"
 [[migration]]
 file = "0049_reconcile_legacy_vault_cohort.sql"
 target = "app"
-sha256 = "334f9f2d51bd00824dd3cee77f08a021ac621f3642a9556b33c82355928496be"
+sha256 = "3a3ef5862778cdf66e558cd23ca727d93384d3ddf0211c9c8f9bb08b56f4758b"
