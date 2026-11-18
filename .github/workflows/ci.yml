@@ -1926,13 +1926,14 @@ jobs:
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
           python3 -I workers/api/tests/test_pg_protocol_frames.py
           python3 -I workers/api/tests/test_pg_commit_barrier.py
+          python3 -I workers/api/tests/test_commit_relay_fragmentation.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
           NNTUNE_SMOKE_PG_PASSWORD: ci-throwaway
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi

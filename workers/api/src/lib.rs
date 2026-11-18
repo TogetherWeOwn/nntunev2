@@ -204,10 +204,16 @@ pub async fn main(
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[worker::event(fetch)]
 pub async fn billing_owned_test_entry(
-    _req: worker::Request,
+    req: worker::Request,
     _env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if req.method() == worker::Method::Post && req.path() == "/billing-ack-proof" {
+        return match worker_entry::billing_budget::test_commit_ack().await {
+            Ok(pid) => worker::Response::ok(format!("billing-ack-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
     if !billing_owned_socket::test_empty_guard_drop() {
         return worker::Response::error("empty guard drop failed", 500);
     }
