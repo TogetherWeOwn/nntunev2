@@ -9,6 +9,9 @@ type NativeObservations = {
 	position: (audio: HTMLAudioElement) => void;
 };
 
+// Queued native events belong to the element, not to a receipt or controller.
+const mountedAudio = new WeakSet<HTMLAudioElement>();
+
 export function createMediaController() {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
@@ -29,6 +32,8 @@ export function createMediaController() {
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {
 			if (destroyed) return () => {};
+			if (observations && mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
+			mountedAudio.add(audio);
 			const previous = current;
 			// Node identity is not attachment identity, even for the same source.
 			const receipt = { audio, playing: false, listeners: new AbortController() };
