@@ -33,6 +33,86 @@ RUST_ENV_PREFIXES = ("CARGO_TARGET_", "CARGO_PROFILE_", "CARGO_UNSTABLE_", "CARG
 RUST_ENV_ALLOWED = {"CARGO_BUILD_JOBS"}
 
 
+def wasm_sections(module: bytes) -> list[tuple[int, bytes]]:
+    """Frame bounded core-WASM sections for inspection, not module validation.
+
+    This does not identify linker globals, authenticate bytes, or admit a build.
+    """
+    if not isinstance(module, bytes) or len(module) > 64 * 1024 * 1024:
+        raise ValueError("invalid or oversized WASM module")
+    if module[:8] != b"\0asm\x01\0\0\0":
+        raise ValueError("expected a core WASM version 1 module")
+    sections = []
+    offset = 8
+    while offset < len(module):
+        if len(sections) >= 10_000:
+            raise ValueError("too many WASM sections")
+        section_id = module[offset]
+        offset += 1
+        size = 0
+        for index in range(5):
+            if offset == len(module):
+                raise ValueError("truncated WASM section size")
+            byte = module[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("WASM section size exceeds u32")
+            size |= (byte & 0x7f) << (7 * index)
+            if not byte & 0x80:
+                break
+        else:
+            raise ValueError("invalid WASM section size")
+        if size > len(module) - offset:
+            raise ValueError("truncated WASM section")
+        sections.append((section_id, module[offset:offset + size]))
+        offset += size
+    return sections
+
+
+def inspect_i32_globals(payload: bytes) -> list[tuple[bool, int]]:
+    """Inspect a restricted global section; this is not module validation.
+
+    Only direct i32.const initializers are supported. Indices are local to this
+    section, not module global indices: imports and exports are not resolved.
+    Nothing here authenticates a candidate or proves a linker's symbol meaning.
+    """
+    def leb(offset: int, signed: bool) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated global section integer")
+            byte = payload[offset]
+            offset += 1
+            bits = byte & 0x7f
+            if index == 4 and (bits > 15 if not signed else not (bits <= 7 or bits >= 0x78)):
+                raise ValueError("global section integer exceeds 32 bits")
+            value |= bits << (index * 7)
+            if not byte & 0x80:
+                if signed and byte & 0x40:
+                    value -= 1 << ((index + 1) * 7)
+                return value, offset
+        raise ValueError("invalid global section integer")
+
+    count, offset = leb(0, False)
+    if count > 10_000:
+        raise ValueError("too many WASM globals")
+    result = []
+    for _ in range(count):
+        if len(payload) - offset < 3 or payload[offset] != 0x7f or payload[offset + 1] not in (0, 1):
+            raise ValueError("unsupported global type or mutability")
+        mutable = bool(payload[offset + 1])
+        if payload[offset + 2] != 0x41:
+            raise ValueError("unsupported global initializer")
+        value, offset = leb(offset + 3, True)
+        if offset >= len(payload) or payload[offset] != 0x0b:
+            raise ValueError("unterminated global initializer")
+        offset += 1
+        result.append((mutable, value & 0xffff_ffff))
+    if offset != len(payload):
+        raise ValueError("trailing global section bytes")
+    return result
+
+
 def check_lock_identity(pins: dict, root: Path = ROOT) -> None:
     locks = pins.get("locks", {})
     if set(locks) != {"workers/api/Cargo.lock"}:

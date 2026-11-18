@@ -426,17 +426,14 @@ test('route cleanup fences an explicit play waiting for tick', async () => {
 
 test.each(['resolve', 'reject'] as const)('route cleanup fences deferred play %s', async (outcome) => {
 	const { page, element } = restartFixture();
-	let settle!: () => void;
 	let plays = 0;
-	element.play = () => {
-		plays += 1;
-		return new Promise<void>((resolve, reject) => {
-			settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
-		});
-	};
+	let settle!: () => void;
+	const deferredPlay = new Promise<void>((resolve, reject) => {
+		settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
+	});
+	element.play = () => { plays += 1; return deferredPlay; };
 	const attempt = page.playQueued('coral');
 	await Promise.resolve();
-	expect(settle).toBeTypeOf('function');
 	expect(plays).toBe(1);
 	page.cleanup();
 	const afterCleanup = page.read();

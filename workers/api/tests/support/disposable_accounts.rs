@@ -43,6 +43,27 @@ impl Accounts {
         Self { observer, ids }
     }
 
+    pub async fn insert_named(
+        observer: &Client,
+        ids: &[String],
+    ) -> Result<(), tokio_postgres::Error> {
+        observer.execute(
+            "INSERT INTO public.users (id, email, created_at) SELECT id, id || '@example.invalid', 1 FROM unnest($1::text[]) AS id",
+            &[&ids],
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_named(
+        observer: &Client,
+        ids: &[String],
+    ) -> Result<(), tokio_postgres::Error> {
+        observer
+            .execute("DELETE FROM public.users WHERE id = ANY($1)", &[&ids])
+            .await?;
+        Ok(())
+    }
+
     pub fn id(&self, index: usize) -> &str {
         &self.ids[index]
     }

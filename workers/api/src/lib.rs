@@ -220,6 +220,9 @@ pub async fn billing_owned_test_entry(
     if let Err(message) = worker_entry::billing_budget::test_budget().await {
         return worker::Response::error(message, 500);
     }
+    if let Err(message) = worker_entry::billing_budget::test_transaction_bootstrap().await {
+        return worker::Response::error(message, 500);
+    }
     if let Err(message) = billing_owned_socket::test_worker_timer().await {
         return worker::Response::error(message, 500);
     }
