@@ -1090,21 +1090,28 @@ writes automatically, and an observer success alone is not verified recovery.
 
 ### Production seed precondition (one-time)
 
-The production lane (`.github/workflows/deploy-production.yml`) promotes
-through the shared gradual-promote action, whose automatic-rollback target is
-the latest production deployment and which refuses unless that deployment is
-a single Worker version at 100%. There is currently no active production
-NNTune Worker deployment, so the very first promotion cannot satisfy that
-precondition on its own. Before the first promotion, an authorized executor
-must seed production once: make one full deploy of the web frontend to
-production (for example `wrangler deploy --env production` from the launch
-SHA, run from `apps/web`) with the `nntune.com` apex custom domain (repo
-variable `PRODUCTION_DOMAIN`) attached and `www` redirecting to the apex,
-leaving a single 100% deployment. The lane enforces this before
-uploading anything: its seed step lists production deployments and refuses
-with these instructions when no single-version 100% deployment exists, so a
-first run fails with guidance instead of orphaning an uploaded version inside
-the promotion action. Re-dispatch the lane after seeding.
+The first rollback target is a binding-free maintenance Worker, not a direct
+application deploy. Do not bypass the production lane to seed the app.
+
+1. **Release Manager:** Accept the exact launch SHA after M1, staging
+   admission, Security → QA, exact-head CI and migration ledger review.
+   Explicitly accept the maintenance seed, hostname attachment and rollback.
+2. **DevOps / GitHub custodian:** Verify the production Environment and
+   credential scopes; set `PRODUCTION_BOOTSTRAP_ACCEPTED_SHA` after acceptance.
+   Dispatch `deploy-production.yml` on `main` with that SHA and
+   `mode=bootstrap-maintenance`. Staging receipt and environment gates still
+   apply. This refuses an existing Worker and never attaches a host or tags.
+   No out-of-band writes; stop and reconcile partial failures before retry.
+3. **Cloudflare custodian / DevOps:** Record the seed's 100% version ID.
+   Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
+   route conflicts; attach the host to `nntune-web` without displacing routing.
+   Record the non-cacheable, non-indexable maintenance 503 probe.
+4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
+   for the same accepted SHA. Stage failure restores maintenance. On final
+   smoke failure, use the locked `apps/web` CLI and production credentials:
+   `wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes` with
+   the recorded UUID. Verify 100% on that version, maintenance 503 on `/`
+   and `/api/build`, and no tag. Retry only with current release admission.
 
 ### Production Worker secret-shape gate
 
