@@ -1965,6 +1965,39 @@ where
     }
 }
 
+// Adapted from the history reader in PR #982. Keep unregistered until
+// private classification is atomic with new-play acquisition.
+#[allow(dead_code)]
+async fn me_history_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.history_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "play_id": row.play_id,
+                        "track_id": row.track_id,
+                        "played_at": row.played_at,
+                        "stream_seconds": row.stream_seconds,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
 // Prepared for direct testing only; preference routes remain unregistered.
 #[allow(dead_code)]
 async fn me_like_track<S, M, D, N>(
@@ -8115,50 +8148,128 @@ mod tests {
     }
 
     #[test]
-    fn history_fake_only_returns_public_metered_bound_plays() {
-        let store = FakeStore::default();
-        let mut windows = store.play_windows.borrow_mut();
-        for i in 0..55 {
+    fn unwired_history_lists_only_public_metered_plays_and_fails_closed() {
+        use serde_json::{json, Value};
+
+        let h = play_harness();
+        let store = &h.store;
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/history?user_id=bob".into(),
+            cookie: Some(alice.clone()),
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request| {
+            let resp = block_on(me_history_list(&h.ctx(), req));
+            assert!(resp.set_cookie.is_none() && resp.extra_headers.is_empty());
+            (resp.status, resp.body)
+        };
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
+        seed_entitled(&h, "alice", "plus", 100);
+        assert!(shared_play_call(&h, "alice", &claims.session_id, "track", None).is_ok());
+        // A grant without delivery does not make a history item.
+        assert_eq!(call(&req), (200, r#"{"items":[]}"#.into()));
+
+        let record = |owner: &str, play: &str, at| {
             let window = crate::ledger::prepare_play_window(
-                "alice",
+                owner,
                 "track",
-                &format!("p{i:02}"),
+                play,
                 100,
-                None,
-                None,
-                i,
+                Some(200),
+                Some(14_000),
+                at,
             )
             .unwrap();
-            windows.insert(window.idempotency_key.clone(), window);
+            assert_eq!(
+                block_on(store.record_play_window(&window)).unwrap(),
+                crate::meter_sink::PlayWindowOutcome::Written
+            );
+            window
+        };
+        for i in 0..55 {
+            record("alice", &format!("p{i:02}"), NOW + i / 2);
         }
-        let mut private =
-            crate::ledger::prepare_play_window("alice", "track", "private", 100, None, None, 100)
-                .unwrap();
+        let private = record("alice", "private", NOW + 100);
         store
             .private_play_marks
             .borrow_mut()
             .insert(("alice".into(), private.idempotency_key.clone()));
-        windows.insert(private.idempotency_key.clone(), private.clone());
-        private.idempotency_key = "play:bob:track:forged".into();
-        windows.insert(private.idempotency_key.clone(), private.clone());
-        private.idempotency_key = "play:alice:track:zero".into();
-        private.bytes_served = 0;
-        windows.insert(private.idempotency_key.clone(), private);
-        let foreign =
-            crate::ledger::prepare_play_window("bob", "track", "foreign", 100, None, None, 200)
-                .unwrap();
-        windows.insert(foreign.idempotency_key.clone(), foreign);
-        drop(windows);
-        let rows = block_on(store.history_list("alice")).unwrap();
-        assert_eq!(rows.len(), 50);
-        assert_eq!(rows[0].play_id, "p54");
-        assert_eq!(rows[49].play_id, "p05");
+        for (key, bytes) in [
+            ("play:bob:track:forged", 100),
+            ("play:alice:other:forged", 100),
+            ("play:alice:track:extra:part", 100),
+            ("ingest:alice:track:non-play", 100),
+            ("play:alice:track:zero", 0),
+        ] {
+            let mut window = private.clone();
+            window.idempotency_key = key.into();
+            window.bytes_served = bytes;
+            store.play_windows.borrow_mut().insert(key.into(), window);
+        }
+        record("bob", "foreign", NOW + 200);
+        block_on(store.upsert_private_session("alice", &claims.session_id, NOW + 60)).unwrap();
+        block_on(store.taste_upsert(
+            "alice",
+            crate::target_identity::TargetKind::Track,
+            "track",
+            crate::taste_signal::TasteSignal::Love,
+            None,
+            NOW,
+        ))
+        .unwrap();
+        let snapshot = || {
+            (
+                store.play_windows.borrow().clone(),
+                store.stream_seconds.borrow().clone(),
+                store.taste_rows.borrow().clone(),
+                store.private_play_marks.borrow().clone(),
+                store.private_sessions.borrow().clone(),
+            )
+        };
+        let before = snapshot();
+        let item = |play_id, played_at| json!({"play_id": play_id, "track_id": "track", "played_at": played_at, "stream_seconds": 7});
+        let (status, body) = call(&req);
+        assert_eq!(status, 200);
+        // Equal timestamps exercise the key tie-breaker, including at the cap.
+        let expected: Vec<_> = (5..55)
+            .rev()
+            .map(|i| item(format!("p{i:02}"), NOW + i / 2))
+            .collect();
         assert_eq!(
-            block_on(store.history_list("bob")).unwrap()[0].play_id,
-            "foreign"
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"items": expected})
         );
+        req.cookie = Some(bob);
+        let (status, body) = call(&req);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"items":[item("foreign".into(), NOW + 200)]})
+        );
+        req.cookie = Some(alice);
+
         *store.fail_history_read.borrow_mut() = true;
-        assert!(block_on(store.history_list("alice")).is_err());
+        assert_eq!(call(&req), (503, unavailable().body));
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert_eq!(call(&req), (409, account_deleting_response().body));
+        *store.fail_history_read.borrow_mut() = false;
+        *store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req), (503, unavailable().body));
+        *store.fail_deleting_probe.borrow_mut() = false;
+        store.deleting_users.borrow_mut().remove("alice");
+        // Model an erased user and cascaded session while retaining ledger fixtures.
+        store.users.borrow_mut().remove("alice");
+        store.sessions.borrow_mut().remove(&claims.session_id);
+        assert_eq!(call(&req), (401, generic_auth().body));
+        assert_eq!(snapshot(), before);
     }
 
     #[test]
