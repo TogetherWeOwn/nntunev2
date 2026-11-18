@@ -39,6 +39,7 @@ nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-fe
 nntune-test-nntp = { version = "0.1.0", path = "../../crates/nntune-test-nntp" }
 nntune-test-fixtures = { version = "0.1.0", path = "../../crates/nntune-test-fixtures" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = { version = "0.7", features = ["runtime"] }
 
 # Standalone even when this checkout is nested under a managed worktree.
 [workspace]
