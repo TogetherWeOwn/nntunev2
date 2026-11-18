@@ -104,6 +104,17 @@ class SealedCandidate(unittest.TestCase):
                 self.assertEqual(fdopen.call_args.kwargs["buffering"], 0)
                 self.assertEqual(reader.read.call_args_list, [call(4), call(1)])
 
+    def test_snapshot_rejects_short_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate.wasm"
+            output.write_bytes(b"wasm")
+            with patch.object(sealed.os, "fdopen") as fdopen:
+                reader = fdopen.return_value.__enter__.return_value
+                reader.read.side_effect = [b"was", b""]
+                with self.assertRaisesRegex(ValueError, "candidate output size changed while reading"):
+                    sealed.snapshot_build_output(output)
+                reader.read.assert_called_once_with(4)
+
     def test_snapshot_is_the_sealed_consumer_input(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "candidate.wasm"
