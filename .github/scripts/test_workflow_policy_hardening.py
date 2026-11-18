@@ -178,6 +178,13 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("git -C data rev-parse HEAD", text)
         self.assertIn("git -C trusted rev-parse HEAD", text)
         self.assertEqual(text.count("staging_apply.py readback"), 1)
+        self.assertEqual(text.count("staging_apply.py audit"), 1)
+        self.assertIn("staging_apply.py audit --trusted-root trusted --data-root data", text)
+        self.assertIn("AUDIT_RECEIPT: ledger-audit-receipt.json", text)
+        self.assertIn("path: ledger-audit-receipt.json", text)
+        self.assertIn("default: readback", text)
+        self.assertEqual(text.count("if: ${{ inputs.mode == 'audit' }}"), 2)
+        self.assertEqual(text.count("if: ${{ inputs.mode == 'readback' }}"), 2)
         for forbidden in ("staging_apply.py apply", "apply_migration.py", "all-pending", "--record-only", "$GITHUB_ENV"):
             self.assertNotIn(forbidden, text)
         self.assertIn("path: readback-receipt.json", text)

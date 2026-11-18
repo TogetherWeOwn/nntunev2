@@ -114,6 +114,25 @@ impl BillingBudget {
     }
 }
 
+/// Start the future billing transaction with conservative work-phase limits.
+/// A failed batch may have begun a transaction, so attempt rollback; failure
+/// or cancellation of that attempt does not establish connection cleanup.
+pub(super) async fn bootstrap_transaction(
+    client: &mut tokio_postgres::Client,
+) -> Result<(), StoreError> {
+    let remaining_ms = WORK_MS;
+    let lock_ms = remaining_ms.min(4_000);
+    let statement_ms = remaining_ms.min(5_000);
+    let idle_ms = remaining_ms.min(5_000);
+    if client.batch_execute(&format!(
+        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL transaction_timeout = {remaining_ms}; SET LOCAL lock_timeout = {lock_ms}; SET LOCAL statement_timeout = {statement_ms}; SET LOCAL idle_in_transaction_session_timeout = {idle_ms}"
+    )).await.is_err() {
+        let _ = client.batch_execute("ROLLBACK").await;
+        return Err(StoreError);
+    }
+    Ok(())
+}
+
 /// Inactive owned transport preparation. Callbacks must not spawn work or let
 /// database handles escape; transaction setup and outcome handling remain the
 /// responsibility of the future billing operation.
@@ -220,6 +239,113 @@ pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
         return Err("real connection work phase did not expire after starting");
     }
     Ok((success_pid, timeout_pid.get()))
+}
+
+// This runs only in the disposable Worker test bundle, against its fixed service.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) async fn test_transaction_bootstrap() -> Result<(), &'static str> {
+    const CONNECTION: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable application_name=bootstrap_test";
+    with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |client| Box::pin(bootstrap_transaction(client)),
+        |client| {
+            Box::pin(async move {
+                let row = client.query_one(
+                    "SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')",
+                    &[],
+                ).await.map_err(|_| StoreError)?;
+                let settings: Vec<String> = (0..5).map(|i| row.get(i)).collect();
+                if settings != ["read committed", "9s", "4s", "5s", "5s"] {
+                    return Err(StoreError);
+                }
+                client.batch_execute("CREATE TEMP TABLE bootstrap_worker_probe (id integer); ROLLBACK")
+                    .await.map_err(|_| StoreError)?;
+                let row = client.query_one("SELECT to_regclass('pg_temp.bootstrap_worker_probe') IS NULL", &[])
+                    .await.map_err(|_| StoreError)?;
+                if !row.get::<_, bool>(0) {
+                    return Err(StoreError);
+                }
+                Ok(())
+            })
+        },
+        || {},
+    ).await.map_err(|_| "Worker transaction bootstrap failed")
+}
+
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+mod postgres_tests {
+    use super::bootstrap_transaction;
+    use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    async fn bootstrap_overrides_session_isolation_and_commit_restores_limits() {
+        // Fixed disposable Actions service; never accept an arbitrary database URL.
+        let (mut client, connection) = tokio_postgres::connect(
+            "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable",
+            NoTls,
+        )
+        .await
+        .expect("connect disposable database");
+        let driver = tokio::spawn(connection);
+        client.batch_execute("SET default_transaction_isolation = 'repeatable read'; SET transaction_timeout = 30000; SET lock_timeout = 11000; SET statement_timeout = 12000; SET idle_in_transaction_session_timeout = 13000")
+            .await.unwrap();
+        let before = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let before: Vec<String> = (0..5).map(|i| before.get(i)).collect();
+        assert_eq!(before, ["repeatable read", "30s", "11s", "12s", "13s"]);
+
+        bootstrap_transaction(&mut client).await.expect("bootstrap");
+        let during = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let during: Vec<String> = (0..5).map(|i| during.get(i)).collect();
+        assert_eq!(during, ["read committed", "9s", "4s", "5s", "5s"]);
+        client.batch_execute("COMMIT").await.unwrap();
+        let after = client.query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await.unwrap();
+        let after: Vec<String> = (0..5).map(|i| after.get(i)).collect();
+        assert_eq!(after, before);
+        drop(client);
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_sets_local_limits_and_rollback_restores_them() {
+        // Fixed disposable Actions service; never accept an arbitrary database URL.
+        let (mut client, connection) = tokio_postgres::connect(
+            "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable",
+            NoTls,
+        )
+        .await
+        .expect("connect disposable database");
+        let driver = tokio::spawn(connection);
+        let before = client
+            .query_one("SELECT current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await
+            .unwrap();
+        let before: Vec<String> = (0..4).map(|i| before.get(i)).collect();
+        bootstrap_transaction(&mut client).await.expect("bootstrap");
+        let row = client
+            .query_one("SELECT current_setting('transaction_isolation'), current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')", &[])
+            .await
+            .unwrap();
+        let settings: Vec<String> = (0..5).map(|i| row.get(i)).collect();
+        assert_eq!(settings, ["read committed", "9s", "4s", "5s", "5s"]);
+        client
+            .batch_execute("CREATE TEMP TABLE bootstrap_rollback_probe (id integer); ROLLBACK")
+            .await
+            .unwrap();
+        let after = client
+            .query_one("SELECT current_setting('transaction_timeout'), current_setting('lock_timeout'), current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'), to_regclass('pg_temp.bootstrap_rollback_probe') IS NULL", &[])
+            .await
+            .unwrap();
+        let restored: Vec<String> = (0..4).map(|i| after.get(i)).collect();
+        assert_eq!(restored, before);
+        assert!(after.get::<_, bool>(4));
+        drop(client);
+        driver.await.unwrap().unwrap();
+    }
 }
 
 // Called only within a phase deadline, itself enclosed by the total deadline.

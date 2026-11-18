@@ -110,6 +110,35 @@ class StagingApplyTests(unittest.TestCase):
                 staging_apply.run_ledger_audit(trusted, data, row[0], sha, DB, env)
             runner.assert_not_called()
 
+    def test_ledger_audit_never_publishes_actor_text(self):
+        contents = b"SELECT 1;\n"
+        sha = hashlib.sha256(contents).hexdigest()
+        manifest = manifest_text().replace(APP_SHA, sha)
+        data, trusted, root = self._roots(manifest)
+        for name in ("0054_first.sql", "0055_second.sql"):
+            (data / "migrations" / name).write_bytes(contents)
+        (trusted / "migrations").mkdir()
+        (trusted / "migrations/manifest.toml").write_text(manifest)
+        env = {"PLANETSCALE_MIGRATOR_URL_STAGING": URL_REQUIRE,
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), "AUDIT_RECEIPT": str(root / "audit"),
+               "TRUSTED_REVISION": "a" * 40, "DATA_REVISION": "b" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "readback"}
+        actors = ("sample-actor-one", "opaqueActor123456789")
+        rows = [[name, sha, "2026-11-17 04:00:00+00", actor]
+                for name, actor in zip(("0054_first.sql", "0055_second.sql"), actors)]
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"database": DB, "plain_table": True, "rows": rows}))
+        from unittest.mock import patch
+        with patch.object(staging_apply.subprocess, "run", return_value=response):
+            staging_apply.run_ledger_audit(trusted, data, rows[-1][0], sha, DB, env)
+        for path in (root / "audit", root / "summary"):
+            text = path.read_text()
+            for actor in actors:
+                self.assertNotIn(actor, text)
+            self.assertEqual(text.count('"applied_by": "[redacted]"'), 2)
+            for row in rows:
+                self.assertIn(row[0], text)
+                self.assertIn(row[1], text)
+
     def test_ledger_audit_requires_complete_unique_app_prefix(self):
         data, _, _ = self._roots(manifest_text())
         entries = staging_apply.load_entries(data)
@@ -118,9 +147,9 @@ class StagingApplyTests(unittest.TestCase):
         validate = staging_apply.validate_ledger_audit
         self.assertEqual(len(validate(entries, [first, second], "0055_second.sql")), 2)
         actor = [*first[:3], "release:operator"]
-        self.assertEqual(validate(entries, [actor, second], "0055_second.sql")[0]["applied_by"], actor[3])
+        self.assertEqual(validate(entries, [actor, second], "0055_second.sql")[0]["applied_by"], "[redacted]")
         historical = [*first[:3], "backfill-2026-11-03 (operator-verified)"]
-        self.assertEqual(validate(entries, [historical, second], "0055_second.sql")[0]["applied_by"], historical[3])
+        self.assertEqual(validate(entries, [historical, second], "0055_second.sql")[0]["applied_by"], "[redacted]")
         for rows in ([second], [first, first, second],
                      [first, [second[0], "f" * 64, *second[2:]]],
                      [first, second, ["0056_other.sql", APP_SHA, *first[2:]]],

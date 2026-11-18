@@ -59,6 +59,51 @@ async fn store(populated: bool, configured: bool) -> (impl Store, Rc<Cell<usize>
 }
 
 #[tokio::test]
+async fn metered_play_adapter_writes_updates_and_respects_fence() {
+    use nntune_api::ledger::prepare_play_window;
+    use nntune_api::meter_sink::PlayWindowOutcome;
+
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let owner = accounts.id(0).to_owned();
+    let db = &accounts.observer;
+    let result: Result<(), String> = async {
+        let fresh = || async {
+            Ok::<_, String>(catalogue_store_for_postgres_test(
+                private_client().await?, false, Err(StoreError), Rc::new(Cell::new(0)),
+            ))
+        };
+        let window = prepare_play_window(&owner, "track", "play", 48_000, None, None, 1)
+            .map_err(|_| "prepare")?;
+        if fresh().await?.record_play_window(&window).await.map_err(|_| "insert")? != PlayWindowOutcome::Written {
+            return Err("insert not written".into());
+        }
+        if fresh().await?.record_play_window(&window).await.map_err(|_| "replay")? != PlayWindowOutcome::Covered {
+            return Err("replay not covered".into());
+        }
+        let larger = prepare_play_window(&owner, "track", "play", 96_000, None, None, 1)
+            .map_err(|_| "prepare larger")?;
+        if fresh().await?.record_play_window(&larger).await.map_err(|_| "update")? != PlayWindowOutcome::Written {
+            return Err("larger union not written".into());
+        }
+        let row = db.query_one("SELECT stream_seconds, bytes_served FROM public.stream_play_ledger WHERE idempotency_key=$1", &[&window.idempotency_key]).await.map_err(|e| e.to_string())?;
+        if (row.get::<_, i32>(0), row.get::<_, i64>(1)) != (2, 96_000) {
+            return Err("wrong persisted metering".into());
+        }
+        db.execute("UPDATE public.users SET deleting_at=now() WHERE id=$1", &[&owner]).await.map_err(|e| e.to_string())?;
+        let fenced = prepare_play_window(&owner, "track", "newplay", 48_000, None, None, 1)
+            .map_err(|_| "prepare fenced")?;
+        if fresh().await?.record_play_window(&fenced).await.map_err(|_| "fence")? != PlayWindowOutcome::Fenced {
+            return Err("deleting account was not fenced".into());
+        }
+        let count: i64 = db.query_one("SELECT count(*) FROM public.stream_play_ledger WHERE idempotency_key=$1", &[&fenced.idempotency_key]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 0 { return Err("fenced write persisted".into()); }
+        Ok(())
+    }.await;
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn history_reader_decodes_metered_public_owner_rows() {
     let accounts = disposable_accounts::Accounts::new(2).await;
     let owner = accounts.id(0).to_owned();

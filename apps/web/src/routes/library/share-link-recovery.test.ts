@@ -12,6 +12,7 @@ import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
+import { createQueueRevision } from '#lib/player/queueRevision.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -49,7 +50,7 @@ function pageScript(search: string) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare,
+		createQueueShare, createQueueRevision,
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,

@@ -75,6 +75,33 @@ finally:
         with self.assertRaises(ValueError):
             sealed.consume_sealed(b"x", lambda _: None, ["true"], cwd="/", env={})
 
+    def test_bytes_subclass_cannot_bypass_validation(self):
+        class MisleadingBytes(bytes):
+            def __len__(self):
+                return 1
+
+            def __eq__(self, other):
+                return True
+
+        candidate = MisleadingBytes(b"candidate bytes")
+        with patch.object(sealed.os, "memfd_create") as create:
+            with self.assertRaisesRegex(ValueError, "invalid candidate bytes"):
+                sealed.consume_sealed(candidate, lambda _: None, ["/bin/true"], cwd="/", env={})
+            create.assert_not_called()
+
+    def test_consumer_command_is_copied_before_verification(self):
+        command = ["/bin/true", "original"]
+        launched = []
+
+        def verify(_):
+            command[:] = ["relative-executable", "changed"]
+
+        def run(argv, **kwargs):
+            launched.append(argv)
+
+        sealed.consume_sealed(b"x", verify, command, cwd="/", env={}, run=run)
+        self.assertEqual(launched[0][:-1], ["/bin/true", "original"])
+
     def test_consumer_failure_propagates(self):
         def fail(*args, **kwargs):
             raise subprocess.CalledProcessError(1, args[0])

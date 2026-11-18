@@ -4017,7 +4017,7 @@ impl Store for PgStore {
                             &window.user_id,
                             &window.track_id,
                             &window.period_month,
-                            &i64_of(window.stream_seconds)?,
+                            &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
                             &i64_of(window.bytes_served)?,
                             &i64_of(window.recorded_at)?,
                             &file_bytes,
