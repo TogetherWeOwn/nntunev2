@@ -774,9 +774,9 @@
 		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
 			resetRestartOnSourceChange(before, after);
 		}
+		if (kind === 'replace') queueAnnouncement = '';
 		queueController.publish(next, receipt);
 		if (!queueController.isCurrentOperation(receipt)) return false;
-		if (kind === 'replace') queueAnnouncement = '';
 		syncMiniPlayerHint(next);
 		return queueController.isCurrentOperation(receipt);
 	}
