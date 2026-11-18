@@ -9,6 +9,7 @@ use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
 use crate::media::{FileKey, Header};
 use crate::origin_sealer::OriginSealer;
+use sha2::{Digest, Sha256};
 
 fn invalid() -> crate::Error {
     crate::Error::Malformed("invalid digest enrollment state".into())
@@ -37,10 +38,17 @@ pub struct OriginManifest {
     map_id: [u8; 16],
     context: [u8; 32],
     header: [u8; 48],
+    plaintext_sha256: [u8; 32],
     rows: Vec<[u8; 32]>,
 }
 
 impl OriginManifest {
+    /// Digest of the plaintext chunks consumed by this sealer, in order.
+    /// This alone does not authorize a claim, publication, or reuse.
+    pub fn plaintext_sha256(&self) -> &[u8; 32] {
+        &self.plaintext_sha256
+    }
+
     /// Match trusted application identities and the exact origin header before
     /// exposing sealer-derived hashes for inactive candidate storage. This is
     /// not a reservation check, trusted enrollment, or authorization to reuse.
@@ -90,6 +98,7 @@ impl OriginManifest {
             map_id,
             context,
             header: [0; 48],
+            plaintext_sha256: [0; 32],
             rows,
         }
     }
@@ -111,6 +120,7 @@ pub struct DigestEnrollment {
     geometry: DigestGeometry,
     map_id: [u8; 16],
     context: [u8; 32],
+    plaintext_sha256: Sha256,
     entries: Vec<[u8; 32]>,
     rows: Vec<[u8; 32]>,
     next_chunk: u32,
@@ -145,6 +155,7 @@ impl DigestEnrollment {
             geometry,
             map_id,
             context,
+            plaintext_sha256: Sha256::new(),
             entries: Vec::with_capacity(256),
             rows: Vec::with_capacity(geometry.pages() as usize),
             next_chunk: 0,
@@ -179,6 +190,7 @@ impl DigestEnrollment {
         if sealed.bytes.len() != length as usize || sealed.final_chunk != final_chunk {
             return Err(invalid());
         }
+        self.plaintext_sha256.update(plaintext);
         self.entries.push(sealed.digest);
         self.next_chunk += 1;
         let index = self.rows.len() as u32;
@@ -219,6 +231,7 @@ impl DigestEnrollment {
             map_id: self.map_id,
             context: self.context,
             header: self.sealer.header().to_bytes(),
+            plaintext_sha256: self.plaintext_sha256.finalize().into(),
             rows: self.rows,
         })
     }
@@ -298,6 +311,33 @@ mod tests {
                 .candidate_page_hashes(&ids, length, &id(6), &changed_header)
                 .is_none());
         }
+    }
+
+    #[test]
+    fn plaintext_digest_follows_the_sealed_chunks() {
+        let ids = [id(1), id(2), id(3), id(4), id(5)];
+        let mut builder = DigestEnrollment::new(3, ids, id(6)).unwrap();
+        builder.seal_chunk(b"abc").unwrap();
+        assert_eq!(
+            builder.finish().unwrap().plaintext_sha256(),
+            &[
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
+            ]
+        );
+
+        let mut plaintext = vec![42; 65_537];
+        let mut builder = DigestEnrollment::new(plaintext.len() as u64, ids, id(6)).unwrap();
+        builder.seal_chunk(&plaintext[..65_536]).unwrap();
+        builder.seal_chunk(&plaintext[65_536..]).unwrap();
+        let digest = *builder.finish().unwrap().plaintext_sha256();
+        assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(&plaintext)));
+        plaintext[65_536] ^= 1;
+        let mut changed = DigestEnrollment::new(plaintext.len() as u64, ids, id(6)).unwrap();
+        changed.seal_chunk(&plaintext[..65_536]).unwrap();
+        changed.seal_chunk(&plaintext[65_536..]).unwrap();
+        assert_ne!(digest, *changed.finish().unwrap().plaintext_sha256());
     }
 
     #[test]
