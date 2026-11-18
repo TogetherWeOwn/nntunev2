@@ -44,6 +44,7 @@ async fn deadline_after_writes(outcome: &ReconcileOutcome) -> Result<(), StoreEr
         trace_id: "worker-deadline-test".into(),
         mirror_binding: MirrorBinding::Unconfigured,
         work_deadline_observer: Some(expired.clone()),
+        cancel_token_observer: None,
     };
     let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", outcome));
     let observe = billing_budget::with_owned_connection(
@@ -158,12 +159,15 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
         move |client| Box::pin(async move {
             phase.set("cancellation observer lock failed");
             client.batch_execute("SELECT pg_advisory_lock(781349052)").await.map_err(|_| StoreError)?;
+            let cancel_token = std::rc::Rc::new(std::cell::RefCell::new(None));
             let store = PgStore {
                 env: None,
                 trace_id: "worker-cancel-test".into(),
                 mirror_binding: MirrorBinding::Unconfigured,
                 work_deadline_observer: None,
+                cancel_token_observer: Some(cancel_token.clone()),
             };
+            super::billing_cancel_control::within_blocked_window(|| async {
             let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", &outcome));
             let mut waiting_pid = None;
             phase.set("cancellation wait observation failed");
@@ -189,8 +193,13 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
             }
             phase.set("cancellation advisory wait not observed");
             let pid = waiting_pid.ok_or(StoreError)?;
-            // Drop the actual reconciliation future only after observing its blocked backend.
+            match select(operation.as_mut(), Box::pin(super::billing_cancel_control::observe_no_cancel(client, pid))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((result, _)) => result.map_err(|_| StoreError)?,
+            }
+            let token = cancel_token.borrow_mut().take().ok_or(StoreError)?;
             drop(operation);
+            super::billing_cancel_control::send_cancel(&token).await.map_err(|_| StoreError)?;
             let mut disappeared = false;
             let mut last_state = None;
             for _ in 0..40 {
@@ -220,6 +229,8 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
             phase.set("cancellation rollback row check failed");
             let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
             if row.get::<_, i64>(0) != 0 || row.get::<_, i64>(1) != 0 { return Err(StoreError); }
+            Ok(())
+            }, StoreError).await?;
             phase.set("cancellation observer unlock failed");
             client.batch_execute("SELECT pg_advisory_unlock(781349052)").await.map_err(|_| StoreError)?;
             Ok(())

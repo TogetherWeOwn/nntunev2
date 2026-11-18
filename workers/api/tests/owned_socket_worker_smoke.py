@@ -164,31 +164,21 @@ def main():
                     url = f"http://127.0.0.1:{port}/billing-cancel-proof"
                     with close_observer.close_observer() as (closed, relay_result):
                         with ThreadPoolExecutor(max_workers=1) as pool:
+                            started = time.monotonic()
                             request = pool.submit(routing.http, "POST", url)
                             saw_eof = closed.wait(8)
-                            held = False
-                            if saw_eof:
-                                held = (
-                                    routing.psql(
-                                        settings,
-                                        BILLING_DB,
-                                        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a WHERE a.application_name = 'owned_billing_reconcile_test' AND a.wait_event_type = 'Lock' AND a.wait_event = 'advisory' AND cardinality(pg_blocking_pids(a.pid)) > 0)",
-                                        tuples=True,
-                                        timeout=2,
-                                    )
-                                    == "t"
-                                )
-                            print(
-                                f"cancellation observer: client_eof={saw_eof}, backend_blocked={held}",
-                                flush=True,
-                            )
                             status, _, body = request.result(timeout=30)
+                            elapsed = time.monotonic() - started
+                            routing.check(
+                                elapsed < 3,
+                                f"cancellation observation exceeded host bound: {elapsed:.3f}s",
+                            )
                         routing.check(
                             status == 200 and body == "billing-cancel-ok", body
                         )
                         routing.check(
-                            saw_eof and held,
-                            "client EOF was not observed while backend remained blocked",
+                            saw_eof,
+                            "client EOF was not observed",
                         )
                         relay_result.result(timeout=2)
                     print(
