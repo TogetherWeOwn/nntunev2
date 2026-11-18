@@ -439,6 +439,20 @@ single-row observation. Neither mode establishes admission expiry, writer drain,
 unknown-outcome reconciliation or crash-safe zero-idle restoration; these
 remain prerequisites for an authorized staging window, not claims of this route.
 
+`purge-census` is disabled for live use. The custodian must verify independent
+SELECT approval for the exact staging app endpoint and role before reviewed code
+pins and wires the protected binding. Ledger/runtime bindings are not substitutes.
+The purge owner confirms the immutable guard head/digest; no guard ref is checked out.
+The two counts mirror the grant and provider-owner guards in
+`0051_purge_legacy_provider_credentials.sql`, including young and temporarily protected
+members but excluding those with any session history, even revoked. This does not
+check vault markers, replace the locked guards or certify caller drain.
+
+Once separately enabled and authorized, retrieve `staging-purge-census-<run>-<attempt>`
+(seven days) as above. Require a successful protected `main` job and match
+`purge-census-receipt.json` to its trusted revision and reviewed guard. Unknown, stale
+or nonzero is NO-GO. A source merge authorizes no dispatch and produces no census.
+
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
 90-second statement/idle-in-transaction and 10-second lock timeouts.
