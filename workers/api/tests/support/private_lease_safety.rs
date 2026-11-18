@@ -1,10 +1,11 @@
-//! Disposable-PostgreSQL controls for the unwired private acquisition.
+//! Disposable-PostgreSQL controls for private acquisition through Store.
 use super::disposable_accounts;
-use nntune_api::handlers::{Store, StoreError};
+use nntune_api::handlers::{self, Request, Store, StoreError};
 use nntune_api::playback::LeaseAcquire::Acquired;
 use nntune_api::worker_entry::{
     catalogue_store_for_postgres_test, private_aware_lease_for_postgres_test as acquire,
 };
+use serde_json::{json, Value};
 use std::{cell::Cell, rc::Rc, time::Duration};
 use tokio_postgres::Client;
 
@@ -21,6 +22,124 @@ async fn store() -> Result<impl Store, String> {
         Err(StoreError),
         Rc::new(Cell::new(0)),
     ))
+}
+
+async fn dispatch(
+    now: u64,
+    connections: usize,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: Value,
+) -> Result<Value, String> {
+    use super::{NoExternalIo, SIGNING_KEY};
+    use nntune_api::{meter_sink, worker_entry::request_store_for_postgres_test};
+    let mut clients = Vec::new();
+    for _ in 0..connections {
+        clients.push(connection().await?);
+    }
+    let store = request_store_for_postgres_test(clients);
+    let origin = "https://app.example.test";
+    let cfg = handlers::Config::new(
+        "app.example.test",
+        origin,
+        SIGNING_KEY.to_vec(),
+        [0; 32],
+        1,
+        3600,
+        false,
+        false,
+        None,
+    )
+    .map_err(|_| "test configuration")?
+    .with_play_grant_secret(SIGNING_KEY.to_vec())
+    .with_meter_sink_secret(SIGNING_KEY.to_vec());
+    let ctx = handlers::Ctx {
+        cfg: &cfg,
+        store: &store,
+        mailer: &NoExternalIo,
+        dialer: &NoExternalIo,
+        dns: &NoExternalIo,
+        now,
+        source_ip: "127.0.0.1".into(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
+    };
+    let body = body.to_string().into_bytes();
+    let authorization = (path == meter_sink::SINK_PATH)
+        .then(|| meter_sink::authorization_header(Some(SIGNING_KEY), now, &body))
+        .flatten();
+    let response = handlers::handle(
+        &ctx,
+        &Request {
+            method: method.into(),
+            path: path.into(),
+            cookie: cookie.map(str::to_owned),
+            origin: Some(origin.into()),
+            authorization,
+            stripe_signature: None,
+            body,
+        },
+    )
+    .await;
+    if response.status != 200 {
+        return Err(format!("{method} {path}: status {}", response.status));
+    }
+    serde_json::from_str(&response.body).map_err(|_| format!("{path}: invalid response"))
+}
+
+#[tokio::test]
+async fn dispatched_private_grant_and_meter_keep_history_and_billing_distinct() {
+    use nntune_api::{meter_sink::SINK_PATH, session::SessionClaims};
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let (db, user) = (&accounts.observer, accounts.id(0));
+    let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(30), async {
+        let now: i64 = db.query_one("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let sid = format!("session-{user}");
+        db.execute("INSERT INTO public.sessions(id,user_id,created_at,expires_at) VALUES($1,$2,$3,$4)", &[&sid, &user, &now, &(now + 3_600)]).await.map_err(|e| e.to_string())?;
+        db.execute("INSERT INTO public.subscriptions (user_id,stripe_subscription_id,stripe_customer_id,stripe_subscription_item_id,stripe_price_id,plan_id,status,paid_through_at) VALUES($1,$1,$1,$1,'test','plus','active',now()+interval '1 hour')", &[&user]).await.map_err(|e| e.to_string())?;
+        let now = now as u64;
+        let token = super::token(&SessionClaims { session_id: sid, user_id: user.into(), created_at: now, issued_at: now, expires_at: now + 3_600, rotation_counter: 0 });
+        let cookie = format!("{}={token}", super::COOKIE_NAME);
+        let play = |id: Value| dispatch(now, if id.is_null() { 7 } else { 4 }, "POST", "/v1/plays", Some(&cookie), json!({"track_id":"track","session_id":"client","play_id":id}));
+        let toggle = |enabled| dispatch(now, 3, "PUT", "/v1/me/private-session", Some(&cookie), json!({"session_id":"client","enabled":enabled}));
+        let public = play(Value::Null).await?;
+        toggle(true).await?;
+        let public_resumed = play(public["play_id"].clone()).await?;
+        let private = play(Value::Null).await?;
+        db.execute("UPDATE public.private_sessions SET expires_at=$2 WHERE user_id=$1 AND session_id='client'", &[&user, &(now as i64 - 1)]).await.map_err(|e| e.to_string())?;
+        let expired_resumed = play(private["play_id"].clone()).await?;
+        toggle(false).await?;
+        let disabled_resumed = play(private["play_id"].clone()).await?;
+        for (start, resumed) in [(&public, public_resumed), (&private, expired_resumed), (&private, disabled_resumed)] {
+            if resumed["play_id"] != start["play_id"] || resumed["lease_epoch"] != start["lease_epoch"] { return Err("continuation changed the holder".into()); }
+        }
+        let grant_only = play(Value::Null).await?;
+        let mut windows = Vec::new();
+        for (play, private, bytes) in [(&public, false, 96_000), (&private, true, 48_000), (&grant_only, false, 0)] {
+            let id = play["play_id"].as_str().ok_or("missing play id")?;
+            if play["grant"].as_str().is_none() { return Err("missing grant".into()); }
+            let key = format!("play:{user}:track:{id}");
+            if store().await?.private_play_marked(user, "track", &key).await.map_err(|_| "mark read failed")? != private {
+                return Err("wrong committed mark before delivery".into());
+            }
+            if bytes != 0 {
+                windows.push(json!({"user_id": user,"track_id":"track","play_id":id,"union_bytes":bytes,"started_at":now}));
+            }
+        }
+        let ack = dispatch(now, 2, "POST", SINK_PATH, None, json!({"windows":windows})).await?;
+        if ack != json!({"accepted":[public["play_id"],private["play_id"]],"fenced":[],"rejected":[]}) { return Err("meter did not acknowledge both deliveries".into()); }
+        let month = nntune_api::ledger::period_month_for_timestamp(now);
+        let key = format!("play:{user}:track:{}", private["play_id"].as_str().ok_or("missing private id")?);
+        let row = db.query_one("SELECT bytes_served, stream_seconds FROM public.stream_play_ledger WHERE idempotency_key=$1", &[&key]).await.map_err(|e| e.to_string())?;
+        if row.get::<_, i64>(0) != 48_000 || row.get::<_, i32>(1) != 1 || store().await?.monthly_stream_seconds(user, &month).await.map_err(|_| "usage read failed")? != 3 {
+            return Err("private delivery was not billed".into());
+        }
+        let history = store().await?.history_list(user).await.map_err(|_| "history read failed")?;
+        if history.len() != 1 || Some(history[0].play_id.as_str()) != public["play_id"].as_str() { return Err("private or grant-only play leaked into history".into()); }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("dispatched privacy/meter test timed out".into()));
+    accounts.cleanup().await;
+    result.unwrap();
 }
 
 #[tokio::test]
@@ -74,8 +193,12 @@ async fn private_delivery_is_hidden_from_history_not_metering() {
             )
             .await
             .map_err(|_| "acquisition failed")?;
-            if !matches!(outcome.0, Acquired { .. }) || outcome.1 != private {
-                return Err(format!("incorrect classification: {outcome:?}"));
+            if !matches!(outcome, Acquired { .. }) {
+                return Err(format!("incorrect acquisition: {outcome:?}"));
+            }
+            let key = format!("play:{user}:track:{play}");
+            if store().await?.private_play_marked(user, "track", &key).await.map_err(|_| "mark probe failed")? != private {
+                return Err(format!("incorrect classification for {play}"));
             }
         }
         let key = format!("play:{a}:track:secret");

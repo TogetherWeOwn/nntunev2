@@ -750,7 +750,7 @@ struct PgStore {
     trace_id: String,
     mirror_binding: MirrorBinding,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-    test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    test_clients: std::cell::RefCell<std::collections::VecDeque<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
@@ -869,7 +869,7 @@ pub fn catalogue_store_for_postgres_test(
         } else {
             MirrorBinding::Unconfigured
         },
-        test_client: std::cell::RefCell::new(Some(app)),
+        test_clients: std::cell::RefCell::new([app].into()),
         test_mirror: Some(CatalogueTestMirror {
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
@@ -886,16 +886,24 @@ pub fn catalogue_store_for_postgres_test(
 pub fn session_retry_store_for_postgres_test(
     client: tokio_postgres::Client,
 ) -> impl Store + SingleUseStore {
+    request_store_for_postgres_test([client])
+}
+
+/// One guarded, owned connection per Store operation in the request.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn request_store_for_postgres_test(
+    clients: impl IntoIterator<Item = tokio_postgres::Client>,
+) -> impl Store + SingleUseStore {
     PgStore {
         env: None,
-        trace_id: "postgres-refresh-test".into(),
+        trace_id: "postgres-request-test".into(),
         mirror_binding: MirrorBinding::Configured,
-        test_client: std::cell::RefCell::new(Some(client)),
+        test_clients: std::cell::RefCell::new(clients.into_iter().collect()),
         test_mirror: None,
     }
 }
 
-/// Exercise the unwired PgStore method with a disposable connection only.
+/// Exercise the real Store acquisition with a disposable connection only.
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn private_aware_lease_for_postgres_test(
@@ -907,18 +915,12 @@ pub async fn private_aware_lease_for_postgres_test(
     now: u64,
     expires_at: u64,
     takeover: bool,
-) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
-    PgStore {
-        env: None,
-        trace_id: "postgres-private-lease-test".into(),
-        mirror_binding: MirrorBinding::Configured,
-        test_client: std::cell::RefCell::new(Some(client)),
-        test_mirror: None,
-    }
-    .acquire_private_aware_lease(
-        user_id, session_id, track_id, play_id, now, expires_at, takeover,
-    )
-    .await
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    session_retry_store_for_postgres_test(client)
+        .acquire_playback_lease(
+            user_id, session_id, track_id, play_id, now, expires_at, takeover,
+        )
+        .await
 }
 
 /// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
@@ -937,9 +939,9 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
-    /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
+    /// NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_private_aware_lease(
         &self,
         user_id: &str,
@@ -949,7 +951,7 @@ impl PgStore {
         now: u64,
         expires_at: u64,
         takeover: bool,
-    ) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
                 let key = format!("play:{user_id}:{track_id}:{play_id}");
@@ -1023,11 +1025,10 @@ impl PgStore {
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
                     tx.commit().await.map_err(|_| StoreError)?;
-                    Ok((result, private))
                 } else {
                     tx.rollback().await.map_err(|_| StoreError)?;
-                    Ok((result, false))
                 }
+                Ok(result)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1325,7 +1326,7 @@ impl PgStore {
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        if let Some(client) = self.test_client.borrow_mut().take() {
+        if let Some(client) = self.test_clients.borrow_mut().pop_front() {
             return Ok(client);
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
@@ -3891,15 +3892,8 @@ impl Store for PgStore {
         expires_at: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-        Self::bounded(
-            async {
-                let client = self.connect().await?;
-                acquire_playback_lease_on(
-                    &client, user_id, session_id, track_id, play_id, now, expires_at, takeover,
-                )
-                .await
-            },
-            TOTAL_TIMEOUT_MS,
+        self.acquire_private_aware_lease(
+            user_id, session_id, track_id, play_id, now, expires_at, takeover,
         )
         .await
     }
@@ -6892,7 +6886,7 @@ pub async fn subsonic_mount(
         trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
         mirror_binding: MirrorBinding::from_env(&env),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-        test_client: std::cell::RefCell::new(None),
+        test_clients: std::cell::RefCell::default(),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_mirror: None,
     };
@@ -7082,7 +7076,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-            test_client: std::cell::RefCell::new(None),
+            test_clients: std::cell::RefCell::default(),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },
