@@ -62,8 +62,8 @@ pub fn candidate_pages_match(
     if !(1..=8_589_934_592).contains(&plaintext_len) {
         return false;
     }
-    let chunks = ((plaintext_len + 65_535) / 65_536) as usize;
-    let pages = (chunks + 255) / 256;
+    let chunks = plaintext_len.div_ceil(65_536) as usize;
+    let pages = chunks.div_ceil(256);
     expected.len() == pages
         && persisted.len() == pages
         && expected
