@@ -26,7 +26,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
-		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelectedTrack'
+		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -492,6 +492,35 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(plays).toBe(0);
 	expect(page.read().queueAnnouncement).toBe(edited.queueAnnouncement);
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
+});
+
+test('native play access cannot start an attempt retired by a queue edit', async () => {
+	const { page, element } = restartFixture();
+	let plays = 0;
+	let afterEdit: ReturnType<typeof page.read> | undefined;
+	Object.defineProperty(element, 'play', { get() {
+		page.remove(0);
+		afterEdit = page.read();
+		return () => { plays += 1; return Promise.resolve(); };
+	} });
+	await page.playQueued('coral');
+	expect(plays).toBe(0);
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(page.read()).toEqual(afterEdit);
+});
+
+test('a late rejection cannot report against a replacement attachment at the same source', async () => {
+	const { page, element, remount } = restartFixture();
+	let rejectPlay!: (reason: Error) => void;
+	element.play = () => new Promise<void>((_resolve, reject) => { rejectPlay = reject; });
+	const attempt = page.playQueued('coral');
+	await Promise.resolve();
+	const replacement = remount();
+	const before = page.read();
+	rejectPlay(new Error('blocked'));
+	await attempt;
+	expect(page.currentAudio()).toBe(replacement);
+	expect(page.read()).toEqual(before);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {

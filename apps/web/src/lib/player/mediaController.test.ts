@@ -1,6 +1,21 @@
 import { expect, test, vi } from 'vitest';
 import { createMediaController } from './mediaController.js';
 
+test('feedback that retires the attempt cannot also bump its live region', async () => {
+	const media = createMediaController();
+	const queue = { tracks: [{ id: 'coral', title: 'Coral', artist: '', streamUrl: '' }], currentIndex: 0 };
+	const announce = vi.fn(() => media.destroy());
+	const bumpAnnouncement = vi.fn();
+	const flush = vi.fn(async () => {});
+	await media.playSelected(queue, 0, { streamUrl: '', isCurrent: () => true }, '', {
+		revision: { revoke: () => 1, isCurrent: () => true },
+		commit: () => true, flush, announce, bumpAnnouncement
+	});
+	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; no stream to play.');
+	expect(flush).not.toHaveBeenCalled();
+	expect(bumpAnnouncement).not.toHaveBeenCalled();
+});
+
 test('cleanup belongs to the attachment, even when the same node is attached twice', () => {
 	const media = createMediaController();
 	const pause = vi.fn(() => expect(media.audio).toBeUndefined());

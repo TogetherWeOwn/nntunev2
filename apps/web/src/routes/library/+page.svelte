@@ -242,7 +242,6 @@
 	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
-	const queueRevision = queueController;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -673,37 +672,18 @@
 		// hydrates only its selected slot, preserving every other queued row.
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
-		base.tracks[index] = { ...target, streamUrl: evidence.streamUrl };
-		if (!replaceQueue(selectQueueIndex(base, index))) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await playSelectedTrack(target, evidence, counts);
+		await playSelected(base, index, evidence, counts);
 	}
 
-	/** One explicit playback attempt, fenced by queue and source receipts. */
-	async function playSelectedTrack(
-		target: Track, { streamUrl, isCurrent }: QueuedPlaySource, suffix = ''
-	): Promise<void> {
-		if (!isCurrent()) return;
-		const receipt = queueRevision.revoke();
-		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
-		let lead = `Selected ${title}; no stream to play.`;
-		if (streamUrl) {
-			await tick();
-			if (!queueRevision.isCurrent(receipt) || !isCurrent()) return;
-			const element = media.audio;
-			lead = `Selected ${title}, paused: playback was blocked.`;
-			if (element) {
-				try {
-					await element.play();
-					lead = `Playing ${title}.`;
-				} catch {
-					// Selected-but-paused is the truthful fallback; no retry.
-				}
-			}
-			if (!queueRevision.isCurrent(receipt) || !isCurrent()) return;
-		}
-		queueAnnouncement = suffix ? `${lead} ${suffix}` : lead;
-		queueAnnouncementVersion += 1;
+	function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
+		return media.playSelected(base, index, source, suffix, {
+			revision: queueController,
+			commit: replaceQueue,
+			flush: tick,
+			announce: (message) => { queueAnnouncement = message; },
+			bumpAnnouncement: () => { queueAnnouncementVersion += 1; }
+		});
 	}
 
 	let favoritesAction = 0;
@@ -1108,10 +1088,7 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
 		if (!evidence) return;
-		const tracks = [...queue.tracks];
-		tracks[index] = { ...target, streamUrl: evidence.streamUrl };
-		if (!replaceQueue(selectQueueIndex({ ...queue, tracks }, index))) return;
-		await playSelectedTrack(target, evidence);
+		await playSelected(queue, index, evidence);
 	}
 
 	function trimPreviousTracks(): void {
@@ -1531,11 +1508,8 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
-		const tracks = [...base.tracks];
-		tracks[index] = { ...target, streamUrl: evidence.streamUrl };
-		if (!replaceQueue(selectQueueIndex({ ...base, tracks }, index))) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await playSelectedTrack(target, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
+		await playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1816,7 +1790,7 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
-			queueRevision.destroy();
+			queueController.destroy();
 			queueShare.dispose();
 			endGeneration += 1;
 			media.destroy();
