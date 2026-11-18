@@ -22,6 +22,32 @@ where
     }
 }
 
+/// Negative control: with no cancel request, independently verify that the
+/// same backend is still blocked by this observer on both sides of a delay.
+/// The caller holds the advisory lock and keeps the target operation polled.
+pub(crate) async fn observe_no_cancel(
+    observer: &tokio_postgres::Client,
+    pid: i32,
+) -> Result<(), &'static str> {
+    for attempt in 0..2 {
+        if attempt != 0 {
+            worker::Delay::from(Duration::from_millis(250)).await;
+        }
+        let blocked: bool = observer
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))",
+                &[&pid],
+            )
+            .await
+            .map_err(|_| "negative control observation failed")?
+            .get(0);
+        if !blocked {
+            return Err("negative control backend did not remain blocked");
+        }
+    }
+    Ok(())
+}
+
 /// A successful send is not an acknowledgement; the caller must independently
 /// observe the target backend and rollback inside `within_blocked_window`.
 pub(crate) async fn send_cancel(token: &CancelToken) -> Result<(), &'static str> {
