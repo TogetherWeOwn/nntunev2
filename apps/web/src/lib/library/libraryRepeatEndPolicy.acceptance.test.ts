@@ -12,10 +12,11 @@ import {
 } from '../player/queue.js';
 
 /**
- * Acceptance for LIBREPEAT: advance at end of track with an explicit repeat
- * Off/One/Queue control on `/library`. `native-restart-builder.test.ts` verifies
- * the registered native ended callback (LIBREP-U03); the companion browser
- * spec verifies the rendered route.
+ * Test-Author owned acceptance for LIBREPEAT: advance at end of track with an
+ * explicit repeat Off/One/Queue control on `/library`. The Builder wires
+ * `apps/web/src/routes/library/+page.svelte` to satisfy this file plus
+ * `apps/web/tests/library-repeat-end-policy.spec.ts` and must not edit either
+ * file.
  *
  * LOCKED CONTRACT (`apps/web/src/routes/library/+page.svelte`):
  * - A NATIVE <select> `player-repeat` (accessible name /repeat/i, values
@@ -34,11 +35,23 @@ import {
  *   automatic advance, none for silent transitions.
  * See the Playwright spec header for the full page contract.
  *
+ * PROTECTED (Test-Author owned; Builder must not edit):
+ * - `apps/web/src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts` (this file)
+ * - `apps/web/tests/library-repeat-end-policy.spec.ts`
+ * BUILDER-OWNED implementation surface:
+ * - `apps/web/src/routes/library/+page.svelte` (repeat control + status,
+ *   ended wiring via naturalEndPolicy, persistence, announcements)
+ * - Existing queue/resume/share/sleep suites stay unchanged.
+ *
  * Run from apps/web (offline):
  *   pnpm test src/lib/library/libraryRepeatEndPolicy.acceptance.test.ts
  * Companion browser run (builds + serves locally; no staging/prod):
  *   pnpm exec playwright test tests/library-repeat-end-policy.spec.ts
  *
+ * RED NOW: the library route has no repeat hooks and does not reference
+ * `naturalEndPolicy`. GREEN CONTROLS: the no-loop pin and the
+ * naturalEndPolicy vector pins pass on the current tree, proving this file
+ * compiles and the reuse contract holds.
  * Every RED assertion message is a compact JSON receipt:
  * {"case","expected","actual","status","error_code","next_action"}.
  */
@@ -143,6 +156,20 @@ describe('library repeat hooks are declared in the library markup', () => {
 				'Builder adds the role=status repeat announcement region.'
 			)
 		).toContain('data-testid="repeat-status"');
+	});
+
+	it('LIBREP-U03 wires the native ended event on the library audio', () => {
+		const audio = routeSource().match(/<audio\b[^>]*\sdata-testid="audio-player"(?=\s|>)[^>]*>/)?.[0];
+		expect(
+			audio ?? '',
+			note(
+				'LIBREP-U03',
+				'the library audio player uses the attachment that registers native ended',
+				'missing audio player or native audio attachment',
+				'ended_handler_missing',
+				'Builder wires attachNativeAudio on the library <audio> and routes ended through naturalEndPolicy (no parallel end-policy).'
+			)
+		).toMatch(/\s\{@attach\s+attachNativeAudio\s*\}(?=\s|>)/);
 	});
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {
