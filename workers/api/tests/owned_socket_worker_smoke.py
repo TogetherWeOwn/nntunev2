@@ -76,6 +76,15 @@ def billing_database(settings):
         admin(f"DROP DATABASE {BILLING_DB}")
 
 
+def check_write_deadline(base, settings, observe):
+    status, _, body = routing.http("POST", base + "/owned-write-deadline-proof")
+    pids = parse_pids(status, body, "owned-write-deadline-ok", 1)
+    wait_for_sessions(settings, pids)
+    count = observe("SELECT count(*) FROM users WHERE id = 'deadline_probe'", tuples=True)
+    routing.check(count == "0", f"deadline write survived: {count!r}")
+    print("PASS: standalone Worker deadline rolled back a prior write", flush=True)
+
+
 def check_billing_ack(base, settings, observe):
     with relay.commit_relay() as ack:
         status, _, body = routing.http("POST", base + "/billing-ack-proof")
@@ -137,6 +146,7 @@ def main():
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
                 with billing_database(settings) as observe:
+                    check_write_deadline(f"http://127.0.0.1:{port}", settings, observe)
                     check_billing_ack(f"http://127.0.0.1:{port}", settings, observe)
             finally:
                 routing.process_group.shutdown_process_group(proc)
