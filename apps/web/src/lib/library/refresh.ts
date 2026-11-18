@@ -23,13 +23,20 @@ export interface LibraryRefreshState {
 	requiresSignIn: boolean;
 }
 
+export interface LibraryRefreshUpdate {
+	/** False after another request, an auth transition, or disposal. */
+	isCurrent: () => boolean;
+	/** A successful response or an explicit invalidation, never cached fallback. */
+	authoritative: boolean;
+}
+
 export interface LibraryRefresherDeps {
 	/** Session-scoped snapshot storage, or null when storage is unavailable. */
 	sessionStorage: () => SnapshotStorage | null;
 	/** Clears every snapshot area and tells other tabs the session ended. */
 	invalidateLibraryCache: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
-	onStateChange?: (state: LibraryRefreshState) => void;
+	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
 	timeoutMs?: number;
 }
 
@@ -64,21 +71,23 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	let inMemorySnapshot: LibrarySnapshot | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
+	let disposed = false;
 
-	function notify(): void {
-		deps.onStateChange?.(state);
+	function startReceipt(): () => boolean {
+		const generation = ++requestGeneration;
+		return () => !disposed && generation === requestGeneration;
 	}
 
 	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
-		if (activeRequest) return;
-		const generation = ++requestGeneration;
+		if (disposed || activeRequest) return;
+		const isCurrent = startReceipt();
+		const controller = new AbortController();
+		activeRequest = controller;
 		state.loading = true;
 		state.loadError = null;
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
-		notify();
-		const controller = new AbortController();
-		activeRequest = controller;
+		let authoritative = false;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -204,6 +213,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		});
 
 		try {
+			deps.onStateChange?.(state, { isCurrent, authoritative: false });
+			if (!isCurrent()) return;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
 				signal: controller.signal
@@ -217,7 +228,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				(lateResponse) => {
 					if (
 						timeoutFired ||
-						generation !== requestGeneration ||
+						!isCurrent() ||
 						controller.signal.aborted
 					) {
 						cancelResponse(lateResponse);
@@ -226,7 +237,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				() => {}
 			);
 			const response = await Promise.race([fetchPromise, timeout, aborted]);
-			if (generation !== requestGeneration || controller.signal.aborted) {
+			if (!isCurrent() || controller.signal.aborted) {
 				cancelResponse(response);
 				return;
 			}
@@ -236,6 +247,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// so abort/disposal cannot cancel them again; never await cleanup.
 				activeResponse = null;
 				cancelResponse(response);
+				if (!isCurrent()) return;
 			}
 			if (response.status === 404) {
 				// The list endpoint has not landed yet. Do not treat a 404 as
@@ -245,23 +257,25 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				state.items = [];
 				state.staleAt = null;
 				state.libraryUnavailable = true;
+				authoritative = true;
 				return;
 			}
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
 				inMemorySnapshot = null;
-				deps.invalidateLibraryCache();
 				state.items = [];
 				state.staleAt = null;
 				state.requiresSignIn = response.status === 401;
 				state.loadError = state.requiresSignIn
 					? 'You are signed out or do not have access to this library.'
 					: 'You do not have access to this library.';
+				authoritative = true;
+				deps.invalidateLibraryCache();
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
 			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
-			if (generation !== requestGeneration || controller.signal.aborted) {
+			if (!isCurrent() || controller.signal.aborted) {
 				cancelResponse(response);
 				return;
 			}
@@ -271,14 +285,19 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			authenticatedThisLoad = true;
 			state.items = fresh;
 			state.staleAt = null;
-			const persistedSnapshot = saveSnapshot(deps.sessionStorage(), fresh);
+			const storage = deps.sessionStorage();
+			if (!isCurrent()) return;
+			const persistedSnapshot = saveSnapshot(storage, fresh);
+			if (!isCurrent()) return;
 			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
+			authoritative = true;
 		} catch {
-			if (generation !== requestGeneration) return;
+			if (!isCurrent()) return;
 			// Do not trust a tab's snapshot until this page has verified its session.
 			const snapshot = authenticatedThisLoad
 				? (inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()))
 				: null;
+			if (!isCurrent()) return;
 			if (snapshot) {
 				state.items = snapshot.items;
 				state.staleAt = snapshot.savedAt;
@@ -292,11 +311,11 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			controller.signal.removeEventListener('abort', onAbort);
 			activeResponse = null;
 			activeReader = null;
-			if (activeRequest === controller) {
-				activeRequest = null;
-				if (generation === requestGeneration) state.loading = false;
+			if (activeRequest === controller) activeRequest = null;
+			if (isCurrent()) {
+				state.loading = false;
+				deps.onStateChange?.(state, { isCurrent, authoritative });
 			}
-			notify();
 		}
 	}
 
@@ -307,18 +326,21 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	 * presentation. Never requests, rebroadcasts, navigates or retries.
 	 */
 	function applyAuthTransition(): void {
-		requestGeneration += 1;
+		if (disposed) return;
+		const isCurrent = startReceipt();
 		activeRequest?.abort();
+		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
 		inMemorySnapshot = null;
 		clearSnapshot(deps.sessionStorage());
+		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
 		state.requiresSignIn = true;
 		state.loadError = 'Your session changed. Sign in again to see this library.';
 		state.loading = false;
-		notify();
+		deps.onStateChange?.(state, { isCurrent, authoritative: true });
 	}
 
 	function handleAuthTransition(event: Pick<StorageEvent, 'key'>): void {
@@ -331,8 +353,9 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	}
 
 	function dispose(): void {
-		requestGeneration += 1;
+		disposed = true;
 		activeRequest?.abort();
+		activeRequest = null;
 	}
 
 	return { state, refresh, handleAuthTransition, handleLocalAuthTransition, dispose };

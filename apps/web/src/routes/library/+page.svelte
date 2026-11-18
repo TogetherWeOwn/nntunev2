@@ -440,10 +440,12 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state) => {
+		onStateChange: (state, { isCurrent, authoritative }) => {
+			if (!isCurrent()) return;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
+			if (!isCurrent()) return;
 			draggedLibraryItem = null;
 			items = state.items;
 			staleAt = state.staleAt;
@@ -477,7 +479,8 @@
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
 			// current track stays current when it survives the refresh.
-			if (queueController.snapshot.tracks.length > 0) {
+			if (!isCurrent()) return;
+			if (authoritative && queueController.snapshot.tracks.length > 0) {
 				const queue = queueController.snapshot;
 				const ids = new Set(state.items.map((track) => track.id));
 				const kept = queue.tracks.filter((track) => ids.has(track.id));
@@ -490,14 +493,10 @@
 					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
 			}
-			// The pending subset is per-account: an access refusal or auth
-			// transition that empties the library purges it, so the next
-			// account never inherits the previous choices. A successful
-			// same-account refresh prunes IDs the new snapshot no longer
-			// carries, preserving activation order. Transient failures keep
-			// their items through the stale fallback, so prune is a no-op
-			// there; failures without a snapshot have no rows selected.
-			if (!state.loading) {
+			// Queue publication can reenter the route and revoke this receipt.
+			if (!isCurrent()) return;
+			// Purge on an auth boundary; reconcile against fresh membership only.
+			if (authoritative) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
 					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
 						purgeSelection();
@@ -514,20 +513,18 @@
 			// Memory stays authoritative for this visit, even if persistence
 			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
-			if (!state.loading && !state.loadError && !state.libraryUnavailable && !favoritesInitialized) {
-				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
-				favoritesInitialized = true;
+			if (authoritative && !state.loadError && !state.libraryUnavailable) {
+				if (!favoritesInitialized) {
+					favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+					favoritesInitialized = true;
+				}
+				if (!recentFindsInitialized) {
+					recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+					recentFindsInitialized = true;
+				}
+				applyShareLink();
 			}
-			if (
-				!state.loading &&
-				!state.loadError &&
-				!state.libraryUnavailable &&
-				!recentFindsInitialized
-			) {
-				recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
-				recentFindsInitialized = true;
-			}
-			if (!state.loading) applyShareLink();
+			if (!isCurrent()) return;
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
 			// was typing in. Background refreshes keep the panel mounted, so
@@ -542,9 +539,11 @@
 					typeof document !== 'undefined' &&
 					typeof tick === 'function'
 				) {
-					void tick().then(() =>
-						document.getElementById('queue-filter-input')?.focus({ preventScroll: true })
-					);
+					void tick().then(() => {
+						if (isCurrent()) {
+							document.getElementById('queue-filter-input')?.focus({ preventScroll: true });
+						}
+					});
 				}
 			}
 		}
