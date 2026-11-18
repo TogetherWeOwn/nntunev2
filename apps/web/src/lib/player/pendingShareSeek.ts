@@ -12,6 +12,7 @@ export function createPendingShareSeek(
 	function clear() { pending = null; revision += 1; }
 	return {
 		get current(): Readonly<Pending> | null { return pending; },
+		get revision() { return revision; },
 		set(target: Target) { pending = { ...target, appliedSeconds: null }; return ++revision; },
 		clear,
 		supersede(trackId: string, source: string) {
