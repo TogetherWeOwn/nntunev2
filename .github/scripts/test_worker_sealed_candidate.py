@@ -82,6 +82,18 @@ class SealedCandidate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sealed.snapshot_build_output(output)
 
+    def test_snapshot_read_is_bounded_when_output_grows(self):
+        cap = 4
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate.wasm"
+            output.write_bytes(b"wasm")
+            with patch.object(sealed, "MAX_CANDIDATE_BYTES", cap), patch.object(sealed.os, "fdopen") as fdopen:
+                reader = fdopen.return_value.__enter__.return_value
+                reader.read.return_value = b"wasm!"
+                with self.assertRaisesRegex(ValueError, "candidate output size changed while reading"):
+                    sealed.snapshot_build_output(output)
+                reader.read.assert_called_once_with(cap + 1)
+
     def test_snapshot_is_the_sealed_consumer_input(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "candidate.wasm"
