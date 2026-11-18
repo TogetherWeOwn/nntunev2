@@ -33,7 +33,9 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  * readback at the target. Never plays or loads, so paused/playing intent is
  * unchanged.
  */
-export function jumpMedia(media: JumpMedia, direction: JumpDirection): JumpOutcome {
+export function jumpMedia(
+	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true
+): JumpOutcome {
 	let target: number;
 	let raw: number;
 	try {
@@ -53,7 +55,9 @@ export function jumpMedia(media: JumpMedia, direction: JumpDirection): JumpOutco
 		return { kind: 'unavailable' };
 	}
 	try {
+		if (!matches()) return { kind: 'unavailable' };
 		media.currentTime = target;
+		if (!matches()) return { kind: 'unavailable' };
 		const readback = media.currentTime;
 		if (!Number.isFinite(readback) || Math.abs(readback - target) > TOLERANCE) {
 			return { kind: 'refused' };

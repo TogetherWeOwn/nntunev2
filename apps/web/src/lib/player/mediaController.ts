@@ -1,5 +1,6 @@
 import { selectTrack, type QueueState } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
+import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
@@ -43,7 +44,7 @@ const mountedAudio = new WeakSet<HTMLAudioElement>();
 export function createMediaController() {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
-	let restartIntent = 0;
+	let positionIntent = 0;
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -97,23 +98,44 @@ export function createMediaController() {
 		if (isCurrent()) deps.bumpAnnouncement();
 	}
 
+	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
+		try {
+			return isCurrent() && audio.getAttribute('src') === source && isCurrent() &&
+				audio.isConnected && isCurrent();
+		} catch {
+			return false;
+		}
+	}
+
+	function jump(
+		source: string, direction: JumpDirection, selectionIsCurrent: () => boolean, supersedeShare: () => void
+	): JumpOutcome | null {
+		if (destroyed) return null;
+		const attachment = current;
+		const intent = ++positionIntent;
+		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
+		const audio = attachment?.audio;
+		if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
+			return isCurrent() ? { kind: 'unavailable' } : null;
+		}
+		// Even a boundary or refused jump takes precedence over a deferred share.
+		supersedeShare();
+		const matches = () => matchesSource(audio, source, isCurrent);
+		if (!matches()) return null;
+		const outcome = jumpMedia(audio, direction, matches);
+		return matches() ? outcome : null;
+	}
+
 	function restart(source: string, title: string, deps: RestartSelection): void {
 		if (destroyed) return;
 		const attachment = current;
-		const intent = ++restartIntent;
+		const intent = ++positionIntent;
 		// Supersede before any native read, including an unavailable or refused seek.
 		const selectionIsCurrent = deps.supersedeShare();
 		if (!attachment) return;
 		const { audio } = attachment;
-		const isCurrent = () => current === attachment && restartIntent === intent && selectionIsCurrent();
-		const matches = () => {
-			try {
-				return isCurrent() && audio.getAttribute('src') === source && isCurrent() &&
-					audio.isConnected && isCurrent();
-			} catch {
-				return false;
-			}
-		};
+		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
+		const matches = () => matchesSource(audio, source, isCurrent);
 		if (!matches()) return;
 
 		let words = 'Could not restart';
@@ -144,6 +166,7 @@ export function createMediaController() {
 	return {
 		playSelected,
 		restart,
+		jump,
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {

@@ -7,7 +7,7 @@
 	import { createMediaController, type MediaAttachment } from '#lib/player/mediaController.js';
 	import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 	import { createFavoritesExport } from './favoritesExport.js';
-	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
+	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
@@ -955,9 +955,17 @@
 	function jumpRelative(direction: JumpDirection): void {
 		const element = media.audio;
 		const current = queueCurrentTrack(queueController.snapshot);
-		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
-		if (live) pendingShareSeek.supersede(current.id, streamUrl);
-		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
+		if (!shareAlive) return;
+		const source = resolveStreamUrl(current);
+		const queueRevision = queueController.revision;
+		let seekRevision = pendingShareSeek.revision;
+		const outcome = media.jump(source, direction,
+			() => shareAlive && queueController.isCurrent(queueRevision) && seekRevision === pendingShareSeek.revision,
+			() => {
+				if (current) pendingShareSeek.supersede(current.id, source);
+				seekRevision = pendingShareSeek.revision;
+			});
+		if (!outcome) return;
 		// A no-write outcome must not disown an earlier jump's queued event.
 		// handleSeeking still retires feedback at a different element or position.
 		if (element && outcome.kind === 'jumped') {
