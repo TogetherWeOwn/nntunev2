@@ -91,12 +91,16 @@ class StagingApplyTests(unittest.TestCase):
                     staging_apply.run_census(filename, sha, DB, env | changes)
             query.assert_not_called()
             active = env | {"FIXTURE_OBSERVER": url, "PGHOSTADDR": "unused", "PGSSLMODE": "disable"}
-            query.return_value = SimpleNamespace(returncode=1, stdout="row-id", stderr="secretpw")
-            with self.assertRaisesRegex(staging_apply.StagingApplyError, r"details redacted$"):
-                staging_apply.run_census(filename, sha, DB, active)
-            self.assertFalse(receipt.exists())
-            query.return_value = SimpleNamespace(returncode=0, stdout="3\t2\t2026-11-18T20:00:00Z\n", stderr="")
-            staging_apply.run_census(filename, sha, DB, active)
+            row = "3\t2\t2026-11-18T20:00:00Z\n"
+            for status, stdout in ((1, row), (0, "row-id")):
+                query.return_value = SimpleNamespace(returncode=status, stdout=stdout, stderr="secretpw")
+                with self.assertRaisesRegex(staging_apply.StagingApplyError, r"details redacted$"):
+                    staging_apply.run_census(filename, sha, DB, active)
+                self.assertFalse(receipt.exists())
+            query.return_value = SimpleNamespace(returncode=0, stdout=row, stderr="")
+            with patch.dict(os.environ, active, clear=True):
+                self.assertEqual(staging_apply.main([
+                    "purge-census", "--file", filename, "--expected-sha", sha, "--expect-database", DB]), 0)
             child = query.call_args.kwargs["env"]
             self.assertEqual((child["PGSSLMODE"], child["PGGSSENCMODE"]), ("verify-full", "disable"))
             self.assertFalse({"PGHOSTADDR", staging_apply.SECRET_ENV} & child.keys())
