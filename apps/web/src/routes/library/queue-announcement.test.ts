@@ -3,7 +3,7 @@ import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
-import { createQueueRevision } from '#lib/player/queueRevision.js';
+import { createQueueController } from '#lib/player/queueController.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
@@ -83,7 +83,9 @@ function pageScript() {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const body = parsed.statements
 		.filter((statement) => !ts.isImportDeclaration(statement))
-		.map((statement) => statement.getText(parsed))
+		.map((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+			(declaration) => declaration.name.getText(parsed) === 'queue'
+		) ? 'let queue; queueController.subscribe((value) => { queue = value; });' : statement.getText(parsed))
 		.join('\n');
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
@@ -93,7 +95,7 @@ function pageScript() {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare,
-		createPendingShareSeek, createQueueRevision,
+		createPendingShareSeek, createQueueController,
 		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
@@ -136,7 +138,7 @@ function pageScript() {
 		resolveStreamUrl: () => null,
 		onMount: () => {},
 		tick: () => Promise.resolve(),
-		$state: <T>(value: T) => value,
+		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
@@ -147,7 +149,10 @@ function pageScript() {
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
-			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); },
+			emptyQueueWithoutEdit: () => {
+				const next = clearQueue(queue);
+				queueController.publish(next, queueController.begin(next, 'clear'));
+			},
 			setFavoriteAnnouncementForFixture: (announcement) => {
 				favoritesAnnouncement = announcement;
 			}
