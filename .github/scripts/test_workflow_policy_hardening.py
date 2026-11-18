@@ -75,8 +75,10 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         for script in ("check_web_bundle_budget.py", "test_check_web_bundle_budget.py"):
             self.assertIn(f'python3 "$GITHUB_WORKSPACE/.github/scripts/{script}"', ci)
         production = (WORKFLOWS / "deploy-production.yml").read_text()
-        self.assertNotIn("wrangler@${{ env.WRANGLER_VERSION }}", production)
-        self.assertEqual(production.count('"wrangler@${WRANGLER_VERSION:?}"'), 3)
+        self.assertNotIn("wrangler@", production)
+        self.assertIn('version="$("$shim/npx" wrangler --version)"', production)
+        self.assertIn('test "$version" = "${WRANGLER_VERSION:?}"', production)
+        self.assertIn('printf \'%s\\n\' "$shim" >> "$GITHUB_PATH"', production)
         deploy = (WORKFLOWS / "deploy.yml").read_text()
         self.assertEqual(deploy.count('./check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"'), 2)
         self.assertNotIn('--config-id "${{ vars.', deploy)

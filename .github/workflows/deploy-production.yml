@@ -99,8 +99,13 @@ jobs:
           INPUT_SHA: ${{ inputs.sha }}
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
+          UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ -n "$UNPROTECTED_ACCEPTED_SHA" ]; then
+            echo '::error::Dispatch on main; PRODUCTION_ACCEPTED_SHA must exist only in the production Environment'
+            exit 1
+          fi
           if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
             echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
             exit 1
@@ -233,9 +238,8 @@ jobs:
     concurrency:
       group: production-worker-mutation
       cancel-in-progress: false
-    # Required reviewers are live repo settings unless auto-approve is on;
-    # the preflight gate already refused a disabled lane or a placeholder
-    # hostname before this job could start.
+    # Keep the candidate authorization in the production Environment, not in
+    # dispatch inputs. Preflight rejects any repo/org-level value of that name.
     environment:
       name: production
       url: ${{ format('https://{0}', needs.preflight.outputs.domain) }}
@@ -244,6 +248,16 @@ jobs:
     # build/upload run steps set working-directory apps/web individually
     # instead of defaulting the whole job there.
     steps:
+      - name: Require the exact Release Manager-accepted SHA
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACCEPTED_SHA" ] || [ "$DEPLOY_SHA" != "$ACCEPTED_SHA" ]; then
+            echo '::error::Dispatch SHA must match PRODUCTION_ACCEPTED_SHA in the production Environment'
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Deploy the validated dispatch SHA, never a newer main head.
@@ -264,9 +278,16 @@ jobs:
         env:
           BUILD_SHA: ${{ needs.preflight.outputs.sha }}
         run: pnpm build
+      - name: Pin the shared action and production steps to locked Wrangler
+        run: |
+          set -euo pipefail
+          shim="$GITHUB_WORKSPACE/ci/locked-wrangler"
+          version="$("$shim/npx" wrangler --version)"
+          test "$version" = "${WRANGLER_VERSION:?}"
+          printf '%s\n' "$shim" >> "$GITHUB_PATH"
       - name: Build production target without deploying
         working-directory: apps/web
-        run: npx --yes "wrangler@${WRANGLER_VERSION:?}" deploy --dry-run --env production --outdir dist-production
+        run: npx wrangler deploy --dry-run --env production --outdir dist-production
       - name: Require production Worker secret shape before upload
         # Offline shape check, not a secret read: the web Worker ships no
         # bindings and needs no secrets, so any production vars table in
@@ -289,21 +310,12 @@ jobs:
           echo "production credentials present (names only)"
       - name: Initialize the first-release maintenance rollback target
         if: inputs.mode == 'bootstrap-maintenance'
+        id: bootstrap
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
-          ACCEPTED_SHA: ${{ vars.PRODUCTION_BOOTSTRAP_ACCEPTED_SHA }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$DEPLOY_SHA" != "$ACCEPTED_SHA" ]; then
-            echo '::error::Bootstrap requires a main dispatch and the exact Release Manager-accepted bootstrap SHA'
-            exit 1
-          fi
-          node ci/production-maintenance/check-absent.mjs
-          pnpm --dir apps/web exec wrangler deploy --name "$WORKER_NAME" \
-            --config ../../ci/production-maintenance/wrangler.toml
+        run: node ci/production-maintenance/seed.mjs
       # One-time production seed precondition (see docs/ops.md). The shared
       # gradual-promote action records its rollback target from the latest
       # production deployment and refuses unless that deployment is a single
@@ -316,9 +328,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
+          SEED_VERSION: ${{ steps.bootstrap.outputs.version }}
+          DEPLOY_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          npx --yes "wrangler@${WRANGLER_VERSION:?}" deployments list --env production --name "$WORKER_NAME" --json \
+          npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
             | node -e '
               let raw = "";
               process.stdin.on("data", (c) => { raw += c; });
@@ -349,6 +363,10 @@ jobs:
                   console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
                   process.exit(1);
                 }
+                if (process.env.DEPLOY_MODE === "bootstrap-maintenance" && id !== process.env.SEED_VERSION) {
+                  console.error("::error::Production is not serving the version just seeded; reconcile before promoting");
+                  process.exit(1);
+                }
                 console.log("production seed ok: rollback target " + id);
               });
             '
@@ -364,7 +382,7 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          npx --yes "wrangler@${WRANGLER_VERSION:?}" versions upload --env production \
+          npx wrangler versions upload --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned

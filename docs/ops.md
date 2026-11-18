@@ -1096,22 +1096,30 @@ application deploy. Do not bypass the production lane to seed the app.
 1. **Release Manager:** Accept the exact launch SHA after M1, staging
    admission, Security → QA, exact-head CI and migration ledger review.
    Explicitly accept the maintenance seed, hostname attachment and rollback.
-2. **DevOps / GitHub custodian:** Verify the production Environment and
-   credential scopes; set `PRODUCTION_BOOTSTRAP_ACCEPTED_SHA` after acceptance.
+2. **DevOps / GitHub custodian:** Verify the production Environment protection
+   and credential scopes. After independent Release Manager acceptance, set
+   `PRODUCTION_ACCEPTED_SHA` **only** in that Environment, never as a repo or org
+   variable. Both modes require this exact SHA, in addition to staging admission.
    Dispatch `deploy-production.yml` on `main` with that SHA and
-   `mode=bootstrap-maintenance`. Staging receipt and environment gates still
-   apply. This refuses an existing Worker and never attaches a host or tags.
-   No out-of-band writes; stop and reconcile partial failures before retry.
+   `mode=bootstrap-maintenance`. Cloudflare creates an unbound Worker under a
+   unique name, deploys maintenance only to that new immutable ID, then renames
+   it to `nntune-web`. Cloudflare returns a conflict if the destination exists;
+   the workflow never writes through that name, attaches a host or tags.
+   On conflict or ambiguous failure, stop. The Cloudflare custodian reconciles
+   the logged scratch name/ID against the canonical Worker before any retry or
+   cleanup; never delete by name or assume a failed rename did not take effect.
 3. **Cloudflare custodian / DevOps:** Record the seed's 100% version ID.
    Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
    route conflicts; attach the host to `nntune-web` without displacing routing.
    Record the non-cacheable, non-indexable maintenance 503 probe.
 4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
-   for the same accepted SHA. Stage failure restores maintenance. On final
-   smoke failure, use the locked `apps/web` CLI and production credentials:
-   `wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes` with
-   the recorded UUID. Verify 100% on that version, maintenance 503 on `/`
-   and `/api/build`, and no tag. Retry only with current release admission.
+   for the same accepted SHA. The gradual action uses the lockfile-installed
+   Wrangler for promotion and automatic stage rollback. On final smoke
+   failure, use the same CLI and production credentials:
+   `pnpm --dir apps/web exec wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes`.
+   Verify 100% on that version, maintenance 503 on `/` and `/api/build`, and
+   no tag. Retry only with current release admission. The GitHub custodian
+   clears `PRODUCTION_ACCEPTED_SHA` after the authorized window closes.
 
 ### Production Worker secret-shape gate
 

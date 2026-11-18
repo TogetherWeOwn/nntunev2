@@ -1238,7 +1238,7 @@ jobs:
           node-version: 24
       - name: Unit-test the promotion receipt proof
         run: node --test ci/test-release-promotion-proof.cjs
-      - name: Exercise the first-release maintenance response (offline)
+      - name: Exercise first-release admission, maintenance seed and rollback (offline)
         run: node --test ci/test-production-maintenance.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
@@ -1554,6 +1554,16 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: 'false'
         run: pnpm exec wrangler deploy --config ../../ci/production-maintenance/wrangler.toml --dry-run --outdir "$RUNNER_TEMP/production-maintenance"
+      - name: Check the locked Wrangler command used by automatic rollback (no deployment)
+        working-directory: .
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          export PATH="$GITHUB_WORKSPACE/ci/locked-wrangler:$PATH"
+          wrangler_version="$(npx wrangler --version)"
+          printf 'Locked Wrangler: %s\n' "$wrangler_version"
+          test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
+          timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
       - name: Exclude history instrumentation from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
