@@ -48,13 +48,16 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
+	const queueController = createQueueController(queue);
+	const { next, sources: evidence } = queueController.prepareLibrary([...ITEMS, ...queue.tracks]);
+	queueController.publish(next, queueController.begin(next, 'replace', true), evidence);
 	const bindings = {
 		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
 		groupLibraryItems, queueCurrentTrack, resolveStreamUrl, createPendingShareSeek,
-		queueController: createQueueController(queue),
+		queueController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
