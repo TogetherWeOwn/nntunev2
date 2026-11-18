@@ -13,6 +13,7 @@ import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -53,7 +54,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createQueueController,
+		createQueueShare, createQueueController, createMediaController,
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
@@ -77,7 +78,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
-			setAudio: (element) => { audioEl = element; },
+			setAudio: media.attach,
+			currentAudio: () => media.audio,
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
 		};
 	`)(...Object.values(bindings)) as {
@@ -86,7 +88,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		resetShareAtAuthBoundary: () => void;
 		selectTrack: (id: string) => void;
 		applyPendingShareSeek: () => void;
-		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void> }) => void;
+		setAudio: (element: { currentTime: number; duration: number; paused?: boolean; play?: () => Promise<void>; pause?: () => void }) => void;
+	currentAudio: () => unknown;
 		playQueuedTrack: (id: string) => Promise<void>;
 		addDisplayed: () => void;
 		subscribe: (callback: (queue: queueFunctions.QueueState) => void) => () => void;
@@ -196,8 +199,9 @@ test('refresh replaces source evidence without hydrating metadata until queued P
 	expect(page.read().queue).toBe(queued);
 	expect(latest?.isCurrent()).toBe(true);
 	const play = vi.fn(async () => {});
+	const attempt = page.playQueuedTrack('coral');
 	page.setAudio({ currentTime: 0, duration: 60, paused: true, play });
-	await page.playQueuedTrack('coral');
+	await attempt;
 	expect(page.read().queue.tracks[0].streamUrl).toBe(updated[0].streamUrl);
 	expect(play).toHaveBeenCalledTimes(1);
 });
@@ -275,7 +279,11 @@ test('queue publication exposes new evidence before a reentrant auth boundary', 
 		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
 		expect(page.source('kelp')).toBeNull();
 		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
+		const pause = vi.fn(() => expect(page.currentAudio()).toBeUndefined());
+		page.setAudio({ currentTime: 0, duration: 60, paused: false, pause });
 		page.endSession();
+		expect(pause).toHaveBeenCalledOnce();
+		expect(page.currentAudio()).toBeUndefined();
 	});
 	serve([{ ...ITEMS[0], streamUrl: '/test-audio/new' }]);
 	await page.refresh();
