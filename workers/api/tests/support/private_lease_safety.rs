@@ -57,8 +57,7 @@ async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
 
         let public = play(&Value::Null).await;
         toggle(true).await;
-        let resumed = play(&public["play_id"]).await;
-        same_lease(&public, resumed);
+        same_lease(&public, play(&public["play_id"]).await);
         assert!(!marked(&key(&public)).await);
         deliver(&public).await;
 
@@ -67,12 +66,14 @@ async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
         assert!(marked(&private_key).await, "mark must commit before delivery");
         fx.observer.execute("UPDATE public.private_sessions SET expires_at=$2 WHERE user_id=$1 AND session_id='player'", &[&fx.user, &(fx.now as i64 - 1)]).await.unwrap();
         same_lease(&private, play(&private["play_id"]).await);
+        toggle(true).await;
         toggle(false).await;
         same_lease(&private, play(&private["play_id"]).await);
         assert!(marked(&private_key).await, "expiry and disable must retain the mark");
         deliver(&private).await;
 
         let grant_only = play(&Value::Null).await;
+        assert_ne!(grant_only["play_id"], public["play_id"]);
         assert!(!marked(&key(&grant_only)).await);
         let rows = fx.observer.query("SELECT idempotency_key, bytes_served, stream_seconds FROM public.stream_play_ledger WHERE user_id=$1", &[&fx.user]).await.unwrap();
         assert_eq!(rows.len(), 2, "grant-only play must not create a ledger row");
@@ -103,54 +104,66 @@ async fn dispatched_acquisition_faults_withhold_grant_and_distinguish_commit_out
         let toggle = fx.request("PUT", "/v1/me/private-session", json!({"session_id": "replacement", "enabled": true}));
         assert_eq!(dispatch(&store, &fx.cfg, fx.now, &toggle).await.status, 200);
 
+        let replacement = |track, takeover| fx.request("POST", "/v1/plays", json!({"track_id": track, "session_id": "replacement", "takeover": takeover}));
+        let no_marks = async || assert!(fx.observer.query("SELECT 1 FROM public.private_plays WHERE user_id=$1", &[&fx.user]).await.unwrap().is_empty());
+        assert_eq!(dispatch(&store, &fx.cfg, fx.now, &replacement(TRACK, false)).await.status, 429);
+        no_marks().await;
+
         let takeover = async |track, client, now| {
-            let client = Cell::new(Some(client));
+            let client = Rc::new(Cell::new(Some(client)));
+            let injected_client = Rc::clone(&client);
             let checkouts = Cell::new(0);
             let faulted = playback_store_for_postgres_test(move || {
                 let nth = checkouts.get() + 1;
                 checkouts.set(nth);
                 // Session, deletion, holder, subscription, caps and usage precede acquisition.
-                let injected = (nth == 7).then(|| client.take().unwrap());
+                let injected = (nth == 7).then(|| injected_client.take().unwrap());
                 async { match injected { Some(client) => Ok(client), None => playback_client().await } }
             });
-            let request = fx.request("POST", "/v1/plays", json!({"track_id": track, "session_id": "replacement", "takeover": true}));
-            let response = dispatch(&faulted, &fx.cfg, now, &request).await;
+            let response = dispatch(&faulted, &fx.cfg, now, &replacement(track, true)).await;
+            assert!(client.take().is_none(), "acquisition never checked out the faulted connection");
             assert_eq!(response.status, 503, "{track}");
             assert!(serde_json::from_str::<Value>(&response.body).unwrap().get("grant").is_none());
         };
 
         // Fault only this fixture's prospective marks; server-minted play IDs need not be known.
-        let tag = format!("dispatch_fault_{}", fx.user.replace('-', ""));
-        let rejected = timeout(Duration::from_secs(20), AssertUnwindSafe(async {
+        let tag = format!("df_{}", fx.user.replace('-', ""));
+        let rejected = timeout(Duration::from_secs(30), AssertUnwindSafe(async {
             fx.observer.batch_execute(&format!("
-                CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$
-                BEGIN RAISE EXCEPTION 'synthetic privacy fault'; END $$;
+                CREATE ROLE {tag} NOLOGIN; GRANT USAGE ON SCHEMA public TO {tag}; GRANT SELECT, UPDATE ON public.users TO {tag};
+                CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic privacy fault'; END $$;
                 CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW
                 WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'mark-fault') EXECUTE FUNCTION public.{tag}();
                 CREATE CONSTRAINT TRIGGER {tag}_commit AFTER INSERT ON public.private_plays DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
                 WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'commit-fault') EXECUTE FUNCTION public.{tag}();",
                 fx.user, fx.user)).await.unwrap();
             let beat = fx.request("POST", "/v1/plays/heartbeat", json!({"session_id": "incumbent", "play_id": issued["play_id"], "lease_epoch": issued["lease_epoch"]}));
-            for (offset, track, expected) in [(1, "mark-fault", CommitOutcome::Unproven), (3, "commit-fault", CommitOutcome::Rejected)] {
+            for (offset, track, expected) in [(1, "lookup-fault", CommitOutcome::Unproven), (3, "mark-fault", CommitOutcome::Unproven), (5, "commit-fault", CommitOutcome::Rejected)] {
                 let now = fx.now + offset;
                 let (client, fault) = CommitAckFault::start().await.unwrap();
+                if track == "lookup-fault" {
+                    client.batch_execute(&format!("SET ROLE {tag}")).await.unwrap();
+                    let probe = client.query(nntune_api::preference_rows::private_session_active_statement(), &[&fx.user, &"replacement"]).await.unwrap_err();
+                    assert_eq!(probe.code(), Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE));
+                }
                 takeover(track, client, now).await;
                 assert_eq!(fault.finish().await.unwrap(), expected, "{track}");
-                assert!(fx.observer.query("SELECT 1 FROM public.private_plays WHERE user_id=$1", &[&fx.user]).await.unwrap().is_empty());
+                no_marks().await;
                 let response = dispatch(&store, &fx.cfg, now + 1, &beat).await;
                 assert_eq!(response.status, 200);
                 assert_eq!(serde_json::from_str::<Value>(&response.body).unwrap(), json!({"lease": "active", "lease_epoch": issued["lease_epoch"], "lease_expires_at": now + 1 + nntune_api::playback::LEASE_TTL_SECS}));
             }
         }).catch_unwind()).await;
         timeout(Duration::from_secs(5), fx.observer.batch_execute(&format!(
-            "DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP TRIGGER IF EXISTS {tag}_commit ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}();"
+            "DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP TRIGGER IF EXISTS {tag}_commit ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}(); \
+             DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{tag}') THEN DROP OWNED BY {tag}; DROP ROLE {tag}; END IF; END $$"
         ))).await.unwrap().unwrap();
         if let Err(panic) = rejected.expect("rollback cases timed out") {
             resume_unwind(panic);
         }
 
         let (client, fault) = CommitAckFault::start().await.unwrap();
-        let now = fx.now + 5;
+        let now = fx.now + 7;
         takeover(TRACK, client, now).await;
         assert_eq!(fault.finish().await.unwrap(), CommitOutcome::Withheld);
 

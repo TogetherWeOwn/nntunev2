@@ -55,6 +55,8 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
+		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
+		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
 		queueController.subscribe((value) => { queue = value; });
 		${compiled}
 		return {

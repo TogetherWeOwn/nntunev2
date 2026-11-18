@@ -137,6 +137,65 @@ class RustPin(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "unsupported memory limits"):
                 wt.inspect_memory_section(payload)
 
+    def test_exported_heap_inspection_is_same_module_and_restricted(self):
+        magic = b"\0asm\x01\0\0\0"
+        def section(kind, payload):
+            return bytes((kind, len(payload))) + payload
+        memory = section(5, b"\x01\x00\x01")
+        globals_ = section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+        exports = section(7, b"\x02\x01a\x03\x00\x01b\x03\x01")
+        types = section(1, b"\x01\x60\x00\x00")  # One () -> () signature.
+        imports = section(2, b"\x01\x03env\x01f\x00\x00")
+        valid = magic + types + imports + memory + globals_ + exports
+        self.assertEqual(wt.inspect_exported_heap_values(valid, "a", "b"), (1, 8, 1))
+        custom = section(0, b"\x07fixture")
+        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + custom
+                                                         + globals_ + exports, "a", "b"), (1, 8, 1))
+        mutable = section(6, b"\x02\x7f\x01\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+        for module, a, b in (
+            (magic + memory + globals_, "a", "b"),
+            (magic + memory + memory + globals_ + exports, "a", "b"),
+            (magic + globals_ + memory + exports, "a", "b"),
+            (magic + section(13, b"") + memory + globals_ + exports, "a", "b"),
+            (magic + section(2, b"\x01\x00\x00\x03\x7f\x00") + memory + globals_ + exports, "a", "b"),
+            # Imported memory must not be confused with the defined memory.
+            (magic + section(2, b"\x01\x00\x00\x02\x00\x01") + memory + globals_ + exports, "a", "b"),
+            (magic + memory + mutable + exports, "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x03\x00"), "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x03\x02"), "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x00\x01"), "a", "b"),
+            (valid, "a", "missing"), (valid, "a", "a"),
+        ):
+            with self.subTest(module=module, a=a, b=b), self.assertRaises(ValueError):
+                wt.inspect_exported_heap_values(module, a, b)
+
+    def test_named_exports_are_not_proof_of_linker_symbol_identity(self):
+        # Arbitrary globals can impersonate the names without being linker symbols.
+        magic = b"\0asm\x01\0\0\0"
+        def section(kind, payload):
+            return bytes((kind, len(payload))) + payload
+        module = (magic + section(5, b"\x01\x00\x01")
+                  + section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+                  + section(7, b"\x02\x0b__heap_base\x03\x00\x0a__heap_end\x03\x01"))
+        base, end, pages = wt.inspect_exported_heap_values(module, "__heap_base", "__heap_end")
+        self.assertEqual((base, end, pages), (1, 8, 1))
+        wt.check_heap_range(base, end, pages)
+        # This deliberately says nothing about validation, provenance or admission.
+
+    def test_heap_range_checks_necessary_donation_conditions(self):
+        # Base need not be aligned: init_top adjusts it, not the end.
+        wt.check_heap_range(17, 65536, 1)
+        wt.check_heap_range(1, 0xffff_fff8, 65536)
+        for base, end, pages in (
+            (0, 8, 1), (8, 8, 1), (9, 8, 1), (1, 65535, 1),
+            (1, 65544, 1), (1, 0x1_0000_0000, 65536),
+            (1, 8, 0), (1, 8, 65537), (True, 8, 1),
+            (1, None, 1),
+        ):
+            with self.subTest(base=base, end=end, pages=pages):
+                with self.assertRaises(ValueError):
+                    wt.check_heap_range(base, end, pages)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
@@ -530,6 +589,40 @@ class RustPin(unittest.TestCase):
             for invalid in ({}, {"../external": "x"}, {"/external": "x"}):
                 with self.assertRaises(ValueError):
                     wt.verify_host_component_files(root, invalid)
+
+    def test_host_linker_must_be_in_verified_components_and_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "toolchain"
+            host = "x86_64-unknown-linux-gnu"
+            name = f"lib/rustlib/{host}/bin/rust-lld"
+            linker = root / name
+            linker.parent.mkdir(parents=True)
+            linker.write_bytes(b"linker")
+            linker.chmod(0o755)
+            expected = {name: hashlib.sha256(b"linker").hexdigest()}
+            self.assertEqual(wt.verified_host_linker(root, expected, host), linker)
+            for invalid in ("", "../other", "a/b", None):
+                with self.subTest(host=invalid), self.assertRaisesRegex(ValueError, "^invalid host triple$"):
+                    wt.verified_host_linker(root, expected, invalid)
+            with self.assertRaisesRegex(ValueError, "lack linker"):
+                wt.verified_host_linker(root, {}, host)
+            linker.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "not executable"):
+                wt.verified_host_linker(root, expected, host)
+            linker.chmod(0o755)
+            linker.write_bytes(b"altered")
+            with self.assertRaisesRegex(ValueError, "differs from archive"):
+                wt.verified_host_linker(root, expected, host)
+            linker.write_bytes(b"linker")
+            other = root / "bin/rustc"
+            other.parent.mkdir()
+            other.write_bytes(b"altered compiler")
+            with self.assertRaisesRegex(ValueError, "differs from archive"):
+                wt.verified_host_linker(root, {**expected, "bin/rustc": hashlib.sha256(b"rustc").hexdigest()}, host)
+            linker.unlink()
+            linker.symlink_to(other)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verified_host_linker(root, expected, host)
 
     def test_candidate_boundary_refuses_even_with_claimed_provenance(self):
         script = str(Path(wt.__file__).resolve())
