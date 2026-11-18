@@ -80,6 +80,10 @@ pub(super) async fn with_playback_account(test: impl AsyncFnOnce(&PlaybackAccoun
     }
 }
 
+fn allows_stream_build(actions: Option<&str>, runner: Option<&str>, host_scratch: bool) -> bool {
+    actions == Some("true") && runner == Some("github-hosted") && !host_scratch
+}
+
 impl PlaybackAccount<'_> {
     pub fn request(&self, method: &str, path: &str, body: Value) -> Request {
         Request {
@@ -95,7 +99,18 @@ impl PlaybackAccount<'_> {
 
     /// Feed the issued grant and its identity unchanged to the native stream
     /// test; return the stream's exact signed body as the real sink request.
+    /// The nested build is only supported on GitHub-hosted Actions.
     pub fn delivered_batch(&self, issued: &Value) -> Request {
+        // The local Cargo pool assigns this scratch selector alongside its
+        // leased target, which the nested, scrubbed build would not inherit.
+        assert!(
+            allows_stream_build(
+                std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+                std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+                std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR").is_some(),
+            ),
+            "the stream delivery fixture requires GitHub-hosted Actions (api-migrations); no nested Cargo build was started"
+        );
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         // The stream and API have separate locked dependency graphs and target
         // directories. Use the compiler beside the invoking Cargo so parallel
@@ -176,6 +191,22 @@ impl PlaybackAccount<'_> {
             stripe_signature: None,
             body: body.into_bytes(),
         }
+    }
+}
+
+#[test]
+fn stream_fixture_requires_hosted_actions_without_host_scratch() {
+    let hosted = Some("github-hosted");
+    assert!(allows_stream_build(Some("true"), hosted, false));
+    for (actions, runner, host_scratch) in [
+        (None, None, false),
+        (None, hosted, false),
+        (Some("false"), hosted, false),
+        (Some("true"), None, false),
+        (Some("true"), Some("self-hosted"), false),
+        (Some("true"), hosted, true),
+    ] {
+        assert!(!allows_stream_build(actions, runner, host_scratch));
     }
 }
 
