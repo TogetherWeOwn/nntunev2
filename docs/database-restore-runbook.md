@@ -166,12 +166,11 @@ forward-only (§4).
    `docs/adr/0002-data-model.md` forbids). If the damage was caused by a
    bad migration, include its forward correction in this pass. Blocked
    until the per-database runner/record prerequisite (§2 step 3) lands.
-5. **Historical vault/KEK pass (pre-purge app schema only).** After
-   forward convergence to a post-purge schema, record this vault step as
-   not applicable; do not reintroduce purged rows or change shared keys.
-   This does not waive verification for active KEK consumers. On a
-   pre-purge restore, per `docs/security/kek-rotation.md` §5 invariant 3
-   and §7 RESTORE, confirm the KEK versions the restored rows need are
+5. **Verify active KEK consumers before cutover (app only).** Confirm every
+   active envelope opens (`track_sources`: [offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment));
+   record results in §6. Mark only the historical vault pass N/A after purge; never
+   reintroduce purged rows or change shared keys. For a pre-purge vault,
+   confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The
    versioned KEK map (`VAULT_KEK_V<N>` per-version secrets +
@@ -198,8 +197,7 @@ forward-only (§4).
    restorable backup/PITR horizon expiry) — a restore never justifies
    deleting key material early.
 6. **Cutover (authorized promotion, not a redeploy).** Only after steps
-   3–4 are recorded green and step 5 is documented as green or not
-   applicable: repoint the serving Hyperdrive binding to the
+   3–5 are recorded green: repoint the serving Hyperdrive binding to the
    restored-and-converged target through the authorized host path —
    app database: `HYPERDRIVE_ID_STAGING` (`nntunev2-staging` config; prod
    `HYPERDRIVE_ID_PROD` stays reserved) — or promote/rename the restore
@@ -283,7 +281,7 @@ migration files to force convergence.
 | New restore target name (§3.2) | name only, no URL/secret |
 | Read-only verification queries + outcomes (§3.3) | expressions + outcomes only |
 | Forward-convergence list (migrations re-applied, §3.4) | numbers + manifest head |
-| Legacy vault re-wrap disposition (§3.5) | counts ×2 if applicable; otherwise schema basis for N/A |
+| Active KEK checks and legacy vault disposition (§3.5) | envelope counts/outcomes; vault counts ×2 or schema basis for N/A |
 | Cutover record (binding repoint/promote, §3.6) | mechanism + time |
 | Health + E2E run URLs (§3.7) | URLs to runs only |
 | Old-target retention + deletion gate (§3.8) | |

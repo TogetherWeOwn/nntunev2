@@ -505,11 +505,9 @@ CISO gate verifies each at its exact head):
 > which does not exist in Worker code or migrations (the
 > versioned KEK map — `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` — HAS
 > landed, §7). On suspected or confirmed exposure, report through
-> GitHub's private vulnerability reporting (see `SECURITY.md`) and
-> apply today's executable containment from §7 (fresh single KEK in
-> legacy mode, or remove the exposed `VAULT_KEK_V<N>` with
-> `VAULT_KEK_CURRENT` on a live version, so exposed-version rows fail
-> closed; treat vaulted credentials as exposed, force re-entry).
+> GitHub's private vulnerability reporting (see `SECURITY.md`). The
+> legacy vault containment in §7 and the design below are historical, not
+> incident procedures. Do not use them to change KEKs for active consumers.
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps

@@ -114,9 +114,8 @@ serialization cannot leak one.
 2. Operator copies the newest `offsite/staging/db/…` dump and the
    keyring objects for exactly the versions in that backup's
    manifest. Anything else fails closed at step 4.
-3. Restore the dump; run the KEK re-wrap pass first if the backup
-   predates a rotation (`docs/security/kek-rotation.md`,
-   `docs/database-restore-runbook.md`).
+3. Restore the dump. For vault re-wrap applicability see
+   [database restore step 3.5](database-restore-runbook.md#3-restore-step-order-operator-executes).
 4. Verify every `track_sources` envelope row opens — authentication
    only, no plaintext is printed. `track_sources` is the wrapped
    per-file-key table that gates library recovery; provider credential

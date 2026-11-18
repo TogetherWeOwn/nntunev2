@@ -1,9 +1,8 @@
 //! Bounded/resumable KEK re-wrap job (`docs/security/kek-rotation.md` §6).
 //!
-//! The store-agnostic pass preserves the payload and re-wraps only the DEK.
-//! The legacy `provider_vaults` SQL lives in historical integration test
-//! fixtures; no Hyperdrive store, migration, or scheduled trigger wires
-//! them into the Worker. The pass implements:
+//! This is the executable runner core for routine rotation phase 3: it
+//! re-wraps the DEK only — payload and nonces preserved — through its
+//! store's claim/CAS contract. What runs today, over any [`RewrapStore`]:
 //!
 //! - cursor-based batch claims (`kek_version < to`, `user_id > cursor`,
 //!   never `OFFSET`), at most [`MAX_BATCH_LIMIT`] rows per batch;
@@ -18,6 +17,14 @@
 //!   after every batch, so a Worker eviction resumes mid-run with no
 //!   in-memory state;
 //! - dry-run mode: claims and re-wraps compute, nothing mutates.
+//!
+//! Deliberately NOT here (see the runbook §7 banner): the Cloudflare
+//! Workflow/Queue trigger, the production `rotation_runs` DDL migration,
+//! and the Hyperdrive [`RewrapStore`] implementation. [`ROTATION_RUNS_DDL`]
+//! is fixture-validated (it executes verbatim on the sqlite stand-in, which
+//! is why it sticks to the Postgres/sqlite overlap); the production DDL
+//! and store wiring never landed. A driver would orchestrate
+//! `load_open_run` → `open_run` → [`run_rewrap_pass`] → `close_run`.
 //!
 //! Redaction: claims and envelopes carry wrap ciphertext, so their `Debug`
 //! impls are manual and redacted; [`RunRecord`] and [`PassReport`] are
