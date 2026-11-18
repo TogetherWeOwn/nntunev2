@@ -39,6 +39,47 @@ pub fn candidate_hashes<'a>(
         .ok_or(CandidateError::Identity)
 }
 
+/// Stored page geometry and hash, read in page-index order.
+#[allow(dead_code)]
+pub struct CandidatePage {
+    pub index: i32,
+    pub chunk_count: i32,
+    pub first_chunk: i32,
+    pub entry_count: i32,
+    pub hash: Vec<u8>,
+}
+
+/// Compare every persisted page and its geometry to sealer-origin hashes.
+///
+/// This comparison alone is not reconciliation: the caller must also establish
+/// immutable identity, a fresh authoritative snapshot and reservation fencing.
+#[allow(dead_code)]
+pub fn candidate_pages_match(
+    plaintext_len: u64,
+    expected: &[[u8; 32]],
+    persisted: &[CandidatePage],
+) -> bool {
+    if !(1..=8_589_934_592).contains(&plaintext_len) {
+        return false;
+    }
+    let chunks = ((plaintext_len + 65_535) / 65_536) as usize;
+    let pages = (chunks + 255) / 256;
+    expected.len() == pages
+        && persisted.len() == pages
+        && expected
+            .iter()
+            .zip(persisted)
+            .enumerate()
+            .all(|(index, (hash, page))| {
+                let first = index * 256;
+                usize::try_from(page.index) == Ok(index)
+                    && usize::try_from(page.chunk_count) == Ok(chunks)
+                    && usize::try_from(page.first_chunk) == Ok(first)
+                    && usize::try_from(page.entry_count) == Ok((chunks - first).min(256))
+                    && page.hash.as_slice() == hash
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +90,74 @@ mod tests {
         id[6] = 0x40;
         id[8] = 0x80;
         id
+    }
+
+    #[test]
+    fn persisted_pages_must_match_every_ordered_hash_and_geometry() {
+        let expected = [[1; 32], [2; 32]];
+        let length = 256 * 65_536 + 1;
+        let page = |index, first_chunk, entry_count, value| CandidatePage {
+            index,
+            chunk_count: 257,
+            first_chunk,
+            entry_count,
+            hash: vec![value; 32],
+        };
+        let mut pages = vec![page(0, 0, 256, 1), page(1, 256, 1, 2)];
+        assert!(candidate_pages_match(length, &expected, &pages));
+        assert!(!candidate_pages_match(0, &[], &[]));
+        assert!(!candidate_pages_match(u64::MAX, &expected, &pages));
+        assert!(!candidate_pages_match(length, &[], &pages));
+        assert!(!candidate_pages_match(length, &expected, &[]));
+        assert!(!candidate_pages_match(length, &expected[..1], &pages));
+        assert!(!candidate_pages_match(length, &expected, &pages[..1]));
+        pages.push(page(2, 512, 1, 2));
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages.pop();
+        pages.swap(0, 1);
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages.swap(0, 1);
+        for index in [0, -1] {
+            pages[1].index = index;
+            assert!(!candidate_pages_match(length, &expected, &pages));
+        }
+        pages[1].index = 1;
+        pages[1].chunk_count = 256;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages[1].chunk_count = 257;
+        pages[1].first_chunk = 255;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages[1].first_chunk = 256;
+        pages[1].entry_count = 2;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages[1].entry_count = 1;
+        pages[1].hash[0] ^= 1;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages[1].hash[0] ^= 1;
+        pages[1].hash.pop();
+        assert!(!candidate_pages_match(length, &expected, &pages));
+    }
+
+    #[test]
+    fn persisted_pages_cover_maximum_geometry_without_truncation() {
+        let length = 8_589_934_592;
+        let expected = vec![[7; 32]; 512];
+        let mut pages: Vec<_> = (0..512)
+            .map(|index| CandidatePage {
+                index,
+                chunk_count: 131_072,
+                first_chunk: index * 256,
+                entry_count: 256,
+                hash: vec![7; 32],
+            })
+            .collect();
+        assert!(candidate_pages_match(length, &expected, &pages));
+        pages[511].entry_count = 255;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        pages[511].entry_count = 256;
+        pages[511].hash[31] ^= 1;
+        assert!(!candidate_pages_match(length, &expected, &pages));
+        assert!(!candidate_pages_match(length + 1, &expected, &pages));
     }
 
     #[test]
