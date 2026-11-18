@@ -15,6 +15,8 @@ use tokio_postgres::{Client, Config, NoTls};
 mod blocker_observer;
 #[path = "support/disposable_accounts.rs"]
 mod disposable_accounts;
+#[path = "support/playback_dispatch.rs"]
+mod playback_dispatch;
 #[path = "support/private_account_fence.rs"]
 mod private_account_fence;
 #[path = "support/private_lease_deletion.rs"]
@@ -478,13 +480,13 @@ struct NoExternalIo;
 
 impl Mailer for NoExternalIo {
     async fn send_magic_link(&self, _email: &str, _token: &str) -> Result<(), StoreError> {
-        panic!("refresh must not send mail")
+        panic!("PostgreSQL dispatcher fixture must not send mail")
     }
 }
 
 impl Dialer for NoExternalIo {
     async fn probe(&self, _target: &nntune_api::vault::ValidatedTarget, _tls: bool) -> bool {
-        panic!("refresh must not dial a provider")
+        panic!("PostgreSQL dispatcher fixture must not dial a provider")
     }
 }
 
@@ -493,13 +495,12 @@ impl AsyncDns for NoExternalIo {
         &'a self,
         _host: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<std::net::IpAddr>> + 'a>> {
-        panic!("refresh must not resolve a provider")
+        panic!("PostgreSQL dispatcher fixture must not resolve a provider")
     }
 }
 
-async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response {
-    let store = nntune_api::worker_entry::session_retry_store_for_postgres_test(f.client().await);
-    let cfg = handlers::Config::new(
+fn dispatcher_config() -> handlers::Config {
+    handlers::Config::new(
         "app.example.test",
         "https://app.example.test",
         SIGNING_KEY.to_vec(),
@@ -510,19 +511,35 @@ async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response
         false,
         None,
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn dispatch(
+    store: &(impl handlers::Store + nntune_api::auth::SingleUseStore),
+    cfg: &handlers::Config,
+    now: u64,
+    req: &Request,
+) -> Response {
     let ctx = handlers::Ctx {
-        cfg: &cfg,
-        store: &store,
+        cfg,
+        store,
         mailer: &NoExternalIo,
         dialer: &NoExternalIo,
         dns: &NoExternalIo,
-        now: clock(&f.db).await as u64,
+        now,
         source_ip: "127.0.0.1".into(),
         stripe: &nntune_api::stripe::NoStripeTransport,
     };
-    handlers::handle(
-        &ctx,
+    handlers::handle(&ctx, req).await
+}
+
+async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response {
+    let store = nntune_api::worker_entry::session_retry_store_for_postgres_test(f.client().await);
+    let cfg = dispatcher_config();
+    dispatch(
+        &store,
+        &cfg,
+        clock(&f.db).await as u64,
         &Request {
             method: "POST".into(),
             path: "/v1/session/refresh".into(),

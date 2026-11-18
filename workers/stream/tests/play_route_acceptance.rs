@@ -248,6 +248,16 @@ impl Harness {
     }
 
     fn request(&mut self, token: Option<String>, range: Option<&str>) -> PlayRouteOutcome {
+        self.request_at(token, range, SECRET, NOW_UNIX)
+    }
+
+    fn request_at(
+        &mut self,
+        token: Option<String>,
+        range: Option<&str>,
+        secret: &[u8],
+        now: u64,
+    ) -> PlayRouteOutcome {
         let request = PlayRouteRequest {
             track_id: TRACK_ID.to_string(),
             token,
@@ -258,10 +268,10 @@ impl Harness {
             &mut self.pool,
             &mut self.cache,
             &mut self.meter,
-            SECRET,
+            secret,
             &self.manifests,
             self.server.addr,
-            NOW_UNIX,
+            now,
             &request,
         )
     }
@@ -288,6 +298,47 @@ impl Harness {
         .expect("finalize");
         body
     }
+}
+
+/// Subprocess of the guarded API PostgreSQL test, not a standalone grant minter.
+#[test]
+#[ignore = "requires an issued grant on stdin from session_refresh_postgres"]
+fn emit_meter_batch_for_issued_grant() {
+    use nntune_stream::meter_sink::{authorization_header, batch_body, MeterBook};
+
+    let (token, user_id, play_id, now, grant_key, meter_key): (
+        String,
+        String,
+        String,
+        u64,
+        String,
+        String,
+    ) = serde_json::from_reader(std::io::stdin().lock()).expect("bridge input");
+    let mut h = Harness::new(100_000, 20_000, true);
+    for (range, expected) in [
+        ("bytes=0-59999", 0..60_000),
+        ("bytes=30000-79999", 30_000..80_000),
+    ] {
+        let served =
+            expect_serve(h.request_at(Some(token.clone()), Some(range), grant_key.as_bytes(), now));
+        assert_eq!(served.status, 206);
+        assert_eq!(h.serve_to_completion(served), &h.plain[expected]);
+    }
+    assert!(h.server.bodies() > 0, "must read from synthetic NNTP");
+    assert_eq!(h.sink.0.len(), 2);
+    let mut book = MeterBook::new(&user_id);
+    for report in &h.sink.0 {
+        assert_eq!(report.play_id, play_id);
+        assert!(book.record(report, now));
+    }
+    let pending = book.pending_windows();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].union_bytes, 80_000);
+    let body = batch_body(&pending).expect("serialize stream batch");
+    let auth =
+        authorization_header(Some(meter_key.as_bytes()), now, &body).expect("sign stream batch");
+    let body = std::str::from_utf8(&body).expect("JSON is UTF-8");
+    println!("STREAM_METER_BATCH {}", serde_json::json!([auth, body]));
 }
 
 fn grant_v2(play_id: &str) -> String {
