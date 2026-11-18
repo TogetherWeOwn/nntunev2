@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for the inert pinned-build to sealed-consumer experiment."""
+import os
 import subprocess
 import sys
 import tempfile
@@ -41,13 +42,15 @@ class BuildSealedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]
         ):
-            output_dir = Path(directory) / "fresh-sealed-ledger-js"
-            probe.experiment(output_dir, env={"PATH": "/tools"}, build=build, run=run)
+            output_dir = Path(directory).resolve() / "fresh-sealed-ledger-js"
+            relative_output_dir = Path(os.path.relpath(output_dir))
+            probe.experiment(relative_output_dir, env={"PATH": "/tools"}, build=build, run=run)
         self.assertEqual(events, ["build", "bindgen", "node"])
 
     def test_build_failure_or_invalid_output_never_runs_consumer(self):
         for result in (None, b"", b"not wasm"):
             with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                error = subprocess.CalledProcessError if result is None else ValueError
                 def build(*, env):
                     if result is None:
                         raise subprocess.CalledProcessError(1, "cargo")
@@ -57,7 +60,7 @@ class BuildSealedTests(unittest.TestCase):
 
                 run = mock.Mock()
                 with mock.patch.object(probe.shutil, "which", side_effect=["/tools/wasm-bindgen", "/tools/node"]):
-                    with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    with self.assertRaises(error):
                         probe.experiment(Path(directory), env={"PATH": "/tools"}, build=build, run=run)
                 run.assert_not_called()
 

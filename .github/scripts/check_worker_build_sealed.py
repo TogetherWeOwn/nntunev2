@@ -32,13 +32,14 @@ def experiment(output_dir, *, env, build=rust.build_ledger, run=subprocess.run):
         if not snapshot.startswith(b"\x00asm\x01\x00\x00\x00"):
             raise ValueError("candidate is not a core WASM module")
 
+    output_dir = output_dir.resolve()
     sealed.experiment_build_and_consume(
         build_output, verify,
         [os.path.abspath(bindgen), "--target", "nodejs", "--out-dir", str(output_dir),
          "--out-name", "nntune_api"], cwd=str(rust.ROOT), env=env, run=run,
     )
     run([os.path.abspath(node), "-e", "require(process.argv[1]).run_ledger_tests()",
-         str((output_dir / "nntune_api.js").resolve())], check=True)
+         str(output_dir / "nntune_api.js")], check=True)
 
 
 def main():
