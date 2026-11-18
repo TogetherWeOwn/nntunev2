@@ -98,7 +98,10 @@ impl PlaybackAccount<'_> {
     pub fn delivered_batch(&self, issued: &Value) -> Request {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         // The stream and API have separate locked dependency graphs and target
-        // directories. Pass no DB URL, provider settings, or credentials.
+        // directories. Use the compiler beside the invoking Cargo so parallel
+        // rustc calls don't run through rustup after scrubbing the environment.
+        // Pass no DB URL, provider settings, or credentials.
+        let rustc = Path::new(env!("CARGO")).with_file_name("rustc");
         let mut child = Command::new("timeout")
             .args([
                 "-k",
@@ -125,6 +128,7 @@ impl PlaybackAccount<'_> {
                     .into_iter()
                     .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
             )
+            .env("RUSTC", rustc)
             .env("CARGO_PROFILE_TEST_DEBUG", "0")
             .env("CARGO_INCREMENTAL", "0")
             .stdin(Stdio::piped())
