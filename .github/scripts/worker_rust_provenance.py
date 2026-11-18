@@ -113,6 +113,180 @@ def inspect_i32_globals(payload: bytes) -> list[tuple[bool, int]]:
     return result
 
 
+def inspect_function_only_imports(payload: bytes) -> int:
+    """Count imports only when all are functions; not module validation.
+
+    This restricted inspection rejects global, memory, table and tag imports.
+    It does not establish that the inspected bytes belong to a candidate build.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated import section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("import section integer exceeds u32")
+            value |= (byte & 0x7f) << (7 * index)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid import section integer")
+
+    count, offset = u32(0)
+    if count > 10_000:
+        raise ValueError("too many WASM imports")
+    for _ in range(count):
+        for _ in range(2):
+            length, offset = u32(offset)
+            if length > len(payload) - offset:
+                raise ValueError("truncated import name")
+            try:
+                payload[offset:offset + length].decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("invalid import name") from error
+            offset += length
+        if offset >= len(payload) or payload[offset] != 0:
+            raise ValueError("only function imports are supported")
+        _, offset = u32(offset + 1)
+    if offset != len(payload):
+        raise ValueError("trailing import section bytes")
+    return count
+
+
+def inspect_exports(payload: bytes) -> dict[str, tuple[int, int]]:
+    """Decode bounded export descriptors without validating or authenticating a module.
+
+    Indices remain module indices; resolving globals requires accounting for imports.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated export section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("export section integer exceeds u32")
+            value |= (byte & 0x7f) << (7 * index)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid export section integer")
+
+    count, offset = u32(0)
+    if count > 10_000:
+        raise ValueError("too many WASM exports")
+    exports = {}
+    for _ in range(count):
+        length, offset = u32(offset)
+        if length > len(payload) - offset:
+            raise ValueError("truncated export name")
+        try:
+            name = payload[offset:offset + length].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("invalid export name") from error
+        offset += length
+        if name in exports or offset >= len(payload) or payload[offset] not in (0, 1, 2, 3):
+            raise ValueError("duplicate export or unsupported descriptor")
+        kind = payload[offset]
+        index, offset = u32(offset + 1)
+        exports[name] = (kind, index)
+    if offset != len(payload):
+        raise ValueError("trailing export section bytes")
+    return exports
+
+
+def inspect_memory_section(payload: bytes) -> tuple[int, int | None]:
+    """Inspect one defined, unshared wasm32 memory; not module validation.
+
+    Does not exclude imported memories or authenticate the section's candidate.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated memory section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("memory section integer exceeds u32")
+            value |= (byte & 0x7f) << (index * 7)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid memory section integer")
+
+    count, offset = u32(0)
+    if count != 1:
+        raise ValueError("expected one defined memory")
+    flags, offset = u32(offset)
+    if flags not in (0, 1):
+        raise ValueError("unsupported memory limits")
+    initial, offset = u32(offset)
+    maximum = None
+    if flags == 1:
+        maximum, offset = u32(offset)
+    if (offset != len(payload) or initial > 65536
+            or (maximum is not None and not initial <= maximum <= 65536)):
+        raise ValueError("invalid memory limits or trailing bytes")
+    return initial, maximum
+
+
+def inspect_exported_heap_values(module: bytes, base_name: str, end_name: str) -> tuple[int, int, int]:
+    """Resolve two immutable i32 exports and memory limits from the same bytes.
+
+    This restricted inspection is not WASM validation, proof of linker symbol
+    meaning, artifact authentication, or admission. Unsupported modules fail.
+    """
+    if not base_name or not end_name or base_name == end_name:
+        raise ValueError("distinct export names are required")
+    # Data-count precedes code despite its numerical section id.
+    order = {section: rank for rank, section in enumerate((1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 10, 11))}
+    sections = {}
+    previous = -1
+    for section, payload in wasm_sections(module):
+        if section == 0:
+            continue
+        if section not in order or order[section] <= previous:
+            raise ValueError("unsupported, duplicate, or out-of-order WASM section")
+        previous = order[section]
+        sections[section] = payload
+    if not {5, 6, 7}.issubset(sections):
+        raise ValueError("memory, globals and exports are required")
+    if 2 in sections:
+        inspect_function_only_imports(sections[2])
+    initial, _ = inspect_memory_section(sections[5])
+    globals_ = inspect_i32_globals(sections[6])
+    exports = inspect_exports(sections[7])
+    indices = []
+    for name in (base_name, end_name):
+        descriptor = exports.get(name)
+        if descriptor is None or descriptor[0] != 3 or descriptor[1] >= len(globals_):
+            raise ValueError("missing or invalid global export")
+        index = descriptor[1]
+        if globals_[index][0]:
+            raise ValueError("global export must be immutable")
+        indices.append(index)
+    if indices[0] == indices[1]:
+        raise ValueError("heap exports must be distinct globals")
+    return globals_[indices[0]][1], globals_[indices[1]][1], initial
+
+
+def check_heap_range(base: int, end: int, initial_pages: int) -> None:
+    """Check necessary donation conditions, not artifact provenance or admission.
+
+    Inputs must eventually come from an authenticated, immutable same-link record.
+    This arithmetic check alone cannot establish what a candidate actually linked.
+    """
+    if any(type(value) is not int for value in (base, end, initial_pages)):
+        raise ValueError("heap bounds and page count must be integers")
+    if not (0 < base < end <= 0xffff_ffff):
+        raise ValueError("invalid wasm32 linker heap range")
+    if not (0 < initial_pages <= 65536 and end <= initial_pages * 65536):
+        raise ValueError("linker heap exceeds initial linear memory")
+    if end % 8:
+        raise ValueError("linker heap end is not eight-byte aligned")
+
+
 def check_lock_identity(pins: dict, root: Path = ROOT) -> None:
     locks = pins.get("locks", {})
     if set(locks) != {"workers/api/Cargo.lock"}:

@@ -97,6 +97,97 @@ class RustPin(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 wt.inspect_i32_globals(payload)
 
+    def test_inspect_function_only_imports_rejects_other_kinds(self):
+        self.assertEqual(wt.inspect_function_only_imports(b"\x00"), 0)
+        self.assertEqual(wt.inspect_function_only_imports(b"\x01\x03env\x01f\x00\x80\x01"), 1)
+        for payload in (b"", b"\x00\x00", b"\x01", b"\x01\x02a", b"\x01\x01\xff\x00\x00\x00",
+                        b"\x01\x00\x00", b"\x01\x00\x00\x00",
+                        b"\x01\x00\x00\x00\xff\xff\xff\xff\x10", b"\x91\x4e",
+                        *(b"\x01\x00\x00" + bytes([kind]) + b"\x00" for kind in (1, 2, 3, 4))):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_function_only_imports(payload)
+
+    def test_inspect_exports_keeps_module_indices_without_resolving_imports(self):
+        self.assertEqual(wt.inspect_exports(b"\x00"), {})
+        self.assertEqual(wt.inspect_exports(
+            b"\x02\x0b__heap_base\x03\x81\x01\x06memory\x02\x00"),
+            {"__heap_base": (3, 129), "memory": (2, 0)})
+        for payload in (b"", b"\x00\x00", b"\x01", b"\x01\x02a", b"\x01\x01\xff\x03\x00",
+                        b"\x01\x01a", b"\x01\x01a\x04\x00", b"\x01\x01a\x03",
+                        b"\x01\x01a\x03\xff\xff\xff\xff\x10",
+                        b"\x02\x01a\x03\x00\x01a\x00\x00", b"\x91\x4e"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_exports(payload)
+
+    def test_inspect_memory_section_is_restricted_and_not_module_validation(self):
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x00\x00"), (0, None))
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x01\x01\x80\x80\x04"),
+                         (1, 65536))
+        for payload in (b"", b"\x00", b"\x02\x00\x01\x00\x01", b"\x01\x02\x01",
+                        b"\x01\x04\x01", b"\x01\x00", b"\x01\x01\x02\x01",
+                        b"\x01\x00\x81\x80\x04", b"\x01\x00\x01\x00",
+                        b"\x01\x00\xff\xff\xff\xff\x10",
+                        b"\x01\x00\x80\x80\x80\x80\x80\x00"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                wt.inspect_memory_section(payload)
+
+    def test_exported_heap_inspection_is_same_module_and_restricted(self):
+        magic = b"\0asm\x01\0\0\0"
+        def section(kind, payload):
+            return bytes((kind, len(payload))) + payload
+        memory = section(5, b"\x01\x00\x01")
+        globals_ = section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+        exports = section(7, b"\x02\x01a\x03\x00\x01b\x03\x01")
+        imports = section(2, b"\x01\x00\x00\x00\x00")
+        valid = magic + imports + memory + globals_ + exports
+        self.assertEqual(wt.inspect_exported_heap_values(valid, "a", "b"), (1, 8, 1))
+        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + section(0, b"")
+                                                          + globals_ + exports, "a", "b"), (1, 8, 1))
+        mutable = section(6, b"\x02\x7f\x01\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+        for module, a, b in (
+            (magic + memory + globals_, "a", "b"),
+            (magic + memory + memory + globals_ + exports, "a", "b"),
+            (magic + globals_ + memory + exports, "a", "b"),
+            (magic + section(13, b"") + memory + globals_ + exports, "a", "b"),
+            (magic + section(2, b"\x01\x00\x00\x03\x7f\x00") + memory + globals_ + exports, "a", "b"),
+            # Imported memory must not be confused with the defined memory.
+            (magic + section(2, b"\x01\x00\x00\x02\x00\x01") + memory + globals_ + exports, "a", "b"),
+            (magic + memory + mutable + exports, "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x03\x00"), "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x03\x02"), "a", "b"),
+            (magic + memory + globals_ + section(7, b"\x02\x01a\x03\x00\x01b\x00\x01"), "a", "b"),
+            (valid, "a", "missing"), (valid, "a", "a"),
+        ):
+            with self.subTest(module=module, a=a, b=b), self.assertRaises(ValueError):
+                wt.inspect_exported_heap_values(module, a, b)
+
+    def test_named_exports_are_not_proof_of_linker_symbol_identity(self):
+        # Arbitrary globals can impersonate the names without being linker symbols.
+        magic = b"\0asm\x01\0\0\0"
+        def section(kind, payload):
+            return bytes((kind, len(payload))) + payload
+        module = (magic + section(5, b"\x01\x00\x01")
+                  + section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
+                  + section(7, b"\x02\x0b__heap_base\x03\x00\x0a__heap_end\x03\x01"))
+        base, end, pages = wt.inspect_exported_heap_values(module, "__heap_base", "__heap_end")
+        self.assertEqual((base, end, pages), (1, 8, 1))
+        wt.check_heap_range(base, end, pages)
+        # This deliberately says nothing about validation, provenance or admission.
+
+    def test_heap_range_checks_necessary_donation_conditions(self):
+        # Base need not be aligned: init_top adjusts it, not the end.
+        wt.check_heap_range(17, 65536, 1)
+        wt.check_heap_range(1, 0xffff_fff8, 65536)
+        for base, end, pages in (
+            (0, 8, 1), (8, 8, 1), (9, 8, 1), (1, 65535, 1),
+            (1, 65544, 1), (1, 0x1_0000_0000, 65536),
+            (1, 8, 0), (1, 8, 65537), (True, 8, 1),
+            (1, None, 1),
+        ):
+            with self.subTest(base=base, end=end, pages=pages):
+                with self.assertRaises(ValueError):
+                    wt.check_heap_range(base, end, pages)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
@@ -413,6 +504,10 @@ class RustPin(unittest.TestCase):
                 entry = tarfile.TarInfo(prefix + path)
                 entry.size = len(name)
                 bundle.addfile(entry, io.BytesIO(name.encode()))
+                if name == "rustc":
+                    linker = tarfile.TarInfo(prefix + f"lib/rustlib/{host}/bin/rust-lld")
+                    linker.size = len(b"linker")
+                    bundle.addfile(linker, io.BytesIO(b"linker"))
                 metadata = tarfile.TarInfo(prefix + "manifest.in")
                 metadata.size = len(name)
                 bundle.addfile(metadata, io.BytesIO(name.encode()))
@@ -425,7 +520,9 @@ class RustPin(unittest.TestCase):
         ).encode()
         rust["channel-manifest"]["sha256"] = hashlib.sha256(manifest).hexdigest()
         result = wt.host_component_files(pins, manifest, archives)
-        self.assertEqual(set(result), set(paths.values()))
+        linker_path = f"lib/rustlib/{host}/bin/rust-lld"
+        self.assertEqual(set(result), set(paths.values()) | {linker_path})
+        self.assertEqual(result[linker_path], hashlib.sha256(b"linker").hexdigest())
         urls = {rust["channel-manifest"]["url"]: manifest,
                 **{f"https://example.invalid/{name}": data for name, data in archives.items()}}
         self.assertEqual(wt.download_host_component_files(pins, lambda url, limit: urls[url]), result)
