@@ -243,6 +243,26 @@ test('a position getter cannot write through a reentrant source change', () => {
 	expect(page.read().restartStatusVersion).toBe(0);
 });
 
+test.each([false, true])('restart with a queue edit during assignment (newer jump: %s)', (newerJump) => {
+	const { page, element, media } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	const read = vi.fn(() => media.position);
+	Object.defineProperty(element, 'currentTime', { get: read, set(value: number) {
+		if (value === 0) page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+		media.position = value;
+		if (value === 0 && newerJump) page.jump('forward');
+		if (value === 0) read.mockClear();
+	} });
+	page.restart();
+	expect(page.currentAudio()).toBe(element);
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral', 'pine']);
+	expect(media.position).toBe(newerJump ? 10 : 0);
+	expect(page.read().jumpStatus).toBe(newerJump ? 'Forward 10 seconds, now at 0:10.' : '');
+	expect(read).not.toHaveBeenCalled();
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
 test('a setter that crosses the account boundary cannot retire new jump feedback or read back', () => {
 	const { page, element, remount, writes } = restartFixture();
 	let reads = 0;

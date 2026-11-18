@@ -126,9 +126,8 @@ export function createMediaController() {
 					const atStart = Math.abs(position) <= 0.05;
 					if (atStart) words = 'Already at the start of';
 					audio.currentTime = 0;
-					// Retire feedback for the old position before another native read.
-					if (!isCurrent()) return;
-					deps.assigned();
+					// Queue edits can revoke readback without retiring the old position feedback.
+					if (current === attachment) deps.assigned();
 					if (!atStart) {
 						if (!matches()) return;
 						const readback = audio.currentTime;

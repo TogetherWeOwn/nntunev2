@@ -936,7 +936,9 @@
 					seekRevision === pendingShareSeek.revision && jumpVersion === jumpStatusVersion;
 			},
 			available: restartIsAvailable,
-			assigned: () => { jumpStatus = ''; },
+			assigned: () => {
+				if (shareAlive && revision === mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
+			},
 			publish: (message, available) => {
 				if (!available) restartCanSeek = false;
 				setRestartStatus(message);
