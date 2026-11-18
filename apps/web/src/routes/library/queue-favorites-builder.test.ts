@@ -6,6 +6,7 @@ import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
+import { createMediaController } from '#lib/player/mediaController.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -35,7 +36,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
 		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision'
+		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision', 'playingElement'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -50,7 +51,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle, createPendingShareSeek,
-		queueController: createQueueController(queue),
+		queueController: createQueueController(queue), createMediaController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
