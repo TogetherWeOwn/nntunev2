@@ -34,7 +34,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
-		'favoriteTracks', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
+		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
 		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision'
 	]);
 	const body = parsed.statements.filter((statement) =>
@@ -65,7 +65,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;
 		replaceQueue: (queue: QueueState) => boolean;
-	commitQueue: (queue: QueueState, kind: 'clear') => boolean;
+		commitQueue: (queue: QueueState, kind: 'clear') => boolean;
 		subscribe: (callback: (queue: QueueState) => void) => () => void;
 		read: () => { queue: QueueState; announcement: string };
 	};
@@ -95,6 +95,21 @@ test('reentrant replacement stops the superseded favorites action', () => {
 	page.queueAll();
 	expect(page.read().queue).toBe(newer);
 	expect(page.read().announcement).toBe('');
+	unsubscribe();
+});
+
+test('a nested favorites action keeps its newer no-op announcement', () => {
+	const page = pageActions(['mike']);
+	let reacted = false;
+	const unsubscribe = page.subscribe((value) => {
+		if (!reacted && value.tracks.some((track) => track.id === 'mike')) {
+			reacted = true;
+			page.queueAll();
+		}
+	});
+	page.queueAll();
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['mike']);
+	expect(page.read().announcement).toMatch(/^queued 0 favorites, 1 already queued/i);
 	unsubscribe();
 });
 

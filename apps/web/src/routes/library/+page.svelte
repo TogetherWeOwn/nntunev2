@@ -483,7 +483,7 @@
 				const kept = queue.tracks.filter((track) => ids.has(track.id));
 				if (kept.length !== queue.tracks.length) {
 					queueConfirmGeneration += 1;
-					const currentId = queueCurrentTrack(queueController.snapshot)?.id ?? null;
+					const currentId = queueCurrentTrack(queue)?.id ?? null;
 					const rebuilt = createQueue(kept);
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
@@ -723,14 +723,17 @@
 		queueAnnouncementVersion += 1;
 	}
 
+	let favoritesAction = 0;
 	function queueFavorites(): void {
 		if (favoriteTracks.length === 0) return;
+		const action = ++favoritesAction;
 		const before = queueController.snapshot.tracks.length;
 		// Use the shelf's resolved star order and the same deduping path as
 		// individual taps. No persistence, playback, or account lookup here.
 		for (const track of favoriteTracks) {
 			if (!selectTrack(track.id, track)) return;
 		}
+		if (action !== favoritesAction) return;
 		const added = queueController.snapshot.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
 	}
