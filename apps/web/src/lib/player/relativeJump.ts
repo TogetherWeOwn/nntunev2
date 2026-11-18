@@ -34,7 +34,7 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  * unchanged.
  */
 export function jumpMedia(
-	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true
+	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void
 ): JumpOutcome {
 	let target: number;
 	let raw: number;
@@ -57,6 +57,7 @@ export function jumpMedia(
 	try {
 		if (!matches()) return { kind: 'unavailable' };
 		media.currentTime = target;
+		assigned?.();
 		if (!matches()) return { kind: 'unavailable' };
 		const readback = media.currentTime;
 		if (!Number.isFinite(readback) || Math.abs(readback - target) > TOLERANCE) {

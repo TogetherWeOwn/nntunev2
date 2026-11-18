@@ -958,22 +958,27 @@
 		if (!shareAlive) return;
 		const source = resolveStreamUrl(current);
 		const queueRevision = queueController.revision;
+		const revision = mediaRevision;
+		const jumpVersion = jumpStatusVersion;
 		let seekRevision = pendingShareSeek.revision;
-		const outcome = media.jump(source, direction,
-			() => shareAlive && queueController.isCurrent(queueRevision) && seekRevision === pendingShareSeek.revision,
-			() => {
+		media.jump(source, direction, {
+			isCurrent: () => shareAlive && queueController.isCurrent(queueRevision) &&
+				seekRevision === pendingShareSeek.revision,
+			supersedeShare: () => {
 				if (current) pendingShareSeek.supersede(current.id, source);
 				seekRevision = pendingShareSeek.revision;
-			});
-		if (!outcome) return;
-		// A no-write outcome must not disown an earlier jump's queued event.
-		// handleSeeking still retires feedback at a different element or position.
-		if (element && outcome.kind === 'jumped') {
-			lastJumpSeek = { element, target: outcome.target };
-		}
-		jumpStatus = describeJump(direction, outcome);
-		// Re-announce a repeated identical outcome.
-		jumpStatusVersion += 1;
+			},
+			assigned: () => {
+				if (!shareAlive || revision !== mediaRevision || jumpVersion !== jumpStatusVersion) return;
+				jumpStatus = '';
+			},
+			publish: (outcome) => {
+				// A no-write outcome must not disown an earlier jump's queued event.
+				if (element && outcome.kind === 'jumped') lastJumpSeek = { element, target: outcome.target };
+				jumpStatus = describeJump(direction, outcome);
+				jumpStatusVersion += 1;
+			}
+		});
 	}
 
 	if (typeof window !== 'undefined') {

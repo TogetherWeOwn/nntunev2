@@ -259,7 +259,8 @@ test.each([false, true])('restart with a queue edit during assignment (newer jum
 	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral', 'pine']);
 	expect(media.position).toBe(newerJump ? 10 : 0);
 	expect(page.read().jumpStatus).toBe(newerJump ? 'Forward 10 seconds, now at 0:10.' : '');
-	expect(read).not.toHaveBeenCalled();
+	// If queued, only the newer jump reads its starting position and readback.
+	expect(read).toHaveBeenCalledTimes(newerJump ? 2 : 0);
 	expect(page.read().restartStatusVersion).toBe(0);
 });
 
@@ -868,20 +869,81 @@ test('a newer share received by a jump source getter survives the old gesture', 
 	expect(writes).toEqual([45]);
 });
 
-test('a newer restart in the jump setter wins over the old jump result', () => {
+test('the final connectivity read cannot redirect the jump to a different source', () => {
+	const { page, element, track, writes } = restartFixture();
+	let source = track.streamUrl;
+	let targetChecked = false;
+	element.getAttribute = () => source;
+	Object.defineProperties(element, {
+		seekable: { get() {
+			targetChecked = true;
+			return { length: 1, start: () => 0, end: () => 120 };
+		} },
+		isConnected: { get() {
+			if (targetChecked) source = '/test-audio/replacement';
+			return true;
+		} }
+	});
+	page.jump('forward');
+	expect(source).toBe('/test-audio/replacement');
+	expect(writes).toEqual([]);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test.each(['before', 'after'])('unreadable source %s assignment retires feedback only if the jump wrote', (order) => {
+	const { page, element, media, track, writes } = restartFixture();
+	page.jump('forward');
+	const priorStatus = 'Forward 10 seconds, now at 0:40.';
+	expect(page.read().jumpStatus).toBe(priorStatus);
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (order === 'before' ? targetChecked : media.position === 50) throw new Error('unreadable source');
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(writes).toEqual(order === 'before' ? [40] : [40, 50]);
+	expect(page.read().jumpStatus).toBe(order === 'before' ? priorStatus : '');
+});
+
+test.each(['before', 'after'])('a restart called %s the jump setter stores its value wins', (order) => {
 	const { page, element, media, writes } = restartFixture();
 	Object.defineProperty(element, 'currentTime', {
 		get: () => media.position,
 		set: (seconds: number) => {
 			writes.push(seconds);
+			if (seconds !== 0 && order === 'before') page.restart();
 			media.position = seconds;
 			page.seeking();
-			if (seconds !== 0) page.restart();
+			if (seconds !== 0 && order === 'after') page.restart();
 		}
 	});
 	page.jump('forward');
 	expect(writes).toEqual([40, 0]);
+	expect(media.position).toBe(0);
 	expect(page.read().restartStatus).toBe('Restarted Coral Night.');
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a new share supersedes a restart deferred by the jump setter', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	Object.defineProperty(element, 'currentTime', { get: () => media.position, set(seconds: number) {
+		writes.push(seconds);
+		if (seconds === 40) {
+			page.restart();
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+		}
+		media.position = seconds;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([40, 45]);
+	expect(media.position).toBe(45);
+	expect(page.read().restartStatusVersion).toBe(0);
 	expect(page.read().jumpStatus).toBe('');
 });
 

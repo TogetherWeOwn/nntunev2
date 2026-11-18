@@ -21,6 +21,13 @@ type PlaySelection = {
 	bumpAnnouncement: () => void;
 };
 
+type JumpSelection = {
+	isCurrent: () => boolean;
+	supersedeShare: () => void;
+	assigned: () => void;
+	publish: (outcome: JumpOutcome) => void;
+};
+
 type RestartSelection = {
 	supersedeShare: () => () => boolean;
 	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
@@ -45,6 +52,8 @@ export function createMediaController() {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
+	let positioning = false;
+	let nextPosition: (() => void) | undefined;
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -100,30 +109,51 @@ export function createMediaController() {
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
 		try {
-			return isCurrent() && audio.getAttribute('src') === source && isCurrent() &&
-				audio.isConnected && isCurrent();
+			return isCurrent() && audio.isConnected && isCurrent() &&
+				audio.getAttribute('src') === source && isCurrent();
 		} catch {
 			return false;
 		}
 	}
 
-	function jump(
-		source: string, direction: JumpDirection, selectionIsCurrent: () => boolean, supersedeShare: () => void
-	): JumpOutcome | null {
-		if (destroyed) return null;
+	function runPosition(action: () => void): void {
+		// A setter can call a newer gesture before storing its own value. Revoke
+		// the old intent immediately, but let the native call unwind before writing again.
+		nextPosition = action;
+		if (positioning) return;
+		positioning = true;
+		try {
+			while (nextPosition) {
+				const run = nextPosition;
+				nextPosition = undefined;
+				run();
+			}
+		} finally {
+			positioning = false;
+			nextPosition = undefined;
+		}
+	}
+
+	function jump(source: string, direction: JumpDirection, deps: JumpSelection): void {
+		if (destroyed) return;
 		const attachment = current;
 		const intent = ++positionIntent;
-		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
-		const audio = attachment?.audio;
-		if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
-			return isCurrent() ? { kind: 'unavailable' } : null;
-		}
-		// Even a boundary or refused jump takes precedence over a deferred share.
-		supersedeShare();
-		const matches = () => matchesSource(audio, source, isCurrent);
-		if (!matches()) return null;
-		const outcome = jumpMedia(audio, direction, matches);
-		return matches() ? outcome : null;
+		const isCurrent = () => !destroyed && current === attachment && positionIntent === intent && deps.isCurrent();
+		runPosition(() => {
+			const audio = attachment?.audio;
+			if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
+				if (isCurrent()) deps.publish({ kind: 'unavailable' });
+				return;
+			}
+			// Even a boundary or refused jump takes precedence over a deferred share.
+			deps.supersedeShare();
+			const matches = () => matchesSource(audio, source, isCurrent);
+			if (!matches()) return;
+			const outcome = jumpMedia(audio, direction, matches, () => {
+				if (current === attachment) deps.assigned();
+			});
+			if (matches()) deps.publish(outcome);
+		});
 	}
 
 	function restart(source: string, title: string, deps: RestartSelection): void {
@@ -132,35 +162,37 @@ export function createMediaController() {
 		const intent = ++positionIntent;
 		// Supersede before any native read, including an unavailable or refused seek.
 		const selectionIsCurrent = deps.supersedeShare();
-		if (!attachment) return;
+		if (!attachment || positionIntent !== intent) return;
 		const { audio } = attachment;
 		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
 		const matches = () => matchesSource(audio, source, isCurrent);
-		if (!matches()) return;
+		runPosition(() => {
+			if (!matches()) return;
 
-		let words = 'Could not restart';
-		let available = false;
-		try {
-			available = deps.available(audio, matches);
-			if (available && matches()) {
-				const position = audio.currentTime;
-				if (Number.isFinite(position) && matches()) {
-					const atStart = Math.abs(position) <= 0.05;
-					if (atStart) words = 'Already at the start of';
-					audio.currentTime = 0;
-					// Queue edits can revoke readback without retiring the old position feedback.
-					if (current === attachment) deps.assigned();
-					if (!atStart) {
-						if (!matches()) return;
-						const readback = audio.currentTime;
-						if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) words = 'Restarted';
+			let words = 'Could not restart';
+			let available = false;
+			try {
+				available = deps.available(audio, matches);
+				if (available && matches()) {
+					const position = audio.currentTime;
+					if (Number.isFinite(position) && matches()) {
+						const atStart = Math.abs(position) <= 0.05;
+						if (atStart) words = 'Already at the start of';
+						audio.currentTime = 0;
+						// Queue edits can revoke readback without retiring the old position feedback.
+						if (current === attachment) deps.assigned();
+						if (!atStart) {
+							if (!matches()) return;
+							const readback = audio.currentTime;
+							if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) words = 'Restarted';
+						}
 					}
 				}
+			} catch {
+				// Unreadable positions and refused assignments cannot prove a restart.
 			}
-		} catch {
-			// Unreadable positions and refused assignments cannot prove a restart.
-		}
-		if (matches()) deps.publish(describeRestart(words, title), available);
+			if (matches()) deps.publish(describeRestart(words, title), available);
+		});
 	}
 
 	return {
