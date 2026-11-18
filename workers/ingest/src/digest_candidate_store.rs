@@ -22,9 +22,16 @@ fn uuid(id: &[u8; 16]) -> String {
 }
 
 /// A single statement matches the immutable DB intent and invokes the fenced
-/// candidate function. The owned client is dropped on timeout, but that does
-/// not prove rollback: `UnknownCommit` requires reconciliation before retry.
-/// Returned errors never expose DB details.
+/// candidate function.
+///
+/// Pass a dedicated, freshly connected client in autocommit mode, with no open
+/// transaction and no other statements using the connection. Only under this
+/// precondition does `Ok(())` confirm the candidate write committed. This
+/// function does not commit a caller's explicit transaction.
+///
+/// The owned client is dropped on timeout, but that does not prove rollback:
+/// `UnknownCommit` requires reconciliation before retry. Returned errors
+/// never expose DB details.
 pub async fn store(
     client: tokio_postgres::Client,
     intent: &CandidateIntent,
