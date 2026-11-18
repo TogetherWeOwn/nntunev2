@@ -890,6 +890,23 @@ test('the final connectivity read cannot redirect the jump to a different source
 	expect(page.read().jumpStatus).toBe('');
 });
 
+test('a source read that disconnects the element cannot authorize a jump', () => {
+	const { page, element, track, writes } = restartFixture();
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (targetChecked) element.isConnected = false;
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(element.isConnected).toBe(false);
+	expect(writes).toEqual([]);
+	expect(page.read().jumpStatus).toBe('');
+});
+
 test.each(['before', 'after'])('unreadable source %s assignment retires feedback only if the jump wrote', (order) => {
 	const { page, element, media, track, writes } = restartFixture();
 	page.jump('forward');

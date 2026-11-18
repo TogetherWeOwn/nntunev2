@@ -109,8 +109,9 @@ export function createMediaController() {
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
 		try {
+			// Reading connectivity can change the source, and reading the source can detach the node.
 			return isCurrent() && audio.isConnected && isCurrent() &&
-				audio.getAttribute('src') === source && isCurrent();
+				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent();
 		} catch {
 			return false;
 		}
