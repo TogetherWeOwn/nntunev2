@@ -191,16 +191,22 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str>
             let pid = waiting_pid.ok_or(StoreError)?;
             // Drop the actual reconciliation future only after observing its blocked backend.
             drop(operation);
-            phase.set("cancellation backend did not disappear or observation failed");
             let mut disappeared = false;
+            let mut last_state = None;
             for _ in 0..40 {
-                let present: bool = client.query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid = $1)", &[&pid]
-                ).await.map_err(|_| StoreError)?.get(0);
-                if !present { disappeared = true; break; }
+                phase.set("cancellation backend observation query failed or timed out");
+                let row = client.query_opt(
+                    "SELECT state, wait_event_type, wait_event, EXTRACT(EPOCH FROM (clock_timestamp() - xact_start))::bigint FROM pg_catalog.pg_stat_activity WHERE pid = $1", &[&pid]
+                ).await.map_err(|_| StoreError)?;
+                let Some(row) = row else { disappeared = true; break; };
+                last_state = Some((row.get::<_, Option<String>>(0), row.get::<_, Option<String>>(1), row.get::<_, Option<String>>(2), row.get::<_, Option<i64>>(3)));
+                phase.set("cancellation backend remained present during observation");
                 worker::Delay::from(Duration::from_millis(50)).await;
             }
-            if !disappeared { return Err(StoreError); }
+            if !disappeared {
+                worker::console_log!("cancellation backend state, wait type, wait event, transaction age seconds: {:?}", last_state);
+                return Err(StoreError);
+            }
             phase.set("cancellation rollback row check failed");
             let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
             if row.get::<_, i64>(0) != 0 || row.get::<_, i64>(1) != 0 { return Err(StoreError); }
