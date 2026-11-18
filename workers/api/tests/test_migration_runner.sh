@@ -24,7 +24,8 @@ case " $* " in
     exit 3 ;;
   *' -1 -v purge_case=grants '*) reason='cache grants are not empty' ;;
   *' -1 -v purge_case=vault '*) reason='a vault owner lacks the account marker' ;;
-  *' -1 -v purge_case=owner '*) reason='provider owners would lose reaping protection' ;;
+  *' -1 -v purge_case=owner '*|*' -1 -v purge_case=owner_admin '*|*' -1 -v purge_case=owner_deleting '*)
+    reason='provider owners would lose reaping protection' ;;
   *) exit 0 ;;
 esac
 printf 'ERROR: legacy provider purge refused: %s\n' "$reason" >&2
@@ -44,6 +45,9 @@ done
 for reason in 'cache grants are not empty' 'a vault owner lacks the account marker' \
   'provider owners would lose reaping protection'; do
   grep -Fq "legacy provider purge refused: $reason" "$dir/output"
+done
+for fixture in grants vault owner owner_admin owner_deleting; do
+  grep -Fq "purge guard ($fixture): ERROR: legacy provider purge refused:" "$dir/output"
 done
 grep -Fq -- '-v purge_case=allow -c BEGIN;' "$dir/calls"
 

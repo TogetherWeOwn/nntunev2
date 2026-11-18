@@ -69,17 +69,17 @@ check_purge_upgrade() {
   local migration=$1 fixture expected output
   check_purge_reader_contention "$migration" users
   check_purge_reader_contention "$migration" cache_objects
-  for fixture in grants vault owner; do
+  for fixture in grants vault owner owner_admin owner_deleting; do
     case "$fixture" in
       grants) expected='cache grants are not empty' ;;
       vault) expected='a vault owner lacks the account marker' ;;
-      owner) expected='provider owners would lose reaping protection' ;;
+      owner|owner_admin|owner_deleting) expected='provider owners would lose reaping protection' ;;
     esac
     if output=$(psql_run -1 -v purge_case="$fixture" -f "$purge_seed" -f "$migration" 2>&1); then
       printf 'purge unexpectedly accepted %s\n' "$fixture" >&2
       return 1
     fi
-    printf '%s\n' "$output"
+    printf 'purge guard (%s): %s\n' "$fixture" "$output"
     [[ "$output" == *"legacy provider purge refused: $expected"* ]] || return 1
   done
   # Exercise the real migration with legacy ciphertext and retained rows,

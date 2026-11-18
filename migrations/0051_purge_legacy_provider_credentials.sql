@@ -25,16 +25,14 @@ BEGIN
         RAISE EXCEPTION 'legacy provider purge refused: a vault owner lacks the account marker';
     END IF;
 
-    -- The providers FK currently prevents reaping these users. Do not
-    -- count temporary protections (age, open challenges or magic links).
-    -- Match the enduring conditions in unverified_user_filter, including
-    -- any session, even one that is revoked. Never admit users via a provider.
+    -- The providers FK currently prevents reaping these users. Role and
+    -- deletion fences can change, just as age and open challenges or magic
+    -- links can expire. Require independent account evidence: the marker,
+    -- any session (even revoked), or a passkey. Do not change admission.
     IF EXISTS (
         SELECT 1 FROM public.providers AS p
         JOIN public.users AS u ON u.id = p.user_id
-        WHERE u.role = 'member'
-          AND u.deleting_at IS NULL
-          AND NOT u.legacy_vault_established
+        WHERE NOT u.legacy_vault_established
           AND NOT EXISTS (SELECT 1 FROM public.sessions AS s WHERE s.user_id = u.id)
           AND NOT EXISTS (SELECT 1 FROM public.webauthn_credentials AS c WHERE c.user_id = u.id)
     ) THEN

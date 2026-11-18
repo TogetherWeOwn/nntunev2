@@ -4,6 +4,11 @@ INSERT INTO users (id, email, created_at, legacy_vault_established) VALUES
     ('purge-session', 'purge-session@example.test', 1, false),
     ('purge-passkey', 'purge-passkey@example.test', 1, false),
     ('purge-young', 'purge-young@example.test', EXTRACT(EPOCH FROM now())::bigint, false);
+INSERT INTO users (id, email, created_at, role, deleting_at)
+SELECT 'purge-owner', 'purge-owner@example.test', 1,
+       CASE WHEN :'purge_case' = 'owner_admin' THEN 'admin' ELSE 'member' END,
+       CASE WHEN :'purge_case' = 'owner_deleting' THEN now() END
+WHERE :'purge_case' IN ('owner_admin', 'owner_deleting');
 INSERT INTO sessions (id, user_id, created_at, expires_at, revoked)
 VALUES ('purge-revoked', 'purge-session', 1, 2, true);
 INSERT INTO webauthn_credentials (cred_id, user_id, public_key, registered_at)
@@ -23,6 +28,7 @@ INSERT INTO providers (user_id, label, encrypted_creds, creds_envelope_version, 
 SELECT id, 'fixture', '\x00', 2, 1, decode(repeat('00', 12), 'hex'),
        decode(repeat('00', 48), 'hex'), decode(repeat('00', 12), 'hex'), 1, 1, 1
 FROM users WHERE id IN ('purge-marker', 'purge-session', 'purge-passkey')
+   OR id = 'purge-owner'
    OR (id = 'purge-young' AND :'purge_case' = 'owner');
 INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at)
 VALUES (repeat('0', 64), 1, 'fixture', 'fixture', 1);
