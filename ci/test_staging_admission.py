@@ -222,10 +222,14 @@ class Base(unittest.TestCase):
 
 
 class PolicyTests(Base):
-    def test_default_policy_has_no_approvals_and_refuses(self):
-        policy = json.loads((HERE / "staging-admission-policy.json").read_text())
-        self.assertEqual(policy["approvals"], [])
-        self.refused("unavailable or ambiguous", sa.approved_contract, policy, CONTRACT_BYTES)
+    def test_checked_in_policy_matches_contract(self):
+        policy = sa.parse_json((HERE / "staging-admission-policy.json").read_bytes())
+        contract = HERE / "product-journey-contract.json"
+        if not contract.exists():
+            self.assertEqual(policy["approvals"], [])
+            self.refused("unavailable or ambiguous", sa.approved_contract, policy, CONTRACT_BYTES)
+            return
+        sa.approved_contract(policy, contract.read_bytes())
 
     def test_missing_or_ambiguous_approval(self):
         policy = make_policy()

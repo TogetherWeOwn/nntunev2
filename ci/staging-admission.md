@@ -5,14 +5,14 @@ acceptance or permission to deploy. The manual production lane remains disabled
 by default. No runner, migration, mirror, production binding, secret or promoter
 is enabled by this change.
 
-## Current state: no approved product scope
+## Product approval and candidate evidence
 
-`staging-admission-policy.json` deliberately has **no approvals**. A green legacy
-journey, its permitted parked skips and a successful but unconfigured API job
-cannot qualify a candidate. The producer can publish an `incomplete` diagnostic
-receipt. Real production admission refuses until an independently approved
-product contract and complete candidate execution evidence exist. Do not enroll
-one of the synthetic test contracts as a production approval.
+An empty `staging-admission-policy.json` approval list refuses admission. A green
+legacy journey, its permitted parked skips and a successful but unconfigured API
+job cannot qualify a candidate. The producer can publish an `incomplete`
+diagnostic receipt. Production admission requires both an independently approved
+product contract and complete candidate execution evidence. Do not enroll a
+synthetic test contract as a production approval.
 
 Product requirements/applicability belong to the product authority; QA separately
 reviews their executable evidence mapping. The repository's normal protected
