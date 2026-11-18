@@ -5,6 +5,7 @@ import socket
 import struct
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "relay", Path(__file__).with_name("pg_commit_relay.py")
@@ -30,6 +31,28 @@ class CommitRelayFragmentation(unittest.TestCase):
             pass
         with self.assertRaises(relay.ProtocolError):
             result.result(timeout=1)
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 15432))
+
+    def test_relay_exit_during_exchange_closes_both_connections(self):
+        upstream, backend = socket.socketpair()
+        with backend, socket.socket() as client:
+            backend.settimeout(2)
+            client.settimeout(2)
+            with patch.object(relay.socket, "create_connection", return_value=upstream):
+                with relay.commit_relay() as result:
+                    client.connect(("127.0.0.1", 15432))
+                    params = b"user\0postgres\0database\0nntune_billing_ack\0\0"
+                    startup = struct.pack("!II", len(params) + 8, 196608) + params
+                    client.sendall(startup)
+                    self.assertEqual(
+                        backend.recv(len(startup), socket.MSG_WAITALL), startup
+                    )
+                with self.assertRaises(relay.ProtocolError):
+                    result.result(timeout=1)
+            self.assertEqual(backend.recv(1), b"")
+            self.assertEqual(client.recv(1), b"")
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 15432))
