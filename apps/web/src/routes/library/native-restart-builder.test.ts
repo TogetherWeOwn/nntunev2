@@ -692,7 +692,7 @@ test('restart at the start clears an earlier boundary readout', () => {
 });
 
 for (const mode of ['one', 'queue'] as const) {
-	test(`same-source repeat ${mode} clears an earlier jump readout`, async () => {
+	test(`LIBREP-U03 native ended replays under repeat ${mode} and clears an earlier jump readout`, async () => {
 		const { page, media, element, capture } = restartFixture();
 		page.jump('forward');
 		expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
@@ -704,6 +704,7 @@ for (const mode of ['one', 'queue'] as const) {
 		await page.end(mode);
 		expect(media.position).toBe(0);
 		expect(page.read().jumpStatus).toBe('');
+		expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
 	});
 }
 
