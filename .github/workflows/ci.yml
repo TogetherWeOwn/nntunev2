@@ -1954,6 +1954,7 @@ jobs:
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
           python3 -I workers/api/tests/test_pg_protocol_frames.py
           python3 -I workers/api/tests/test_pg_commit_barrier.py
+          python3 -I workers/api/tests/test_pg_close_observer.py
           python3 -I workers/api/tests/test_commit_relay_fragmentation.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:
