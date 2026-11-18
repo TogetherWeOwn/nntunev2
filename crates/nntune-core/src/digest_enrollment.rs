@@ -44,7 +44,8 @@ pub struct OriginManifest {
 
 impl OriginManifest {
     /// Digest of the plaintext chunks consumed by this sealer, in order.
-    /// This alone does not authorize a claim, publication, or reuse.
+    /// This alone does not authorize a claim, publication, or reuse. Do not
+    /// include this digest in logs or errors.
     pub fn plaintext_sha256(&self) -> &[u8; 32] {
         &self.plaintext_sha256
     }
@@ -338,6 +339,26 @@ mod tests {
         changed.seal_chunk(&plaintext[..65_536]).unwrap();
         changed.seal_chunk(&plaintext[65_536..]).unwrap();
         assert_ne!(digest, *changed.finish().unwrap().plaintext_sha256());
+    }
+
+    #[test]
+    fn plaintext_digest_preserves_order_across_page_boundary() {
+        let ids = [id(1), id(2), id(3), id(4), id(5)];
+        let mut builder = DigestEnrollment::new(256 * 65_536 + 1, ids, id(6)).unwrap();
+        for index in 0..256 {
+            builder
+                .seal_chunk(&vec![(index % 251) as u8; 65_536])
+                .unwrap();
+        }
+        builder.seal_chunk(&[254]).unwrap();
+        assert_eq!(
+            builder.finish().unwrap().plaintext_sha256(),
+            &[
+                0xc2, 0xd6, 0xf0, 0xa6, 0x82, 0x94, 0xfb, 0xc4, 0x4e, 0x6b, 0x38, 0x68, 0x75, 0x7e,
+                0x15, 0x6d, 0xa7, 0xc0, 0x94, 0x91, 0x3d, 0x2d, 0xed, 0x69, 0xaa, 0x19, 0x9f, 0xf3,
+                0x98, 0x32, 0xe7, 0x19,
+            ]
+        );
     }
 
     #[test]
