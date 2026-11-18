@@ -180,7 +180,8 @@ class RustPin(unittest.TestCase):
         base, end, pages = wt.inspect_exported_heap_values(module, "__heap_base", "__heap_end")
         self.assertEqual((base, end, pages), (1, 8, 1))
         wt.check_heap_range(base, end, pages)
-        # This deliberately says nothing about validation, provenance or admission.
+        self.assertTrue(wt.linker_donation_fits(base, end, pages, 7))
+        # Even a fitting range says nothing about symbol identity or admission.
 
     def test_heap_range_checks_necessary_donation_conditions(self):
         # Base need not be aligned: init_top adjusts it, not the end.
@@ -195,6 +196,19 @@ class RustPin(unittest.TestCase):
             with self.subTest(base=base, end=end, pages=pages):
                 with self.assertRaises(ValueError):
                     wt.check_heap_range(base, end, pages)
+
+    def test_linker_donation_size_predicate_is_bounded(self):
+        self.assertTrue(wt.linker_donation_fits(17, 65536, 1, 65519))
+        self.assertFalse(wt.linker_donation_fits(17, 65536, 1, 65520))
+        self.assertTrue(wt.linker_donation_fits(7, 8, 1, 1))
+        self.assertFalse(wt.linker_donation_fits(7, 8, 1, 2))
+        self.assertTrue(wt.linker_donation_fits(1, 0xffff_fff8, 65536, 0xffff_fff7))
+        self.assertFalse(wt.linker_donation_fits(1, 0xffff_fff8, 65536, 0xffff_ffff))
+        for request in (0, -1, 0x1_0000_0000, True, None):
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                wt.linker_donation_fits(17, 65536, 1, request)
+        with self.assertRaises(ValueError):
+            wt.linker_donation_fits(17, 65535, 1, 1)
 
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
