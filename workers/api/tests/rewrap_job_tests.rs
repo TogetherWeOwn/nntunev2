@@ -558,7 +558,7 @@ fn job_sql_consts_match_the_runbook_claim_and_cas_contract() {
     assert_eq!(
         CAS_REWRAP_SQL,
         &section_6[update_start..update_start + update_end + 1],
-        "CAS SQL drifted from the §6 UPDATE"
+        "historical fixture CAS SQL drifted from the §6 UPDATE"
     );
 }
 

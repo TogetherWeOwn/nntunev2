@@ -29,8 +29,6 @@
 //! contract, so their bytes and hashes coincide by construction.
 //! Source bytes are only ever read, never modified.
 //!
-//! Publication is idempotent. Per-user cache grants are retired by ADR 0013.
-//!
 //! - [`upsert_cache_object_sql`] — the content-global blob row. No
 //!   writer fence: the row carries no user identity and an orphaned
 //!   blob is swept, never served.

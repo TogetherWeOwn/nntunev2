@@ -2,8 +2,8 @@
 //! (`workers/api/src/rotation.rs`, `docs/security/kek-rotation.md` §6).
 //!
 //! Second-implementation coverage over a synthetic in-memory sqlite vault:
-//! every test builds its own fixture (migrations 0002 + 0015, then `ROTATION_RUNS_DDL`
-//! verbatim), drives `run_rewrap_pass` through a local
+//! every test builds its own fixture (migrations 0002 + 0015, then the job's
+//! `ROTATION_RUNS_DDL` verbatim), drives `run_rewrap_pass` through a local
 //! `RewrapStore` that executes the historical vault SQL, and asserts the
 //! end-state a rotation drill would check. Keys are random per test; user ids
 //! and payloads are synthetic.
