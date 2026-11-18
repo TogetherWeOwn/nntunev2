@@ -113,6 +113,124 @@ def inspect_i32_globals(payload: bytes) -> list[tuple[bool, int]]:
     return result
 
 
+def inspect_function_only_imports(payload: bytes) -> int:
+    """Count imports only when all are functions; not module validation.
+
+    This restricted inspection rejects global, memory, table and tag imports.
+    It does not establish that the inspected bytes belong to a candidate build.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated import section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("import section integer exceeds u32")
+            value |= (byte & 0x7f) << (7 * index)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid import section integer")
+
+    count, offset = u32(0)
+    if count > 10_000:
+        raise ValueError("too many WASM imports")
+    for _ in range(count):
+        for _ in range(2):
+            length, offset = u32(offset)
+            if length > len(payload) - offset:
+                raise ValueError("truncated import name")
+            try:
+                payload[offset:offset + length].decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("invalid import name") from error
+            offset += length
+        if offset >= len(payload) or payload[offset] != 0:
+            raise ValueError("only function imports are supported")
+        _, offset = u32(offset + 1)
+    if offset != len(payload):
+        raise ValueError("trailing import section bytes")
+    return count
+
+
+def inspect_exports(payload: bytes) -> dict[str, tuple[int, int]]:
+    """Decode bounded export descriptors without validating or authenticating a module.
+
+    Indices remain module indices; resolving globals requires accounting for imports.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated export section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("export section integer exceeds u32")
+            value |= (byte & 0x7f) << (7 * index)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid export section integer")
+
+    count, offset = u32(0)
+    if count > 10_000:
+        raise ValueError("too many WASM exports")
+    exports = {}
+    for _ in range(count):
+        length, offset = u32(offset)
+        if length > len(payload) - offset:
+            raise ValueError("truncated export name")
+        try:
+            name = payload[offset:offset + length].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("invalid export name") from error
+        offset += length
+        if name in exports or offset >= len(payload) or payload[offset] not in (0, 1, 2, 3):
+            raise ValueError("duplicate export or unsupported descriptor")
+        kind = payload[offset]
+        index, offset = u32(offset + 1)
+        exports[name] = (kind, index)
+    if offset != len(payload):
+        raise ValueError("trailing export section bytes")
+    return exports
+
+
+def inspect_memory_section(payload: bytes) -> tuple[int, int | None]:
+    """Inspect one defined, unshared wasm32 memory; not module validation.
+
+    Does not exclude imported memories or authenticate the section's candidate.
+    """
+    def u32(offset: int) -> tuple[int, int]:
+        value = 0
+        for index in range(5):
+            if offset >= len(payload):
+                raise ValueError("truncated memory section integer")
+            byte = payload[offset]
+            offset += 1
+            if index == 4 and byte & 0xf0:
+                raise ValueError("memory section integer exceeds u32")
+            value |= (byte & 0x7f) << (index * 7)
+            if not byte & 0x80:
+                return value, offset
+        raise ValueError("invalid memory section integer")
+
+    count, offset = u32(0)
+    if count != 1:
+        raise ValueError("expected one defined memory")
+    flags, offset = u32(offset)
+    if flags not in (0, 1):
+        raise ValueError("unsupported memory limits")
+    initial, offset = u32(offset)
+    maximum = None
+    if flags == 1:
+        maximum, offset = u32(offset)
+    if (offset != len(payload) or initial > 65536
+            or (maximum is not None and not initial <= maximum <= 65536)):
+        raise ValueError("invalid memory limits or trailing bytes")
+    return initial, maximum
+
+
 def check_lock_identity(pins: dict, root: Path = ROOT) -> None:
     locks = pins.get("locks", {})
     if set(locks) != {"workers/api/Cargo.lock"}:
