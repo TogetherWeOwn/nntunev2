@@ -144,11 +144,13 @@ class RustPin(unittest.TestCase):
         memory = section(5, b"\x01\x00\x01")
         globals_ = section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
         exports = section(7, b"\x02\x01a\x03\x00\x01b\x03\x01")
-        imports = section(2, b"\x01\x00\x00\x00\x00")
-        valid = magic + imports + memory + globals_ + exports
+        types = section(1, b"\x01\x60\x00\x00")  # One () -> () signature.
+        imports = section(2, b"\x01\x03env\x01f\x00\x00")
+        valid = magic + types + imports + memory + globals_ + exports
         self.assertEqual(wt.inspect_exported_heap_values(valid, "a", "b"), (1, 8, 1))
-        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + section(0, b"")
-                                                          + globals_ + exports, "a", "b"), (1, 8, 1))
+        custom = section(0, b"\x07fixture")
+        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + custom
+                                                         + globals_ + exports, "a", "b"), (1, 8, 1))
         mutable = section(6, b"\x02\x7f\x01\x41\x01\x0b\x7f\x00\x41\x08\x0b")
         for module, a, b in (
             (magic + memory + globals_, "a", "b"),
