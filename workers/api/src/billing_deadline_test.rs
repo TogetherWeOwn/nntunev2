@@ -144,14 +144,19 @@ pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
         .map_err(|_| "billing deadline after writes control failed")
 }
 
-async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), StoreError> {
+async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str> {
     use futures_util::future::{select, Either};
     use std::time::Duration;
 
+    let phase = std::rc::Rc::new(std::cell::Cell::new(
+        "cancellation observer connection failed",
+    ));
+    let diagnostic = phase.clone();
     billing_budget::with_owned_connection(
         "127.0.0.1", 5432, CONNECTION,
         |_| Box::pin(async { Ok(()) }),
         move |client| Box::pin(async move {
+            phase.set("cancellation observer lock failed");
             client.batch_execute("SELECT pg_advisory_lock(781349052)").await.map_err(|_| StoreError)?;
             let store = PgStore {
                 env: None,
@@ -161,6 +166,7 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), StoreError> {
             };
             let mut operation = Box::pin(store.store_reconcile_outcome("worker_fault_user", &outcome));
             let mut waiting_pid = None;
+            phase.set("cancellation wait observation failed");
             for _ in 0..40 {
                 let observation = Box::pin(async {
                     let rows = client.query(
@@ -172,15 +178,20 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), StoreError> {
                     Ok(pid)
                 });
                 match select(operation.as_mut(), observation).await {
-                    Either::Left(_) => return Err(StoreError),
+                    Either::Left((result, _)) => {
+                        phase.set(if result.is_ok() { "cancellation operation completed early" } else { "cancellation operation failed early" });
+                        return Err(StoreError);
+                    }
                     Either::Right((result, _)) => {
                         if let Some(pid) = result? { waiting_pid = Some(pid); break; }
                     }
                 }
             }
+            phase.set("cancellation advisory wait not observed");
             let pid = waiting_pid.ok_or(StoreError)?;
             // Drop the actual reconciliation future only after observing its blocked backend.
             drop(operation);
+            phase.set("cancellation backend did not disappear or observation failed");
             let mut disappeared = false;
             for _ in 0..40 {
                 let present: bool = client.query_one(
@@ -190,13 +201,15 @@ async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), StoreError> {
                 worker::Delay::from(Duration::from_millis(50)).await;
             }
             if !disappeared { return Err(StoreError); }
+            phase.set("cancellation rollback row check failed");
             let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
             if row.get::<_, i64>(0) != 0 || row.get::<_, i64>(1) != 0 { return Err(StoreError); }
+            phase.set("cancellation observer unlock failed");
             client.batch_execute("SELECT pg_advisory_unlock(781349052)").await.map_err(|_| StoreError)?;
             Ok(())
         }),
         |_| {},
-    ).await
+    ).await.map_err(|_| diagnostic.get())
 }
 
 pub(crate) async fn test_reconcile_cancel() -> Result<(), &'static str> {
@@ -206,7 +219,5 @@ pub(crate) async fn test_reconcile_cancel() -> Result<(), &'static str> {
     let mut outcome = test_outcome();
     outcome.history[1].stripe_invoice_id = "in_worker_cancel".into();
     outcome.row.paid_invoice_id = Some("in_worker_cancel".into());
-    cancel_in_flight(outcome)
-        .await
-        .map_err(|_| "billing cancellation control failed")
+    cancel_in_flight(outcome).await
 }
