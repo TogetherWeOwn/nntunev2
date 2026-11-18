@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -18,6 +19,7 @@ relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
 routing = relay.load("worker_routing_postgres_smoke")
 BILLING_DB = relay.BILLING_DB
+close_observer = relay.load("pg_close_observer")
 
 
 def parse_pids(status, body, marker, count):
@@ -160,8 +162,35 @@ def main():
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                 try:
                     url = f"http://127.0.0.1:{port}/billing-cancel-proof"
-                    status, _, body = routing.http("POST", url)
-                    routing.check(status == 200 and body == "billing-cancel-ok", body)
+                    with close_observer.close_observer() as (closed, relay_result):
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            request = pool.submit(routing.http, "POST", url)
+                            saw_eof = closed.wait(8)
+                            held = False
+                            if saw_eof:
+                                held = (
+                                    routing.psql(
+                                        settings,
+                                        BILLING_DB,
+                                        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a WHERE a.application_name = 'owned_billing_reconcile_test' AND a.wait_event_type = 'Lock' AND a.wait_event = 'advisory' AND cardinality(pg_blocking_pids(a.pid)) > 0)",
+                                        tuples=True,
+                                        timeout=2,
+                                    )
+                                    == "t"
+                                )
+                            print(
+                                f"cancellation observer: client_eof={saw_eof}, backend_blocked={held}",
+                                flush=True,
+                            )
+                            status, _, body = request.result(timeout=30)
+                        routing.check(
+                            status == 200 and body == "billing-cancel-ok", body
+                        )
+                        routing.check(
+                            saw_eof and held,
+                            "client EOF was not observed while backend remained blocked",
+                        )
+                        relay_result.result(timeout=2)
                     print(
                         "PASS: in-flight billing prototype cancellation rolled back",
                         flush=True,
