@@ -6,7 +6,7 @@ import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
-import { createQueueRevision } from '#lib/player/queueRevision.js';
+import { createQueueController } from '#lib/player/queueController.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -73,7 +73,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		createQueueRevision, streamUrl: track.streamUrl,
+		createQueueController, streamUrl: track.streamUrl,
 		tick, window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -85,7 +85,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
 		const restartSupersededSources = new Set();
-		const queueRevision = createQueueRevision();
+		const queueController = createQueueController(queue);
+		queueController.subscribe((value) => { queue = value; });
+		const queueRevision = queueController;
 		let endGeneration = 0, queueAnnouncementVersion = 0;
 		let repeat = 'off', playingElement = element;
 		let density, priorDocumentTitle = null, tabTitle = '';
@@ -105,6 +107,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => handleSeeking({ currentTarget: target }), replaceQueue,
+			subscribe: queueController.subscribe,
 			end: (mode) => { repeat = mode; return handleEnded({ currentTarget: element }); },
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
 			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, queueAnnouncement, queueAnnouncementVersion })
@@ -124,6 +127,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		playQueued: (id: string) => Promise<void>;
 		seeking: (target?: unknown) => void;
 		replaceQueue: (queue: ReturnType<typeof createQueue>) => void;
+		subscribe: (callback: (queue: ReturnType<typeof createQueue>) => void) => () => void;
 		end: (mode: 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
 		read: () => {
@@ -233,6 +237,110 @@ test('same-source replacement preserves pending share but only a new object fenc
 	expect(page.read().pendingShareSeek).toBe(before.pendingShareSeek);
 });
 
+test('a reentrant subscription cannot publish an older operation hint', () => {
+	const { page } = restartFixture();
+	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);
+	const oak = createQueue([{ id: 'oak', title: 'Oak', artist: '', streamUrl: '/test-audio/oak' }]);
+	const unsubscribe = page.subscribe((value) => {
+		if (value === pine) page.replaceQueue(oak);
+	});
+	page.replaceQueue(pine);
+	expect(page.read().queue).toBe(oak);
+	expect(readMiniPlayerHint()?.trackId).toBe('oak');
+	unsubscribe();
+});
+
+test('reentrant replacement during share append prevents the older navigation', async () => {
+	const { page, location, writes } = restartFixture();
+	page.replaceQueue(createQueue([]));
+	const newer = selectTrack(createQueue([
+		{ id: 'coral', title: 'Coral Night', artist: '', streamUrl: '/test-audio/coral' },
+		{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }
+	]), 1);
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 1 && value.tracks[0].id === 'coral') page.replaceQueue(newer);
+	});
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(page.read().queue).toBe(newer);
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(writes).toEqual([]);
+	unsubscribe();
+});
+
+test('reentrant replacement suppresses the superseded removal announcement', () => {
+	const { page } = restartFixture();
+	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);
+	const version = page.read().queueAnnouncementVersion;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) page.replaceQueue(pine);
+	});
+	page.remove(0);
+	expect(page.read().queue).toBe(pine);
+	expect(page.read().queueAnnouncement).toBe('');
+	expect(page.read().queueAnnouncementVersion).toBe(version);
+	unsubscribe();
+});
+
+test('reentrant replacement prevents the superseded play attempt', async () => {
+	const { page, element } = restartFixture();
+	const pine = createQueue([{ id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }]);
+	let plays = 0;
+	element.play = () => { plays += 1; return Promise.resolve(); };
+	const original = page.read().queue;
+	const unsubscribe = page.subscribe((value) => {
+		if (value !== original && value !== pine) page.replaceQueue(pine);
+	});
+	await page.playQueued('coral');
+	expect(page.read().queue).toBe(pine);
+	expect(plays).toBe(0);
+	expect(page.read().queueAnnouncement).toBe('');
+	expect(page.read().queueAnnouncementVersion).toBe(0);
+	unsubscribe();
+});
+
+test('a clear subscriber invoking the share handler leaves the share selection and pending seek final', () => {
+	const { page, media, location } = restartFixture();
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	let reacted = 0;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) { reacted += 1; page.applyShareLink(); }
+	});
+	const version = page.read().queueAnnouncementVersion;
+	page.clear();
+	const after = page.read();
+	expect(reacted).toBe(1);
+	expect(after.queue.tracks.map((track) => track.id)).toEqual(['coral']);
+	expect(currentTrack(after.queue)?.id).toBe('coral');
+	expect(after.pendingShareSeek).toMatchObject({ trackId: 'coral', streamUrl: '/test-audio/coral', seconds: 45 });
+	expect(after.queueAnnouncement).toBe('');
+	expect(after.queueAnnouncementVersion).toBe(version);
+	unsubscribe();
+});
+
+test('a selection subscriber replacing with the same object delivers once and still starts playback', async () => {
+	const { page, element } = restartFixture();
+	const pine = { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' };
+	page.replaceQueue({ tracks: [pine, { id: 'coral', title: 'Coral Night', artist: '', streamUrl: '' }], currentIndex: 0 });
+	let plays = 0, deliveries = 0, replaced = 0;
+	element.play = () => { plays += 1; return Promise.resolve(); };
+	const unsubscribe = page.subscribe((value) => {
+		deliveries += 1;
+		if (value.currentIndex === 1) { replaced += 1; page.replaceQueue(value); }
+	});
+	await page.playQueued('coral');
+	// One initial delivery plus the single selection; the same-object replace publishes nothing.
+	expect(deliveries).toBe(2);
+	expect(replaced).toBe(1);
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(plays).toBe(1);
+	expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
+	expect(page.read().queueAnnouncementVersion).toBe(1);
+	unsubscribe();
+});
+
 test.each(['move', 'remove', 'clear', 'select', 'trimPrevious', 'trimUpcoming'] as const)(
 	'%s publishes its real caller policy', (mode) => {
 		const { page, media, location, track } = restartFixture();
@@ -318,17 +426,20 @@ test('route cleanup fences an explicit play waiting for tick', async () => {
 
 test.each(['resolve', 'reject'] as const)('route cleanup fences deferred play %s', async (outcome) => {
 	const { page, element } = restartFixture();
+	let plays = 0;
 	let settle!: () => void;
-	element.play = () => new Promise<void>((resolve, reject) => {
+	const deferredPlay = new Promise<void>((resolve, reject) => {
 		settle = () => outcome === 'resolve' ? resolve() : reject(new Error('blocked'));
 	});
+	element.play = () => { plays += 1; return deferredPlay; };
 	const attempt = page.playQueued('coral');
 	await Promise.resolve();
-	expect(settle).toBeTypeOf('function');
+	expect(plays).toBe(1);
 	page.cleanup();
 	const afterCleanup = page.read();
 	settle();
 	await attempt;
+	expect(plays).toBe(1);
 	expect(page.read().queueAnnouncement).toBe(afterCleanup.queueAnnouncement);
 	expect(page.read().queueAnnouncementVersion).toBe(afterCleanup.queueAnnouncementVersion);
 });
