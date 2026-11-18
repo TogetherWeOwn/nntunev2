@@ -144,11 +144,13 @@ class RustPin(unittest.TestCase):
         memory = section(5, b"\x01\x00\x01")
         globals_ = section(6, b"\x02\x7f\x00\x41\x01\x0b\x7f\x00\x41\x08\x0b")
         exports = section(7, b"\x02\x01a\x03\x00\x01b\x03\x01")
-        imports = section(2, b"\x01\x00\x00\x00\x00")
-        valid = magic + imports + memory + globals_ + exports
+        types = section(1, b"\x01\x60\x00\x00")  # One () -> () signature.
+        imports = section(2, b"\x01\x03env\x01f\x00\x00")
+        valid = magic + types + imports + memory + globals_ + exports
         self.assertEqual(wt.inspect_exported_heap_values(valid, "a", "b"), (1, 8, 1))
-        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + section(0, b"")
-                                                          + globals_ + exports, "a", "b"), (1, 8, 1))
+        custom = section(0, b"\x07fixture")
+        self.assertEqual(wt.inspect_exported_heap_values(magic + memory + custom
+                                                         + globals_ + exports, "a", "b"), (1, 8, 1))
         mutable = section(6, b"\x02\x7f\x01\x41\x01\x0b\x7f\x00\x41\x08\x0b")
         for module, a, b in (
             (magic + memory + globals_, "a", "b"),
@@ -587,6 +589,40 @@ class RustPin(unittest.TestCase):
             for invalid in ({}, {"../external": "x"}, {"/external": "x"}):
                 with self.assertRaises(ValueError):
                     wt.verify_host_component_files(root, invalid)
+
+    def test_host_linker_must_be_in_verified_components_and_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "toolchain"
+            host = "x86_64-unknown-linux-gnu"
+            name = f"lib/rustlib/{host}/bin/rust-lld"
+            linker = root / name
+            linker.parent.mkdir(parents=True)
+            linker.write_bytes(b"linker")
+            linker.chmod(0o755)
+            expected = {name: hashlib.sha256(b"linker").hexdigest()}
+            self.assertEqual(wt.verified_host_linker(root, expected, host), linker)
+            for invalid in ("", "../other", "a/b", None):
+                with self.assertRaises(ValueError):
+                    wt.verified_host_linker(root, expected, invalid)
+            with self.assertRaisesRegex(ValueError, "lack linker"):
+                wt.verified_host_linker(root, {}, host)
+            linker.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "not executable"):
+                wt.verified_host_linker(root, expected, host)
+            linker.chmod(0o755)
+            linker.write_bytes(b"altered")
+            with self.assertRaisesRegex(ValueError, "differs from archive"):
+                wt.verified_host_linker(root, expected, host)
+            linker.write_bytes(b"linker")
+            other = root / "bin/rustc"
+            other.parent.mkdir()
+            other.write_bytes(b"altered compiler")
+            with self.assertRaisesRegex(ValueError, "differs from archive"):
+                wt.verified_host_linker(root, {**expected, "bin/rustc": hashlib.sha256(b"rustc").hexdigest()}, host)
+            linker.unlink()
+            linker.symlink_to(other)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                wt.verified_host_linker(root, expected, host)
 
     def test_candidate_boundary_refuses_even_with_claimed_provenance(self):
         script = str(Path(wt.__file__).resolve())
