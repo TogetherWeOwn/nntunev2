@@ -69,7 +69,10 @@ class StagingApplyTests(unittest.TestCase):
     def test_census_binding_and_receipt_fail_closed(self):
         from unittest.mock import patch
 
-        filename, head, sha = staging_apply.CENSUS_GUARD
+        # Use the reviewed candidate as input, not the driver's own pin.
+        filename = "0051_purge_legacy_provider_credentials.sql"
+        head = "10c9e67b73c59efed95c2c693fd2fd1971dbf2e6"
+        sha = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"
         _, _, root = self._roots(manifest_text())
         receipt = root / "census.json"
         env = {"DATA_REVISION": head, "TRUSTED_REVISION": "a" * 40,
