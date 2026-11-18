@@ -169,6 +169,7 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
         cancel_token_observer: None,
     };
     let mut outcome = test_outcome();
+    outcome.history[1].currency = "eur".into();
     outcome.history[1].amount_cents = -1;
     if store
         .store_reconcile_outcome("worker_fault_user", &outcome)
@@ -250,6 +251,8 @@ async fn fault_snapshot() -> Result<String, StoreError> {
                                                 AND amount_cents = 800)
                                       AND array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
                                           = ARRAY['in_worker_first', 'in_worker_second']
+                                      AND array_agg(currency ORDER BY stripe_invoice_id)
+                                          = ARRAY['usd', 'eur']
                                  FROM public.paid_invoice_history),
                                 jsonb_build_array(
                                     (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)
