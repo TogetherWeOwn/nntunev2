@@ -1,5 +1,6 @@
 //! Owned native client behind the hosted disposable COMMIT relay.
 use std::error::Error;
+use std::net::Ipv4Addr;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -63,7 +64,8 @@ impl CommitAckFault {
             .map_err(|_| "invalid disposable configuration")?;
         config.ssl_mode(SslMode::Disable);
         let (client, connection) = timeout(IO_BUDGET, async {
-            let socket = TcpStream::connect(([127, 0, 0, 1], u16::from_be_bytes(port))).await?;
+            let socket =
+                TcpStream::connect((Ipv4Addr::LOCALHOST, u16::from_be_bytes(port))).await?;
             Ok::<_, Box<dyn Error>>(config.connect_raw(socket, NoTls).await?)
         })
         .await??;
