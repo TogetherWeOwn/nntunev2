@@ -218,10 +218,10 @@ def inspect_memory_section(payload: bytes) -> tuple[int, int | None]:
     count, offset = u32(0)
     if count != 1:
         raise ValueError("expected one defined memory")
-    flags, offset = u32(offset)
-    if flags not in (0, 1):
+    if offset >= len(payload) or payload[offset] not in (0, 1):
         raise ValueError("unsupported memory limits")
-    initial, offset = u32(offset)
+    flags = payload[offset]
+    initial, offset = u32(offset + 1)
     maximum = None
     if flags == 1:
         maximum, offset = u32(offset)

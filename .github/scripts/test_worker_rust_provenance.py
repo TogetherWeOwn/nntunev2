@@ -131,6 +131,12 @@ class RustPin(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 wt.inspect_memory_section(payload)
 
+    def test_inspect_memory_section_requires_a_single_byte_limits_flag(self):
+        self.assertEqual(wt.inspect_memory_section(b"\x01\x01\x81\x00\x82\x00"), (1, 2))
+        for payload in (b"\x01", b"\x01\x80\x00\x01", b"\x01\x81\x00\x01\x02"):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "unsupported memory limits"):
+                wt.inspect_memory_section(payload)
+
     def test_pins_are_the_verified_official_tuple(self):
         rust = wt.load_pins()["rust"]
         self.assertEqual(rust["commit"], "48a229ceaefd4985c50990b14116b6d856af0985")
