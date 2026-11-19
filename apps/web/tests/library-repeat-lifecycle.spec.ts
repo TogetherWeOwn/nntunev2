@@ -180,6 +180,7 @@ test('a same-flush queue source round trip replaces the rendered audio host', as
 	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
 	await expect(player).toHaveJSProperty('controls', true);
 	await expect(player).toHaveJSProperty('autoplay', false);
+	await expect(region.getByTestId('library-now-playing')).toHaveText('Coral Night — Mira');
 
 	// Route-owned Play now must find the replacement through the attachment.
 	await page.getByTestId('queue-item').getByRole('button', { name: 'More actions for Coral Night', exact: true }).click();
