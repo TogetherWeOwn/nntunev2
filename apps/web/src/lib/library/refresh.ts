@@ -21,6 +21,8 @@ export interface LibraryRefreshState {
 	loadError: string | null;
 	libraryUnavailable: boolean;
 	requiresSignIn: boolean;
+	/** Position namespace attested by the authenticated response, never a cache hint. */
+	positionScope: string | null;
 }
 
 export interface LibraryRefreshUpdate {
@@ -65,7 +67,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		loading: true,
 		loadError: null,
 		libraryUnavailable: false,
-		requiresSignIn: false
+		requiresSignIn: false,
+		positionScope: null
 	};
 	let authenticatedThisLoad = false;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
@@ -253,6 +256,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.
 				authenticatedThisLoad = false;
+				state.positionScope = null;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -262,6 +266,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
+				state.positionScope = null;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -282,6 +287,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
+			const scope = response.headers?.get('x-library-position-scope');
+			if (!isCurrent()) return;
 			authenticatedThisLoad = true;
 			state.items = fresh;
 			state.staleAt = null;
@@ -290,6 +297,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const persistedSnapshot = saveSnapshot(storage, fresh);
 			if (!isCurrent()) return;
 			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
+			state.positionScope = scope && /^[a-f0-9]{64}$/.test(scope) ? scope : null;
 			authoritative = true;
 		} catch {
 			if (!isCurrent()) return;
@@ -328,6 +336,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	function applyAuthTransition(): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
+		state.positionScope = null;
 		activeRequest?.abort();
 		if (!isCurrent()) return;
 		activeRequest = null;

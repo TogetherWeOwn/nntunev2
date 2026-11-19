@@ -249,10 +249,13 @@
 	let mediaRevision = $state(0);
 
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
+		const track = queueCurrentTrack(queueController.snapshot);
+		const source = resolveStreamUrl(track);
 		return media.attach(audio, {
 			source: () => shareAlive ? resolveStreamUrl(queueCurrentTrack(queueController.snapshot)) : null,
 			seeking: handleSeeking,
-			position: refreshRestartAvailability
+			position: refreshRestartAvailability,
+			persistence: track && source ? { trackId: track.id, source, storage: () => browserStorage('local') } : undefined
 		});
 	}
 
@@ -353,6 +356,7 @@
 		},
 		onStateChange: (state, { isCurrent, authoritative }) => {
 			if (!isCurrent()) return;
+			if (authoritative) media.setPositionScope(state.positionScope);
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -707,6 +711,7 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		media.setPositionScope(null);
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		media.clearShareSeek();
@@ -1651,8 +1656,11 @@
 		density = readStoredDensity();
 		media.restoreRepeat(browserStorage('local'));
 		window.addEventListener('storage', handleAuthTransition);
-		// Leaving the page with a query applied (tab close, hard navigation).
-		window.addEventListener('pagehide', recordFindQuery);
+		const onPageHide = () => {
+			media.savePosition();
+			recordFindQuery();
+		};
+		window.addEventListener('pagehide', onPageHide);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
@@ -1678,7 +1686,7 @@
 			recordFindQuery();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
-			window.removeEventListener('pagehide', recordFindQuery);
+			window.removeEventListener('pagehide', onPageHide);
 		};
 	});
 </script>

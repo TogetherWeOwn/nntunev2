@@ -27,7 +27,7 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  * Only lifecycle/storage and Svelte state cells are substituted. Browser cases
  * in library-share-link-lifecycle.spec.ts cover navigation and rendered media.
  */
-function pageScript(search: string, tick = () => Promise.resolve()) {
+function pageScript(search: string, tick = () => Promise.resolve(), storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null = null) {
 	vi.stubGlobal('window', { location: { search } });
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
@@ -68,7 +68,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		clearMiniPlayerHint, setMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
-		browserStorage: () => null,
+		browserStorage: (kind: string) => kind === 'local' ? storage : null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		afterNavigate: () => {},
@@ -132,6 +132,43 @@ function serve(payload: { id: string; title: string; streamUrl?: string }[] = IT
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+test('the authenticated Library response scopes only audio attached under that account', async () => {
+	const writes = vi.fn();
+	const page = pageScript('?track=coral&t=0', undefined, {
+		getItem: () => null, setItem: writes, removeItem: () => {}
+	});
+	const first = 'a'.repeat(64), second = 'b'.repeat(64);
+	async function refresh(scope: string) {
+		vi.stubGlobal('fetch', async () => Response.json(ITEMS, {
+			headers: { 'x-library-position-scope': scope }
+		}));
+		await page.refresh();
+	}
+	function attach() {
+		const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+		page.attachNativeAudio(audio);
+		return audio;
+	}
+	function sample(audio: ReturnType<typeof attach>, seconds: number) {
+		audio.currentTime = seconds;
+		audio.dispatchEvent(new Event('timeupdate'));
+	}
+	await refresh(first);
+	const former = attach();
+	sample(former, 12);
+	await refresh(second);
+	sample(former, 40);
+	const replacement = attach();
+	sample(replacement, 30);
+	await refresh('malformed');
+	sample(replacement, 50);
+	sample(attach(), 60);
+	expect(writes.mock.calls).toEqual([
+		[`nntune:library-position:v1:${first}`, '{"coral":12}'],
+		[`nntune:library-position:v1:${second}`, '{"coral":30}']
+	]);
+});
 
 for (const status of [500, 404]) {
 	test(`a valid initial link survives an empty ${status} load and applies once on Retry`, async () => {

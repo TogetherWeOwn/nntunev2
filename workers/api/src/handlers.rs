@@ -1830,10 +1830,8 @@ pub struct Response {
     pub set_cookie: Option<String>,
     /// `Retry-After` seconds for a 429; the entry renders the header.
     pub retry_after: Option<u64>,
-    /// Extra response headers the entry renders verbatim (plan-limit
-    /// `x-plan-limit` / `x-plan-reset` today). Values must be names-only
-    /// by construction — see `plan_limits::Denial::headers`; never put
-    /// account data here.
+    /// Extra response headers the entry renders verbatim. Restrict values
+    /// to protocol metadata; never include raw account or session data.
     pub extra_headers: Vec<(String, String)>,
 }
 
@@ -4485,7 +4483,20 @@ where
             Err(resp) => return resp,
         }
     };
-    catalogue_library_entries(ctx, &user_id).await
+    let mut response = catalogue_library_entries(ctx, &user_id).await;
+    if response.status == 200 {
+        use sha2::{Digest, Sha256};
+        // Use a purpose-scoped digest of the account, not a credential, raw
+        // identifier or session token. The entry renders this response no-store.
+        let mut scope = Sha256::new();
+        scope.update(b"nntune:library-position:v1\0");
+        scope.update(user_id.as_bytes());
+        response.extra_headers.push((
+            "x-library-position-scope".into(),
+            format!("{:x}", scope.finalize()),
+        ));
+    }
+    response
 }
 
 /// Shared store read plus serialization for the two library routes: the
@@ -25930,6 +25941,30 @@ mod tests {
             alias.body, v1.body,
             "alias must never reshape the M1 contract"
         );
+    }
+
+    #[test]
+    fn library_position_scope_is_stable_and_account_specific() {
+        let h = harness();
+        seed_user(&h, "account-a", "a@example.com");
+        seed_user(&h, "account-b", "b@example.com");
+        let scope = |cookie| {
+            let response = h.call_full("GET", "/api/library", None, cookie, Some(ORIGIN));
+            response
+                .extra_headers
+                .into_iter()
+                .find_map(|(name, value)| (name == "x-library-position-scope").then_some(value))
+        };
+        let first = scope(Some(magic_login(&h, "a@example.com"))).unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            scope(Some(magic_login(&h, "a@example.com"))),
+            Some(first.clone())
+        );
+        let other = scope(Some(magic_login(&h, "b@example.com"))).unwrap();
+        assert_ne!(first, other);
+        assert_eq!(scope(None), None);
     }
 
     #[test]
