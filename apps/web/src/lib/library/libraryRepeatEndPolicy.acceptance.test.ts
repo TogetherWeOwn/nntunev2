@@ -58,11 +58,12 @@ import {
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
 const sources = import.meta.glob(
-	['../../routes/library/+page.svelte', '../player/NativeAudio.svelte', '../player/mediaController.ts'],
+	['../../routes/library/+page.svelte', '../player/NativePlayer.svelte', '../player/NativeAudio.svelte', '../player/mediaController.ts'],
 	{ query: '?raw', import: 'default', eager: true }
 ) as Record<string, string>;
 
 const ROUTE = '../../routes/library/+page.svelte';
+const PLAYER = '../player/NativePlayer.svelte';
 const HOST = '../player/NativeAudio.svelte';
 
 function routeSource(): string {
@@ -159,7 +160,8 @@ describe('library repeat hooks are declared in the library markup', () => {
 	});
 
 	it('LIBREP-U03 wires the native ended event on the library audio', () => {
-		expect(routeSource()).toMatch(/<NativeAudio\b[^>]*\s\{attachNativeAudio\}/);
+		expect(routeSource()).toMatch(/<NativePlayer\b[^>]*\s\{attachNativeAudio\}/);
+		expect(sources[PLAYER]).toMatch(/<NativeAudio\b[^>]*\s\{attachNativeAudio\}/);
 		const audio = sources[HOST].match(/<audio\b[^>]*\sdata-testid="audio-player"(?=\s|>)[^>]*>/)?.[0];
 		expect(
 			audio ?? '',
@@ -182,13 +184,13 @@ describe('library repeat hooks are declared in the library markup', () => {
 	});
 
 	it('LIBREP-U05 never uses a native loop attribute (control: passes now, must stay green)', () => {
-		const source = `${routeSource()}\n${sources[HOST]}`;
+		const source = [routeSource(), sources[PLAYER], sources[HOST]].join('\n');
 		for (const forbidden of ['loop=', 'loop={true}', '.loop = true']) {
 			expect(
 				source,
 				note(
 					'LIBREP-U05',
-					`no "${forbidden}" in the library route`,
+					`no "${forbidden}" in the library player sources`,
 					'native loop present',
 					'native_loop_forbidden',
 					'Remove the native loop; One/Queue replay comes from naturalEndPolicy-driven play-from-zero, never the loop attribute.'
