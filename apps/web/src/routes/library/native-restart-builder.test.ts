@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPlayerController } from '#lib/player/controller.js';
 import { describeJump } from '#lib/player/relativeJump.js';
@@ -1241,21 +1241,23 @@ test.each(['none', 'callback', 'publication'] as const)('native ended uses the q
 	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
 });
 
-test('a reset during queued Play publication retires the hint and the Play attempt', async () => {
+test.each(['publication', 'hint'] as const)('a reset during queued Play %s retires the Play attempt', async (boundary) => {
 	const flush = vi.fn(async () => {});
 	const { page, remount } = restartFixture(flush);
 	page.replaceQueue(selectTrack(addTrack(page.read().queue, pine), 1));
 	remount(pine.streamUrl);
-	const stop = page.subscribe((next) => {
-		if (currentTrack(next)?.id === 'coral') page.resetAuth();
-	});
+	const revision = page.read().mediaRevision;
+	const stop = boundary === 'publication'
+		? page.subscribe((next) => { if (currentTrack(next)?.id === 'coral') page.resetAuth(); })
+		: onMiniPlayerHint((hint) => { if (hint?.trackId === 'coral') page.resetAuth(); });
 	const attempt = page.playQueued('coral');
 	stop();
 	const target = remount();
 	target.play = vi.fn(async () => {});
 	await attempt;
+	expect(page.read().mediaRevision).toBe(revision + 2);
 	expect(currentTrack(page.read().queue)?.id).toBe('coral');
-	expect(readMiniPlayerHint()?.trackId).toBe('pine');
+	expect(readMiniPlayerHint()?.trackId).toBe(boundary === 'publication' ? 'pine' : 'coral');
 	expect(flush).not.toHaveBeenCalled();
 	expect(target.play).not.toHaveBeenCalled();
 	expect(page.read().queueAnnouncement).toBe('');
