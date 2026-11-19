@@ -87,7 +87,7 @@ test('cleanup belongs to the attachment, even when the same node is attached twi
 test('retiring a receipt aborts its listener bank without aborting the replacement', () => {
 	const media = createMediaController();
 	const observations = {
-		source: () => null, interrupt: vi.fn(), ended: vi.fn(async () => {}),
+		source: () => null,
 		seeking: vi.fn(), position: vi.fn()
 	};
 	const attach = () => {
@@ -126,7 +126,7 @@ test('a receipt-only mount cannot later be observed, even by a new controller', 
 	media.destroy();
 	const replacement = createMediaController();
 	expect(() => replacement.attach(audio, {
-		source: () => null, interrupt: vi.fn(), ended: vi.fn(async () => {}),
+		source: () => null,
 		seeking: vi.fn(), position: vi.fn()
 	})).toThrow(/fresh audio element/);
 	expect(replacement.attachment).toBeUndefined();
