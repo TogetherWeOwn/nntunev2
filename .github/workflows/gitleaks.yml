@@ -29,6 +29,10 @@ jobs:
     name: gitleaks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Include text patches regardless of attributes, and merge-resolution
+      # changes relative to the first parent, without limiting traversal.
+      GITLEAKS_LOG_OPTS: '--text --diff-merges=first-parent HEAD'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,6 +57,11 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
           chmod 0755 "$RUNNER_TEMP/gitleaks"
           "$RUNNER_TEMP/gitleaks" version
+
+      - name: Self-test history scanning
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
+        run: bash .github/scripts/test_gitleaks_history.sh
 
       - name: Scan the full history
         env:
@@ -90,11 +99,11 @@ jobs:
               echo "::warning::PR touches .gitleaksignore; it is NOT in effect for this scan (base ignore pinned). Review the ignore change itself before merge."
             fi
             "$GITLEAKS_BIN" git . --redact --verbose --exit-code 1 \
-              --log-opts=HEAD --ignore-gitleaks-allow \
+              --log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow \
               --config "${scratch}/gitleaks.toml" \
               --gitleaks-ignore-path "${scratch}/.gitleaksignore"
           else
             "$GITLEAKS_BIN" git . --redact --verbose --exit-code 1 \
-              --log-opts=HEAD --ignore-gitleaks-allow \
+              --log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow \
               --config .gitleaks.toml
           fi
