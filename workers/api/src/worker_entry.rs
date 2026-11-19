@@ -751,6 +751,10 @@ impl MirrorBinding {
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
+// Unmounted until the staging membership and mirror readers adopt it.
+#[allow(dead_code)]
+#[path = "subsonic_pg_page.rs"]
+pub(crate) mod subsonic_pg_page;
 
 struct PgStore {
     env: Option<Env>,
