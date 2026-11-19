@@ -121,9 +121,9 @@ pub(crate) fn streamed_projection_enforces_admission() {
         }
     }
 
-    // Reject early EOF, an extra row, and a stream error after all admitted
-    // rows. An extra row must not reach the decoder.
-    for (values, count) in [(&[0][..], 2), (&[0, 1], 1), (&[0, -1], 1)] {
+    // Reject early EOF, an extra row, and a stream error within the admitted
+    // count after retaining a row. An extra row must not reach the decoder.
+    for (values, count) in [(&[0][..], 2), (&[0, 1], 1), (&[1, -1], 2)] {
         let mut budget = ConstructionBudget::new(charge);
         let mut decoded = 0;
         let result = project_rows(
