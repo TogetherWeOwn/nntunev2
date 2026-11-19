@@ -166,8 +166,13 @@ pub(super) async fn exercise(url: &str, db: &Client) {
             observe_with_deadline(connect(url).await, &i, &m, pending()).await,
             Indeterminate
         );
-        // A newer generation fences the old write with or without a holder change.
-        let next_holder = if base == 80 { &i } else { &successor };
+        // Same-holder reacquisition reaches the function's generation check;
+        // a different holder no longer matches the writer's outer query.
+        let (next_holder, stale_error) = if base == 80 {
+            (&i, CandidateError::Permanent)
+        } else {
+            (&successor, CandidateError::MissingOrFenced)
+        };
         assert_eq!(reserve(db, next_holder).await, 2);
         assert_eq!(
             observe_with_deadline(connect(url).await, &i, &m, pending()).await,
@@ -180,7 +185,7 @@ pub(super) async fn exercise(url: &str, db: &Client) {
         if finish == "ROLLBACK" {
             assert_eq!(
                 store_with_deadline(connect(url).await, &i, &m, pending()).await,
-                Err(CandidateError::MissingOrFenced)
+                Err(stale_error)
             );
             assert_no_candidate(db, &object, &map).await;
             // Isolate the two join arms in separate append-only scopes.
