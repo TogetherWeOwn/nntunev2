@@ -1,9 +1,8 @@
-//! Inert accounting for snapshot output allocations only.
+//! Bounded owned snapshot construction, not connected to the mount.
 //!
-//! Success does not admit raw rows or authorize construction or mounting.
-//! Raw row allocations, database collection, ordering work and other runtime
-//! allocations require separate accounting. Charges are cumulative; discard
-//! the budget after an error.
+//! The caller must independently bound database collection and input storage.
+//! Logical byte limits do not bound allocator capacity or other runtime
+//! allocations. Charges are cumulative; discard the budget after an error.
 
 use nntune_subsonic::construction_budget::{BudgetExceeded, ConstructionBudget};
 use nntune_subsonic::library::{Album, Artist, Song, NOW};
@@ -17,6 +16,8 @@ mod raw_fixture_plan;
 mod snapshot_bytes;
 #[path = "subsonic_snapshot_work.rs"]
 mod snapshot_work;
+
+use snapshot_work::check_order_work;
 
 fn vec_of<T>(b: &mut ConstructionBudget, n: usize) -> Result<(), BudgetExceeded> {
     if n == 0 || std::mem::size_of::<T>() == 0 {
@@ -82,9 +83,8 @@ pub fn plan_snapshot_output(
 
 // This receipt owns its rows and exclusively borrows the ledger for their
 // entire lifetime. It deliberately has no mutable row access or constructor
-// accepting caller-owned vectors. Only the zero-allocation case is proven:
-// try_reserve_exact does not promise an upper bound on allocator capacity.
-// Nonempty construction must remain unavailable until that bound is proven.
+// accepting caller-owned vectors. Logical byte limits are not an upper bound
+// on allocator capacity; this receipt is not connected to the mount.
 #[allow(dead_code)]
 struct OwnedRawRows<'a> {
     budget: &'a mut ConstructionBudget,
@@ -101,8 +101,8 @@ impl<'a> OwnedRawRows<'a> {
         releases: &[ReleaseDbRow],
         tracks: &[TrackDbRow],
     ) -> Result<Self, BudgetExceeded> {
-        // The caller's storage is not retained. No reservation or copy is
-        // attempted until its maximum retained capacity can be established.
+        // This legacy path admits only empty rows; nonempty copies require
+        // explicit logical limits through try_copy_bounded.
         if !artists.is_empty() || !releases.is_empty() || !tracks.is_empty() {
             return Err(BudgetExceeded);
         }
@@ -111,6 +111,86 @@ impl<'a> OwnedRawRows<'a> {
             artists: Vec::new(),
             releases: Vec::new(),
             tracks: Vec::new(),
+        })
+    }
+
+    // Logical limits are checked for every raw and output occurrence before
+    // allocating the owned copies. The receipt never admits borrowed storage.
+    fn try_copy_bounded(
+        budget: &'a mut ConstructionBudget,
+        artists: &[ArtistDbRow],
+        releases: &[ReleaseDbRow],
+        tracks: &[TrackDbRow],
+        work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+        per_row: usize,
+        total: usize,
+    ) -> Result<Self, BudgetExceeded> {
+        check_order_work(artists.len(), releases.len(), tracks.len(), work)?;
+        let mut bytes = snapshot_bytes::SnapshotBytes::new(per_row, total);
+        bytes.raw_and_output(artists, releases, tracks)?;
+        vec_of::<ArtistDbRow>(budget, artists.len())?;
+        vec_of::<ReleaseDbRow>(budget, releases.len())?;
+        vec_of::<TrackDbRow>(budget, tracks.len())?;
+        fn copy(budget: &mut ConstructionBudget, value: &str) -> Result<String, BudgetExceeded> {
+            string(budget, value.len())?;
+            let mut result = String::new();
+            result
+                .try_reserve_exact(value.len())
+                .map_err(|_| BudgetExceeded)?;
+            result.push_str(value);
+            Ok(result)
+        }
+        fn optional(
+            budget: &mut ConstructionBudget,
+            value: &Option<String>,
+        ) -> Result<Option<String>, BudgetExceeded> {
+            value.as_deref().map(|s| copy(budget, s)).transpose()
+        }
+        fn vector<T>(len: usize) -> Result<Vec<T>, BudgetExceeded> {
+            let mut result = Vec::new();
+            result.try_reserve_exact(len).map_err(|_| BudgetExceeded)?;
+            Ok(result)
+        }
+        let mut owned_artists = vector(artists.len())?;
+        let mut owned_releases = vector(releases.len())?;
+        let mut owned_tracks = vector(tracks.len())?;
+        for row in artists {
+            owned_artists.push(ArtistDbRow {
+                mbid: copy(budget, &row.mbid)?,
+                name: copy(budget, &row.name)?,
+                sort_name: copy(budget, &row.sort_name)?,
+                artist_type: optional(budget, &row.artist_type)?,
+                country: optional(budget, &row.country)?,
+            });
+        }
+        for row in releases {
+            owned_releases.push(ReleaseDbRow {
+                mbid: copy(budget, &row.mbid)?,
+                title: copy(budget, &row.title)?,
+                release_type: optional(budget, &row.release_type)?,
+                year: row.year,
+                artist_mbid: optional(budget, &row.artist_mbid)?,
+                artist_name: optional(budget, &row.artist_name)?,
+            });
+        }
+        for row in tracks {
+            owned_tracks.push(TrackDbRow {
+                release_mbid: copy(budget, &row.release_mbid)?,
+                recording_mbid: copy(budget, &row.recording_mbid)?,
+                title: copy(budget, &row.title)?,
+                duration_ms: row.duration_ms,
+                medium_no: row.medium_no,
+                track_no: row.track_no,
+                release_title: copy(budget, &row.release_title)?,
+                artist_mbid: optional(budget, &row.artist_mbid)?,
+                artist_name: optional(budget, &row.artist_name)?,
+            });
+        }
+        Ok(Self {
+            budget,
+            artists: owned_artists,
+            releases: owned_releases,
+            tracks: owned_tracks,
         })
     }
 
@@ -152,12 +232,8 @@ fn construct_snapshot(
     tracks: &[TrackDbRow],
     work: crate::subsonic_dispatch::snapshot_order::OrderWork,
 ) -> Result<Snapshot, BudgetExceeded> {
-    use crate::subsonic_dispatch::snapshot_order::{order_snapshot, order_work};
-    let needed = order_work(artists.len(), releases.len(), tracks.len(), artists.len())
-        .ok_or(BudgetExceeded)?;
-    if needed.comparisons > work.comparisons || needed.artist_row_probes > work.artist_row_probes {
-        return Err(BudgetExceeded);
-    }
+    use crate::subsonic_dispatch::snapshot_order::order_snapshot;
+    check_order_work(artists.len(), releases.len(), tracks.len(), work)?;
     plan_snapshot_output(budget, artists, releases, tracks)?;
     fn copy(s: &str) -> Result<String, BudgetExceeded> {
         let mut out = String::new();
@@ -381,6 +457,52 @@ mod tests {
             assert!(build_bounded_snapshot(&mut budget, artists, releases, tracks, work).is_err());
             assert_eq!(budget.charged(), 0);
         }
+    }
+
+    #[test]
+    fn owned_copy_checks_bytes_and_work_before_copying() {
+        let artists = [artist("a", "n", "s"), artist("a", "n", "s")];
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        for (per_row, total, accepted) in [(3, 10, true), (2, 10, false), (3, 9, false)] {
+            let mut budget = ConstructionBudget::new(usize::MAX);
+            match OwnedRawRows::try_copy_bounded(
+                &mut budget,
+                &artists,
+                &[],
+                &[],
+                work,
+                per_row,
+                total,
+            ) {
+                Ok(receipt) => {
+                    assert!(accepted);
+                    assert_eq!(receipt.rows().0.len(), 2);
+                    assert_eq!(receipt.rows().0[0].sort_name, "s");
+                }
+                Err(_) => {
+                    assert!(!accepted);
+                    assert_eq!(budget.charged(), 0);
+                }
+            }
+        }
+        let no_work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: 0,
+            artist_row_probes: 0,
+        };
+        let mut budget = ConstructionBudget::new(usize::MAX);
+        assert!(
+            OwnedRawRows::try_copy_bounded(&mut budget, &artists, &[], &[], no_work, 3, 10)
+                .is_err()
+        );
+        assert_eq!(budget.charged(), 0);
+        let mut exhausted = ConstructionBudget::new(0);
+        assert!(
+            OwnedRawRows::try_copy_bounded(&mut exhausted, &artists, &[], &[], work, 3, 10)
+                .is_err()
+        );
     }
 
     #[test]
