@@ -1,6 +1,7 @@
 import { selectTrack, type QueueState } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
+import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
@@ -9,7 +10,6 @@ type NativeObservations = {
 	interrupt: () => void;
 	ended: (attachment: MediaAttachment) => Promise<void>;
 	seeking: (audio: HTMLAudioElement) => void;
-	metadata: (audio: HTMLAudioElement) => void;
 	position: (audio: HTMLAudioElement) => void;
 };
 
@@ -22,14 +22,15 @@ type PlaySelection = {
 };
 
 type JumpSelection = {
+	trackId?: string;
 	isCurrent: () => boolean;
-	supersedeShare: () => void;
 	assigned: () => void;
 	publish: (outcome: JumpOutcome) => void;
 };
 
 type RestartSelection = {
-	supersedeShare: () => () => boolean;
+	trackId: string;
+	isCurrent: () => boolean;
 	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
 	assigned: () => void;
 	publish: (message: string, available: boolean) => void;
@@ -56,8 +57,11 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 
 export function createMediaController(matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
+	let attachmentVersion = 0;
 	let destroyed = false;
 	let positionIntent = 0;
+	const pendingShare = createPendingShareSeek();
+	let applyingShare: { revision: number; retry: boolean } | undefined;
 	let positioning = false;
 	let nextPosition: (() => void) | undefined;
 
@@ -68,6 +72,8 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 	function reset(): void {
 		const previous = current;
 		current = undefined;
+		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
+		attachmentVersion += 1;
 		previous?.listeners.abort();
 		pause(previous?.audio);
 	}
@@ -143,14 +149,46 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 		}
 	}
 
+	function retryShare(audio: HTMLAudioElement | undefined, revision: number): void {
+		if (!audio || !pendingShare.current || pendingShare.revision !== revision || nextPosition) return;
+		if (applyingShare?.revision === revision) {
+			applyingShare.retry = true;
+			return;
+		}
+		runPosition(() => {
+			const attempt = { revision, retry: false };
+			applyingShare = attempt;
+			try {
+				pendingShare.apply(audio, revision, () => attempt.retry);
+				// Keep the receipt for at most one follow-up; newer positions go first.
+				if (attempt.retry && !nextPosition) pendingShare.apply(audio, revision);
+			} finally {
+				applyingShare = undefined;
+			}
+		});
+	}
+
+	function captureShareSeek(intent: number, target: ShareSeekTarget, selected: () => boolean) {
+		if (!selected() || destroyed || intent !== positionIntent) return;
+		// Before the keyed node mounts, only the first upcoming attachment can inherit this seek.
+		const version = current ? attachmentVersion : attachmentVersion + 1;
+		const revision = pendingShare.set(target, (audio) => ({
+			isCurrent: () => matchesSource(audio, target.streamUrl, () =>
+				selected() && current?.audio === audio && attachmentVersion === version && positionIntent === intent)
+		}));
+		return () => retryShare(current?.audio, revision);
+	}
+
 	function jump(source: string, direction: JumpDirection, deps: JumpSelection): void {
 		if (destroyed) return;
 		const attachment = current;
 		const audio = attachment?.audio;
 		const intent = ++positionIntent;
-		const isCurrent = () => !destroyed && current === attachment && positionIntent === intent && deps.isCurrent();
-		// Cancel the older share on acceptance, not when the native seek drains.
-		if (audio && source && isCurrent() && matchesNative(audio, source)) deps.supersedeShare();
+		// Cancel on acceptance, even if the native seek is deferred or refused.
+		if (deps.trackId !== undefined) pendingShare.supersede(deps.trackId, source);
+		const revision = pendingShare.revision;
+		const isCurrent = () => deps.isCurrent() && !destroyed && current === attachment &&
+			positionIntent === intent && pendingShare.revision === revision;
 		runPosition(() => {
 			if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
 				if (isCurrent()) deps.publish({ kind: 'unavailable' });
@@ -170,10 +208,12 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 		const attachment = current;
 		const intent = ++positionIntent;
 		// Supersede before any native read, including an unavailable or refused seek.
-		const selectionIsCurrent = deps.supersedeShare();
-		if (!attachment || positionIntent !== intent) return;
+		pendingShare.supersede(deps.trackId, source);
+		if (!attachment) return;
 		const { audio } = attachment;
-		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
+		const revision = pendingShare.revision;
+		const isCurrent = () => deps.isCurrent() && current === attachment &&
+			positionIntent === intent && pendingShare.revision === revision;
 		const matches = () => matchesSource(audio, source, isCurrent);
 		runPosition(() => {
 			if (!matches()) return;
@@ -208,6 +248,10 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 		playSelected,
 		restart,
 		jump,
+		beginShareInput() { pendingShare.clear(); return ++positionIntent; },
+		captureShareSeek,
+		clearShareSeek: pendingShare.clear,
+		get pendingShareSeek() { return pendingShare.current; },
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {
@@ -215,15 +259,19 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 			if (observations && mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
+			if (previous) pendingShare.clear();
+			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
 			const receipt = { audio, playing: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
 			if (observations) {
 				const observe = (event: Event) => {
+					const shareRevision = pendingShare.revision;
+					const intent = positionIntent;
 					if (current !== receipt || event.currentTarget !== audio || !audio.isConnected) return;
 					const source = observations.source();
-					if (!source || audio.getAttribute('src') !== source) return;
+					if (!source || audio.getAttribute('src') !== source || current !== receipt) return;
 					switch (event.type) {
 						case 'play':
 						case 'playing':
@@ -237,10 +285,13 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 							if (audio.error === null) return;
 							break;
 						case 'ended': return observations.ended(receipt);
-						case 'seeking': return observations.seeking(audio);
+						case 'seeking':
+							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
+							if (current === receipt && positionIntent === intent) observations.seeking(audio);
+							return;
 						case 'loadedmetadata':
 						case 'durationchange':
-							observations.metadata(audio);
+							retryShare(audio, shareRevision);
 							if (current !== receipt) return;
 							// fall through to refresh position availability
 						default: return observations.position(audio);
@@ -261,6 +312,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 		reset,
 		destroy() {
 			destroyed = true;
+			pendingShare.clear();
 			reset();
 		}
 	};
