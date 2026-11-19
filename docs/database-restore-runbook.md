@@ -171,10 +171,10 @@ forward-only (§4).
    `track_sources` ([offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment)),
    active Subsonic tokens (`subsonic_auth.rs`), and retained admin originals (`ingest_originals`, `admin_ingest.rs`).
    Record counts and outcomes only (§6); hold on query or export errors, mismatches, or missing or failed verification.
-   **Separately verify serving-key readiness, before or after purge.** Before repointing, use an approved check on the intended Worker build, environment, and key bindings to prove the runtime loads its current write KEK, even when every envelope count is zero.
-   Also use the runtime key lookup to open one retained envelope for each retained KEK version.
-   An offline decrypt or a listed secret alone is not serving evidence: legacy mode loads only one version, and versioned mode discovers only `CURRENT ± 8` via `kek_set_from_lookup`.
-   Record only the Worker build ID, environment label, current write version and load outcome, and open outcome per retained version (§6). Hold cutover if any check fails or lacks approved evidence, including the current write-key check on an empty restore.
+   **Separately verify serving-key readiness, before or after purge.** Before repointing, use an approved check on the intended Worker build, environment, and key bindings to prove its runtime selects the expected current write version and that the loaded key matches the approved recovery keyring for that version.
+   To prove the match, use the runtime key lookup to open a retained envelope already verified with that recovery key, or, if none uses the current version, a disposable test envelope sealed with that recovery key in isolation. Do not write the test envelope to the restored data or expose key material.
+   Also use the runtime key lookup to open one retained envelope for each retained KEK version. An offline decrypt, a listed secret, or a successful load alone is not serving evidence: legacy mode loads only one version, and versioned mode discovers only `CURRENT ± 8` via `kek_set_from_lookup`.
+   Record only the Worker build ID, environment label, current write version and key-match outcome, and open outcome per retained version (§6). Hold cutover if any check fails or lacks approved evidence, including the current write-key match on an empty restore.
    **Historical vault pass only.** After purge, mark this pass N/A; never restore purged rows or change shared keys. For a pre-purge vault,
    confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
@@ -288,7 +288,7 @@ migration files to force convergence.
 | Read-only verification queries + outcomes (§3.3) | expressions + outcomes only |
 | Forward-convergence list (migrations re-applied, §3.4) | numbers + manifest head |
 | App envelope checks (§3.5) | counts and outcomes |
-| Intended Worker serving-key check (§3.5) | build ID, environment label, current write version and load outcome, open outcome per retained version |
+| Intended Worker serving-key check (§3.5) | build ID, environment label, current write version and key-match outcome, open outcome per retained version |
 | Historical vault pass (§3.5) | vault counts ×2 or schema basis for N/A |
 | Cutover record (binding repoint/promote, §3.6) | mechanism + time |
 | Health + E2E run URLs (§3.7) | URLs to runs only |

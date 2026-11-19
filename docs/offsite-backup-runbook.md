@@ -142,9 +142,11 @@ serialization cannot leak one.
      export BACKUP_DRILL_KEK_V1 BACKUP_DRILL_KEK_V2
      ./target/debug/backup-drill verify --rows "$SCRATCH/rows.jsonl"
    ) > "$SCRATCH/verify-report.json" || exit 1
-   jq -e --argjson expected "$expected" \
-     '$expected > 0 and .rows == $expected and .ok == $expected and .failed == 0' \
-     "$SCRATCH/verify-report.json" > /dev/null || exit 1
+   jq -e --argjson expected "$expected" '
+     if $expected > 0 and .rows == $expected and .ok == $expected and .failed == 0
+     then {expected: $expected, rows, ok, failed, keyring_versions}
+     else error("envelope verification totals do not match") end
+   ' "$SCRATCH/verify-report.json" || exit 1
    ```
    Post-migration-0027 notes: `track_sources` has no `user_id` column
    (one global slot per `track_id`), no `row_key` column, and the
@@ -156,8 +158,8 @@ serialization cannot leak one.
    Pass KEKs as 64 hex chars via environment from the operator store;
    never write them to a file or enable shell tracing. The populated
    drill passes only when `rows == ok == expected count > 0` and
-   `failed == 0`. Retain only the expected count and the report's
-   `rows`, `ok`, `failed`, and `keyring_versions` as envelope evidence.
+   `failed == 0`. Save the printed evidence JSON: the expected count
+   and the report's `rows`, `ok`, `failed`, and `keyring_versions` only.
 5. Decrypt one posted fixture track end to end from the restored
    material only (fetch its articles through the normal ranged path
    against the isolated target, decrypt, compare SHA-256 with the
