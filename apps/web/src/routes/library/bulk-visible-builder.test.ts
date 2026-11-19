@@ -6,7 +6,6 @@ import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
 import { createMediaController } from '#lib/player/mediaController.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -34,7 +33,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -57,7 +56,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		groupLibraryItems, queueCurrentTrack, resolveStreamUrl, createPendingShareSeek,
+		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
 		queueController, createMediaController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,

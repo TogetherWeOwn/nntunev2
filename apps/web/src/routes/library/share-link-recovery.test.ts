@@ -12,11 +12,11 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
 import { createMediaController } from '#lib/player/mediaController.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import { survivingInteractionIds } from './interactionSelection.js';
+import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -56,7 +56,9 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createQueueController, createMediaController,
+		createQueueShare, createQueueController, restartIsAvailable,
+		createMediaController: () => createMediaController((audio, source) =>
+			audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
@@ -65,7 +67,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
-		resolveStreamUrl, resolveShareTarget, endTrackDrag, createPendingShareSeek,
+		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
@@ -79,7 +81,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		return {
 			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
-			applyPendingShareSeek, playQueuedTrack, subscribe: queueController.subscribe,
+			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
@@ -88,7 +90,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
 			playIds: () => playLibraryIds(['coral']),
 			feedback: () => [queueAnnouncement, queueAnnouncementVersion],
-			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: pendingShareSeek.current, loadError })
+			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: media.pendingShareSeek, loadError })
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
@@ -96,7 +98,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		handleLocalAuthTransition: () => void;
 		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
-		applyPendingShareSeek: () => void;
+		attachNativeAudio: (element: EventTarget) => void;
 		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
 			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
 		currentAudio: () => unknown;
@@ -145,13 +147,13 @@ for (const status of [500, 404]) {
 		expect(queueFunctions.currentTrack(page.read().queue)?.id).toBe('coral');
 		expect(page.read().shareInvalid).toBe(false);
 		expect(page.read().pendingShareSeek?.seconds).toBe(90);
-		const audio = { currentTime: 0, duration: 60 };
-		page.setAudio(audio);
-		page.applyPendingShareSeek();
+		const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+		page.attachNativeAudio(audio);
+		audio.dispatchEvent(new Event('loadedmetadata'));
 		expect(audio.currentTime).toBe(60);
 		audio.currentTime = 12;
 		await page.refresh();
-		page.applyPendingShareSeek();
+		audio.dispatchEvent(new Event('durationchange'));
 		expect(audio.currentTime).toBe(12);
 	});
 }

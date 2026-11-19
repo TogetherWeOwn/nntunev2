@@ -4,7 +4,6 @@ import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, s
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
 import { createMediaController } from '#lib/player/mediaController.js';
 import type { LibraryItem } from '#lib/library/cache.js';
@@ -50,7 +49,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	}).outputText;
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
-		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle, createPendingShareSeek,
+		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
 		queueController: createQueueController(queue), createMediaController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value

@@ -35,7 +35,7 @@ test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 		const staleCleanup = media.attach(audio);
 		const assigned = vi.fn(), publish = vi.fn();
 		media.restart('/coral', 'Coral', {
-			supersedeShare: () => () => true,
+			trackId: 'coral', isCurrent: () => true,
 			available: () => { if (phase === 'availability') media.attach(audio); return true; },
 			assigned, publish
 		});
@@ -59,7 +59,7 @@ test('only the newer restart on an unchanged receipt can seek and publish', () =
 	media.attach(native as unknown as HTMLAudioElement);
 	const receipt = media.attachment;
 	const assigned = vi.fn(), publish = vi.fn();
-	const deps = { supersedeShare: () => () => true, available: () => true, assigned, publish };
+	const deps = { trackId: 'coral', isCurrent: () => true, available: () => true, assigned, publish };
 	media.restart('/coral', 'Older', {
 		...deps, available: () => { media.restart('/coral', 'Newer', deps); return true; }
 	});
@@ -88,7 +88,7 @@ test('retiring a receipt aborts its listener bank without aborting the replaceme
 	const media = createMediaController();
 	const observations = {
 		source: () => null, interrupt: vi.fn(), ended: vi.fn(async () => {}),
-		seeking: vi.fn(), metadata: vi.fn(), position: vi.fn()
+		seeking: vi.fn(), position: vi.fn()
 	};
 	const attach = () => {
 		const target = Object.assign(new EventTarget(), { paused: true, pause: vi.fn() });
@@ -127,7 +127,7 @@ test('a receipt-only mount cannot later be observed, even by a new controller', 
 	const replacement = createMediaController();
 	expect(() => replacement.attach(audio, {
 		source: () => null, interrupt: vi.fn(), ended: vi.fn(async () => {}),
-		seeking: vi.fn(), metadata: vi.fn(), position: vi.fn()
+		seeking: vi.fn(), position: vi.fn()
 	})).toThrow(/fresh audio element/);
 	expect(replacement.attachment).toBeUndefined();
 });
