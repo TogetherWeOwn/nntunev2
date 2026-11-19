@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { createQueueController, type QueueCommitKind, type QueuedPlaySource } from '#lib/player/queueController.js';
+	import type { QueueCommitKind, QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
-	import { createMediaController } from '#lib/player/mediaController.js';
+	import { createPlayerController } from '#lib/player/controller.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -144,7 +144,15 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	const queueController = createQueueController(createQueue([]));
+	const player = createPlayerController(createQueue([]), {
+		commit: replaceQueue,
+		flush: () => tick(),
+		clearShareFeedback,
+		clearJumpFeedback: () => { jumpStatus = ''; },
+		announce: (track) => announceEnd(track)
+	});
+	const queueController = player.queue;
+	const media = player.media;
 	const queue = $derived($queueController);
 	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
 	let queueConfirmGeneration = $state(0);
@@ -236,14 +244,6 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
-	const media = createMediaController(undefined, {
-		queue: queueController,
-		commit: replaceQueue,
-		flush: () => tick(),
-		clearShareFeedback,
-		clearJumpFeedback: () => { jumpStatus = ''; },
-		announce: (track) => announceEnd(track)
-	});
 	const repeat = media.repeat;
 	// A source round trip before Svelte flushes must not revive a retired node.
 	let mediaRevision = $state(0);
@@ -602,7 +602,6 @@
 
 	function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
 		return media.playSelected(base, index, source, suffix, {
-			revision: queueController,
 			commit: replaceQueue,
 			flush: tick,
 			announce: (message) => { queueAnnouncement = message; },

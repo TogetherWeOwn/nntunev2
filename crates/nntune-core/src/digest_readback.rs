@@ -1,14 +1,15 @@
 //! Bounded content verification against an existing sealer-origin manifest.
 //!
-//! This checks a sequence of supplied frames, not the transport that framed
-//! them. The caller must separately verify locator/version, actual EOF, the
-//! complete sidecar inventory, and media validity. Success grants no custody,
-//! publication, or reuse authority.
+//! The frame verifier accepts externally framed bytes. The body adapter also
+//! checks exact lengths and EOF on the supplied bodies. Neither establishes
+//! locator/version, complete sidecar inventory, or media validity. Success
+//! grants no custody, publication, or reuse authority.
 
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
 use crate::media::FileKey;
 use sha2::{Digest, Sha256};
+use std::{future::Future, ops::AsyncFnMut};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReadbackError {
@@ -74,10 +75,163 @@ impl<'a> DigestReadback<'a> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum BodyReadbackError {
+    Transport,
+    Truncated,
+    Trailing,
+    Geometry,
+    Content(ReadbackError),
+}
+
+pub trait ReadbackBody {
+    /// Fill up to `dst.len()` bytes. With nonempty `dst`, `Ok(0)` must mean
+    /// clean EOF of this entire object body, not a temporary lack of bytes,
+    /// a declared-length cap, or failed HTTP framing. Return errors as errors.
+    fn read(&mut self, dst: &mut [u8]) -> impl Future<Output = std::io::Result<usize>>;
+}
+
+async fn read_exact(
+    body: &mut impl ReadbackBody,
+    mut dst: &mut [u8],
+) -> Result<(), BodyReadbackError> {
+    while !dst.is_empty() {
+        let n = body
+            .read(dst)
+            .await
+            .map_err(|_| BodyReadbackError::Transport)?;
+        if n == 0 {
+            return Err(BodyReadbackError::Truncated);
+        }
+        dst = dst.get_mut(n..).ok_or(BodyReadbackError::Transport)?;
+    }
+    Ok(())
+}
+
+async fn require_eof(body: &mut impl ReadbackBody) -> Result<(), BodyReadbackError> {
+    match body.read(&mut [0]).await {
+        Ok(0) => Ok(()),
+        Ok(1) => Err(BodyReadbackError::Trailing),
+        _ => Err(BodyReadbackError::Transport),
+    }
+}
+
+/// Check the exact media body and each expected page body, one at a time.
+/// The caller supplies already-authorized, version-pinned full-body reads
+/// with deadlines. Fetching the expected indices does not prove that the
+/// trusted inventory contains no extra locators. This returns no receipt.
+pub async fn verify_readback_bodies<B: ReadbackBody>(
+    manifest: &OriginManifest,
+    key: &FileKey,
+    mut media: impl ReadbackBody,
+    mut open_page: impl AsyncFnMut(u32) -> std::io::Result<B>,
+) -> Result<(), BodyReadbackError> {
+    let geometry = manifest.geometry();
+    let mut readback = DigestReadback::new(manifest, key).map_err(BodyReadbackError::Content)?;
+    let mut header = [0; 48];
+    read_exact(&mut media, &mut header).await?;
+    for index in 0..geometry.pages() {
+        let page = geometry.page(index).ok_or(BodyReadbackError::Geometry)?;
+        let mut bytes = vec![0; page.encoded_len as usize];
+        let mut body = open_page(index)
+            .await
+            .map_err(|_| BodyReadbackError::Transport)?;
+        read_exact(&mut body, &mut bytes).await?;
+        require_eof(&mut body).await?;
+        drop(body);
+        for chunk in page.first..page.first + page.count {
+            let (len, _) = geometry.chunk(chunk).ok_or(BodyReadbackError::Geometry)?;
+            let mut sealed = vec![0; len as usize];
+            read_exact(&mut media, &mut sealed).await?;
+            readback
+                .push(
+                    chunk,
+                    &bytes,
+                    sealed,
+                    (chunk == 0).then_some(header.as_slice()),
+                )
+                .map_err(BodyReadbackError::Content)?;
+        }
+    }
+    require_eof(&mut media).await?;
+    readback.finish().map_err(BodyReadbackError::Content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::digest_test_fixture::{fixture, Fixture};
+
+    struct Body<'a>(&'a [u8], bool);
+
+    impl ReadbackBody for Body<'_> {
+        async fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() && self.1 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            // Deliberately split header, ciphertext, and page across reads.
+            let n = dst.len().min(self.0.len()).min(11);
+            dst[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    async fn bodies(f: &Fixture, media: Body<'_>, page: Body<'_>) -> Result<(), BodyReadbackError> {
+        let Body(bytes, fail_at_eof) = page;
+        verify_readback_bodies(&f.manifest, &f.key, media, async move |index| {
+            assert_eq!(index, 0);
+            Ok(Body(bytes, fail_at_eof))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn readback_bodies_require_clean_exact_eof() {
+        let f = fixture(&vec![5; 65_537]);
+        let mut media = f.header.to_vec();
+        media.extend(f.chunks.iter().flatten().copied());
+        let page = &f.pages[0];
+        assert_eq!(
+            bodies(&f, Body(&media, false), Body(page, false)).await,
+            Ok(())
+        );
+        for (m, p, expected) in [
+            (
+                Body(&media[..media.len() - 1], false),
+                Body(page, false),
+                BodyReadbackError::Truncated,
+            ),
+            (
+                Body(&media, false),
+                Body(&page[..page.len() - 1], false),
+                BodyReadbackError::Truncated,
+            ),
+            (
+                Body(&media, true),
+                Body(page, false),
+                BodyReadbackError::Transport,
+            ),
+            (
+                Body(&media, false),
+                Body(page, true),
+                BodyReadbackError::Transport,
+            ),
+        ] {
+            assert_eq!(bodies(&f, m, p).await, Err(expected));
+        }
+        let mut extra_page = page.clone();
+        extra_page.push(0);
+        assert_eq!(
+            bodies(&f, Body(&media, false), Body(&extra_page, false)).await,
+            Err(BodyReadbackError::Trailing)
+        );
+        media.push(0);
+        assert_eq!(
+            bodies(&f, Body(&media, false), Body(page, false)).await,
+            Err(BodyReadbackError::Trailing)
+        );
+    }
 
     fn first(readback: &mut DigestReadback<'_>, f: &Fixture) {
         readback

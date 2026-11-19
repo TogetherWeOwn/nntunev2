@@ -157,6 +157,107 @@ async fn staging_credential_projection_charges_bounded_fields() {
 }
 
 #[tokio::test]
+async fn staging_membership_admits_only_complete_owner_scoped_pages() {
+    use super::super::subsonic_membership::read_membership;
+    const SHARED: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const RECORDING: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const TRANSFER: i32 = 7 * 36; // NULL pairs still transfer their release field
+    let mut client = database().await;
+    client
+        .batch_execute(
+            "CREATE TEMP TABLE library (user_id text, release_mbid text, recording_mbids text[])",
+        )
+        .await
+        .unwrap();
+    let mut expected = ConstructionBudget::new(8 * 1024);
+    let empty = read_membership(&mut client, &mut expected, USER, 0, 0, &mut 0)
+        .await
+        .unwrap();
+    assert!(empty.releases.is_empty() && empty.pairs.is_empty());
+    client
+        .execute(
+            "INSERT INTO library VALUES ($1, upper($2), ARRAY[$4, NULL]), (NULL, $3, ARRAY[$4]), \
+         ('other', $4, ARRAY[$2]), ($1, repeat('é', 512), '{}')",
+            &[&USER, &ID, &SHARED, &RECORDING],
+        )
+        .await
+        .unwrap();
+    for (cap, remaining) in [(2, TRANSFER), (3, TRANSFER - 1)] {
+        let mut budget = ConstructionBudget::new(8 * 1024);
+        let mut fetches = 0;
+        assert!(
+            read_membership(&mut client, &mut budget, USER, cap, remaining, &mut fetches)
+                .await
+                .is_err()
+        );
+        assert_eq!(fetches, 0, "ID fetch started before admission");
+    }
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    let mut fetches = 0;
+    let membership = read_membership(&mut client, &mut budget, USER, 3, TRANSFER, &mut fetches)
+        .await
+        .unwrap();
+    assert_eq!(fetches, 2);
+    assert_eq!(membership.remaining_text_bytes, 0);
+    assert_eq!(membership.releases.as_slice(), [ID, SHARED]);
+    assert_eq!(membership.pairs.len(), 2);
+    for (pair, release) in membership.pairs.iter().zip([ID, SHARED]) {
+        assert_eq!((pair.0.as_str(), pair.1.as_str()), (release, RECORDING));
+    }
+    // The empty read charges the same SQL strings and no output allocations.
+    type Pair = (String, String);
+    expected
+        .charge(3, size_of::<String>(), align_of::<String>())
+        .unwrap();
+    expected
+        .charge(3, size_of::<Pair>(), align_of::<Pair>())
+        .unwrap();
+    for _ in 0..2 {
+        expected.charge(ID.len(), 1, 1).unwrap();
+    }
+    let mut short = ConstructionBudget::new(expected.charged() - 1);
+    fetches = 0;
+    let result = read_membership(&mut client, &mut short, USER, 3, TRANSFER, &mut fetches).await;
+    assert!(result.is_err());
+    assert_eq!(fetches, 1, "pair fetch started before its output reserve");
+    client.batch_execute("UPDATE library SET release_mbid = release_mbid || 'x' WHERE octet_length(release_mbid) = 1024").await.unwrap();
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    let mut fetches = 0;
+    assert!(
+        read_membership(&mut client, &mut budget, USER, 3, TRANSFER, &mut fetches)
+            .await
+            .is_err()
+    );
+    assert_eq!(fetches, 0, "fetch started before release-width admission");
+    client
+        .execute(
+            "DELETE FROM library WHERE octet_length(release_mbid) > 1024",
+            &[],
+        )
+        .await
+        .unwrap();
+    // Release preflight passes in both cases. With three pairs, cap 2
+    // isolates the pair row bound and cap 3 isolates recording width.
+    let over_width = "é".repeat(513);
+    for (recording, cap) in [(ID, 2), (over_width.as_str(), 3)] {
+        client
+            .execute(
+                "UPDATE library SET recording_mbids = ARRAY[$2, $3]::text[] WHERE user_id = $1",
+                &[&USER, &RECORDING, &recording],
+            )
+            .await
+            .unwrap();
+        let mut budget = ConstructionBudget::new(8 * 1024);
+        let mut fetches = 0;
+        let remaining = TRANSFER + 72;
+        let result =
+            read_membership(&mut client, &mut budget, USER, cap, remaining, &mut fetches).await;
+        assert!(result.is_err(), "expected pair rejection at cap {cap}");
+        assert_eq!(fetches, 0, "before pair admission at cap {cap}");
+    }
+}
+
+#[tokio::test]
 async fn exact_lookup_completion_and_reindex_are_committed() {
     let mut client = database().await;
     assert!(lookup(&mut client, Some(2), &"a".repeat(64))

@@ -12,8 +12,7 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
+import { createPlayerController } from '#lib/player/controller.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import { survivingInteractionIds } from './interactionSelection.js';
 import { restartIsAvailable } from './restartAvailability.js';
@@ -56,9 +55,9 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createQueueController, restartIsAvailable,
-		createMediaController: (_: undefined, end: Parameters<typeof createMediaController>[1]) =>
-			createMediaController((audio, source) => audio.isConnected && audio.getAttribute('src') === source, end),
+		createQueueShare, restartIsAvailable,
+		createPlayerController: (initial: queueFunctions.QueueState, end: Parameters<typeof createPlayerController>[1]) =>
+			createPlayerController(initial, end, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
@@ -108,7 +107,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		playQueuedTrack: (id: string) => Promise<void>;
 		addDisplayed: () => void;
 		subscribe: (callback: (queue: queueFunctions.QueueState) => void) => () => void;
-		source: ReturnType<typeof createQueueController>['sourceForQueuedPlay'];
+		source: ReturnType<typeof createPlayerController>['queue']['sourceForQueuedPlay'];
 		endSession: () => void;
 		dispose: () => void;
 		read: () => {

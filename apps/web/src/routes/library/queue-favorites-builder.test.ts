@@ -4,8 +4,7 @@ import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, s
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
+import { createPlayerController } from '#lib/player/controller.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -35,7 +34,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
 		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision'
+		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'queueController', 'media', 'mediaRevision'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -50,15 +49,15 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
-		queueController: createQueueController(queue), createMediaController,
+		createQueue: () => queue, createPlayerController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
+		${compiled}
 		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
 		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
 		queueController.subscribe((value) => { queue = value; });
-		${compiled}
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
 			replaceQueue, commitQueue, subscribe: queueController.subscribe,
