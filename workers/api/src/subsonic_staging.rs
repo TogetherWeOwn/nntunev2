@@ -8,8 +8,14 @@ use nntune_subsonic::staging_rejection::StagingRejection;
 use crate::subsonic_http::{parse_staging_credentials, CredentialParseError};
 
 #[cfg(target_arch = "wasm32")]
+mod dispatch;
+#[cfg(target_arch = "wasm32")]
 mod request;
 
+#[cfg(target_arch = "wasm32")]
+pub use crate::subsonic_staging_response::respond_fixed_rejection;
+#[cfg(target_arch = "wasm32")]
+pub use dispatch::{respond_staging, StagingApp, StagingDispatch};
 #[cfg(target_arch = "wasm32")]
 pub use request::InputError;
 
