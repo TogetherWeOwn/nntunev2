@@ -33,12 +33,8 @@ async function playing(page: Page) {
 const original = 'a'.repeat(43);
 const replacement = 'b'.repeat(43);
 
-function json(body: object, status = 200) {
-	return { status, contentType: 'application/json', body: JSON.stringify(body) };
-}
-
 async function mountLibrary(page: Page) {
-	await page.route('**/api/library', (route) => route.fulfill(json(ITEMS)));
+	await page.route('**/api/library', (route) => route.fulfill({ json: ITEMS }));
 	await page.route('**/test-audio/**', () => {});
 	await watchListenContext(page);
 	await page.addInitScript(() => {
@@ -61,10 +57,10 @@ async function mountLibrary(page: Page) {
 
 test('library records a terminal against the start for the same audio element', async ({ page }) => {
 	const bodies: Body[] = [];
-	await page.route(contextPath, (route) => route.fulfill(json({ context: original })));
+	await page.route(contextPath, (route) => route.fulfill({ json: { context: original } }));
 	await page.route(eventsPath, (route) => {
 		bodies.push(route.request().postDataJSON() as Body);
-		return route.fulfill(json({}));
+		return route.fulfill({ json: {} });
 	});
 	await mountLibrary(page);
 	await playing(page);
@@ -91,16 +87,16 @@ test('library keeps a pending start bound when no auth notification arrives', as
 	const received: Body[] = [];
 	await page.route(contextPath, (route) => {
 		contextLoads++;
-		return route.fulfill(json({ context: activeContext }));
+		return route.fulfill({ json: { context: activeContext } });
 	});
 	await page.route(eventsPath, (route) => {
 		const body = route.request().postDataJSON() as Body;
 		received.push(body);
 		if (received.length === 1) {
 			activeContext = replacement;
-			return route.fulfill(json({}, 503));
+			return route.fulfill({ json: {}, status: 503 });
 		}
-		return route.fulfill(json({}, body.context === activeContext ? 200 : 401));
+		return route.fulfill({ json: {}, status: body.context === activeContext ? 200 : 401 });
 	});
 	await mountLibrary(page);
 	const refused = page.waitForResponse((response) =>

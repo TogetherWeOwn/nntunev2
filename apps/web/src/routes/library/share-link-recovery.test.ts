@@ -59,6 +59,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		createPlayerController: (initial: queueFunctions.QueueState, end: Parameters<typeof createPlayerController>[1]) =>
 			createPlayerController(initial, end, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
+		createPageListenHistory: () => ({ attach: () => () => {} }),
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
