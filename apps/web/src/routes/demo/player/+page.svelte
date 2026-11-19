@@ -31,7 +31,6 @@
 		type MediaSessionSeekDetails
 	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
-	import { createPageListenHistory } from '#lib/player/pageListenHistory.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import {
 		clampPlaybackSpeed,
@@ -706,17 +705,13 @@
 		selectAt(index);
 	}
 
-	const listenHistory = createPageListenHistory();
-
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
 		if (restored) updateSound(sound, node, false);
 		const stopObserving = playback.observe(node);
-		const stopHistory = listenHistory.attach(node, trackId);
 		return {
 			destroy() {
-				stopHistory();
 				stopObserving();
 				// The action tears down on every swap and on unmount, before
 				// the source unloads: persist from this node while it holds time.
@@ -1519,7 +1514,6 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
-		const stopHistory = listenHistory.mount();
 		sound = loadSoundPreference(safeStorage());
 		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
@@ -1622,7 +1616,6 @@
 		window.addEventListener('pagehide', persistOnPageHide);
 		// OS media controls are global: release them when the page goes away.
 		return () => {
-			stopHistory();
 			// A copy settling after teardown must not resurrect state.
 			alive = false;
 			// Disarm the page-local timer so callbacks captured before
