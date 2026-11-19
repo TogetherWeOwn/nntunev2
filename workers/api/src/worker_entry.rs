@@ -4017,6 +4017,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn record_listen_event(
+        &self,
+        owner: &str,
+        event: &crate::listen_history::ListenEventBody,
+        now: u64,
+    ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let now = i64::try_from(now).map_err(|_| StoreError)?;
+                crate::listen_history::record(&mut client, owner, event, now)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_write"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn playback_lease(
         &self,
         user_id: &str,
