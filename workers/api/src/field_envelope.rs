@@ -32,16 +32,20 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
-    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
-        let mut out = Vec::new();
-        for s in [
+    fn aad_parts<'a>(&'a self, purpose: &'a str) -> [&'a str; 6] {
+        [
             "nntune-envelope-v2",
             purpose,
             self.table,
             self.field,
             self.scope,
             self.row,
-        ] {
+        ]
+    }
+
+    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in self.aad_parts(purpose) {
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
             out.extend_from_slice(s.as_bytes());
         }
