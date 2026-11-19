@@ -259,4 +259,4 @@ sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
 [[migration]]
 file = "0051_storage_object_envelope_intents.sql"
 target = "app"
-sha256 = "e480bb48c50764970c650e41f7a805788ffdc195feedca55982b755ebce15caf"
+sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"

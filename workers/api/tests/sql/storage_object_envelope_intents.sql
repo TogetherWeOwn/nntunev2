@@ -25,6 +25,7 @@ DO $$
 DECLARE
     record_object_id CONSTANT UUID := 'c0000000-0000-4000-8000-000000000001';
     root_id CONSTANT UUID := 'f0000000-0000-4000-8000-000000000001';
+    invalid_root_id CONSTANT UUID := 'f0000000-0000-5000-8000-000000000001';
     successor CONSTANT UUID := 'f0000000-0000-4000-8000-000000000002';
     record CONSTANT BYTEA := decode(
         '4e4e544d454430310002' || 'f0000000000040008000000000000001'
@@ -48,6 +49,9 @@ BEGIN
         PERFORM pg_temp.expect_error(format(insert_sql, record_object_id, root_id,
             set_byte(record, byte_offset, get_byte(record, byte_offset) # 1)), '23514');
     END LOOP;
+    -- Match the column and embedded UUID so the context check does not mask a non-v4 root.
+    PERFORM pg_temp.expect_error(format(insert_sql, record_object_id, invalid_root_id,
+        overlay(record PLACING uuid_send(invalid_root_id) FROM 11)), '23514');
     PERFORM pg_temp.expect_error(format(insert_sql, record_object_id, root_id, substring(record FROM 1 FOR 229)), '23514');
     PERFORM pg_temp.expect_error(format(insert_sql, record_object_id, root_id, record || decode('00', 'hex')), '23514');
     PERFORM pg_temp.expect_error(format(insert_sql, successor, root_id, record), '23503');

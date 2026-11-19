@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS public.storage_object_envelope_intents (
 );
 
 CREATE OR REPLACE FUNCTION public.check_storage_object_envelope_intent() RETURNS trigger
-LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+LANGUAGE plpgsql SET search_path = public, pg_catalog AS $$
 DECLARE
     intent public.storage_object_intents%ROWTYPE;
 BEGIN
