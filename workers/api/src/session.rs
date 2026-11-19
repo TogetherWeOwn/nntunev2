@@ -244,7 +244,11 @@ pub fn listen_context(secret: &[u8], claims: &SessionClaims) -> Result<String, S
 }
 
 /// Must be called with the claims from full cookie and row verification.
-pub fn verify_listen_context(secret: &[u8], claims: &SessionClaims, presented: Option<&str>) -> bool {
+pub fn verify_listen_context(
+    secret: &[u8],
+    claims: &SessionClaims,
+    presented: Option<&str>,
+) -> bool {
     let Some(presented) = presented.filter(|value| value.len() == 43) else {
         return false;
     };

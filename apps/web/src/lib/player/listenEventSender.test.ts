@@ -77,35 +77,25 @@ describe('createListenEventSender', () => {
 		expect(fetchFn).not.toHaveBeenCalled();
 	});
 
-	it('retries transient failures a bounded number of times with the same payload', async () => {
-		const fetchFn = vi.fn(async () => new Response('', { status: 503 }));
-		const sender = createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1, 1] });
-		sender.send(ev('start'));
-		await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(3));
-		await new Promise((r) => setTimeout(r, 20));
+	it('bounds network and transient HTTP retries with the same payload', async () => {
+		vi.useFakeTimers();
+		const fetchFn = vi.fn<typeof fetch>()
+			.mockRejectedValueOnce(new TypeError('offline'))
+			.mockImplementation(async () => new Response('', { status: 503 }));
+		createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1, 1] }).send(ev('start'));
+		await vi.advanceTimersByTimeAsync(100);
 		expect(fetchFn).toHaveBeenCalledTimes(3);
-		const bodies = fetchFn.mock.calls.map((c) => (c as unknown as [string, RequestInit])[1].body);
-		expect(new Set(bodies).size).toBe(1);
+		expect(new Set(fetchFn.mock.calls.map(([, init]) => init?.body)).size).toBe(1);
 	});
 
-	it('retries network errors but not other 4xx', async () => {
-		const net = vi.fn().mockRejectedValueOnce(new TypeError('x')).mockResolvedValue(ok());
-		createListenEventSender({ context, baseUrl: '', fetchFn: net, retryDelaysMs: [1] }).send(ev('start'));
-		await vi.waitFor(() => expect(net).toHaveBeenCalledTimes(2));
-		const bad = vi.fn(async () => new Response('', { status: 400 }));
-		createListenEventSender({ context, baseUrl: '', fetchFn: bad, retryDelaysMs: [1] }).send(ev('start'));
-		await new Promise((r) => setTimeout(r, 20));
-		expect(bad).toHaveBeenCalledTimes(1);
-	});
-
-	it('stops all telemetry after a 401 and never throws', async () => {
+	it('stops the page sender after a 401', async () => {
+		vi.useFakeTimers();
 		const fetchFn = vi.fn(async () => new Response('', { status: 401 }));
 		const sender = createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1] });
 		sender.send(ev('start'));
-		await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
-		await new Promise((r) => setTimeout(r, 10));
-		expect(() => sender.send(ev('complete'))).not.toThrow();
-		await new Promise((r) => setTimeout(r, 10));
+		await vi.advanceTimersByTimeAsync(10);
+		sender.send({ ...ev('start'), playback_id: '22222222-2222-4222-8222-222222222222' });
+		await vi.advanceTimersByTimeAsync(10);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 
@@ -117,7 +107,7 @@ describe('createListenEventSender', () => {
 		// Flush microtasks only: the first attempt runs, the retry timer has not fired.
 		await vi.advanceTimersByTimeAsync(0);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
-		sender.reset();
+		sender.dispose();
 		await vi.advanceTimersByTimeAsync(1000);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});

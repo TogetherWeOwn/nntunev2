@@ -1,10 +1,7 @@
 /**
  * Best-effort listen-event telemetry (`POST /v1/plays/events`).
  *
- * Telemetry only reports; it never bills, never touches leases or grants and
- * never blocks, delays or errors playback. Every failure is swallowed. The
- * payload carries only the event and its opaque session binding. Pending
- * work is in memory and is dropped on `reset()` (page or session boundary).
+ * Pending work lives in memory and cannot outlive the player page's session scope.
  */
 
 import type { ListenContext } from './listenContext.js';
@@ -29,15 +26,13 @@ export interface ListenEventSenderOptions {
 
 export interface ListenEventSender {
 	send(event: ListenEvent): void;
-	/** Drop queued/retrying events and abort in flight (account boundary). */
-	reset(): void;
+	/** Permanently stop sending and abort pending work. */
+	dispose(): void;
 }
 
 const MAX_TRACK_ID_BYTES = 128;
 const DEFAULT_RETRY_DELAYS_MS = [500, 1500] as const;
 const DEFAULT_TIMEOUT_MS = 10_000;
-/** After a 401 stop sending; a later sign-in is picked up after this pause. */
-const ANONYMOUS_COOLDOWN_MS = 5 * 60_000;
 /** In-memory ceiling on playbacks with unsent events; excess is dropped. */
 const MAX_PENDING_PLAYBACKS = 32;
 /** Longest Retry-After honoured; the server asks for 60 s on 429. */
@@ -63,18 +58,19 @@ function retryAfterMs(response: Response): number {
 export function createListenEventSender({
 	baseUrl,
 	context,
-	fetchFn,
+	fetchFn = fetch,
 	retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
 	timeoutMs = DEFAULT_TIMEOUT_MS
 }: ListenEventSenderOptions): ListenEventSender {
 	const url = `${baseUrl.replace(/\/+$/, '')}/v1/plays/events`;
-	// One ordered chain per playback so a terminal event follows its start.
-	// A terminal is only sent once the start was accepted (the server rejects
-	// a terminal without an accepted start).
+	// Ordered chain and immutable binding for each playback.
 	const chains = new Map<string, { tail: Promise<void>; accepted: boolean; binding: string }>();
-	let epoch = 0;
-	let disabledUntil = 0;
-	let controller = new AbortController();
+	const controller = new AbortController();
+	const { signal } = controller;
+	function dispose(): void {
+		controller.abort();
+		chains.clear();
+	}
 
 	function sleep(ms: number, signal: AbortSignal): Promise<void> {
 		return new Promise((resolve) => {
@@ -89,50 +85,36 @@ export function createListenEventSender({
 		});
 	}
 
-	/** Resolves true when the server acknowledged the event. */
-	async function attempt(
-		event: ListenEvent,
-		binding: string,
-		myEpoch: number,
-		signal: AbortSignal
-	): Promise<boolean> {
-		for (let n = 0; ; n++) {
-			if (myEpoch !== epoch || Date.now() < disabledUntil) return false;
+	async function attempt(event: ListenEvent, binding: string): Promise<boolean> {
+		for (let n = 0; !signal.aborted; n++) {
 			let wait = 0;
-			const deadline = AbortSignal.timeout(timeoutMs);
 			try {
-				const doFetch = fetchFn ?? ((input, init) => fetch(input, init));
-				const response = await doFetch(url, {
+				const response = await fetchFn(url, {
 					method: 'POST',
 					credentials: 'include',
 					redirect: 'error',
 					keepalive: true,
 					headers: { 'content-type': 'application/json', accept: 'application/json' },
 					body: JSON.stringify({ ...event, context: binding }),
-					signal: AbortSignal.any([signal, deadline])
+					signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
 				});
-				if (response.ok) return myEpoch === epoch;
-				if (response.status === 401) {
-					// Anonymous: stop telemetry until the account boundary resets it.
-					if (myEpoch === epoch) disabledUntil = Date.now() + ANONYMOUS_COOLDOWN_MS;
-					return false;
-				}
+				if (response.ok) return !signal.aborted;
+				if (response.status === 401) dispose();
 				if (!transient(response.status)) return false;
 				wait = retryAfterMs(response);
 			} catch {
-				if (signal.aborted) return false;
+				// Network failure: retry within the same scope and budget.
 			}
-			if (n >= retryDelaysMs.length) return false;
+			if (n >= retryDelaysMs.length) break;
 			await sleep(Math.max(retryDelaysMs[n], wait), signal);
 		}
+		return false;
 	}
 
 	return {
 		send(event) {
 			try {
-				if (Date.now() < disabledUntil || !isValidTrackId(event.track_id)) return;
-				const myEpoch = epoch;
-				const signal = controller.signal;
+				if (signal.aborted || !isValidTrackId(event.track_id)) return;
 				let chain = chains.get(event.playback_id);
 				if (!chain) {
 					if (event.event !== 'start' || chains.size >= MAX_PENDING_PLAYBACKS) return;
@@ -146,7 +128,7 @@ export function createListenEventSender({
 				const next: Promise<void> = owner.tail
 					.then(async () => {
 						if (!isStart && !owner.accepted) return;
-						const ok = await attempt(event, owner.binding, myEpoch, signal);
+						const ok = await attempt(event, owner.binding);
 						if (isStart) owner.accepted = ok;
 					})
 					.catch(() => {})
@@ -163,12 +145,6 @@ export function createListenEventSender({
 				// Telemetry never throws into playback.
 			}
 		},
-		reset() {
-			epoch++;
-			disabledUntil = 0;
-			controller.abort();
-			controller = new AbortController();
-			chains.clear();
-		}
+		dispose
 	};
 }
