@@ -1167,6 +1167,7 @@ for (const mode of ['one', 'queue'] as const) {
 		media.position = media.duration;
 		element.ended = element.paused = true;
 		capture('pause')();
+		element.play = async () => { element.ended = element.paused = false; };
 		await page.end(mode);
 		expect(media.position).toBe(0);
 		expect(page.read().jumpStatus).toBe('');
@@ -1227,7 +1228,7 @@ test.each(['pause', 'auth', 'edit'] as const)('queue wrap is fenced by %s during
 	expect(page.read().queueAnnouncement).toBe('');
 });
 
-test.each(['plays', 'refuses'] as const)('queue wrap transfers native settings and %s without a premature announcement', async (outcome) => {
+test.each(['plays', 'refuses', 'pauses before pause dispatch'] as const)('queue wrap transfers native settings and %s without a premature announcement', async (outcome) => {
 	let settle!: () => void;
 	const fixture = restartFixture();
 	const { page, element, track, remount, writes } = fixture;
@@ -1239,13 +1240,16 @@ test.each(['plays', 'refuses'] as const)('queue wrap transfers native settings a
 	target.volume = 1;
 	target.playbackRate = 1;
 	target.play = vi.fn(() => new Promise<void>((resolve, reject) => {
-		settle = outcome === 'plays' ? resolve : () => reject(new Error('native play refused'));
+		if (outcome !== 'refuses') target.paused = false;
+		settle = outcome === 'refuses' ? () => reject(new Error('native play refused')) : resolve;
 	}));
 	await Promise.resolve();
 	expect(target.play).toHaveBeenCalledTimes(1);
 	expect(target).toMatchObject({ volume: 0.6, muted: true, playbackRate: 1.25 });
 	expect(writes).toEqual([0]);
 	expect(page.read().queueAnnouncement).toBe('');
+	// Native pause changes the property immediately, but queues the pause event.
+	if (outcome === 'pauses before pause dispatch') target.pause();
 	settle();
 	await continuation;
 	expect(page.read().queueAnnouncement).toBe(outcome === 'plays' ? 'Playing Pine Morning.' : '');

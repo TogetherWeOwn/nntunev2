@@ -312,7 +312,8 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 			const play = target.play;
 			if (!matches()) return;
 			await play.call(target);
-			if (!matches()) return;
+			// A captured play promise can fulfill before the queued pause event runs.
+			if (!matches() || target.paused || target.ended || target.error !== null) return;
 			replay.playing = true;
 			announce(track);
 		} catch {
