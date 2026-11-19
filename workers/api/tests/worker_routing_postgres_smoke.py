@@ -5,7 +5,8 @@ Runs the prebuilt bundle (workers/api/build/worker/shim.mjs) under the locked
 `wrangler dev --local` with a local Hyperdrive binding to a run-scoped database
 created in (and dropped from) the service, migrated from migrations/manifest.toml.
 Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
-inserted auth_challenges row back), plus non-/rest and /rest routing controls.
+inserted auth_challenges row back), marker-based magic admission and signup
+reaping, plus non-/rest and /rest routing controls.
 /rest is asserted against the inert main baseline; the two observed tables
 must not gain rows. This is NOT Subsonic activation proof. Missing prerequisites fail.
 By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
@@ -17,7 +18,7 @@ _USER (postgres), _ADMIN_DB (nntune_ci). Needs node and a host psql client.
 
     python3 -I workers/api/tests/worker_routing_postgres_smoke.py [--wrangler PATH]
 """
-import argparse, base64, importlib.util, json, os, re, secrets, shutil, socket, subprocess
+import argparse, base64, hashlib, importlib.util, json, os, re, secrets, shutil, socket, subprocess
 import sys, tempfile, time, tomllib, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -32,7 +33,7 @@ spec.loader.exec_module(fixture)
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "workers/api/build/worker/shim.mjs"
 MANIFEST = ROOT / "migrations/manifest.toml"
-WRANGLER_VERSION = "4.153.0"
+WRANGLER_VERSION = "4.162.0"
 RP_ID = "example.test"
 ORIGIN = f"https://{RP_ID}"
 IDENT = re.compile(r"[A-Za-z0-9_]+")
@@ -81,6 +82,7 @@ compatibility_date = "2026-10-01"
 RP_ID = "{RP_ID}"
 RP_ORIGIN = "{ORIGIN}"
 BUILD_SHA = "{sha}"
+INVITES_REQUIRED = "1"
 # Local stand-in only: the real Hyperdrive cache gate is not exercised here.
 HYPERDRIVE_CACHING_DISABLED = "1"
 
@@ -134,7 +136,7 @@ def check_ping(status, ctype, body):
           "unauthenticated /rest/ping must fail")
 
 
-def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
+def psql(s, db, sql=None, stdin=None, tuples=False, *, timeout=300, **variables):
     args = [shutil.which("psql") or "psql", "-h", s["host"], "-p", s["port"], "-U", s["user"],
             "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db]
     args += ["-A", "-t"] if tuples else []
@@ -143,7 +145,7 @@ def psql(s, db, sql=None, stdin=None, tuples=False, **variables):
     args += ["-c", sql] if sql is not None else []
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": s["password"],
            "PGOPTIONS": "-c search_path=public,pg_catalog", "PGCONNECT_TIMEOUT": "10"}
-    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=300)
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, env=env, timeout=timeout)
     check(p.returncode == 0, f"psql failed: {p.stderr.strip()[:300]}")
     return p.stdout.strip()
 
@@ -156,13 +158,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 
-def http(method, url, body=None, headers=None):
+def http(method, url, body=None, headers=None, *, response_header="content-type"):
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
         with OPENER.open(req, timeout=30) as r:
-            return r.status, r.headers.get("content-type", ""), r.read().decode(errors="replace")
+            return r.status, r.headers.get(response_header, ""), r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("content-type", ""), e.read().decode(errors="replace")
+        return e.code, e.headers.get(response_header, ""), e.read().decode(errors="replace")
 
 
 def find_wrangler(explicit):
@@ -172,6 +174,11 @@ def find_wrangler(explicit):
     pkg = found[0].resolve().parent.parent / "package.json"
     check(json.loads(pkg.read_text()).get("version") == WRANGLER_VERSION, f"wrangler must be {WRANGLER_VERSION}")
     return found[0].resolve()
+
+
+def check_source_phase_bundle(index):
+    check(re.search(r"\bimport\s+source\s+\w+\s+from\s*['\"]\./index_bg\.wasm['\"]", index),
+          "generated Worker bundle is missing its source-phase Wasm import")
 
 
 def prerequisites(args):
@@ -184,6 +191,7 @@ def prerequisites(args):
     wrangler = find_wrangler(args.wrangler or os.environ.get("NNTUNE_WRANGLER"))
     check(BUNDLE.is_file() and (BUNDLE.parent.parent / "index_bg.wasm").is_file(),
           "missing prebuilt Worker bundle (worker-build --release -- --locked in workers/api)")
+    check_source_phase_bundle((BUNDLE.parent.parent / "index.js").read_text())
     sha = os.environ.get("GITHUB_SHA", "")
     return s, wrangler, sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "0123456789abcdef0123456789abcdef01234567"
 
@@ -210,6 +218,77 @@ def fixture_inert(base, q, fx, mirror):
             check(st == 410 and b.strip() == "Gone", f"fixture {sc.name}: expected 410 Gone")
     check(q(fixture.snapshot_sql()) == before, "inert /rest changed fixture-observed tables")
     print(f"ok: {len(fixture.SCENARIOS)} synthetic fixture scenarios inert, no row changes", flush=True)
+
+
+def legacy_vault_cutover(base, q):
+    """Exercise both production queries via HTTP on the disposable Worker DB."""
+    # Hide the retired relation in this fixture so even a redundant read fails.
+    q("""
+        ALTER TABLE provider_vaults RENAME TO smoke_retired_provider_vaults;
+        INSERT INTO users (id, email, created_at, legacy_vault_established) VALUES
+            ('smoke-marker', 'marker@example.test', 1, true),
+            ('smoke-stale', 'stale@example.test', 1, false);
+        INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, purpose)
+        VALUES ('smoke-expired', 'smoke-stale', :'rp', :'origin', 2, 'register');
+    """, rp=RP_ID, origin=ORIGIN)
+    headers = {"content-type": "application/json", "origin": ORIGIN}
+
+    def finish(user, expected):
+        # Seed only the synthetic inbox proof, leaving the Worker to decide
+        # admission and execute the normal token claim and session transaction.
+        token = b64(secrets.token_bytes(32))
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        now = int(time.time())
+        q("""
+            INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at)
+            SELECT :'hash', id, email, :issued, :expires FROM users WHERE id = :'uid';
+        """, hash=digest, uid=user, issued=now, expires=now + 600)
+        status, cookie, _ = http("POST", base + "/v1/auth/magic/finish",
+                                 json.dumps({"token": token}).encode(), headers,
+                                 response_header="set-cookie")
+        check(status == expected, f"magic finish for {user}: got {status}, want {expected}")
+        admitted = expected == 200
+        check(cookie.startswith("__Host-nntune-session=") if admitted else not cookie,
+              f"unexpected session cookie outcome for {user}")
+        actual = q("""
+            SELECT used::text || '/' || (SELECT count(*) FROM sessions WHERE user_id = :'uid')
+            FROM magic_link_tokens WHERE token_hash = :'hash';
+        """, hash=digest, uid=user)
+        check(actual == ("true/1" if admitted else "false/0"), f"unexpected claim/session state for {user}")
+
+    finish("smoke-stale", 401)
+    q("UPDATE magic_link_tokens SET expires_at = 2 WHERE user_id = 'smoke-stale';")
+    # Run cleanup before issuing the marker account any token or session.
+    status, _, _ = http("POST", base + "/v1/auth/passkey/register/start",
+                        b'{"email":"cleanup-trigger@example.test"}', headers)
+    check(status == 200, f"register start for cleanup: got {status}, want 200")
+    ids = q("SELECT id FROM users WHERE id IN ('smoke-marker', 'smoke-stale') ORDER BY id;")
+    check(ids == "smoke-marker", "cleanup must preserve the marker-only user and reap the stale signup")
+    check(q("SELECT count(*) FROM auth_challenges WHERE id = 'smoke-expired';") == "0",
+          "cleanup must remove the stale signup's expired challenge")
+    finish("smoke-marker", 200)
+
+    # Only test admission for owners: their foreign keys still restrict deletion.
+    # A grant needs a provider owned by the same user, so test both owner states.
+    q("""
+        INSERT INTO users (id, email, created_at) VALUES
+            ('smoke-provider', 'provider@example.test', 1),
+            ('smoke-grant', 'grant@example.test', 1);
+        INSERT INTO providers (user_id, label, encrypted_creds, creds_envelope_version, creds_kek_version,
+                               creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+                               creds_payload_format, created_at, last_verified_at)
+        SELECT id, 'synthetic', decode('00', 'hex'), 2, 1,
+               decode(repeat('00', 12), 'hex'), decode(repeat('00', 48), 'hex'),
+               decode(repeat('00', 12), 'hex'), 1, 1, 1
+        FROM users WHERE id IN ('smoke-provider', 'smoke-grant');
+        INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at)
+        VALUES (repeat('0', 64), 1, 'synthetic', 'synthetic', 1);
+        INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+        SELECT user_id, repeat('0', 64), id, 1 FROM providers WHERE user_id = 'smoke-grant';
+    """)
+    finish("smoke-provider", 401)
+    finish("smoke-grant", 401)
+    print("ok: PostgreSQL marker-only admission and reaping, stale cleanup, provider/grant denial", flush=True)
 
 
 def smoke(base, s, db, fx=None, mirror=False):
@@ -244,7 +323,12 @@ def smoke(base, s, db, fx=None, mirror=False):
     after = q("SELECT (SELECT count(*) FROM auth_challenges) || '/' || (SELECT count(*) FROM auth_rate_limit_slots)")
     check(after == snap, "current main /rest changed observed table counts")
     print("ok: /rest claimed by the Subsonic adapter; observed table counts unchanged", flush=True)
+    legacy_vault_cutover(base, q)
     if fx:
+        # Seed after auth cleanup so unrelated historical fixture users cannot
+        # become reaper candidates.
+        q(fixture.seed_sql(fx, mirror))
+        print("seeded synthetic Subsonic fixture", flush=True)
         fixture_inert(base, q, fx, mirror)
 
 
@@ -282,11 +366,9 @@ def main(argv=None):
         for name in app_migrations():
             print(f"migrate app: {name}", flush=True)
             psql(s, db, stdin=(ROOT / "migrations" / name).read_text())
-        if fx:
-            for name in (fixture.mirror_files() if args.mirror_fixture else ()):
+        if fx and args.mirror_fixture:
+            for name in fixture.mirror_files():
                 psql(s, db, stdin=(ROOT / "migrations" / name).read_text())
-            psql(s, db, stdin=fixture.seed_sql(fx, args.mirror_fixture))
-            print("seeded synthetic Subsonic fixture", flush=True)
         (tmp / "wrangler.toml").write_text(wrangler_toml(conn_string(s, db), sha, bool(fx and args.mirror_fixture)))
         (tmp / ".dev.vars").write_text(dev_vars(fx))
         (tmp / "home").mkdir()

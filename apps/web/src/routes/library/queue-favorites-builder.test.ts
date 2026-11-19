@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
+import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
+import { createPlayerController } from '#lib/player/controller.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -26,14 +27,14 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'commitQueue', 'queueFavorites', 'clearShareFeedback',
 		'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
-		'favoriteTracks', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'playEpoch'
+		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
+		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'queueController', 'media', 'mediaRevision'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -48,16 +49,25 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		createQueue: () => queue, createPlayerController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
-	return new Function(...Object.keys(bindings), `${compiled}
+	return new Function(...Object.keys(bindings), `
+		${compiled}
+		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
+		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
+		queueController.subscribe((value) => { queue = value; });
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
+			replaceQueue, commitQueue, subscribe: queueController.subscribe,
 			read: () => ({ queue, announcement: queueAnnouncement })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;
+		replaceQueue: (queue: QueueState) => boolean;
+		commitQueue: (queue: QueueState, kind: 'clear') => boolean;
+		subscribe: (callback: (queue: QueueState) => void) => () => void;
 		read: () => { queue: QueueState; announcement: string };
 	};
 }
@@ -75,6 +85,33 @@ test('queues shelf favorites in star order, not library/title order, with displa
 	expect(page.read().announcement).toMatch(/queued 3.*0 already queued/i);
 	expect(readMiniPlayerHint()?.trackId).toBe('mike');
 	expect(readMiniPlayerHint()?.title).toBe('Mike Song');
+});
+
+test('reentrant replacement stops the superseded favorites action', () => {
+	const page = pageActions(['mike', 'alpha'], createQueue([]), 'Earlier outcome');
+	const newer = createQueue([{ id: 'zulu', title: 'Zulu Song', artist: '', streamUrl: '' }]);
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.some((track) => track.id === 'mike')) page.replaceQueue(newer);
+	});
+	page.queueAll();
+	expect(page.read().queue).toBe(newer);
+	expect(page.read().announcement).toBe('');
+	unsubscribe();
+});
+
+test('a nested favorites action keeps its newer no-op announcement', () => {
+	const page = pageActions(['mike']);
+	let reacted = false;
+	const unsubscribe = page.subscribe((value) => {
+		if (!reacted && value.tracks.some((track) => track.id === 'mike')) {
+			reacted = true;
+			page.queueAll();
+		}
+	});
+	page.queueAll();
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['mike']);
+	expect(page.read().announcement).toMatch(/^queued 0 favorites, 1 already queued/i);
+	unsubscribe();
 });
 
 test('keeps already queued tracks in place and preserves a non-first current selection', () => {
@@ -115,4 +152,19 @@ test('repeated activation replaces the outcome and does not duplicate or reorder
 	page.queueAll();
 	expect(page.read().queue).toBe(queued);
 	expect(page.read().announcement).toMatch(/^queued 0.*2 already queued/i);
+});
+
+test('a clear subscriber running multi-row queueFavorites leaves its queue and count final', () => {
+	const original = createQueue([{ id: 'other', title: 'Other', artist: '', streamUrl: '' }]);
+	const page = pageActions(['mike', 'zulu', 'alpha'], original, 'Earlier outcome');
+	let reacted = 0;
+	const unsubscribe = page.subscribe((value) => {
+		if (value.tracks.length === 0) { reacted += 1; page.queueAll(); }
+	});
+	expect(page.commitQueue(clearQueue(original), 'clear')).toBe(false);
+	expect(reacted).toBe(1);
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['mike', 'zulu', 'alpha']);
+	expect(page.read().queue.currentIndex).toBe(0);
+	expect(page.read().announcement).toMatch(/^queued 3 favorites, 0 already queued/i);
+	unsubscribe();
 });

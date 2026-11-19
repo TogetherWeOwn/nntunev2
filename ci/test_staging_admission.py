@@ -160,6 +160,7 @@ class World:
 
     def add_other(self, conclusion, status="completed", job="staging-api"):
         other = {"id": 101, "run_attempt": 1, "event": "push", "head_sha": OTHER_SHA,
+                 "head_branch": "main", "workflow_id": WORKFLOW_ID,
                  "created_at": iso(-1), "updated_at": iso(-1), "status": status,
                  "conclusion": "success" if status == "completed" else None}
         self.runs.append(other)
@@ -185,10 +186,14 @@ class World:
         queries = {f"head_sha={SHA}": candidate, f"head_sha={OTHER_SHA}": []}
         for status in ("queued", "in_progress", "waiting", "pending", "requested"):
             queries[f"status={status}"] = [run for run in self.runs if run.get("status") == status]
-        cutoff = (datetime.fromisoformat(self.receipt["identities"]["build-identity"]["observed_at"])
-                  - timedelta(days=66)).date().isoformat()
-        queries[f"created=%3E%3D{cutoff}"] = [
-            run for run in self.runs if datetime.fromisoformat(run["created_at"]).date().isoformat() >= cutoff]
+        opening = sa.timestamp(self.receipt["identities"]["build-identity"]["observed_at"])
+        opening_day = opening.astimezone(timezone.utc).date()
+        dated = [(sa.timestamp(run["created_at"]).astimezone(timezone.utc).date(), run) for run in self.runs]
+        for start, end in ((66, 45), (44, 23), (22, None)):
+            first = opening_day - timedelta(days=start)
+            last = opening_day - timedelta(days=end) if end is not None else None
+            query = f"created={first}..{last}" if last else f"created=%3E%3D{first}"
+            queries[query] = [run for day, run in dated if day >= first and (last is None or day <= last)]
         for query, rows in queries.items():
             for start in range(0, max(1, len(rows)), 100):
                 route = (f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&{query}"
@@ -415,26 +420,117 @@ class VerifyTests(Base):
         w.others[101][0]["completed_at"] = iso(-15)
         self.assertEqual(w.verify()["result"], "satisfied")
 
-    def test_large_lifetime_history_and_complete_relevant_pagination(self):
+    def test_relevant_history_above_search_ceiling(self):
         w = World()
-        for rid in range(200, 986):
-            # More than a hundred relevant rows, plus old lifetime history.
-            recent = rid < 401
-            w.runs.append(dict(w.run, id=rid, head_sha=OTHER_SHA,
-                               created_at=iso(-60 if recent else -100 * 24 * 60),
-                               updated_at=iso(-30)))
-        actions = FakeActions(w.routes())
+        # Model the observed 1,113 results: 647 in a bounded slice, then 466
+        # in the open tail (including the candidate), plus irrelevant lifetime history.
+        for start, count, age in ((200, 647, 35), (900, 465, 10), (1400, 125, 100)):
+            w.runs.extend(dict(w.run, id=rid, head_sha=OTHER_SHA, created_at=iso(-age * 24 * 60),
+                               updated_at=iso(-30)) for rid in range(start, start + count))
+        base = f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push"
+        cutoff = (sa.timestamp(iso(-3)) - timedelta(days=66)).date()
+        old_query = f"{base}&created=%3E%3D{cutoff}&per_page=100&page=1"
+        routes = w.routes()
+        routes[old_query] = page("workflow_runs", w.runs[:100], total=1113)
+        actions = FakeActions(routes)
         self.assertEqual(w.verify_with_actions(actions)["result"], "satisfied")
-        self.assertTrue(any("page=3" in route for route in actions.calls))
-        self.assertNotIn(f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&per_page=100&page=1",
-                         actions.calls)
+        self.assertTrue(any("&created=" in route and route.endswith("page=7") for route in actions.calls))
+        self.assertTrue(any("&created=%3E%3D" in route and route.endswith("page=5") for route in actions.calls))
+        self.assertNotIn(old_query, actions.calls)
+        self.assertNotIn(f"{base}&per_page=100&page=1", actions.calls)
 
-    def test_incomplete_relevant_discovery_refuses(self):
+    def test_incomplete_relevant_discovery_refuses_without_partial_proof(self):
+        w = World()
+        w.add_other("success")
+        w.runs[1]["created_at"] = iso(-60 * 24 * 60)
+        for filter_ in ("&created=%3E%3D", "&status=requested"):
+            with self.subTest(filter_=filter_):
+                routes = w.routes()
+                route = next(r for r in routes if filter_ in r)
+                routes[route]["total_count"] = 1000
+                actions = FakeActions(routes)
+                self.refused("incomplete or exhausted workflow_runs", w.verify_with_actions, actions)
+                self.assertFalse(any("jobs?filter=all" in call for call in actions.calls))
+
+    def test_conflict_search_covers_utc_boundaries_and_all_age_pending(self):
+        # The local calendar date is Nov 19, but the opening UTC date is Nov 18.
+        opening = sa.timestamp("2026-11-19T00:30:00+02:00")
+        base = f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push"
+        dates = {
+            "created=2026-09-13..2026-10-04": ("2026-09-13T00:00:00Z", "2026-10-04T23:59:59Z"),
+            "created=2026-10-05..2026-10-26": ("2026-10-05T00:00:00Z", "2026-10-26T23:59:59Z"),
+            "created=%3E%3D2026-10-27": ("2026-10-27T00:00:00Z", "2026-11-20T00:00:00Z"),
+        }
+        row = World().run
+        rows = {query: [dict(row, id=2 * ix + offset, created_at=stamp) for offset, stamp in enumerate(stamps)]
+                for ix, (query, stamps) in enumerate(dates.items(), 50)}
+        statuses = ("queued", "in_progress", "waiting", "pending", "requested")
+        rows.update({f"status={status}": [dict(row, id=200 + ix, status=status,
+                                              conclusion=None, created_at="2026-01-01T00:00:00Z")]
+                     for ix, status in enumerate(statuses)})
+        recent = dict(rows["created=%3E%3D2026-10-27"][0], status="queued", conclusion=None)
+        rows["created=%3E%3D2026-10-27"][0] = recent
+        rows["status=queued"].append(recent)
+        routes = {f"{base}&{query}&per_page=100&page=1": page("workflow_runs", batch)
+                  for query, batch in rows.items()}
+        actions = FakeActions(routes)
+        self.assertCountEqual(actions.conflicts(str(WORKFLOW_ID), opening),
+                              [run for batch in rows.values() for run in batch if run is not recent] + [recent])
+        self.assertCountEqual(actions.calls, routes)
+
+        # Valid overlap is deduped, changed attempt metadata and out-of-scope rows are not.
+        queued = f"{base}&status=queued&per_page=100&page=1"
+        first = f"{base}&created=2026-09-13..2026-10-04&per_page=100&page=1"
+        oldest = rows["created=2026-09-13..2026-10-04"][0]
+        for route, wrong, reason in (
+            (queued, dict(recent, run_attempt=2), "changed during conflict discovery"),
+            (queued, dict(recent, status="completed"), "outside requested status"),
+            (first, recent, "outside requested creation dates"),
+            (first, dict(oldest, created_at="2026-09-12T23:59:59Z"), "outside requested creation dates"),
+            (first, dict(oldest, event="workflow_dispatch"), "outside requested workflow scope"),
+            (first, dict(oldest, head_branch="other"), "outside requested workflow scope"),
+            (first, dict(oldest, workflow_id=WORKFLOW_ID + 1), "outside requested workflow scope"),
+        ):
+            with self.subTest(reason=reason, wrong=wrong):
+                invalid = FakeActions({**routes, route: page("workflow_runs", [wrong])})
+                self.refused(reason, invalid.conflicts, str(WORKFLOW_ID), opening)
+
+    def test_conflict_partitions_share_the_actions_network_deadline(self):
+        empty = io.BytesIO(json.dumps(page("workflow_runs", [])).encode())
+        with patch.object(sa.time, "monotonic", side_effect=[100, 100, 219, 220]):
+            actions = sa.Actions(REPO, "synthetic-token")
+            with patch.object(actions.opener, "open", return_value=empty) as open_:
+                self.refused("time budget exhausted", actions.conflicts, str(WORKFLOW_ID), NOW)
+                self.assertEqual(open_.call_count, 1)
+
+    def test_final_actions_response_must_finish_before_deadline(self):
         w = World()
         routes = w.routes()
-        route = next(r for r in routes if "&created=" in r)
-        routes[route]["total_count"] = 201
-        self.assertWorldRefused(w, "incomplete or exhausted workflow_runs", routes=routes)
+        now = 100
+        candidate_reads = 0
+
+        class FinalResponse(io.BytesIO):
+            def read(self, size=-1):
+                nonlocal now
+                now = 220
+                return super().read(size)
+
+        def open_(request, timeout):
+            nonlocal candidate_reads
+            route = request.full_url.removeprefix(actions.base)
+            data = routes[route]
+            body = data if isinstance(data, bytes) else json.dumps(data).encode()
+            if route == f"runs/{RUN_ID}":
+                candidate_reads += 1
+                if candidate_reads == 2:
+                    return FinalResponse(body)
+            return io.BytesIO(body)
+
+        with patch.object(sa.time, "monotonic", side_effect=lambda: now):
+            actions = sa.Actions(REPO, "synthetic-token")
+            with patch.object(actions.opener, "open", side_effect=open_):
+                self.refused("time budget exhausted", w.verify_with_actions, actions)
+        self.assertEqual(candidate_reads, 2)
 
     def test_older_unresolved_run_is_discovered_independently(self):
         w = World()
@@ -531,6 +627,8 @@ class VerifyTests(Base):
                        {first: page("workflow_runs", rows[:100], total=101),
                         second: page("workflow_runs", rows[:1], total=101)}):
             self.refused("incomplete or exhausted|unavailable", FakeActions(routes).runs, route)
+        self.refused("invalid JSON object", FakeActions({first: []}).runs, route)
+        self.refused("invalid workflow_runs row", FakeActions({first: page("workflow_runs", [None])}).runs, route)
         self.refused("response exceeds bounds", FakeActions({first: b" " * (sa.MAX_RUN_PAGE + 1)}).runs, route)
 
     def test_missing_conflicting_lanes_refuses(self):

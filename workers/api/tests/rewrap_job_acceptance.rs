@@ -4,22 +4,24 @@
 //! Second-implementation coverage over a synthetic in-memory sqlite vault:
 //! every test builds its own fixture (migrations 0002 + 0015, then the job's
 //! `ROTATION_RUNS_DDL` verbatim), drives `run_rewrap_pass` through a local
-//! `RewrapStore` that executes the job's SQL consts, and asserts the
+//! `RewrapStore` that executes the historical vault SQL, and asserts the
 //! end-state a rotation drill would check. Keys are random per test; user ids
 //! and payloads are synthetic.
 //!
 //! Each test names the production change that would make it fail. A test
 //! that cannot fail is not a test.
 
+#[path = "support/historical_vault_rotation_sql.rs"]
+mod historical_vault_rotation_sql;
+
+use historical_vault_rotation_sql::{CAS_REWRAP_SQL, CLAIM_BATCH_SQL};
 use nntune_api::b64;
 use nntune_api::handlers::StoreError;
 use nntune_api::rotation::{
     run_rewrap_pass, validate_new_run, CasRewrapOutcome, JobError, KekSource, RewrapClaim,
-    RewrapParams, RewrapStore, RewrappedEnvelope, RunRecord, CAS_REWRAP_SQL, CLAIM_BATCH_SQL,
-    MAX_BATCH_LIMIT, ROTATION_RUNS_DDL,
+    RewrapParams, RewrapStore, RewrappedEnvelope, RunRecord, MAX_BATCH_LIMIT, ROTATION_RUNS_DDL,
 };
 use nntune_api::vault::{decrypt_vault, encrypt_vault, rewrap_dek, VaultBlob};
-use rand::RngCore;
 use rusqlite::{params, Connection};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -46,9 +48,7 @@ fn drive<F: Future>(future: F) -> F::Output {
 }
 
 fn fresh_key() -> [u8; 32] {
-    let mut key = [0; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    key
+    rand::random()
 }
 
 fn workspace_root() -> PathBuf {
@@ -1191,7 +1191,7 @@ fn job_module_has_no_log_path_and_scalar_errors() {
     }
 }
 
-/// The job's claim/CAS consts equal the normative runbook text byte for byte.
+/// The fixture claim/CAS SQL matches the historical runbook byte for byte.
 ///
 /// Mutants killed: a const edited without updating the runbook (or the
 /// reverse); an unbound batch size; a CAS dropping a captured-envelope

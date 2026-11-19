@@ -35,6 +35,16 @@ use crate::handlers::{
     ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
     QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
+#[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
+#[path = "billing_budget.rs"]
+pub(crate) mod billing_budget;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_cancel_control.rs"]
+mod billing_cancel_control;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_deadline_test.rs"]
+pub(crate) mod billing_deadline_test;
+
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -517,6 +527,51 @@ async fn query_playback_lease_row(
     }
 }
 
+/// Acquire on the caller's connection; refusal reads the incumbent on that same connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire_playback_lease_on(
+    client: &impl GenericClient,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    let rows = client
+        .query_typed(
+            crate::playback::playback_lease_acquire_statement(),
+            &[
+                (&user_id, Type::TEXT),
+                (&session_id, Type::TEXT),
+                (&track_id, Type::TEXT),
+                (&play_id, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&i64_of(now)?, Type::INT8),
+                (&takeover, Type::BOOL),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    match rows.first() {
+        Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
+            epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+        }),
+        // A vanished row (including a deletion-fence refusal) reads as retry-now.
+        None => {
+            let retry_after_secs = match query_playback_lease_row(client, user_id).await? {
+                Some(row) => row.retry_after_secs(now),
+                None => 0,
+            };
+            Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
+        }
+    }
+}
+
 /// Durable-slot budgets are bounded: a zero limit/window admits
 /// nothing, and the slot scan is capped at
 /// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
@@ -693,24 +748,57 @@ impl MirrorBinding {
     }
 }
 
+#[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
+#[path = "subsonic_membership.rs"]
+pub(crate) mod subsonic_membership;
+#[allow(dead_code)] // Unmounted until the bounded adapter is wired.
+#[path = "subsonic_mirror.rs"]
+pub(crate) mod subsonic_mirror;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
+pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
+// Unmounted until the staging membership and mirror readers adopt it.
+#[allow(dead_code)]
+#[path = "subsonic_pg_page.rs"]
+pub(crate) mod subsonic_pg_page;
+
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
+pub use subsonic_pg::load_staging_account;
 
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
     mirror_binding: MirrorBinding,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    cancel_token_observer:
+        Option<std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::CancelToken>>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_connect: Option<Box<dyn Fn() -> TestConnectFuture>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_mirror: Option<CatalogueTestMirror>,
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+type TestConnectFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<tokio_postgres::Client, StoreError>>>>;
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
     client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    membership_hook: std::cell::RefCell<Option<MembershipTestHook>>,
+    mirror_hook: std::cell::RefCell<Option<MembershipTestHook>>,
+    preflight_hook: std::cell::RefCell<Option<(&'static str, MembershipTestHook)>>,
 }
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub type MembershipTestHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = Result<(), StoreError>>>>>;
 
 /// Test-only seam for the Subsonic mount's snapshot read: the postgres
 /// harness drives the production `PgStore::subsonic_member_catalogue`
@@ -718,6 +806,10 @@ struct CatalogueTestMirror {
 /// `catalogue_store_for_postgres_test`).
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 pub trait SubsonicSnapshotCatalogueStore {
+    fn set_membership_hook(&self, hook: MembershipTestHook);
+    fn set_mirror_hook(&self, hook: MembershipTestHook);
+    fn set_preflight_hook(&self, phase: &'static str, hook: MembershipTestHook);
+
     async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
@@ -749,6 +841,33 @@ pub trait SubsonicSnapshotCatalogueStore {
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 impl SubsonicSnapshotCatalogueStore for PgStore {
+    fn set_preflight_hook(&self, phase: &'static str, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .preflight_hook
+            .borrow_mut() = Some((phase, hook));
+    }
+
+    fn set_mirror_hook(&self, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .mirror_hook
+            .borrow_mut() = Some(hook);
+    }
+
+    fn set_membership_hook(&self, hook: MembershipTestHook) {
+        *self
+            .test_mirror
+            .as_ref()
+            .expect("test mirror")
+            .membership_hook
+            .borrow_mut() = Some(hook);
+    }
+
     async fn subsonic_snapshot_catalogue_with_cap(
         &self,
         user_id: &str,
@@ -783,9 +902,13 @@ pub fn catalogue_store_for_postgres_test(
             MirrorBinding::Unconfigured
         },
         test_client: std::cell::RefCell::new(Some(app)),
+        test_connect: None,
         test_mirror: Some(CatalogueTestMirror {
             client: std::cell::RefCell::new(Some(mirror)),
             attempts,
+            membership_hook: std::cell::RefCell::new(None),
+            mirror_hook: std::cell::RefCell::new(None),
+            preflight_hook: std::cell::RefCell::new(None),
         }),
     }
 }
@@ -801,8 +924,54 @@ pub fn session_retry_store_for_postgres_test(
         trace_id: "postgres-refresh-test".into(),
         mirror_binding: MirrorBinding::Configured,
         test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
         test_mirror: None,
     }
+}
+
+/// Test-only connection acquisition for dispatch paths that call several
+/// production Store methods. Each checkout must be from the disposable DB.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn playback_store_for_postgres_test<F, Fut>(connect: F) -> impl Store + SingleUseStore
+where
+    F: Fn() -> Fut + 'static,
+    Fut: Future<Output = Result<tokio_postgres::Client, StoreError>> + 'static,
+{
+    PgStore {
+        env: None,
+        trace_id: "postgres-playback-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        test_client: std::cell::RefCell::new(None),
+        test_connect: Some(Box::new(move || Box::pin(connect()))),
+        test_mirror: None,
+    }
+}
+
+/// Exercise the production Store acquisition with a disposable connection.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+pub async fn private_aware_lease_for_postgres_test(
+    client: tokio_postgres::Client,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    PgStore {
+        env: None,
+        trace_id: "postgres-private-lease-test".into(),
+        mirror_binding: MirrorBinding::Configured,
+        test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
+        test_mirror: None,
+    }
+    .acquire_playback_lease(
+        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+    )
+    .await
 }
 
 /// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
@@ -821,6 +990,197 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)] // Not called by release reconciliation until activation.
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+        #[cfg(feature = "billing-owned-wasm-test")]
+        probe: crate::billing_transaction_sql::ReconcileProbe,
+    ) -> Result<(), StoreError> {
+        use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| failed())?;
+        #[cfg(feature = "billing-owned-wasm-test")]
+        let (host, port, connection_string) = (
+                "127.0.0.1".to_owned(),
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
+                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+            );
+        #[cfg(not(feature = "billing-owned-wasm-test"))]
+        let (host, port, connection_string) = {
+            let env = self.env.as_ref().ok_or(StoreError)?;
+            let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+            (
+                hyperdrive.host().to_owned(),
+                hyperdrive.port(),
+                hyperdrive.connection_string(),
+            )
+        };
+        billing_budget::with_owned_connection(
+            &host,
+            port,
+            &connection_string,
+            |client| {
+                #[cfg(feature = "billing-owned-wasm-test")]
+                if let Some(observer) = &self.cancel_token_observer {
+                    *observer.borrow_mut() = Some(client.cancel_token());
+                }
+                Box::pin(billing_budget::bootstrap_transaction(client))
+            },
+            move |client| {
+                Box::pin(apply(
+                    client,
+                    user_id,
+                    outcome,
+                    #[cfg(feature = "billing-owned-wasm-test")]
+                    probe,
+                ))
+            },
+            #[cfg(feature = "billing-owned-wasm-test")]
+            |expired| {
+                if let Some(observer) = &self.work_deadline_observer {
+                    observer.set(expired);
+                }
+            },
+        )
+        .await
+        .map_err(|_| failed())
+    }
+
+    // Native acceptance injects connection acquisition only. This entry is not
+    // wired to Store; its client stays inside the budgeted operation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| failed())?;
+        billing_budget::BillingBudget::run(|budget| async move {
+            let mut client = budget.connect(|| self.connect()).await?;
+            budget
+                .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
+                .await?;
+            budget
+                .work(|| {
+                    crate::billing_transaction_sql::apply_reconcile_transaction(
+                        &mut client,
+                        user_id,
+                        outcome,
+                    )
+                })
+                .await
+        })
+        .await
+        .map_err(|_| failed())
+    }
+
+    /// NEW-play acquisition. The account lock serializes privacy toggles,
+    /// including when the session has no privacy row yet.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_private_aware_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+        Self::bounded(
+            async {
+                let key = format!("play:{user_id}:{track_id}:{play_id}");
+                if !crate::history_key::matches_owner_track(&key, user_id, track_id)
+                    || !crate::history_key::valid_mark_time(now)
+                {
+                    return Err(StoreError);
+                }
+                let mut client = self.connect().await?;
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if tx
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                let rows = tx
+                    .query_typed(
+                        crate::preference_rows::private_session_active_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                let private: bool = rows[0].try_get(0).map_err(|_| StoreError)?;
+                if private {
+                    let rows = tx
+                        .query_typed(
+                            crate::preference_rows::private_play_mark_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&key, Type::TEXT),
+                                (&i64_of(now)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    if rows.len() != 1 {
+                        return Err(StoreError);
+                    }
+                    let rows = tx
+                        .query_typed(
+                            crate::preference_rows::private_play_probe_statement(),
+                            &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    if rows.len() != 1 || !rows[0].try_get::<_, bool>(0).map_err(|_| StoreError)? {
+                        return Err(StoreError);
+                    }
+                }
+                let result = acquire_playback_lease_on(
+                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                )
+                .await?;
+                if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
+                    tx.commit().await.map_err(|_| StoreError)?;
+                } else {
+                    tx.rollback().await.map_err(|_| StoreError)?;
+                }
+                Ok(result)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     /// Race a store operation against the caller's budget, expiring to the
     /// opaque `StoreError`. Every `Store` method runs its connect plus
     /// statements inside this seam with the vault total: Hyperdrive pools
@@ -834,6 +1194,38 @@ impl PgStore {
         timeout_ms: u64,
     ) -> Result<T, StoreError> {
         with_deadline(operation, timeout_ms, StoreError).await
+    }
+
+    async fn delete_preference(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        love_only: bool,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_delete_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&love_only, Type::BOOL),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_delete"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     /// One account row for the Subsonic mount's identity: email drives
@@ -908,58 +1300,142 @@ impl PgStore {
             async {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
-                let client = self.connect().await?;
-                let member = client
+                let membership_cap = cap.checked_mul(2).filter(|n| *n > 0).ok_or(StoreError)?;
+                let membership_limit = membership_cap.checked_add(1).ok_or(StoreError)?;
+                let limit = cap.checked_add(1).ok_or(StoreError)?;
+                let mut client = self.connect().await?;
+                let tx = client.build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true).start().await.map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await.map_err(|_| StoreError)?;
+                let releases_sql = format!(
+                    "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
+                    crate::catalogue::catalogue_member_releases_statement()
+                );
+                // Count at most cap + 1 rows in the database; reject the
+                // sentinel before transferring membership rows.
+                let admitted: bool = tx
                     .query_typed(
-                        crate::catalogue::catalogue_member_releases_statement(),
-                        &[(&user_id, Type::TEXT)],
+                        &subsonic_page_probe(&releases_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-release").await?;
+                let member = tx
+                    .query_typed(
+                        &releases_sql,
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
                     })?;
+                require_complete_snapshot_page(member.len(), membership_cap)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                {
+                    let hook = self.test_mirror.as_ref().and_then(|m| m.membership_hook.borrow_mut().take());
+                    if let Some(hook) = hook { hook().await?; }
+                }
                 let member: Vec<crate::catalogue::MembershipReleaseRow> = member
                     .iter()
                     .map(catalogue_member_release_from_row)
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
-                let pairs = client
+                let pairs_sql = format!(
+                    "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid, \
+                     CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END AS recording_mbid \
+                     FROM ({}) AS membership LIMIT $2",
+                    crate::catalogue::catalogue_member_track_pairs_statement()
+                );
+                let admitted: bool = tx
                     .query_typed(
-                        crate::catalogue::catalogue_member_track_pairs_statement(),
-                        &[(&user_id, Type::TEXT)],
+                        &subsonic_page_probe(&pairs_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-pairs").await?;
+                let pairs = tx
+                    .query_typed(
+                        &pairs_sql,
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
                     })?;
+                require_complete_snapshot_page(pairs.len(), membership_cap)?;
                 let pairs: Vec<crate::catalogue::MembershipTrackPairRow> = pairs
                     .iter()
                     .map(catalogue_member_pair_from_row)
                     .collect::<Result<_, _>>()?;
+                tx.commit().await.map_err(|_| StoreError)?;
                 let member_pairs = crate::catalogue::member_pair_arrays(&pairs);
                 if member_releases.is_empty() && member_pairs.is_empty() {
                     return Ok((Vec::new(), Vec::new(), Vec::new()));
                 }
                 self.require_mirror()?;
-                let mirror = self.connect_mirror().await?;
+                let mut mirror = self.connect_mirror().await?;
+                let tx = mirror.build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true).start().await.map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await.map_err(|_| StoreError)?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.subsonic_member_catalogue");
-                let artist_rows = mirror
+                let artist_preflight = subsonic_text_preflight(
+                    crate::catalogue::artists_list_statement(),
+                    &["mbid", "name", "sort_name", "type", "country"],
+                    "$2",
+                );
+                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("artist").await?;
+                let artist_rows = tx
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
                 require_complete_snapshot_page(artist_rows.len(), cap)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                {
+                    let hook = self.test_mirror.as_ref().and_then(|m| m.mirror_hook.borrow_mut().take());
+                    if let Some(hook) = hook { hook().await?; }
+                }
                 let artist_rows: Vec<crate::catalogue::ArtistDbRow> = artist_rows
                     .iter()
                     .map(catalogue_artist_from_row)
                     .collect::<Result<_, _>>()?;
-                let release_rows = mirror
+                let release_preflight = subsonic_text_preflight(
+                    crate::catalogue::releases_list_statement(),
+                    &["mbid", "title", "release_type", "artist_mbid", "artist_name"],
+                    "$2",
+                );
+                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("release").await?;
+                let release_rows = tx
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
@@ -970,13 +1446,23 @@ impl PgStore {
                     .collect::<Result<_, _>>()?;
                 let (pair_releases, pair_recordings) =
                     crate::catalogue::member_pair_columns(&member_pairs);
-                let track_rows = mirror
+                let track_preflight = subsonic_text_preflight(
+                    crate::catalogue::tracks_list_statement(),
+                    &["release_mbid", "recording_mbid", "title", "release_title", "artist_mbid", "artist_name"],
+                    "$3",
+                );
+                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&limit, Type::INT8)])
+                    .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("track").await?;
+                let track_rows = tx
                     .query_typed(
                         crate::catalogue::tracks_list_statement(),
                         &[
                             (&pair_releases, Type::TEXT_ARRAY),
                             (&pair_recordings, Type::TEXT_ARRAY),
-                            (&cap, Type::INT8),
+                            (&limit, Type::INT8),
                         ],
                     )
                     .await
@@ -986,6 +1472,7 @@ impl PgStore {
                     .iter()
                     .map(catalogue_track_from_row)
                     .collect::<Result<_, _>>()?;
+                tx.commit().await.map_err(|_| StoreError)?;
                 Ok((
                     artist_rows,
                     release_rows,
@@ -997,10 +1484,33 @@ impl PgStore {
         .await
     }
 
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    async fn run_preflight_hook(&self, phase: &'static str) -> Result<(), StoreError> {
+        let hook = self.test_mirror.as_ref().and_then(|mirror| {
+            let mut slot = mirror.preflight_hook.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(selected, _)| *selected == phase)
+            {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            hook().await?;
+        }
+        Ok(())
+    }
+
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
             return Ok(client);
+        }
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        if let Some(connect) = &self.test_connect {
+            return connect().await;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -1254,6 +1764,19 @@ impl PgStore {
         }
         emit_record(crate::logging::Level::Error, event, trace_id, fields)
     }
+}
+
+fn taste_row_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+    Ok(crate::preference_rows::TasteDbRow {
+        kind: row.try_get("kind").map_err(|_| StoreError)?,
+        target_id: row.try_get("target_id").map_err(|_| StoreError)?,
+        signal: row.try_get("signal").map_err(|_| StoreError)?,
+        snooze_until: row.try_get("snooze_until").map_err(|_| StoreError)?,
+        created_at: row.try_get("created_at").map_err(|_| StoreError)?,
+        updated_at: row.try_get("updated_at").map_err(|_| StoreError)?,
+    })
 }
 
 fn user_from_row(row: &tokio_postgres::Row) -> Result<UserRecord, StoreError> {
@@ -2454,6 +2977,425 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn mark_private_play(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+        marked_at: u64,
+    ) -> Result<(), StoreError> {
+        // Adapted from PR #982's preserved patch.
+        if !crate::history_key::matches_owner_track(key, user_id, track_id)
+            || !crate::history_key::valid_mark_time(marked_at)
+        {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                let rows = tx
+                    .query_typed(
+                        crate::preference_rows::private_play_mark_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&key, Type::TEXT),
+                            (&i64_of(marked_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-play-mark").await?;
+                tx.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_play_marked(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        key: &str,
+    ) -> Result<bool, StoreError> {
+        if !crate::history_key::matches_owner_track(key, user_id, track_id) {
+            return Err(StoreError);
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_play_probe_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn history_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::history_list_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.history_list"))?;
+                rows.iter()
+                    .map(|row| {
+                        let key: String = row.try_get("idempotency_key").map_err(|_| StoreError)?;
+                        let play_id =
+                            crate::history_key::play_id_from_key(&key).ok_or(StoreError)?;
+                        Ok(crate::preference_rows::HistoryDbRow {
+                            play_id,
+                            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+                            played_at: row.try_get("recorded_at").map_err(|_| StoreError)?,
+                            stream_seconds: row
+                                .try_get("stream_seconds")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::private_session_active_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get(0).map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn upsert_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-upsert").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn delete_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|_| StoreError)?;
+                transaction
+                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
+                    .query_typed(
+                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?
+                    .len()
+                    != 1
+                {
+                    return Err(StoreError);
+                }
+                transaction
+                    .query_typed(
+                        crate::preference_rows::private_session_delete_statement(),
+                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("private-session-delete").await?;
+                transaction.commit().await.map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_list(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_list_statement(),
+                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn likes_list(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::likes_list_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.likes_list"))?;
+                rows.iter().map(taste_row_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn like_delete(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_preference(user_id, kind, target, true).await
+    }
+
+    async fn taste_delete(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_preference(user_id, kind, target, false).await
+    }
+
+    async fn taste_upsert(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        signal: crate::taste_signal::TasteSignal,
+        snooze_until: Option<u64>,
+        now: u64,
+    ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let snooze_until = snooze_until.map(i64_of).transpose()?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_upsert_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&signal.as_str(), Type::TEXT),
+                            (&snooze_until, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_upsert"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                taste_row_from_row(&rows[0])
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn taste_get(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::preference_rows::taste_get_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.taste_get"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(taste_row_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn catalogue_member_target(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let target = match kind {
+                    crate::target_identity::TargetKind::Track => target.to_owned(),
+                    crate::target_identity::TargetKind::Release => {
+                        if !crate::catalogue::is_catalogue_mbid(target) {
+                            return Ok(false);
+                        }
+                        crate::target_identity::canonical_target_id(target)
+                    }
+                };
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::catalogue::member_target_statement(kind),
+                        &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                Ok(!rows.is_empty())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn resolve_member_track(
+        &self,
+        user_id: &str,
+        target: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::catalogue::resolve_member_track_statement(),
+                        &[(&user_id, Type::TEXT), (&target, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.member_target"))?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
@@ -3133,46 +4075,8 @@ impl Store for PgStore {
         expires_at: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-        Self::bounded(
-            async {
-                let client = self.connect().await?;
-                let rows = client
-                    .query_typed(
-                        crate::playback::playback_lease_acquire_statement(),
-                        &[
-                            (&user_id, Type::TEXT),
-                            (&session_id, Type::TEXT),
-                            (&track_id, Type::TEXT),
-                            (&play_id, Type::TEXT),
-                            (&i64_of(expires_at)?, Type::INT8),
-                            (&i64_of(now)?, Type::INT8),
-                            (&takeover, Type::BOOL),
-                        ],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                match rows.first() {
-                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
-                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
-                    }),
-                    // Zero rows: another session holds a live lease.
-                    // Read it (same connection, same budget) so the
-                    // 429 carries its real remaining TTL. A vanished
-                    // row (deleted mid-race) reads as retry-now.
-                    None => {
-                        let retry_after_secs =
-                            match query_playback_lease_row(&client, user_id).await? {
-                                Some(row) => row.retry_after_secs(now),
-                                None => 0,
-                            };
-                        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
-                    }
-                }
-            },
-            TOTAL_TIMEOUT_MS,
+        self.acquire_private_aware_lease(
+            user_id, session_id, track_id, play_id, now, expires_at, takeover,
         )
         .await
     }
@@ -3290,7 +4194,7 @@ impl Store for PgStore {
                             &window.user_id,
                             &window.track_id,
                             &window.period_month,
-                            &i64_of(window.stream_seconds)?,
+                            &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
                             &i64_of(window.bytes_served)?,
                             &i64_of(window.recorded_at)?,
                             &file_bytes,
@@ -4427,6 +5331,7 @@ impl Store for PgStore {
         .await
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     async fn store_reconcile_outcome(
         &self,
         user_id: &str,
@@ -4496,6 +5401,22 @@ impl Store for PgStore {
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let user_id = user_id.to_owned();
+        let outcome = outcome.clone();
+        self.store_reconcile_owned(
+            user_id,
+            outcome,
+            crate::billing_transaction_sql::ReconcileProbe::None,
         )
         .await
     }
@@ -4677,16 +5598,14 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // One EXISTS probe over the same established states
-                // the reaper protects (`unverified_user_filter`):
-                // credential, any session row (a completed sign-in
-                // leaves one, revoked or not), vault, or a promoted
-                // (non-member) role. A missing user row is simply
-                // never-admitted.
+                // Established states protected by `unverified_user_filter`:
+                // a credential, any session (even revoked), the legacy
+                // vault marker, or a promoted (non-member) role. A missing
+                // user is never admitted.
                 let sql = format!(
                     "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
                      OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
-                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND legacy_vault_established) \
                      OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
                     member = crate::admin::ROLE_MEMBER
                 );
@@ -6026,12 +6945,39 @@ fn emit_record(
 /// unstreamable; the snapshot reads the whole member collection under this
 /// far larger but still bounded cap (rows are in-memory only).
 #[allow(dead_code)] // Used by the mount in the next slice.
-const SUBSONIC_SNAPSHOT_CAP: i64 = 100_000;
+const SUBSONIC_SNAPSHOT_CAP: i64 = 1_024;
 
-// A full page may have been truncated. Refuse it rather than serve a
-// potentially incomplete catalogue; the check precedes membership filtering.
+// Only static, developer-owned column names and statements may be passed.
+// Numeric aggregation avoids overflow even for pathological stored values.
+// `cap_param` is the statement's LIMIT placeholder, bound to cap + 1.
+// A full sentinel page is refused inside the database before row transfer.
+fn subsonic_text_preflight(statement: &str, columns: &[&str], cap_param: &str) -> String {
+    let lengths: Vec<String> = columns
+        .iter()
+        .map(|column| format!("COALESCE(octet_length({column}), 0)::bigint"))
+        .collect();
+    let per_field = lengths
+        .iter()
+        .map(|length| format!("{length} <= 1024"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let row_bytes = lengths.join(" + ");
+    format!(
+        "SELECT count(*) < {cap_param}::bigint AND \
+         COALESCE(bool_and({per_field}), true) AND \
+         COALESCE(sum(({row_bytes})::numeric), 0) <= 262144 \
+         FROM ({statement}) AS snapshot_rows"
+    )
+}
+
+// The membership LIMIT is cap + 1; a full sentinel page is over cap.
+fn subsonic_page_probe(statement: &str) -> String {
+    format!("SELECT count(*) < $2::bigint FROM (SELECT 1 FROM ({statement}) AS probe_rows LIMIT $2) AS page")
+}
+
+// A sentinel row means the page exceeds the admitted cap.
 fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError> {
-    if cap <= 0 || len >= cap as usize {
+    if cap <= 0 || len > cap as usize {
         Err(StoreError)
     } else {
         Ok(())
@@ -6144,8 +7090,14 @@ pub async fn subsonic_mount(
         env: Some(env.clone()),
         trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
         mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        work_deadline_observer: None,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        cancel_token_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        test_connect: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_mirror: None,
     };
@@ -6334,8 +7286,14 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             env: Some(env.clone()),
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            work_deadline_observer: None,
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            cancel_token_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_connect: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_mirror: None,
         },
@@ -6402,16 +7360,20 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
 }
 
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[path = "billing_store_postgres_test.rs"]
+mod billing_store_postgres_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn full_snapshot_page_fails_closed() {
+    fn over_cap_snapshot_page_fails_closed() {
         let cap = SUBSONIC_SNAPSHOT_CAP as usize;
         assert!(require_complete_snapshot_page(0, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
-        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
+        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
     }
 

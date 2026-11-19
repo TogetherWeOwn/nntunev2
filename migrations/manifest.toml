@@ -210,3 +210,53 @@ old_path = "migrations/0037_account_taste_and_privacy.sql"
 new_path = "migrations/0041_account_taste_and_privacy.sql"
 old_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
 new_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
+
+[[migration]]
+file = "0042_storage_namespaces.sql"
+target = "app"
+sha256 = "40e243b952f7fc289f0167cb118a3fcc5ec3b17c1b74b62424a2abd3477a88ab"
+
+[[migration]]
+file = "0043_storage_object_intents.sql"
+target = "app"
+sha256 = "20aba6004de405fd9b3bd9c5c74e418d3f9ac0626058e5f4b6aac4218fa77787"
+
+[[migration]]
+file = "0044_storage_digest_map_intents.sql"
+target = "app"
+sha256 = "512933c73aca98b0d809f0780428f218d8951f5fe1d319815188df6f54cf4c5d"
+
+[[migration]]
+file = "0045_storage_plaintext_digest_claim_intents.sql"
+target = "app"
+sha256 = "72f290344655562f7fafef39d18c18f679e1b13635f0e622612afca57a76cf47"
+
+[[migration]]
+file = "0046_storage_digest_reservations.sql"
+target = "app"
+sha256 = "2c73d6cdb8e6f3b49ce510ead0dd0e45c01e55bc497d0677bfc444e55c46c53b"
+
+[[migration]]
+file = "0047_storage_digest_candidate_batch.sql"
+target = "app"
+sha256 = "d2be227b0921f715fceab9233314ca1a612a4c5342d8eeab4800aebfc24b9c26"
+
+[[migration]]
+file = "0048_legacy_vault_established.sql"
+target = "app"
+sha256 = "52736113f25cd0aa6a5af161f02f8f2fa546140da61f3dd5cf4560206a4a868d"
+
+[[migration]]
+file = "0049_reconcile_legacy_vault_cohort.sql"
+target = "app"
+sha256 = "3a3ef5862778cdf66e558cd23ca727d93384d3ddf0211c9c8f9bb08b56f4758b"
+
+[[migration]]
+file = "0050_refresh_legacy_vault_cohort.sql"
+target = "app"
+sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
+
+[[migration]]
+file = "0051_storage_object_envelope_intents.sql"
+target = "app"
+sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"

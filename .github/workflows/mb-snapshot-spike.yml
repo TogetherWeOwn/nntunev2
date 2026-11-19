@@ -1,12 +1,8 @@
 # Phase 0 spike: R2 snapshot backend for workers/mb (measurement only).
 #
-# Never runs on push and is not a required check. Two entry points:
-# - `workflow_dispatch`: the full measurement. With `stage: true` and only
-#   on `main`, it also uploads the snapshot to the staging bucket, deploys
-#   the token-gated spike Worker, runs the latency bench and tears both
-#   down (workers/mb/spike/stage.sh). That is the only step that sees the
-#   Cloudflare CI token.
-# - a PR labeled `mb-snapshot-spike`: build + recall only, no secrets.
+# Never runs on push and is not a required check. Manual dispatch and a PR
+# labeled `mb-snapshot-spike` run only the credential-free build and recall.
+# The live latency benchmark was retired.
 #
 # Gates and method: workers/mb/SNAPSHOT.md. Only the CC0 core archive
 # (mbdump.tar.bz2) is downloaded; no NC-licensed archive, no replication
@@ -21,11 +17,6 @@ on:
         required: false
         type: string
         default: "20261104-002222"
-      stage:
-        description: "Upload, deploy the spike Worker and bench (main only)"
-        required: false
-        type: boolean
-        default: false
       golden_count:
         description: "Golden-set size"
         required: false
@@ -47,7 +38,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WRANGLER_VERSION: 4.153.0
   RUST_IMAGE: rust:1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8
   PG_IMAGE: postgres:18-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
 
@@ -57,11 +47,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'mb-snapshot-spike'
     runs-on: ubuntu-latest
     timeout-minutes: 345
-    # Staging-scoped by name only (no rules, no deployment record). The
-    # Cloudflare secrets are still read only by the main-only stage steps.
-    environment:
-      name: staging
-      deployment: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -156,27 +141,6 @@ jobs:
           done
           docker rm -f mbpg
 
-      - name: Stage, deploy spike Worker and bench (gate 2)
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.stage
-        env:
-          MB_DUMP: ${{ steps.dump.outputs.dump }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
-          bash workers/mb/spike/stage.sh up /work/snap
-          bash workers/mb/spike/stage.sh bench "$RUNNER_TEMP/out/mbids" "$RUNNER_TEMP/out/golden.tsv" "$RUNNER_TEMP/out/bench.json"
-
-      - name: Tear down spike Worker and objects
-        if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.stage
-        env:
-          MB_DUMP: ${{ steps.dump.outputs.dump }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bash workers/mb/spike/stage.sh down
-
       - name: Summary
         if: always()
         env:
@@ -185,7 +149,7 @@ jobs:
           out="$RUNNER_TEMP/out"
           {
             echo "## mb-snapshot-spike (${MB_DUMP})"
-            for f in build.json snapshot-size.txt recall-heldout.md recall.md bench.json; do
+            for f in build.json snapshot-size.txt recall-heldout.md recall.md; do
               if [ -f "$out/$f" ]; then echo "### $f"; echo '```'; cat "$out/$f"; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"

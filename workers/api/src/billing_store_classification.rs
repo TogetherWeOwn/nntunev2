@@ -1,0 +1,201 @@
+//! Classification primitives for the future coupled reconciliation transaction.
+//!
+//! These functions do not acquire locks, decode database rows, or perform writes.
+//! Callers must supply a fresh global-key observation made after acquiring the
+//! subscription table exclusion on the same transaction backend. The stale
+//! predicate must be evaluated by PostgreSQL using the production input casts.
+//! Used by the dormant owned Worker store; not a live reconciliation boundary.
+
+use crate::billing_reconcile::ReconcileOutcome;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Identity<'a> {
+    pub user_id: &'a str,
+    pub subscription_id: &'a str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObservedTarget<'a> {
+    pub identity: Identity<'a>,
+    pub predicate_stale: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Target {
+    Absent,
+    Owned { predicate_stale: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    StaleOwned,
+    StaleAbsentEmpty,
+    AppliedOwned,
+    PredicateStaleOwned,
+}
+
+/// A refusal is intentionally opaque to the caller. Database decoding errors
+/// must also become store failures before invoking these classifiers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refused;
+
+/// Only the exact subscription named by the fold can authorize history.
+pub fn validate_history_target(outcome: &ReconcileOutcome) -> Result<(), Refused> {
+    if outcome
+        .history
+        .iter()
+        .any(|item| item.stripe_subscription_id != outcome.row.stripe_subscription_id)
+    {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
+/// Classify a fresh, global-key observation before any subscription or history
+/// write. A foreign, mismatched, or multiple-row result is never absence.
+pub fn classify_target(
+    requested: &Identity<'_>,
+    rows: &[ObservedTarget<'_>],
+) -> Result<Target, Refused> {
+    match rows {
+        [] => Ok(Target::Absent),
+        [row] if row.identity == *requested => Ok(Target::Owned {
+            predicate_stale: row.predicate_stale,
+        }),
+        _ => Err(Refused),
+    }
+}
+
+/// Explicit-stale operations must skip subscription DML entirely.
+pub fn classify_explicit_stale(target: &Target, history_empty: bool) -> Result<Accepted, Refused> {
+    match (target, history_empty) {
+        (Target::Owned { .. }, _) => Ok(Accepted::StaleOwned),
+        (Target::Absent, true) => Ok(Accepted::StaleAbsentEmpty),
+        (Target::Absent, false) => Err(Refused),
+    }
+}
+
+/// Classify checked RETURNING rows for a non-explicit write, before history.
+/// SQL and constraint errors must not be converted into an empty result.
+pub fn classify_write(
+    requested: &Identity<'_>,
+    target: &Target,
+    returned: &[Identity<'_>],
+) -> Result<Accepted, Refused> {
+    match returned {
+        [identity] if identity == requested => Ok(Accepted::AppliedOwned),
+        [] if *target
+            == (Target::Owned {
+                predicate_stale: true,
+            }) =>
+        {
+            Ok(Accepted::PredicateStaleOwned)
+        }
+        _ => Err(Refused),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity<'a>(user_id: &'a str, subscription_id: &'a str) -> Identity<'a> {
+        Identity {
+            user_id,
+            subscription_id,
+        }
+    }
+
+    #[test]
+    fn global_observation_rejects_foreign_mismatched_and_multiple_rows() {
+        let requested = identity("user-a", "sub-a");
+        assert_eq!(classify_target(&requested, &[]), Ok(Target::Absent));
+        for row in [
+            ObservedTarget {
+                identity: identity("user-b", "sub-a"),
+                predicate_stale: true,
+            },
+            ObservedTarget {
+                identity: identity("user-a", "sub-b"),
+                predicate_stale: false,
+            },
+        ] {
+            assert_eq!(classify_target(&requested, &[row]), Err(Refused));
+        }
+        let rows = [
+            ObservedTarget {
+                identity: identity("user-a", "sub-a"),
+                predicate_stale: false,
+            },
+            ObservedTarget {
+                identity: identity("user-a", "sub-a"),
+                predicate_stale: false,
+            },
+        ];
+        assert_eq!(classify_target(&requested, &rows), Err(Refused));
+    }
+
+    #[test]
+    fn explicit_stale_requires_owned_target_or_empty_absence() {
+        let requested = identity("user-a", "sub-a");
+        let own = [ObservedTarget {
+            identity: identity("user-a", "sub-a"),
+            predicate_stale: false,
+        }];
+        let target = classify_target(&requested, &own).unwrap();
+        assert_eq!(
+            classify_explicit_stale(&target, false),
+            Ok(Accepted::StaleOwned)
+        );
+        assert_eq!(
+            classify_explicit_stale(&target, true),
+            Ok(Accepted::StaleOwned)
+        );
+        assert_eq!(
+            classify_explicit_stale(&Target::Absent, true),
+            Ok(Accepted::StaleAbsentEmpty)
+        );
+        assert_eq!(
+            classify_explicit_stale(&Target::Absent, false),
+            Err(Refused)
+        );
+    }
+
+    #[test]
+    fn write_result_requires_exact_identity_or_proved_owned_suppression() {
+        let requested = identity("user-a", "sub-a");
+        let own_stale = Target::Owned {
+            predicate_stale: true,
+        };
+        let own_fresh = Target::Owned {
+            predicate_stale: false,
+        };
+        assert_eq!(
+            classify_write(&requested, &Target::Absent, &[identity("user-a", "sub-a")]),
+            Ok(Accepted::AppliedOwned)
+        );
+        assert_eq!(
+            classify_write(&requested, &own_stale, &[]),
+            Ok(Accepted::PredicateStaleOwned)
+        );
+        assert_eq!(classify_write(&requested, &own_fresh, &[]), Err(Refused));
+        assert_eq!(
+            classify_write(&requested, &Target::Absent, &[]),
+            Err(Refused)
+        );
+        for wrong in [identity("user-b", "sub-a"), identity("user-a", "sub-b")] {
+            assert_eq!(
+                classify_write(&requested, &own_stale, &[wrong]),
+                Err(Refused)
+            );
+        }
+        assert_eq!(
+            classify_write(
+                &requested,
+                &own_stale,
+                &[identity("user-a", "sub-a"), identity("user-a", "sub-a")]
+            ),
+            Err(Refused)
+        );
+    }
+}

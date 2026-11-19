@@ -47,4 +47,5 @@ for f in "${tests[@]}"; do
     -v audio_manifest_store_sql="$(<"$root/workers/ingest/src/audio_manifest_store.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
+# Hosted-only concurrent fixtures are run separately by the migration CI job.
 echo "migration tests passed"

@@ -88,7 +88,7 @@ pub enum Route<'a> {
     Unknown,
 }
 
-pub fn route(path: &str) -> Route<'_> {
+pub fn route(path: &str) -> Route<'static> {
     let rest = path.strip_prefix("/rest/").unwrap_or("\u{0}");
     if rest.contains('\u{0}') {
         return Route::Unknown;

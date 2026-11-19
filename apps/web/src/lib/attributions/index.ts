@@ -18,7 +18,7 @@ function runtimePackage(
 /** Direct web build/test tools: classified, but not claimed as shipped runtime packages. */
 export const WEB_TOOL_PACKAGES = [
 	'@axe-core/playwright', '@playwright/test', '@sveltejs/vite-plugin-svelte',
-	'svelte-check', 'terser', 'typescript', 'vite', 'vitest'
+	'svelte-check', 'terser', 'typescript', 'vite', 'vitest', 'wrangler'
 ] as const;
 
 /** First-party, JSON-serializable inventory; see docs/attributions.md for scope and upkeep. */
@@ -27,7 +27,7 @@ export const attributionInventory: AttributionInventory = {
 	entries: [
 		runtimePackage('svelte', '^5.57.3', '5.57.3',
 			'https://github.com/sveltejs/svelte', 'https://github.com/sveltejs/svelte/blob/main/LICENSE.md'),
-		runtimePackage('@sveltejs/kit', '^3.1.1', '3.1.1',
+		runtimePackage('@sveltejs/kit', '^3.2.0', '3.2.0',
 			'https://github.com/sveltejs/kit', 'https://github.com/sveltejs/kit/blob/main/LICENSE'),
 		runtimePackage('@sveltejs/adapter-cloudflare', '^8.0.2', '8.0.2',
 			'https://github.com/sveltejs/kit/tree/main/packages/adapter-cloudflare',

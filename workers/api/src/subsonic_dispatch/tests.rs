@@ -203,6 +203,82 @@ fn snapshot_maps_flac_size_duration_and_year() {
 }
 
 #[test]
+fn bounded_snapshot_order_matches_mapper_and_preserves_equal_occurrences() {
+    use super::snapshot_order::{order_snapshot, order_work};
+    let artists = vec![
+        artist_row("x", "X", "A"),
+        artist_row("y", "Y", "M"),
+        artist_row("x", "X", "Z"),
+    ];
+    let releases = vec![
+        release_row("b", "Same", Some(2001), "x"),
+        release_row("a", "Same", Some(2002), "y"),
+        release_row("a", "Same", Some(2003), "y"),
+    ];
+    let tracks = vec![
+        track_row("b", "z", "last", None, Some(1), Some(1)),
+        track_row("a", "a", "first", None, Some(1), Some(1)),
+        track_row("a", "a", "second", None, Some(1), Some(1)),
+    ];
+    let expected = build_snapshot(&artists, &releases, &tracks);
+    let mut a: Vec<_> = artists
+        .iter()
+        .flat_map(|row| build_snapshot(std::slice::from_ref(row), &[], &[]).0)
+        .collect();
+    let mut b: Vec<_> = releases
+        .iter()
+        .flat_map(|row| build_snapshot(&artists, std::slice::from_ref(row), &tracks).1)
+        .collect();
+    let mut s: Vec<_> = tracks
+        .iter()
+        .flat_map(|row| build_snapshot(&artists, &releases, std::slice::from_ref(row)).2)
+        .collect();
+    let budget = order_work(a.len(), b.len(), s.len(), artists.len()).unwrap();
+    let before = format!("{a:?}{b:?}{s:?}");
+    for limited in [
+        super::snapshot_order::OrderWork {
+            comparisons: budget.comparisons - 1,
+            ..budget
+        },
+        super::snapshot_order::OrderWork {
+            artist_row_probes: budget.artist_row_probes - 1,
+            ..budget
+        },
+    ] {
+        assert!(order_snapshot(&mut a, &mut b, &mut s, &artists, limited).is_err());
+        assert_eq!(format!("{a:?}{b:?}{s:?}"), before);
+    }
+    assert!(order_snapshot(&mut a, &mut b, &mut s, &artists, budget).is_ok());
+    assert_eq!(
+        format!("{a:?}{b:?}{s:?}"),
+        format!("{:?}{:?}{:?}", expected.0, expected.1, expected.2)
+    );
+    assert_eq!(
+        a.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+        ["y", "x", "x"]
+    );
+    assert_eq!(
+        b.iter().take(2).map(|x| x.year).collect::<Vec<_>>(),
+        [Some(2002), Some(2003)]
+    );
+    assert_eq!(
+        s.iter()
+            .take(2)
+            .map(|x| x.title.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn bounded_order_work_rejects_overflow() {
+    use super::snapshot_order::order_work;
+    assert!(order_work(usize::MAX, 0, 0, 0).is_none());
+    assert!(order_work(2, 0, 0, usize::MAX).is_none());
+    assert_eq!(order_work(0, 0, 0, usize::MAX).unwrap().comparisons, 0);
+}
+
+#[test]
 fn snapshot_ordering_is_deterministic() {
     let (artists, releases, tracks) = fixture_rows();
     let (a1, b1, s1) = build_snapshot(&artists, &releases, &tracks);

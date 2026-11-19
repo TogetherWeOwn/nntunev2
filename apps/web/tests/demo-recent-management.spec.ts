@@ -1,28 +1,30 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * Acceptance-owned: continue with production changes, not edits to this file.
- * Contract-first browser half for per-entry history management. Existing hooks
- * are reused; NEW actions are located by accessible name INSIDE the existing
- * recent row, not by a new controller/path/test-id convention. Names must
- * communicate Add to queue versus Forget, and the row supplies track context.
- * Feedback wording is flexible: one nonempty polite region in the history
- * section, action-only (not mount/play/seek), added versus already queued.
+ * Acceptance-owned: only acceptance-owner-authorized amendments may change this bank.
+ * Contract-first browser coverage for the surviving recent-history actions:
+ * Replay and Clear, plus real play recording. The history-row Forget and Add
+ * controls are retired; their absence is checked in the companion browser suite
+ * and exact-ID forgetting remains covered by the shared store tests, not here.
+ * Clear removes all entries; it is not claimed to delete one stable ID.
  *
  * Unknown history IDs may be filtered (existing policy) or shown unavailable;
  * either way explain unavailable history without ever substituting a track.
- * Focus may move to any surviving enabled history button, not the document
- * body or removed node. No exact DOM layout, focus-target or message pin.
+ * Keyboard (Enter and Space) Clear keeps focus on the surviving enabled Clear
+ * button, not the document body or a removed node. No exact DOM layout, focus
+ * message or copy pin. Mount, play and seek emit no management announcement,
+ * and reload never replays stale feedback.
  *
  * Media loading stays pending locally. Only the native transport boundary is
  * mocked; queue/history/session persistence and the Svelte page remain real.
- * All backend/telemetry/external requests are rejected and asserted absent.
+ * All backend/telemetry/external requests are rejected and asserted absent,
+ * including for the second tab and the mobile contexts.
  * Synthetic media events are not evidence of real streams, audio output, OS
  * media controls, or OS IME. This suite adds no operational API or CLI.
  *
- * Breaks caught: Replay accidentally reused for Add; duplicate add; mutation
- * of order/current/time/source/history; by-index forget; stale-ID substitution;
- * storage rollback; resume deletion; focus loss; duplicate live messages;
+ * Breaks caught: mutation of queue/current/time/source/resume during Clear;
+ * storage rollback or stale-byte resurrection under write/read denial;
+ * focus loss; spurious live messages; recording or Replay regressions;
  * inaccessible/overlapping narrow-screen actions; cross-tab propagation.
  */
 const HISTORY = 'nntune:demo-recently-played:v1';
@@ -48,12 +50,6 @@ type Probe = {
 function row(page: Page, id: string): Locator {
 	return page.getByTestId('recent-item').filter({ has: page.locator(`[data-testid="recent-played-at-${id}"]`) });
 }
-function add(page: Page, id: string): Locator {
-	return row(page, id).getByRole('button', { name: /add.*queue/i });
-}
-function forget(page: Page, id: string): Locator {
-	return row(page, id).getByRole('button', { name: /forget/i });
-}
 function section(page: Page): Locator { return page.getByTestId('recently-played'); }
 
 async function entries(page: Page): Promise<Entry[]> {
@@ -70,17 +66,7 @@ async function liveMessages(page: Page): Promise<string[]> {
 		regions.map((node) => node.textContent?.trim() ?? '').filter(Boolean)
 	);
 }
-async function feedback(page: Page, meaning: RegExp): Promise<void> {
-	await expect.poll(() => liveMessages(page)).toHaveLength(1);
-	const messages = await liveMessages(page);
-	expect(messages[0]).toMatch(meaning);
-	await expect(section(page).locator('[role="alert"], [aria-live="assertive"]')).toHaveCount(0);
-}
 
-async function addedFeedback(page: Page): Promise<void> {
-	await feedback(page, /(?:added|queued)/i);
-	expect((await liveMessages(page))[0]).not.toMatch(/already|unavailable|failed/i);
-}
 
 async function open(page: Page, options: {
 	history?: Entry[];
@@ -207,81 +193,36 @@ async function transport(page: Page) {
 	}, RESUME);
 }
 
-for (const intent of ['selected', 'playing', 'paused'] as const) {
-	test(`RM-B-01-${intent} enqueue missing track once without transport/history mutation`, async ({ page }) => {
-		await open(page, { intent });
-		const before = await transport(page);
-		const history = await entries(page);
-		await expect(add(page, 'second-signal'), 'separate accessible Add to queue action').toBeVisible();
-		await add(page, 'second-signal').click();
-		await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		expect(await transport(page)).toEqual(before);
-		expect(await entries(page)).toEqual(history);
-		await addedFeedback(page);
-		// A second activation must be possible and report an honest no-op.
-		await add(page, 'second-signal').click();
-		await feedback(page, /already/i);
-		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		expect(await transport(page)).toEqual(before);
-		expect(await entries(page)).toEqual(history);
-	});
+
+const clear = (page: Page): Locator => page.getByTestId('recently-played-clear');
+async function expectUsableClearFocus(page: Page): Promise<void> {
+	await expect(clear(page), 'surviving enabled Clear keeps focus').toBeFocused();
+	await expect(clear(page)).toBeEnabled();
 }
-
-test('RM-B-02 already queued current ID is an explained no-op, never Replay', async ({ page }) => {
-	await open(page, { intent: 'playing' });
-	const before = await transport(page);
-	const history = await entries(page);
-	await expect(add(page, 'demo-track')).toBeVisible();
-	await add(page, 'demo-track').click();
-	await feedback(page, /already/i);
-	expect(await transport(page)).toEqual(before);
-	expect(await entries(page)).toEqual(history);
-	expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
-});
-
-for (const target of ['second-signal', 'demo-track', 'third-light']) {
-	test(`RM-B-03-${target} forget only chosen history ID, not queue/current/resume`, async ({ page }) => {
-		await open(page, { intent: target === 'demo-track' ? 'playing' : 'selected' });
-		const before = await transport(page);
-		const history = await entries(page);
-		await expect(forget(page, target), 'separate accessible Forget action').toBeVisible();
-		await forget(page, target).focus();
-		await page.keyboard.press('Enter');
-		const expected = history.filter((entry) => entry.trackId !== target);
-		await expect.poll(() => ids(page, 'recent-item')).toEqual(expected.map((entry) => entry.trackId));
-		expect(await entries(page)).toEqual(expected);
-		expect(await transport(page)).toEqual(before);
-		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
-		await feedback(page, /forgot|forgotten|removed/i);
-		expect(await section(page).evaluate((el) => {
-			const focused = document.activeElement;
-			return focused instanceof HTMLButtonElement && !focused.disabled && el.contains(focused);
-		}), 'focus stays on an enabled surviving history action').toBe(true);
-		await page.reload();
-		await expect.poll(() => ids(page, 'recent-item')).toEqual(expected.map((entry) => entry.trackId));
-		expect(await entries(page)).toEqual(expected);
-	});
-}
-
-test('RM-B-04 forget last row gives usable empty state and preserves Clear', async ({ page }) => {
-	await open(page, { history: [ENTRIES[2]!] });
-	const before = await transport(page);
-	await expect(forget(page, 'demo-track')).toBeVisible();
-	await forget(page, 'demo-track').focus();
-	await page.keyboard.press('Space');
+async function expectEmptyHistory(page: Page): Promise<void> {
 	await expect(page.getByTestId('recent-item')).toHaveCount(0);
 	await expect(page.getByTestId('recently-played-empty')).toBeVisible();
 	await expect(page.getByTestId('recently-played-empty')).toContainText(/\S/);
+}
+
+test('RM-B-04 Clear on a one-row history by Space gives usable empty state and focus', async ({ page }) => {
+	await open(page, { history: [ENTRIES[2]!] });
+	const before = await transport(page);
+	await expect(clear(page)).toBeEnabled();
+	await clear(page).focus();
+	await page.keyboard.press('Space');
+	await expectEmptyHistory(page);
 	expect(await entries(page)).toEqual([]);
 	expect(await transport(page)).toEqual(before);
-	await expect(page.getByTestId('recently-played-clear')).toBeFocused();
+	expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
+	await expectUsableClearFocus(page);
 });
 
-test('RM-B-05 actual play re-adds a forgotten entry; Replay still explicitly plays', async ({ page }) => {
-	await open(page);
-	await expect(forget(page, 'demo-track')).toBeVisible();
-	await forget(page, 'demo-track').click();
+test('RM-B-05 actual play records a history entry; Replay still explicitly plays', async ({ page }) => {
+	await open(page, { history: [ENTRIES[0]!, ENTRIES[1]!] });
 	await expect(row(page, 'demo-track')).toHaveCount(0);
+	await expect(row(page, 'third-light')).toHaveCount(1);
+	await expect(row(page, 'second-signal')).toHaveCount(1);
 	await page.clock.setFixedTime(new Date('2026-01-01T12:01:00Z'));
 	await page.getByTestId('queue-select-demo-track').click();
 	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
@@ -293,42 +234,55 @@ test('RM-B-05 actual play re-adds a forgotten entry; Replay still explicitly pla
 	await page.getByTestId('recent-replay-second-signal').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
 	expect((await transport(page)).plays).toBeGreaterThan(before.plays);
-	expect((await entries(page))[0]?.trackId).toBe('second-signal');
+	const after = await entries(page);
+	expect(after[0]?.trackId).toBe('second-signal');
+	expect(after.filter((entry) => entry.trackId === 'second-signal')).toHaveLength(1);
 });
 
-test('RM-B-06 Clear after one forget persists empty without clearing queue or resume', async ({ page }) => {
+test('RM-B-06 Clear persists empty without clearing queue or resume', async ({ page }) => {
 	await open(page);
 	const before = await transport(page);
-	await expect(forget(page, 'second-signal')).toBeVisible();
-	await forget(page, 'second-signal').click();
-	await page.getByTestId('recently-played-clear').click();
-	await expect(page.getByTestId('recently-played-empty')).toBeVisible();
+	const queue = await ids(page, 'queue-item');
+	await expect(clear(page)).toBeVisible();
+	await clear(page).click();
+	await expectEmptyHistory(page);
 	expect(await entries(page)).toEqual([]);
+	expect(await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY)).toBe('[]');
 	expect(await transport(page)).toEqual(before);
+	expect(await ids(page, 'queue-item')).toEqual(queue);
 	await page.reload();
 	await expect(page.getByTestId('recent-item')).toHaveCount(0);
+	expect(await entries(page)).toEqual([]);
+	expect(await ids(page, 'queue-item')).toEqual(queue);
 });
 
 for (const blocked of ['writes', 'all'] as const) {
-	test(`RM-B-07-${blocked} blocked session storage cannot undo current-visit forget or enqueue`, async ({ page }) => {
+	test(`RM-B-07-${blocked} blocked session storage cannot undo current-visit Clear`, async ({ page }) => {
 		await open(page, { intent: 'playing' });
 		const before = await transport(page);
+		const queue = await ids(page, 'queue-item');
 		const history = await entries(page);
+		expect(history.length).toBeGreaterThan(0);
+		const persisted = await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY);
 		await page.evaluate((mode) => {
 			(window as unknown as { __recentManagement: Probe }).__recentManagement.blocked = mode;
 		}, blocked);
-		await expect(forget(page, 'third-light')).toBeVisible();
-		await forget(page, 'third-light').click();
-		await expect.poll(() => ids(page, 'recent-item')).toEqual(history.filter((entry) => entry.trackId !== 'third-light').map((entry) => entry.trackId));
-		await add(page, 'second-signal').click();
-		await addedFeedback(page);
-		expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-		await add(page, 'second-signal').click();
-		await feedback(page, /already/i);
+		await expect(clear(page)).toBeVisible();
+		await clear(page).focus();
+		await page.keyboard.press('Enter');
+		await expectEmptyHistory(page);
 		expect(await transport(page)).toEqual(before);
-		expect(await ids(page, 'recent-item')).toEqual(history.filter((entry) => entry.trackId !== 'third-light').map((entry) => entry.trackId));
+		expect(await ids(page, 'queue-item')).toEqual(queue);
 		// Quota/read denial is real: persisted bytes remain unchanged.
 		expect(await entries(page)).toEqual(history);
+		expect(await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY)).toBe(persisted);
+		// Another Clear invocation refreshes state; stale bytes must not resurrect rows.
+		await clear(page).click();
+		await expectEmptyHistory(page);
+		expect(await transport(page)).toEqual(before);
+		expect(await ids(page, 'queue-item')).toEqual(queue);
+		expect(await entries(page)).toEqual(history);
+		expect(await page.evaluate((key) => (window as unknown as { __recentManagement: Probe }).__recentManagement.read(key), HISTORY)).toBe(persisted);
 	});
 }
 
@@ -339,72 +293,82 @@ test('RM-B-08 unrecognized stable ID is explained and never resolves to another 
 	const before = await transport(page);
 	const history = await entries(page);
 	await expect(section(page)).toContainText(/unavailable|unrecognized|unknown|no longer available|not available/i);
-	const unavailable = row(page, 'second-signal-missing');
-	if (await unavailable.count()) {
-		const action = unavailable.getByRole('button', { name: /add.*queue/i });
-		if (await action.count() && await action.isEnabled()) {
-			await action.click();
-			await feedback(page, /unavailable|unknown|not found|not available/i);
-		}
-	}
 	expect(await transport(page)).toEqual(before);
 	expect(await entries(page)).toEqual(history);
 	expect(await ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
 });
 
-test('RM-B-09 no action feedback on load/play/time; enqueue remains session-only on reload', async ({ page }) => {
+test('RM-B-09 no feedback on load/play/time; keyboard Clear remains session-only on reload', async ({ page }) => {
 	await open(page, { intent: 'playing' });
 	expect(await liveMessages(page)).toEqual([]);
-	await expect(add(page, 'second-signal')).toBeVisible();
-	await add(page, 'second-signal').focus();
+	const before = await transport(page);
+	const queue = await ids(page, 'queue-item');
+	await expect(clear(page)).toBeVisible();
+	await clear(page).focus();
 	await page.keyboard.press('Enter');
-	await addedFeedback(page);
+	await expectEmptyHistory(page);
+	expect(await entries(page)).toEqual([]);
+	expect(await transport(page)).toEqual(before);
+	expect(await ids(page, 'queue-item')).toEqual(queue);
+	await expectUsableClearFocus(page);
 	const messages = await liveMessages(page);
 	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
 		el.currentTime = 33;
 		el.dispatchEvent(new Event('timeupdate'));
 	});
 	expect(await liveMessages(page)).toEqual(messages);
-	const history = await entries(page);
+	expect(await entries(page)).toEqual([]);
+	await expect(page.getByTestId('recent-item')).toHaveCount(0);
 	await page.reload();
-	await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track', 'second-signal']);
-	expect(await entries(page)).toEqual(history);
+	await expect.poll(() => ids(page, 'queue-item')).toEqual(['third-light', 'demo-track']);
+	await expect(page.getByTestId('recent-item')).toHaveCount(0);
+	expect(await entries(page)).toEqual([]);
 	expect(await liveMessages(page)).toEqual([]);
-	// Session state must not subscribe to another tab's storage events.
-	await page.evaluate(({ key }) => window.dispatchEvent(new StorageEvent('storage', {
-		key, newValue: '[]', storageArea: localStorage
-	})), { key: HISTORY });
-	expect(await entries(page)).toEqual(history);
+	// Session state must not subscribe to another tab's storage events. The payload
+	// is a valid, nonempty history that conflicts with the empty cleared state.
+	await page.evaluate(({ key, value }) => window.dispatchEvent(new StorageEvent('storage', {
+		key, newValue: value, storageArea: localStorage
+	})), { key: HISTORY, value: JSON.stringify([{ trackId: 'third-light', playedAt: 999 }]) });
+	expect(await entries(page)).toEqual([]);
+	await expect(page.getByTestId('recent-item')).toHaveCount(0);
+	expect(await ids(page, 'recent-item')).toEqual([]);
 });
 
-test('RM-B-11 forget stays in this tab, never writes account/local history or syncs another tab', async ({ page }) => {
+test('RM-B-11 Clear stays in this tab, never writes account/local history or syncs another tab', async ({ page }) => {
 	await open(page);
+	const before = await transport(page);
+	const queue = await ids(page, 'queue-item');
 	const other = await page.context().newPage();
 	try {
-		await open(other, { history: [ENTRIES[0]!], order: ['third-light'], currentId: 'third-light' });
-		await expect(forget(page, 'third-light')).toBeVisible();
-		await forget(page, 'third-light').click();
-		await expect(row(page, 'third-light')).toHaveCount(0);
+		await open(other, { history: [ENTRIES[0]!, ENTRIES[1]!], order: ['third-light'], currentId: 'third-light' });
+		await expect(clear(page)).toBeVisible();
+		await clear(page).click();
+		await expectEmptyHistory(page);
+		expect(await entries(page)).toEqual([]);
+		expect(await transport(page)).toEqual(before);
+		expect(await ids(page, 'queue-item')).toEqual(queue);
 		// Let a mistakenly broadcast storage/channel event reach the second tab.
 		await other.waitForTimeout(100);
-		expect(await entries(other)).toEqual([ENTRIES[0]]);
-		expect(await ids(other, 'recent-item')).toEqual(['third-light']);
+		expect(await entries(other)).toEqual([ENTRIES[0], ENTRIES[1]]);
+		expect(await ids(other, 'recent-item')).toEqual(['third-light', 'second-signal']);
 		expect(await page.evaluate((key) => localStorage.getItem(key), HISTORY)).toBeNull();
 		expect(backendCalls.get(other)).toEqual([]);
 	} finally { await other.close(); }
 });
 
 for (const colorScheme of ['light', 'dark'] as const) {
-	test(`RM-B-10-${colorScheme} narrow touch actions are distinct, reachable and do not transport`, async ({ browser, baseURL }, testInfo) => {
+	test(`RM-B-10-${colorScheme} narrow touch actions are reachable and Clear does not transport`, async ({ browser, baseURL }, testInfo) => {
 		const context = await browser.newContext({ baseURL, viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true, colorScheme });
 		const page = await context.newPage();
 		try {
 			await open(page);
 			const before = await transport(page);
-			await expect(add(page, 'second-signal')).toBeVisible();
-			await expect(forget(page, 'second-signal')).toBeVisible();
-			await expect(page.getByTestId('recent-replay-second-signal')).toBeVisible();
-			for (const control of [add(page, 'second-signal'), forget(page, 'second-signal')]) {
+			const queue = await ids(page, 'queue-item');
+			const replay = page.getByTestId('recent-replay-second-signal');
+			await expect(replay).toBeVisible();
+			await expect(clear(page)).toBeVisible();
+			for (const control of [replay, clear(page)]) {
+				await expect(control).toBeEnabled();
 				await control.scrollIntoViewIfNeeded();
 				const box = await control.boundingBox();
 				expect(box).not.toBeNull();
@@ -413,13 +377,15 @@ for (const colorScheme of ['light', 'dark'] as const) {
 				expect(box!.width).toBeGreaterThanOrEqual(24);
 				expect(box!.height).toBeGreaterThanOrEqual(24);
 			}
-			await add(page, 'second-signal').tap();
-			await addedFeedback(page);
-			await forget(page, 'second-signal').tap();
-			await expect(row(page, 'second-signal')).toHaveCount(0);
-			expect(await transport(page)).toEqual(before);
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+			// Populated-history evidence, with Replay and Clear both present.
 			await testInfo.attach(`recent-management-${colorScheme}`, { body: await section(page).screenshot(), contentType: 'image/png' });
+			await clear(page).tap();
+			await expectEmptyHistory(page);
+			expect(await entries(page)).toEqual([]);
+			expect(await transport(page)).toEqual(before);
+			expect(await ids(page, 'queue-item')).toEqual(queue);
+			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 			expect(backendCalls.get(page)).toEqual([]);
 		} finally { await context.close(); }
 	});

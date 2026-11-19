@@ -265,6 +265,13 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
+    let store = store.replacen(
+        function_body(prototype, "asyncfnstore_reconcile_outcome("),
+        "{}",
+        1,
+    );
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -281,9 +288,54 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    for piece in &pieces {
-        assert_bounded(piece, method_name(piece));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&n| n == "store_reconcile_outcome")
+            .count(),
+        2
+    );
+    for gate in [prototype_gate, release_gate] {
+        assert_eq!(
+            store
+                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
+                .count(),
+            1
+        );
     }
+    for (index, piece) in pieces.iter().enumerate() {
+        let name = method_name(piece);
+        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
+            continue;
+        }
+        if matches!(name, "like_delete" | "taste_delete") {
+            let love_only = name == "like_delete";
+            let body = function_body(piece, name);
+            assert_eq!(
+                body,
+                format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
+                "{name} must delegate its entire operation to the bounded helper"
+            );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
+            );
+        } else {
+            assert_bounded(piece, name);
+        }
+    }
+    assert_bounded(
+        function_body(&source, "asyncfndelete_preference("),
+        "delete_preference",
+    );
 }
 
 #[test]
@@ -376,7 +428,12 @@ fn mint_path_statements_run_unnamed_through_query_typed() {
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
-    for name in ["user_by_email", "insert_user", "insert_session"] {
+    for name in [
+        "user_by_email",
+        "insert_user",
+        "insert_session",
+        "private_session_active",
+    ] {
         let piece = pieces
             .iter()
             .find(|piece| method_name(piece) == name)

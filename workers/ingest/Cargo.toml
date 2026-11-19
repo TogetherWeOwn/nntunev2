@@ -10,7 +10,7 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "queue", "tokio-postgres"] }
+worker = { version = "0.9", features = ["http", "queue", "tokio-postgres"] }
 http = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +39,7 @@ nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-fe
 nntune-test-nntp = { version = "0.1.0", path = "../../crates/nntune-test-nntp" }
 nntune-test-fixtures = { version = "0.1.0", path = "../../crates/nntune-test-fixtures" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = { version = "0.7", features = ["runtime"] }
 
 # Standalone even when this checkout is nested under a managed worktree.
 [workspace]

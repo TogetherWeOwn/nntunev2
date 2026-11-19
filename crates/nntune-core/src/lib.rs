@@ -46,10 +46,17 @@ pub use velmora::{
     transports, yenc, Error, Result,
 };
 
+pub mod digest_chunk;
 pub mod digest_context;
+pub mod digest_cursor;
 pub mod digest_enrollment;
 pub mod digest_geometry;
 pub mod digest_page;
+pub mod digest_range;
+pub mod digest_readback;
+#[cfg(test)]
+mod digest_test_fixture;
+pub mod digest_verifier;
 pub mod media_envelope;
 pub mod media_layout;
 pub mod origin_sealer;

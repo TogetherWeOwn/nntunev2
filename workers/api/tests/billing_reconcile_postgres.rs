@@ -2,18 +2,21 @@
 #![cfg(feature = "postgres-tests")]
 
 use nntune_api::billing_reconcile::{
-    insert_paid_invoice_history_statement, reconcile_live_select_statement,
-    reconcile_lock_statement, reconcile_subscription, reconcile_target_select_statement,
-    store_reconciled_subscription_statement, LiveRow, PriceBinding, ReconcileInput,
-    ReconcileOutcome, RemoteSubscription,
+    reconcile_live_select_statement, reconcile_subscription, reconcile_target_select_statement,
+    LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
 };
 use nntune_api::stripe::{
     Invoice, InvoiceLine, InvoiceLinePeriod, InvoiceLines, InvoiceStatusTransitions, Subscription,
     SubscriptionItem, SubscriptionItems,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls};
+
+#[path = "support/billing_contention.rs"]
+mod billing_contention;
+#[path = "support/billing_transaction_fixture.rs"]
+mod billing_transaction_fixture;
 
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const T: i64 = 1_786_032_000;
@@ -207,85 +210,10 @@ impl Fx {
         &mut self,
         user: &str,
         outcome: &ReconcileOutcome,
-    ) -> Result<(), tokio_postgres::Error> {
-        let tx = self.db.transaction().await?;
-        tx.query_typed(reconcile_lock_statement(), &[(&user, Type::TEXT)])
-            .await?;
-        let stmt = tx
-            .prepare_typed(
-                store_reconciled_subscription_statement(),
-                &[
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::BOOL,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::BOOL,
-                ],
-            )
-            .await?;
-        let r = &outcome.row;
-        let params: [&(dyn ToSql + Sync); 15] = [
-            &user,
-            &r.stripe_subscription_id,
-            &r.stripe_customer_id,
-            &r.stripe_item_id,
-            &r.stripe_price_id,
-            &r.plan_id,
-            &r.status,
-            &r.current_period_end_unix,
-            &r.cancel_at_period_end,
-            &r.paid_through_unix,
-            &r.paid_invoice_id,
-            &r.grace_until_unix,
-            &outcome.read_anchor,
-            &outcome.read_plan,
-            &outcome.explicit_stale,
-        ];
-        tx.query(&stmt, &params).await?;
-        let history = tx
-            .prepare_typed(
-                insert_paid_invoice_history_statement(),
-                &[
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::TEXT,
-                    Type::INT8,
-                    Type::INT8,
-                    Type::INT8,
-                    Type::TEXT,
-                    Type::INT8,
-                ],
-            )
-            .await?;
-        for h in &outcome.history {
-            tx.execute(
-                &history,
-                &[
-                    &user,
-                    &h.stripe_invoice_id,
-                    &h.stripe_subscription_id,
-                    &h.plan_id,
-                    &h.period_start_unix,
-                    &h.period_end_unix,
-                    &h.amount_cents,
-                    &h.currency,
-                    &h.paid_at_unix,
-                ],
-            )
-            .await?;
-        }
-        tx.commit().await
+    ) -> Result<(), billing_transaction_fixture::FixtureError> {
+        billing_transaction_fixture::run(&mut self.db, &self.schema, user, outcome)
+            .await
+            .map(|_| ())
     }
 
     async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
@@ -685,7 +613,11 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
             reconcile_subscription(&input, &remote(&newcomer, &[invoice(&newcomer, 1)]), T);
         let result = fx.try_put(&user, &outcome).await;
         if live.contains(status) {
-            let error = result.expect_err(status);
+            let billing_transaction_fixture::FixtureError::Postgres(error) =
+                result.expect_err(status)
+            else {
+                panic!("expected PostgreSQL unique violation for {status}");
+            };
             assert_eq!(
                 error.code(),
                 Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
@@ -724,7 +656,11 @@ async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
     assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
     let outcome = fx.fold("u1", &b).await;
     assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
-    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    let billing_transaction_fixture::FixtureError::Postgres(error) =
+        fx.try_put("u1", &outcome).await.expect_err("foreign B")
+    else {
+        panic!("expected PostgreSQL unique violation for foreign B");
+    };
     assert_eq!(
         error.code(),
         Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
@@ -1156,4 +1092,510 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
         "fixture cleanup failed: {cleanup:?}; contention phases: {result:?}"
     );
     result.expect("contention phases failed");
+}
+
+// A writer that does not take the advisory lock may commit or roll back while
+// the table lock is waiting. The subsequent READ COMMITTED statement must see
+// the resulting state; a pre-lock observation is not ownership evidence.
+#[tokio::test]
+async fn table_exclusion_classifies_after_writer_commit_or_rollback() {
+    snapshot_fixture(false)
+        .await
+        .expect("snapshot phases failed");
+}
+
+#[tokio::test]
+async fn snapshot_fixture_cleans_up_after_early_lock_completion() {
+    let result = snapshot_fixture(true).await;
+    assert_eq!(result.unwrap_err(), "lock finished before wait barrier");
+}
+
+async fn snapshot_fixture(force_early_completion: bool) -> Result<(), String> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let schema = format!(
+        "billing_snapshot_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut drivers = Vec::new();
+    let mut pending = Vec::new();
+    let result: Result<(), String> = timeout(Duration::from_secs(25), async {
+        let (observer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        observer.batch_execute(&format!("SET statement_timeout = '4s'; CREATE SCHEMA {schema}; CREATE TABLE {schema}.subscriptions (stripe_subscription_id text PRIMARY KEY, user_id text NOT NULL)")).await.map_err(|e| e.to_string())?;
+        for commit in [true, false] {
+            let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let (reader, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let reader_pid: i32 = reader.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            writer.batch_execute(&format!("BEGIN; SET LOCAL statement_timeout = '4s'; INSERT INTO {schema}.subscriptions VALUES ('sub', 'other')")).await.map_err(|e| e.to_string())?;
+            reader.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '4s'; SET LOCAL statement_timeout = '4s'; SET LOCAL transaction_timeout = '10s'").await.map_err(|e| e.to_string())?;
+            let before = reader.query_opt(&format!("SELECT user_id FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub'"), &[]).await.map_err(|e| e.to_string())?;
+            if before.is_some() { return Err("uncommitted writer was visible".into()); }
+            let sql = if force_early_completion { "INVALID LOCK".to_string() } else { format!("LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE") };
+            let (phase_tx, phase_rx) = billing_contention::phase();
+            pending.push(tokio::spawn(async move {
+                let _ = phase_tx.send(());
+                let result = reader.batch_execute(&sql).await;
+                (reader, result)
+            }));
+            billing_contention::reached(phase_rx).await?;
+            let task = pending.last_mut().unwrap();
+            if force_early_completion {
+                timeout(Duration::from_secs(3), async {
+                    while !task.is_finished() { tokio::task::yield_now().await; }
+                }).await.map_err(|_| "early completion timed out".to_string())?;
+            }
+            let relation = format!("{schema}.subscriptions");
+            let wait = billing_contention::relation_wait(
+                &observer, task, writer_pid, reader_pid, &relation, "ShareRowExclusiveLock",
+            ).await;
+            if let Err(error) = wait {
+                if error == "lock finished before wait barrier" {
+                    pending.pop(); // The helper consumed this handle's output.
+                }
+                return Err(error);
+            }
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let completed = timeout(Duration::from_secs(5), pending.last_mut().unwrap()).await.map_err(|_| "lock did not resume".to_string())?;
+            pending.pop(); // The handle has been consumed, even if the task failed.
+            let (reader, lock) = completed.map_err(|e| e.to_string())?;
+            lock.map_err(|e| e.to_string())?;
+            let after = reader.query_opt(&format!("SELECT user_id FROM {schema}.subscriptions WHERE stripe_subscription_id = 'sub'"), &[]).await.map_err(|e| e.to_string())?;
+            let owner = after.map(|row| row.get::<_, String>(0));
+            if owner.as_deref() != if commit { Some("other") } else { None } {
+                return Err(format!("unexpected post-lock owner after commit={commit}: {owner:?}"));
+            }
+            reader.batch_execute("ROLLBACK").await.map_err(|e| e.to_string())?;
+            observer.batch_execute(&format!("DELETE FROM {schema}.subscriptions")).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("snapshot phases timed out".into()));
+    for task in pending {
+        task.abort();
+        let _ = task.await;
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    let cleanup = timeout(Duration::from_secs(5), async {
+        let (db, connection) = config.connect(NoTls).await?;
+        let driver = tokio::spawn(connection);
+        let result = async {
+            db.batch_execute(&format!("SET lock_timeout = '3s'; SET statement_timeout = '4s'; DROP SCHEMA IF EXISTS {schema} CASCADE")).await?;
+            let exists: bool = db.query_one("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", &[&schema]).await?.get(0);
+            Ok::<_, tokio_postgres::Error>(exists)
+        }.await;
+        drop(db);
+        driver.abort();
+        let _ = driver.await;
+        result
+    }).await;
+    assert!(
+        matches!(cleanup, Ok(Ok(false))),
+        "fixture cleanup failed: {cleanup:?}; snapshot phases: {result:?}"
+    );
+    result
+}
+
+// These are server-side expiry controls on a disposable relation, not proof of
+// production pooling, role privileges, version support, or driver cancellation.
+#[tokio::test]
+async fn abandoned_table_lock_expires_and_rollback_cleans_local_settings() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let schema = format!(
+        "billing_expiry_{}_{}",
+        std::process::id(),
+        SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut drivers = Vec::new();
+    let mut pending = Vec::new();
+    let result: Result<(), String> = timeout(Duration::from_secs(30), async {
+        let (observer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        observer.batch_execute(&format!("SET statement_timeout = '4s'; CREATE SCHEMA {schema}; CREATE TABLE {schema}.subscriptions (id integer PRIMARY KEY, value integer NOT NULL); INSERT INTO {schema}.subscriptions VALUES (1, 0)")).await.map_err(|e| e.to_string())?;
+
+        // Acknowledged rollback on a surviving connection is distinct from expiry.
+        let baseline: String = observer.query_one("SHOW lock_timeout", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let pid: i32 = observer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        observer.batch_execute(&format!("BEGIN; SET LOCAL lock_timeout = '1s'; LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE; UPDATE {schema}.subscriptions SET value = 99; ROLLBACK")).await.map_err(|e| e.to_string())?;
+        let row = observer.query_one(&format!("SELECT pg_backend_pid(), current_setting('lock_timeout'), (SELECT value FROM {schema}.subscriptions WHERE id = 1), EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND relation = '{schema}.subscriptions'::regclass AND mode = 'ShareRowExclusiveLock')"), &[]).await.map_err(|e| e.to_string())?;
+        if row.get::<_, i32>(0) != pid || row.get::<_, String>(1) != baseline || row.get::<_, i32>(2) != 0 || row.get::<_, bool>(3) {
+            return Err("acknowledged rollback did not restore settings, data, and lock state".into());
+        }
+
+        for expiry in ["transaction", "idle"] {
+            let (holder, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+            drivers.push(tokio::spawn(connection));
+            writer.batch_execute("SET statement_timeout = '8s'").await.map_err(|e| e.to_string())?;
+            let holder_pid: i32 = holder.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let settings = if expiry == "transaction" {
+                "SET LOCAL transaction_timeout = '3s'; SET LOCAL idle_in_transaction_session_timeout = '0'"
+            } else {
+                "SET LOCAL transaction_timeout = '10s'; SET LOCAL idle_in_transaction_session_timeout = '3s'"
+            };
+            holder.batch_execute(&format!("BEGIN ISOLATION LEVEL READ COMMITTED; {settings}; SET LOCAL statement_timeout = '8s'; LOCK TABLE {schema}.subscriptions IN SHARE ROW EXCLUSIVE MODE; UPDATE {schema}.subscriptions SET value = 10 WHERE id = 1")).await.map_err(|e| e.to_string())?;
+            let sql = format!("UPDATE {schema}.subscriptions SET value = value + 1 WHERE id = 1");
+            pending.push(tokio::spawn(async move { writer.execute(&sql, &[]).await }));
+            let task = pending.last_mut().unwrap();
+            // Observe the actual wait before allowing the server timeout to end it.
+            let relation = format!("{schema}.subscriptions");
+            let params: [&(dyn ToSql + Sync); 3] = [&holder_pid, &writer_pid, &relation];
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut *task => return Err(format!("{expiry} writer finished before wait barrier: {result:?}")),
+                        row = observer.query_one("SELECT $1 = ANY(pg_blocking_pids($2)) AND EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $3::text::regclass AND mode = 'ShareRowExclusiveLock' AND granted)", &params) => {
+                            if row.map_err(|e| e.to_string())?.get::<_, bool>(0) { break; }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), String>(())
+            }).await.map_err(|_| format!("{expiry} wait barrier timed out"))??;
+            let expiry_error = if expiry == "transaction" {
+                // Keep the client alive even if the statement unexpectedly succeeds.
+                let (send, receive) = tokio::sync::oneshot::channel();
+                pending.push(tokio::spawn(async move {
+                    let result = holder.batch_execute("SELECT pg_sleep(6)").await;
+                    let code = result.err().and_then(|e| e.code().map(|c| c.code().to_owned()));
+                    let _ = send.send(code);
+                    std::future::pending::<()>().await;
+                    drop(holder);
+                    Ok::<u64, tokio_postgres::Error>(0)
+                }));
+                Some(receive)
+            } else {
+                // Keep the client alive but issue no command while the idle timer runs.
+                pending.push(tokio::spawn(async move { std::future::pending::<()>().await; drop(holder); Ok::<u64, tokio_postgres::Error>(0) }));
+                None
+            };
+            let writer_index = pending.len() - 2;
+            let task = &mut pending[writer_index];
+            let count = timeout(Duration::from_secs(8), task).await.map_err(|_| format!("{expiry} writer did not resume"))?.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            if count != 1 { return Err(format!("{expiry} writer affected {count} rows")); }
+            if let Some(receive) = expiry_error {
+                let code = timeout(Duration::from_secs(5), receive).await.map_err(|_| "transaction expiry error timed out".to_string())?.map_err(|e| e.to_string())?;
+                if code.as_deref() != Some("25P04") { return Err(format!("unexpected transaction expiry SQLSTATE: {code:?}")); }
+            }
+            // Backend exit can trail lock release. Observe it separately, within a bound.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let row = observer.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1), EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1)", &[&holder_pid]).await.map_err(|e| e.to_string())?;
+                    if !row.get::<_, bool>(0) && !row.get::<_, bool>(1) { break; }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), String>(())
+            }).await.map_err(|_| format!("{expiry} backend exit timed out"))??;
+            let value: i32 = observer.query_one(&format!("SELECT value FROM {schema}.subscriptions WHERE id = 1"), &[]).await.map_err(|e| e.to_string())?.get(0);
+            let expected = if expiry == "transaction" { 1 } else { 2 };
+            if value != expected { return Err(format!("{expiry} rollback state incorrect")); }
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("expiry phases timed out".into()));
+
+    for task in pending {
+        if !task.is_finished() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    let cleanup = timeout(Duration::from_secs(5), async {
+        let (db, connection) = config.connect(NoTls).await?;
+        let driver = tokio::spawn(connection);
+        let result = db.batch_execute(&format!("SET lock_timeout = '3s'; SET statement_timeout = '4s'; DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        drop(db);
+        driver.abort();
+        let _ = driver.await;
+        result
+    }).await;
+    assert!(
+        matches!(cleanup, Ok(Ok(()))),
+        "fixture cleanup failed: {cleanup:?}; phases: {result:?}"
+    );
+    result.expect("expiry phases failed");
+}
+
+#[test]
+fn coupled_sql_relation_is_transformed_only_for_the_trusted_schema() {
+    let [lock, lookup, write] = billing_transaction_fixture::fixed_sql("billing_test_1_2");
+    assert!(lock.contains("billing_test_1_2.subscriptions IN SHARE ROW EXCLUSIVE"));
+    assert!(lookup.contains("FROM billing_test_1_2.subscriptions WHERE"));
+    assert!(write.starts_with("INSERT INTO billing_test_1_2.subscriptions "));
+    assert!(
+        std::panic::catch_unwind(|| billing_transaction_fixture::fixed_sql("x; DROP")).is_err()
+    );
+}
+
+// A raw writer does not take the fixture's advisory lock. Its uncommitted
+// insert must finish before the fixture can classify the global target.
+#[tokio::test]
+async fn coupled_fixture_waits_for_raw_insert_commit_or_rollback() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    let config = disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+    let mut outcome = fx
+        .fold("u1", &remote("sub_raw", &[invoice("sub_raw", 1)]))
+        .await;
+    fx.db
+        .batch_execute("SET lock_timeout = '4s'; SET statement_timeout = '5s'")
+        .await
+        .unwrap();
+    outcome.explicit_stale = true;
+    outcome.history.clear();
+    let mut drivers = Vec::new();
+    let mut pending = None;
+    let result: Result<(), String> = timeout(Duration::from_secs(30), async {
+        let (writer, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        let (mut runner, connection) = config.connect(NoTls).await.map_err(|e| e.to_string())?;
+        drivers.push(tokio::spawn(connection));
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        let runner_pid: i32 = runner.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
+        runner.batch_execute(&format!("SET search_path TO {}; SET lock_timeout = '4s'; SET statement_timeout = '5s'; SET transaction_timeout = '10s'", fx.schema)).await.map_err(|e| e.to_string())?;
+        writer.batch_execute(&format!("SET search_path TO {}; SET statement_timeout = '5s'", fx.schema)).await.map_err(|e| e.to_string())?;
+        for commit in [false, true] {
+            writer.batch_execute("BEGIN; INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status) VALUES ('u2', 'sub_raw', 'cus_a', 'si_raw', 'price_plus_test', 'plus', 'canceled')").await.map_err(|e| e.to_string())?;
+            let (phase_tx, phase_rx) = billing_contention::phase();
+            let schema = fx.schema.clone();
+            let input = outcome.clone();
+            pending = Some(tokio::spawn(async move {
+                let _ = phase_tx.send(());
+                let result = billing_transaction_fixture::run(&mut runner, &schema, "u1", &input).await;
+                (runner, result)
+            }));
+            billing_contention::reached(phase_rx).await?;
+            let wait = billing_contention::relation_wait(&fx.db, pending.as_mut().unwrap(), writer_pid, runner_pid, &format!("{}.subscriptions", fx.schema), "ShareRowExclusiveLock").await;
+            if let Err(error) = wait {
+                if error == "lock finished before wait barrier" { pending = None; }
+                return Err(error);
+            }
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let completed = timeout(Duration::from_secs(5), pending.as_mut().unwrap()).await.map_err(|_| "fixture did not resume".to_string())?;
+            pending = None;
+            let (next_runner, classification) = completed.map_err(|e| e.to_string())?;
+            runner = next_runner;
+            if commit {
+                if !matches!(&classification, Err(billing_transaction_fixture::FixtureError::Refusal(error)) if error == "foreign or mismatched target") { return Err(format!("committed foreign insert: {classification:?}")); }
+                if fx.snap("sub_raw").await.map(|row| row.user_id).as_deref() != Some("u2") { return Err("committed foreign row changed".into()); }
+            } else if !matches!(&classification, Ok(billing_transaction_fixture::Class::AbsentEmpty)) || fx.snap("sub_raw").await.is_some() {
+                return Err(format!("rolled-back insert: {classification:?}"));
+            }
+            if fx.history_rows("sub_raw").await != 0 { return Err("unexpected history".into()); }
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("contention phases timed out".into()));
+    if let Some(task) = pending {
+        task.abort();
+        let _ = task.await;
+    }
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
+    fx.cleanup().await;
+    result.expect("raw writer exclusion failed");
+}
+
+// A raw parent delete reaches the FK cascade without participating in the
+// fixture's locking convention. Observe the child relation wait before release.
+#[tokio::test]
+async fn parent_delete_waits_for_subscription_exclusion() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    for commit_delete in [false, true] {
+        let mut fx = Fx::new().await;
+        fx.add_user("u1").await;
+        let before = fx.seed_active("u1", "sub_parent").await;
+        assert_eq!(fx.history_rows("sub_parent").await, 2);
+        let config =
+            disposable_config(&std::env::var("NNTUNE_TEST_DATABASE_URL").unwrap()).unwrap();
+        let (holder, connection) = config.connect(NoTls).await.unwrap();
+        let holder_driver = tokio::spawn(connection);
+        let (deleter, connection) = config.connect(NoTls).await.unwrap();
+        let deleter_driver = tokio::spawn(connection);
+        let holder_pid: i32 = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let deleter_pid: i32 = deleter
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        holder.batch_execute(&format!("SET search_path TO {}; SET statement_timeout = '5s'; BEGIN; LOCK TABLE subscriptions IN SHARE ROW EXCLUSIVE MODE", fx.schema)).await.unwrap();
+        deleter
+            .batch_execute(&format!(
+                "SET search_path TO {}; SET statement_timeout = '5s'; BEGIN",
+                fx.schema
+            ))
+            .await
+            .unwrap();
+        let (phase_tx, phase_rx) = billing_contention::phase();
+        let mut pending = tokio::spawn(async move {
+            let _ = phase_tx.send(());
+            let result = deleter
+                .execute("DELETE FROM users WHERE id = 'u1'", &[])
+                .await;
+            (deleter, result)
+        });
+        let result: Result<(), String> = async {
+            billing_contention::reached(phase_rx).await?;
+            billing_contention::relation_wait(&fx.db, &mut pending, holder_pid, deleter_pid, &format!("{}.subscriptions", fx.schema), "RowExclusiveLock").await?;
+            if fx.snap("sub_parent").await != Some(before.clone()) || fx.history_rows("sub_parent").await != 2 {
+                return Err("uncommitted deletion changed the visible snapshot".into());
+            }
+            holder.batch_execute("COMMIT").await.map_err(|e| e.to_string())?;
+            let (deleter, deleted) = timeout(Duration::from_secs(5), &mut pending).await.map_err(|_| "delete did not finish after release".to_string())?.map_err(|e| e.to_string())?;
+            if deleted.map_err(|e| e.to_string())? != 1 { return Err("expected one deleted parent".into()); }
+            deleter.batch_execute(if commit_delete { "COMMIT" } else { "ROLLBACK" }).await.map_err(|e| e.to_string())?;
+            let row = fx.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND relation = $2::text::regclass AND mode = 'ShareRowExclusiveLock')", &[&holder_pid, &format!("{}.subscriptions", fx.schema)]).await.map_err(|e| e.to_string())?;
+            if row.get::<_, bool>(0) { return Err("holder retained subscription lock".into()); }
+            let parent_exists: bool = fx.db.query_one("SELECT EXISTS (SELECT 1 FROM users WHERE id = 'u1')", &[]).await.map_err(|e| e.to_string())?.get(0);
+            let expected = if commit_delete { None } else { Some(before.clone()) };
+            if parent_exists == commit_delete || fx.snap("sub_parent").await != expected || fx.history_rows("sub_parent").await != if commit_delete { 0 } else { 2 } {
+                return Err("delete did not commit or roll back parent and children together".into());
+            }
+            Ok(())
+        }.await;
+        pending.abort();
+        drop(holder);
+        holder_driver.abort();
+        deleter_driver.abort();
+        let _ = holder_driver.await;
+        let _ = deleter_driver.await;
+        fx.cleanup().await;
+        result.expect("parent delete contention failed");
+    }
+}
+
+#[tokio::test]
+async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
+    use billing_transaction_fixture::{run, Class};
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    let schema = fx.schema.clone();
+    // Non-explicit guarded upsert: exact RETURNING, then an equal-end replay.
+    let first = fx
+        .fold(
+            "u1",
+            &remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]),
+        )
+        .await;
+    assert!(!first.explicit_stale);
+    assert!(matches!(
+        run(&mut fx.db, &schema, "u1", &first).await,
+        Ok(Class::Wrote)
+    ));
+    let stored = fx.snap("sub_a").await.unwrap();
+    assert_eq!(fx.history_rows("sub_a").await, 2);
+    assert!(matches!(
+        run(&mut fx.db, &schema, "u1", &first).await,
+        Ok(Class::Wrote)
+    ));
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+
+    let mut stale = fx
+        .fold("u1", &remote("sub_a", &[invoice("sub_a", 1)]))
+        .await;
+    assert!(stale.explicit_stale);
+    let mut extra = stale.history[0].clone();
+    extra.stripe_invoice_id = "inv_extra".into();
+    stale.history.push(extra);
+    // Explicit stale: own succeeds and keeps history; the row never changes.
+    assert!(matches!(
+        run(&mut fx.db, &schema, "u1", &stale).await,
+        Ok(Class::OwnStale)
+    ));
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    // Foreign owner rejects whatever the history, and leaves no history.
+    let mut foreign = stale.clone();
+    foreign.history[1].stripe_invoice_id = "inv_foreign".into();
+    for history_empty in [false, true] {
+        if history_empty {
+            foreign.history.clear();
+        }
+        assert!(matches!(run(&mut fx.db, &schema, "u2", &foreign).await,
+            Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "foreign or mismatched target"));
+        assert_eq!(fx.history_rows("sub_a").await, 3);
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    }
+    let mut unflagged_foreign = stale.clone();
+    unflagged_foreign.explicit_stale = false;
+    assert!(
+        matches!(run(&mut fx.db, &schema, "u2", &unflagged_foreign).await,
+        Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "foreign or mismatched target")
+    );
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    // Absent: empty explicit stale succeeds without a row; with history rejects.
+    let mut absent = stale.clone();
+    absent.row.stripe_subscription_id = "sub_missing".into();
+    for h in &mut absent.history {
+        h.stripe_subscription_id = "sub_missing".into();
+    }
+    absent.history[1].stripe_invoice_id = "inv_absent".into();
+    assert!(matches!(run(&mut fx.db, &schema, "u1", &absent).await,
+        Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "absent row with history rejected"));
+    assert_eq!(fx.history_rows("sub_a").await, 3);
+    assert_eq!(fx.history_rows("sub_missing").await, 0);
+    assert!(fx.snap("sub_missing").await.is_none());
+    absent.history.clear();
+    assert!(matches!(
+        run(&mut fx.db, &schema, "u1", &absent).await,
+        Ok(Class::AbsentEmpty)
+    ));
+    assert!(fx.snap("sub_missing").await.is_none());
+    // Zero rows from a non-explicit write are recognized only as own PG-stale.
+    let mut unflagged = stale.clone();
+    unflagged.explicit_stale = false;
+    assert!(matches!(
+        run(&mut fx.db, &schema, "u1", &unflagged).await,
+        Ok(Class::OwnStale)
+    ));
+    assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+    // A history SQL failure after a successful write rolls the write back.
+    let mut failing = fx
+        .fold("u2", &remote("sub_r", &[invoice("sub_r", 1)]))
+        .await;
+    failing.history[0].plan_id = "missing_plan".into();
+    let failure = run(&mut fx.db, &schema, "u2", &failing).await.unwrap_err();
+    match failure {
+        billing_transaction_fixture::FixtureError::Postgres(error) => {
+            let db_error = error.as_db_error().expect("database error");
+            assert_eq!(
+                db_error.code(),
+                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION
+            );
+            assert!(db_error.message().contains("foreign key"));
+        }
+        other => panic!("expected PostgreSQL error, got {other:?}"),
+    }
+    assert!(fx.snap("sub_r").await.is_none());
+    assert_eq!(fx.history_rows("sub_r").await, 0);
+    assert_eq!(fx.snap("sub_a").await, Some(stored));
+    fx.cleanup().await;
 }

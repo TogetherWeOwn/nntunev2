@@ -33,11 +33,6 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 "rust-transcode": ("rustfmt,clippy", "wasm32-unknown-unknown"),
             },
             "coverage.yml": {"coverage": ("llvm-tools-preview", None)},
-            "deploy.yml": {
-                "staging-api": (None, "wasm32-unknown-unknown"),
-                "staging-mb": (None, "wasm32-unknown-unknown"),
-                "staging-ingest": (None, "wasm32-unknown-unknown"),
-            },
         }
         for path, jobs in expected.items():
             text = (WORKFLOWS / path).read_text()
@@ -51,6 +46,12 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                     if target:
                         command += f" --target {target}"
                     self.assertIn(command + "\n          rustup default stable\n", section)
+        deploy = (WORKFLOWS / "deploy.yml").read_text()
+        for name in ("staging-api", "staging-mb", "staging-ingest"):
+            with self.subTest(path="deploy.yml", job=name):
+                section = job(deploy, name)
+                self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)
+                self.assertNotIn("rustup toolchain install stable", section)
 
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
@@ -74,8 +75,10 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         for script in ("check_web_bundle_budget.py", "test_check_web_bundle_budget.py"):
             self.assertIn(f'python3 "$GITHUB_WORKSPACE/.github/scripts/{script}"', ci)
         production = (WORKFLOWS / "deploy-production.yml").read_text()
-        self.assertNotIn("wrangler@${{ env.WRANGLER_VERSION }}", production)
-        self.assertEqual(production.count('"wrangler@${WRANGLER_VERSION:?}"'), 3)
+        self.assertNotIn("wrangler@", production)
+        self.assertIn('version="$("$shim/npx" wrangler --version)"', production)
+        self.assertIn('test "$version" = "${WRANGLER_VERSION:?}"', production)
+        self.assertIn('printf \'%s\\n\' "$shim" >> "$GITHUB_PATH"', production)
         deploy = (WORKFLOWS / "deploy.yml").read_text()
         self.assertEqual(deploy.count('./check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"'), 2)
         self.assertNotIn('--config-id "${{ vars.', deploy)
@@ -83,6 +86,20 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn('if [ "$GITHUB_EVENT_NAME" = pull_request ]; then', leaks)
         self.assertIn('base="refs/remotes/origin/${GITHUB_BASE_REF}"', leaks)
         self.assertNotIn('${{ github.base_ref }}', leaks)
+
+    def test_gitleaks_history_scan_uses_the_fixture_options(self):
+        leaks = job((WORKFLOWS / "gitleaks.yml").read_text(), "gitleaks")
+        self.assertIn("GITLEAKS_LOG_OPTS: '--text --diff-merges=first-parent HEAD'", leaks)
+        scan_name = "- name: Scan the full history\n"
+        fixture_name = "- name: Self-test history scanning\n"
+        self.assertLess(leaks.index(scan_name), leaks.index(fixture_name))
+        self.assertNotIn(".github/scripts/", leaks)
+        scan, fixture = leaks.split(scan_name, 1)[1].split(fixture_name, 1)
+        for name, step in (("scan", scan), ("fixture", fixture)):
+            with self.subTest(step=name):
+                self.assertEqual(step.count('"$GITLEAKS_BIN" git '), 1)
+                self.assertEqual(step.count('--log-opts='), 1)
+                self.assertIn('--log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow', step)
 
     def test_local_workflows_use_the_same_source_revision(self):
         for path, callee in (("deploy.yml", "e2e-staging.yml"), ("deploy-production.yml", "release.yml")):
@@ -104,6 +121,29 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertNotIn("environment:", job(production, "preflight"))
         self.assertIn("      name: production\n", job(production, "deploy-production"))
         self.assertIn("needs: [preflight, staging-evidence]", job(production, "deploy-production"))
+
+    def test_snapshot_spike_is_build_and_recall_only(self):
+        text = (WORKFLOWS / "mb-snapshot-spike.yml").read_text()
+        self.assertRegex(text, r"(?m)^  workflow_dispatch:$")
+        self.assertIn("  pull_request:\n    types: [labeled]", text)
+        self.assertIn("github.event.label.name == 'mb-snapshot-spike'", text)
+        self.assertIn("permissions:\n  contents: read", text)
+        self.assertNotRegex(text, r"(?m)^\s*(stage|environment|workflow_call):")
+        self.assertNotRegex(text, r"\b(secrets|inputs\.stage|CLOUDFLARE_\w+|wrangler)\b")
+
+        spike = job(text, "spike")
+        self.assertIn("persist-credentials: false", spike)
+        for command in ("bash workers/mb/spike/measure.sh", "python3 workers/mb/spike/recall.py"):
+            self.assertRegex(spike, rf"(?m)^[ \t]+{re.escape(command)}[ \t]+")
+        self.assertRegex(spike, r"(?m)^ {10}name: mb-snapshot-spike-results$")
+        for retired in ("stage.sh", "lifecycle.py", "bench.py", "live-archive"):
+            self.assertNotIn(retired, text)
+
+        for helper in ("stage.sh", "lifecycle.py", "test_lifecycle.py"):
+            self.assertFalse((ROOT / "workers/mb/spike" / helper).exists())
+        ci = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("spike/test_lifecycle.py", ci)
+        self.assertNotIn("spike/live-archive", ci)
 
     def test_regression_suite_is_a_required_ci_step(self):
         ci = (WORKFLOWS / "ci.yml").read_text()
@@ -161,6 +201,42 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         # the credential is reached, while a started apply that fails
         # still records evidence.
         self.assertIn("if: always() && steps.apply.conclusion != 'skipped'", apply)
+
+    def test_staging_readback_is_observation_only(self):
+        text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertIn("workflow_dispatch:", triggers)
+        for event in ("pull_request", "push", "schedule"):
+            self.assertNotIn(event + ":", triggers)
+        self.assertIn('"$WORKFLOW_REF" == refs/heads/main', text)
+        self.assertIn("contents: read", text)
+        self.assertIn("environment:\n      name: staging\n      deployment: false", text)
+        self.assertEqual(text.count("persist-credentials: false"), 2)
+        self.assertIn("ref: ${{ inputs.ref }}", text)
+        self.assertIn("ref: ${{ github.sha }}", text)
+        self.assertIn("git -C data rev-parse HEAD", text)
+        self.assertIn("git -C trusted rev-parse HEAD", text)
+        self.assertEqual(text.count("staging_apply.py readback"), 1)
+        self.assertEqual(text.count("staging_apply.py audit"), 1)
+        self.assertIn("staging_apply.py audit --trusted-root trusted --data-root data", text)
+        self.assertIn("AUDIT_RECEIPT: ledger-audit-receipt.json", text)
+        self.assertIn("path: ledger-audit-receipt.json", text)
+        self.assertIn("default: readback", text)
+        self.assertEqual(text.count("if: ${{ inputs.mode == 'audit' }}"), 2)
+        self.assertEqual(text.count("if: ${{ inputs.mode == 'readback' }}"), 2)
+        for forbidden in ("staging_apply.py apply", "apply_migration.py", "all-pending", "--record-only", "$GITHUB_ENV"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("path: readback-receipt.json", text)
+        self.assertIn("if-no-files-found: error", text)
+        self.assertIn("group: migrations-staging-apply", text)
+        self.assertIn("if: ${{ inputs.mode != 'purge-census' }}", text.split("Check out trusted code")[0])
+        self.assertIn('test "$REF_PROTECTED" = true', text)
+        self.assertIn('test "$WORKFLOW_SHA" = "$TRUSTED_REF"', text)
+        census = text.split("- name: Observe staging purge census", 1)[1]
+        self.assertEqual(census.count("if: ${{ inputs.mode == 'purge-census' }}"), 2)
+        self.assertIn("staging_apply.py purge-census", census)
+        self.assertNotRegex(census, r"secrets\.|--data-root")
+        self.assertIn("path: purge-census-receipt.json", census)
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter
