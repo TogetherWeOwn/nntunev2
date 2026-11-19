@@ -7864,6 +7864,11 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "unknown");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/taste?user_id=bob"),
+            "/v1/me/taste"
+        );
+        assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

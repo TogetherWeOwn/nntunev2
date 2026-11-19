@@ -1869,9 +1869,7 @@ fn account_deleting_response() -> Response {
     }
 }
 
-// Prepared for future preference handlers; not admitted by dispatch. The
-// deletion probe is a precheck, not a substitute for a transactional fence.
-#[allow(dead_code)]
+// The deletion probe is a precheck, not a substitute for a transactional fence.
 async fn preference_authenticate<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -1990,8 +1988,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2001,6 +1997,14 @@ where
 {
     let (claims, _) = match preference_authenticate(ctx, req, false).await {
         Ok(pair) => pair,
+        // Keep the preference contract's envelope without changing legacy session routes.
+        Err(resp) if resp.status == 401 => {
+            let error = crate::api_error::ApiError::unauthorized("authentication required");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
         Err(resp) => return resp,
     };
     match ctx.store.taste_list(&claims.user_id, ctx.now).await {
@@ -7594,6 +7598,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
+            | "/v1/me/taste"
             | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
@@ -7788,6 +7793,7 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
         ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
@@ -15542,12 +15548,7 @@ mod tests {
             .unwrap();
         assert_eq!(unavailable_response.body, unavailable().body);
         assert_eq!(unavailable_response.status, 503);
-        for path in [
-            "/v1/me/likes",
-            "/v1/me/taste",
-            "/v1/me/history",
-            "/v1/me/private-session/",
-        ] {
+        for path in ["/v1/me/likes", "/v1/me/history", "/v1/me/private-session/"] {
             assert_eq!(
                 h.call_full("GET", path, None, req.cookie.clone(), Some(ORIGIN))
                     .status,
@@ -15654,7 +15655,17 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_list_is_bounded_owner_scoped_and_fail_closed() {
+    fn taste_list_handler_is_bounded_owner_scoped_and_fail_closed() {
+        assert_taste_list_contract("/v1/me/taste?user_id=bob", false);
+    }
+
+    #[test]
+    fn taste_list_dispatch_is_bounded_owner_scoped_and_fail_closed() {
+        // Worker entry forwards only the bare path.
+        assert_taste_list_contract("/v1/me/taste", true);
+    }
+
+    fn assert_taste_list_contract(path: &str, dispatch: bool) {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
         let h = harness();
@@ -15664,14 +15675,21 @@ mod tests {
         let bob = magic_login(&h, "bob@example.com");
         let mut req = Request {
             method: "GET".into(),
-            path: "/v1/me/taste?user_id=bob".into(),
+            path: path.into(),
             cookie: Some(alice.clone()),
             origin: Some(ORIGIN.into()),
             authorization: None,
             stripe_signature: None,
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
-        let call = |req: &Request| block_on(me_taste_list(&h.ctx(), req));
+        let call_at = |ctx: &Ctx<'_, _, _, _, _>, req: &Request| {
+            if dispatch {
+                block_on(handle(ctx, req))
+            } else {
+                block_on(me_taste_list(ctx, req))
+            }
+        };
+        let call = |req: &Request| call_at(&h.ctx(), req);
         let empty = call(&req);
         assert_eq!(
             (empty.status, empty.body.as_str()),
@@ -15741,22 +15759,33 @@ mod tests {
             |item| !["past", "equal", "foreign"].contains(&item["target_id"].as_str().unwrap())
         ));
         req.cookie = Some(bob);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&call(&req).body).unwrap(),
-            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "signal":"love", "until":null, "updated_at":999}]})
-        );
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            let response = call(&req);
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "signal":"love", "until":null, "updated_at":999}]})
+            );
+        }
         req.cookie = Some(alice.clone());
         req.authorization = Some("Bearer anything".into());
-        assert_eq!(call(&req).status, 404);
+        let denied = call(&req);
+        assert_eq!((denied.status, denied.body), (404, not_found().body));
         req.authorization = None;
-        req.cookie = None;
-        assert_eq!(call(&req).status, 401);
-        req.cookie = Some("__Host-nntune-session=invalid".into());
-        assert_eq!(call(&req).status, 401);
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            let denied = call(&req);
+            assert_eq!(denied.status, 401);
+            assert_eq!(
+                denied.body,
+                r#"{"code":"unauthorized","message":"authentication required","retryable":false}"#
+            );
+        }
         req.cookie = Some(alice);
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
-        assert_eq!(block_on(me_taste_list(&expired, &req)).status, 401);
+        assert_eq!(call_at(&expired, &req).status, 401);
         *h.store.fail_taste_read.borrow_mut() = true;
         let failure = call(&req);
         assert_eq!((failure.status, failure.body), (503, unavailable().body));
@@ -16887,30 +16916,81 @@ mod tests {
     }
 
     #[test]
+    fn taste_list_dispatch_has_exact_session_only_routing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        let h = peppered_harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let cookie = magic_login(&h, "alice@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/taste".into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: Some(format!("Bearer {key}")),
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let path = req.path.as_str();
+        assert!(is_known_path(path));
+        assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+        let before = *h.store.native_credential_lookups.borrow();
+        for session in [None, Some(cookie.clone())] {
+            req.cookie = session;
+            let denied = block_on(handle(&h.ctx(), &req));
+            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        }
+        assert_eq!(*h.store.native_credential_lookups.borrow(), before);
+        req.method = "OPTIONS".into();
+        req.cookie = None;
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            let response = block_on(handle(&h.ctx(), &req));
+            let control = h.call_full("OPTIONS", "/v1/me/private-session", None, None, origin);
+            assert_eq!(response.status, 204);
+            assert_eq!(response.status, control.status);
+            assert_eq!(response.body, control.body);
+        }
+        for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE", "get"] {
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            let denied = h.call_full(method, &req.path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(denied.status, 404, "{method}");
+        }
+    }
+
+    #[test]
     fn preference_paths_remain_unregistered() {
         let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let cookie = magic_login(&h, "alice@example.com");
         for path in [
             "/v1/me/likes",
             "/v1/me/likes/import",
             "/v1/me/likes/track/example",
-            "/v1/me/taste",
+            "/v1/me/taste/",
             "/v1/me/taste/track/example",
+            "/v1/me/tastes",
             "/v1/me/history",
             "/v1/me/private-session/",
             "/v1/me/private-session/extra",
         ] {
             assert!(!is_known_path(path), "{path}");
             assert!(!options_preflight_served(path), "{path}");
-            for method in ["GET", "PUT", "POST", "DELETE", "OPTIONS"] {
+            for method in ["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"] {
                 assert_eq!(
                     crate::native_rest::scope_for_operation(method, path),
                     crate::native_rest::RouteDecision::Deny
                 );
-                assert_eq!(
-                    h.call_full(method, path, None, None, Some(ORIGIN)).status,
-                    404,
-                    "{method} {path}"
-                );
+                for session in [None, Some(cookie.clone())] {
+                    let denied = h.call_full(method, path, None, session, Some(ORIGIN));
+                    assert_eq!(denied.status, 404, "{method} {path}");
+                }
             }
         }
     }

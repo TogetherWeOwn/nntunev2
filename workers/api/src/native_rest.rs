@@ -489,7 +489,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
-            if path == "/v1/me" || path == "/v1/indexers" {
+            if matches!(path, "/v1/me" | "/v1/indexers" | "/v1/me/taste") {
                 return SessionOnly;
             }
             // Billing/usage display reads: session-only like checkout —
