@@ -23,7 +23,7 @@ async fn database() -> Client {
     client
         .batch_execute(
             "SET search_path = pg_temp;
-        CREATE TEMP TABLE users (id TEXT PRIMARY KEY, deleting_at TIMESTAMPTZ);
+        CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL);
         CREATE TEMP TABLE sessions (LIKE public.sessions INCLUDING ALL);
         INSERT INTO sessions (id,user_id,created_at,expires_at,rotation_counter,revoked)
         VALUES ('test-session','subsonic-test-owner',100,1000,0,false);",
@@ -37,12 +37,70 @@ async fn database() -> Client {
         .await
         .unwrap();
     client
-        .execute("INSERT INTO users (id) VALUES ($1)", &[&USER])
+        .execute(
+            "INSERT INTO users (id,email,created_at) VALUES ($1,'owner@example.invalid',100)",
+            &[&USER],
+        )
         .await
         .unwrap();
     client.execute("INSERT INTO subsonic_credentials (id,user_id,subsonic_username,api_key_hmac,pepper_version)
         VALUES ($1::text::uuid,$2,'generated-client',repeat('a',64),1)", &[&ID,&USER]).await.unwrap();
     client
+}
+
+#[tokio::test]
+async fn staging_account_projects_only_bounded_email_and_live_role_flags() {
+    let mut client = database().await;
+    let principal = Principal::postgres_test_fixture(USER, ID, "generated-client");
+    let mut budget = ConstructionBudget::new(usize::MAX);
+    client
+        .batch_execute("UPDATE users SET email = repeat('é',512)")
+        .await
+        .unwrap();
+    let (identity, account) = load_staging_account(&mut budget, &mut client, &principal)
+        .await
+        .unwrap();
+    assert_eq!(identity.username, "generated-client");
+    assert_eq!(identity.email, "é".repeat(512));
+    assert_eq!(identity.email.len(), ACCOUNT_FIELD_BYTES as usize);
+    assert_eq!(account.email, identity.email);
+    assert!(!identity.is_admin && !account.is_admin && !account.is_manager);
+
+    client
+        .batch_execute("UPDATE users SET role = 'admin'")
+        .await
+        .unwrap();
+    let (identity, account) = load_staging_account(&mut budget, &mut client, &principal)
+        .await
+        .unwrap();
+    assert!(identity.is_admin && account.is_admin && !account.is_manager);
+
+    client
+        .batch_execute("UPDATE users SET email = email || 'x'")
+        .await
+        .unwrap();
+    let row = staging_account_row(&client, USER).await.unwrap().unwrap();
+    assert_eq!(row.get::<_, Option<&str>>(0), None);
+    let charged = budget.charged();
+    for change in [
+        None,
+        Some("UPDATE users SET email = repeat('é',512), deleting_at = now()"),
+        // Keep an unrelated live account when the principal's row is absent.
+        Some(
+            "DELETE FROM users;
+             INSERT INTO users (id,email,created_at)
+             VALUES ('subsonic-test-other','other@example.invalid',100)",
+        ),
+    ] {
+        if let Some(change) = change {
+            client.batch_execute(change).await.unwrap();
+        }
+        assert_eq!(
+            load_staging_account(&mut budget, &mut client, &principal).await,
+            Err(StagingRejection::BusyOrCapacity)
+        );
+        assert_eq!(budget.charged(), charged);
+    }
 }
 
 #[tokio::test]
@@ -306,7 +364,7 @@ async fn changed_username_owner_or_material_never_completes_a_stale_snapshot() {
     for change in [
         "UPDATE subsonic_credentials SET subsonic_username='different-client'",
         "UPDATE subsonic_credentials SET subsonic_username='generated-client',api_key_hmac=repeat('b',64)",
-        "INSERT INTO users(id) VALUES ('other'); UPDATE subsonic_credentials SET api_key_hmac=repeat('a',64),user_id='other'",
+        "INSERT INTO users(id,email,created_at) VALUES ('other','other@example.invalid',100); UPDATE subsonic_credentials SET api_key_hmac=repeat('a',64),user_id='other'",
     ] {
         client.batch_execute(change).await.unwrap();
         assert!(!mutate(&mut client, &selected, None, 120).await.unwrap());

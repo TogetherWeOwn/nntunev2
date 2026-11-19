@@ -2,9 +2,12 @@
 use super::{PgStore, StoreError, TOTAL_TIMEOUT_MS};
 use crate::field_envelope::FieldEnvelope;
 use crate::subsonic_auth::{
-    AuthError, AuthMode, CredentialRecord, CredentialStore, Reindex, TokenEnvelope,
+    AuthError, AuthMode, CredentialRecord, CredentialStore, Principal, Reindex, TokenEnvelope,
 };
-use nntune_subsonic::construction_budget::ConstructionBudget;
+use nntune_subsonic::{
+    construction_budget::ConstructionBudget, staging_rejection::StagingRejection, Identity,
+    UserAccount,
+};
 use tokio_postgres::{types::Type, Client, GenericClient, Row, Transaction};
 
 macro_rules! lookup_sql {
@@ -236,6 +239,135 @@ async fn lookup_record(
     }
     .map_err(|_| StoreError)?;
     row.as_ref().map(|row| record(row, budget)).transpose()
+}
+
+const ACCOUNT_FIELD_BYTES: i32 = 1_024;
+
+fn account_fields(
+    budget: &mut ConstructionBudget,
+    username: &str,
+    email: &str,
+    is_admin: bool,
+    is_manager: bool,
+) -> Result<(Identity, UserAccount), StagingRejection> {
+    let capacity = StagingRejection::BusyOrCapacity;
+    if [username, email]
+        .iter()
+        .any(|text| text.len() > ACCOUNT_FIELD_BYTES as usize)
+    {
+        return Err(capacity);
+    }
+    let mut copy = |text: &str| {
+        let mut bytes = budget.allocate_exact(text.len()).map_err(|_| capacity)?;
+        bytes.extend_from_slice(text.as_bytes());
+        String::from_utf8(bytes).map_err(|_| capacity)
+    };
+    Ok((
+        Identity {
+            username: copy(username)?,
+            email: copy(email)?,
+            is_admin,
+        },
+        UserAccount {
+            email: copy(email)?,
+            is_admin,
+            is_manager,
+        },
+    ))
+}
+
+/// Read account state after authentication and before member catalogue work.
+/// The caller supplies the already connected staging app client. The deadline
+/// bounds this lookup, not the driver's cancellation or teardown.
+pub async fn load_staging_account(
+    budget: &mut ConstructionBudget,
+    client: &mut Client,
+    principal: &Principal,
+) -> Result<(Identity, UserAccount), StagingRejection> {
+    use StagingRejection::BusyOrCapacity;
+    super::with_deadline(
+        async {
+            let tx = client.transaction().await.map_err(|_| BusyOrCapacity)?;
+            tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
+                .await
+                .map_err(|_| BusyOrCapacity)?;
+            let row = staging_account_row(&tx, principal.user_id())
+                .await
+                .map_err(|_| BusyOrCapacity)?
+                .ok_or(BusyOrCapacity)?;
+            let (email, admin, manager) = (
+                row.try_get::<_, Option<&str>>(0)
+                    .map_err(|_| BusyOrCapacity)?,
+                row.try_get(1).map_err(|_| BusyOrCapacity)?,
+                row.try_get(2).map_err(|_| BusyOrCapacity)?,
+            );
+            let account = account_fields(
+                budget,
+                principal.username(),
+                email.ok_or(BusyOrCapacity)?,
+                admin,
+                manager,
+            )?;
+            tx.commit().await.map_err(|_| BusyOrCapacity)?;
+            Ok(account)
+        },
+        1_000,
+        BusyOrCapacity,
+    )
+    .await
+}
+
+async fn staging_account_row(
+    client: &impl GenericClient,
+    user_id: &str,
+) -> Result<Option<Row>, StoreError> {
+    // Same-statement projection: return a NULL sentinel, never the oversized
+    // email. The role is reduced to flags before transfer, not cloned in Rust.
+    client
+        .query_typed_opt(
+            "SELECT CASE WHEN octet_length(email) <= $2 THEN email END, \
+             role = 'admin', role = 'manager' FROM users \
+             WHERE id = $1 AND deleting_at IS NULL LIMIT 2",
+            &[(&user_id, Type::TEXT), (&ACCOUNT_FIELD_BYTES, Type::INT4)],
+        )
+        .await
+        .map_err(|_| StoreError)
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
+#[cfg_attr(test, test)]
+pub(crate) fn account_fields_use_the_carried_charge() {
+    let email = "é".repeat(ACCOUNT_FIELD_BYTES as usize / 2);
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    for size in [1, "client".len(), email.len(), email.len()] {
+        expected.charge(size, 1, 1).unwrap();
+    }
+    let total = expected.charged();
+    for limit in [total - 1, total] {
+        let mut budget = ConstructionBudget::new(limit);
+        budget.charge(1, 1, 1).unwrap(); // A charge carried from an earlier phase.
+        let result = account_fields(&mut budget, "client", &email, false, true);
+        if limit < total {
+            assert_eq!(result, Err(StagingRejection::BusyOrCapacity));
+        } else {
+            let (identity, account) = result.unwrap();
+            assert_eq!(identity.username, "client");
+            assert_eq!(identity.username.capacity(), "client".len());
+            assert_eq!(identity.email, email);
+            assert_eq!(account.email, email);
+            assert_eq!(identity.email.capacity(), email.len());
+            assert_eq!(account.email.capacity(), email.len());
+            assert!(!identity.is_admin && !account.is_admin && account.is_manager);
+            assert_eq!(budget.charged(), total);
+        }
+    }
+    let mut budget = ConstructionBudget::new(usize::MAX);
+    let over = email + "x";
+    assert_eq!(
+        account_fields(&mut budget, "client", &over, false, false),
+        Err(StagingRejection::BusyOrCapacity)
+    );
+    assert_eq!(budget.charged(), 0);
 }
 
 async fn owner_fence(

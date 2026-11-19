@@ -10314,6 +10314,31 @@ mod tests {
             {
                 return Err(StoreError);
             }
+            use crate::billing_store_classification::{
+                classify_explicit_stale, validate_history_target, Target,
+            };
+            validate_history_target(outcome).map_err(|_| StoreError)?;
+            if outcome.explicit_stale {
+                let own_current = self
+                    .billing_rows
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|row| &row.stripe_subscription_id == sub);
+                let own_shadow = self
+                    .billing_shadow
+                    .borrow()
+                    .contains_key(&(user_id.to_string(), sub.clone()));
+                let target = if own_current || own_shadow {
+                    // Explicit stale ignores the numeric suppression predicate.
+                    Target::Owned {
+                        predicate_stale: false,
+                    }
+                } else {
+                    Target::Absent
+                };
+                classify_explicit_stale(&target, outcome.history.is_empty())
+                    .map_err(|_| StoreError)?;
+            }
             if !outcome.explicit_stale {
                 let mut rows = self.billing_rows.borrow_mut();
                 let mut shadow = self.billing_shadow.borrow_mut();
@@ -13419,7 +13444,6 @@ mod tests {
         let h = stripe_harness();
         let end = BILLING_NOW + BILLING_PERIOD;
         let seed = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_seed"), None);
-        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
         let mut subscription = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS);
         subscription.cancel_at_period_end = true;
         subscription.current_period_end = Some(end + 100);
@@ -13442,6 +13466,21 @@ mod tests {
         );
         assert!(stale.explicit_stale);
         assert_eq!(stale.history.len(), 1);
+        // The same fold needs a freshly observed owner before appending history.
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &stale)).is_err());
+        let mut empty = stale.clone();
+        empty.history.clear();
+        block_on(h.store.store_reconcile_outcome("u1", &empty)).unwrap();
+        assert!(h.store.billing_rows.borrow().is_empty());
+        assert!(h.store.billing_shadow.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
+
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        let mut misattributed = stale.clone();
+        misattributed.history[0].stripe_subscription_id = "sub_other".into();
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &misattributed)).is_err());
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+        assert!(h.store.invoice_history.borrow().is_empty());
         block_on(h.store.store_reconcile_outcome("u1", &stale)).unwrap();
         assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
         assert!(h.store.invoice_history.borrow().contains_key("in_old"));

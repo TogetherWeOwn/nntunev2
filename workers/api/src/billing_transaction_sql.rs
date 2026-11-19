@@ -106,14 +106,8 @@ pub(crate) async fn apply_reconcile_transaction(
             subscription_id: &row.stripe_subscription_id,
         };
         let target = classify_target(&requested, &observed).map_err(|_| StoreError)?;
-        // Classification protects only the exact subscription named by the fold.
-        if outcome
-            .history
-            .iter()
-            .any(|history| history.stripe_subscription_id != requested.subscription_id)
-        {
-            return Err(StoreError);
-        }
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| StoreError)?;
         if outcome.explicit_stale {
             classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| StoreError)?;
         } else {

@@ -70,6 +70,8 @@ pub mod subsonic_lifecycle;
 #[cfg(target_arch = "wasm32")]
 pub mod subsonic_request_metadata;
 pub mod subsonic_snapshot_plan;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging_response;
 pub mod target_identity;
 pub mod taste_signal;
 pub mod vault;
@@ -169,6 +171,7 @@ mod ledger_wasm_test {
     #[wasm_bindgen]
     pub fn run_ledger_tests() {
         assert_eq!(std::mem::size_of::<String>(), 12);
+        crate::subsonic_auth::verification_uses_the_carried_charge();
         nntune_subsonic::construction_budget::tests::rounds_each_allocation_and_fails_closed_at_limit();
         nntune_subsonic::construction_budget::tests::rejects_alignment_and_arithmetic_overflow_without_changing_charge();
         nntune_subsonic::construction_budget::tests::exact_vector_reservation_checks_limit_and_overflow();
@@ -176,6 +179,7 @@ mod ledger_wasm_test {
         nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
         nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();
         crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
+        crate::worker_entry::account_fields_use_the_carried_charge();
         crate::worker_entry::subsonic_membership::membership_projection_charges_capacity_before_copying();
     }
 }

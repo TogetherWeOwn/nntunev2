@@ -199,6 +199,29 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
         work_deadline_observer: None,
         cancel_token_observer: None,
     };
+    let mut absent = test_outcome();
+    absent.explicit_stale = true;
+    absent.history.truncate(1);
+    absent.history[0].stripe_invoice_id = "in_worker_absent".into();
+    if store
+        .store_reconcile_outcome("worker_fault_user", &absent)
+        .await
+        .is_ok()
+    {
+        return Err("explicit stale accepted history for an absent subscription");
+    }
+    fixture(false)
+        .await
+        .map_err(|_| "absent subscription refusal changed committed state")?;
+    absent.history.clear();
+    store
+        .store_reconcile_outcome("worker_fault_user", &absent)
+        .await
+        .map_err(|_| "explicit stale with absent subscription and empty history failed")?;
+    fixture(false)
+        .await
+        .map_err(|_| "empty absent subscription no-op changed committed state")?;
+
     let mut outcome = test_outcome();
     outcome.history[1].currency = "eur".into();
     outcome.history[1].amount_cents = -1;
