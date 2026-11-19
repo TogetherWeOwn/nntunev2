@@ -297,8 +297,11 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
     let recovered = fault_snapshot_with_recovery(true)
         .await
         .map_err(|_| "row-6 recovery did not append the expected history")?;
-    if recovered[0] != before[0] {
+    if recovered.subscription != before.subscription {
         return Err("row-6 recovery changed the existing subscription");
+    }
+    if recovered.existing_history != before.existing_history {
+        return Err("row-6 recovery changed existing invoice history");
     }
     store
         .store_reconcile_outcome("worker_fault_user", &absent)
@@ -386,11 +389,18 @@ async fn late_fault_state() -> Result<(bool, bool), StoreError> {
     .await
 }
 
-async fn fault_snapshot() -> Result<[String; 2], StoreError> {
+#[derive(PartialEq, Eq)]
+struct FaultSnapshot {
+    subscription: String,
+    existing_history: String,
+    recovered_history: Option<String>,
+}
+
+async fn fault_snapshot() -> Result<FaultSnapshot, StoreError> {
     fault_snapshot_with_recovery(false).await
 }
 
-async fn fault_snapshot_with_recovery(recovered: bool) -> Result<[String; 2], StoreError> {
+async fn fault_snapshot_with_recovery(recovered: bool) -> Result<FaultSnapshot, StoreError> {
     billing_budget::with_owned_connection(
         "127.0.0.1",
         5432,
@@ -417,7 +427,10 @@ async fn fault_snapshot_with_recovery(recovered: bool) -> Result<[String; 2], St
                                 (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)::text
                                  FROM public.subscriptions s),
                                 (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text
-                                 FROM public.paid_invoice_history h)",
+                                 FROM public.paid_invoice_history h
+                                 WHERE stripe_invoice_id <> 'in_worker_absent'),
+                                (SELECT to_jsonb(h)::text FROM public.paid_invoice_history h
+                                 WHERE stripe_invoice_id = 'in_worker_absent')",
                         &[&recovered],
                     )
                     .await
@@ -427,7 +440,11 @@ async fn fault_snapshot_with_recovery(recovered: bool) -> Result<[String; 2], St
                 {
                     return Err(StoreError);
                 }
-                Ok([row.get(2), row.get(3)])
+                Ok(FaultSnapshot {
+                    subscription: row.get(2),
+                    existing_history: row.get(3),
+                    recovered_history: row.get(4),
+                })
             })
         },
         |_| {},

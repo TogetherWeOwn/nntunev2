@@ -8082,6 +8082,7 @@ mod tests {
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
+        reconcile_outcome_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -10303,6 +10304,8 @@ mod tests {
             user_id: &str,
             outcome: &crate::billing_reconcile::ReconcileOutcome,
         ) -> Result<(), StoreError> {
+            self.reconcile_outcome_attempts
+                .set(self.reconcile_outcome_attempts.get() + 1);
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
@@ -13130,7 +13133,10 @@ mod tests {
         // An independently restored own target makes that stale fold safe to retry.
         block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
         for _ in 0..2 {
+            let attempts = h.store.reconcile_outcome_attempts.get();
             webhook_ok(&deliver("evt_row6"));
+            // A duplicate must reach persistence, not just acknowledge the claim.
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
             assert!(h.store.webhook_events.borrow().contains("evt_row6"));
             assert_eq!(op().state, "succeeded");
             assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
