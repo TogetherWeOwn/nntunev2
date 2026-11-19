@@ -57,9 +57,9 @@ on:
         type: string
         default: ""
       mode:
-        description: "Promote the app (bootstrap-maintenance is unavailable)"
+        description: "Promote the app"
         type: choice
-        options: [promote, bootstrap-maintenance]
+        options: [promote]
         default: promote
 
 permissions:

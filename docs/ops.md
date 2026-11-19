@@ -1105,7 +1105,10 @@ writes automatically, and an observer success alone is not verified recovery.
 
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
-`mode=bootstrap-maintenance` refuses in preflight. Keep promotion disabled.
+The dispatch form offers only `promote`. Do not dispatch bootstrap as a probe:
+if a legacy `mode=bootstrap-maintenance` request reaches preflight, it fails
+before staging admission and may be reported as a preflight incident even though
+no deployment ran. Keep promotion disabled.
 Cloudflare documents [empty Worker creation](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/),
 but [version upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
 and [deployment creation](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)

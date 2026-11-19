@@ -28,12 +28,15 @@ test('maintenance dry-run config has no routes, bindings or public preview', () 
 const version = '12345678-1234-1234-1234-123456789abc';
 const workflow = readFileSync(new URL('../.github/workflows/deploy-production.yml', import.meta.url), 'utf8');
 test('maintenance bootstrap refuses before staging or production access, even with promotion enabled', () => {
-  const preflight = workflow.match(/id: target\n[\s\S]+?        run: \|\n((?: {10}[^\n]*\n)+)/)?.[1];
+  const dispatch = workflow.split('\non:\n')[1].split('\npermissions:')[0];
+  assert.match(dispatch, /^      mode:\n(?:        [^\n]*\n)*?        options: \[promote\]$/m);
+  const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
   assert.ok(preflight);
+  assert.match(preflight[1], /^ {10}DEPLOY_MODE: \$\{\{ inputs\.mode \}\}$/m);
   assert.match(workflow, /staging-evidence:\n    name: staging-evidence\n    needs: \[preflight\]/);
   assert.match(workflow, /deploy-production:\n    name: deploy-production\n    needs: \[preflight, staging-evidence\]/);
   assert.doesNotMatch(workflow, /production-maintenance\/seed\.mjs|continue-on-error:/);
-  const result = spawnSync('/bin/bash', ['-c', preflight.replace(/^ {10}/gm, '')], {
+  const result = spawnSync('/bin/bash', ['-c', preflight[2].replace(/^ {10}/gm, '')], {
     encoding: 'utf8', timeout: 5_000, env: {
       PATH: process.env.PATH, GITHUB_OUTPUT: '/dev/stdout', GITHUB_REF: 'refs/heads/main',
       INPUT_SHA: 'a'.repeat(40), DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
