@@ -975,6 +975,66 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)] // Not called by release reconciliation until activation.
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+        deadline_probe: bool,
+    ) -> Result<(), StoreError> {
+        use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        if outcome
+            .history
+            .iter()
+            .any(|history| history.stripe_subscription_id != outcome.row.stripe_subscription_id)
+        {
+            return Err(failed());
+        }
+        #[cfg(feature = "billing-owned-wasm-test")]
+        let (host, port, connection_string) = (
+                "127.0.0.1".to_owned(),
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
+                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+            );
+        #[cfg(not(feature = "billing-owned-wasm-test"))]
+        let (host, port, connection_string) = {
+            let env = self.env.as_ref().ok_or(StoreError)?;
+            let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+            (
+                hyperdrive.host().to_owned(),
+                hyperdrive.port(),
+                hyperdrive.connection_string(),
+            )
+        };
+        billing_budget::with_owned_connection(
+            &host,
+            port,
+            &connection_string,
+            |client| {
+                #[cfg(feature = "billing-owned-wasm-test")]
+                if let Some(observer) = &self.cancel_token_observer {
+                    *observer.borrow_mut() = Some(client.cancel_token());
+                }
+                Box::pin(billing_budget::bootstrap_transaction(client))
+            },
+            move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
+            #[cfg(feature = "billing-owned-wasm-test")]
+            |expired| {
+                if let Some(observer) = &self.work_deadline_observer {
+                    observer.set(expired);
+                }
+            },
+        )
+        .await
+        .map_err(|_| failed())
+    }
+
     /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
     #[allow(dead_code, clippy::too_many_arguments)]
