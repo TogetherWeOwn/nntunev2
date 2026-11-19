@@ -751,6 +751,9 @@ impl MirrorBinding {
 #[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
 #[path = "subsonic_membership.rs"]
 pub(crate) mod subsonic_membership;
+#[allow(dead_code)] // Unmounted until the bounded adapter is wired.
+#[path = "subsonic_mirror.rs"]
+pub(crate) mod subsonic_mirror;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
