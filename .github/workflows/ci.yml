@@ -1938,7 +1938,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/staging-body-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
-          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs
+          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts
