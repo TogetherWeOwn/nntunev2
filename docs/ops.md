@@ -529,6 +529,13 @@ are not PR deletions; no merge from the target is required to hide them.
 Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 
+A confirmed-unapplied byte-identical renumber needs a source-only record
+in the trusted checker, pinned to the repository, PR, reviewed Git parent,
+paths, digest and target. Both passes require exact Git lineage and an
+unchanged accepted prefix. Trigger a fresh PR event after the checker
+lands; rerunning a prior event uses its old base. If the destination slot
+changes, reconcile the new path with the checker owner before retrying.
+
 The secretless PR gate loads its checker and its stdlib-only
 `migration_history.py` import from a separate checkout of the event's full
 trusted **base SHA**. The PR **head SHA** is checked out with full Git

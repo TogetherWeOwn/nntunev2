@@ -2,6 +2,7 @@
 """Real Git fixtures for migration lineage, coverage and fail-closed bounds."""
 import contextlib
 import copy
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -301,6 +302,10 @@ class GitFixture(unittest.TestCase):
         # A genuine alias alone retains one-hop behavior; history is optional.
         entries[0]["source_rename_history"] = []
         self.verify(entries)
+        path = self.root / "migrations/manifest.toml"
+        path.write_text(manifest(entries))
+        self.assertTrue(staging.compare(staging.load_expected(path),
+                                        [("0001_old.sql", entries[0]["sha256"])]))
         entries[0]["renamed_from"] = []
         with self.assertRaisesRegex(history.HistoryError, "lacks renamed_from"):
             self.verify(entries)
@@ -684,7 +689,7 @@ class GitFixture(unittest.TestCase):
         return {"number": 1, "repository": metadata["base"]["repo"], "pull_request": metadata}
 
     def run_workflow(self, pages, metadata, api_exit=0, *, samples=None, event=None,
-                     missing_code=False, poison=False):
+                     missing_code=False, poison=False, reviewed_unapplied=None):
         from test_ci_pnpm_retry import split_jobs, split_steps, step_field
 
         source = pathlib.Path(__file__).resolve().parents[2]
@@ -703,6 +708,10 @@ class GitFixture(unittest.TestCase):
         for name in ("migration_history.py", "migration_snapshot.py", "migrations_rename_check.py"):
             if not missing_code:
                 shutil.copyfile(source / ".github/scripts" / name, scripts / name)
+        if reviewed_unapplied is not None:
+            # Supply synthetic custodian pins only in the trusted checkout.
+            with (scripts / "migrations_rename_check.py").open("a") as script:
+                script.write(f"\nREVIEWED_UNAPPLIED = {reviewed_unapplied!r}\n")
         api = workspace / "api"
         api.mkdir()
         self.workflow_api = api
@@ -832,6 +841,100 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(outcomes["effective"]["base"], advanced)
         self.assertEqual(outcomes["event"]["merge_base"], self.base)
         self.assertEqual(outcomes["effective"]["merge_base"], self.base)
+
+    def unapplied_restack(self, *, duplicate=False):
+        manifest_path = self.root / "migrations/manifest.toml"
+        old, new = "0001_purge.sql", "0002_purge.sql"
+        self.git("checkout", "-qb", "feature")
+        self.write(old)
+        manifest_path.write_text(manifest(self.entries()))
+        reviewed = self.commit("reviewed provisional migration")
+        self.git("checkout", "main")
+        self.write("0001_storage.sql", BODY + b"-- accepted storage\n")
+        manifest_path.write_text(manifest(self.entries()))
+        self.base = self.commit("accept storage at the provisional number")
+        self.git("checkout", "-qb", "restack")
+        self.git("merge", "-s", "ours", "--no-commit", "--no-ff", "feature")
+        self.write(new)
+        if duplicate:
+            self.write("0003_duplicate.sql")
+        entries = self.entries()
+        manifest_path.write_text(manifest(entries))
+        head = self.commit("restack the reviewed bytes")
+        pin = history.UnappliedRename(reviewed, self.base, "migrations/" + old,
+                                     "migrations/" + new, entries[1]["sha256"], "app")
+        return entries, head, pin
+
+    def test_workflow_reviewed_unapplied_rename_is_source_only_in_both_passes(self):
+        entries, head, pin = self.unapplied_restack()
+        self.git("checkout", "main")
+        (self.root / "README.md").write_text("base moves without touching migrations\n")
+        effective = self.commit("advance base separately")
+        self.git("checkout", "--detach", head)
+        key = (1, "example/project", 1, "main", "feature")
+        live = {"base": {"sha": effective}, "head": {"sha": head}, "changed_files": 2}
+        pages = [[{"filename": "migrations/manifest.toml", "status": "modified"},
+                  {"filename": pin.new_path, "status": "added"}]]
+        result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        for name, base in (("event", self.base), ("effective", effective)):
+            self.assertEqual(outcomes[name]["base"], base)
+            self.assertEqual(outcomes[name]["outcome"], "verified")
+            self.assertEqual(outcomes[name]["unapplied_rename"], dict(zip(history.EDGE_KEYS,
+                (pin.reviewed_head, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256))))
+        expected = staging.load_expected(self.root / "migrations/manifest.toml")
+        rows = [(e["file"], e["sha256"]) for e in entries]
+        self.assertTrue(staging.compare(expected, rows))
+        self.assertFalse(staging.compare(expected, rows[:1] + [("0001_purge.sql", pin.sha256)]))
+
+        for label, records, diagnostic in (
+                ("no trusted record", {}, "lacks renamed_from"),
+                ("wrong repository ID", {(2, *key[1:]): pin}, "lacks renamed_from"),
+                ("wrong PR", {(1, "example/project", 2, "main", "feature"): pin}, "lacks renamed_from"),
+                ("wrong digest", {key: replace(pin, sha256="0" * 64)}, "differs from reviewed"),
+                ("wrong reviewed head", {key: replace(pin, reviewed_head=self.base)}, "differs from reviewed")):
+            with self.subTest(label=label):
+                result = self.run_workflow(pages, live, reviewed_unapplied=records)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
+        self.git("checkout", "main")
+        self.write("0002_other.sql", BODY + b"-- newly accepted migration\n")
+        (self.root / "migrations/manifest.toml").write_text(manifest(self.entries()))
+        advanced = self.commit("fill the approved number on main")
+        self.git("checkout", "--detach", head)
+        live["base"]["sha"] = advanced
+        result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertIn("changes the accepted migration prefix", outcomes["diagnostic"])
+
+    def test_unapplied_rename_rejects_forgery_alias_and_prefix_edits(self):
+        entries, head, pin = self.unapplied_restack()
+        entries[1]["source_rename_history"] = [dict(zip(history.EDGE_KEYS,
+            (self.base, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256)))]
+        with self.assertRaisesRegex(history.HistoryError, "evidence is forged"):
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+        entries[1].pop("source_rename_history")
+        entries[1]["renamed_from"] = [{"file": "0001_purge.sql", "sha256": pin.sha256}]
+        with self.assertRaisesRegex(history.HistoryError, "must not become an applied alias"):
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+        entries[1].pop("renamed_from")
+        entries[0]["target"] = "mirror"
+        with self.assertRaisesRegex(history.HistoryError, "changes the accepted migration prefix"):
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+        self.write("0001_storage.sql", BODY + b"-- modified accepted SQL\n")
+        altered = self.commit("change an accepted migration after restack")
+        with self.assertRaisesRegex(history.HistoryError, "changes the accepted migration prefix"):
+            history.verify(self.root, self.base, altered, manifest(self.entries()), unapplied=pin)
+
+    def test_unapplied_rename_rejects_ambiguous_blob_matches(self):
+        entries, head, pin = self.unapplied_restack(duplicate=True)
+        with self.assertRaisesRegex(history.HistoryError, "unique byte-identical|single exact"):
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
 
     def test_workflow_original_range_cannot_be_hidden_by_effective_base(self):
         self.write("0001_old.sql")
