@@ -506,6 +506,37 @@ mod tests {
     }
 
     #[test]
+    fn owned_copy_charges_strings_at_construction_budget_boundary() {
+        let mut row = artist("a", "A longer name", "s");
+        row.country = Some("GB".into());
+        let work = crate::subsonic_dispatch::snapshot_order::OrderWork {
+            comparisons: usize::MAX,
+            artist_row_probes: usize::MAX,
+        };
+        let mut expected = ConstructionBudget::new(usize::MAX);
+        vec_of::<ArtistDbRow>(&mut expected, 1).unwrap();
+        for len in [row.mbid.len(), row.name.len(), row.sort_name.len()] {
+            expected.charge(len, 1, 1).unwrap();
+        }
+        let before_country = expected.charged();
+        expected.charge(2, 1, 1).unwrap();
+        let need = expected.charged();
+        let artists = [row];
+
+        let mut exact = ConstructionBudget::new(need);
+        let receipt =
+            OwnedRawRows::try_copy_bounded(&mut exact, &artists, &[], &[], work, 32, 64).unwrap();
+        assert_eq!(receipt.budget.charged(), need);
+        assert_eq!(receipt.rows().0[0].country.as_deref(), Some("GB"));
+
+        let mut short = ConstructionBudget::new(need - 1);
+        assert!(
+            OwnedRawRows::try_copy_bounded(&mut short, &artists, &[], &[], work, 32, 64).is_err()
+        );
+        assert_eq!(short.charged(), before_country);
+    }
+
+    #[test]
     fn internal_mapper_preserves_duplicate_occurrences_and_fields() {
         let artists = [artist("a", "First", "Z"), artist("a", "Last", "A")];
         let mut releases = [release("r", Some(("a", "First"))), release("r", None)];
