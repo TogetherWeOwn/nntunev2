@@ -186,7 +186,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
     }
     let released = state(HOLDER, Some("canceled")).await?;
     store
-        .store_reconcile_owned(USER.into(), outcome, ReconcileProbe::None)
+        .store_reconcile_owned(USER.into(), outcome.clone(), ReconcileProbe::None)
         .await
         .map_err(|_| "same pre-release fold failed after live slot release")?;
     let committed = state(TARGET, None).await?;
@@ -212,6 +212,69 @@ pub(super) async fn check() -> Result<(), &'static str> {
         return Err(
             "post-release commit changed the holder or failed to persist exact target state",
         );
+    }
+
+    // This pass read absence before the slot release. Another commit has now
+    // created the target; a delayed pass without proof must retry, not append.
+    let mut delayed = outcome;
+    delayed.history[0].stripe_invoice_id = "in_worker_provenance".into();
+    delayed.row.cancel_at_period_end = true;
+    for status in ["active", "trialing", "canceled"] {
+        let before = state(TARGET, Some(status)).await?;
+        for paid_end in [None, Some(END - 1), Some(END), Some(END + 1)] {
+            delayed.row.paid_through_unix = paid_end;
+            delayed.row.paid_invoice_id = match paid_end {
+                None | Some(END) => None,
+                _ => Some("in_worker_provenance".into()),
+            };
+            if store
+                .store_reconcile_owned(USER.into(), delayed.clone(), ReconcileProbe::None)
+                .await
+                .is_ok()
+            {
+                return Err("delayed absence fold accepted for an existing target");
+            }
+            if state(TARGET, None).await? != before || state(HOLDER, None).await? != released {
+                return Err("delayed absence fold mutated committed subscription or history");
+            }
+        }
+    }
+
+    let before = state(TARGET, None).await?;
+    let listing = remote(
+        TARGET,
+        "si_worker_exact",
+        "active",
+        &[("in_worker_exact", "usd"), ("in_worker_provenance", "usd")],
+    );
+    let fresh = reconcile_exact_target(input(before.row), &listing, NOW);
+    if fresh.explicit_stale
+        || fresh.read_plan.as_deref() != Some("plus")
+        || fresh.read_anchor.as_deref() != Some("in_worker_exact")
+    {
+        return Err("fresh fold did not carry exact target proof");
+    }
+    store
+        .store_reconcile_owned(USER.into(), fresh, ReconcileProbe::None)
+        .await
+        .map_err(|_| "fresh exact-target retry failed")?;
+    let applied = state(TARGET, None).await?;
+    let history: serde_json::Value = serde_json::from_str(&applied.history)
+        .map_err(|_| "invalid provenance history snapshot")?;
+    let Some(row) = applied.row else {
+        return Err("fresh exact-target retry did not recover the target");
+    };
+    if row.status != "active"
+        || row.plan_id != "plus"
+        || row.paid_through_unix != Some(END)
+        || row.paid_invoice_id.as_deref() != Some("in_worker_provenance")
+        || applied.history_count != 2
+        || history[1]["stripe_invoice_id"] != "in_worker_provenance"
+        || history[1]["stripe_subscription_id"] != TARGET
+        || history[1]["user_id"] != USER
+        || state(HOLDER, None).await? != released
+    {
+        return Err("fresh exact-target retry did not recover state and history");
     }
     Ok(())
 }
