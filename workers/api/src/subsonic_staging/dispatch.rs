@@ -3,7 +3,6 @@
 use std::future::Future;
 
 use nntune_subsonic::capped_render::Format;
-use nntune_subsonic::construction_budget::{BudgetExceeded, ConstructionBudget};
 use nntune_subsonic::envelope::{self, code};
 use nntune_subsonic::routes::{route, Route};
 use nntune_subsonic::staging_browse::MemberBrowse;
@@ -31,35 +30,54 @@ use crate::worker_entry::{
     with_deadline,
 };
 
-pub struct StagingDispatch<'a, K> {
-    pub peppers: &'a IndexKeyring<'a>,
-    pub keks: &'a K,
-    pub now_seconds: u64,
+pub struct StagingDispatch {
     pub now_millis: i64,
     pub order_work: OrderWork,
+}
+
+pub enum StagingApp<'a, K> {
+    Postgres {
+        client: Client,
+        peppers: &'a IndexKeyring<'a>,
+        keks: &'a K,
+        now_seconds: u64,
+    },
+    #[cfg(feature = "staging-body-wasm-test")]
+    VerifiedFixture,
+}
+
+impl<K> StagingApp<'_, K> {
+    fn postgres(&mut self) -> &mut Client {
+        match self {
+            Self::Postgres { client, .. } => client,
+            #[cfg(feature = "staging-body-wasm-test")]
+            Self::VerifiedFixture => panic!("unexpected staging data load"),
+        }
+    }
 }
 
 /// Unmounted. The caller must first verify staging arming and app/mirror
 /// isolation. The supplied fixture authorization runs after real auth and
 /// before account, membership or mirror reads.
-pub async fn respond_staging<K: KekSource, A, M>(
+pub async fn respond_staging<'a, K: KekSource + 'a, A, M>(
     request: &web_sys::Request,
-    context: StagingDispatch<'_, K>,
+    context: StagingDispatch,
     open_app: impl FnOnce() -> A,
     authorize_fixture: impl FnOnce(&Principal) -> bool,
     open_mirror: impl FnOnce() -> M,
 ) -> WorkerResult<Response>
 where
-    A: Future<Output = Result<Client, StagingRejection>>,
+    A: Future<Output = Result<StagingApp<'a, K>, StagingRejection>>,
     M: Future<Output = Result<Client, StagingRejection>>,
 {
+    let reject_xml = |reason| respond_fixed_rejection(reason, RejectionFormat::Xml);
     let input = match StagingInput::collect(request).await {
         Ok(input) => input,
         Err(error) => return error.respond(),
     };
     let mut scope = match StagingConstruction::begin(input) {
         Ok(scope) => scope,
-        Err(reason) => return respond_fixed_rejection(reason, RejectionFormat::Xml),
+        Err(reason) => return reject_xml(reason),
     };
     let Route::Endpoint(name) = route(scope.path()) else {
         return finish_document(Ok(None));
@@ -80,17 +98,28 @@ where
     let opened = with_deadline(async { open_app().await }, 2_000, BusyOrCapacity);
     let mut app = match opened.await {
         Ok(app) => app,
-        Err(reason) => return respond_fixed_rejection(reason, RejectionFormat::Xml),
+        Err(reason) => return reject_xml(reason),
     };
-    let authenticated = subsonic_auth::authenticate_staging(
-        &mut app,
-        &credentials,
-        context.peppers,
-        context.keks,
-        context.now_seconds,
-        scope.budget(),
-    )
-    .await;
+    let authenticated = match &mut app {
+        StagingApp::Postgres {
+            client,
+            peppers,
+            keks,
+            now_seconds,
+        } => {
+            subsonic_auth::authenticate_staging(
+                client,
+                &credentials,
+                peppers,
+                *keks,
+                *now_seconds,
+                &mut scope.input.budget,
+            )
+            .await
+        }
+        #[cfg(feature = "staging-body-wasm-test")]
+        StagingApp::VerifiedFixture => Ok(Principal::staging_test_fixture()),
+    };
     drop(credentials);
     let principal = match authenticated {
         Ok(principal) => principal,
@@ -102,10 +131,7 @@ where
                 AuthError::InvalidKey => "Invalid API key.",
                 AuthError::InvalidToken => "Wrong username or password.",
                 AuthError::Unavailable => {
-                    return respond_fixed_rejection(
-                        StagingRejection::Unavailable,
-                        RejectionFormat::Xml,
-                    );
+                    return reject_xml(StagingRejection::Unavailable);
                 }
             };
             return scope.protocol_failure(error.subsonic_code(), message);
@@ -115,16 +141,9 @@ where
         return scope.protocol_failure(code::NOT_AUTHORIZED, "Not authorized for staging.");
     }
     let document = scope
-        .dispatch_document(
-            &mut app,
-            &principal,
-            open_mirror,
-            name,
-            context.order_work,
-            context.now_millis,
-        )
+        .dispatch_document(&mut app, &principal, open_mirror, name, context)
         .await;
-    finish_document(document)
+    finish_document(document.map(Some))
 }
 
 impl InputError {
@@ -138,92 +157,60 @@ impl InputError {
 }
 
 impl StagingConstruction {
-    fn budget(&mut self) -> &mut ConstructionBudget {
-        &mut self.input.budget
-    }
-
-    // StagingInput can only be collected after validating the raw sources.
-    fn dispatch_params(&mut self) -> Result<Params, BudgetExceeded> {
+    fn dispatch_params(&mut self) -> Result<Params, DocumentError> {
         let form = (self.method() == "POST").then_some(self.input.form.as_str());
         Params::parse_charged(&self.input.query, form, &mut self.input.budget)
+            .map_err(|_| DocumentError::Rejected(BusyOrCapacity, RejectionFormat::Xml))
     }
 
     fn protocol_failure(mut self, err_code: i64, message: &str) -> WorkerResult<Response> {
         let document = (|| {
-            let params = self
-                .dispatch_params()
-                .map_err(|_| DocumentError::Rejected(BusyOrCapacity, RejectionFormat::Xml))?;
-            let selector = params.get("f");
-            let refusal = RejectionFormat::from_safe_selector(selector);
-            if selector == Some("jsonp")
-                && !params
-                    .get("callback")
-                    .is_some_and(envelope::is_valid_jsonp_callback)
-            {
-                return Err(DocumentError::InvalidCallback);
-            }
+            let params = self.dispatch_params()?;
+            let (_, refusal) = request_format(&params)?;
             let format = match refusal {
                 RejectionFormat::Json => Format::Json,
                 RejectionFormat::Xml => Format::Xml,
             };
-            let graph = envelope::charged_error_document(self.budget(), err_code, message)
+            let budget = &mut self.input.budget;
+            let graph = envelope::charged_error_document(budget, err_code, message)
                 .map_err(|_| DocumentError::Rejected(BusyOrCapacity, refusal))?;
-            prepare(self.budget(), &graph, format, 1024).map(Some)
+            prepare(budget, &graph, format, 1024)
         })();
-        finish_document(document)
+        finish_document(document.map(Some))
     }
 
-    async fn dispatch_document<F>(
+    async fn dispatch_document<F: Future<Output = Result<Client, StagingRejection>>>(
         &mut self,
-        client: &mut Client,
+        app: &mut StagingApp<'_, impl KekSource>,
         principal: &Principal,
         connect_isolated: impl FnOnce() -> F,
         name: &str,
-        work: OrderWork,
-        now_millis: i64,
-    ) -> Result<Option<StagingDocument>, DocumentError>
-    where
-        F: Future<Output = Result<Client, StagingRejection>>,
-    {
-        let params = self
-            .dispatch_params()
-            .map_err(|_| DocumentError::Rejected(BusyOrCapacity, RejectionFormat::Xml))?;
-        let selector = params.get("f");
-        let refusal = RejectionFormat::from_safe_selector(selector);
+        context: StagingDispatch,
+    ) -> Result<StagingDocument, DocumentError> {
+        let params = self.dispatch_params()?;
+        let (format, refusal) = request_format(&params)?;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
-        let format = match selector {
-            Some("json") => Format::Json,
-            Some("jsonp") => match params
-                .get("callback")
-                .filter(|cb| envelope::is_valid_jsonp_callback(cb))
-            {
-                Some(callback) => Format::Jsonp(callback),
-                None => return Err(DocumentError::InvalidCallback),
-            },
-            _ => Format::Xml,
-        };
+        let budget = &mut self.input.budget;
         let doc = if MemberBrowse::supports(name) {
-            let member = load_staging_membership(self.budget(), client, principal)
+            let member = load_staging_membership(budget, app.postgres(), principal)
                 .await
                 .map_err(reject)?;
-            let (artists, releases, tracks) = load_staging_mirror(
-                self.budget(),
-                MirrorSelection {
-                    releases: &member.releases,
-                    pairs: &member.pairs,
-                    remaining_text_bytes: member.remaining_text_bytes,
-                },
-                connect_isolated,
-            )
-            .await
-            .map_err(reject)?;
+            let selection = MirrorSelection {
+                releases: &member.releases,
+                pairs: &member.pairs,
+                remaining_text_bytes: member.remaining_text_bytes,
+            };
+            let (artists, releases, tracks) =
+                load_staging_mirror(budget, selection, connect_isolated)
+                    .await
+                    .map_err(reject)?;
             drop(member);
             let (artists, albums, songs) = build_owned_bounded_snapshot(
-                self.budget(),
+                budget,
                 &artists,
                 &releases,
                 &tracks,
-                work,
+                context.order_work,
                 8 * 1024,
                 CONSTRUCTION_BYTES,
             )
@@ -232,58 +219,55 @@ impl StagingConstruction {
                 artists: &artists,
                 albums: &albums,
                 songs: &songs,
-                now_millis,
+                now_millis: context.now_millis,
             }
-            .document(self.budget(), name, &params, |id| {
+            .document(budget, name, &params, |id| {
                 ProductionStore::resolve_song_occurrence(&tracks, &songs, id)
             })
         } else if name == "getLicense" {
-            let (identity, _) = load_staging_account(self.budget(), client, principal)
+            let (identity, _) = load_staging_account(budget, app.postgres(), principal)
                 .await
                 .map_err(reject)?;
-            basic_document(self.budget(), name, &identity.email)
+            basic_document(budget, name, &identity.email)
         } else {
-            basic_document(self.budget(), name, "")
+            basic_document(budget, name, "")
         }
         .map_err(|_| reject(BusyOrCapacity))?
         .ok_or_else(|| reject(BusyOrCapacity))?;
-        prepare(self.budget(), &doc, format, DOCUMENT_BYTES).map(Some)
+        prepare(budget, &doc, format, DOCUMENT_BYTES)
     }
+}
+
+fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), DocumentError> {
+    let selector = params.get("f");
+    let format = match selector {
+        Some("json") => Format::Json,
+        Some("jsonp") => Format::Jsonp(
+            params
+                .get("callback")
+                .filter(|cb| envelope::is_valid_jsonp_callback(cb))
+                .ok_or(DocumentError::InvalidCallback)?,
+        ),
+        _ => Format::Xml,
+    };
+    Ok((format, RejectionFormat::from_safe_selector(selector)))
 }
 
 #[cfg(feature = "staging-body-wasm-test")]
 mod wasm_test {
     use super::*;
-    use crate::native_rest::Pepper;
+    use crate::handlers::Config;
     use crate::subsonic_dispatch::snapshot_order::order_work;
     use worker::wasm_bindgen::{self, prelude::*};
     use worker::{js_sys, wasm_bindgen_futures::JsFuture};
-
-    struct NoKeys;
-
-    impl KekSource for NoKeys {
-        fn kek(&self, _: u32) -> Option<&[u8; 32]> {
-            None
-        }
-    }
 
     #[wasm_bindgen]
     pub async fn staging_dispatch_test(
         request: web_sys::Request,
         open_app: js_sys::Function,
+        allowed: bool,
     ) -> Result<web_sys::Response, JsValue> {
-        let peppers = IndexKeyring::new(
-            Pepper {
-                version: 1,
-                bytes: &[0; 32],
-            },
-            None,
-        )
-        .unwrap();
         let context = StagingDispatch {
-            peppers: &peppers,
-            keks: &NoKeys,
-            now_seconds: 0,
             now_millis: 0,
             order_work: order_work(0, 0, 0, 0).unwrap(),
         };
@@ -292,12 +276,17 @@ mod wasm_test {
             context,
             || async {
                 let ready = open_app.call0(&JsValue::UNDEFINED).unwrap();
-                JsFuture::from(js_sys::Promise::resolve(&ready))
+                let result = JsFuture::from(js_sys::Promise::resolve(&ready))
                     .await
                     .unwrap();
-                Err(StagingRejection::Unavailable)
+                (result.as_bool() == Some(true))
+                    .then_some(StagingApp::<Config>::VerifiedFixture)
+                    .ok_or(StagingRejection::Unavailable)
             },
-            |_| panic!("no principal from unavailable app"),
+            |principal| {
+                assert_eq!(principal.user_id(), "fixture-user");
+                allowed
+            },
             || async { panic!("unexpected mirror") },
         )
         .await

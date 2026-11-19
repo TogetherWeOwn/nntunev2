@@ -26,23 +26,27 @@ test('rejects oversized input, unsupported routes and duplicate credentials befo
   for (const input of ['fixture.cb', 'first', 'second']) assert.ok(!body.includes(input));
 });
 
-test('a contender refuses before app access; app failure releases the permit', { timeout: 2000 }, async () => {
+test('busy refusal and app-open timeout release the permit', { timeout: 10000 }, async () => {
   let entered;
-  let release;
   const started = new Promise((resolve) => { entered = resolve; });
-  const held = new Promise((resolve) => { release = resolve; });
   const first = dispatch(request('getArtists?apiKey=fixture'), () => {
     entered();
-    return held;
+    return new Promise(() => {});
   });
-  try {
-    await started;
-    await refusal(await dispatch(request('ping?apiKey=fixture'), neverOpen), 503, '1');
-  } finally {
-    release();
-    await refusal(await first, 503);
+  await started;
+  await refusal(await dispatch(request('ping?apiKey=fixture'), neverOpen), 503, '1');
+  await refusal(await first, 503, '1');
+  // Only the connector's Unavailable response has no Retry-After header.
+  await refusal(await dispatch(request('ping?apiKey=fixture'), () => {}), 503);
+});
+
+test('fixture authorization gates account and catalogue reads and permits charged dispatch', async () => {
+  for (const endpoint of ['getLicense', 'getArtists']) {
+    const denied = await dispatch(request(`${endpoint}?f=json`), () => true, false);
+    assert.equal(JSON.parse(await refusal(denied, 200))['subsonic-response'].error.code, 50);
   }
-  let reopened = false;
-  await refusal(await dispatch(request('ping?apiKey=fixture'), () => { reopened = true; }), 503);
-  assert.ok(reopened);
+  const allowed = await dispatch(request('getMusicFolders?f=json'), () => true, true);
+  const payload = JSON.parse(await refusal(allowed, 200))['subsonic-response'];
+  assert.equal(payload.status, 'ok');
+  assert.deepEqual(payload.musicFolders.musicFolder, [{ id: 1, name: 'Music' }]);
 });
