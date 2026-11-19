@@ -807,7 +807,8 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres
           inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests -- --list)"
           printf '%s\n' "$inventory"
-          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 11
+          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 12
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_credential_mutations_keep_the_cap_and_fences: test'
           printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_membership_admits_only_complete_owner_scoped_pages: test'
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres

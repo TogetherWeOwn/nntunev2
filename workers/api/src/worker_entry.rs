@@ -753,6 +753,7 @@ impl MirrorBinding {
 pub(crate) mod subsonic_membership;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
+pub use subsonic_pg::mutate_staging_credential;
 
 struct PgStore {
     env: Option<Env>,
