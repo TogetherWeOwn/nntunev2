@@ -100,6 +100,15 @@ fn enrolled_key_envelope_and_range_compose() {
         Err(EnrolledEnvelopeError::Mismatch)
     );
 
+    let wrong_length = EnvelopeContext {
+        plaintext_len: context.plaintext_len + 1,
+        ..context
+    };
+    assert_eq!(
+        verify_enrolled_scheme2(&root, &wrong_length, &envelope, &envelope, &manifest),
+        Err(EnrolledEnvelopeError::Mismatch)
+    );
+
     // A separately wrapped key authenticates as an envelope but does not
     // match the sealer's header commitment. Use a distinct test root/version.
     let wrong_key_context = EnvelopeContext {
