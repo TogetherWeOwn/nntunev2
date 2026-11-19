@@ -1,4 +1,4 @@
-//! Disposable Worker-only control for the real reconciliation store.
+//! Disposable Worker-only controls for the test-feature reconciliation prototype.
 use super::{billing_budget, MirrorBinding, PgStore, Store, StoreError};
 use crate::billing_reconcile::{PaidInvoiceRow, ReconcileOutcome, ReconciledRow};
 const CONNECTION: &str =
@@ -388,4 +388,53 @@ pub(crate) async fn test_reconcile_cancel() -> Result<(), &'static str> {
     outcome.history[1].stripe_invoice_id = "in_worker_cancel".into();
     outcome.row.paid_invoice_id = Some("in_worker_cancel".into());
     cancel_in_flight(outcome).await
+}
+
+pub(crate) async fn setup_ack_fixture() -> Result<(), &'static str> {
+    fixture(true)
+        .await
+        .map_err(|_| "billing fixture setup failed")
+}
+
+// The relay withholds a successful COMMIT response from the test-feature
+// prototype. Observe the committed rows before retrying the same outcome.
+pub(crate) async fn test_reconcile_ack_retry() -> Result<(), &'static str> {
+    let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-commit-ack-loss-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: Some(expired.clone()),
+        cancel_token_observer: None,
+    };
+    let mut outcome = test_outcome();
+    outcome.history[1].currency = "eur".into();
+    if store
+        .store_reconcile_outcome("worker_fault_user", &outcome)
+        .await
+        .is_ok()
+    {
+        return Err("COMMIT acknowledgement loss unexpectedly succeeded");
+    }
+    if expired.get() {
+        return Err("COMMIT acknowledgement loss was masked by the Worker work deadline");
+    }
+    let committed = fault_snapshot()
+        .await
+        .map_err(|_| "COMMIT acknowledgement loss stored incorrect state")?;
+    let retry = PgStore {
+        trace_id: "worker-fault-test".into(),
+        work_deadline_observer: None,
+        ..store
+    };
+    for step in ["billing retry failed", "billing replay failed"] {
+        retry
+            .store_reconcile_outcome("worker_fault_user", &outcome)
+            .await
+            .map_err(|_| step)?;
+        if fault_snapshot().await.map_err(|_| step)? != committed {
+            return Err("billing retry or replay changed committed state");
+        }
+    }
+    Ok(())
 }

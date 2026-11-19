@@ -226,6 +226,18 @@ pub async fn billing_owned_test_entry(
             Err(message) => worker::Response::error(message, 500),
         };
     }
+    if req.method() == worker::Method::Post && req.path() == "/billing-ack-fixture" {
+        return match worker_entry::billing_deadline_test::setup_ack_fixture().await {
+            Ok(()) => worker::Response::ok("billing-ack-fixture-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-reconcile-ack-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_ack_retry().await {
+            Ok(()) => worker::Response::ok("billing-reconcile-ack-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
     if req.method() == worker::Method::Post && req.path() == "/billing-cancel-proof" {
         return match worker_entry::billing_deadline_test::test_reconcile_cancel().await {
             Ok(()) => worker::Response::ok("billing-cancel-ok"),

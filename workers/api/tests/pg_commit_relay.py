@@ -176,9 +176,8 @@ def run(listener, stop, exchange=None):
         # The server's readiness snapshot may predate queued frontend input.
         if select.select((client,), [], [], 0)[0]:
             raise ProtocolError("frontend data after COMMIT")
-        # Close both connections without releasing the barrier.
-        if exchange.native:
-            return b"W"
+    # Both connections have closed without releasing the barrier.
+    return b"W"
 
 
 @contextmanager

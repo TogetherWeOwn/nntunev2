@@ -98,6 +98,16 @@ def check_billing_ack(base, settings, observe):
     print("PASS: withheld COMMIT; durable row and closed backend", flush=True)
 
 
+def check_reconcile_ack(base):
+    status, _, body = routing.http("POST", base + "/billing-ack-fixture")
+    routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
+    with relay.commit_relay() as ack:
+        status, _, body = routing.http("POST", base + "/billing-reconcile-ack-proof")
+        routing.check(status == 200 and body == "billing-reconcile-ack-ok", body)
+        routing.check(ack.result(timeout=2) == b"W", "relay did not withhold COMMIT")
+    print("PASS: test-feature billing prototype lost COMMIT acknowledgement, retry and replay", flush=True)
+
+
 def main():
     routing.check(os.environ.get("GITHUB_ACTIONS") == "true" and
                   os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", "hosted Actions only")
@@ -157,6 +167,11 @@ def main():
                     status, _, body = routing.http("POST", url)
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    check_reconcile_ack(f"http://127.0.0.1:{port}")
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
