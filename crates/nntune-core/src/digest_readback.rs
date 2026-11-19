@@ -1,15 +1,14 @@
 //! Bounded content verification against an existing sealer-origin manifest.
 //!
-//! The frame verifier accepts externally framed bytes. The body adapter also
-//! checks exact lengths and EOF on the supplied bodies. Neither establishes
-//! locator/version, complete sidecar inventory, or media validity. Success
-//! grants no custody, publication, or reuse authority.
+//! The frame verifier accepts externally framed bytes. The pinned adapter
+//! additionally checks full responses and EOF against an existing inventory.
+//! Success does not establish inventory trust, media validity, custody, or eligibility.
 
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
 use crate::media::FileKey;
 use sha2::{Digest, Sha256};
-use std::{future::Future, ops::AsyncFnMut};
+use std::{collections::HashSet, future::Future, ops::AsyncFnMut};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReadbackError {
@@ -77,6 +76,8 @@ impl<'a> DigestReadback<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BodyReadbackError {
+    Inventory,
+    Response,
     Transport,
     Truncated,
     Trailing,
@@ -116,26 +117,91 @@ async fn require_eof(body: &mut impl ReadbackBody) -> Result<(), BodyReadbackErr
     }
 }
 
-/// Check the exact media body and each expected page body, one at a time.
-/// The caller supplies already-authorized, version-pinned full-body reads
-/// with deadlines. Fetching the expected indices does not prove that the
-/// trusted inventory contains no extra locators. This returns no receipt.
-pub async fn verify_readback_bodies<B: ReadbackBody>(
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReadbackPin<'a> {
+    pub configuration: [u8; 16],
+    pub object_key: &'a str,
+    /// `None` is only for a qualified immutable, unversioned profile.
+    pub version: Option<&'a str>,
+}
+
+pub struct ReadbackResponse<B> {
+    /// Configuration and key actually used for the request.
+    pub configuration: [u8; 16],
+    pub object_key: String,
+    /// Version actually observed in the response, not the requested version.
+    pub version: Option<String>,
+    pub status: u16,
+    pub content_length: Option<u64>,
+    pub has_content_range: bool,
+    pub has_content_encoding: bool,
+    pub body: B,
+}
+
+async fn open_pinned<'a, B>(
+    open: &mut impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
+    pin: ReadbackPin<'a>,
+    length: u64,
+) -> Result<B, BodyReadbackError> {
+    let response = open(pin).await.map_err(|_| BodyReadbackError::Transport)?;
+    if response.configuration != pin.configuration
+        || response.object_key != pin.object_key
+        || response.version.as_deref() != pin.version
+        || response.status != 200
+        || response.content_length != Some(length)
+        || response.has_content_range
+        || response.has_content_encoding
+    {
+        return Err(BodyReadbackError::Response);
+    }
+    Ok(response.body)
+}
+
+/// Check a complete ordered locator inventory against the origin manifest,
+/// then verify full responses without releasing plaintext. The caller must
+/// supply the full inventory from one authorized immutable snapshot, with
+/// canonical keys and a qualified provider profile. The opener must use the
+/// requested pin with deadlines, no redirects or decoding, and reject
+/// ambiguous metadata. This does not list storage or issue a receipt.
+pub async fn verify_pinned_readback<'a, B: ReadbackBody>(
     manifest: &OriginManifest,
     key: &FileKey,
-    mut media: impl ReadbackBody,
-    mut open_page: impl AsyncFnMut(u32) -> std::io::Result<B>,
+    identities: &[[u8; 16]; 5],
+    media: ReadbackPin<'a>,
+    pages: &[(u32, ReadbackPin<'a>)],
+    mut open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
 ) -> Result<(), BodyReadbackError> {
     let geometry = manifest.geometry();
+    let indices = pages.iter().map(|&(index, _)| index);
+    let origin = manifest.candidate_page_hashes(
+        identities,
+        geometry.plaintext_len(),
+        manifest.map_id(),
+        manifest.header_bytes(),
+    );
+    if indices.ne(0..geometry.pages()) || origin.is_none() {
+        return Err(BodyReadbackError::Inventory);
+    }
+    let mut keys = HashSet::with_capacity(pages.len() + 1);
+    let mut pins = std::iter::once(media).chain(pages.iter().map(|&(_, pin)| pin));
+    if !pins.all(|pin| {
+        pin.configuration == identities[4]
+            && !pin.object_key.is_empty()
+            && keys.insert(pin.object_key)
+            && pin.version.is_some() == media.version.is_some()
+            && !matches!(pin.version, Some("" | "null"))
+    }) {
+        return Err(BodyReadbackError::Inventory);
+    }
+    drop(keys);
     let mut readback = DigestReadback::new(manifest, key).map_err(BodyReadbackError::Content)?;
+    let mut media = open_pinned(&mut open, media, geometry.sealed_len()).await?;
     let mut header = [0; 48];
     read_exact(&mut media, &mut header).await?;
-    for index in 0..geometry.pages() {
+    for &(index, pin) in pages {
         let page = geometry.page(index).ok_or(BodyReadbackError::Geometry)?;
         let mut bytes = vec![0; page.encoded_len as usize];
-        let mut body = open_page(index)
-            .await
-            .map_err(|_| BodyReadbackError::Transport)?;
+        let mut body = open_pinned(&mut open, pin, u64::from(page.encoded_len)).await?;
         read_exact(&mut body, &mut bytes).await?;
         require_eof(&mut body).await?;
         drop(body);
@@ -160,7 +226,7 @@ pub async fn verify_readback_bodies<B: ReadbackBody>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest_test_fixture::{fixture, Fixture};
+    use crate::digest_test_fixture::{fixture, id, Fixture};
 
     struct Body<'a>(&'a [u8], bool);
 
@@ -177,13 +243,103 @@ mod tests {
         }
     }
 
+    fn pin(object_key: &str) -> ReadbackPin<'_> {
+        ReadbackPin {
+            configuration: id(1),
+            object_key,
+            version: Some("original"),
+        }
+    }
+
     async fn bodies(f: &Fixture, media: Body<'_>, page: Body<'_>) -> Result<(), BodyReadbackError> {
-        let Body(bytes, fail_at_eof) = page;
-        verify_readback_bodies(&f.manifest, &f.key, media, async move |index| {
-            assert_eq!(index, 0);
-            Ok(Body(bytes, fail_at_eof))
-        })
+        verify_pinned_readback(
+            &f.manifest,
+            &f.key,
+            &[id(1); 5],
+            pin("media"),
+            &[(0, pin("page"))],
+            async |request: ReadbackPin<'_>| {
+                let (key, body, length) = match request.object_key {
+                    "media" => ("media", &media, f.manifest.geometry().sealed_len()),
+                    "page" => ("page", &page, f.pages[0].len() as u64),
+                    _ => panic!("unexpected synthetic request"),
+                };
+                assert!(request == pin(key));
+                Ok(ReadbackResponse {
+                    configuration: id(1),
+                    object_key: key.into(),
+                    version: Some("original".into()),
+                    status: 200,
+                    content_length: Some(length),
+                    has_content_range: false,
+                    has_content_encoding: false,
+                    body: Body(body.0, body.1),
+                })
+            },
+        )
         .await
+    }
+
+    #[tokio::test]
+    async fn invalid_inventory_is_refused_before_opening_any_body() {
+        let f = fixture(b"abc");
+        let media = pin("media");
+        let mut wrong_config = pin("page");
+        wrong_config.configuration = id(2);
+        let mut unversioned = pin("page");
+        unversioned.version = None;
+        let mut null_version = pin("page");
+        null_version.version = Some("null");
+        let mut wrong_identity = [id(1); 5];
+        wrong_identity[0] = id(2);
+        for (identities, pages) in [
+            ([id(1); 5], vec![]),
+            ([id(1); 5], vec![(0, pin("page")), (1, pin("extra"))]),
+            ([id(1); 5], vec![(1, pin("page"))]),
+            ([id(1); 5], vec![(0, media)]),
+            ([id(1); 5], vec![(0, wrong_config)]),
+            ([id(1); 5], vec![(0, unversioned)]),
+            ([id(1); 5], vec![(0, null_version)]),
+            (wrong_identity, vec![(0, pin("page"))]),
+        ] {
+            let open = async |_| -> std::io::Result<ReadbackResponse<Body<'static>>> {
+                panic!("invalid inventory opened a body")
+            };
+            assert_eq!(
+                verify_pinned_readback(&f.manifest, &f.key, &identities, media, &pages, open).await,
+                Err(BodyReadbackError::Inventory)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_open_rejects_mismatched_response_metadata() {
+        for (status, length, version, key, configuration, range, encoding) in [
+            (206, Some(4), Some("original"), "page", id(1), false, false),
+            (200, Some(5), Some("original"), "page", id(1), false, false),
+            (200, None, Some("original"), "page", id(1), false, false),
+            (200, Some(4), None, "page", id(1), false, false),
+            (200, Some(4), Some("other"), "page", id(1), false, false),
+            (200, Some(4), Some("original"), "other", id(1), false, false),
+            (200, Some(4), Some("original"), "page", id(2), false, false),
+            (200, Some(4), Some("original"), "page", id(1), true, false),
+            (200, Some(4), Some("original"), "page", id(1), false, true),
+        ] {
+            let mut open = async |_| {
+                Ok(ReadbackResponse {
+                    configuration,
+                    object_key: key.into(),
+                    version: version.map(str::to_owned),
+                    status,
+                    content_length: length,
+                    has_content_range: range,
+                    has_content_encoding: encoding,
+                    body: (),
+                })
+            };
+            let result = open_pinned(&mut open, pin("page"), 4).await;
+            assert_eq!(result, Err(BodyReadbackError::Response));
+        }
     }
 
     #[tokio::test]
