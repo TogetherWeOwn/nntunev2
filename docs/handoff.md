@@ -83,10 +83,10 @@ on `main`.
    Record Worker identity and outcome for each deployed lane. Use the
    [staging readout template](staging-validation-readout-template.md) and the
    [promotion checklist](ops.md#staging-promotion-checklist).
-4. Before promotion, record the last-good staging SHA and its successful
-   push deploy run. Follow the [deploy lock and rollback procedure](ops.md#staging-deploy-lock-cutover-and-rollback)
-   to drain concurrent deploys, rerun that push, and verify the web job,
-   health and restored SHA. Retain [separate Worker rollback evidence](ops.md#future-worker-deploy-lanes-required-rollback-evidence).
+4. Before promotion, record the last-good staging version, SHA and successful
+   push deploy run for each affected Worker. Follow the [deploy lock and rollback procedure](ops.md#staging-deploy-lock-cutover-and-rollback)
+   and [Worker custody checks](ops.md#staging-worker-custody) before restoring
+   an exact version. Retain [per-Worker rollback evidence](ops.md#future-worker-deploy-lanes-required-rollback-evidence).
    An accepted rollback pointer and successful restore run are still outstanding
    in this readout.
 

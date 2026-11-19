@@ -1295,23 +1295,13 @@ requires independent release approval. A push to `main` deploys to the
   creation, and no resize, split, role change, or credential rotation as part
   of promotion. Staging serves `nntunev2_staging` through its runtime roles;
   the prod binding stays reserved.
-- [ ] Rollback pointer recorded: record the last good staging SHA and its
-  successful push-triggered `deploy.yml` run, with `staging-web` conclusion
-  `success` (not `skipped`), before promoting. To accept rollback evidence,
-  also require the rollback rerun's `staging-web` job conclusion to be `success`
-  (not `skipped`); overall workflow success and staging health alone are
-  insufficient. Follow the [staging deploy lock cutover and rollback
-  procedure](#staging-deploy-lock-cutover-and-rollback) before re-running
-  any known-good push. To roll back `apps/web`, open that Actions run and
-  choose **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
-  `staging-web` is push-only and will be skipped. Verify the rerun's
-  `staging-web` success and staging health. The rerun also redeploys the api,
-  mb and ingest Workers through `staging-api`, `staging-mb` and
-  `staging-ingest` when those lanes are configured; that is not verified
-  Worker rollback, and each Worker needs its own rollback evidence.
-  Staging rollback is
-  a redeploy, never a data restore; retain the UNDO blocks and consolidation
-  receipt for infrastructure-specific rollback.
+- [ ] Rollback pointer recorded: for each affected staging Worker, retain the
+  last reviewed known-good version, source SHA, successful deployment run/attempt,
+  and effective binding inventory before promoting. Require an executed rollback
+  job and verify each affected Worker's restored version, serving SHA and health.
+  Follow the [deploy lock procedure](#staging-deploy-lock-cutover-and-rollback)
+  and the [Worker custody checks](#staging-worker-custody). Retain the UNDO blocks
+  and consolidation receipt for separate infrastructure rollback.
 
 ### Staging deploy lock cutover and rollback
 
@@ -1327,14 +1317,62 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   the lock change and let its deploy and post-deploy E2E finish before
   resuming normal merges and reruns. Do not rerun a pre-lock deploy during
   cutover.
-- **Rollback:** Pause new `main` merges/pushes and other staging deploy
-  reruns, and let all active and queued `main` deploy runs finish through
-  post-deploy E2E. Only then **Re-run all jobs** on the chosen push run.
-  Keep the pause in place through the rerun's deploy and post-deploy E2E
-  and verify that staging is serving the rollback SHA before resuming.
-  Draining first also keeps an already queued push from immediately
-  undoing the rollback. If the queue cannot be drained and kept clear, do
-  not start a pre-lock rerun.
+- **Rollback:** Pause new `main` merges/pushes and staging deploy reruns.
+  Drain active and queued deploys through post-deploy E2E, including the
+  separate alerts lane when affected. Keep the pause through the reviewed
+  restore and its readback so a queued push cannot immediately overwrite it.
+  A historical rerun can redeploy multiple Workers and may bypass the lock.
+  Hold if the queue cannot be drained or the restore path is unverified.
+
+### Staging Worker custody
+
+Custody and rollback require a separately verified activation. The protected
+staging workflows have these fixed source targets.
+
+| Workflow | Job | Worker |
+| --- | --- | --- |
+| [`deploy.yml`](../.github/workflows/deploy.yml) | `staging-web` | `nntune-web-staging` |
+| `deploy.yml` | `staging-api` | `nntune-api-staging` |
+| `deploy.yml` | `staging-mb` | `nntune-mb-staging` |
+| `deploy.yml` | `staging-ingest` | `nntune-ingest-staging` |
+| [`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml) | `deploy` | `nntune-alerts-staging` |
+
+1. Use read-only provider inventory to confirm the account, Worker identity,
+   active deployment, and effective bindings of each deploy and rollback
+   target. Follow service bindings, Tail, queues, routes and other invocation
+   paths to their destinations. Resolve unexpected reach and verify isolation
+   from production writes. Preserve the documented shared MusicBrainz read
+   boundary and [MB/ingest activation holds](#operator-runbook-enabling-staging-mb--staging-ingest).
+   Cloudflare [Worker roles](https://developers.cloudflare.com/workers/authorization/workers/)
+   can limit Worker names while allowing bindings to same-account resources.
+2. Confirm a single authorized writer before applying anything. Inventory
+   deploy, observation and other credential consumers. A cutover has to remove
+   superseded write access and prove that those paths are unusable. Refuse
+   alternate workflows and jobs, stale refs, reruns and off-CI writers. Keep
+   provider observation, staging Access, CI fixtures and production credentials
+   separate. The GitHub environment's branch rule covers refs only.
+3. Independently approve the exact submission before the writer uses its
+   credential. Tie approval to the trusted workflow revision, protected main
+   ref, approved event, job, run/attempt, exact source SHA, account, Worker and
+   operation. The deploy lanes use the main push event.
+   Cover each outgoing provider mutation with its HTTP method, path, query,
+   request format and digest of the final body, including generated settings,
+   code, routes and triggers. The writer verifies provider-retained settings,
+   loads the independent approval itself, derives the submission from trusted
+   provenance and sends the same checked bytes without overrides. Record hashes
+   and IDs in the authorized evidence record. Keep raw requests and credentials
+   out of evidence. The [offline comparison](../ci/staging_worker_submission.py)
+   compares the supplied pins. Caller authentication, single-use enforcement,
+   request handling and provider confirmation are separate admission requirements.
+4. Before a staging apply, prove that the same custody and review boundary can
+   restore the exact known-good Worker version, with safe reachable bindings
+   and compatible schema and Durable Object lineage. Rehearse the restore and
+   refusals with synthetic fixtures. For live evidence use the existing protected
+   staging workflow, retain its executed restore result and read back the restored
+   serving version, SHA and health. Record partial-failure state before any retry.
+   Hold the apply while the protected restore path or its readback is unavailable.
+   Retain existing health, schema and exact-head checks and bound the staging
+   window, including cleanup or expiry on failure and cancellation.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1510,11 +1548,7 @@ deploys either Worker — until every step below clears, in order:
    corresponding `absent_in` entries from
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
-8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
-   follow the [staging deploy lock cutover and rollback
-   procedure](#staging-deploy-lock-cutover-and-rollback), then re-run the
-   known-good push's `deploy.yml` run (**Re-run all jobs**; never
-   `workflow_dispatch` on an old SHA — the lanes are push-only and would
-   skip). Retain the per-Worker evidence in the table above. A
-   rerun redeploys every configured lane; that is not verified per-Worker
-   rollback unless each Worker's own outcome evidence is recorded.
+8. **Rollback restores Worker code.** Preserve the last reviewed known-good
+   version and the per-Worker evidence above. Follow the
+   [deploy lock procedure](#staging-deploy-lock-cutover-and-rollback) and
+   [staging Worker custody](#staging-worker-custody) before restoring it.
