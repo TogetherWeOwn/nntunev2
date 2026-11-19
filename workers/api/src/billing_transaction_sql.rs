@@ -46,6 +46,157 @@ impl<'a> LookupBinds<'a> {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileProbe {
+    None,
+    WorkerDeadline,
+    ServerWatchdog,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)] // Not reachable from a release reconciliation caller.
+pub(crate) async fn apply_reconcile_transaction(
+    transaction: &mut tokio_postgres::Client,
+    user_id: String,
+    outcome: crate::billing_reconcile::ReconcileOutcome,
+    #[cfg(feature = "billing-owned-wasm-test")] probe: ReconcileProbe,
+) -> Result<(), crate::handlers::StoreError> {
+    use crate::billing_store_classification::{
+        classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget,
+    };
+    use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
+    use tokio_postgres::types::Type;
+    let row = &outcome.row;
+    let work = async {
+        transaction
+            .query_typed(reconcile_lock_statement(), &[(&user_id, Type::TEXT)])
+            .await
+            .map_err(|_| StoreError)?;
+        transaction
+            .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
+            .await
+            .map_err(|_| StoreError)?;
+        let observed_rows = transaction
+            .query_typed(
+                crate::billing_transaction_sql::LOOKUP_TARGET,
+                &[
+                    (&row.stripe_subscription_id, Type::TEXT),
+                    (&row.paid_through_unix, Type::INT8),
+                    (&row.paid_invoice_id, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        let observed = observed_rows
+            .iter()
+            .map(|found| {
+                Ok(ObservedTarget {
+                    identity: Identity {
+                        user_id: found.try_get("user_id")?,
+                        subscription_id: found.try_get("stripe_subscription_id")?,
+                    },
+                    predicate_stale: found.try_get("predicate_stale")?,
+                })
+            })
+            .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+            .map_err(|_| StoreError)?;
+        let requested = Identity {
+            user_id: &user_id,
+            subscription_id: &row.stripe_subscription_id,
+        };
+        let target = classify_target(&requested, &observed).map_err(|_| StoreError)?;
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| StoreError)?;
+        if outcome.explicit_stale {
+            classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| StoreError)?;
+        } else {
+            let written = transaction
+                .query_typed(
+                    crate::billing_transaction_sql::WRITE_SUBSCRIPTION,
+                    &[
+                        (&user_id, Type::TEXT),
+                        (&row.stripe_subscription_id, Type::TEXT),
+                        (&row.stripe_customer_id, Type::TEXT),
+                        (&row.stripe_item_id, Type::TEXT),
+                        (&row.stripe_price_id, Type::TEXT),
+                        (&row.plan_id, Type::TEXT),
+                        (&row.status, Type::TEXT),
+                        (&row.current_period_end_unix, Type::INT8),
+                        (&row.cancel_at_period_end, Type::BOOL),
+                        (&row.paid_through_unix, Type::INT8),
+                        (&row.paid_invoice_id, Type::TEXT),
+                        (&row.grace_until_unix, Type::INT8),
+                        (&outcome.read_anchor, Type::TEXT),
+                        (&outcome.read_plan, Type::TEXT),
+                        (&outcome.explicit_stale, Type::BOOL),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+            let returned = written
+                .iter()
+                .map(|found| {
+                    Ok(Identity {
+                        user_id: found.try_get("user_id")?,
+                        subscription_id: found.try_get("stripe_subscription_id")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+                .map_err(|_| StoreError)?;
+            classify_write(&requested, &target, &returned).map_err(|_| StoreError)?;
+        }
+        for history in &outcome.history {
+            transaction
+                .query_typed(
+                    crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                    &[
+                        (&user_id, Type::TEXT),
+                        (&history.stripe_invoice_id, Type::TEXT),
+                        (&history.stripe_subscription_id, Type::TEXT),
+                        (&history.plan_id, Type::TEXT),
+                        (&history.period_start_unix, Type::INT8),
+                        (&history.period_end_unix, Type::INT8),
+                        (&history.amount_cents, Type::INT8),
+                        (&history.currency, Type::TEXT),
+                        (&history.paid_at_unix, Type::INT8),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        }
+        // The probes run only after all billing writes and before COMMIT.
+        #[cfg(feature = "billing-owned-wasm-test")]
+        if probe != ReconcileProbe::None {
+            let written = transaction.query_one(
+                "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
+            ).await.map_err(|_| StoreError)?;
+            if written.get::<_, i64>(0) != 1 || written.get::<_, i64>(1) != 2 {
+                return Err(StoreError);
+            }
+            if probe == ReconcileProbe::WorkerDeadline {
+                transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+            }
+            // Readiness follows acknowledgement of the timeout settings.
+            transaction
+                .batch_execute("SELECT pg_advisory_xact_lock(781349053)")
+                .await
+                .map_err(|_| StoreError)?;
+            std::future::pending::<()>().await;
+        }
+        Ok::<(), StoreError>(())
+    };
+    // A failed COMMIT acknowledgement remains an unknown outcome.
+    if let Err(error) = work.await {
+        let _ = transaction.batch_execute("ROLLBACK").await;
+        return Err(error);
+    }
+    transaction
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|_| StoreError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

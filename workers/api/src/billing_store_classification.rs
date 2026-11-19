@@ -4,7 +4,9 @@
 //! Callers must supply a fresh global-key observation made after acquiring the
 //! subscription table exclusion on the same transaction backend. The stale
 //! predicate must be evaluated by PostgreSQL using the production input casts.
-//! This module is not wired to the Worker store and does not close collisions.
+//! Used by the dormant owned Worker store; not a live reconciliation boundary.
+
+use crate::billing_reconcile::ReconcileOutcome;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Identity<'a> {
@@ -36,6 +38,18 @@ pub enum Accepted {
 /// must also become store failures before invoking these classifiers.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Refused;
+
+/// Only the exact subscription named by the fold can authorize history.
+pub fn validate_history_target(outcome: &ReconcileOutcome) -> Result<(), Refused> {
+    if outcome
+        .history
+        .iter()
+        .any(|item| item.stripe_subscription_id != outcome.row.stripe_subscription_id)
+    {
+        return Err(Refused);
+    }
+    Ok(())
+}
 
 /// Classify a fresh, global-key observation before any subscription or history
 /// write. A foreign, mismatched, or multiple-row result is never absence.

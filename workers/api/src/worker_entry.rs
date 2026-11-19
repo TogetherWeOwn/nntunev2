@@ -38,6 +38,12 @@ use crate::handlers::{
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
 pub(crate) mod billing_budget;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_cancel_control.rs"]
+mod billing_cancel_control;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_deadline_test.rs"]
+pub(crate) mod billing_deadline_test;
 
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -742,13 +748,30 @@ impl MirrorBinding {
     }
 }
 
+#[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
+#[path = "subsonic_membership.rs"]
+pub(crate) mod subsonic_membership;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
+pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
+// Unmounted until the staging membership and mirror readers adopt it.
+#[allow(dead_code)]
+#[path = "subsonic_pg_page.rs"]
+pub(crate) mod subsonic_pg_page;
+
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
+pub use subsonic_pg::load_staging_account;
 
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
     mirror_binding: MirrorBinding,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    cancel_token_observer:
+        Option<std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::CancelToken>>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -957,6 +980,70 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)] // Not called by release reconciliation until activation.
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+        #[cfg(feature = "billing-owned-wasm-test")]
+        probe: crate::billing_transaction_sql::ReconcileProbe,
+    ) -> Result<(), StoreError> {
+        use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| failed())?;
+        #[cfg(feature = "billing-owned-wasm-test")]
+        let (host, port, connection_string) = (
+                "127.0.0.1".to_owned(),
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
+                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+            );
+        #[cfg(not(feature = "billing-owned-wasm-test"))]
+        let (host, port, connection_string) = {
+            let env = self.env.as_ref().ok_or(StoreError)?;
+            let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+            (
+                hyperdrive.host().to_owned(),
+                hyperdrive.port(),
+                hyperdrive.connection_string(),
+            )
+        };
+        billing_budget::with_owned_connection(
+            &host,
+            port,
+            &connection_string,
+            |client| {
+                #[cfg(feature = "billing-owned-wasm-test")]
+                if let Some(observer) = &self.cancel_token_observer {
+                    *observer.borrow_mut() = Some(client.cancel_token());
+                }
+                Box::pin(billing_budget::bootstrap_transaction(client))
+            },
+            move |client| {
+                Box::pin(apply(
+                    client,
+                    user_id,
+                    outcome,
+                    #[cfg(feature = "billing-owned-wasm-test")]
+                    probe,
+                ))
+            },
+            #[cfg(feature = "billing-owned-wasm-test")]
+            |expired| {
+                if let Some(observer) = &self.work_deadline_observer {
+                    observer.set(expired);
+                }
+            },
+        )
+        .await
+        .map_err(|_| failed())
+    }
+
     /// NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
     #[allow(clippy::too_many_arguments)]
@@ -1173,6 +1260,8 @@ impl PgStore {
                 // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
                 // backends).
                 let membership_cap = cap.checked_mul(2).filter(|n| *n > 0).ok_or(StoreError)?;
+                let membership_limit = membership_cap.checked_add(1).ok_or(StoreError)?;
+                let limit = cap.checked_add(1).ok_or(StoreError)?;
                 let mut client = self.connect().await?;
                 let tx = client.build_transaction()
                     .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
@@ -1183,10 +1272,25 @@ impl PgStore {
                     "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_releases_statement()
                 );
+                // Count at most cap + 1 rows in the database; reject the
+                // sentinel before transferring membership rows.
+                let admitted: bool = tx
+                    .query_typed(
+                        &subsonic_page_probe(&releases_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-release").await?;
                 let member = tx
                     .query_typed(
                         &releases_sql,
-                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
@@ -1209,10 +1313,23 @@ impl PgStore {
                      FROM ({}) AS membership LIMIT $2",
                     crate::catalogue::catalogue_member_track_pairs_statement()
                 );
+                let admitted: bool = tx
+                    .query_typed(
+                        &subsonic_page_probe(&pairs_sql),
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.subsonic_member_catalogue")
+                    })?
+                    .first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
+                if !admitted { return Err(StoreError); }
+                #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                self.run_preflight_hook("membership-pairs").await?;
                 let pairs = tx
                     .query_typed(
                         &pairs_sql,
-                        &[(&user_id, Type::TEXT), (&membership_cap, Type::INT8)],
+                        &[(&user_id, Type::TEXT), (&membership_limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| {
@@ -1240,8 +1357,9 @@ impl PgStore {
                 let artist_preflight = subsonic_text_preflight(
                     crate::catalogue::artists_list_statement(),
                     &["mbid", "name", "sort_name", "type", "country"],
+                    "$2",
                 );
-                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&artist_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1249,7 +1367,7 @@ impl PgStore {
                 let artist_rows = tx
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
@@ -1266,8 +1384,9 @@ impl PgStore {
                 let release_preflight = subsonic_text_preflight(
                     crate::catalogue::releases_list_statement(),
                     &["mbid", "title", "release_type", "artist_mbid", "artist_name"],
+                    "$2",
                 );
-                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&release_preflight, &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1275,7 +1394,7 @@ impl PgStore {
                 let release_rows = tx
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
-                        &[(&member_releases, Type::TEXT_ARRAY), (&cap, Type::INT8)],
+                        &[(&member_releases, Type::TEXT_ARRAY), (&limit, Type::INT8)],
                     )
                     .await
                     .map_err(|_| statement_failed())?;
@@ -1289,8 +1408,9 @@ impl PgStore {
                 let track_preflight = subsonic_text_preflight(
                     crate::catalogue::tracks_list_statement(),
                     &["release_mbid", "recording_mbid", "title", "release_title", "artist_mbid", "artist_name"],
+                    "$3",
                 );
-                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&cap, Type::INT8)])
+                let admitted: bool = tx.query_typed(&track_preflight, &[(&pair_releases, Type::TEXT_ARRAY), (&pair_recordings, Type::TEXT_ARRAY), (&limit, Type::INT8)])
                     .await.map_err(|_| statement_failed())?.first().ok_or(StoreError)?.try_get(0).map_err(|_| StoreError)?;
                 if !admitted { return Err(StoreError); }
                 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -1301,7 +1421,7 @@ impl PgStore {
                         &[
                             (&pair_releases, Type::TEXT_ARRAY),
                             (&pair_recordings, Type::TEXT_ARRAY),
-                            (&cap, Type::INT8),
+                            (&limit, Type::INT8),
                         ],
                     )
                     .await
@@ -5170,6 +5290,7 @@ impl Store for PgStore {
         .await
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     async fn store_reconcile_outcome(
         &self,
         user_id: &str,
@@ -5239,6 +5360,22 @@ impl Store for PgStore {
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let user_id = user_id.to_owned();
+        let outcome = outcome.clone();
+        self.store_reconcile_owned(
+            user_id,
+            outcome,
+            crate::billing_transaction_sql::ReconcileProbe::None,
         )
         .await
     }
@@ -5420,16 +5557,14 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // One EXISTS probe over the same established states
-                // the reaper protects (`unverified_user_filter`):
-                // credential, any session row (a completed sign-in
-                // leaves one, revoked or not), vault, or a promoted
-                // (non-member) role. A missing user row is simply
-                // never-admitted.
+                // Established states protected by `unverified_user_filter`:
+                // a credential, any session (even revoked), the legacy
+                // vault marker, or a promoted (non-member) role. A missing
+                // user is never admitted.
                 let sql = format!(
                     "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
                      OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
-                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND legacy_vault_established) \
                      OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
                     member = crate::admin::ROLE_MEMBER
                 );
@@ -6773,7 +6908,9 @@ const SUBSONIC_SNAPSHOT_CAP: i64 = 1_024;
 
 // Only static, developer-owned column names and statements may be passed.
 // Numeric aggregation avoids overflow even for pathological stored values.
-fn subsonic_text_preflight(statement: &str, columns: &[&str]) -> String {
+// `cap_param` is the statement's LIMIT placeholder, bound to cap + 1.
+// A full sentinel page is refused inside the database before row transfer.
+fn subsonic_text_preflight(statement: &str, columns: &[&str], cap_param: &str) -> String {
     let lengths: Vec<String> = columns
         .iter()
         .map(|column| format!("COALESCE(octet_length({column}), 0)::bigint"))
@@ -6785,16 +6922,21 @@ fn subsonic_text_preflight(statement: &str, columns: &[&str]) -> String {
         .join(" AND ");
     let row_bytes = lengths.join(" + ");
     format!(
-        "SELECT COALESCE(bool_and({per_field}), true) AND \
+        "SELECT count(*) < {cap_param}::bigint AND \
+         COALESCE(bool_and({per_field}), true) AND \
          COALESCE(sum(({row_bytes})::numeric), 0) <= 262144 \
          FROM ({statement}) AS snapshot_rows"
     )
 }
 
-// A full page may have been truncated. Refuse it rather than serve a
-// potentially incomplete catalogue; the check precedes membership filtering.
+// The membership LIMIT is cap + 1; a full sentinel page is over cap.
+fn subsonic_page_probe(statement: &str) -> String {
+    format!("SELECT count(*) < $2::bigint FROM (SELECT 1 FROM ({statement}) AS probe_rows LIMIT $2) AS page")
+}
+
+// A sentinel row means the page exceeds the admitted cap.
 fn require_complete_snapshot_page(len: usize, cap: i64) -> Result<(), StoreError> {
-    if cap <= 0 || len >= cap as usize {
+    if cap <= 0 || len > cap as usize {
         Err(StoreError)
     } else {
         Ok(())
@@ -6907,6 +7049,10 @@ pub async fn subsonic_mount(
         env: Some(env.clone()),
         trace_id: crate::logging::resolve_trace_id(trace_id.as_deref()),
         mirror_binding: MirrorBinding::from_env(&env),
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        work_deadline_observer: None,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        cancel_token_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -7099,6 +7245,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             env: Some(env.clone()),
             trace_id: trace_id.clone(),
             mirror_binding: MirrorBinding::from_env(&env),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            work_deadline_observer: None,
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            cancel_token_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -7174,11 +7324,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_snapshot_page_fails_closed() {
+    fn over_cap_snapshot_page_fails_closed() {
         let cap = SUBSONIC_SNAPSHOT_CAP as usize;
         assert!(require_complete_snapshot_page(0, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
-        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_err());
+        assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
     }
 

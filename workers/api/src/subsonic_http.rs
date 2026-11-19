@@ -27,6 +27,7 @@
 use std::fmt;
 
 use nntune_subsonic::auth::Credentials;
+use nntune_subsonic::construction_budget::ConstructionBudget;
 
 mod staging_body;
 pub use staging_body::{StagingBody, StagingBodyError};
@@ -60,6 +61,8 @@ pub enum CredentialParseError {
     /// A credential parameter appeared more than once (any source), or in
     /// array form.
     DuplicateCredential,
+    /// Staging decode exceeded its construction budget or could not reserve storage.
+    Capacity,
 }
 
 impl fmt::Display for CredentialParseError {
@@ -71,6 +74,7 @@ impl fmt::Display for CredentialParseError {
             Self::ValueTooLong => "credential parameter too long",
             Self::MalformedEncoding => "malformed parameter encoding",
             Self::DuplicateCredential => "duplicate credential parameter",
+            Self::Capacity => "request construction capacity unavailable",
         })
     }
 }
@@ -139,13 +143,28 @@ pub fn parse_credentials(
     query: Option<&str>,
     form_body: Option<&[u8]>,
 ) -> Result<Credentials, CredentialParseError> {
+    parse_credential_sources(query, form_body, None)
+}
+
+#[allow(dead_code)] // Unmounted; staging integration will supply the production caller.
+pub(crate) fn parse_staging_credentials(
+    query: Option<&str>,
+    form_body: Option<&[u8]>,
+    budget: &mut ConstructionBudget,
+) -> Result<Credentials, CredentialParseError> {
+    validate_staging_sources(query, form_body)?;
+    parse_credential_sources(query, form_body, Some(budget))
+}
+
+fn parse_credential_sources(
+    query: Option<&str>,
+    form_body: Option<&[u8]>,
+    mut budget: Option<&mut ConstructionBudget>,
+) -> Result<Credentials, CredentialParseError> {
     let mut creds = Credentials::default();
     let mut seen = [false; 5];
-    if let Some(q) = query {
-        scan(q.as_bytes(), &mut creds, &mut seen)?;
-    }
-    if let Some(b) = form_body {
-        scan(b, &mut creds, &mut seen)?;
+    for raw in [query.map(str::as_bytes), form_body].into_iter().flatten() {
+        scan(raw, &mut creds, &mut seen, budget.as_deref_mut())?;
     }
     Ok(creds)
 }
@@ -154,6 +173,7 @@ fn scan(
     raw: &[u8],
     creds: &mut Credentials,
     seen: &mut [bool; 5],
+    mut budget: Option<&mut ConstructionBudget>,
 ) -> Result<(), CredentialParseError> {
     if raw.len() > MAX_SOURCE_BYTES {
         return Err(CredentialParseError::SourceTooLarge);
@@ -174,7 +194,7 @@ fn scan(
         if raw_key.len() > MAX_KEY_BYTES {
             return Err(CredentialParseError::KeyTooLong);
         }
-        let key = decode(raw_key)?;
+        let key = decode(raw_key, budget.as_deref_mut())?;
         // Array-style names (`u[]`) are judged by their base name.
         let base = key.split('[').next().unwrap_or("");
         let Some(slot) = Slot::from_key(base) else {
@@ -191,7 +211,7 @@ fn scan(
         if raw_value.len() > MAX_CREDENTIAL_VALUE_BYTES {
             return Err(CredentialParseError::ValueTooLong);
         }
-        let value = Some(decode(raw_value)?);
+        let value = Some(decode(raw_value, budget.as_deref_mut())?);
         match slot {
             Slot::ApiKey => creds.api_key = value,
             Slot::Username => creds.username = value,
@@ -205,8 +225,17 @@ fn scan(
 
 /// Form-urlencoded decode: `+` is a space, `%XX` must be two hex digits,
 /// result must be UTF-8.
-fn decode(raw: &[u8]) -> Result<String, CredentialParseError> {
-    let mut out = Vec::with_capacity(raw.len());
+fn decode(
+    raw: &[u8],
+    budget: Option<&mut ConstructionBudget>,
+) -> Result<String, CredentialParseError> {
+    let mut out = if let Some(budget) = budget {
+        budget
+            .allocate_exact(raw.len())
+            .map_err(|_| CredentialParseError::Capacity)?
+    } else {
+        Vec::with_capacity(raw.len())
+    };
     let mut i = 0;
     while i < raw.len() {
         match raw[i] {
@@ -233,6 +262,41 @@ fn hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
+#[cfg_attr(test, test)]
+pub(crate) fn staging_decode_charges_encoded_capacity_and_keeps_errors() {
+    let (query, form) = (Some("x=%zz"), Some(b"%75=%C3%A9%41%42%43".as_slice()));
+    // Two decoded key allocations (24 each) and the 15-byte value buffer (32).
+    let mut short = ConstructionBudget::new(79);
+    let mut exact = ConstructionBudget::new(80);
+    assert_eq!(
+        parse_staging_credentials(query, form, &mut short).unwrap_err(),
+        CredentialParseError::Capacity
+    );
+    assert_eq!(short.charged(), 48);
+    let name = parse_staging_credentials(query, form, &mut exact)
+        .unwrap()
+        .username
+        .unwrap();
+    assert_eq!(
+        (name.as_str(), name.capacity(), exact.charged()),
+        ("éABC", 15, 80)
+    );
+    for (form, error) in [
+        ("%75=b", CredentialParseError::DuplicateCredential),
+        ("p=%", CredentialParseError::MalformedEncoding),
+        ("p=%ff", CredentialParseError::MalformedEncoding),
+    ] {
+        let mut budget = ConstructionBudget::new(128);
+        let (query, form) = (Some("u=a"), Some(form.as_bytes()));
+        assert_eq!(
+            parse_staging_credentials(query, form, &mut budget).unwrap_err(),
+            error
+        );
+        assert_eq!(parse_credentials(query, form).unwrap_err(), error);
     }
 }
 

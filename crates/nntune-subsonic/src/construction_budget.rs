@@ -21,6 +21,25 @@ impl ConstructionBudget {
         self.charged
     }
 
+    /// Charge and reserve a fresh vector. Callers may fill it up to the
+    /// requested capacity; any later growth needs its own pre-allocation charge.
+    pub fn allocate_exact<T>(&mut self, capacity: usize) -> Result<Vec<T>, BudgetExceeded> {
+        let mut out = Vec::new();
+        if capacity != 0 && std::mem::size_of::<T>() != 0 {
+            self.charge(
+                capacity,
+                std::mem::size_of::<T>(),
+                std::mem::align_of::<T>(),
+            )?;
+            out.try_reserve_exact(capacity)
+                .map_err(|_| BudgetExceeded)?;
+            if out.capacity() != capacity {
+                return Err(BudgetExceeded);
+            }
+        }
+        Ok(out)
+    }
+
     /// Charge one allocation before allocating; failure leaves the ledger unchanged.
     ///
     /// Pinned Rust's rust-src `vendor/dlmalloc-0.2.13/src/dlmalloc.rs` defines
@@ -53,6 +72,22 @@ impl ConstructionBudget {
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 pub mod tests {
     use super::*;
+
+    #[cfg_attr(test, test)]
+    pub fn exact_vector_reservation_checks_limit_and_overflow() {
+        let mut short = ConstructionBudget::new(31);
+        assert_eq!(short.allocate_exact::<u32>(4), Err(BudgetExceeded));
+        assert_eq!(short.charged(), 0);
+        let mut budget = ConstructionBudget::new(32);
+        assert_eq!(
+            budget.allocate_exact::<u32>(usize::MAX),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(budget.charged(), 0);
+        assert_eq!(budget.allocate_exact::<u32>(0).unwrap().capacity(), 0);
+        assert_eq!(budget.allocate_exact::<u32>(4).unwrap().capacity(), 4);
+        assert_eq!(budget.charged(), 32);
+    }
 
     #[cfg_attr(test, test)]
     pub fn rounds_each_allocation_and_fails_closed_at_limit() {

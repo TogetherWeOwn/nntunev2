@@ -66,6 +66,57 @@ class StagingApplyTests(unittest.TestCase):
             "import sys\nsys.exit(0)\n")
         return data, trusted, root
 
+    def test_census_binding_and_receipt_fail_closed(self):
+        from unittest.mock import patch
+
+        # Use the reviewed candidate as input, not the driver's own pin.
+        filename = "0051_purge_legacy_provider_credentials.sql"
+        head = "10c9e67b73c59efed95c2c693fd2fd1971dbf2e6"
+        sha = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"
+        _, _, root = self._roots(manifest_text())
+        receipt = root / "census.json"
+        env = {"DATA_REVISION": head, "TRUSTED_REVISION": "a" * 40,
+               "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_JOB": "readback",
+               "GITHUB_STEP_SUMMARY": str(root / "summary"), staging_apply.SECRET_ENV: URL_REQUIRE}
+        with patch.object(staging_apply.subprocess, "run") as query:
+            with self.assertRaisesRegex(staging_apply.StagingApplyError, "no approved"):
+                staging_apply.run_census(filename, sha, DB, env)
+            query.assert_not_called()
+        url = URL_REQUIRE.replace("migrator", "fixture_observer")
+        binding = ("FIXTURE_OBSERVER", "ep.example.com", 5432, "fixture_observer")
+        with patch.object(staging_apply, "CENSUS_BINDING", binding), \
+             patch.object(staging_apply.subprocess, "run") as query, \
+             patch.object(staging_apply, "Path", return_value=receipt):
+            for changes in ({}, {"FIXTURE_OBSERVER": url.replace(DB, "production")},
+                            {"FIXTURE_OBSERVER": url.replace("ep.example.com", "other.example.com")},
+                            {"FIXTURE_OBSERVER": URL_REQUIRE}, {"FIXTURE_OBSERVER": url, "DATA_REVISION": "b" * 40}):
+                with self.assertRaises(staging_apply.StagingApplyError):
+                    staging_apply.run_census(filename, sha, DB, env | changes)
+            query.assert_not_called()
+            active = env | {"FIXTURE_OBSERVER": url, "PGHOSTADDR": "unused", "PGSSLMODE": "disable"}
+            row = "3\t2\t2026-11-18T20:00:00Z\n"
+            for status, stdout in ((1, row), (0, "row-id")):
+                query.return_value = SimpleNamespace(returncode=status, stdout=stdout, stderr="secretpw")
+                with self.assertRaisesRegex(staging_apply.StagingApplyError, r"details redacted$"):
+                    staging_apply.run_census(filename, sha, DB, active)
+                self.assertFalse(receipt.exists())
+            query.return_value = SimpleNamespace(returncode=0, stdout=row, stderr="")
+            with patch.dict(os.environ, active, clear=True):
+                self.assertEqual(staging_apply.main([
+                    "purge-census", "--file", filename, "--expected-sha", sha, "--expect-database", DB]), 0)
+            self.assertIn("REPEATABLE READ READ ONLY", query.call_args.kwargs["input"])
+            self.assertIn("SET LOCAL row_security = off", query.call_args.kwargs["input"])
+            child = query.call_args.kwargs["env"]
+            self.assertEqual((child["PGSSLMODE"], child["PGGSSENCMODE"]), ("verify-full", "disable"))
+            self.assertFalse({"PGHOSTADDR", staging_apply.SECRET_ENV} & child.keys())
+            self.assertIn("statement_timeout=30000", child["PGOPTIONS"])
+            self.assertEqual(query.call_args.kwargs["timeout"], 60)
+        expected = dict(target="app", database=DB, guard_head=head, guard_sha256=sha, trusted_revision="a" * 40,
+                        run_id="123", run_attempt="2", job="readback", observed_at_utc="2026-11-18T20:00:00Z",
+                        user_cache_grants=3, provider_owners_without_account_evidence=2)
+        self.assertEqual(json.loads(receipt.read_text()), expected)
+        self.assertIn(receipt.read_text(), (root / "summary").read_text())
+
     def test_ledger_audit_reads_one_snapshot_and_redacts_failures(self):
         contents = b"SELECT 1;\n"
         sha = hashlib.sha256(contents).hexdigest()

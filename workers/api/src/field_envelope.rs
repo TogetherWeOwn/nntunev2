@@ -32,16 +32,32 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
-    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
-        let mut out = Vec::new();
-        for s in [
+    fn aad_parts<'a>(&'a self, purpose: &'a str) -> [&'a str; 6] {
+        [
             "nntune-envelope-v2",
             purpose,
             self.table,
             self.field,
             self.scope,
             self.row,
-        ] {
+        ]
+    }
+
+    fn aad_capacity(&self, purpose: &str, versioned: bool) -> Option<usize> {
+        let trailer = if versioned { 8usize } else { 4 };
+        self.aad_parts(purpose)
+            .into_iter()
+            .try_fold(trailer, |size, part| {
+                size.checked_add(4)?.checked_add(part.len())
+            })
+    }
+
+    pub(crate) fn aad(&self, purpose: &str, kek_version: Option<u32>) -> Vec<u8> {
+        let capacity = self
+            .aad_capacity(purpose, kek_version.is_some())
+            .expect("field AAD capacity overflow");
+        let mut out = Vec::with_capacity(capacity);
+        for s in self.aad_parts(purpose) {
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
             out.extend_from_slice(s.as_bytes());
         }
@@ -91,6 +107,21 @@ pub(crate) fn seal(
         payload_nonce,
         ciphertext,
     })
+}
+
+/// Capacities of the two AAD buffers and two decrypt inputs. The locked
+/// `aead` 0.6.1 decrypt path copies each full ciphertext, including the tag,
+/// then truncates in place without allocating a separate plaintext buffer.
+pub(crate) fn open_capacities(
+    context: &Context<'_>,
+    envelope: &FieldEnvelope,
+) -> Option<[usize; 4]> {
+    Some([
+        context.aad_capacity("dek", true)?,
+        envelope.dek_wrapped.len(),
+        context.aad_capacity("payload", false)?,
+        envelope.ciphertext.len(),
+    ])
 }
 
 pub(crate) fn open(

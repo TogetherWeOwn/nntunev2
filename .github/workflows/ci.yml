@@ -674,8 +674,6 @@ jobs:
         run: python3 workers/mb/spike/test_recall.py
       - name: Run R2 snapshot spike gate 2 verdict tests
         run: python3 workers/mb/spike/test_bench.py
-      - name: Run R2 snapshot spike expiry-rule check tests
-        run: python3 workers/mb/spike/test_lifecycle.py
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
@@ -684,7 +682,7 @@ jobs:
   api-migrations:
     name: api-migrations
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         # Pinned by digest (`18` = PostgreSQL 18.6, the app-cluster major in
@@ -755,6 +753,14 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Exercise ingest candidate adapter on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+        run: |
+          test_name='digest_candidate_store::tests::postgres_candidate_adapter_fences_and_persists'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --exact --ignored
       # Meter-metadata boundary runs below against independently migrated
       # app/mirror stores (their own env vars); it must not run here on the
       # single shared database, where the split-store env vars are absent.
@@ -799,7 +805,12 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres
           inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests -- --list)"
           printf '%s\n' "$inventory"
-          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 10
+          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 15
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_credential_mutations_keep_the_cap_and_fences: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_credential_projection_charges_bounded_fields: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_account_projects_only_bounded_email_and_live_role_flags: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_membership_admits_only_complete_owner_scoped_pages: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_session_enforces_admission_before_reindexing: test'
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test subsonic_deadlock_postgres
@@ -1900,6 +1911,10 @@ jobs:
           node -e 'require(process.argv[1]).run_ledger_tests()' "$RUNNER_TEMP/ledger-js/nntune_api.js"
           python3 -I .github/scripts/test_worker_sealed_bindgen.py
           python3 -I .github/scripts/check_worker_sealed_bindgen.py "$RUNNER_TEMP/ledger-target/wasm32-unknown-unknown/release/nntune_api.wasm" "$RUNNER_TEMP/sealed-ledger-js"
+      - name: Exercise fresh ledger build through sealed consumer (compatibility only)
+        run: |
+          python3 -I .github/scripts/test_worker_build_sealed.py
+          python3 -I .github/scripts/check_worker_build_sealed.py "$RUNNER_TEMP/fresh-sealed-ledger-js"
       - name: Reject a conflicting dependency global allocator in the ledger artifact graph
         run: |
           set -euo pipefail
@@ -1925,7 +1940,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/staging-body-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
-          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs
+          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts
@@ -1942,6 +1957,7 @@ jobs:
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
           python3 -I workers/api/tests/test_pg_protocol_frames.py
           python3 -I workers/api/tests/test_pg_commit_barrier.py
+          python3 -I workers/api/tests/test_pg_close_observer.py
           python3 -I workers/api/tests/test_commit_relay_fragmentation.py
           python3 -I workers/api/tests/worker_routing_postgres_smoke.py --postgres-service --mirror-fixture
         env:

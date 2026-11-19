@@ -67,7 +67,13 @@ pub mod subsonic_config;
 pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
+#[cfg(target_arch = "wasm32")]
+pub mod subsonic_request_metadata;
 pub mod subsonic_snapshot_plan;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging_response;
 pub mod target_identity;
 pub mod taste_signal;
 pub mod vault;
@@ -167,8 +173,20 @@ mod ledger_wasm_test {
     #[wasm_bindgen]
     pub fn run_ledger_tests() {
         assert_eq!(std::mem::size_of::<String>(), 12);
+        crate::subsonic_auth::verification_uses_the_carried_charge();
         nntune_subsonic::construction_budget::tests::rounds_each_allocation_and_fails_closed_at_limit();
         nntune_subsonic::construction_budget::tests::rejects_alignment_and_arithmetic_overflow_without_changing_charge();
+        nntune_subsonic::construction_budget::tests::exact_vector_reservation_checks_limit_and_overflow();
+        crate::worker_entry::subsonic_pg_page::streamed_projection_enforces_admission();
+        nntune_subsonic::value::charged_values_check_owned_storage_limits();
+        nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
+        nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();
+        nntune_subsonic::staging_browse::member_browse_boundaries();
+        nntune_subsonic::staging_browse::search_boundaries();
+        nntune_subsonic::staging_browse::search_matches_dispatch();
+        crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
+        crate::worker_entry::account_fields_use_the_carried_charge();
+        crate::worker_entry::subsonic_membership::membership_projection_charges_capacity_before_copying();
     }
 }
 
@@ -211,6 +229,36 @@ pub async fn billing_owned_test_entry(
     if req.method() == worker::Method::Post && req.path() == "/billing-ack-proof" {
         return match worker_entry::billing_budget::test_commit_ack().await {
             Ok(pid) => worker::Response::ok(format!("billing-ack-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/owned-write-deadline-proof" {
+        return match worker_entry::billing_budget::test_deadline_after_write().await {
+            Ok(pid) => worker::Response::ok(format!("owned-write-deadline-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-deadline-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_deadline().await {
+            Ok(()) => worker::Response::ok("billing-deadline-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-ack-fixture" {
+        return match worker_entry::billing_deadline_test::setup_ack_fixture().await {
+            Ok(()) => worker::Response::ok("billing-ack-fixture-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-reconcile-ack-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_ack_retry().await {
+            Ok(()) => worker::Response::ok("billing-reconcile-ack-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-cancel-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_cancel().await {
+            Ok(()) => worker::Response::ok("billing-cancel-ok"),
             Err(message) => worker::Response::error(message, 500),
         };
     }

@@ -4,14 +4,25 @@
 
 use std::future::Future;
 
-use nntune_subsonic::auth::{md5_hex, Credentials};
+use nntune_subsonic::auth::Credentials;
+use nntune_subsonic::construction_budget::ConstructionBudget;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::{
-    field_envelope::{self, Context, FieldEnvelope},
-    native_rest::{credential_hmac, Pepper},
-    rotation::KekSource,
+use crate::{field_envelope::FieldEnvelope, native_rest::Pepper, rotation::KekSource};
+
+#[path = "subsonic_auth_verify.rs"]
+mod verify;
+use verify::{indexed_digest, verify_token};
+
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+pub(crate) use verify::verification_uses_the_carried_charge;
+
+#[cfg(test)]
+use {
+    crate::{field_envelope, native_rest::credential_hmac},
+    nntune_subsonic::auth::md5_hex,
+    verify::token_context,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,8 +90,8 @@ pub struct TokenEnvelope {
     pub envelope: FieldEnvelope,
 }
 
-/// Cannot be constructed outside this module. This is a compatibility
-/// identity, not a cookie session or native REST bearer credential.
+/// In production, only authentication constructs this compatibility identity.
+/// It is not a cookie session or native REST bearer credential.
 #[derive(PartialEq, Eq)]
 pub struct Principal {
     user_id: String,
@@ -95,6 +106,19 @@ impl std::fmt::Debug for Principal {
 }
 
 impl Principal {
+    #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+    pub(crate) fn postgres_test_fixture(
+        user_id: &str,
+        credential_id: &str,
+        username: &str,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            credential_id: credential_id.into(),
+            username: username.into(),
+        }
+    }
+
     pub fn user_id(&self) -> &str {
         &self.user_id
     }
@@ -208,68 +232,123 @@ fn valid_record(record: &CredentialRecord) -> bool {
         }
 }
 
-fn token_context<'a>(user_id: &'a str, credential_id: &'a str) -> Context<'a> {
-    Context {
-        table: "subsonic_credentials",
-        field: "token_secret_encrypted",
-        scope: user_id,
-        row: credential_id,
-        version: 2,
-        format: 1,
+// The staging session borrows one app client for lookup, admission and
+// completion. The ordinary store's connection behavior remains separate.
+trait AuthSession {
+    fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> impl Future<Output = Result<Option<CredentialRecord>, AuthError>>;
+
+    fn admit(
+        &mut self,
+        selected: &CredentialRecord,
+        now: u64,
+    ) -> impl Future<Output = Result<bool, AuthError>>;
+
+    fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> impl Future<Output = Result<bool, AuthError>>;
+}
+
+impl<S: CredentialStore> AuthSession for &S {
+    async fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> Result<Option<CredentialRecord>, AuthError> {
+        if budget.is_some() {
+            return Err(AuthError::Unavailable);
+        }
+        match version {
+            Some(version) => self.by_key(version, value).await,
+            None => self.by_username(value).await,
+        }
+    }
+
+    async fn admit(&mut self, selected: &CredentialRecord, now: u64) -> Result<bool, AuthError> {
+        self.admit_attempt(selected, now).await
+    }
+
+    async fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        self.complete(selected, reindex, now).await
     }
 }
 
-fn verify_token(
-    selected: &CredentialRecord,
-    presented: &str,
-    salt: &str,
-    keks: &impl KekSource,
-) -> Result<(), AuthError> {
-    let stored = selected.token.as_ref().ok_or(AuthError::InvalidToken)?;
-    if stored.envelope_version != 2
-        || stored.payload_format != 1
-        || stored.envelope.ciphertext.len() < 32 + 16
-        || stored.envelope.ciphertext.len() > 512 + 16
-    {
-        return Err(AuthError::InvalidToken);
-    }
-    let kek = keks.kek(stored.kek_version).ok_or(AuthError::Unavailable)?;
-    let secret = Zeroizing::new(
-        field_envelope::open(
-            kek,
-            stored.kek_version,
-            &token_context(&selected.user_id, &selected.id),
-            &stored.envelope,
+impl AuthSession for tokio_postgres::Client {
+    async fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> Result<Option<CredentialRecord>, AuthError> {
+        crate::worker_entry::load_staging_credential(
+            self,
+            budget.ok_or(AuthError::Unavailable)?,
+            version,
+            value,
         )
-        .map_err(|_| AuthError::InvalidToken)?,
-    );
-    // The provisioning path uses a generated printable secret, not raw
-    // arbitrary bytes or a reversible copy of the API key.
-    if !(32..=512).contains(&secret.len()) || !secret.iter().all(u8::is_ascii_graphic) {
-        return Err(AuthError::InvalidToken);
+        .await
     }
-    let mut salted = Zeroizing::new(Vec::with_capacity(secret.len() + salt.len()));
-    salted.extend_from_slice(&secret);
-    salted.extend_from_slice(salt.as_bytes());
-    let expected = Zeroizing::new(md5_hex(&salted));
-    // MD5 is only the mandated compatibility checksum. Constant-time
-    // comparison prevents a prefix oracle; accepting hex case changes no bits.
-    let normalized = Zeroizing::new(presented.to_ascii_lowercase());
-    if expected.as_bytes().ct_eq(normalized.as_bytes()).unwrap_u8() != 1 {
-        return Err(AuthError::InvalidToken);
+
+    async fn admit(&mut self, selected: &CredentialRecord, now: u64) -> Result<bool, AuthError> {
+        crate::worker_entry::mutate_staging_credential(self, selected, None, now).await
     }
-    Ok(())
+
+    async fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        crate::worker_entry::mutate_staging_credential(self, selected, Some(reindex), now).await
+    }
 }
 
 /// Authenticate without cookies, native bearer keys, client-name identity,
 /// or fixture-password fallback. The HTTP adapter must reject duplicate
 /// credential parameters before constructing Credentials (including p=).
 pub async fn authenticate(
-    store: &impl CredentialStore,
+    mut store: &impl CredentialStore,
     credentials: &Credentials,
     peppers: &IndexKeyring<'_>,
     keks: &impl KekSource,
     now: u64,
+) -> Result<Principal, AuthError> {
+    authenticate_in(&mut store, credentials, peppers, keks, now, None).await
+}
+
+/// Authenticate a staging request on its already admitted app client and
+/// construction ledger. This helper neither connects nor mounts a route.
+pub async fn authenticate_staging(
+    client: &mut tokio_postgres::Client,
+    credentials: &Credentials,
+    peppers: &IndexKeyring<'_>,
+    keks: &impl KekSource,
+    now: u64,
+    budget: &mut ConstructionBudget,
+) -> Result<Principal, AuthError> {
+    authenticate_in(client, credentials, peppers, keks, now, Some(budget)).await
+}
+
+async fn authenticate_in(
+    store: &mut impl AuthSession,
+    credentials: &Credentials,
+    peppers: &IndexKeyring<'_>,
+    keks: &impl KekSource,
+    now: u64,
+    mut budget: Option<&mut ConstructionBudget>,
 ) -> Result<Principal, AuthError> {
     if credentials.password.is_some() {
         return Err(AuthError::Unsupported);
@@ -286,8 +365,11 @@ pub async fn authenticate(
         }
         let mut matched = None;
         for pepper in std::iter::once(&peppers.current).chain(peppers.previous.as_ref()) {
-            let digest = Zeroizing::new(credential_hmac(key, pepper.bytes));
-            let Some(record) = store.by_key(pepper.version, &digest).await? else {
+            let digest = Zeroizing::new(indexed_digest(key, pepper.bytes, budget.as_deref_mut())?);
+            let Some(record) = store
+                .lookup(Some(pepper.version), &digest, budget.as_deref_mut())
+                .await?
+            else {
                 continue;
             };
             if !valid_record(&record)
@@ -299,10 +381,18 @@ pub async fn authenticate(
             {
                 return Err(AuthError::InvalidKey);
             }
-            let reindex = (pepper.version != peppers.current.version).then(|| Reindex {
-                pepper_version: peppers.current.version,
-                api_key_hmac: credential_hmac(key, peppers.current.bytes),
-            });
+            let reindex = if pepper.version != peppers.current.version {
+                Some(Reindex {
+                    pepper_version: peppers.current.version,
+                    api_key_hmac: indexed_digest(
+                        key,
+                        peppers.current.bytes,
+                        budget.as_deref_mut(),
+                    )?,
+                })
+            } else {
+                None
+            };
             matched = Some((record, reindex));
             break;
         }
@@ -332,7 +422,7 @@ pub async fn authenticate(
             return Err(AuthError::InvalidToken);
         }
         let record = store
-            .by_username(username)
+            .lookup(None, username, budget.as_deref_mut())
             .await?
             .ok_or(AuthError::InvalidToken)?;
         if !valid_record(&record)
@@ -342,16 +432,16 @@ pub async fn authenticate(
             return Err(AuthError::InvalidToken);
         }
         // Reserve before any cryptography involving a reversible secret.
-        if !store.admit_attempt(&record, now).await? {
+        if !store.admit(&record, now).await? {
             return Err(AuthError::InvalidToken);
         }
-        verify_token(&record, token, salt, keks)?;
+        verify_token(&record, token, salt, keks, budget)?;
         (record, None, AuthError::InvalidToken)
     };
-    if failure == AuthError::InvalidKey && !store.admit_attempt(&selected, now).await? {
+    if failure == AuthError::InvalidKey && !store.admit(&selected, now).await? {
         return Err(failure);
     }
-    if !store.complete(&selected, reindex.as_ref(), now).await? {
+    if !store.finish(&selected, reindex.as_ref(), now).await? {
         return Err(failure);
     }
     Ok(Principal {

@@ -6,8 +6,7 @@ import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
-import { createQueueController } from '#lib/player/queueController.js';
+import { createPlayerController } from '#lib/player/controller.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
@@ -33,7 +32,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'queueController', 'media', 'mediaRevision']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -48,23 +47,22 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
-	const queueController = createQueueController(queue);
-	const { next, sources: evidence } = queueController.prepareLibrary([...ITEMS, ...queue.tracks]);
-	queueController.publish(next, queueController.begin(next, 'replace', true), evidence);
 	const bindings = {
 		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		groupLibraryItems, queueCurrentTrack, resolveStreamUrl, createPendingShareSeek,
-		queueController,
+		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
+		createQueue: () => queue, createPlayerController,
 		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
-		queueController.subscribe((value) => { queue = value; });
 		${compiled}
+		const { next, sources: evidence } = queueController.prepareLibrary([...items, ...queue.tracks]);
+		queueController.publish(next, queueController.begin(next, 'replace', true), evidence);
+		queueController.subscribe((value) => { queue = value; });
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,
 			add: addDisplayedTracksToQueue,

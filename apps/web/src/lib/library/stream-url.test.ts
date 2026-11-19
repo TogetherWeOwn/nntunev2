@@ -39,27 +39,30 @@ describe('resolveStreamUrl', () => {
 // Builder-owned exact pins for the library player wiring, via the same Vite
 // raw-glob seam as the other route-markup pins. The exact binding and the
 // helper derivation are pinned here.
-const routeSources = import.meta.glob('../../routes/**/*.svelte', {
+const sources = import.meta.glob(['../../routes/library/+page.svelte', '../player/NativeAudio.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
 }) as Record<string, string>;
 
 describe('library player wiring', () => {
-	const source = routeSources['../../routes/library/+page.svelte'];
+	const source = sources['../../routes/library/+page.svelte'];
+	const host = sources['../player/NativeAudio.svelte'];
 
 	it('derives the stream URL through resolveStreamUrl', () => {
 		expect(source).toMatch(/resolveStreamUrl\(currentTrack\)/);
 	});
 
 	it('renders audio only when a stream URL exists', () => {
-		expect(source).toMatch(/\{#if streamUrl\}/);
+		expect(source).toMatch(/\{#if streamUrl\}\s*<section aria-label="Player">/);
+		expect(source).not.toMatch(/<audio\b/);
 	});
 
 	it('binds the audio src to exactly the derived stream URL', () => {
-		expect(source).toMatch(/<audio[^>]*\ssrc=\{streamUrl\}/);
+		expect(source).toMatch(/<NativeAudio\b[^>]*\s\{streamUrl\}/);
+		expect(host).toMatch(/<audio[^>]*\ssrc=\{streamUrl\}/);
 		// Any other binding expression must fail — not just a literal.
-		expect(source).not.toMatch(/<audio[^>]*\ssrc=\{(?!streamUrl\})/);
-		expect(source).not.toMatch(/<audio[^>]*\ssrc=""/);
+		expect(host).not.toMatch(/<audio[^>]*\ssrc=\{(?!streamUrl\})/);
+		expect(host).not.toMatch(/<audio[^>]*\ssrc=""/);
 	});
 });

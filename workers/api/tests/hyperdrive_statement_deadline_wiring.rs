@@ -266,6 +266,13 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
+    let store = store.replacen(
+        function_body(prototype, "asyncfnstore_reconcile_outcome("),
+        "{}",
+        1,
+    );
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -282,8 +289,28 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    for piece in &pieces {
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&n| n == "store_reconcile_outcome")
+            .count(),
+        2
+    );
+    for gate in [prototype_gate, release_gate] {
+        assert_eq!(
+            store
+                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
+                .count(),
+            1
+        );
+    }
+    for (index, piece) in pieces.iter().enumerate() {
         let name = method_name(piece);
+        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
+            continue;
+        }
         if matches!(name, "like_delete" | "taste_delete") {
             let love_only = name == "like_delete";
             let body = function_body(piece, name);

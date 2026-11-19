@@ -1,5 +1,8 @@
 'use strict';
 
+require('./staging_metadata_wasm.cjs');
+require('./staging_response_wasm.cjs');
+
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { collect_staging_test: collect } = require(process.env.STAGING_BODY_WASM_JS);
@@ -19,6 +22,11 @@ test('collects bounded chunks through the Worker adapter', async () => {
   for (const declared of [undefined, 0, 1, 8192]) {
     assert.equal(await collect(request(chunks(bytes('x='), bytes(text.slice(2)))), declared), text);
   }
+});
+
+test('only charges for nonempty input and rejects a budget one byte short', async () => {
+  assert.equal(await collect(request(chunks(bytes(''))), 0, true), '');
+  await assert.rejects(collect(request(chunks(bytes('x=a'))), 3, true), (e) => e === 'Capacity');
 });
 
 test('rejects oversized chunks and cumulative input', async () => {

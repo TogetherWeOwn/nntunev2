@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -18,6 +19,7 @@ relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
 routing = relay.load("worker_routing_postgres_smoke")
 BILLING_DB = relay.BILLING_DB
+close_observer = relay.load("pg_close_observer")
 
 
 def parse_pids(status, body, marker, count):
@@ -76,6 +78,15 @@ def billing_database(settings):
         admin(f"DROP DATABASE {BILLING_DB}")
 
 
+def check_write_deadline(base, settings, observe):
+    status, _, body = routing.http("POST", base + "/owned-write-deadline-proof")
+    pids = parse_pids(status, body, "owned-write-deadline-ok", 1)
+    wait_for_sessions(settings, pids)
+    count = observe("SELECT count(*) FROM users WHERE id = 'deadline_probe'", tuples=True)
+    routing.check(count == "0", f"deadline write survived: {count!r}")
+    print("PASS: standalone Worker deadline rolled back a prior write", flush=True)
+
+
 def check_billing_ack(base, settings, observe):
     with relay.commit_relay() as ack:
         status, _, body = routing.http("POST", base + "/billing-ack-proof")
@@ -85,6 +96,16 @@ def check_billing_ack(base, settings, observe):
     actual = observe("SELECT id FROM users ORDER BY id", tuples=True)
     routing.check(actual.splitlines() == ["withheld"], f"unexpected durable rows: {actual!r}")
     print("PASS: withheld COMMIT; durable row and closed backend", flush=True)
+
+
+def check_reconcile_ack(base):
+    status, _, body = routing.http("POST", base + "/billing-ack-fixture")
+    routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
+    with relay.commit_relay() as ack:
+        status, _, body = routing.http("POST", base + "/billing-reconcile-ack-proof")
+        routing.check(status == 200 and body == "billing-reconcile-ack-ok", body)
+        routing.check(ack.result(timeout=2) == b"W", "relay did not withhold COMMIT")
+    print("PASS: test-feature billing prototype lost COMMIT acknowledgement, retry and replay", flush=True)
 
 
 def main():
@@ -137,7 +158,54 @@ def main():
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
                 with billing_database(settings) as observe:
+                    check_write_deadline(f"http://127.0.0.1:{port}", settings, observe)
                     check_billing_ack(f"http://127.0.0.1:{port}", settings, observe)
+                admin = partial(routing.psql, settings, settings["admin"], timeout=10)
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    url = f"http://127.0.0.1:{port}/billing-deadline-proof"
+                    status, _, body = routing.http("POST", url)
+                    routing.check(status == 200 and body == "billing-deadline-ok", body)
+                    print("PASS: billing deadline after writes rolled back", flush=True)
+                    print(
+                        "PASS: PostgreSQL watchdog rolled back abandoned billing writes",
+                        flush=True,
+                    )
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    check_reconcile_ack(f"http://127.0.0.1:{port}")
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    url = f"http://127.0.0.1:{port}/billing-cancel-proof"
+                    with close_observer.close_observer() as (closed, relay_result):
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            started = time.monotonic()
+                            request = pool.submit(routing.http, "POST", url)
+                            saw_eof = closed.wait(8)
+                            status, _, body = request.result(timeout=30)
+                            elapsed = time.monotonic() - started
+                            routing.check(
+                                elapsed < 3,
+                                f"cancellation observation exceeded host bound: {elapsed:.3f}s",
+                            )
+                        routing.check(
+                            status == 200 and body == "billing-cancel-ok", body
+                        )
+                        routing.check(
+                            saw_eof,
+                            "client EOF was not observed",
+                        )
+                        relay_result.result(timeout=2)
+                    print(
+                        "PASS: in-flight billing prototype cancellation rolled back",
+                        flush=True,
+                    )
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
             finally:
                 routing.process_group.shutdown_process_group(proc)
     return 0
