@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { contextPath, eventsPath, watchListenContext } from './fixtures/listen-context.js';
+import { contextPath, eventsPath, watchListenContext } from '../fixtures/listen-context.js';
 
 /**
  * Library route integration for listen-event telemetry. Fixtures follow

@@ -1,5 +1,4 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { isListenContextRequest } from './fixtures/listen-context.js';
 
 /**
  * Builder-owned review-round pins for per-entry demo history management.
@@ -39,7 +38,6 @@ async function open(page: Page, baseURL: string, options: OpenOptions = {}): Pro
 			calls.push(`external ${request.method()} ${target.pathname}`);
 			return route.abort();
 		}
-		if (isListenContextRequest(request, origin.origin)) return route.fulfill({ status: 401 });
 		if (target.pathname === '/api/demo/audio') return;
 		// Page-embedded image GETs (demo artwork placeholders) are static assets, not
 		// backend calls; only mutating or xhr/fetch requests count, as in the sibling spec.

@@ -1,5 +1,4 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { isListenContextRequest } from './fixtures/listen-context.js';
 
 /**
  * Acceptance-owned: only acceptance-owner-authorized amendments may change this bank.
@@ -85,8 +84,6 @@ async function open(page: Page, options: {
 		if (url.origin !== localOrigin) {
 			calls.push(`external ${request.method()} ${url.pathname}`);
 			await route.abort();
-		} else if (isListenContextRequest(request, localOrigin)) {
-			await route.fulfill({ status: 401 });
 		} else if (request.method() !== 'GET' || ['xhr', 'fetch'].includes(request.resourceType())) {
 			calls.push(`${request.method()} ${url.pathname}`);
 			await route.abort();

@@ -1,5 +1,4 @@
 import { expect, test, type Page } from '@playwright/test';
-import { isListenContextRequest } from './fixtures/listen-context.js';
 
 /**
  * Acceptance: session-local demo recently-played list (test half).
@@ -416,13 +415,9 @@ test('RP-B-17 entries reference demo tracks only; the section never mentions the
 	await expect(section).not.toContainText(/library/i);
 });
 
-test('RP-B-18 recent-played flows make zero backend calls', async ({ page, baseURL }) => {
+test('RP-B-18 recent-played flows make zero backend calls', async ({ page }) => {
 	const calls: { method: string; url: string; resourceType: string }[] = [];
-	await page.route('**/v1/plays/events/context', (route) =>
-		isListenContextRequest(route.request(), baseURL) ? route.fulfill({ status: 401 }) : route.fallback()
-	);
 	page.on('request', (request) => {
-		if (isListenContextRequest(request, baseURL)) return;
 		calls.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() });
 	});
 	await openPlayer(page);
@@ -560,16 +555,14 @@ async function failAutoAdvance(page: Page): Promise<void> {
 }
 
 test.describe('review regressions', () => {
-	// The startup probe is refused; no retry, native control or shortcut may write history.
+	// No retry, native control or shortcut may send history to a backend.
 	const backendCalls = new WeakMap<Page, string[]>();
-	test.beforeEach(async ({ page, baseURL }) => {
+	test.beforeEach(async ({ page }) => {
 		const calls: string[] = [];
 		backendCalls.set(page, calls);
 		await page.route('**/*', async (route) => {
 			const request = route.request();
-			if (isListenContextRequest(request, baseURL)) {
-				await route.fulfill({ status: 401 });
-			} else if (['fetch', 'xhr'].includes(request.resourceType()) || request.method() !== 'GET') {
+			if (['fetch', 'xhr'].includes(request.resourceType()) || request.method() !== 'GET') {
 				calls.push(`${request.method()} ${request.url()}`);
 				await route.abort();
 			} else {
