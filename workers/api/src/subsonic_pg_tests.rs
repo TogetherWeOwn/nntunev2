@@ -458,6 +458,56 @@ async fn lifecycle_failed_commit_never_reports_issue_or_revoke_success() {
 }
 
 #[tokio::test]
+async fn staging_credential_mutations_keep_the_cap_and_fences() {
+    let mut client = database().await;
+    client
+        .batch_execute("UPDATE subsonic_credentials SET attempt_count = 59, attempt_window = 2")
+        .await
+        .unwrap();
+    let selected = lookup(&mut client, None, "generated-client")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(mutate_staging_credential(&mut client, &selected, None, 120)
+        .await
+        .unwrap());
+    assert!(
+        !mutate_staging_credential(&mut client, &selected, None, 120)
+            .await
+            .unwrap()
+    );
+    let reindex = Reindex {
+        pepper_version: 2,
+        api_key_hmac: "b".repeat(64),
+    };
+    assert!(
+        mutate_staging_credential(&mut client, &selected, Some(Some(&reindex)), 121)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !mutate_staging_credential(&mut client, &selected, Some(Some(&reindex)), 122)
+            .await
+            .unwrap()
+    );
+    let current = lookup(&mut client, Some(2), &reindex.api_key_hmac)
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .batch_execute("UPDATE users SET deleting_at = now()")
+        .await
+        .unwrap();
+    for completion in [None, Some(None)] {
+        assert!(
+            !mutate_staging_credential(&mut client, &current, completion, 180)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn schema_refuses_partial_extra_and_unscoped_material() {
     let client = database().await;
     for change in [

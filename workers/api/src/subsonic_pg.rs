@@ -15,16 +15,24 @@ const COLUMNS: &str = "c.id::text AS id, c.user_id, c.subsonic_username, c.scope
     c.token_payload_format, c.token_kek_version, c.token_dek_wrapped_nonce, \
     c.token_dek_wrapped, c.token_payload_nonce";
 // Compare all security-relevant selected material, not just id or last_used_at.
-const SNAPSHOT: &str = "id = $1::text::uuid AND user_id = $2 AND subsonic_username = $3 \
-    AND scope = 'subsonic' AND revoked_at IS NULL AND auth_mode = $4 \
-    AND api_key_hmac IS NOT DISTINCT FROM $5 AND pepper_version IS NOT DISTINCT FROM $6 \
-    AND token_secret_encrypted IS NOT DISTINCT FROM $7 \
-    AND token_envelope_version IS NOT DISTINCT FROM $8 \
-    AND token_payload_format IS NOT DISTINCT FROM $9 \
-    AND token_kek_version IS NOT DISTINCT FROM $10 \
-    AND token_dek_wrapped_nonce IS NOT DISTINCT FROM $11 \
-    AND token_dek_wrapped IS NOT DISTINCT FROM $12 \
-    AND token_payload_nonce IS NOT DISTINCT FROM $13";
+macro_rules! update_sql {
+    ($update:literal, $suffix:literal) => {
+        concat!(
+            $update,
+            " WHERE id = $1::text::uuid AND user_id = $2 AND subsonic_username = $3 \
+             AND scope = 'subsonic' AND revoked_at IS NULL AND auth_mode = $4 \
+             AND api_key_hmac IS NOT DISTINCT FROM $5 AND pepper_version IS NOT DISTINCT FROM $6 \
+             AND token_secret_encrypted IS NOT DISTINCT FROM $7 \
+             AND token_envelope_version IS NOT DISTINCT FROM $8 \
+             AND token_payload_format IS NOT DISTINCT FROM $9 \
+             AND token_kek_version IS NOT DISTINCT FROM $10 \
+             AND token_dek_wrapped_nonce IS NOT DISTINCT FROM $11 \
+             AND token_dek_wrapped IS NOT DISTINCT FROM $12 \
+             AND token_payload_nonce IS NOT DISTINCT FROM $13",
+            $suffix, " RETURNING id"
+        )
+    };
+}
 
 fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
     let mode: String = row.try_get("auth_mode").map_err(|_| StoreError)?;
@@ -110,6 +118,14 @@ async fn transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError>
     let tx = client.transaction().await.map_err(|_| StoreError)?;
     // Hyperdrive transaction pooling requires the timeout on this transaction.
     tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(tx)
+}
+
+async fn staging_transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
+    let tx = client.transaction().await.map_err(|_| StoreError)?;
+    tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
         .await
         .map_err(|_| StoreError)?;
     Ok(tx)
@@ -305,8 +321,41 @@ async fn mutate(
     completion: Option<Option<&Reindex>>,
     now: u64,
 ) -> Result<bool, StoreError> {
+    mutate_transaction(transaction(client).await?, s, completion, now).await
+}
+
+/// The same fenced admission/completion updates, on the staging app client.
+/// Keep admission and completion in separate committed transactions.
+pub async fn mutate_staging_credential(
+    client: &mut Client,
+    selected: &CredentialRecord,
+    completion: Option<Option<&Reindex>>,
+    now: u64,
+) -> Result<bool, AuthError> {
+    super::with_deadline(
+        async {
+            mutate_transaction(
+                staging_transaction(client).await?,
+                selected,
+                completion,
+                now,
+            )
+            .await
+        },
+        1_000,
+        StoreError,
+    )
+    .await
+    .map_err(|_| AuthError::Unavailable)
+}
+
+async fn mutate_transaction(
+    tx: Transaction<'_>,
+    s: &CredentialRecord,
+    completion: Option<Option<&Reindex>>,
+    now: u64,
+) -> Result<bool, StoreError> {
     let now = i64::try_from(now).map_err(|_| StoreError)?;
-    let tx = transaction(client).await?;
     if !owner_fence(&tx, s).await? {
         return Ok(false);
     }
@@ -348,7 +397,13 @@ async fn mutate(
         .token
         .as_ref()
         .map(|t| t.envelope.payload_nonce.as_slice());
-    let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> = vec![
+    let new_version = completion
+        .flatten()
+        .map(|r| i32::try_from(r.pepper_version))
+        .transpose()
+        .map_err(|_| StoreError)?;
+    let new_digest = completion.flatten().map(|r| r.api_key_hmac.as_str());
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 16] = [
         (&s.id, Type::TEXT),
         (&s.user_id, Type::TEXT),
         (&s.username, Type::TEXT),
@@ -363,39 +418,32 @@ async fn mutate(
         (&wrapped, Type::BYTEA),
         (&nonce, Type::BYTEA),
         (&now, Type::INT8),
+        (&new_version, Type::INT4),
+        (&new_digest, Type::TEXT),
     ];
-    let new_version = completion
-        .flatten()
-        .map(|r| i32::try_from(r.pepper_version))
-        .transpose()
-        .map_err(|_| StoreError)?;
-    let new_digest = completion.flatten().map(|r| r.api_key_hmac.as_str());
-    let sql = if completion.is_some() {
-        params.extend([
-            (
-                &new_version as &(dyn tokio_postgres::types::ToSql + Sync),
-                Type::INT4,
-            ),
-            (&new_digest, Type::TEXT),
-        ]);
-        format!("UPDATE subsonic_credentials SET last_used_at = GREATEST(last_used_at, to_timestamp($14::bigint::double precision)), \
-            pepper_version = COALESCE($15, pepper_version), api_key_hmac = COALESCE($16, api_key_hmac) \
-            WHERE {SNAPSHOT} RETURNING id")
+    const COMPLETE: &str = update_sql!(
+        "UPDATE subsonic_credentials SET last_used_at = GREATEST(last_used_at, to_timestamp($14::bigint::double precision)), \
+         pepper_version = COALESCE($15, pepper_version), api_key_hmac = COALESCE($16, api_key_hmac)",
+        ""
+    );
+    // Fixed per-credential 60/minute allowance, persisted across isolates.
+    // A regressed clock never reopens an earlier allowance.
+    const ADMIT: &str = update_sql!(
+        "UPDATE subsonic_credentials SET \
+         attempt_count = CASE WHEN attempt_window < $14 / 60 THEN 1 ELSE attempt_count + 1 END, \
+         attempt_window = GREATEST(attempt_window, $14 / 60)",
+        " AND (attempt_window < $14 / 60 OR attempt_count < 60)"
+    );
+    let (sql, params) = if completion.is_some() {
+        (COMPLETE, &params[..])
     } else {
-        // Fixed per-credential 60/minute allowance, persisted across isolates.
-        // A regressed clock never reopens an earlier allowance.
-        format!(
-            "UPDATE subsonic_credentials SET \
-            attempt_count = CASE WHEN attempt_window < $14 / 60 THEN 1 ELSE attempt_count + 1 END, \
-            attempt_window = GREATEST(attempt_window, $14 / 60) \
-            WHERE {SNAPSHOT} AND (attempt_window < $14 / 60 OR attempt_count < 60) RETURNING id"
-        )
+        (ADMIT, &params[..14])
     };
-    let rows = tx
-        .query_typed(&sql, &params)
+    let row = tx
+        .query_typed_opt(sql, params)
         .await
         .map_err(|_| StoreError)?;
-    if rows.len() != 1 {
+    if row.is_none() {
         return Ok(false);
     }
     tx.commit().await.map_err(|_| StoreError)?;
