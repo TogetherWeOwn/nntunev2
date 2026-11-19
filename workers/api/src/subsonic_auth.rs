@@ -8,18 +8,21 @@ use nntune_subsonic::auth::Credentials;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::{
-    field_envelope::FieldEnvelope,
-    native_rest::{credential_hmac, Pepper},
-    rotation::KekSource,
-};
+use crate::{field_envelope::FieldEnvelope, native_rest::Pepper, rotation::KekSource};
 
 #[path = "subsonic_auth_verify.rs"]
 mod verify;
-use verify::verify_token;
+use verify::{indexed_digest, verify_token};
+
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+pub(crate) use verify::verification_uses_the_carried_charge;
 
 #[cfg(test)]
-use {crate::field_envelope, nntune_subsonic::auth::md5_hex, verify::token_context};
+use {
+    crate::{field_envelope, native_rest::credential_hmac},
+    nntune_subsonic::auth::md5_hex,
+    verify::token_context,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
@@ -240,7 +243,7 @@ pub async fn authenticate(
         }
         let mut matched = None;
         for pepper in std::iter::once(&peppers.current).chain(peppers.previous.as_ref()) {
-            let digest = Zeroizing::new(credential_hmac(key, pepper.bytes));
+            let digest = Zeroizing::new(indexed_digest(key, pepper.bytes, None)?);
             let Some(record) = store.by_key(pepper.version, &digest).await? else {
                 continue;
             };
@@ -253,10 +256,14 @@ pub async fn authenticate(
             {
                 return Err(AuthError::InvalidKey);
             }
-            let reindex = (pepper.version != peppers.current.version).then(|| Reindex {
-                pepper_version: peppers.current.version,
-                api_key_hmac: credential_hmac(key, peppers.current.bytes),
-            });
+            let reindex = if pepper.version != peppers.current.version {
+                Some(Reindex {
+                    pepper_version: peppers.current.version,
+                    api_key_hmac: indexed_digest(key, peppers.current.bytes, None)?,
+                })
+            } else {
+                None
+            };
             matched = Some((record, reindex));
             break;
         }
@@ -299,7 +306,7 @@ pub async fn authenticate(
         if !store.admit_attempt(&record, now).await? {
             return Err(AuthError::InvalidToken);
         }
-        verify_token(&record, token, salt, keks)?;
+        verify_token(&record, token, salt, keks, None)?;
         (record, None, AuthError::InvalidToken)
     };
     if failure == AuthError::InvalidKey && !store.admit_attempt(&selected, now).await? {
