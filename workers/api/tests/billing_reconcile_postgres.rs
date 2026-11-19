@@ -15,8 +15,6 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/billing_contention.rs"]
 mod billing_contention;
-#[path = "support/billing_legacy_write.rs"]
-mod billing_legacy_write;
 #[path = "support/billing_transaction_fixture.rs"]
 mod billing_transaction_fixture;
 
@@ -212,8 +210,10 @@ impl Fx {
         &mut self,
         user: &str,
         outcome: &ReconcileOutcome,
-    ) -> Result<(), tokio_postgres::Error> {
-        billing_legacy_write::try_put(&mut self.db, user, outcome).await
+    ) -> Result<(), billing_transaction_fixture::FixtureError> {
+        billing_transaction_fixture::run(&mut self.db, &self.schema, user, outcome)
+            .await
+            .map(|_| ())
     }
 
     async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
@@ -613,7 +613,11 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
             reconcile_subscription(&input, &remote(&newcomer, &[invoice(&newcomer, 1)]), T);
         let result = fx.try_put(&user, &outcome).await;
         if live.contains(status) {
-            let error = result.expect_err(status);
+            let billing_transaction_fixture::FixtureError::Postgres(error) =
+                result.expect_err(status)
+            else {
+                panic!("expected PostgreSQL unique violation for {status}");
+            };
             assert_eq!(
                 error.code(),
                 Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
@@ -652,7 +656,11 @@ async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
     assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
     let outcome = fx.fold("u1", &b).await;
     assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
-    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    let billing_transaction_fixture::FixtureError::Postgres(error) =
+        fx.try_put("u1", &outcome).await.expect_err("foreign B")
+    else {
+        panic!("expected PostgreSQL unique violation for foreign B");
+    };
     assert_eq!(
         error.code(),
         Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
@@ -1553,6 +1561,8 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     assert!(matches!(run(&mut fx.db, &schema, "u1", &absent).await,
         Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "absent row with history rejected"));
     assert_eq!(fx.history_rows("sub_a").await, 3);
+    assert_eq!(fx.history_rows("sub_missing").await, 0);
+    assert!(fx.snap("sub_missing").await.is_none());
     absent.history.clear();
     assert!(matches!(
         run(&mut fx.db, &schema, "u1", &absent).await,
