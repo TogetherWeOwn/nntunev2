@@ -6,6 +6,12 @@
 
 use nntune_core::digest_enrollment::OriginManifest;
 
+// Not wired until authority and custody can be established by the caller.
+#[allow(dead_code)]
+mod reconciliation;
+#[cfg(test)]
+mod reconciliation_tests;
+
 const STORE_SQL: &str = "WITH locked_reservation AS MATERIALIZED (
     SELECT r.object_id FROM public.storage_digest_reservations AS r
     JOIN public.storage_plaintext_digest_claim_intents AS c
@@ -117,14 +123,14 @@ mod tests {
     use super::*;
     use nntune_core::digest_enrollment::DigestEnrollment;
 
-    fn id(value: u8) -> [u8; 16] {
+    pub(super) fn id(value: u8) -> [u8; 16] {
         let mut id = [value; 16];
         id[6] = 0x40;
         id[8] = 0x80;
         id
     }
 
-    async fn connect(url: &str) -> tokio_postgres::Client {
+    pub(super) async fn connect(url: &str) -> tokio_postgres::Client {
         let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
             .await
             .unwrap();
@@ -132,7 +138,7 @@ mod tests {
         client
     }
 
-    async fn assert_no_candidate(db: &tokio_postgres::Client, object: &str, map: &str) {
+    pub(super) async fn assert_no_candidate(db: &tokio_postgres::Client, object: &str, map: &str) {
         let row = db.query_one(
             "SELECT (SELECT count(*) FROM public.storage_digest_map_intents WHERE object_id = $1::text::uuid OR map_id = $2::text::uuid),\n                    (SELECT count(*) FROM public.storage_digest_map_page_intents WHERE map_id = $2::text::uuid)",
             &[&object, &map],
@@ -558,5 +564,6 @@ mod tests {
             assert_eq!(row.get::<_, i32>(2), if index == 0 { 256 } else { 1 });
             assert_eq!(row.get::<_, Vec<u8>>(3), expected[index]);
         }
+        reconciliation_tests::exercise(&url, &db).await;
     }
 }
