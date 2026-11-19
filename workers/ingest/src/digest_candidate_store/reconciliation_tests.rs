@@ -166,7 +166,9 @@ pub(super) async fn exercise(url: &str, db: &Client) {
             observe_with_deadline(connect(url).await, &i, &m, pending()).await,
             Indeterminate
         );
-        assert_eq!(reserve(db, &successor).await, 2);
+        // A newer generation fences the old write with or without a holder change.
+        let next_holder = if base == 80 { &i } else { &successor };
+        assert_eq!(reserve(db, next_holder).await, 2);
         assert_eq!(
             observe_with_deadline(connect(url).await, &i, &m, pending()).await,
             if finish == "COMMIT" {
