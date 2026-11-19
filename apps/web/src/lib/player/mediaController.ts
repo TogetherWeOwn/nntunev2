@@ -146,16 +146,16 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 	function jump(source: string, direction: JumpDirection, deps: JumpSelection): void {
 		if (destroyed) return;
 		const attachment = current;
+		const audio = attachment?.audio;
 		const intent = ++positionIntent;
 		const isCurrent = () => !destroyed && current === attachment && positionIntent === intent && deps.isCurrent();
+		// Cancel the older share on acceptance, not when the native seek drains.
+		if (audio && source && isCurrent() && matchesNative(audio, source)) deps.supersedeShare();
 		runPosition(() => {
-			const audio = attachment?.audio;
 			if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
 				if (isCurrent()) deps.publish({ kind: 'unavailable' });
 				return;
 			}
-			// Even a boundary or refused jump takes precedence over a deferred share.
-			deps.supersedeShare();
 			const matches = () => matchesSource(audio, source, isCurrent);
 			if (!matches()) return;
 			const outcome = jumpMedia(audio, direction, matches, () => {

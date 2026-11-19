@@ -846,6 +846,26 @@ test('a refused jump still supersedes a pending share seek for the source', () =
 	expect(media.position).toBe(30);
 });
 
+test('a deferred Back cancels an older share before a metadata retry', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	let firstRead = true;
+	Object.defineProperty(element, 'duration', { get() {
+		if (firstRead) {
+			firstRead = false;
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+			page.jump('back');
+			element.dispatchEvent(new Event('loadedmetadata'));
+		}
+		return media.duration;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([20]);
+	expect(media.position).toBe(20);
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 0:20.');
+});
+
 test.each(['account', 'queue', 'attachment'] as const)(
 	'jump cannot write after a native getter revokes its %s receipt', (boundary) => {
 		const { page, element, writes, remount } = restartFixture();
