@@ -13,8 +13,9 @@ type NativeObservations = {
 	position: (audio: HTMLAudioElement) => void;
 };
 
-type NaturalEndSelection = {
-	queue: Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'isCurrent'>;
+type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent'>;
+
+export type NaturalEndSelection = {
 	commit: (queue: QueueState) => boolean;
 	flush: () => Promise<void>;
 	clearShareFeedback: () => void;
@@ -25,7 +26,6 @@ type NaturalEndSelection = {
 const REPEAT_KEY = 'nntune:library-repeat:v1';
 
 type PlaySelection = {
-	revision: Pick<ReturnType<typeof createQueueController>, 'revoke' | 'isCurrent'>;
 	commit: (queue: QueueState) => boolean;
 	flush: () => Promise<void>;
 	announce: (message: string) => void;
@@ -66,7 +66,7 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
 }
 
-export function createMediaController(matchesNative = matchesNativeSource, naturalEnd?: NaturalEndSelection) {
+export function createMediaController(queue: QueueAuthority, naturalEnd?: NaturalEndSelection, matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
@@ -101,9 +101,9 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 		tracks[index] = { ...target, streamUrl };
 		if (!deps.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
 
-		const receipt = deps.revision.revoke();
+		const receipt = queue.revoke();
 		let attachment = current;
-		const ownsAttempt = () => !destroyed && deps.revision.isCurrent(receipt) && source.isCurrent();
+		const ownsAttempt = () => !destroyed && queue.isCurrent(receipt) && source.isCurrent();
 		const isCurrent = () => ownsAttempt() && current === attachment;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
@@ -259,7 +259,7 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 
 	async function handleEnded(attachment: MediaAttachment, source: string): Promise<void> {
 		if (!naturalEnd) return;
-		const { queue, commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
+		const { commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
 		const { audio } = attachment;
 		const intent = positionIntent;
 		const version = attachmentVersion;
