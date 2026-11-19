@@ -4485,16 +4485,12 @@ where
     };
     let mut response = catalogue_library_entries(ctx, &user_id).await;
     if response.status == 200 {
-        use sha2::{Digest, Sha256};
         // Use a purpose-scoped digest of the account, not a credential, raw
         // identifier or session token. The entry renders this response no-store.
-        let mut scope = Sha256::new();
-        scope.update(b"nntune:library-position:v1\0");
-        scope.update(user_id.as_bytes());
-        response.extra_headers.push((
-            "x-library-position-scope".into(),
-            format!("{:x}", scope.finalize()),
-        ));
+        let scope = crate::auth::sha256_hex(&format!("nntune:library-position:v1\0{user_id}"));
+        response
+            .extra_headers
+            .push(("x-library-position-scope".into(), scope));
     }
     response
 }
