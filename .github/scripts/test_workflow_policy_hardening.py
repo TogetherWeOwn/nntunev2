@@ -87,6 +87,20 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn('base="refs/remotes/origin/${GITHUB_BASE_REF}"', leaks)
         self.assertNotIn('${{ github.base_ref }}', leaks)
 
+    def test_gitleaks_history_scan_uses_the_fixture_options(self):
+        leaks = job((WORKFLOWS / "gitleaks.yml").read_text(), "gitleaks")
+        self.assertIn("GITLEAKS_LOG_OPTS: '--text --diff-merges=first-parent HEAD'", leaks)
+        scan_name = "- name: Scan the full history\n"
+        fixture_name = "- name: Self-test history scanning\n"
+        self.assertLess(leaks.index(scan_name), leaks.index(fixture_name))
+        self.assertNotIn(".github/scripts/", leaks)
+        scan, fixture = leaks.split(scan_name, 1)[1].split(fixture_name, 1)
+        for name, step in (("scan", scan), ("fixture", fixture)):
+            with self.subTest(step=name):
+                self.assertEqual(step.count('"$GITLEAKS_BIN" git '), 1)
+                self.assertEqual(step.count('--log-opts='), 1)
+                self.assertIn('--log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow', step)
+
     def test_local_workflows_use_the_same_source_revision(self):
         for path, callee in (("deploy.yml", "e2e-staging.yml"), ("deploy-production.yml", "release.yml")):
             with self.subTest(path=path):
