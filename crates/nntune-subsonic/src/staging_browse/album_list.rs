@@ -88,7 +88,8 @@ impl MemberBrowse<'_> {
                 "Required parameter is missing.",
             )
         };
-        let order = match params.get("type") {
+        let list_type = params.get("type");
+        let order = match list_type {
             Some("random") => AlbumOrder::Id,
             Some("newest") if catalogue => AlbumOrder::Curated,
             Some("newest") => AlbumOrder::Created,
@@ -121,8 +122,18 @@ impl MemberBrowse<'_> {
         if !(1..=500).contains(&size) {
             return missing(budget);
         }
-        if catalogue && matches!(order, AlbumOrder::Snapshot | AlbumOrder::Empty) {
-            return charged_error_document(budget, code::GENERIC, "Unsupported album list type.");
+        if catalogue {
+            let message = match list_type {
+                Some("frequent") => Some("Unsupported album list type: frequent"),
+                Some("recent") => Some("Unsupported album list type: recent"),
+                Some("starred") => Some("Unsupported album list type: starred"),
+                Some("highest") => Some("Unsupported album list type: highest"),
+                Some("byGenre") => Some("Unsupported album list type: byGenre"),
+                _ => None,
+            };
+            if let Some(message) = message {
+                return charged_error_document(budget, code::GENERIC, message);
+            }
         }
         let offset = if !catalogue && matches!(order, AlbumOrder::Id) {
             0
@@ -162,7 +173,35 @@ impl MemberBrowse<'_> {
 #[cfg_attr(test, test)]
 #[doc(hidden)]
 pub fn album_list_boundaries() {
+    use crate::envelope::error_document;
     use crate::library::{Library, MemStore};
+    use std::mem::{align_of, size_of};
+
+    fn charge<T>(budget: &mut ConstructionBudget, len: usize) {
+        if len != 0 {
+            budget.charge(len, size_of::<T>(), align_of::<T>()).unwrap();
+        }
+    }
+
+    fn charge_graph(budget: &mut ConstructionBudget, value: &Value) {
+        match value {
+            Value::Map(entries) => {
+                charge::<(String, Value)>(budget, entries.len());
+                for (key, child) in entries {
+                    charge::<u8>(budget, key.len());
+                    charge_graph(budget, child);
+                }
+            }
+            Value::List(entries) => {
+                charge::<Value>(budget, entries.len());
+                for child in entries {
+                    charge_graph(budget, child);
+                }
+            }
+            Value::Str(text) => charge::<u8>(budget, text.len()),
+            _ => {}
+        }
+    }
 
     let store = MemStore::seeded();
     let mut albums = Vec::new();
@@ -201,29 +240,49 @@ pub fn album_list_boundaries() {
         songs: &songs,
         now_millis: 0,
     };
-    for (name, rest, ids) in [
-        ("getAlbumList2", "type=newest", &["d", "a", "b", "c"][..]),
+    let all = albums.len();
+    for (name, rest, ids, candidates) in [
+        (
+            "getAlbumList2",
+            "type=newest",
+            &["d", "a", "b", "c"][..],
+            all,
+        ),
         (
             "getAlbumList2",
             "type=byYear&fromYear=2020&toYear=2024",
             &["a", "b", "c", "d"],
+            all,
         ),
         (
             "getAlbumList2",
             "type=byYear&fromYear=2020&toYear=2024&offset=1&size=2",
             &["b", "c"],
+            all,
         ),
         (
             "getAlbumList2",
             "type=byYear&fromYear=2024&toYear=2020",
             &[],
+            0,
         ),
-        ("getAlbumList2", "type=random&offset=1&size=2", &["b", "c"]),
-        ("getAlbumList", "type=random&offset=1&size=2", &["a", "b"]),
+        (
+            "getAlbumList2",
+            "type=random&offset=1&size=2",
+            &["b", "c"],
+            all,
+        ),
+        (
+            "getAlbumList",
+            "type=random&offset=1&size=2",
+            &["a", "b"],
+            all,
+        ),
         (
             "getAlbumList",
             "type=newest",
             &["c", "b", "d", "a", "empty"],
+            all,
         ),
     ] {
         let params = Params::parse(rest);
@@ -246,13 +305,51 @@ pub fn album_list_boundaries() {
         for (item, id) in page.iter().zip(ids) {
             assert_eq!(super::field(item, "id"), &Value::Str((*id).into()));
         }
+        let mut expected = ConstructionBudget::new(usize::MAX);
+        // The buffer is reserved before member eligibility and pagination.
+        charge::<(usize, &Album, i64)>(&mut expected, candidates);
+        charge_graph(&mut expected, &actual);
+        let limit = expected.charged();
+        assert_eq!(probe.charged(), limit);
+        assert_eq!(build(&mut ConstructionBudget::new(limit)), Ok(actual));
         assert_eq!(
-            build(&mut ConstructionBudget::new(probe.charged())).unwrap(),
-            actual
-        );
-        assert_eq!(
-            build(&mut ConstructionBudget::new(probe.charged() - 1)),
+            build(&mut ConstructionBudget::new(limit - 1)),
             Err(BudgetExceeded)
+        );
+    }
+
+    let refusal = |query| {
+        view.document(
+            &mut ConstructionBudget::new(usize::MAX),
+            "getAlbumList2",
+            &Params::parse(query),
+            |_| panic!("no song lookup"),
+        )
+        .unwrap()
+    };
+    for (query, kind) in [
+        ("type=frequent", "frequent"),
+        ("type=recent", "recent"),
+        ("type=starred", "starred"),
+        ("type=highest", "highest"),
+        ("type=byGenre&genre=Rock", "byGenre"),
+    ] {
+        assert_eq!(
+            refusal(query),
+            Some(error_document(
+                0,
+                &format!("Unsupported album list type: {kind}")
+            ))
+        );
+    }
+    for query in [
+        "type=byGenre",
+        "type=frequent&size=0",
+        "type=recent&offset=x",
+    ] {
+        assert_eq!(
+            refusal(query),
+            Some(error_document(10, "Required parameter is missing."))
         );
     }
 }
