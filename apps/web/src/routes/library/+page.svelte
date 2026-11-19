@@ -59,6 +59,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+	import NativeAudio from '#lib/player/NativeAudio.svelte';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
@@ -2194,14 +2195,7 @@
 				</p>
 			{/if}
 			<div class="nt-library-player-controls">
-				{#key mediaRevision}
-					<audio
-						{@attach attachNativeAudio}
-						data-testid="audio-player"
-						controls
-						src={streamUrl}
-					></audio>
-				{/key}
+				<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
 				<button
 					class="nt-button nt-library-restart"
 					type="button"
@@ -2439,18 +2433,11 @@
 	.nt-player-identity {
 		overflow-wrap: anywhere;
 	}
-	audio {
-		max-width: 100%;
-	}
 	.nt-library-player-controls {
 		display: flex;
 		align-items: center;
 		flex-wrap: wrap;
 		gap: var(--nt-space-2) var(--nt-space-3);
-	}
-	.nt-library-player-controls audio {
-		flex: 1 1 12rem;
-		min-width: 0;
 	}
 	.nt-library-restart {
 		flex: 0 0 auto;
