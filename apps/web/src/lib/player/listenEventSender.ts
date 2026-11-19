@@ -1,7 +1,7 @@
 /**
  * Best-effort listen-event telemetry (`POST /v1/plays/events`).
  *
- * Pending work lives in memory and cannot outlive the player page's session scope.
+ * Pending work lives in memory and remains bound to the original playback session.
  */
 
 import type { ListenContext } from './listenContext.js';
@@ -26,6 +26,8 @@ export interface ListenEventSenderOptions {
 
 export interface ListenEventSender {
 	send(event: ListenEvent): void;
+	/** Reject new work and finish queued first attempts without retrying. */
+	close(): Promise<void>;
 	/** Permanently stop sending and abort pending work. */
 	dispose(): void;
 }
@@ -66,10 +68,18 @@ export function createListenEventSender({
 	// Ordered chain and immutable binding for each playback.
 	const chains = new Map<string, { tail: Promise<void>; accepted: boolean; binding: string }>();
 	const controller = new AbortController();
+	const retries = new AbortController();
 	const { signal } = controller;
 	function dispose(): void {
 		controller.abort();
+		retries.abort();
 		chains.clear();
+	}
+
+	async function close(): Promise<void> {
+		retries.abort();
+		await Promise.all([...chains.values()].map(({ tail }) => tail));
+		dispose();
 	}
 
 	function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -105,8 +115,9 @@ export function createListenEventSender({
 			} catch {
 				// Network failure: retry within the same scope and budget.
 			}
-			if (n >= retryDelaysMs.length) break;
-			await sleep(Math.max(retryDelaysMs[n], wait), signal);
+			if (retries.signal.aborted || n >= retryDelaysMs.length) break;
+			await sleep(Math.max(retryDelaysMs[n], wait), retries.signal);
+			if (retries.signal.aborted) break;
 		}
 		return false;
 	}
@@ -114,7 +125,7 @@ export function createListenEventSender({
 	return {
 		send(event) {
 			try {
-				if (signal.aborted || !isValidTrackId(event.track_id)) return;
+				if (retries.signal.aborted || !isValidTrackId(event.track_id)) return;
 				let chain = chains.get(event.playback_id);
 				if (!chain) {
 					if (event.event !== 'start' || chains.size >= MAX_PENDING_PLAYBACKS) return;
@@ -145,6 +156,7 @@ export function createListenEventSender({
 				// Telemetry never throws into playback.
 			}
 		},
+		close,
 		dispose
 	};
 }

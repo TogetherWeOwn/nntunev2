@@ -8,6 +8,7 @@ import { observeListenEvents } from './observeListenEvents.js';
 /** One context per mounted player page, independent of its keyed audio elements. */
 export function createPageListenHistory() {
 	let sender: ListenEventSender | undefined;
+	const observers = new Set<() => void>();
 
 	return {
 		mount(): () => void {
@@ -26,18 +27,29 @@ export function createPageListenHistory() {
 			};
 			window.addEventListener('storage', onStorage);
 			return () => {
-				drop();
-				unsubscribe();
-				window.removeEventListener('storage', onStorage);
+				for (const dispose of observers) dispose();
+				context.drop();
+				if (sender === scopedSender) sender = undefined;
+				// Navigation may send the terminal. An auth reset still aborts that drain.
+				void scopedSender.close().finally(() => {
+					unsubscribe();
+					window.removeEventListener('storage', onStorage);
+				});
 			};
 		},
 		attach(audio: HTMLAudioElement, trackId: string | undefined): () => void {
 			if (trackId) {
 				try {
-					return observeListenEvents(audio, {
+					const observer = observeListenEvents(audio, {
 						trackId,
 						sender: { send: (event) => sender?.send(event) }
-					}).dispose;
+					});
+					const dispose = () => {
+						observers.delete(dispose);
+						observer.dispose();
+					};
+					observers.add(dispose);
+					return dispose;
 				} catch {
 					// Observation must not prevent the element from attaching.
 				}
