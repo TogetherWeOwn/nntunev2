@@ -20,7 +20,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'commitQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'syncMiniPlayerHint',
 		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
@@ -32,7 +32,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
 		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const bindingsInRoute = new Set(['player', 'queueController', 'media']);
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
 	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
@@ -114,7 +114,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		const library = queueController.prepareLibrary(items);
-		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
+		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
@@ -1200,6 +1200,66 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 });
 
 const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
+
+test.each(['none', 'callback', 'publication'] as const)('native ended uses the queue transaction with reset at %s', async (boundary) => {
+	const flush = vi.fn(async () => {});
+	const { page, element, remount, observeClear, writes } = restartFixture(flush);
+	page.replaceQueue(addTrack(page.read().queue, pine));
+	const before = page.read();
+	let publications = 0;
+	const stop = page.subscribe((next) => {
+		if (currentTrack(next) !== pine) return;
+		publications += 1;
+		expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+		expect(page.currentAudio()).toBeUndefined();
+		expect(readMiniPlayerHint()?.trackId).toBe('coral');
+		if (boundary === 'publication') page.resetAuth();
+	});
+	if (boundary === 'callback') {
+		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
+	}
+
+	element.paused = false;
+	element.dispatchEvent(new Event('play'));
+	element.ended = element.paused = true;
+	element.dispatchEvent(new Event('pause'));
+	element.dispatchEvent(new Event('ended'));
+	stop();
+	const target = remount(pine.streamUrl);
+	target.play = vi.fn(async () => { target.paused = false; });
+	await Promise.resolve(); // Native flush.
+	await Promise.resolve(); // Native play result.
+
+	const advanced = boundary !== 'callback';
+	const played = boundary === 'none';
+	expect(publications).toBe(Number(advanced));
+	expect(currentTrack(page.read().queue)?.id).toBe(advanced ? 'pine' : 'coral');
+	expect(readMiniPlayerHint()?.trackId).toBe(played ? 'pine' : 'coral');
+	expect(flush).toHaveBeenCalledTimes(Number(played));
+	expect(target.play).toHaveBeenCalledTimes(Number(played));
+	expect(writes).toEqual(played ? [0] : []);
+	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
+});
+
+test('a reset during queued Play publication retires the hint and the Play attempt', async () => {
+	const flush = vi.fn(async () => {});
+	const { page, remount } = restartFixture(flush);
+	page.replaceQueue(selectTrack(addTrack(page.read().queue, pine), 1));
+	remount(pine.streamUrl);
+	const stop = page.subscribe((next) => {
+		if (currentTrack(next)?.id === 'coral') page.resetAuth();
+	});
+	const attempt = page.playQueued('coral');
+	stop();
+	const target = remount();
+	target.play = vi.fn(async () => {});
+	await attempt;
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(readMiniPlayerHint()?.trackId).toBe('pine');
+	expect(flush).not.toHaveBeenCalled();
+	expect(target.play).not.toHaveBeenCalled();
+	expect(page.read().queueAnnouncement).toBe('');
+});
 
 function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restartFixture>): void {
 	element.paused = false;

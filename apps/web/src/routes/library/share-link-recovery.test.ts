@@ -255,12 +255,14 @@ test('same-queue evidence replacement revokes an explicit Play waiting for flush
 	await page.refresh();
 	page.selectTrack('coral');
 	const play = vi.fn(async () => {});
-	page.setAudio(playableAudio(play));
+	const audio = playableAudio(play);
+	page.setAudio(audio);
 	const pending = page.playQueuedTrack('coral');
 	expect(tick).toHaveBeenCalledOnce();
 	const queue = page.read().queue;
 	await page.refresh();
 	expect(page.read().queue).toBe(queue);
+	expect(page.currentAudio()).toBe(audio);
 	flush();
 	await pending;
 	expect(play).not.toHaveBeenCalled();

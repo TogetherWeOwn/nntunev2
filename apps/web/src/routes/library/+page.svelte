@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import type { QueueCommitKind, QueuedPlaySource } from '#lib/player/queueController.js';
+	import type { QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
@@ -146,12 +146,21 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	const player = createPlayerController(createQueue([]), {
-		commit: replaceQueue,
 		flush: () => tick(),
 		clearShareFeedback,
 		clearJumpFeedback: () => { jumpStatus = ''; },
-		announce: (track) => announceEnd(track)
+		announce: (track) => announceEnd(track),
+		clearRestartFeedback: () => {
+			restartCanSeek = false;
+			restartStatus = '';
+			jumpStatus = '';
+		},
+		bumpMediaKey: () => { mediaRevision += 1; },
+		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
+		syncMiniPlayerHint
 	});
+	const commitQueue = player.commitQueue;
+	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
 	const media = player.media;
 	const queue = $derived($queueController);
@@ -634,56 +643,6 @@
 		return favoritesExportSnapshot()
 			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
 			.join('\u0001');
-	}
-
-	/** Reset restart and jump feedback when an edit changes the current source. */
-	function resetRestartOnSourceChange(
-		before: Track | null | undefined,
-		after: Track | null | undefined
-	): void {
-		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
-			restartCanSeek = false;
-			restartStatus = '';
-			jumpStatus = '';
-		}
-	}
-
-	function commitQueue(
-		next: QueueState,
-		kind: QueueCommitKind,
-		library?: Pick<ReturnType<typeof queueController.prepareLibrary>, 'sources'> & { isCurrent: () => boolean }
-	): boolean {
-		if (library && !library.isCurrent()) return false;
-		const receipt = queueController.begin(next, kind, !!library);
-		if (library && next === queueController.snapshot) {
-			queueController.publish(next, receipt, library.sources);
-			return true;
-		}
-		const before = queueCurrentTrack(queueController.snapshot);
-		const after = queueCurrentTrack(next);
-		if ((kind === 'replace' || kind === 'select') &&
-			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
-			if (kind === 'replace') clearShareFeedback();
-			media.clearShareSeek();
-			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		}
-		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
-			resetRestartOnSourceChange(before, after);
-		}
-		if (before?.id !== after?.id || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
-			mediaRevision += 1;
-			media.reset();
-			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		}
-		if (kind === 'replace') queueAnnouncement = '';
-		queueController.publish(next, receipt, library?.sources);
-		if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		syncMiniPlayerHint(next);
-		return queueController.isCurrentOperation(receipt);
-	}
-
-	function replaceQueue(next: QueueState): boolean {
-		return commitQueue(next, 'replace');
 	}
 
 	/** Mirror the current selection into the metadata-only mobile hint. */
