@@ -508,6 +508,89 @@ async fn staging_credential_mutations_keep_the_cap_and_fences() {
 }
 
 #[tokio::test]
+async fn staging_session_enforces_admission_before_reindexing() {
+    use crate::native_rest::{credential_hmac, Pepper};
+    use crate::subsonic_auth::{authenticate_staging, IndexKeyring};
+    use nntune_subsonic::auth::Credentials;
+
+    struct NoKeks;
+    impl crate::rotation::KekSource for NoKeks {
+        fn kek(&self, _: u32) -> Option<&[u8; 32]> {
+            panic!("API-key authentication must not open a token envelope")
+        }
+    }
+
+    let mut client = database().await;
+    let issued = prepared(AuthMode::ApiKey);
+    let record = &issued.prepared.record;
+    assert!(insert(&mut client, &issued.prepared, &claims())
+        .await
+        .unwrap());
+    let credentials = Credentials {
+        api_key: Some(issued.api_key.as_ref().unwrap().as_str().to_owned()),
+        ..Credentials::default()
+    };
+    let peppers = IndexKeyring::new(
+        Pepper {
+            version: 2,
+            bytes: &[9; 32],
+        },
+        Some(Pepper {
+            version: 1,
+            bytes: &[7; 32],
+        }),
+    )
+    .unwrap();
+    let new_hmac = credential_hmac(credentials.api_key.as_deref().unwrap(), &[9; 32]);
+
+    for (count, limit, error) in [
+        (59_i32, 0, Some(AuthError::Unavailable)),
+        (60, 4096, Some(AuthError::InvalidKey)),
+        (59, 4096, None),
+    ] {
+        client
+            .execute(
+                "UPDATE subsonic_credentials SET attempt_count = $1, attempt_window = 2 WHERE id = $2::text::uuid",
+                &[&count, &record.id],
+            )
+            .await
+            .unwrap();
+        let result = authenticate_staging(
+            &mut client,
+            &credentials,
+            &peppers,
+            &NoKeks,
+            121,
+            &mut ConstructionBudget::new(limit),
+        )
+        .await;
+        let row = client
+            .query_one(
+                "SELECT attempt_count, extract(epoch FROM last_used_at)::bigint, pepper_version, api_key_hmac \
+                 FROM subsonic_credentials WHERE id = $1::text::uuid",
+                &[&record.id],
+            )
+            .await
+            .unwrap();
+        if let Some(error) = error {
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!(row.get::<_, i32>(0), count);
+            assert_eq!(row.get::<_, Option<i64>>(1), None);
+            assert_eq!(row.get::<_, i32>(2), 1);
+            assert!(row.get::<_, &str>(3) == record.api_key_hmac.as_deref().unwrap());
+        } else {
+            let principal = result.unwrap();
+            assert_eq!(principal.user_id(), USER);
+            assert_eq!(principal.credential_id(), record.id);
+            assert_eq!(row.get::<_, i32>(0), 60);
+            assert_eq!(row.get::<_, Option<i64>>(1), Some(121));
+            assert_eq!(row.get::<_, i32>(2), 2);
+            assert!(row.get::<_, &str>(3) == new_hmac.as_str());
+        }
+    }
+}
+
+#[tokio::test]
 async fn schema_refuses_partial_extra_and_unscoped_material() {
     let client = database().await;
     for change in [

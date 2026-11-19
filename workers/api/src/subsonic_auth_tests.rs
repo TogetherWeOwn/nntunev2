@@ -326,6 +326,19 @@ async fn staged_session_carries_charge_and_waits_for_conditional_completion() {
 async fn current_key_authenticates_without_native_or_token_fallback() {
     let store = FakeStore::new(Some(api_record(2)));
     let keks = Keks::new();
+    // The ordinary store must not silently accept a charged lookup.
+    assert_eq!(
+        AuthSession::lookup(
+            &mut &store,
+            Some(2),
+            "unused",
+            Some(&mut ConstructionBudget::new(4096)),
+        )
+        .await
+        .err(),
+        Some(AuthError::Unavailable),
+    );
+    assert!(store.lookups.borrow().is_empty());
     let principal = authenticate(&store, &api_credentials(), &keyring(), &keks, NOW)
         .await
         .unwrap();
