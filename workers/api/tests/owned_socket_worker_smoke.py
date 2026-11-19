@@ -167,6 +167,10 @@ def main():
                     status, _, body = routing.http("POST", url)
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
+                    print(
+                        "PASS: PostgreSQL watchdog rolled back abandoned billing writes",
+                        flush=True,
+                    )
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")

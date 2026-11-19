@@ -255,3 +255,8 @@ sha256 = "3a3ef5862778cdf66e558cd23ca727d93384d3ddf0211c9c8f9bb08b56f4758b"
 file = "0050_refresh_legacy_vault_cohort.sql"
 target = "app"
 sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
+
+[[migration]]
+file = "0051_storage_object_envelope_intents.sql"
+target = "app"
+sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"

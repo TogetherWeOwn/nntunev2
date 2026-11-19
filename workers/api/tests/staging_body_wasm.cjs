@@ -21,6 +21,11 @@ test('collects bounded chunks through the Worker adapter', async () => {
   }
 });
 
+test('only charges for nonempty input and rejects a budget one byte short', async () => {
+  assert.equal(await collect(request(chunks(bytes(''))), 0, true), '');
+  await assert.rejects(collect(request(chunks(bytes('x=a'))), 3, true), (e) => e === 'Capacity');
+});
+
 test('rejects oversized chunks and cumulative input', async () => {
   await assert.rejects(collect(request(chunks(bytes('x=' + 'a'.repeat(8191))))), (e) => e === 'TooLarge');
   await assert.rejects(collect(request(chunks(bytes('x='), bytes('a'.repeat(8190)), bytes('z')))), (e) => e === 'TooLarge');

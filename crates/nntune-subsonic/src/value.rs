@@ -79,7 +79,10 @@ impl Value {
     }
 }
 
-fn copy_text(budget: &mut ConstructionBudget, text: &str) -> Result<String, BudgetExceeded> {
+pub(crate) fn copy_text(
+    budget: &mut ConstructionBudget,
+    text: &str,
+) -> Result<String, BudgetExceeded> {
     let mut bytes = budget.allocate_exact(text.len())?;
     bytes.extend_from_slice(text.as_bytes());
     String::from_utf8(bytes).map_err(|_| BudgetExceeded)
