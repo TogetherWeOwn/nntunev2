@@ -172,6 +172,7 @@ mod ledger_wasm_test {
         nntune_subsonic::construction_budget::tests::exact_vector_reservation_checks_limit_and_overflow();
         nntune_subsonic::value::charged_values_check_owned_storage_limits();
         crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
+        crate::worker_entry::account_fields_use_the_carried_charge();
     }
 }
 

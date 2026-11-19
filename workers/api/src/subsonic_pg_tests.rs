@@ -46,6 +46,42 @@ async fn database() -> Client {
 }
 
 #[tokio::test]
+async fn staging_account_projects_only_bounded_email_and_live_role_flags() {
+    let client = database().await;
+    client
+        .batch_execute(
+            "ALTER TABLE users ADD email TEXT NOT NULL DEFAULT '', \
+             ADD role TEXT NOT NULL DEFAULT 'member'; \
+             UPDATE users SET email = repeat('é',512), role = 'manager'",
+        )
+        .await
+        .unwrap();
+    let row = staging_account_row(&client, USER).await.unwrap().unwrap();
+    assert_eq!(row.get::<_, &str>(0).len(), ACCOUNT_FIELD_BYTES as usize);
+    assert!(!row.get::<_, bool>(1));
+    assert!(row.get::<_, bool>(2));
+    assert!(staging_account_row(&client, "unknown")
+        .await
+        .unwrap()
+        .is_none());
+
+    client
+        .batch_execute("UPDATE users SET email = email || 'x', role = 'admin'")
+        .await
+        .unwrap();
+    let row = staging_account_row(&client, USER).await.unwrap().unwrap();
+    assert_eq!(row.get::<_, Option<&str>>(0), None);
+    assert!(row.get::<_, bool>(1));
+    assert!(!row.get::<_, bool>(2));
+
+    client
+        .batch_execute("UPDATE users SET deleting_at = now()")
+        .await
+        .unwrap();
+    assert!(staging_account_row(&client, USER).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn exact_lookup_completion_and_reindex_are_committed() {
     let mut client = database().await;
     assert!(lookup(&mut client, Some(2), &"a".repeat(64))
