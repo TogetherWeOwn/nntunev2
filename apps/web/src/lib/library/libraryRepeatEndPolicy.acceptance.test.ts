@@ -57,7 +57,7 @@ import {
  */
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
-const sources = import.meta.glob('../../routes/**/*.svelte', {
+const sources = import.meta.glob(['../../routes/**/*.svelte', '../player/mediaController.ts'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
@@ -173,16 +173,11 @@ describe('library repeat hooks are declared in the library markup', () => {
 	});
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {
-		expect(
-			routeSource(),
-			note(
-				'LIBREP-U04',
-				'the library route reuses naturalEndPolicy',
-				'no reference',
-				'end_policy_reuse_missing',
-				'Builder imports naturalEndPolicy from #lib/player/queue.js and drives every library ended event through it.'
-			)
-		).toContain('naturalEndPolicy');
+		const authority = sources['../player/mediaController.ts'] ?? '';
+		expect(routeSource()).toMatch(/return media\.attach\(audio,/);
+		expect(routeSource()).not.toMatch(/\b(?:naturalEndPolicy|handleEnded)\b/);
+		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source\)/);
+		expect(authority).toMatch(/const result = naturalEndPolicy\(base, \{/);
 	});
 
 	it('LIBREP-U05 never uses a native loop attribute (control: passes now, must stay green)', () => {

@@ -1,4 +1,6 @@
-import { selectTrack, type QueueState } from './queue.js';
+import { get, writable } from 'svelte/store';
+import { resolveStreamUrl } from '../library/stream-url.js';
+import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode, type Track } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
 import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
@@ -7,11 +9,20 @@ export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boole
 
 type NativeObservations = {
 	source: () => string | null;
-	interrupt: () => void;
-	ended: (attachment: MediaAttachment) => Promise<void>;
 	seeking: (audio: HTMLAudioElement) => void;
 	position: (audio: HTMLAudioElement) => void;
 };
+
+type NaturalEndSelection = {
+	queue: Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'isCurrent'>;
+	commit: (queue: QueueState) => boolean;
+	flush: () => Promise<void>;
+	clearShareFeedback: () => void;
+	clearJumpFeedback: () => void;
+	announce: (track?: Track) => void;
+};
+
+const REPEAT_KEY = 'nntune:library-repeat:v1';
 
 type PlaySelection = {
 	revision: Pick<ReturnType<typeof createQueueController>, 'revoke' | 'isCurrent'>;
@@ -55,9 +66,11 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
 }
 
-export function createMediaController(matchesNative = matchesNativeSource) {
+export function createMediaController(matchesNative = matchesNativeSource, naturalEnd?: NaturalEndSelection) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
+	let endGeneration = 0;
+	const repeat = writable<RepeatMode>('off');
 	let destroyed = false;
 	let positionIntent = 0;
 	const pendingShare = createPendingShareSeek();
@@ -244,7 +257,82 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 		});
 	}
 
+	async function handleEnded(attachment: MediaAttachment, source: string): Promise<void> {
+		if (!naturalEnd) return;
+		const { queue, commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
+		const { audio } = attachment;
+		const intent = positionIntent;
+		const version = attachmentVersion;
+		let generation = endGeneration;
+		let revision = queue.revision;
+		const ownsEnd = () => !destroyed && generation === endGeneration && intent === positionIntent &&
+			queue.isCurrent(revision);
+		const ownsOrigin = () => ownsEnd() && current === attachment;
+		const base = queue.snapshot;
+		const result = naturalEndPolicy(base, {
+			repeat: get(repeat), radioActive: false, continueRadio: false, sleepComplete: false,
+			playing: attachment.playing, validEnd: audio.ended && audio.error === null
+		});
+		if (result.action === 'ignore' || !ownsOrigin()) return;
+		attachment.playing = false;
+		generation = ++endGeneration;
+		announce();
+		if (result.action !== 'play') return;
+		const track = currentTrack(result.queue);
+		const streamUrl = resolveStreamUrl(track);
+		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
+		const { volume, muted, playbackRate } = audio;
+		if (!ownsOrigin()) return;
+		// Replay supersedes a deferred share even when the native source survives.
+		clearShareFeedback();
+		if (!ownsOrigin()) return;
+		pendingShare.clear();
+		if (!commit(result.queue) || queue.snapshot !== result.queue || !track || !streamUrl) return;
+		revision = queue.revision;
+		// A keyed source change retires exactly one node and admits exactly one replacement.
+		// Resetting again (including auth reset before mount) cannot inherit this end.
+		if (attachmentVersion !== version + Number(replacing)) return;
+		await flush();
+		const replay = current;
+		const isCurrent = () => ownsEnd() && current === replay &&
+			attachmentVersion === version + (replacing ? 2 : 0);
+		if (!replay || replay.playing) return;
+		const target = replay.audio;
+		const matches = () => matchesSource(target, streamUrl, isCurrent);
+		try {
+			if (!matches()) return;
+			target.volume = volume;
+			if (!matches()) return;
+			target.muted = muted;
+			if (!matches()) return;
+			target.playbackRate = playbackRate;
+			runPosition(() => { if (matches()) target.currentTime = 0; });
+			if (!matches()) return;
+			clearJumpFeedback();
+			const play = target.play;
+			if (!matches()) return;
+			await play.call(target);
+			if (!matches()) return;
+			replay.playing = true;
+			announce(track);
+		} catch {
+			// Autoplay can be refused; native controls remain available, no success claim.
+			if (matches()) replay.playing = false;
+		}
+	}
+
 	return {
+		repeat: { subscribe: repeat.subscribe },
+		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
+			let value: string | null | undefined;
+			try { value = storage?.getItem(REPEAT_KEY); } catch { /* Storage is optional. */ }
+			repeat.set(value === 'one' || value === 'queue' ? value : 'off');
+		},
+		setRepeat(value: string, storage: Pick<Storage, 'setItem'> | null): void {
+			if (value !== 'off' && value !== 'one' && value !== 'queue') return;
+			repeat.set(value);
+			try { storage?.setItem(REPEAT_KEY, value); } catch { /* Keep the choice for this visit. */ }
+		},
 		playSelected,
 		restart,
 		jump,
@@ -284,7 +372,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 						case 'error':
 							if (audio.error === null) return;
 							break;
-						case 'ended': return observations.ended(receipt);
+						case 'ended': return handleEnded(receipt, source);
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							if (current === receipt && positionIntent === intent) observations.seeking(audio);
@@ -297,7 +385,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 						default: return observations.position(audio);
 					}
 					receipt.playing = false;
-					observations.interrupt();
+					endGeneration += 1;
 				};
 				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'seeking',
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate']) {
