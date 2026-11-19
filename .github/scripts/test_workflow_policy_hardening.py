@@ -122,6 +122,29 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("      name: production\n", job(production, "deploy-production"))
         self.assertIn("needs: [preflight, staging-evidence]", job(production, "deploy-production"))
 
+    def test_snapshot_spike_is_build_and_recall_only(self):
+        text = (WORKFLOWS / "mb-snapshot-spike.yml").read_text()
+        self.assertRegex(text, r"(?m)^  workflow_dispatch:$")
+        self.assertIn("  pull_request:\n    types: [labeled]", text)
+        self.assertIn("github.event.label.name == 'mb-snapshot-spike'", text)
+        self.assertIn("permissions:\n  contents: read", text)
+        self.assertNotRegex(text, r"(?m)^\s*(stage|environment|workflow_call):")
+        self.assertNotRegex(text, r"\b(secrets|inputs\.stage|CLOUDFLARE_\w+|wrangler)\b")
+
+        spike = job(text, "spike")
+        self.assertIn("persist-credentials: false", spike)
+        for command in ("bash workers/mb/spike/measure.sh", "python3 workers/mb/spike/recall.py"):
+            self.assertRegex(spike, rf"(?m)^[ \t]+{re.escape(command)}[ \t]+")
+        self.assertRegex(spike, r"(?m)^ {10}name: mb-snapshot-spike-results$")
+        for retired in ("stage.sh", "lifecycle.py", "bench.py", "live-archive"):
+            self.assertNotIn(retired, text)
+
+        for helper in ("stage.sh", "lifecycle.py", "test_lifecycle.py"):
+            self.assertFalse((ROOT / "workers/mb/spike" / helper).exists())
+        ci = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("spike/test_lifecycle.py", ci)
+        self.assertNotIn("spike/live-archive", ci)
+
     def test_regression_suite_is_a_required_ci_step(self):
         ci = (WORKFLOWS / "ci.yml").read_text()
         self.assertIn("python3 .github/scripts/test_workflow_policy_hardening.py", job(ci, "public-text"))
