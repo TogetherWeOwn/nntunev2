@@ -5,7 +5,8 @@
 //! format follows `f`: `json`, `jsonp`, anything else XML. `type` is `nntune`
 //! (v1 said `koel` from its upstream heritage; see ADR 0001).
 
-use crate::value::Value;
+use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
+use crate::value::{copy_text, Value};
 
 pub const API_VERSION: &str = "1.16.1";
 pub const SERVER_TYPE: &str = "nntune";
@@ -66,6 +67,51 @@ pub fn ok_document(payload: Vec<(String, Value)>) -> Value {
 /// Failed document with a Subsonic error code/message.
 pub fn error_document(error_code: i64, message: &str) -> Value {
     Value::Map(base_envelope(Some((error_code, message))))
+}
+
+/// Wrap already-charged fields in one exact-capacity envelope, without an
+/// intermediate payload vector or any uncharged Value clones.
+pub fn charged_ok_document<const N: usize>(
+    budget: &mut ConstructionBudget,
+    payload: [(&str, Value); N],
+) -> Result<Value, BudgetExceeded> {
+    charged_document(budget, "ok", payload)
+}
+
+pub fn charged_error_document(
+    budget: &mut ConstructionBudget,
+    error_code: i64,
+    message: &str,
+) -> Result<Value, BudgetExceeded> {
+    let message = Value::charged_str(budget, message)?;
+    let error = Value::charged_map(
+        budget,
+        [("code", Value::Int(error_code)), ("message", message)],
+    )?;
+    charged_document(budget, "failed", [("error", error)])
+}
+
+fn charged_document<const N: usize>(
+    budget: &mut ConstructionBudget,
+    status: &str,
+    payload: [(&str, Value); N],
+) -> Result<Value, BudgetExceeded> {
+    let headers = [
+        ("status", status),
+        ("version", API_VERSION),
+        ("type", SERVER_TYPE),
+        ("serverVersion", SERVER_VERSION),
+    ];
+    let capacity = N.checked_add(headers.len() + 1).ok_or(BudgetExceeded)?;
+    let mut entries = budget.allocate_exact(capacity)?;
+    for (key, value) in headers {
+        entries.push((copy_text(budget, key)?, Value::charged_str(budget, value)?));
+    }
+    entries.push((copy_text(budget, "openSubsonic")?, Value::Bool(true)));
+    for (key, value) in payload {
+        entries.push((copy_text(budget, key)?, value));
+    }
+    Ok(Value::Map(entries))
 }
 
 /// Render a document for `f=json`.
