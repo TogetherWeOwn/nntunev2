@@ -159,7 +159,7 @@ fn test_outcome() -> ReconcileOutcome {
         read_anchor: None,
     }
 }
-// Exercise a late history constraint error and retry using the prototype store.
+// Exercise history refusal, late rollback and replay through the shared store.
 async fn late_fault_and_retry() -> Result<(), &'static str> {
     let store = PgStore {
         env: None,
@@ -202,6 +202,26 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
     let after = fault_snapshot().await.map_err(|_| "replay state invalid")?;
     if before != after {
         return Err("replay changed committed state");
+    }
+    outcome.history[0].stripe_invoice_id = "in_worker_fresh_first".into();
+    outcome.history[1].stripe_invoice_id = "in_worker_fresh_second".into();
+    outcome.history[1].stripe_subscription_id = "sub_worker_other".into();
+    for explicit_stale in [false, true] {
+        outcome.explicit_stale = explicit_stale;
+        if store
+            .store_reconcile_outcome("worker_fault_user", &outcome)
+            .await
+            .is_ok()
+        {
+            return Err("history for a different subscription was accepted");
+        }
+        if fault_snapshot()
+            .await
+            .map_err(|_| "history attribution refusal changed committed state")?
+            != before
+        {
+            return Err("history attribution refusal changed committed state");
+        }
     }
     Ok(())
 }
