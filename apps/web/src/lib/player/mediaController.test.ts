@@ -1,14 +1,18 @@
 import { expect, test, vi } from 'vitest';
-import { createMediaController } from './mediaController.js';
+import { createMediaController as createMedia } from './mediaController.js';
+import { createQueue, type QueueState } from './queue.js';
+import { createQueueController } from './queueController.js';
+
+const createMediaController = (matchesNative?: Parameters<typeof createMedia>[2], initial: QueueState = createQueue([])) =>
+	createMedia(createQueueController(initial), undefined, matchesNative);
 
 test('feedback that retires the attempt cannot also bump its live region', async () => {
-	const media = createMediaController();
 	const queue = { tracks: [{ id: 'coral', title: 'Coral', artist: '', streamUrl: '' }], currentIndex: 0 };
+	const media = createMediaController(undefined, queue);
 	const announce = vi.fn(() => media.destroy());
 	const bumpAnnouncement = vi.fn();
 	const flush = vi.fn(async () => {});
 	await media.playSelected(queue, 0, { streamUrl: '', isCurrent: () => true }, '', {
-		revision: { revoke: () => 1, isCurrent: () => true },
 		commit: () => true, flush, announce, bumpAnnouncement
 	});
 	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; no stream to play.');

@@ -1105,6 +1105,17 @@ writes automatically, and an observer success alone is not verified recovery.
 
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
+The dispatch form offers only `promote`. Do not dispatch bootstrap as a probe:
+if a legacy `mode=bootstrap-maintenance` request reaches preflight, it fails
+before staging admission and may be reported as a preflight incident even though
+no deployment ran. Keep promotion disabled.
+Cloudflare documents [empty Worker creation](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/),
+but [version upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
+and [deployment creation](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+do not document a deploy-only-if-undeployed condition. Actions serialization
+cannot stop a concurrent provider write between the empty read and deployment.
+No account-wide credential, manual deployment, or live experiment may be
+used as a workaround. The sequence below is held until a safe path lands.
 
 1. **Release Manager:** Accept the exact launch SHA after M1, staging
    admission, Security → QA, exact-head CI and migration ledger review.
@@ -1113,22 +1124,20 @@ application deploy. Do not bypass the production lane to seed the app.
    and credential scopes. After independent Release Manager acceptance, set
    `PRODUCTION_ACCEPTED_SHA` **only** in that Environment, never as a repo or org
    variable. Both modes require this exact SHA, in addition to staging admission.
-   Dispatch `deploy-production.yml` on `main` with that SHA and
-   `mode=bootstrap-maintenance`. Cloudflare creates an unbound Worker under a
-   unique name, deploys maintenance only to that new immutable ID, then renames
-   it to `nntune-web`. Cloudflare returns a conflict if the destination exists;
-   the workflow never writes through that name, attaches a host or tags.
-   On conflict or ambiguous failure, stop. The Cloudflare custodian reconciles
-   the logged scratch name/ID against the canonical Worker before any retry or
-   cleanup; never delete by name or assume a failed rename did not take effect.
-3. **Cloudflare custodian / DevOps:** Record the seed's 100% version ID.
+   A future bootstrap must pin the immutable `nntune-web` identity and refuse
+   unless empty, unrouted, unbound, with workers.dev and previews off. Use only
+   the Environment's Worker-scoped credentials; qualify asset upload separately.
+   On refusal, drift or an uncertain response, reconcile pinned Worker, version
+   and route state before re-entry; never delete by name or retry blindly.
+3. **Cloudflare custodian / DevOps:** Record the exact seed version at 100%.
    Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
    route conflicts; attach the host to `nntune-web` without displacing routing.
-   Record the non-cacheable, non-indexable maintenance 503 probe.
+   Record the non-cacheable, non-indexable maintenance 503 probe. First-cutover
+   undo closes the enable window and reverses only new production DNS/routes.
 4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
-   for the same accepted SHA. The gradual action uses the lockfile-installed
-   Wrangler for promotion and automatic stage rollback. On final smoke
-   failure, use the same CLI and production credentials:
+   only after separate exact-SHA/mode acceptance. The gradual action uses the
+   lockfile-installed Wrangler for promotion and automatic stage rollback.
+   On final smoke failure, use the same CLI and production credentials:
    `pnpm --dir apps/web exec wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes`.
    Verify 100% on that version, maintenance 503 on `/` and `/api/build`, and
    no tag. Retry only with current release admission. The GitHub custodian

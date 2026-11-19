@@ -5,8 +5,7 @@ import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
+import { createPlayerController } from '#lib/player/controller.js';
 import { describeJump } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -33,10 +32,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
 		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const controller = parsed.statements.find((node) => ts.isVariableStatement(node) &&
-		node.declarationList.declarations.some((declaration) => declaration.name.getText(parsed) === 'media'));
-	if (!mount || !controller) throw new Error('Missing route mount or media authority');
-	const handlers = [...declarations, controller, mount].map((node) => node.getText(parsed)).join('\n');
+	const bindingsInRoute = new Set(['player', 'queueController', 'media']);
+	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
+		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
+	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
+	const handlers = [...declarations, ...controllers, mount].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -83,13 +83,12 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
 		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
-		createQueueController,
-		createMediaController: (_: undefined, end: Parameters<typeof createMediaController>[1]) => {
-			const controller = createMediaController((audio, source) =>
-				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source, end);
-			const clear = controller.clearShareSeek;
-			controller.clearShareSeek = () => { onClear(); clear(); };
-			return controller;
+		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end, (audio, source) =>
+				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const clear = player.media.clearShareSeek;
+			player.media.clearShareSeek = () => { onClear(); clear(); };
+			return player;
 		},
 		tick, window: { location }, element, track, capture
 	};
@@ -101,11 +100,6 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let queueConfirmGeneration = 0;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
-		const queueController = createQueueController(queue);
-		const library = queueController.prepareLibrary(items);
-		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
-		queueController.subscribe((value) => { queue = value; });
-		const queueRevision = queueController;
 		let queueAnnouncementVersion = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
@@ -119,6 +113,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const queueShare = { dispose() {}, reset() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
+		const library = queueController.prepareLibrary(items);
+		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
+		queueController.subscribe((value) => { queue = value; });
+		const queueRevision = queueController;
 		return {
 			detach: attachNativeAudio(element),
 			restart: restartCurrentTrack, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: jumpRelative,
@@ -1210,6 +1208,41 @@ function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restart
 	element.ended = element.paused = true;
 	capture('pause')(); // The browser's completion pause is not a manual pause.
 }
+
+test('route selection drives native repeat, and cleanup retires only its own player', async () => {
+	let flush!: () => void;
+	const pending = new Promise<void>((resolve) => { flush = resolve; });
+	const selectedFlush = vi.fn(() => pending);
+	const leavingFlush = vi.fn(() => pending);
+	const selected = restartFixture(selectedFlush);
+	const leaving = restartFixture(leavingFlush);
+	selected.page.replaceQueue(addTrack(selected.page.read().queue, pine));
+	selected.page.select(1);
+	const target = selected.remount(pine.streamUrl);
+	target.play = vi.fn(async () => { target.ended = target.paused = false; });
+	leaving.element.play = vi.fn(async () => { leaving.element.ended = leaving.element.paused = false; });
+
+	signalNaturalEnd({ ...selected, element: target });
+	signalNaturalEnd(leaving);
+	const repeatSelection = selected.page.end('one');
+	const retiredRepeat = leaving.page.end('one');
+	expect(selectedFlush).toHaveBeenCalledOnce();
+	expect(leavingFlush).toHaveBeenCalledOnce();
+	leaving.page.cleanup();
+	flush();
+	await Promise.all([repeatSelection, retiredRepeat]);
+
+	expect(currentTrack(selected.page.read().queue)).toBe(pine);
+	expect(selected.page.currentAudio()).toBe(target);
+	expect(target.play).toHaveBeenCalledOnce();
+	expect(selected.writes).toEqual([0]);
+	expect(selected.page.read().queueAnnouncement).toBe('Playing Pine Morning.');
+	expect(currentTrack(leaving.page.read().queue)?.id).toBe(leaving.track.id);
+	expect(leaving.page.currentAudio()).toBeUndefined();
+	expect(leaving.element.play).not.toHaveBeenCalled();
+	expect(leaving.writes).toEqual([]);
+	expect(leaving.page.read().queueAnnouncement).toBe('');
+});
 
 test.each(['pause', 'auth', 'edit'] as const)('queue wrap is fenced by %s during the native flush', async (boundary) => {
 	let flush!: () => void;

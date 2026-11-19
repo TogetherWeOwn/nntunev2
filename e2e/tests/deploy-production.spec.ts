@@ -108,6 +108,7 @@ test.describe('production preflight (exact checked-in block, offline)', () => {
   // exact block executes with the same inputs it gets in CI.
   const STEP_ENV = {
     GITHUB_REF: 'refs/heads/main',
+    DEPLOY_MODE: 'promote',
     PRODUCTION_DOMAIN_DEFAULT: 'production-placeholder.example.invalid',
     UNPROTECTED_ACCEPTED_SHA: '',
   };

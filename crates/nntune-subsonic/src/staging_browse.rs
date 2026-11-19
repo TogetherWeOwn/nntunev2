@@ -5,16 +5,23 @@ use crate::library::{Album, Artist, Song};
 use crate::value::Value;
 
 mod album_list;
+mod search;
 
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 pub use album_list::album_list_boundaries;
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+pub use search::{search_boundaries, search_matches_dispatch};
 
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     let Value::Map(fields) = value else {
-        panic!("expected map")
+        panic!("expected map for {key}");
     };
-    &fields.iter().find(|(name, _)| name == key).unwrap().1
+    &fields
+        .iter()
+        .find(|(name, _)| name == key)
+        .unwrap_or_else(|| panic!("missing field {key}"))
+        .1
 }
 
 /// Borrows a member snapshot in browse order. The adapter enforces membership
@@ -38,6 +45,8 @@ impl<'a> MemberBrowse<'a> {
                 | "getMusicDirectory"
                 | "getAlbumList"
                 | "getAlbumList2"
+                | "search2"
+                | "search3"
         )
     }
 
@@ -54,6 +63,7 @@ impl<'a> MemberBrowse<'a> {
         let doc = match name {
             "getArtists" | "getIndexes" => self.index_document(budget, name)?,
             "getAlbumList" | "getAlbumList2" => self.album_list_document(budget, name, params)?,
+            "search2" | "search3" => self.search_document(budget, name, params)?,
             _ => {
                 let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {
                     return charged_error_document(
