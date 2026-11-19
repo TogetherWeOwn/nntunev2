@@ -97,3 +97,118 @@ fn history_native_write_requires_plays_scope_without_browser_context() {
         assert_eq!(block_on(handle(&h.ctx(), &req)).status, 404);
     }
 }
+
+#[test]
+fn history_export_pages_and_clear_affect_only_the_session_owner() {
+    use crate::listen_history::{ListenEvent, ListenRow, EVENTS_PATH, EXPORT_PAGE_SIZE};
+    let h = harness();
+    seed_user(&h, "listener-a", "alice@example.com");
+    seed_user(&h, "listener-b", "bob@example.com");
+    let alice = magic_login(&h, "alice@example.com");
+    let bob = magic_login(&h, "bob@example.com");
+    for (owner, count) in [("listener-a", EXPORT_PAGE_SIZE + 1), ("listener-b", 1)] {
+        h.store
+            .listen_rows
+            .borrow_mut()
+            .extend((1..=count).map(|index| {
+                (
+                    owner.into(),
+                    ListenRow {
+                        playback_id: format!("00000000-0000-4000-8000-{index:012}"),
+                        track_id: format!("{owner}-{index}"),
+                        event: ListenEvent::Start,
+                        recorded_at: NOW as i64,
+                    },
+                )
+            }));
+    }
+    let export = |cookie: &str, body: serde_json::Value| -> serde_json::Value {
+        let resp = h.call_full(
+            "POST",
+            listen_history_handlers::EXPORT_PATH,
+            Some(body.to_string()),
+            Some(cookie.into()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        serde_json::from_str(&resp.body).unwrap()
+    };
+    let first = export(&alice, serde_json::json!({}));
+    let events = first["events"].as_array().unwrap();
+    assert_eq!(events.len(), EXPORT_PAGE_SIZE);
+    assert_eq!(
+        events[0]["track_id"],
+        format!("listener-a-{}", EXPORT_PAGE_SIZE + 1)
+    );
+    assert!(events
+        .iter()
+        .all(|row| row.get("id").is_none() && row.get("user_id").is_none()));
+    assert_eq!(first["retention"], "account_lifetime");
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let last = export(&alice, serde_json::json!({"before_id": cursor}));
+    assert_eq!(last["events"].as_array().unwrap().len(), 1);
+    assert_eq!(last["events"][0]["track_id"], "listener-a-1");
+    assert!(last["next_cursor"].is_null());
+    assert_eq!(
+        export(&bob, serde_json::json!({"before_id": cursor}))["events"],
+        serde_json::json!([])
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            h.call_full(
+                "DELETE",
+                EVENTS_PATH,
+                None,
+                Some(alice.clone()),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+    }
+    assert_eq!(
+        export(&alice, serde_json::json!({}))["events"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        export(&bob, serde_json::json!({}))["events"][0]["track_id"],
+        "listener-b-1"
+    );
+}
+
+#[test]
+fn history_privacy_routes_require_cookie_origin_and_fresh_clear() {
+    let (h, cookie, secret) = play_bearer_harness("plays:write", false);
+    let mut ctx = h.ctx();
+    for (method, path) in [
+        ("POST", listen_history_handlers::EXPORT_PATH),
+        ("DELETE", crate::listen_history::EVENTS_PATH),
+    ] {
+        let mut req = Request {
+            method: method.into(),
+            path: path.into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(block_on(handle(&ctx, &req)).status, 401);
+        req.cookie = Some(cookie.clone());
+        req.authorization = Some(format!("Bearer {secret}"));
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        req.authorization = None;
+        req.origin = None;
+        assert_eq!(block_on(handle(&ctx, &req)).status, 401);
+        req.origin = Some(ORIGIN.into());
+        if method == "DELETE" {
+            ctx.now = NOW + 601;
+            let stale = block_on(handle(&ctx, &req));
+            assert_eq!(stale.status, 401, "{}", stale.body);
+            assert!(stale.body.contains("reauth_required"));
+        } else {
+            req.body = br#"{"before_id":"42"}"#.to_vec();
+            assert_eq!(block_on(handle(&ctx, &req)).status, 422);
+        }
+    }
+}

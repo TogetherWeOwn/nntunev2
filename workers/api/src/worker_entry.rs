@@ -4036,6 +4036,36 @@ impl Store for PgStore {
         .await
     }
 
+    async fn export_listen_events(
+        &self,
+        owner: &str,
+        before: Option<&crate::listen_history::ExportCursor>,
+    ) -> Result<Vec<crate::listen_history::ListenRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                crate::listen_history::export(&client, owner, before)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_export"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn clear_listen_events(&self, owner: &str) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                crate::listen_history::clear(&mut client, owner)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_clear"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn playback_lease(
         &self,
         user_id: &str,
