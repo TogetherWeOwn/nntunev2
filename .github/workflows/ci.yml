@@ -820,6 +820,20 @@ jobs:
           python3 .github/scripts/check_refresh_retry_mutants.py
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise dormant native PgStore billing reconciliation
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          test_name=worker_entry::billing_store_postgres_test::dormant_store_refuses_absent_history_and_replays_when_owned
+          test_args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${test_args[@]}" -- --exact --ignored --list)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          maintenance=postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
+          createdb --maintenance-db="$maintenance" --template=template0 nntune_billing_native
+          trap 'dropdb --maintenance-db="$maintenance" nntune_billing_native' EXIT
+          log="$RUNNER_TEMP/native-billing-reconciliation.log"
+          cargo test "${test_args[@]}" -- --exact --ignored | tee "$log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
       # The preparation entry point creates its own isolated PostgreSQL
       # container, migrates each store, runs the schema test and removes it.
       - name: Reject externally supplied store targets
