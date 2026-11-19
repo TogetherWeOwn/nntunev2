@@ -260,3 +260,9 @@ sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
 file = "0051_storage_object_envelope_intents.sql"
 target = "app"
 sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"
+
+[[migration]]
+file = "0052_listen_history.sql"
+target = "app"
+sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"
+renamed_from = [{ file = "0037_listen_history.sql", sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e" }]
