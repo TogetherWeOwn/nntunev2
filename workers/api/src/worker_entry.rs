@@ -750,6 +750,7 @@ impl MirrorBinding {
 
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
+pub use subsonic_pg::mutate_staging_credential;
 // Unmounted until the staging membership and mirror readers adopt it.
 #[allow(dead_code)]
 #[path = "subsonic_pg_page.rs"]
