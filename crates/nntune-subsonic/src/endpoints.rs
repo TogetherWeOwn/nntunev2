@@ -153,7 +153,8 @@ pub fn charged_params_preserve_order_and_lossy_decoding() {
             std::mem::align_of::<(String, String)>(),
         )
         .unwrap();
-    for capacity in [4, 6, 2, 10, 7, 2, 4, 5, 5, 5, 0] {
+    // The empty value reserves nothing, so it has no ledger entry.
+    for capacity in [4, 6, 2, 10, 7, 2, 4, 5, 5, 5] {
         expected.charge(capacity, 1, 1).unwrap();
     }
     let limit = expected.charged();
