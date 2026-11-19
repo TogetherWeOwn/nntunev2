@@ -1,8 +1,8 @@
 # R2 snapshot backend — phase 0 spike
 
-Measurement-only. Every deployed `workers/mb` environment leaves
-`MB_BACKEND` unset and keeps the Hyperdrive repository; nothing here
-changes the `/v1/mb/*` contract or any production configuration.
+**Historical experiment: NO-GO, not adopted.** The live benchmark is
+retired. Ordinary `workers/mb` deployments use the Hyperdrive repository;
+nothing here changes the `/v1/mb/*` contract or production configuration.
 
 The question: can an immutable snapshot of the curated CC0 subset in R2,
 read through `SnapshotRepo` (`src/snapshot.rs`) behind the existing
@@ -10,8 +10,7 @@ read through `SnapshotRepo` (`src/snapshot.rs`) behind the existing
 
 That cluster was deleted on 2026-11-06 (it held only a test seed), so the
 `pg_trgm` baseline runs on a throwaway Postgres container inside the
-spike job. A no-go would mean recreating the cluster, which is new spend
-and an owner decision first.
+spike job. This experiment does not commission a replacement.
 
 ## Pieces
 
@@ -138,11 +137,22 @@ CC0 core only, no NC supplementary data or live product API reads.
 
 ## Running
 
-- PR label `mb-snapshot-spike`: build + recall, no secrets.
-- `workflow_dispatch` on `main` with `stage: true`: also uploads to
-  `nntunev2-mb-snap-staging` (14-day expiry rule on `snap/`), deploys the
-  token-gated `nntune-mb-snap-staging` Worker, runs the bench, then
-  deletes the Worker and the objects.
+Manual dispatch and the PR label `mb-snapshot-spike` both run only the
+CC0 build and local recall comparison. Results are the run's step summary
+and the `mb-snapshot-spike-results` artifact. The workflow does not bind a
+GitHub Environment, read Cloudflare credentials, or call a deploy helper.
 
-Results are the run's step summary and the `mb-snapshot-spike-results`
-artifact.
+## Retired live benchmark
+
+The [decision run](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42352987049)
+measured 1,510 vs 1,504 held-out hits (2,000 queries), and ETL took 54.6 min
+with 18.1 GB peak disk usage. Uncached latency failed: worst lookup p95 was
+566.8 ms (target <250 ms), and search p95 was 714.1 ms (target <600 ms).
+Successful workflow execution did not mean the backend passed.
+
+That run tore down the benchmark Worker and staged objects. Keep the spike
+inert: no pointer flip, no reactivation, and no change to the bucket's native
+14-day `snap/` expiry. The former cloud helpers and their mock tests are
+[archived as text](spike/live-archive); they are not called by CI or a runbook.
+Removing the live path from current source does not revoke a credential or
+stop GitHub from re-running a historical workflow revision.
