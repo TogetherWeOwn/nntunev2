@@ -5,6 +5,7 @@
 use std::future::Future;
 
 use nntune_subsonic::auth::Credentials;
+use nntune_subsonic::construction_budget::ConstructionBudget;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -218,15 +219,123 @@ fn valid_record(record: &CredentialRecord) -> bool {
         }
 }
 
+// The staging session borrows one app client for lookup, admission and
+// completion. The ordinary store's connection behavior remains separate.
+trait AuthSession {
+    fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> impl Future<Output = Result<Option<CredentialRecord>, AuthError>>;
+
+    fn admit(
+        &mut self,
+        selected: &CredentialRecord,
+        now: u64,
+    ) -> impl Future<Output = Result<bool, AuthError>>;
+
+    fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> impl Future<Output = Result<bool, AuthError>>;
+}
+
+impl<S: CredentialStore> AuthSession for &S {
+    async fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> Result<Option<CredentialRecord>, AuthError> {
+        if budget.is_some() {
+            return Err(AuthError::Unavailable);
+        }
+        match version {
+            Some(version) => self.by_key(version, value).await,
+            None => self.by_username(value).await,
+        }
+    }
+
+    async fn admit(&mut self, selected: &CredentialRecord, now: u64) -> Result<bool, AuthError> {
+        self.admit_attempt(selected, now).await
+    }
+
+    async fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        self.complete(selected, reindex, now).await
+    }
+}
+
+impl AuthSession for tokio_postgres::Client {
+    async fn lookup(
+        &mut self,
+        version: Option<u32>,
+        value: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> Result<Option<CredentialRecord>, AuthError> {
+        crate::worker_entry::load_staging_credential(
+            self,
+            budget.ok_or(AuthError::Unavailable)?,
+            version,
+            value,
+        )
+        .await
+    }
+
+    async fn admit(&mut self, selected: &CredentialRecord, now: u64) -> Result<bool, AuthError> {
+        crate::worker_entry::mutate_staging_credential(self, selected, None, now).await
+    }
+
+    async fn finish(
+        &mut self,
+        selected: &CredentialRecord,
+        reindex: Option<&Reindex>,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        crate::worker_entry::mutate_staging_credential(self, selected, Some(reindex), now).await
+    }
+}
+
 /// Authenticate without cookies, native bearer keys, client-name identity,
 /// or fixture-password fallback. The HTTP adapter must reject duplicate
 /// credential parameters before constructing Credentials (including p=).
 pub async fn authenticate(
-    store: &impl CredentialStore,
+    mut store: &impl CredentialStore,
     credentials: &Credentials,
     peppers: &IndexKeyring<'_>,
     keks: &impl KekSource,
     now: u64,
+) -> Result<Principal, AuthError> {
+    authenticate_in(&mut store, credentials, peppers, keks, now, None).await
+}
+
+/// Authenticate a staging request on its already admitted app client and
+/// construction ledger. This helper neither connects nor mounts a route.
+pub async fn authenticate_staging(
+    client: &mut tokio_postgres::Client,
+    credentials: &Credentials,
+    peppers: &IndexKeyring<'_>,
+    keks: &impl KekSource,
+    now: u64,
+    budget: &mut ConstructionBudget,
+) -> Result<Principal, AuthError> {
+    authenticate_in(client, credentials, peppers, keks, now, Some(budget)).await
+}
+
+async fn authenticate_in(
+    store: &mut impl AuthSession,
+    credentials: &Credentials,
+    peppers: &IndexKeyring<'_>,
+    keks: &impl KekSource,
+    now: u64,
+    mut budget: Option<&mut ConstructionBudget>,
 ) -> Result<Principal, AuthError> {
     if credentials.password.is_some() {
         return Err(AuthError::Unsupported);
@@ -243,8 +352,11 @@ pub async fn authenticate(
         }
         let mut matched = None;
         for pepper in std::iter::once(&peppers.current).chain(peppers.previous.as_ref()) {
-            let digest = Zeroizing::new(indexed_digest(key, pepper.bytes, None)?);
-            let Some(record) = store.by_key(pepper.version, &digest).await? else {
+            let digest = Zeroizing::new(indexed_digest(key, pepper.bytes, budget.as_deref_mut())?);
+            let Some(record) = store
+                .lookup(Some(pepper.version), &digest, budget.as_deref_mut())
+                .await?
+            else {
                 continue;
             };
             if !valid_record(&record)
@@ -259,7 +371,11 @@ pub async fn authenticate(
             let reindex = if pepper.version != peppers.current.version {
                 Some(Reindex {
                     pepper_version: peppers.current.version,
-                    api_key_hmac: indexed_digest(key, peppers.current.bytes, None)?,
+                    api_key_hmac: indexed_digest(
+                        key,
+                        peppers.current.bytes,
+                        budget.as_deref_mut(),
+                    )?,
                 })
             } else {
                 None
@@ -293,7 +409,7 @@ pub async fn authenticate(
             return Err(AuthError::InvalidToken);
         }
         let record = store
-            .by_username(username)
+            .lookup(None, username, budget.as_deref_mut())
             .await?
             .ok_or(AuthError::InvalidToken)?;
         if !valid_record(&record)
@@ -303,16 +419,16 @@ pub async fn authenticate(
             return Err(AuthError::InvalidToken);
         }
         // Reserve before any cryptography involving a reversible secret.
-        if !store.admit_attempt(&record, now).await? {
+        if !store.admit(&record, now).await? {
             return Err(AuthError::InvalidToken);
         }
-        verify_token(&record, token, salt, keks, None)?;
+        verify_token(&record, token, salt, keks, budget)?;
         (record, None, AuthError::InvalidToken)
     };
-    if failure == AuthError::InvalidKey && !store.admit_attempt(&selected, now).await? {
+    if failure == AuthError::InvalidKey && !store.admit(&selected, now).await? {
         return Err(failure);
     }
-    if !store.complete(&selected, reindex.as_ref(), now).await? {
+    if !store.finish(&selected, reindex.as_ref(), now).await? {
         return Err(failure);
     }
     Ok(Principal {

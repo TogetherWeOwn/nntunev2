@@ -224,6 +224,104 @@ impl CredentialStore for FakeStore {
     }
 }
 
+struct ChargedSession {
+    row: Option<CredentialRecord>,
+    calls: Vec<&'static str>,
+    committed: bool,
+}
+
+impl AuthSession for ChargedSession {
+    async fn lookup(
+        &mut self,
+        version: Option<u32>,
+        digest: &str,
+        budget: Option<&mut ConstructionBudget>,
+    ) -> Result<Option<CredentialRecord>, AuthError> {
+        self.calls.push("lookup");
+        assert_eq!(version, Some(2));
+        assert_eq!(
+            self.row.as_ref().unwrap().api_key_hmac.as_deref(),
+            Some(digest)
+        );
+        budget
+            .unwrap()
+            .charge(1, 1, 1)
+            .map_err(|_| AuthError::Unavailable)?;
+        Ok(self.row.take())
+    }
+
+    async fn admit(&mut self, _: &CredentialRecord, _: u64) -> Result<bool, AuthError> {
+        self.calls.push("admit");
+        Ok(true)
+    }
+
+    async fn finish(
+        &mut self,
+        _: &CredentialRecord,
+        _: Option<&Reindex>,
+        _: u64,
+    ) -> Result<bool, AuthError> {
+        self.calls.push("finish");
+        Ok(self.committed)
+    }
+}
+
+#[tokio::test]
+async fn staged_session_carries_charge_and_waits_for_conditional_completion() {
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    expected.charge(24, 1, 1).unwrap(); // Earlier request allocations.
+    expected.charge(64, 1, 1).unwrap(); // HMAC text.
+    let before_lookup = expected.charged();
+    expected.charge(1, 1, 1).unwrap(); // Synthetic projection charge.
+    let exact = expected.charged();
+    for (limit, committed, error, calls) in [
+        (
+            before_lookup - 1,
+            true,
+            Some(AuthError::Unavailable),
+            &[][..],
+        ),
+        (
+            exact - 1,
+            true,
+            Some(AuthError::Unavailable),
+            &["lookup"][..],
+        ),
+        (
+            exact,
+            false,
+            Some(AuthError::InvalidKey),
+            &["lookup", "admit", "finish"][..],
+        ),
+        (exact, true, None, &["lookup", "admit", "finish"][..]),
+    ] {
+        let mut store = ChargedSession {
+            row: Some(api_record(2)),
+            calls: Vec::new(),
+            committed,
+        };
+        let mut budget = ConstructionBudget::new(limit);
+        budget.charge(24, 1, 1).unwrap();
+        let result = authenticate_in(
+            &mut store,
+            &api_credentials(),
+            &keyring(),
+            &Keks::new(),
+            NOW,
+            Some(&mut budget),
+        )
+        .await;
+        assert_eq!(store.calls.as_slice(), calls);
+        match error {
+            Some(error) => assert_eq!(result.unwrap_err(), error),
+            None => assert_eq!(result.unwrap().user_id(), "user-a"),
+        }
+        if limit == exact {
+            assert_eq!(budget.charged(), exact);
+        }
+    }
+}
+
 #[tokio::test]
 async fn current_key_authenticates_without_native_or_token_fallback() {
     let store = FakeStore::new(Some(api_record(2)));
