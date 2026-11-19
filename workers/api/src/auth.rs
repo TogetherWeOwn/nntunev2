@@ -56,7 +56,7 @@ fn random_b64url_32() -> Result<String, AuthError> {
     Ok(crate::b64::encode(&bytes))
 }
 
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     let digest = Sha256::digest(s.as_bytes());
     let mut out = String::with_capacity(64);
     for b in digest {

@@ -16,7 +16,7 @@ const sources = import.meta.glob('./+page.svelte', {
 
 // Exercise the real page handlers and registered lifecycle with mutable native getters.
 // Rendering is covered by the browser banks.
-function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
+function restartFixture(tick: () => Promise<void> = () => Promise.resolve(), scope: string | null = null) {
 	const source = sources['./+page.svelte'];
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
@@ -25,7 +25,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
-		'attachNativeAudio', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'attachNativeAudio', 'announceEnd', 'onPageHide', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -78,6 +78,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
+	const positions = new Map<string, string>();
+	const storage = {
+		getItem: vi.fn((key: string) => positions.get(key) ?? null),
+		setItem: vi.fn((key: string, value: string) => positions.set(key, value)),
+		removeItem: (key: string) => positions.delete(key)
+	};
+	const lifecycle = new EventTarget();
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
@@ -85,13 +92,16 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
 		createQueueController,
 		createMediaController: (_: undefined, end: Parameters<typeof createMediaController>[1]) => {
-			const controller = createMediaController((audio, source) =>
-				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source, end);
+			const controller = createMediaController((audio, source, detached) =>
+				audio instanceof NativeAudio && (detached || audio.connected) && audio.sourceAttribute === source, end);
+			controller.setPositionScope(scope);
 			const clear = controller.clearShareSeek;
 			controller.clearShareSeek = () => { onClear(); clear(); };
 			return controller;
 		},
-		tick, window: { location }, element, track, capture
+		tick, element, track, capture,
+		window: Object.assign(lifecycle, { location }),
+		browserStorage: (kind: string) => kind === 'local' ? storage : null
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), mediaRevision = 0;
@@ -113,11 +123,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const readStoredDensity = () => 'comfortable';
 		const handleAuthTransition = () => {}, recordFindQuery = () => {};
 		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
-		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
+		const clearSnapshot = () => {}, refresh = () => {};
 		const endTrackDrag = () => {}, document = { title: '' };
 		let queueExportAuthGeneration = 0;
 		const queueShare = { dispose() {}, reset() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
-		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		return {
 			detach: attachNativeAudio(element),
@@ -177,8 +186,77 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		page.attach(next);
 		return element = next;
 	};
-	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
+	return { page, media, writes, location, track, element, capture, remount, positions, storage,
+		pagehide: () => lifecycle.dispatchEvent(new Event('pagehide')),
+		observeClear: (callback: () => void) => { onClear = callback; } };
 }
+
+const ACCOUNT_SCOPE = 'a'.repeat(64);
+const POSITION_KEY = `nntune:library-position:v1:${ACCOUNT_SCOPE}`;
+
+test('Library saves observed positions without restoring, and disconnect flushes only its current source', () => {
+	const f = restartFixture(undefined, ACCOUNT_SCOPE);
+	f.media.position = 34;
+	f.pagehide();
+	expect(f.positions.get(POSITION_KEY)).toBe('{"coral":34}');
+	const replacement = f.remount();
+	f.media.position = 0;
+	f.capture('loadedmetadata')();
+	f.capture('canplay')();
+	f.pagehide();
+	f.page.detach();
+	expect(f.positions.get(POSITION_KEY)).toBe('{"coral":34}');
+	expect(f.writes).toEqual([]);
+	f.page.restart();
+	f.capture('seeked')();
+	expect(f.positions.get(POSITION_KEY)).toBe('{"coral":0}');
+	f.media.position = 37;
+	replacement.connected = false;
+	f.page.cleanup();
+	expect(f.positions.get(POSITION_KEY)).toBe('{"coral":37}');
+});
+
+test('Library clears a completed position without saving it again at disconnect', () => {
+	const f = restartFixture(undefined, ACCOUNT_SCOPE);
+	f.capture('ended')();
+	expect(f.positions.has(POSITION_KEY)).toBe(true);
+	f.element.ended = true;
+	f.capture('ended')();
+	f.pagehide();
+	f.page.detach();
+	expect(f.positions.get(POSITION_KEY)).toBe('{}');
+});
+
+test('Library never reads storage for an unknown account or saves during auth reset', () => {
+	const anonymous = restartFixture();
+	anonymous.storage.getItem.mockClear(); // Ignore the existing repeat preference read.
+	anonymous.pagehide();
+	anonymous.page.detach();
+	expect(anonymous.storage.getItem).not.toHaveBeenCalled();
+	expect(anonymous.storage.setItem).not.toHaveBeenCalled();
+
+	const f = restartFixture(undefined, ACCOUNT_SCOPE);
+	f.storage.setItem.mockClear();
+	f.media.position = 99;
+	f.page.resetAuth();
+	f.page.detach();
+	f.pagehide();
+	expect(f.storage.setItem).not.toHaveBeenCalled();
+});
+
+test.each(['position', 'storage'] as const)('a reentrant auth reset during %s read cannot save', (phase) => {
+	const f = restartFixture(undefined, ACCOUNT_SCOPE);
+	f.storage.setItem.mockClear();
+	const reset = () => { f.page.resetAuth(); return 66; };
+	if (phase === 'position') Object.defineProperty(f.element, 'currentTime', { get: reset });
+	else {
+		f.media.position = 66;
+		f.storage.getItem.mockImplementationOnce(() => { reset(); return null; });
+	}
+	f.pagehide();
+	f.page.detach();
+	expect(f.storage.setItem).not.toHaveBeenCalled();
+});
 
 test('restart reads mutable availability once per gesture', () => {
 	const { page, media, element, writes } = restartFixture();

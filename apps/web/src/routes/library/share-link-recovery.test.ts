@@ -5,7 +5,7 @@ import { createQueueShare } from '#lib/player/queueShare.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
-import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
+import { clearRecentFindsAtAuthBoundary, loadRecentFinds, recordRecentFind } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -27,7 +27,7 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  * Only lifecycle/storage and Svelte state cells are substituted. Browser cases
  * in library-share-link-lifecycle.spec.ts cover navigation and rendered media.
  */
-function pageScript(search: string, tick = () => Promise.resolve()) {
+function pageScript(search: string, tick = () => Promise.resolve(), storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null = null) {
 	vi.stubGlobal('window', { location: { search } });
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
@@ -66,9 +66,9 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
-		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
+		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary, recordRecentFind,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
-		browserStorage: () => null,
+		browserStorage: (kind: string) => kind === 'local' ? storage : null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		afterNavigate: () => {},
@@ -81,7 +81,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		return {
 			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
-			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
+			attachNativeAudio, onPageHide, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
@@ -98,7 +98,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		handleLocalAuthTransition: () => void;
 		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
-		attachNativeAudio: (element: EventTarget) => void;
+		attachNativeAudio: (element: EventTarget) => () => void;
+		onPageHide: () => void;
 		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
 			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
 		currentAudio: () => unknown;
@@ -132,6 +133,76 @@ function serve(payload: { id: string; title: string; streamUrl?: string }[] = IT
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+test('the authenticated Library response scopes only audio attached under that account', async () => {
+	const writes = vi.fn();
+	const page = pageScript('?track=coral&t=0', undefined, {
+		getItem: () => null, setItem: writes, removeItem: () => {}
+	});
+	const first = 'a'.repeat(64), second = 'b'.repeat(64);
+	async function refresh(scope: string) {
+		vi.stubGlobal('fetch', async () => Response.json(ITEMS, {
+			headers: { 'x-library-position-scope': scope }
+		}));
+		await page.refresh();
+	}
+	function attach() {
+		const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+		page.attachNativeAudio(audio);
+		return audio;
+	}
+	function sample(audio: ReturnType<typeof attach>, seconds: number) {
+		audio.currentTime = seconds;
+		audio.dispatchEvent(new Event('timeupdate'));
+	}
+	await refresh(first);
+	const former = attach();
+	sample(former, 12);
+	await refresh(second);
+	sample(former, 40);
+	const replacement = attach();
+	sample(replacement, 30);
+	await refresh('malformed');
+	sample(replacement, 50);
+	sample(attach(), 60);
+	expect(writes.mock.calls).toEqual([
+		[`nntune:library-position:v1:${first}`, '{"coral":12}'],
+		[`nntune:library-position:v1:${second}`, '{"coral":30}']
+	]);
+});
+
+test('new account headers fence pagehide and detach before and after a refused body', async () => {
+	const writes = vi.fn();
+	const page = pageScript('?track=coral&t=0', undefined, {
+		getItem: () => null, setItem: writes, removeItem: () => {}
+	});
+	const first = 'a'.repeat(64), second = 'b'.repeat(64);
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS, {
+		headers: { 'x-library-position-scope': first }
+	}));
+	await page.refresh();
+	const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+	const detach = page.attachNativeAudio(audio);
+	audio.currentTime = 12;
+	page.onPageHide();
+	expect(writes).toHaveBeenCalledWith(`nntune:library-position:v1:${first}`, '{"coral":12}');
+	writes.mockClear();
+	let startRead!: (controller: ReadableStreamDefaultController<Uint8Array>) => void;
+	const readStarted = new Promise<ReadableStreamDefaultController<Uint8Array>>((resolve) => { startRead = resolve; });
+	const body = new ReadableStream<Uint8Array>({ pull: startRead }, { highWaterMark: 0 });
+	vi.stubGlobal('fetch', async () => new Response(body, { headers: { 'x-library-position-scope': second } }));
+	const refresh = page.refresh();
+	const bodyController = await readStarted;
+	audio.currentTime = 30;
+	page.onPageHide();
+	bodyController.error(new Error('body refused'));
+	await refresh;
+	audio.currentTime = 45;
+	detach();
+	page.attachNativeAudio(Object.assign(new EventTarget(), playableAudio(async () => {}), { currentTime: 23 }));
+	page.onPageHide();
+	expect(writes).not.toHaveBeenCalled();
+});
 
 for (const status of [500, 404]) {
 	test(`a valid initial link survives an empty ${status} load and applies once on Retry`, async () => {

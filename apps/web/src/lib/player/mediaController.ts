@@ -4,13 +4,17 @@ import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type Repe
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
 import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
+import { createResumeController } from './resumeController.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
+type PositionWrite = 'sample' | 'flush' | 'disconnect' | 'seeked' | 'ended';
+type NativeReceipt = MediaAttachment & { listeners: AbortController; persist?: (kind: PositionWrite) => void };
 
 type NativeObservations = {
 	source: () => string | null;
 	seeking: (audio: HTMLAudioElement) => void;
 	position: (audio: HTMLAudioElement) => void;
+	persistence?: { trackId: string; source: string; storage: Parameters<ReturnType<typeof createResumeController>['capture']>[1] };
 };
 
 type NaturalEndSelection = {
@@ -62,12 +66,13 @@ const mountedAudio = new WeakSet<HTMLAudioElement>();
 const nativeIsConnected = typeof Node === 'undefined' ? undefined : Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected')?.get;
 const nativeGetAttribute = typeof Element === 'undefined' ? undefined : Element.prototype.getAttribute;
 
-function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
-	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
+function matchesNativeSource(audio: HTMLAudioElement, source: string, detached = false): boolean {
+	return (detached || nativeIsConnected?.call(audio) === true) && nativeGetAttribute?.call(audio, 'src') === source;
 }
 
 export function createMediaController(matchesNative = matchesNativeSource, naturalEnd?: NaturalEndSelection) {
-	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
+	let current: NativeReceipt | undefined;
+	const resume = createResumeController();
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	const repeat = writable<RepeatMode>('off');
@@ -84,6 +89,8 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 
 	function reset(): void {
 		const previous = current;
+		previous?.persist?.('disconnect');
+		if (current !== previous) return;
 		current = undefined;
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
@@ -132,16 +139,56 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 		if (isCurrent()) deps.bumpAnnouncement();
 	}
 
-	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
+	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean, detached = false): boolean {
 		try {
 			// Either instance accessor can change what the other last observed. End
 			// with a DOM snapshot that does not call back into those accessors.
-			return isCurrent() && audio.isConnected && isCurrent() &&
-				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent() &&
-				matchesNative(audio, source);
+			return isCurrent() && (detached || audio.isConnected) && isCurrent() &&
+				audio.getAttribute('src') === source && isCurrent() && (detached || audio.isConnected) && isCurrent() &&
+				matchesNative(audio, source, detached) && isCurrent();
 		} catch {
 			return false;
 		}
+	}
+
+	function bindPersistence(receipt: NativeReceipt, observations: NativeObservations): void {
+		if (!observations.persistence) return;
+		const { trackId, source, storage } = observations.persistence;
+		const { audio } = receipt;
+		const ownsSource = () => current === receipt;
+		const write = resume.capture(trackId, storage, ownsSource);
+		if (!write) return;
+		let busy = false;
+		let lastPosition: number | undefined;
+		receipt.persist = (kind) => {
+			if (busy || positioning || !ownsSource()) return;
+			const intent = positionIntent;
+			const detached = kind === 'disconnect';
+			const matches = () => (detached || observations.source() === source) &&
+				matchesSource(audio, source, () => ownsSource() && positionIntent === intent, detached);
+			busy = true;
+			try {
+				if (!matches()) return;
+				if (kind === 'ended') {
+					if (audio.ended && audio.error === null) {
+						write(null, matches);
+						lastPosition = undefined;
+					}
+					return;
+				}
+				const seconds = audio.currentTime;
+				if (audio.ended || !Number.isFinite(seconds) || seconds < 0 || seconds === lastPosition) return;
+				// An untouched mount must not overwrite a saved position with zero.
+				if (seconds === 0 && lastPosition === undefined && kind !== 'seeked') return;
+				if (kind === 'sample' && Math.abs(seconds - (lastPosition ?? 0)) < 5) return;
+				write(seconds, matches);
+				lastPosition = seconds;
+			} catch {
+				// Optional persistence must never interrupt native transport.
+			} finally {
+				busy = false;
+			}
+		};
 	}
 
 	function runPosition(action: () => void): void {
@@ -257,11 +304,12 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 		});
 	}
 
-	async function handleEnded(attachment: MediaAttachment, source: string): Promise<void> {
-		if (!naturalEnd) return;
+	async function handleEnded(attachment: NativeReceipt, source: string): Promise<void> {
+		const intent = positionIntent;
+		attachment.persist?.('ended');
+		if (!naturalEnd || current !== attachment || positionIntent !== intent) return;
 		const { queue, commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
 		const { audio } = attachment;
-		const intent = positionIntent;
 		const version = attachmentVersion;
 		let generation = endGeneration;
 		let revision = queue.revision;
@@ -343,6 +391,8 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 		get pendingShareSeek() { return pendingShare.current; },
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
+		setPositionScope: resume.setScope,
+		savePosition() { current?.persist?.('flush'); },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {
 			if (destroyed) return () => {};
 			if (observations && mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
@@ -351,10 +401,11 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
-			const receipt = { audio, playing: false, listeners: new AbortController() };
+			const receipt: NativeReceipt = { audio, playing: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
 			if (observations) {
+				bindPersistence(receipt, observations);
 				const observe = (event: Event) => {
 					const shareRevision = pendingShare.revision;
 					const intent = positionIntent;
@@ -374,6 +425,11 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 							if (audio.error === null) return;
 							break;
 						case 'ended': return handleEnded(receipt, source);
+						case 'seeked': return receipt.persist?.('seeked');
+						case 'timeupdate':
+							receipt.persist?.('sample');
+							if (current === receipt) return observations.position(audio);
+							return;
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							if (current === receipt && positionIntent === intent) observations.seeking(audio);
@@ -387,8 +443,9 @@ export function createMediaController(matchesNative = matchesNativeSource, natur
 					}
 					receipt.playing = false;
 					endGeneration += 1;
+					if (event.type === 'pause') receipt.persist?.('flush');
 				};
-				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'seeking',
+				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'seeking', 'seeked',
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate']) {
 					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
 				}
