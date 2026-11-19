@@ -5,10 +5,14 @@ use crate::catalogue::{
     catalogue_member_releases_statement, catalogue_member_track_pairs_statement, is_catalogue_mbid,
 };
 use crate::subsonic_auth::Principal;
+use futures_util::TryStreamExt;
 use nntune_subsonic::{
     construction_budget::ConstructionBudget, staging_rejection::StagingRejection,
 };
-use tokio_postgres::{types::Type, Client, Row, Transaction};
+use tokio_postgres::{
+    types::{ToSql, Type},
+    Client, Row, Transaction,
+};
 
 const MEMBERSHIP_ROWS: i64 = 1_024;
 const SOURCE_TEXT_BYTES: i32 = 256 * 1_024;
@@ -35,11 +39,11 @@ fn sql(budget: &mut ConstructionBudget, parts: &[&str]) -> Result<String, StoreE
 const RELEASE_BYTES: &str =
     "CASE WHEN octet_length(release_mbid) <= 36 THEN octet_length(release_mbid) ELSE 0 END";
 const RECORDING_BYTES: &str =
-    "CASE WHEN octet_length(recording_mbid) <= 36 THEN octet_length(recording_mbid) ELSE 0 END";
+    " + CASE WHEN octet_length(recording_mbid) <= 36 THEN octet_length(recording_mbid) ELSE 0 END";
 const PROJECT_RELEASE: &str =
     "CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END";
 const PROJECT_RECORDING: &str =
-    "CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END";
+    ", CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END";
 
 async fn preflight(
     tx: &Transaction<'_>,
@@ -49,24 +53,23 @@ async fn preflight(
     limit: i64,
     pairs: bool,
     remaining: &mut i32,
-) -> Result<(), StoreError> {
+) -> Result<usize, StoreError> {
     let query = sql(
         budget,
         &[
-            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 THEN used::int END \
+            "SELECT CASE WHEN row_count < $2 AND fields_ok AND used <= $3 THEN row_count END, used::int \
              FROM (SELECT count(*) AS row_count, COALESCE(bool_and(octet_length(release_mbid) <= 1024",
-            if pairs { " AND COALESCE(octet_length(recording_mbid) <= 1024, false)" } else { "" },
+            if pairs { " AND COALESCE(octet_length(recording_mbid), 0) <= 1024" } else { "" },
             "), true) AS fields_ok, COALESCE(sum(",
             RELEASE_BYTES,
-            if pairs { " + " } else { "" },
             if pairs { RECORDING_BYTES } else { "" },
             "), 0) AS used FROM (",
             statement,
             " LIMIT $2) AS membership) AS admission",
         ],
     )?;
-    let rows = tx
-        .query_typed(
+    let row = tx
+        .query_typed_one(
             &query,
             &[
                 (&user_id, Type::TEXT),
@@ -76,51 +79,64 @@ async fn preflight(
         )
         .await
         .map_err(|_| StoreError)?;
-    let used: i32 = rows
-        .first()
-        .ok_or(StoreError)?
-        .try_get(0)
-        .map_err(|_| StoreError)?;
+    let count: i64 = row.try_get(0).map_err(|_| StoreError)?;
+    let used: i32 = row.try_get(1).map_err(|_| StoreError)?;
     *remaining = remaining
         .checked_sub(used)
         .filter(|n| *n >= 0 && used >= 0)
         .ok_or(StoreError)?;
-    Ok(())
+    usize::try_from(count).map_err(|_| StoreError)
 }
 
-async fn fetch(
+async fn fetch<T: Ord>(
     tx: &Transaction<'_>,
     budget: &mut ConstructionBudget,
     statement: &str,
     user_id: &str,
-    limit: i64,
-    pairs: bool,
+    (count, pairs): (usize, bool),
     #[cfg(test)] fetches: &mut usize,
-) -> Result<Vec<Row>, StoreError> {
-    #[cfg(test)]
-    {
-        *fetches += 1;
-    }
+    mut decode: impl FnMut(&mut ConstructionBudget, &Row) -> Result<Option<T>, StoreError>,
+) -> Result<Vec<T>, StoreError> {
     let query = sql(
         budget,
         &[
             "SELECT ",
             PROJECT_RELEASE,
-            if pairs { ", " } else { "" },
             if pairs { PROJECT_RECORDING } else { "" },
             " FROM (",
             statement,
             " LIMIT $2) AS membership",
         ],
     )?;
+    // Charge the exact output slots before starting the ID query. The driver
+    // owns its buffers; the projection holds only one transient row at a time.
+    let mut projected = budget.allocate_exact(count).map_err(|_| StoreError)?;
+    let limit = count as i64 + 1; // preflight bounded count by MEMBERSHIP_ROWS
+    #[cfg(test)]
+    {
+        *fetches += 1;
+    }
+    let params: [(&(dyn ToSql + Sync), Type); 2] = [(&user_id, Type::TEXT), (&limit, Type::INT8)];
     let rows = tx
-        .query_typed(&query, &[(&user_id, Type::TEXT), (&limit, Type::INT8)])
+        .query_typed_raw(&query, params)
         .await
         .map_err(|_| StoreError)?;
-    if i64::try_from(rows.len()).map_err(|_| StoreError)? >= limit {
+    let mut rows = std::pin::pin!(rows);
+    let mut seen = 0;
+    while let Some(row) = rows.try_next().await.map_err(|_| StoreError)? {
+        if seen == count {
+            return Err(StoreError);
+        }
+        seen += 1;
+        if let Some(value) = decode(budget, &row)? {
+            projected.push(value);
+        }
+    }
+    if seen != count {
         return Err(StoreError);
     }
-    Ok(rows)
+    normalize_order(&mut projected);
+    Ok(projected)
 }
 
 fn copy_id(budget: &mut ConstructionBudget, value: &str) -> Result<String, StoreError> {
@@ -130,21 +146,10 @@ fn copy_id(budget: &mut ConstructionBudget, value: &str) -> Result<String, Store
     String::from_utf8(bytes).map_err(|_| StoreError)
 }
 
-fn project<R, T: Ord>(
-    budget: &mut ConstructionBudget,
-    rows: &[R],
-    mut decode: impl FnMut(&mut ConstructionBudget, &R) -> Result<Option<T>, StoreError>,
-) -> Result<Vec<T>, StoreError> {
-    let mut projected = budget.allocate_exact(rows.len()).map_err(|_| StoreError)?;
-    for row in rows {
-        if let Some(value) = decode(budget, row)? {
-            projected.push(value);
-        }
-    }
+fn normalize_order<T: Ord>(ids: &mut Vec<T>) {
     // Unstable sort is in-place. Deduplicate after ASCII normalization.
-    projected.sort_unstable();
-    projected.dedup();
-    Ok(projected)
+    ids.sort_unstable();
+    ids.dedup();
 }
 
 pub(super) async fn read_membership(
@@ -171,48 +176,46 @@ pub(super) async fn read_membership(
         .map_err(|_| StoreError)?;
     let releases = catalogue_member_releases_statement();
     let pairs = catalogue_member_track_pairs_statement();
-    preflight(&tx, budget, releases, user_id, limit, false, &mut remaining).await?;
-    preflight(&tx, budget, pairs, user_id, limit, true, &mut remaining).await?;
-    let rows = fetch(
+    let release_count =
+        preflight(&tx, budget, releases, user_id, limit, false, &mut remaining).await?;
+    let pair_count = preflight(&tx, budget, pairs, user_id, limit, true, &mut remaining).await?;
+    let releases = fetch(
         &tx,
         budget,
         releases,
         user_id,
-        limit,
-        false,
+        (release_count, false),
         #[cfg(test)]
         fetches,
+        |budget, row| {
+            let release: &str = row.try_get(0).map_err(|_| StoreError)?;
+            is_catalogue_mbid(release)
+                .then(|| copy_id(budget, release))
+                .transpose()
+        },
     )
     .await?;
-    let releases = project(budget, &rows, |budget, row| {
-        let release: &str = row.try_get(0).map_err(|_| StoreError)?;
-        is_catalogue_mbid(release)
-            .then(|| copy_id(budget, release))
-            .transpose()
-    })?;
-    drop(rows);
-    let rows = fetch(
+    let pairs = fetch(
         &tx,
         budget,
         pairs,
         user_id,
-        limit,
-        true,
+        (pair_count, true),
         #[cfg(test)]
         fetches,
+        |budget, row| {
+            let release: &str = row.try_get(0).map_err(|_| StoreError)?;
+            let recording: &str = row.try_get(1).map_err(|_| StoreError)?;
+            if !is_catalogue_mbid(release) || !is_catalogue_mbid(recording) {
+                return Ok(None);
+            }
+            Ok(Some((
+                copy_id(budget, release)?,
+                copy_id(budget, recording)?,
+            )))
+        },
     )
     .await?;
-    let pairs = project(budget, &rows, |budget, row| {
-        let release: &str = row.try_get(0).map_err(|_| StoreError)?;
-        let recording: &str = row.try_get(1).map_err(|_| StoreError)?;
-        if !is_catalogue_mbid(release) || !is_catalogue_mbid(recording) {
-            return Ok(None);
-        }
-        Ok(Some((
-            copy_id(budget, release)?,
-            copy_id(budget, recording)?,
-        )))
-    })?;
     tx.commit().await.map_err(|_| StoreError)?;
     Ok(StagingMembership {
         releases,
@@ -267,11 +270,14 @@ pub(crate) fn membership_projection_charges_capacity_before_copying() {
     for limit in [charge - 1, charge] {
         let mut budget = ConstructionBudget::new(limit);
         budget.charge(5, 1, 1).unwrap();
-        let result = project(&mut budget, &rows, |budget, value| {
-            is_catalogue_mbid(value)
-                .then(|| copy_id(budget, value))
-                .transpose()
-        });
+        let result = (|| -> Result<_, StoreError> {
+            let mut ids = budget.allocate_exact(rows.len()).map_err(|_| StoreError)?;
+            for value in rows.into_iter().filter(|id| is_catalogue_mbid(id)) {
+                ids.push(copy_id(&mut budget, value)?);
+            }
+            normalize_order(&mut ids);
+            Ok(ids)
+        })();
         if limit < charge {
             assert!(result.is_err());
         } else {

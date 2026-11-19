@@ -51,7 +51,7 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
     use nntune_subsonic::construction_budget::ConstructionBudget;
     const SHARED: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const RECORDING: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-    const TRANSFER: i32 = 6 * 36;
+    const TRANSFER: i32 = 7 * 36; // NULL pairs still transfer their release field
     let mut client = database().await;
     client
         .batch_execute(
@@ -66,7 +66,7 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
     assert!(empty.releases.is_empty() && empty.pairs.is_empty());
     client
         .execute(
-            "INSERT INTO library VALUES ($1, upper($2), ARRAY[$4]), (NULL, $3, ARRAY[$4]), \
+            "INSERT INTO library VALUES ($1, upper($2), ARRAY[$4, NULL]), (NULL, $3, ARRAY[$4]), \
          ('other', $4, ARRAY[$2]), ($1, repeat('é', 512), '{}')",
             &[&USER, &ID, &SHARED, &RECORDING],
         )
@@ -94,6 +94,16 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
     for (pair, release) in membership.pairs.iter().zip([ID, SHARED]) {
         assert_eq!((pair.0.as_str(), pair.1.as_str()), (release, RECORDING));
     }
+    let mut pair_text = ConstructionBudget::new(usize::MAX);
+    for _ in 0..4 {
+        pair_text.charge(ID.len(), 1, 1).unwrap();
+    }
+    // Enough for the pair SQL, but one byte short of its output reservation.
+    let mut short = ConstructionBudget::new(budget.charged() - pair_text.charged() - 1);
+    fetches = 0;
+    let result = read_membership(&mut client, &mut short, USER, 3, TRANSFER, &mut fetches).await;
+    assert!(result.is_err());
+    assert_eq!(fetches, 1, "pair fetch started before its output reserve");
     client.batch_execute("UPDATE library SET release_mbid = release_mbid || 'x' WHERE octet_length(release_mbid) = 1024").await.unwrap();
     let mut budget = ConstructionBudget::new(8 * 1024);
     let mut fetches = 0;
