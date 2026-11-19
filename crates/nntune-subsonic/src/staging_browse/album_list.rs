@@ -233,13 +233,12 @@ pub fn album_list_boundaries() {
         };
         let mut probe = ConstructionBudget::new(usize::MAX);
         let actual = build(&mut probe).unwrap();
-        let payload = super::field(&actual, "subsonic-response");
         let key = if name == "getAlbumList" {
             "albumList"
         } else {
             "albumList2"
         };
-        let Value::List(page) = super::field(super::field(payload, key), "album") else {
+        let Value::List(page) = super::field(super::field(&actual, key), "album") else {
             panic!("expected page")
         };
         assert_eq!(page.len(), ids.len());
