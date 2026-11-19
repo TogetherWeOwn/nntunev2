@@ -1,6 +1,7 @@
 'use strict';
 
 require('./staging_metadata_wasm.cjs');
+require('./staging_response_wasm.cjs');
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
