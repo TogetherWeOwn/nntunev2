@@ -68,19 +68,25 @@ async fn staging_credential_projection_charges_bounded_fields() {
     let exact = expected.charged();
     let mut budget = ConstructionBudget::new(exact - 1);
     budget.charge(1, 1, 1).unwrap();
+    let prior = budget.charged();
     assert!(matches!(
         load_staging_credential(&mut client, &mut budget, None, "generated-client").await,
         Err(AuthError::Unavailable)
     ));
-    let mut budget = ConstructionBudget::new(exact);
-    budget.charge(1, 1, 1).unwrap();
-    let selected = load_staging_credential(&mut client, &mut budget, Some(1), &"a".repeat(64))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(budget.charged(), exact);
-    assert_eq!(selected.user_id.capacity(), 128);
-    assert_eq!(selected.token.unwrap().envelope.ciphertext.capacity(), 528);
+    assert!(budget.charged() > prior);
+    let hmac = "a".repeat(64);
+    for (version, value) in [(Some(1), hmac.as_str()), (None, "generated-client")] {
+        let mut budget = ConstructionBudget::new(exact);
+        budget.charge(1, 1, 1).unwrap();
+        let selected = load_staging_credential(&mut client, &mut budget, version, value)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.charged(), exact);
+        assert_eq!(selected.username, "generated-client");
+        assert_eq!(selected.user_id.capacity(), 128);
+        assert_eq!(selected.token.unwrap().envelope.ciphertext.capacity(), 528);
+    }
     client.batch_execute(
         "UPDATE users SET id = id || 'x'; UPDATE subsonic_credentials SET user_id = user_id || 'x'"
     ).await.unwrap();
