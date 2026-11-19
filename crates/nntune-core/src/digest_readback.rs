@@ -115,6 +115,22 @@ mod tests {
     }
 
     #[test]
+    fn header_on_later_frame_poisons_readback() {
+        let f = fixture(&vec![5; 65_537]);
+        let mut readback = DigestReadback::new(&f.manifest, &f.key).unwrap();
+        first(&mut readback, &f);
+        assert_eq!(
+            readback.push(1, &f.pages[0], f.chunks[1].clone(), Some(&f.header)),
+            Err(ReadbackError::Frame(RangeError::Header))
+        );
+        assert_eq!(
+            readback.push(1, &f.pages[0], f.chunks[1].clone(), None),
+            Err(ReadbackError::Failed)
+        );
+        assert_eq!(readback.finish(), Err(ReadbackError::Failed));
+    }
+
+    #[test]
     fn refused_or_surplus_frame_poisons_readback() {
         let f = fixture(&vec![5; 65_537]);
         let mut readback = DigestReadback::new(&f.manifest, &f.key).unwrap();
