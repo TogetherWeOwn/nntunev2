@@ -1044,6 +1044,37 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
+    // Native acceptance injects connection acquisition only. This entry is not
+    // wired to Store; its client stays inside the budgeted operation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| failed())?;
+        billing_budget::BillingBudget::run(|budget| async move {
+            let mut client = budget.connect(|| self.connect()).await?;
+            budget
+                .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
+                .await?;
+            budget
+                .work(|| {
+                    crate::billing_transaction_sql::apply_reconcile_transaction(
+                        &mut client,
+                        user_id,
+                        outcome,
+                    )
+                })
+                .await
+        })
+        .await
+        .map_err(|_| failed())
+    }
+
     /// NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
     #[allow(clippy::too_many_arguments)]
@@ -7318,6 +7349,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
 fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
 }
+
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[path = "billing_store_postgres_test.rs"]
+mod billing_store_postgres_test;
 
 #[cfg(test)]
 mod tests {
