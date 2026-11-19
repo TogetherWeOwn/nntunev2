@@ -39,6 +39,61 @@ pub fn candidate_hashes<'a>(
         .ok_or(CandidateError::Identity)
 }
 
+/// Immutable fields from a joined object intent and candidate manifest.
+#[allow(dead_code)]
+pub struct CandidateRecord {
+    pub identities: [[u8; 16]; 5],
+    pub plaintext_len: i64,
+    pub envelope_bytes: i64,
+    pub map_id: [u8; 16],
+    pub header: Vec<u8>,
+    pub chunk_count: i32,
+    pub page_count: i32,
+    pub claim_sha256: Vec<u8>,
+    pub reservation_sha256: Vec<u8>,
+    pub reservation_environment: [u8; 16],
+    pub reservation_library: [u8; 16],
+    pub reservation_object: [u8; 16],
+    pub reservation_bytes: i64,
+    pub reservation_generation: i64,
+}
+
+/// Compare selected candidate fields without establishing custody, a fence or authorization.
+#[allow(dead_code)]
+pub fn candidate_record_matches(
+    intent: &CandidateIntent,
+    manifest: &OriginManifest,
+    record: &CandidateRecord,
+    pages: &[CandidatePage],
+) -> bool {
+    let Ok(hashes) = candidate_hashes(intent, manifest) else {
+        return false;
+    };
+    let Ok(length) = u64::try_from(record.plaintext_len) else {
+        return false;
+    };
+    if !(1..=8_589_934_592).contains(&length) {
+        return false;
+    }
+    let chunks = length.div_ceil(65_536);
+    let page_count = chunks.div_ceil(256);
+    record.identities == intent.identities
+        && length == intent.plaintext_len
+        && u64::try_from(record.envelope_bytes) == Ok(48 + length + 16 * chunks)
+        && record.map_id == intent.map_id
+        && record.header.as_slice() == intent.header
+        && u64::try_from(record.chunk_count) == Ok(chunks)
+        && u64::try_from(record.page_count) == Ok(page_count)
+        && record.claim_sha256.as_slice() == manifest.plaintext_sha256()
+        && record.reservation_sha256.as_slice() == manifest.plaintext_sha256()
+        && record.reservation_environment == intent.identities[0]
+        && record.reservation_library == intent.identities[1]
+        && record.reservation_object == intent.identities[2]
+        && record.reservation_bytes == record.plaintext_len
+        && record.reservation_generation == intent.reservation_generation
+        && candidate_pages_match(length, hashes, pages)
+}
+
 /// Stored page geometry and hash, read in page-index order.
 #[allow(dead_code)]
 pub struct CandidatePage {
@@ -158,6 +213,125 @@ mod tests {
         pages[511].hash[31] ^= 1;
         assert!(!candidate_pages_match(length, &expected, &pages));
         assert!(!candidate_pages_match(length + 1, &expected, &pages));
+    }
+
+    #[test]
+    fn persisted_record_must_match_origin_and_immutable_identity() {
+        let identities = [id(1), id(2), id(3), id(4), id(5)];
+        let mut builder = DigestEnrollment::new(1, identities, id(6)).unwrap();
+        let header = builder.header().to_bytes();
+        builder.seal_chunk(&[42]).unwrap();
+        let manifest = builder.finish().ok().unwrap();
+        let intent = CandidateIntent {
+            identities,
+            plaintext_len: 1,
+            map_id: id(6),
+            header,
+            reservation_generation: 1,
+        };
+        let hashes = candidate_hashes(&intent, &manifest).unwrap();
+        let pages = [CandidatePage {
+            index: 0,
+            chunk_count: 1,
+            first_chunk: 0,
+            entry_count: 1,
+            hash: hashes[0].to_vec(),
+        }];
+        let mut record = CandidateRecord {
+            identities,
+            plaintext_len: 1,
+            envelope_bytes: 65,
+            map_id: id(6),
+            header: header.to_vec(),
+            chunk_count: 1,
+            page_count: 1,
+            claim_sha256: manifest.plaintext_sha256().to_vec(),
+            reservation_sha256: manifest.plaintext_sha256().to_vec(),
+            reservation_environment: identities[0],
+            reservation_library: identities[1],
+            reservation_object: identities[2],
+            reservation_bytes: 1,
+            reservation_generation: 1,
+        };
+        assert!(candidate_record_matches(
+            &intent, &manifest, &record, &pages
+        ));
+        macro_rules! assert_mismatch {
+            () => {
+                assert!(!candidate_record_matches(
+                    &intent, &manifest, &record, &pages
+                ))
+            };
+        }
+        for index in 0..5 {
+            record.identities[index][0] ^= 1;
+            assert_mismatch!();
+            record.identities[index][0] ^= 1;
+        }
+        for length in [-1, 0, 2, i64::MAX] {
+            record.plaintext_len = length;
+            assert_mismatch!();
+        }
+        record.plaintext_len = 1;
+        for envelope_bytes in [-1, 0, 64, 66, i64::MAX] {
+            record.envelope_bytes = envelope_bytes;
+            assert_mismatch!();
+        }
+        record.envelope_bytes = 65;
+        record.map_id[0] ^= 1;
+        assert_mismatch!();
+        record.map_id[0] ^= 1;
+        record.header[0] ^= 1;
+        assert_mismatch!();
+        record.header[0] ^= 1;
+        record.header.pop();
+        assert_mismatch!();
+        record.header = header.to_vec();
+        for count in [-1, 0, 2] {
+            record.chunk_count = count;
+            assert_mismatch!();
+        }
+        record.chunk_count = 1;
+        for count in [-1, 0, 2] {
+            record.page_count = count;
+            assert_mismatch!();
+        }
+        record.page_count = 1;
+        record.claim_sha256[0] ^= 1;
+        assert_mismatch!();
+        record.claim_sha256[0] ^= 1;
+        record.claim_sha256.pop();
+        assert_mismatch!();
+        record.claim_sha256 = manifest.plaintext_sha256().to_vec();
+        record.reservation_sha256[0] ^= 1;
+        assert_mismatch!();
+        record.reservation_sha256[0] ^= 1;
+        record.reservation_sha256.pop();
+        assert_mismatch!();
+        record.reservation_sha256 = manifest.plaintext_sha256().to_vec();
+        record.reservation_environment[0] ^= 1;
+        assert_mismatch!();
+        record.reservation_environment[0] ^= 1;
+        record.reservation_library[0] ^= 1;
+        assert_mismatch!();
+        record.reservation_library[0] ^= 1;
+        record.reservation_object[0] ^= 1;
+        assert_mismatch!();
+        record.reservation_object[0] ^= 1;
+        for bytes in [-1, 0, 2] {
+            record.reservation_bytes = bytes;
+            assert_mismatch!();
+        }
+        record.reservation_bytes = 1;
+        for generation in [-1, 0, 2] {
+            record.reservation_generation = generation;
+            assert_mismatch!();
+        }
+        record.reservation_generation = 1;
+        assert!(candidate_record_matches(
+            &intent, &manifest, &record, &pages
+        ));
+        assert!(!candidate_record_matches(&intent, &manifest, &record, &[]));
     }
 
     #[test]
