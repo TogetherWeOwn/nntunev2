@@ -318,6 +318,16 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
                 format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
                 "{name} must delegate its entire operation to the bounded helper"
             );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
+            );
         } else {
             assert_bounded(piece, name);
         }
