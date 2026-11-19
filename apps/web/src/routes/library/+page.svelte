@@ -239,10 +239,10 @@
 	const media = createMediaController(undefined, {
 		queue: queueController,
 		commit: replaceQueue,
-		flush: tick,
+		flush: () => tick(),
 		clearShareFeedback,
 		clearJumpFeedback: () => { jumpStatus = ''; },
-		announce: announceEnd
+		announce: (track) => announceEnd(track)
 	});
 	const repeat = media.repeat;
 	// A source round trip before Svelte flushes must not revive a retired node.
