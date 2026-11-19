@@ -29,7 +29,10 @@ fn event(playback_number: u8, event: ListenEvent) -> ListenEventBody {
 }
 
 async fn pid(client: &Client) -> i32 {
-    let row = client.query_one("SELECT pg_backend_pid()", &[]).await.unwrap();
+    let row = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap();
     row.get(0)
 }
 
