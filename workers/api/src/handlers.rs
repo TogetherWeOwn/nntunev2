@@ -8081,6 +8081,7 @@ mod tests {
         /// reconcile input loads whole.
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        remove_billing_row_after_read: std::cell::Cell<bool>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -10272,6 +10273,11 @@ mod tests {
                 paid_invoice_id: row.paid_invoice_id.clone(),
                 grace_until_unix: row.grace_until_unix,
             });
+            if self.remove_billing_row_after_read.replace(false) {
+                // The caller keeps its read snapshot, but persistence sees an absent target.
+                assert!(live.is_some());
+                assert!(self.billing_rows.borrow_mut().remove(user_id).is_some());
+            }
             Ok(crate::billing_reconcile::ReconcileInput {
                 stripe_customer_id: self.billing_customers.borrow().get(user_id).cloned(),
                 live,
@@ -13043,6 +13049,96 @@ mod tests {
                 .state,
             "succeeded"
         );
+    }
+
+    #[test]
+    fn billing_webhook_retries_when_stale_target_disappears_after_read() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let seed = stored_seed(
+            PLAN_PLUS,
+            "active",
+            Some(BILLING_NOW + BILLING_PERIOD),
+            Some("in_newer"),
+            None,
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".into(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        // Stripe's exhausted listing is missing the read row's invoice anchor.
+        h.stripe.invoices.borrow_mut().insert(
+            "in_old".into(),
+            test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .unwrap();
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .unwrap();
+        let op = || {
+            block_on(h.store.checkout_operation_by_id("op_test_1"))
+                .unwrap()
+                .unwrap()
+        };
+        let deliver = |event| {
+            let body = checkout_completed_body(event, "cs_test_1", false);
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW)))
+        };
+        let submitted = op();
+        assert_eq!(submitted.state, "submitted");
+        for _ in 0..2 {
+            block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+            h.store.remove_billing_row_after_read.set(true);
+            assert_eq!(deliver("evt_row6").status, 500);
+            assert!(!h.store.remove_billing_row_after_read.get());
+            assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
+            assert_eq!(op(), submitted);
+            assert_eq!(h.store.checkout_ops.borrow().len(), 1);
+            assert!(h.store.billing_rows.borrow().is_empty());
+            assert!(h.store.billing_shadow.borrow().is_empty());
+            assert!(h.store.invoice_history.borrow().is_empty());
+        }
+        // An independently restored own target makes that stale fold safe to retry.
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        for _ in 0..2 {
+            webhook_ok(&deliver("evt_row6"));
+            assert!(h.store.webhook_events.borrow().contains("evt_row6"));
+            assert_eq!(op().state, "succeeded");
+            assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+            let history = h.store.invoice_history.borrow();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history["in_old"].stripe_subscription_id, "sub_test_1");
+        }
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
     }
 
     #[test]

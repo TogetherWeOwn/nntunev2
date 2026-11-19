@@ -201,21 +201,25 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
     };
     let mut absent = test_outcome();
     absent.explicit_stale = true;
+    absent.row.paid_invoice_id = None;
     absent.history.truncate(1);
     absent.history[0].stripe_invoice_id = "in_worker_absent".into();
-    if store
-        .store_reconcile_outcome("worker_fault_user", &absent)
-        .await
-        .is_ok()
-    {
-        return Err("explicit stale accepted history for an absent subscription");
+    for _ in 0..2 {
+        if store
+            .store_reconcile_outcome("worker_fault_user", &absent)
+            .await
+            .is_ok()
+        {
+            return Err("explicit stale accepted history for an absent subscription");
+        }
+        fixture(false)
+            .await
+            .map_err(|_| "absent subscription refusal changed committed state")?;
     }
-    fixture(false)
-        .await
-        .map_err(|_| "absent subscription refusal changed committed state")?;
-    absent.history.clear();
+    let mut empty = absent.clone();
+    empty.history.clear();
     store
-        .store_reconcile_outcome("worker_fault_user", &absent)
+        .store_reconcile_outcome("worker_fault_user", &empty)
         .await
         .map_err(|_| "explicit stale with absent subscription and empty history failed")?;
     fixture(false)
@@ -284,6 +288,28 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
         {
             return Err("transaction attribution refusal changed committed state");
         }
+    }
+    // The exact failed outcome can append history once the target is owned.
+    store
+        .store_reconcile_outcome("worker_fault_user", &absent)
+        .await
+        .map_err(|_| "owned target did not recover the refused stale history")?;
+    let recovered = fault_snapshot_with_recovery(true)
+        .await
+        .map_err(|_| "row-6 recovery did not append the expected history")?;
+    if recovered[0] != before[0] {
+        return Err("row-6 recovery changed the existing subscription");
+    }
+    store
+        .store_reconcile_outcome("worker_fault_user", &absent)
+        .await
+        .map_err(|_| "row-6 recovery replay failed")?;
+    if fault_snapshot_with_recovery(true)
+        .await
+        .map_err(|_| "row-6 recovery replay state invalid")?
+        != recovered
+    {
+        return Err("row-6 recovery replay changed committed state");
     }
     Ok(())
 }
@@ -360,13 +386,17 @@ async fn late_fault_state() -> Result<(bool, bool), StoreError> {
     .await
 }
 
-async fn fault_snapshot() -> Result<String, StoreError> {
+async fn fault_snapshot() -> Result<[String; 2], StoreError> {
+    fault_snapshot_with_recovery(false).await
+}
+
+async fn fault_snapshot_with_recovery(recovered: bool) -> Result<[String; 2], StoreError> {
     billing_budget::with_owned_connection(
         "127.0.0.1",
         5432,
         CONNECTION,
         |_| Box::pin(async { Ok(()) }),
-        |client| {
+        move |client| {
             Box::pin(async move {
                 let row = client
                     .query_one(
@@ -374,20 +404,21 @@ async fn fault_snapshot() -> Result<String, StoreError> {
                                                 AND stripe_subscription_id = 'sub_worker_fault'
                                                 AND paid_invoice_id = 'in_worker_second')
                                  FROM public.subscriptions),
-                                (SELECT count(*) = 2 AND bool_and(user_id = 'worker_fault_user'
+                                (SELECT bool_and(user_id = 'worker_fault_user'
                                                 AND stripe_subscription_id = 'sub_worker_fault'
                                                 AND amount_cents = 800)
                                       AND array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
-                                          = ARRAY['in_worker_first', 'in_worker_second']
+                                          = CASE WHEN $1 THEN ARRAY['in_worker_absent', 'in_worker_first', 'in_worker_second']
+                                                 ELSE ARRAY['in_worker_first', 'in_worker_second'] END
                                       AND array_agg(currency ORDER BY stripe_invoice_id)
-                                          = ARRAY['usd', 'eur']
+                                          = CASE WHEN $1 THEN ARRAY['usd', 'usd', 'eur']
+                                                 ELSE ARRAY['usd', 'eur'] END
                                  FROM public.paid_invoice_history),
-                                jsonb_build_array(
-                                    (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)
-                                     FROM public.subscriptions s),
-                                    (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)
-                                     FROM public.paid_invoice_history h))::text",
-                        &[],
+                                (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)::text
+                                 FROM public.subscriptions s),
+                                (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text
+                                 FROM public.paid_invoice_history h)",
+                        &[&recovered],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -396,7 +427,7 @@ async fn fault_snapshot() -> Result<String, StoreError> {
                 {
                     return Err(StoreError);
                 }
-                Ok(row.get(2))
+                Ok([row.get(2), row.get(3)])
             })
         },
         |_| {},
