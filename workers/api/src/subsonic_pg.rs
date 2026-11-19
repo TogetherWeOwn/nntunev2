@@ -4,12 +4,27 @@ use crate::field_envelope::FieldEnvelope;
 use crate::subsonic_auth::{
     AuthError, AuthMode, CredentialRecord, CredentialStore, Reindex, TokenEnvelope,
 };
+use nntune_subsonic::construction_budget::ConstructionBudget;
 use tokio_postgres::{types::Type, Client, GenericClient, Row, Transaction};
 
-const COLUMNS: &str = "c.id::text AS id, c.user_id, c.subsonic_username, c.scope, c.auth_mode, \
-    c.api_key_hmac, c.pepper_version, c.token_secret_encrypted, c.token_envelope_version, \
-    c.token_payload_format, c.token_kek_version, c.token_dek_wrapped_nonce, \
-    c.token_dek_wrapped, c.token_payload_nonce";
+macro_rules! lookup_sql {
+    (bounded, $predicate:literal) => {
+        lookup_sql!("CASE WHEN octet_length(c.user_id) BETWEEN 1 AND 128 THEN c.user_id END", $predicate)
+    };
+    ($user_id:literal, $predicate:literal) => {
+        concat!(
+            "SELECT c.id::text AS id, ", $user_id,
+            " AS user_id, c.subsonic_username, c.scope, c.auth_mode, c.api_key_hmac, \
+             c.pepper_version, c.token_secret_encrypted, c.token_envelope_version, \
+             c.token_payload_format, c.token_kek_version, c.token_dek_wrapped_nonce, \
+             c.token_dek_wrapped, c.token_payload_nonce \
+             FROM subsonic_credentials c JOIN users u ON u.id = c.user_id \
+             WHERE c.scope = 'subsonic' AND c.revoked_at IS NULL AND u.deleting_at IS NULL AND ",
+            $predicate, " LIMIT 2"
+        )
+    };
+}
+
 // Compare all security-relevant selected material, not just id or last_used_at.
 macro_rules! update_sql {
     ($update:literal, $suffix:literal) => {
@@ -30,22 +45,43 @@ macro_rules! update_sql {
     };
 }
 
-fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
-    let mode: String = row.try_get("auth_mode").map_err(|_| StoreError)?;
-    let auth_mode = match mode.as_str() {
+fn copy_credential_bytes(
+    budget: &mut Option<&mut ConstructionBudget>,
+    source: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    let Some(budget) = budget else {
+        return Ok(source.to_vec());
+    };
+    let mut bytes = budget
+        .allocate_exact(source.len())
+        .map_err(|_| StoreError)?;
+    bytes.extend_from_slice(source);
+    Ok(bytes)
+}
+
+fn record(
+    row: &Row,
+    mut budget: Option<&mut ConstructionBudget>,
+) -> Result<CredentialRecord, StoreError> {
+    // Borrow directly from the bounded driver row. In staging, a NULL owner
+    // sentinel must fail before any credential bytes are copied.
+    let user_id: &str = row.try_get("user_id").map_err(|_| StoreError)?;
+    let mode: &str = row.try_get("auth_mode").map_err(|_| StoreError)?;
+    let auth_mode = match mode {
         "apikey" => AuthMode::ApiKey,
         "token" => AuthMode::Token,
         "both" => AuthMode::Both,
         _ => return Err(StoreError),
     };
-    let ciphertext: Option<Vec<u8>> = row
+    let ciphertext: Option<&[u8]> = row
         .try_get("token_secret_encrypted")
         .map_err(|_| StoreError)?;
     let token = if let Some(ciphertext) = ciphertext {
-        let wrap_nonce: Vec<u8> = row
+        let wrap_nonce: &[u8] = row
             .try_get("token_dek_wrapped_nonce")
             .map_err(|_| StoreError)?;
-        let nonce: Vec<u8> = row.try_get("token_payload_nonce").map_err(|_| StoreError)?;
+        let nonce: &[u8] = row.try_get("token_payload_nonce").map_err(|_| StoreError)?;
+        let wrapped: &[u8] = row.try_get("token_dek_wrapped").map_err(|_| StoreError)?;
         Some(TokenEnvelope {
             envelope_version: u16::try_from(
                 row.try_get::<_, i16>("token_envelope_version")
@@ -64,23 +100,31 @@ fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
             .map_err(|_| StoreError)?,
             envelope: FieldEnvelope {
                 dek_wrapped_nonce: wrap_nonce.try_into().map_err(|_| StoreError)?,
-                dek_wrapped: row.try_get("token_dek_wrapped").map_err(|_| StoreError)?,
+                dek_wrapped: copy_credential_bytes(&mut budget, wrapped)?,
                 payload_nonce: nonce.try_into().map_err(|_| StoreError)?,
-                ciphertext,
+                ciphertext: copy_credential_bytes(&mut budget, ciphertext)?,
             },
         })
     } else {
         None
     };
+    let mut copy_text = |text: &str| {
+        if budget.is_none() {
+            return Ok(text.to_owned());
+        }
+        String::from_utf8(copy_credential_bytes(&mut budget, text.as_bytes())?)
+            .map_err(|_| StoreError)
+    };
+    let api_key_hmac: Option<&str> = row.try_get("api_key_hmac").map_err(|_| StoreError)?;
     Ok(CredentialRecord {
-        id: row.try_get("id").map_err(|_| StoreError)?,
-        user_id: row.try_get("user_id").map_err(|_| StoreError)?,
-        username: row.try_get("subsonic_username").map_err(|_| StoreError)?,
-        scope: row.try_get("scope").map_err(|_| StoreError)?,
+        id: copy_text(row.try_get("id").map_err(|_| StoreError)?)?,
+        user_id: copy_text(user_id)?,
+        username: copy_text(row.try_get("subsonic_username").map_err(|_| StoreError)?)?,
+        scope: copy_text(row.try_get("scope").map_err(|_| StoreError)?)?,
         auth_mode,
         revoked: false,
         owner_active: true,
-        api_key_hmac: row.try_get("api_key_hmac").map_err(|_| StoreError)?,
+        api_key_hmac: api_key_hmac.map(copy_text).transpose()?,
         pepper_version: row
             .try_get::<_, Option<i32>>("pepper_version")
             .map_err(|_| StoreError)?
@@ -133,18 +177,48 @@ async fn lookup(
     value: &str,
 ) -> Result<Option<CredentialRecord>, StoreError> {
     let tx = transaction(client).await?;
-    let sql = format!(
-        "SELECT {COLUMNS} FROM subsonic_credentials c JOIN users u ON u.id = c.user_id \
-        WHERE c.scope = 'subsonic' AND c.revoked_at IS NULL AND u.deleting_at IS NULL AND {}",
-        if version.is_some() {
-            "c.pepper_version = $1 AND c.api_key_hmac = $2"
-        } else {
-            "c.subsonic_username = $1"
-        }
-    );
-    let rows = if let Some(version) = version {
-        tx.query_typed(
-            &sql,
+    let selected = lookup_record(&tx, version, value, None).await?;
+    tx.commit().await.map_err(|_| StoreError)?;
+    Ok(selected)
+}
+
+/// Unmounted lookup on the existing app client. Expiry does not prove driver cancellation.
+pub async fn load_staging_credential(
+    client: &mut Client,
+    budget: &mut ConstructionBudget,
+    version: Option<u32>,
+    value: &str,
+) -> Result<Option<CredentialRecord>, AuthError> {
+    super::with_deadline(
+        async {
+            let tx = staging_transaction(client).await?;
+            let selected = lookup_record(&tx, version, value, Some(budget)).await?;
+            tx.commit().await.map_err(|_| StoreError)?;
+            Ok(selected)
+        },
+        1_000,
+        StoreError,
+    )
+    .await
+    .map_err(|_| AuthError::Unavailable)
+}
+
+async fn lookup_record(
+    tx: &Transaction<'_>,
+    version: Option<u32>,
+    value: &str,
+    budget: Option<&mut ConstructionBudget>,
+) -> Result<Option<CredentialRecord>, StoreError> {
+    // The UUID cast and the credential table's checks bound all other fields.
+    // The owner is unconstrained in that schema: project a same-row sentinel
+    // rather than transferring an oversized identifier or treating it as absent.
+    let staged = budget.is_some();
+    let row = if let Some(version) = version {
+        const KEY: &str = lookup_sql!("c.user_id", "c.pepper_version = $1 AND c.api_key_hmac = $2");
+        const STAGED_KEY: &str =
+            lookup_sql!(bounded, "c.pepper_version = $1 AND c.api_key_hmac = $2");
+        tx.query_typed_opt(
+            if staged { STAGED_KEY } else { KEY },
             &[
                 (&i32::try_from(version).map_err(|_| StoreError)?, Type::INT4),
                 (&value, Type::TEXT),
@@ -152,15 +226,16 @@ async fn lookup(
         )
         .await
     } else {
-        tx.query_typed(&sql, &[(&value, Type::TEXT)]).await
+        const USERNAME: &str = lookup_sql!("c.user_id", "c.subsonic_username = $1");
+        const STAGED_USERNAME: &str = lookup_sql!(bounded, "c.subsonic_username = $1");
+        tx.query_typed_opt(
+            if staged { STAGED_USERNAME } else { USERNAME },
+            &[(&value, Type::TEXT)],
+        )
+        .await
     }
     .map_err(|_| StoreError)?;
-    if rows.len() > 1 {
-        return Err(StoreError);
-    }
-    let selected = rows.first().map(record).transpose()?;
-    tx.commit().await.map_err(|_| StoreError)?;
-    Ok(selected)
+    row.as_ref().map(|row| record(row, budget)).transpose()
 }
 
 async fn owner_fence(

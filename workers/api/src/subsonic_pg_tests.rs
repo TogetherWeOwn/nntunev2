@@ -46,6 +46,53 @@ async fn database() -> Client {
 }
 
 #[tokio::test]
+async fn staging_credential_projection_charges_bounded_fields() {
+    let mut client = database().await;
+    client
+        .batch_execute(
+            "UPDATE users SET id = repeat('é', 64); \
+         UPDATE subsonic_credentials SET user_id = repeat('é', 64), auth_mode = 'both', \
+         token_secret_encrypted = decode(repeat('00', 528), 'hex'), \
+         token_envelope_version = 2, token_payload_format = 1, token_kek_version = 1, \
+         token_dek_wrapped_nonce = decode(repeat('00', 12), 'hex'), \
+         token_dek_wrapped = decode(repeat('00', 48), 'hex'), \
+         token_payload_nonce = decode(repeat('00', 12), 'hex')",
+        )
+        .await
+        .unwrap();
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    // Prior charge, UUID, owner, username, scope, HMAC and two envelope buffers.
+    for capacity in [1, 36, 128, 16, 8, 64, 48, 528] {
+        expected.charge(capacity, 1, 1).unwrap();
+    }
+    let exact = expected.charged();
+    let mut budget = ConstructionBudget::new(exact - 1);
+    budget.charge(1, 1, 1).unwrap();
+    assert!(matches!(
+        load_staging_credential(&mut client, &mut budget, None, "generated-client").await,
+        Err(AuthError::Unavailable)
+    ));
+    let mut budget = ConstructionBudget::new(exact);
+    budget.charge(1, 1, 1).unwrap();
+    let selected = load_staging_credential(&mut client, &mut budget, Some(1), &"a".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.charged(), exact);
+    assert_eq!(selected.user_id.capacity(), 128);
+    assert_eq!(selected.token.unwrap().envelope.ciphertext.capacity(), 528);
+    client.batch_execute(
+        "UPDATE users SET id = id || 'x'; UPDATE subsonic_credentials SET user_id = user_id || 'x'"
+    ).await.unwrap();
+    let mut budget = ConstructionBudget::new(exact);
+    assert!(matches!(
+        load_staging_credential(&mut client, &mut budget, None, "generated-client").await,
+        Err(AuthError::Unavailable)
+    ));
+    assert_eq!(budget.charged(), 0);
+}
+
+#[tokio::test]
 async fn exact_lookup_completion_and_reindex_are_committed() {
     let mut client = database().await;
     assert!(lookup(&mut client, Some(2), &"a".repeat(64))
