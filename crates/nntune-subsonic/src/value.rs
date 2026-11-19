@@ -9,6 +9,8 @@
 
 use std::fmt::Write as _;
 
+use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
+
 /// Ordered map entry list; insertion order is the wire order (as in v1).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -21,6 +23,26 @@ pub enum Value {
 }
 
 impl Value {
+    /// Each child must have been built on the same ledger. A stack array
+    /// avoids an intermediate heap vector for the map entries.
+    pub fn charged_map<const N: usize>(
+        budget: &mut ConstructionBudget,
+        entries: [(&str, Value); N],
+    ) -> Result<Self, BudgetExceeded> {
+        let mut map = budget.allocate_exact(N)?;
+        for (key, value) in entries {
+            map.push((copy_text(budget, key)?, value));
+        }
+        Ok(Self::Map(map))
+    }
+
+    pub fn charged_str(
+        budget: &mut ConstructionBudget,
+        text: &str,
+    ) -> Result<Self, BudgetExceeded> {
+        copy_text(budget, text).map(Self::Str)
+    }
+
     pub fn map(entries: Vec<(&str, Value)>) -> Value {
         Value::Map(
             entries
@@ -55,6 +77,56 @@ impl Value {
         write_xml_element(self, name, &mut out);
         out
     }
+}
+
+fn copy_text(budget: &mut ConstructionBudget, text: &str) -> Result<String, BudgetExceeded> {
+    let mut bytes = budget.allocate_exact(text.len())?;
+    bytes.extend_from_slice(text.as_bytes());
+    String::from_utf8(bytes).map_err(|_| BudgetExceeded)
+}
+
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+#[cfg_attr(test, test)]
+#[doc(hidden)]
+pub fn charged_values_check_owned_storage_limits() {
+    type Entry = (String, Value);
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    expected
+        .charge(1, size_of::<Entry>(), align_of::<Entry>())
+        .unwrap();
+    let limit = expected.charged() + 48; // Two small strings: value and key.
+    for cap in [limit - 1, limit] {
+        let mut budget = ConstructionBudget::new(cap);
+        let text = Value::charged_str(&mut budget, "é").unwrap();
+        assert_eq!(budget.charged(), 24);
+        let map = Value::charged_map(&mut budget, [("名", text)]);
+        if cap < limit {
+            assert_eq!(map, Err(BudgetExceeded));
+            assert_eq!(budget.charged(), limit - 24);
+        } else {
+            let Value::Map(entries) = map.unwrap() else {
+                panic!("expected map")
+            };
+            let (key, Value::Str(text)) = &entries[0] else {
+                panic!("expected string")
+            };
+            assert_eq!((key.as_str(), text.as_str()), ("名", "é"));
+            assert_eq!(
+                (entries.capacity(), key.capacity(), text.capacity()),
+                (1, 3, 2)
+            );
+            assert_eq!(budget.charged(), limit);
+        }
+    }
+    let mut budget = ConstructionBudget::new(usize::MAX);
+    budget.charge(usize::MAX - 31, 1, 1).unwrap();
+    let charged = budget.charged();
+    assert_eq!(Value::charged_str(&mut budget, "é"), Err(BudgetExceeded));
+    assert_eq!(
+        Value::charged_map(&mut budget, [("名", Value::Null)]),
+        Err(BudgetExceeded)
+    );
+    assert_eq!(budget.charged(), charged);
 }
 
 fn write_json(v: &Value, out: &mut String) {
