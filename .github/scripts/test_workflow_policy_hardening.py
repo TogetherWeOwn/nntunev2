@@ -87,6 +87,20 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn('base="refs/remotes/origin/${GITHUB_BASE_REF}"', leaks)
         self.assertNotIn('${{ github.base_ref }}', leaks)
 
+    def test_gitleaks_history_scan_uses_the_fixture_options(self):
+        leaks = job((WORKFLOWS / "gitleaks.yml").read_text(), "gitleaks")
+        self.assertIn("GITLEAKS_LOG_OPTS: '--text --diff-merges=first-parent HEAD'", leaks)
+        scan_name = "- name: Scan the full history\n"
+        fixture_name = "- name: Self-test history scanning\n"
+        self.assertLess(leaks.index(scan_name), leaks.index(fixture_name))
+        self.assertNotIn(".github/scripts/", leaks)
+        scan, fixture = leaks.split(scan_name, 1)[1].split(fixture_name, 1)
+        for name, step in (("scan", scan), ("fixture", fixture)):
+            with self.subTest(step=name):
+                self.assertEqual(step.count('"$GITLEAKS_BIN" git '), 1)
+                self.assertEqual(step.count('--log-opts='), 1)
+                self.assertIn('--log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow', step)
+
     def test_local_workflows_use_the_same_source_revision(self):
         for path, callee in (("deploy.yml", "e2e-staging.yml"), ("deploy-production.yml", "release.yml")):
             with self.subTest(path=path):
@@ -191,6 +205,15 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
             self.assertNotIn(forbidden, text)
         self.assertIn("path: readback-receipt.json", text)
         self.assertIn("if-no-files-found: error", text)
+        self.assertIn("group: migrations-staging-apply", text)
+        self.assertIn("if: ${{ inputs.mode != 'purge-census' }}", text.split("Check out trusted code")[0])
+        self.assertIn('test "$REF_PROTECTED" = true', text)
+        self.assertIn('test "$WORKFLOW_SHA" = "$TRUSTED_REF"', text)
+        census = text.split("- name: Observe staging purge census", 1)[1]
+        self.assertEqual(census.count("if: ${{ inputs.mode == 'purge-census' }}"), 2)
+        self.assertIn("staging_apply.py purge-census", census)
+        self.assertNotRegex(census, r"secrets\.|--data-root")
+        self.assertIn("path: purge-census-receipt.json", census)
 
     def test_codeql_reports_on_every_pull_request(self):
         # The code_scanning ruleset waits for CodeQL on every PR; a path filter

@@ -39,6 +39,9 @@ use crate::handlers::{
 #[path = "billing_budget.rs"]
 pub(crate) mod billing_budget;
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_cancel_control.rs"]
+mod billing_cancel_control;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[path = "billing_deadline_test.rs"]
 pub(crate) mod billing_deadline_test;
 
@@ -754,6 +757,9 @@ struct PgStore {
     mirror_binding: MirrorBinding,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     work_deadline_observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    cancel_token_observer:
+        Option<std::rc::Rc<std::cell::RefCell<Option<tokio_postgres::CancelToken>>>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -969,6 +975,66 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)] // Not called by release reconciliation until activation.
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+        deadline_probe: bool,
+    ) -> Result<(), StoreError> {
+        use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        if outcome
+            .history
+            .iter()
+            .any(|history| history.stripe_subscription_id != outcome.row.stripe_subscription_id)
+        {
+            return Err(failed());
+        }
+        #[cfg(feature = "billing-owned-wasm-test")]
+        let (host, port, connection_string) = (
+                "127.0.0.1".to_owned(),
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
+                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+            );
+        #[cfg(not(feature = "billing-owned-wasm-test"))]
+        let (host, port, connection_string) = {
+            let env = self.env.as_ref().ok_or(StoreError)?;
+            let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+            (
+                hyperdrive.host().to_owned(),
+                hyperdrive.port(),
+                hyperdrive.connection_string(),
+            )
+        };
+        billing_budget::with_owned_connection(
+            &host,
+            port,
+            &connection_string,
+            |client| {
+                #[cfg(feature = "billing-owned-wasm-test")]
+                if let Some(observer) = &self.cancel_token_observer {
+                    *observer.borrow_mut() = Some(client.cancel_token());
+                }
+                Box::pin(billing_budget::bootstrap_transaction(client))
+            },
+            move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
+            #[cfg(feature = "billing-owned-wasm-test")]
+            |expired| {
+                if let Some(observer) = &self.work_deadline_observer {
+                    observer.set(expired);
+                }
+            },
+        )
+        .await
+        .map_err(|_| failed())
+    }
+
     /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -5478,14 +5544,23 @@ impl Store for PgStore {
             #[cfg(feature = "billing-owned-wasm-test")]
             let (host, port, connection_string) = (
                 "127.0.0.1".to_owned(),
-                5432,
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
                 "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
             );
             billing_budget::with_owned_connection(
                 &host,
                 port,
                 &connection_string,
-                |client| Box::pin(billing_budget::bootstrap_transaction(client)),
+                |client| {
+                    if let Some(observer) = &self.cancel_token_observer {
+                        *observer.borrow_mut() = Some(client.cancel_token());
+                    }
+                    Box::pin(billing_budget::bootstrap_transaction(client))
+                },
                 move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
                 |expired| {
                     if let Some(observer) = &self.work_deadline_observer {
@@ -7169,6 +7244,8 @@ pub async fn subsonic_mount(
         mirror_binding: MirrorBinding::from_env(&env),
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         work_deadline_observer: None,
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        cancel_token_observer: None,
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         test_client: std::cell::RefCell::new(None),
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
@@ -7363,6 +7440,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             mirror_binding: MirrorBinding::from_env(&env),
             #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
             work_deadline_observer: None,
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            cancel_token_observer: None,
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
             test_client: std::cell::RefCell::new(None),
             #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]

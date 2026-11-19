@@ -1,5 +1,6 @@
 import { selectTrack, type QueueState } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
+import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
@@ -20,12 +21,45 @@ type PlaySelection = {
 	bumpAnnouncement: () => void;
 };
 
+type JumpSelection = {
+	isCurrent: () => boolean;
+	supersedeShare: () => void;
+	assigned: () => void;
+	publish: (outcome: JumpOutcome) => void;
+};
+
+type RestartSelection = {
+	supersedeShare: () => () => boolean;
+	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
+	assigned: () => void;
+	publish: (message: string, available: boolean) => void;
+};
+
+function describeRestart(words: string, title: string): string {
+	const suffix = ` ${title}.`;
+	if (words.length + suffix.length <= 99) return `${words}${suffix}`;
+	let end = 97 - words.length;
+	// Never cut between the halves of a surrogate pair.
+	const last = title.charCodeAt(end - 1);
+	if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+	return `${words} ${title.slice(0, end)}…`;
+}
+
 // Queued native events belong to the element, not to a receipt or controller.
 const mountedAudio = new WeakSet<HTMLAudioElement>();
+const nativeIsConnected = typeof Node === 'undefined' ? undefined : Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected')?.get;
+const nativeGetAttribute = typeof Element === 'undefined' ? undefined : Element.prototype.getAttribute;
 
-export function createMediaController() {
+function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
+	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
+}
+
+export function createMediaController(matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
+	let positionIntent = 0;
+	let positioning = false;
+	let nextPosition: (() => void) | undefined;
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
@@ -79,8 +113,101 @@ export function createMediaController() {
 		if (isCurrent()) deps.bumpAnnouncement();
 	}
 
+	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
+		try {
+			// Either instance accessor can change what the other last observed. End
+			// with a DOM snapshot that does not call back into those accessors.
+			return isCurrent() && audio.isConnected && isCurrent() &&
+				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent() &&
+				matchesNative(audio, source);
+		} catch {
+			return false;
+		}
+	}
+
+	function runPosition(action: () => void): void {
+		// A setter can call a newer gesture before storing its own value. Revoke
+		// the old intent immediately, but let the native call unwind before writing again.
+		nextPosition = action;
+		if (positioning) return;
+		positioning = true;
+		try {
+			while (nextPosition) {
+				const run = nextPosition;
+				nextPosition = undefined;
+				run();
+			}
+		} finally {
+			positioning = false;
+			nextPosition = undefined;
+		}
+	}
+
+	function jump(source: string, direction: JumpDirection, deps: JumpSelection): void {
+		if (destroyed) return;
+		const attachment = current;
+		const audio = attachment?.audio;
+		const intent = ++positionIntent;
+		const isCurrent = () => !destroyed && current === attachment && positionIntent === intent && deps.isCurrent();
+		// Cancel the older share on acceptance, not when the native seek drains.
+		if (audio && source && isCurrent() && matchesNative(audio, source)) deps.supersedeShare();
+		runPosition(() => {
+			if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
+				if (isCurrent()) deps.publish({ kind: 'unavailable' });
+				return;
+			}
+			const matches = () => matchesSource(audio, source, isCurrent);
+			if (!matches()) return;
+			const outcome = jumpMedia(audio, direction, matches, () => {
+				if (current === attachment) deps.assigned();
+			});
+			if (matches()) deps.publish(outcome);
+		});
+	}
+
+	function restart(source: string, title: string, deps: RestartSelection): void {
+		if (destroyed) return;
+		const attachment = current;
+		const intent = ++positionIntent;
+		// Supersede before any native read, including an unavailable or refused seek.
+		const selectionIsCurrent = deps.supersedeShare();
+		if (!attachment || positionIntent !== intent) return;
+		const { audio } = attachment;
+		const isCurrent = () => current === attachment && positionIntent === intent && selectionIsCurrent();
+		const matches = () => matchesSource(audio, source, isCurrent);
+		runPosition(() => {
+			if (!matches()) return;
+
+			let words = 'Could not restart';
+			let available = false;
+			try {
+				available = deps.available(audio, matches);
+				if (available && matches()) {
+					const position = audio.currentTime;
+					if (Number.isFinite(position) && matches()) {
+						const atStart = Math.abs(position) <= 0.05;
+						if (atStart) words = 'Already at the start of';
+						audio.currentTime = 0;
+						// Queue edits can revoke readback without retiring the old position feedback.
+						if (current === attachment) deps.assigned();
+						if (!atStart) {
+							if (!matches()) return;
+							const readback = audio.currentTime;
+							if (Number.isFinite(readback) && Math.abs(readback) <= 0.05) words = 'Restarted';
+						}
+					}
+				}
+			} catch {
+				// Unreadable positions and refused assignments cannot prove a restart.
+			}
+			if (matches()) deps.publish(describeRestart(words, title), available);
+		});
+	}
+
 	return {
 		playSelected,
+		restart,
+		jump,
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {

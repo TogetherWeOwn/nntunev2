@@ -439,6 +439,19 @@ single-row observation. Neither mode establishes admission expiry, writer drain,
 unknown-outcome reconciliation or crash-safe zero-idle restoration; these
 remain prerequisites for an authorized staging window, not claims of this route.
 
+`purge-census` stays disabled until reviewed code pins the independently approved SELECT-only
+staging app endpoint and role (no ledger/runtime fallback) and the purge owner's exact guard
+head/digest. No guard ref is checked out. The receipt reports `user_cache_grants` (all rows)
+and `provider_owners_without_account_evidence` (distinct provider owners without a vault marker,
+passkey or session, even a revoked one). Role, deletion fence, age, challenges and magic links do
+not affect the count. Before relying on it, confirm both predicates against the exact final reviewed
+`0051_purge_legacy_provider_credentials.sql`. This is not proof of vault markers, locked-guard success
+or caller drain.
+
+After separate dispatch approval, retrieve `staging-purge-census-<run>-<attempt>` (seven days)
+from a successful protected `main` job. Match `purge-census-receipt.json` to its run/job/attempt,
+trusted revision and reviewed guard. Unknown, stale or nonzero is NO-GO. A merge produces no receipt.
+
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
 90-second statement/idle-in-transaction and 10-second lock timeouts.
@@ -870,7 +883,7 @@ worker and the exact config source for each row.
 | `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
 | `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml:136-139` (top-level), `:212-214` (staging), `:272-274` (production); code `workers/ingest/src/metering.rs:16-18` |
 | `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:141-145`, production `:276-278`; target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:24` |
-| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:147-152`, production `:280-282`; target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
+| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:147-152`, production `:280-282`; target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:85` |
 | `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml:154-158` (top-level), `:216-221` (staging), `:284-286` (production); per-env names committed in `workers/mb/wrangler.toml:24` (top-level), `:61` (staging), `:80` (production); code `workers/ingest/src/matching.rs:30` |
 | `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:33` |
 | `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:34` |

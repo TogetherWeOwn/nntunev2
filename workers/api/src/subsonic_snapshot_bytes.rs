@@ -279,6 +279,27 @@ mod tests {
     }
 
     #[test]
+    fn raw_and_output_share_the_total_limit() {
+        let artists = [ArtistDbRow {
+            mbid: "a".into(),
+            name: "bb".into(),
+            sort_name: "ccc".into(),
+            artist_type: None,
+            country: None,
+        }];
+        let mut exact = SnapshotBytes::new(6, 9);
+        exact.raw_and_output(&artists, &[], &[]).unwrap();
+        assert_eq!(exact.total, 9);
+
+        let mut short = SnapshotBytes::new(6, 8);
+        assert_eq!(
+            short.raw_and_output(&artists, &[], &[]),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(short.total, 6);
+    }
+
+    #[test]
     fn arithmetic_overflow_fails_without_changing_total() {
         let mut budget = SnapshotBytes::new(usize::MAX, usize::MAX);
         budget.row(&[1]).unwrap();
