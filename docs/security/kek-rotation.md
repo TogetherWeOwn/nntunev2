@@ -507,13 +507,14 @@ CISO gate verifies each at its exact head):
 > landed, §7). On suspected or confirmed exposure, report through
 > GitHub's private vulnerability reporting (see `SECURITY.md`). The
 > legacy vault containment in §7 and the design below are historical, not
-> incident procedures. Do not use them to change KEKs for active consumers.
+> incident procedures. For active consumers, use only separately authorized
+> containment and record unavailable procedures in the private incident record.
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps
 the same DEK that decrypts today's payload. On suspected or confirmed
 KEK exposure, do NOT run a routine rotation and call it contained.
-Instead:
+The historical vault design proposed the following steps:
 
 1. Provision KEK[M] (fresh version, one environment at a time) and flip
    `VAULT_KEK_CURRENT=M` so no new row touches the exposed version.
@@ -544,5 +545,5 @@ Instead:
    rule — restores of older snapshots still need it to run THEIR
    compromise re-key.
 
-Drill: rehearse steps 1–2 on staging (dry-run + live pass) before the
-vault PR merges, so the path exists before it is ever needed.
+The historical design called for a staging drill; it is not an active
+incident or release procedure.
