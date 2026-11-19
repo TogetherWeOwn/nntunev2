@@ -15,6 +15,7 @@ pub mod endpoints;
 pub mod envelope;
 pub mod library;
 pub mod routes;
+pub mod staging_browse;
 pub mod staging_endpoints;
 pub mod staging_rejection;
 pub mod value;
