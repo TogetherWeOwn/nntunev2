@@ -25,6 +25,29 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                     client.batch_execute(migration).await.map_err(|_| StoreError)?;
                 }
                 client.batch_execute("CREATE FUNCTION public.worker_billing_cancel_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.stripe_invoice_id = 'in_worker_cancel' THEN PERFORM pg_advisory_xact_lock(781349052); END IF; RETURN NEW; END $$; CREATE TRIGGER worker_billing_cancel_barrier BEFORE INSERT ON public.paid_invoice_history FOR EACH ROW EXECUTE FUNCTION public.worker_billing_cancel_barrier()").await.map_err(|_| StoreError)?;
+                // A sequence advance survives rollback, unlike a witness row.
+                // Observe the preceding writes inside the failing transaction.
+                client.batch_execute(r#"
+                    CREATE SEQUENCE public.worker_billing_late_insert;
+                    CREATE FUNCTION public.worker_billing_note_late_insert() RETURNS trigger
+                    LANGUAGE plpgsql AS $$ BEGIN
+                        IF EXISTS (SELECT 1 FROM public.subscriptions s
+                                   WHERE s.user_id = NEW.user_id
+                                     AND s.stripe_subscription_id = NEW.stripe_subscription_id
+                                     AND s.paid_invoice_id = NEW.stripe_invoice_id)
+                           AND EXISTS (SELECT 1 FROM public.paid_invoice_history h
+                                       WHERE h.user_id = NEW.user_id
+                                         AND h.stripe_subscription_id = NEW.stripe_subscription_id
+                                         AND h.stripe_invoice_id = 'in_worker_first') THEN
+                            PERFORM nextval('public.worker_billing_late_insert');
+                        END IF;
+                        RETURN NEW;
+                    END $$;
+                    CREATE TRIGGER worker_billing_late_insert BEFORE INSERT
+                    ON public.paid_invoice_history FOR EACH ROW
+                    WHEN (NEW.stripe_invoice_id = 'in_worker_second' AND NEW.amount_cents = -1)
+                    EXECUTE FUNCTION public.worker_billing_note_late_insert();
+                "#).await.map_err(|_| StoreError)?;
                 client.batch_execute("INSERT INTO public.users (id,email,created_at) VALUES ('worker_fault_user','worker-fault@example.test',1786032000); COMMIT").await.map_err(|_| StoreError)?;
             } else {
                 let row = client.query_one("SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[]).await.map_err(|_| StoreError)?;
@@ -136,13 +159,131 @@ fn test_outcome() -> ReconcileOutcome {
         read_anchor: None,
     }
 }
+// Exercise a late history constraint error and retry using the prototype store.
+async fn late_fault_and_retry() -> Result<(), &'static str> {
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-fault-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let mut outcome = test_outcome();
+    outcome.history[1].currency = "eur".into();
+    outcome.history[1].amount_cents = -1;
+    if store
+        .store_reconcile_outcome("worker_fault_user", &outcome)
+        .await
+        .is_ok()
+    {
+        return Err("late history error was not returned");
+    }
+    let (reached, empty) = late_fault_state()
+        .await
+        .map_err(|_| "late history evidence query failed")?;
+    if !reached {
+        return Err("invalid second insert was not reached after both earlier writes");
+    }
+    if !empty {
+        return Err("late history error did not roll back");
+    }
+    outcome.history[1].amount_cents = 800;
+    store
+        .store_reconcile_outcome("worker_fault_user", &outcome)
+        .await
+        .map_err(|_| "corrected retry failed")?;
+    let before = fault_snapshot()
+        .await
+        .map_err(|_| "corrected retry state invalid")?;
+    store
+        .store_reconcile_outcome("worker_fault_user", &outcome)
+        .await
+        .map_err(|_| "identical replay failed")?;
+    let after = fault_snapshot().await.map_err(|_| "replay state invalid")?;
+    if before != after {
+        return Err("replay changed committed state");
+    }
+    Ok(())
+}
+
+async fn late_fault_state() -> Result<(bool, bool), StoreError> {
+    billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "SELECT is_called,
+                                NOT EXISTS (SELECT 1 FROM public.subscriptions)
+                                AND NOT EXISTS (SELECT 1 FROM public.paid_invoice_history)
+                         FROM public.worker_billing_late_insert",
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok((row.get(0), row.get(1)))
+            })
+        },
+        |_| {},
+    )
+    .await
+}
+
+async fn fault_snapshot() -> Result<String, StoreError> {
+    billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "SELECT (SELECT count(*) = 1 AND bool_and(user_id = 'worker_fault_user'
+                                                AND stripe_subscription_id = 'sub_worker_fault'
+                                                AND paid_invoice_id = 'in_worker_second')
+                                 FROM public.subscriptions),
+                                (SELECT count(*) = 2 AND bool_and(user_id = 'worker_fault_user'
+                                                AND stripe_subscription_id = 'sub_worker_fault'
+                                                AND amount_cents = 800)
+                                      AND array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
+                                          = ARRAY['in_worker_first', 'in_worker_second']
+                                      AND array_agg(currency ORDER BY stripe_invoice_id)
+                                          = ARRAY['usd', 'eur']
+                                 FROM public.paid_invoice_history),
+                                jsonb_build_array(
+                                    (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)
+                                     FROM public.subscriptions s),
+                                    (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)
+                                     FROM public.paid_invoice_history h))::text",
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if row.get::<_, Option<bool>>(0) != Some(true)
+                    || row.get::<_, Option<bool>>(1) != Some(true)
+                {
+                    return Err(StoreError);
+                }
+                Ok(row.get(2))
+            })
+        },
+        |_| {},
+    )
+    .await
+}
+
 pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     fixture(true)
         .await
         .map_err(|_| "billing fixture setup failed")?;
     deadline_after_writes(&test_outcome())
         .await
-        .map_err(|_| "billing deadline after writes control failed")
+        .map_err(|_| "billing deadline after writes control failed")?;
+    late_fault_and_retry().await
 }
 
 async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str> {
