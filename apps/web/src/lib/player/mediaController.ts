@@ -159,9 +159,8 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 			const attempt = { revision, retry: false };
 			applyingShare = attempt;
 			try {
-				pendingShare.apply(audio, revision);
-				// Coalesce callbacks into one follow-up after the native call unwinds.
-				// The existing receipt still gates the write and newer positions go first.
+				pendingShare.apply(audio, revision, () => attempt.retry);
+				// Keep the receipt for at most one follow-up; newer positions go first.
 				if (attempt.retry && !nextPosition) pendingShare.apply(audio, revision);
 			} finally {
 				applyingShare = undefined;
@@ -269,6 +268,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 			if (observations) {
 				const observe = (event: Event) => {
 					const shareRevision = pendingShare.revision;
+					const intent = positionIntent;
 					if (current !== receipt || event.currentTarget !== audio || !audio.isConnected) return;
 					const source = observations.source();
 					if (!source || audio.getAttribute('src') !== source || current !== receipt) return;
@@ -287,7 +287,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 						case 'ended': return observations.ended(receipt);
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
-							if (current === receipt) observations.seeking(audio);
+							if (current === receipt && positionIntent === intent) observations.seeking(audio);
 							return;
 						case 'loadedmetadata':
 						case 'durationchange':

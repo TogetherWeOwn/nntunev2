@@ -21,7 +21,7 @@ export function createPendingShareSeek() {
 		supersede(trackId: string, source: string) {
 			if (pending?.trackId === trackId && pending.streamUrl === source) clear();
 		},
-		apply(element: HTMLAudioElement | undefined | null, expectedRevision = revision) {
+		apply(element: HTMLAudioElement | undefined | null, expectedRevision = revision, hasRetry?: () => boolean) {
 			const target = pending;
 			if (!target || !element || expectedRevision !== revision) return;
 			try {
@@ -38,7 +38,7 @@ export function createPendingShareSeek() {
 				target.appliedSeconds = seconds;
 				writing = true;
 				try { element.currentTime = seconds; } finally { writing = false; }
-				if (known && current()) clear();
+				if (known && current() && !hasRetry?.()) clear();
 			} catch {
 				// Native getters and setters may refuse until metadata is available.
 			}

@@ -319,16 +319,16 @@ test('a synchronous seeking event preserves the share retry; duration clamps it 
 	expect(page.read().pendingShareSeek).toBeNull();
 });
 
-test.each(['clamp', 'restart', 'unknown'] as const)(
-	'a metadata event during the share setter is bounded and respects %s', async (outcome) => {
+test.each(['clamp', 'extend', 'restart', 'unknown'] as const)(
+	'a duration event during the share setter is bounded and respects %s', async (outcome) => {
 		const { page, location, element, media, writes } = restartFixture();
-		media.duration = NaN;
+		media.duration = outcome === 'extend' ? 60 : NaN;
 		Object.defineProperty(element, 'currentTime', {
 			get: () => media.position,
 			set(value: number) {
 				writes.push(value);
-				if (value === 90 && (writes.length === 1 || outcome === 'unknown')) {
-					if (outcome !== 'unknown') media.duration = 60;
+				if (writes.length === 1 || outcome === 'unknown') {
+					if (outcome !== 'unknown') media.duration = outcome === 'extend' ? 120 : 60;
 					page.retryShare('durationchange');
 					if (outcome === 'restart') page.restart();
 				}
@@ -339,7 +339,7 @@ test.each(['clamp', 'restart', 'unknown'] as const)(
 		page.applyShareLink();
 		await Promise.resolve();
 		const expected = outcome === 'clamp' ? 60 : outcome === 'restart' ? 0 : 90;
-		expect(writes).toEqual([90, expected]);
+		expect(writes).toEqual([outcome === 'extend' ? 60 : 90, expected]);
 		expect(media.position).toBe(expected);
 		if (outcome === 'unknown') expect(page.read().pendingShareSeek).not.toBeNull();
 		else expect(page.read().pendingShareSeek).toBeNull();
@@ -388,7 +388,6 @@ test.each(['tick', 'loadedmetadata', 'durationchange'] as const)(
 		page.applyShareLink();
 		const pending = page.read().pendingShareSeek;
 		expect(pending).toMatchObject({ trackId: 'coral', streamUrl: element.sourceAttribute, seconds: 90 });
-
 		page.detach();
 		expect(page.currentAudio()).toBeUndefined();
 		expect(page.read().pendingShareSeek).toBe(pending);
@@ -396,13 +395,9 @@ test.each(['tick', 'loadedmetadata', 'durationchange'] as const)(
 		expect(page.currentAudio()).toBe(replacement);
 		expect(replacement.sourceAttribute).toBe(element.sourceAttribute);
 		expect(page.read().pendingShareSeek).toBe(pending);
-
-		if (retry === 'tick') {
-			resume();
-			await Promise.resolve();
-		} else {
-			replacement.dispatchEvent(new Event(retry));
-		}
+		if (retry === 'tick') resume();
+		else replacement.dispatchEvent(new Event(retry));
+		await Promise.resolve();
 		expect(writes).toEqual([]);
 	}
 );
@@ -930,20 +925,28 @@ test('a native seek retires earlier boundary feedback', () => {
 	expect(page.read().jumpStatus).toBe('');
 });
 
-test('a refused jump still supersedes a pending share seek for the source', () => {
-	const { page, media, location } = restartFixture();
-	media.duration = Number.NaN;
+test.each([false, true])('a refused jump supersedes a pending share (during seeking: %s)', async (seeking) => {
+	const { page, media, location, element } = restartFixture();
+	media.duration = NaN;
 	location.search = '?track=coral&t=45';
 	page.applyShareLink();
+	if (seeking) await Promise.resolve();
 	expect(page.read().pendingShareSeek).not.toBeNull();
 	media.duration = 120;
 	media.refuse = true;
-	page.jump('forward');
+	if (seeking) {
+		expect(media.position).toBe(45);
+		vi.spyOn(element, 'currentTime', 'get').mockImplementationOnce(() => {
+			page.jump('forward');
+			return media.position;
+		});
+		page.seeking();
+	} else page.jump('forward');
 	expect(page.read().jumpStatus).toBe('The player did not accept that jump.');
 	expect(page.read().pendingShareSeek).toBeNull();
 	media.refuse = false;
 	page.retryShare();
-	expect(media.position).toBe(30);
+	expect(media.position).toBe(seeking ? 45 : 30);
 });
 
 test('a deferred Back cancels an older share before a metadata retry', async () => {
