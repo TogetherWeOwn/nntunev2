@@ -1212,8 +1212,10 @@ function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restart
 test('route selection drives native repeat, and cleanup retires only its own player', async () => {
 	let flush!: () => void;
 	const pending = new Promise<void>((resolve) => { flush = resolve; });
-	const selected = restartFixture(() => pending);
-	const leaving = restartFixture(() => pending);
+	const selectedFlush = vi.fn(() => pending);
+	const leavingFlush = vi.fn(() => pending);
+	const selected = restartFixture(selectedFlush);
+	const leaving = restartFixture(leavingFlush);
 	selected.page.replaceQueue(addTrack(selected.page.read().queue, pine));
 	selected.page.select(1);
 	const target = selected.remount(pine.streamUrl);
@@ -1224,6 +1226,8 @@ test('route selection drives native repeat, and cleanup retires only its own pla
 	signalNaturalEnd(leaving);
 	const repeatSelection = selected.page.end('one');
 	const retiredRepeat = leaving.page.end('one');
+	expect(selectedFlush).toHaveBeenCalledOnce();
+	expect(leavingFlush).toHaveBeenCalledOnce();
 	leaving.page.cleanup();
 	flush();
 	await Promise.all([repeatSelection, retiredRepeat]);
