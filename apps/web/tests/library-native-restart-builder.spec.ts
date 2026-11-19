@@ -138,6 +138,45 @@ test('the restart button cannot seek a source retired during the position read',
 	await expect(restartStatus(page)).toHaveText('');
 });
 
+for (const gesture of ['jump', 'restart'] as const) {
+	for (const change of ['source replacement', 'detachment'] as const) {
+		test(`${gesture} refuses ${change} hidden by the audio instance accessors`, async ({ page }) => {
+			await openLibrary(page);
+			await selectRow(page, 'rb-coral', 'Coral Night');
+			await mockMedia(page, 30);
+			await signalMedia(page);
+			const button = gesture === 'restart' ? restartButton(page) : page.getByRole('button', { name: 'Forward 10 seconds' });
+			await expect(button).toBeEnabled();
+			const result = await button.evaluate((control: HTMLButtonElement, { change, gesture }) => {
+				const el = document.querySelector<HTMLAudioElement>('[data-testid="audio-player"]')!;
+				const source = el.getAttribute('src');
+				const writes: number[] = [];
+				let reads = 0, changed = false;
+				// Restart reads position for availability first; both gestures then read it to seek.
+				const seekRead = gesture === 'restart' ? 2 : 1;
+				Object.defineProperties(el, {
+					currentTime: { get: () => { reads += 1; return 30; }, set: (value: number) => writes.push(value) },
+					isConnected: { get: () => true },
+					getAttribute: { value: (name: string) => {
+						if (name !== 'src') return Element.prototype.getAttribute.call(el, name);
+						if (!changed && reads >= seekRead) {
+							changed = true;
+							if (change === 'detachment') el.remove();
+							else el.setAttribute('src', '/test-audio/replacement');
+						}
+						return source;
+					} }
+				});
+				control.click();
+				return { changed, writes };
+			}, { change, gesture });
+			expect(result).toEqual({ changed: true, writes: [] });
+			await expect(restartStatus(page)).toHaveText('');
+			await expect(page.getByTestId('player-seek-feedback')).toHaveText('');
+		});
+	}
+}
+
 test('a new same-source share navigation applies after restarting', async ({ page }) => {
 	await openLibrary(page);
 	await restartCoral(page);
