@@ -176,6 +176,7 @@ mod ledger_wasm_test {
         nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
         nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();
         crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
+        crate::worker_entry::subsonic_membership::membership_projection_charges_capacity_before_copying();
     }
 }
 
