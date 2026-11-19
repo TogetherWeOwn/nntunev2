@@ -89,8 +89,8 @@ pub struct TokenEnvelope {
     pub envelope: FieldEnvelope,
 }
 
-/// Cannot be constructed outside this module. This is a compatibility
-/// identity, not a cookie session or native REST bearer credential.
+/// In production, only authentication constructs this compatibility identity.
+/// It is not a cookie session or native REST bearer credential.
 #[derive(PartialEq, Eq)]
 pub struct Principal {
     user_id: String,
@@ -105,6 +105,19 @@ impl std::fmt::Debug for Principal {
 }
 
 impl Principal {
+    #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+    pub(crate) fn postgres_test_fixture(
+        user_id: &str,
+        credential_id: &str,
+        username: &str,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            credential_id: credential_id.into(),
+            username: username.into(),
+        }
+    }
+
     pub fn user_id(&self) -> &str {
         &self.user_id
     }

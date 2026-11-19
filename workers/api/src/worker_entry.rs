@@ -752,6 +752,10 @@ impl MirrorBinding {
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
 
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
+pub use subsonic_pg::load_staging_account;
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
