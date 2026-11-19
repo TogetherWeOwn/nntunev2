@@ -379,6 +379,34 @@ test('a share tick cannot seek a same-source replacement mounted before the tick
 	expect(page.read().pendingShareSeek).toBeNull();
 });
 
+test.each(['tick', 'loadedmetadata', 'durationchange'] as const)(
+	'%s cannot seek a same-source remount using a share retained after detach', async (retry) => {
+		let resume!: () => void;
+		const { page, element, location, remount, writes } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
+		expect(page.currentAudio()).toBe(element);
+		location.search = '?track=coral&t=90';
+		page.applyShareLink();
+		const pending = page.read().pendingShareSeek;
+		expect(pending).toMatchObject({ trackId: 'coral', streamUrl: element.sourceAttribute, seconds: 90 });
+
+		page.detach();
+		expect(page.currentAudio()).toBeUndefined();
+		expect(page.read().pendingShareSeek).toBe(pending);
+		const replacement = remount();
+		expect(page.currentAudio()).toBe(replacement);
+		expect(replacement.sourceAttribute).toBe(element.sourceAttribute);
+		expect(page.read().pendingShareSeek).toBe(pending);
+
+		if (retry === 'tick') {
+			resume();
+			await Promise.resolve();
+		} else {
+			replacement.dispatchEvent(new Event(retry));
+		}
+		expect(writes).toEqual([]);
+	}
+);
+
 test('a new same-source share navigation supersedes an earlier restart marker', async () => {
 	const { page, media, location } = restartFixture();
 	page.restart();
