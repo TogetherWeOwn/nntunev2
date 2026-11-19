@@ -4,7 +4,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
-	import { createMediaController, type MediaAttachment } from '#lib/player/mediaController.js';
+	import { createMediaController } from '#lib/player/mediaController.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -75,14 +75,12 @@
 		insertTracks,
 		insertTracksNext,
 		moveTrack,
-		naturalEndPolicy,
 		nextTrack,
 		playNext,
 		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
 		type QueueState,
-		type RepeatMode,
 		type Track
 	} from '#lib/player/queue.js';
 
@@ -109,27 +107,8 @@
 		}
 	}
 
-	const REPEAT_KEY = 'nntune:library-repeat:v1';
-	let repeat: RepeatMode = $state('off');
-
-	function readStoredRepeat(): RepeatMode {
-		try {
-			const value = window.localStorage.getItem(REPEAT_KEY);
-			return value === 'one' || value === 'queue' ? value : 'off';
-		} catch {
-			return 'off';
-		}
-	}
-
 	function onRepeatChange(event: Event): void {
-		const value = (event.currentTarget as HTMLSelectElement).value;
-		if (value !== 'off' && value !== 'one' && value !== 'queue') return;
-		repeat = value;
-		try {
-			window.localStorage.setItem(REPEAT_KEY, value);
-		} catch {
-			// Storage refused: keep the choice for this visit.
-		}
+		media.setRepeat((event.currentTarget as HTMLSelectElement).value, browserStorage('local'));
 	}
 
 	let items: LibraryItem[] = $state([]);
@@ -257,71 +236,31 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
-	const media = createMediaController();
+	const media = createMediaController(undefined, {
+		queue: queueController,
+		commit: replaceQueue,
+		flush: () => tick(),
+		clearShareFeedback,
+		clearJumpFeedback: () => { jumpStatus = ''; },
+		announce: (track) => announceEnd(track)
+	});
+	const repeat = media.repeat;
 	// A source round trip before Svelte flushes must not revive a retired node.
 	let mediaRevision = $state(0);
-	let endGeneration = 0;
 
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
 		return media.attach(audio, {
 			source: () => shareAlive ? resolveStreamUrl(queueCurrentTrack(queueController.snapshot)) : null,
-			interrupt: () => { endGeneration += 1; },
-			ended: handleEnded,
 			seeking: handleSeeking,
 			position: refreshRestartAvailability
 		});
 	}
 
-	async function handleEnded(attachment: MediaAttachment): Promise<void> {
-		const element = attachment.audio;
-		const result = naturalEndPolicy(queueController.snapshot, {
-			repeat,
-			radioActive: false,
-			continueRadio: false,
-			playing: attachment.playing,
-			validEnd: element.ended && element.error === null,
-			// Library has no sleep timer; any explicit pause clears intent above.
-			sleepComplete: false
-		});
-		if (result.action === 'ignore') return;
-		attachment.playing = false;
-		const generation = ++endGeneration;
-		queueAnnouncement = '';
-		if (result.action !== 'play') return;
-		const settings = {
-			volume: element.volume, muted: element.muted, playbackRate: element.playbackRate
-		};
-		// Replays must also retire a deferred inbound-share seek on this source.
-		clearShareFeedback();
-		media.clearShareSeek();
-		const revision = mediaRevision;
-		if (!replaceQueue(result.queue)) return;
-		const targetQueue = queueController.snapshot;
-		const sameSource = mediaRevision === revision;
-		await tick();
-		const replay = media.attachment;
-		const track = queueCurrentTrack(queueController.snapshot);
-		if (!shareAlive || generation !== endGeneration || queueController.snapshot !== targetQueue ||
-			!replay || (sameSource && replay !== attachment) || !replay.audio.isConnected || !track ||
-			replay.audio.getAttribute('src') !== resolveStreamUrl(track)) return;
-		const target = replay.audio;
-		try {
-			target.volume = settings.volume;
-			target.muted = settings.muted;
-			target.playbackRate = settings.playbackRate;
-			target.currentTime = 0;
-			jumpStatus = '';
-			replay.playing = true;
-			await target.play();
-			if (!shareAlive || generation !== endGeneration || replay !== media.attachment ||
-				queueController.snapshot !== targetQueue || !replay.playing) return;
-			queueAnnouncement = `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.`;
-			queueAnnouncementVersion += 1;
-		} catch {
-			// Autoplay can be refused; native controls remain available, no success claim.
-			if (generation === endGeneration) replay.playing = false;
-		}
+	function announceEnd(track?: Track): void {
+		queueAnnouncement = track ? `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.` : '';
+		if (track) queueAnnouncementVersion += 1;
 	}
+
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
 	let shareInvalid = $state(false);
@@ -771,7 +710,6 @@
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		media.clearShareSeek();
-		endGeneration += 1;
 		mediaRevision += 1;
 		media.reset();
 		clearShareFeedback();
@@ -1711,7 +1649,7 @@
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
-		repeat = readStoredRepeat();
+		media.restoreRepeat(browserStorage('local'));
 		window.addEventListener('storage', handleAuthTransition);
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
@@ -1728,7 +1666,6 @@
 			shareAlive = false;
 			queueController.destroy();
 			queueShare.dispose();
-			endGeneration += 1;
 			media.destroy();
 			favoritesExport.destroy();
 			clearShareFeedback();
@@ -2241,12 +2178,12 @@
 	{#if !loading && !loadError && !libraryUnavailable && items.length > 0}
 		<div class="nt-library-repeat">
 			<label for="library-repeat">Repeat</label>
-			<select id="library-repeat" data-testid="player-repeat" value={repeat} onchange={onRepeatChange}>
+			<select id="library-repeat" data-testid="player-repeat" value={$repeat} onchange={onRepeatChange}>
 				<option value="off">Off</option>
 				<option value="one">One</option>
 				<option value="queue">Queue</option>
 			</select>
-			<p data-testid="repeat-status" role="status" aria-atomic="true">Repeat: {repeat === 'off' ? 'Off' : repeat === 'one' ? 'One' : 'Queue'}</p>
+			<p data-testid="repeat-status" role="status" aria-atomic="true">Repeat: {$repeat === 'off' ? 'Off' : $repeat === 'one' ? 'One' : 'Queue'}</p>
 		</div>
 	{/if}
 	{#if streamUrl}

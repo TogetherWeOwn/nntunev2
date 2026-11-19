@@ -750,7 +750,7 @@ impl MirrorBinding {
 
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
-pub use subsonic_pg::mutate_staging_credential;
+pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
 
 #[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
@@ -986,7 +986,8 @@ impl PgStore {
         &self,
         user_id: String,
         outcome: crate::billing_reconcile::ReconcileOutcome,
-        deadline_probe: bool,
+        #[cfg(feature = "billing-owned-wasm-test")]
+        probe: crate::billing_transaction_sql::ReconcileProbe,
     ) -> Result<(), StoreError> {
         use crate::billing_transaction_sql::apply_reconcile_transaction as apply;
         let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
@@ -1028,7 +1029,15 @@ impl PgStore {
                 }
                 Box::pin(billing_budget::bootstrap_transaction(client))
             },
-            move |client| Box::pin(apply(client, user_id, outcome, deadline_probe)),
+            move |client| {
+                Box::pin(apply(
+                    client,
+                    user_id,
+                    outcome,
+                    #[cfg(feature = "billing-owned-wasm-test")]
+                    probe,
+                ))
+            },
             #[cfg(feature = "billing-owned-wasm-test")]
             |expired| {
                 if let Some(observer) = &self.work_deadline_observer {
@@ -5376,9 +5385,12 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         let user_id = user_id.to_owned();
         let outcome = outcome.clone();
-        let deadline_probe = self.trace_id == "worker-deadline-test";
-        self.store_reconcile_owned(user_id, outcome, deadline_probe)
-            .await
+        self.store_reconcile_owned(
+            user_id,
+            outcome,
+            crate::billing_transaction_sql::ReconcileProbe::None,
+        )
+        .await
     }
 
     async fn open_checkout_operation(

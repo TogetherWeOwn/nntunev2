@@ -4,15 +4,22 @@
 
 use std::future::Future;
 
-use nntune_subsonic::auth::{md5_hex, Credentials};
+use nntune_subsonic::auth::Credentials;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    field_envelope::{self, Context, FieldEnvelope},
+    field_envelope::FieldEnvelope,
     native_rest::{credential_hmac, Pepper},
     rotation::KekSource,
 };
+
+#[path = "subsonic_auth_verify.rs"]
+mod verify;
+use verify::verify_token;
+
+#[cfg(test)]
+use {crate::field_envelope, nntune_subsonic::auth::md5_hex, verify::token_context};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
@@ -219,59 +226,6 @@ fn valid_record(record: &CredentialRecord) -> bool {
                     && record.token.is_some()
             }
         }
-}
-
-fn token_context<'a>(user_id: &'a str, credential_id: &'a str) -> Context<'a> {
-    Context {
-        table: "subsonic_credentials",
-        field: "token_secret_encrypted",
-        scope: user_id,
-        row: credential_id,
-        version: 2,
-        format: 1,
-    }
-}
-
-fn verify_token(
-    selected: &CredentialRecord,
-    presented: &str,
-    salt: &str,
-    keks: &impl KekSource,
-) -> Result<(), AuthError> {
-    let stored = selected.token.as_ref().ok_or(AuthError::InvalidToken)?;
-    if stored.envelope_version != 2
-        || stored.payload_format != 1
-        || stored.envelope.ciphertext.len() < 32 + 16
-        || stored.envelope.ciphertext.len() > 512 + 16
-    {
-        return Err(AuthError::InvalidToken);
-    }
-    let kek = keks.kek(stored.kek_version).ok_or(AuthError::Unavailable)?;
-    let secret = Zeroizing::new(
-        field_envelope::open(
-            kek,
-            stored.kek_version,
-            &token_context(&selected.user_id, &selected.id),
-            &stored.envelope,
-        )
-        .map_err(|_| AuthError::InvalidToken)?,
-    );
-    // The provisioning path uses a generated printable secret, not raw
-    // arbitrary bytes or a reversible copy of the API key.
-    if !(32..=512).contains(&secret.len()) || !secret.iter().all(u8::is_ascii_graphic) {
-        return Err(AuthError::InvalidToken);
-    }
-    let mut salted = Zeroizing::new(Vec::with_capacity(secret.len() + salt.len()));
-    salted.extend_from_slice(&secret);
-    salted.extend_from_slice(salt.as_bytes());
-    let expected = Zeroizing::new(md5_hex(&salted));
-    // MD5 is only the mandated compatibility checksum. Constant-time
-    // comparison prevents a prefix oracle; accepting hex case changes no bits.
-    let normalized = Zeroizing::new(presented.to_ascii_lowercase());
-    if expected.as_bytes().ct_eq(normalized.as_bytes()).unwrap_u8() != 1 {
-        return Err(AuthError::InvalidToken);
-    }
-    Ok(())
 }
 
 /// Authenticate without cookies, native bearer keys, client-name identity,

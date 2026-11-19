@@ -57,8 +57,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare, createQueueController, restartIsAvailable,
-		createMediaController: () => createMediaController((audio, source) =>
-			audio.isConnected && audio.getAttribute('src') === source),
+		createMediaController: (_: undefined, end: Parameters<typeof createMediaController>[1]) =>
+			createMediaController((audio, source) => audio.isConnected && audio.getAttribute('src') === source, end),
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
