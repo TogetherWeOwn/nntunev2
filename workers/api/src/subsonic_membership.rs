@@ -95,7 +95,12 @@ async fn fetch(
     user_id: &str,
     limit: i64,
     pairs: bool,
+    #[cfg(test)] fetches: &mut usize,
 ) -> Result<Vec<Row>, StoreError> {
+    #[cfg(test)]
+    {
+        *fetches += 1;
+    }
     let query = sql(
         budget,
         &[
@@ -148,6 +153,7 @@ pub(super) async fn read_membership(
     user_id: &str,
     cap: i64,
     mut remaining: i32,
+    #[cfg(test)] fetches: &mut usize,
 ) -> Result<StagingMembership, StoreError> {
     let limit = cap
         .checked_add(1)
@@ -167,7 +173,17 @@ pub(super) async fn read_membership(
     let pairs = catalogue_member_track_pairs_statement();
     preflight(&tx, budget, releases, user_id, limit, false, &mut remaining).await?;
     preflight(&tx, budget, pairs, user_id, limit, true, &mut remaining).await?;
-    let rows = fetch(&tx, budget, releases, user_id, limit, false).await?;
+    let rows = fetch(
+        &tx,
+        budget,
+        releases,
+        user_id,
+        limit,
+        false,
+        #[cfg(test)]
+        fetches,
+    )
+    .await?;
     let releases = project(budget, &rows, |budget, row| {
         let release: &str = row.try_get(0).map_err(|_| StoreError)?;
         is_catalogue_mbid(release)
@@ -175,7 +191,17 @@ pub(super) async fn read_membership(
             .transpose()
     })?;
     drop(rows);
-    let rows = fetch(&tx, budget, pairs, user_id, limit, true).await?;
+    let rows = fetch(
+        &tx,
+        budget,
+        pairs,
+        user_id,
+        limit,
+        true,
+        #[cfg(test)]
+        fetches,
+    )
+    .await?;
     let pairs = project(budget, &rows, |budget, row| {
         let release: &str = row.try_get(0).map_err(|_| StoreError)?;
         let recording: &str = row.try_get(1).map_err(|_| StoreError)?;
@@ -209,6 +235,8 @@ pub(crate) async fn load_staging_membership(
             principal.user_id(),
             MEMBERSHIP_ROWS,
             SOURCE_TEXT_BYTES,
+            #[cfg(test)]
+            &mut 0,
         ),
         1_000,
         StoreError,

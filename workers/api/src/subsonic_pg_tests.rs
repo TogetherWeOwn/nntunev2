@@ -60,7 +60,7 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
         .await
         .unwrap();
     let mut budget = ConstructionBudget::new(8 * 1024);
-    let empty = read_membership(&mut client, &mut budget, USER, 0, 0)
+    let empty = read_membership(&mut client, &mut budget, USER, 0, 0, &mut 0)
         .await
         .unwrap();
     assert!(empty.releases.is_empty() && empty.pairs.is_empty());
@@ -74,16 +74,20 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
         .unwrap();
     for (cap, remaining) in [(2, TRANSFER), (3, TRANSFER - 1)] {
         let mut budget = ConstructionBudget::new(8 * 1024);
+        let mut fetches = 0;
         assert!(
-            read_membership(&mut client, &mut budget, USER, cap, remaining)
+            read_membership(&mut client, &mut budget, USER, cap, remaining, &mut fetches)
                 .await
                 .is_err()
         );
+        assert_eq!(fetches, 0, "ID fetch started before admission");
     }
     let mut budget = ConstructionBudget::new(8 * 1024);
-    let membership = read_membership(&mut client, &mut budget, USER, 3, TRANSFER)
+    let mut fetches = 0;
+    let membership = read_membership(&mut client, &mut budget, USER, 3, TRANSFER, &mut fetches)
         .await
         .unwrap();
+    assert_eq!(fetches, 2);
     assert_eq!(membership.remaining_text_bytes, 0);
     assert_eq!(membership.releases.as_slice(), [ID, SHARED]);
     assert_eq!(membership.pairs.len(), 2);
@@ -92,9 +96,16 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
     }
     client.batch_execute("UPDATE library SET release_mbid = release_mbid || 'x' WHERE octet_length(release_mbid) = 1024").await.unwrap();
     let mut budget = ConstructionBudget::new(8 * 1024);
-    assert!(read_membership(&mut client, &mut budget, USER, 3, TRANSFER)
-        .await
-        .is_err());
+    let mut fetches = 0;
+    assert!(
+        read_membership(&mut client, &mut budget, USER, 3, TRANSFER, &mut fetches)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fetches, 0,
+        "ID fetch started before release-width admission"
+    );
     client
         .execute(
             "DELETE FROM library WHERE octet_length(release_mbid) > 1024",
@@ -102,16 +113,28 @@ async fn staging_membership_admits_only_complete_owner_scoped_pages() {
         )
         .await
         .unwrap();
-    client.execute(
-        "UPDATE library SET recording_mbids = array_append(recording_mbids, $2) WHERE user_id = $1",
-        &[&USER, &ID],
-    ).await.unwrap();
-    let mut budget = ConstructionBudget::new(8 * 1024);
-    assert!(
-        read_membership(&mut client, &mut budget, USER, 2, TRANSFER + 72)
+    // Release preflight passes in both cases. With three pairs, cap 2
+    // isolates the pair row bound and cap 3 isolates recording width.
+    let over_width = "é".repeat(513);
+    for (recording, cap) in [(ID, 2), (over_width.as_str(), 3)] {
+        client
+            .execute(
+                "UPDATE library SET recording_mbids = ARRAY[$2, $3]::text[] WHERE user_id = $1",
+                &[&USER, &RECORDING, &recording],
+            )
             .await
-            .is_err()
-    );
+            .unwrap();
+        let mut budget = ConstructionBudget::new(8 * 1024);
+        let mut fetches = 0;
+        let remaining = TRANSFER + 72;
+        let result =
+            read_membership(&mut client, &mut budget, USER, cap, remaining, &mut fetches).await;
+        assert!(result.is_err(), "expected pair rejection at cap {cap}");
+        assert_eq!(
+            fetches, 0,
+            "fetch started before pair preflight (cap {cap})"
+        );
+    }
 }
 
 #[tokio::test]
