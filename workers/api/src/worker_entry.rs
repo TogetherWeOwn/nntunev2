@@ -750,7 +750,7 @@ impl MirrorBinding {
 
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
-pub use subsonic_pg::mutate_staging_credential;
+pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
 
 struct PgStore {
     env: Option<Env>,
