@@ -2,8 +2,8 @@
 use super::*;
 use tokio_postgres::{Config, NoTls};
 
-async fn database() -> Client {
-    let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
+async fn database(name: &str) -> Client {
+    let mut config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("CI disposable database required; never silently skip")
         .parse()
         .unwrap();
@@ -13,7 +13,7 @@ async fn database() -> Client {
         matches!(config.get_hosts(), [tokio_postgres::config::Host::Tcp(host)]
         if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
     );
-    let (client, connection) = config.connect(NoTls).await.unwrap();
+    let (client, connection) = config.dbname(name).connect(NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     client
 }
@@ -28,7 +28,7 @@ async fn staging_mirror_counts_combined_text_and_keeps_exact_occurrences() {
     // bytes in the receipt and all remaining non-null text is one byte.
     const TEXT_BYTES: i32 = 38 + 2 * 74 + 2 * 111;
     const CARRIED: usize = 17;
-    let mut client = database().await;
+    let mut client = database("nntune_ci").await;
     client.batch_execute(
         "SET search_path = pg_temp;
          CREATE TEMP TABLE mb_artist (mbid uuid, name text, sort_name text, type text, country text);
@@ -62,7 +62,13 @@ async fn staging_mirror_counts_combined_text_and_keeps_exact_occurrences() {
         pairs: &pairs,
         remaining_text_bytes,
     };
+    // No mirror tables in this fixture: rejection must precede building a probe.
+    let mut latin1 = database("nntune_ci_latin1").await;
     let mut budget = ConstructionBudget::new(16 * 1024);
+    let result = read_mirror(&mut latin1, &mut budget, member(TEXT_BYTES), 2).await;
+    assert!(result.is_err());
+    assert_eq!(budget.charged(), 0);
+
     budget.charge(CARRIED, 1, 1).unwrap();
     let (artists, releases, tracks) = read_mirror(&mut client, &mut budget, member(TEXT_BYTES), 2)
         .await
@@ -77,21 +83,16 @@ async fn staging_mirror_counts_combined_text_and_keeps_exact_occurrences() {
     assert_eq!(tracks[1].release_mbid, RELEASE);
     assert_eq!((tracks[0].track_no, tracks[1].track_no), (Some(1), Some(2)));
     let exact = budget.charged();
-    for (ceiling, accepted) in [(exact - 1, false), (exact, true)] {
+    for (ceiling, bytes, cap, accepted) in [
+        (exact - 1, TEXT_BYTES, 2, false),
+        (exact, TEXT_BYTES, 2, true),
+        (16 * 1024, TEXT_BYTES - 1, 2, false),
+        (16 * 1024, TEXT_BYTES, 1, false),
+    ] {
         let mut budget = ConstructionBudget::new(ceiling);
         budget.charge(CARRIED, 1, 1).unwrap();
-        assert_eq!(
-            read_mirror(&mut client, &mut budget, member(TEXT_BYTES), 2)
-                .await
-                .is_ok(),
-            accepted,
-        );
-    }
-    for (bytes, cap) in [(TEXT_BYTES - 1, 2), (TEXT_BYTES, 1)] {
-        let mut budget = ConstructionBudget::new(16 * 1024);
-        assert!(read_mirror(&mut client, &mut budget, member(bytes), cap)
-            .await
-            .is_err());
+        let result = read_mirror(&mut client, &mut budget, member(bytes), cap).await;
+        assert_eq!(result.is_ok(), accepted, "{ceiling} / {bytes} / {cap}");
     }
     client
         .batch_execute("UPDATE mb_artist SET sort_name = repeat('é', 512)")

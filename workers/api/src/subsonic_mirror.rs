@@ -57,23 +57,15 @@ async fn preflight(
     limit: i64,
     remaining: &mut i32,
 ) -> Result<usize, StoreError> {
-    // Two array columns at most; the limit and remaining byte count are the
-    // final slots. Keep the parameter list inline rather than allocating.
-    let mut probe_params: [Param<'_>; 4] = [
-        (&limit, Type::INT8),
-        (&limit, Type::INT8),
-        (&limit, Type::INT8),
-        (&limit, Type::INT8),
-    ];
-    let count = params
-        .len()
-        .checked_add(1)
-        .filter(|n| *n <= probe_params.len())
-        .ok_or(StoreError)?;
-    probe_params[..params.len()].clone_from_slice(params);
+    // Append the remaining text allowance without allocating a bind list.
     let available = *remaining;
-    probe_params[params.len()] = (&available, Type::INT4);
-    admit_page(tx, probe, &probe_params[..count], limit, remaining).await
+    let allowance: Param<'_> = (&available, Type::INT4);
+    let mut binds: [_; 4] = std::array::from_fn(|_| allowance.clone());
+    if params.len() >= binds.len() {
+        return Err(StoreError);
+    }
+    binds[..params.len()].clone_from_slice(params);
+    admit_page(tx, probe, &binds[..=params.len()], limit, remaining).await
 }
 
 fn text(budget: &mut ConstructionBudget, value: &str) -> Result<String, StoreError> {
@@ -112,6 +104,15 @@ async fn read_mirror(
     tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
         .await
         .map_err(|_| StoreError)?;
+    // octet_length measures server bytes, while binary text uses the client encoding.
+    let utf8 = "SELECT getdatabaseencoding() = 'UTF8' AND pg_client_encoding() = 'UTF8'";
+    let encoding = tx
+        .query_typed_one(utf8, &[])
+        .await
+        .map_err(|_| StoreError)?;
+    if !encoding.try_get::<_, bool>(0).map_err(|_| StoreError)? {
+        return Err(StoreError);
+    }
     let params = [
         (&member.releases as &(dyn ToSql + Sync), Type::TEXT_ARRAY),
         (&limit, Type::INT8),
@@ -168,12 +169,9 @@ async fn read_mirror(
 
     // Borrow both aligned columns from the charged pair strings, keeping the
     // normalized pairs for the independent exact-occurrence fence below.
-    let mut pair_releases = budget
-        .allocate_exact(member.pairs.len())
-        .map_err(|_| StoreError)?;
-    let mut pair_recordings = budget
-        .allocate_exact(member.pairs.len())
-        .map_err(|_| StoreError)?;
+    let pair_count = member.pairs.len();
+    let mut pair_releases = budget.allocate_exact(pair_count).map_err(|_| StoreError)?;
+    let mut pair_recordings = budget.allocate_exact(pair_count).map_err(|_| StoreError)?;
     for (release, recording) in member.pairs {
         pair_releases.push(release.as_str());
         pair_recordings.push(recording.as_str());
