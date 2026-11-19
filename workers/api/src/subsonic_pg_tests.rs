@@ -85,7 +85,12 @@ async fn staging_account_projects_only_bounded_email_and_live_role_flags() {
     for change in [
         None,
         Some("UPDATE users SET email = repeat('é',512), deleting_at = now()"),
-        Some("DELETE FROM users"),
+        // Keep an unrelated live account when the principal's row is absent.
+        Some(
+            "DELETE FROM users;
+             INSERT INTO users (id,email,created_at)
+             VALUES ('subsonic-test-other','other@example.invalid',100)",
+        ),
     ] {
         if let Some(change) = change {
             client.batch_execute(change).await.unwrap();
