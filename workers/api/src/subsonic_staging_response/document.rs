@@ -121,17 +121,28 @@ mod tests {
     #[test]
     fn output_uses_the_existing_snapshot_and_graph_ledger() {
         let mut budget = ConstructionBudget::new(usize::MAX);
-        let doc = graph(&mut budget);
-        for (format, rejection, content_type) in [
-            (Format::Json, RejectionFormat::Json, JSON_CONTENT_TYPE),
-            (Format::Xml, RejectionFormat::Xml, XML_CONTENT_TYPE),
+        graph(&mut budget);
+        for (format, rejection, content_type, expected) in [
+            (
+                Format::Json,
+                RejectionFormat::Json,
+                JSON_CONTENT_TYPE,
+                r#"{"subsonic-response":{"title":"<&é"}}"#,
+            ),
+            (
+                Format::Xml,
+                RejectionFormat::Xml,
+                XML_CONTENT_TYPE,
+                r#"<?xml version="1.0" encoding="UTF-8"?><subsonic-response title="&lt;&amp;é"/>"#,
+            ),
             (
                 Format::Jsonp("music.done"),
                 RejectionFormat::Json,
                 JSONP_CONTENT_TYPE,
+                r#"/**/music.done({"subsonic-response":{"title":"<&é"}});"#,
             ),
         ] {
-            let len = capped_render::encoded_len(&doc, format, DOCUMENT_BYTES).unwrap();
+            let len = expected.len();
             let mut charges = ConstructionBudget::new(usize::MAX);
             charges.charge(len, 1, 1).unwrap();
             let total = budget.charged() + charges.charged();
@@ -158,7 +169,7 @@ mod tests {
                 } else {
                     let doc = result.unwrap();
                     assert_eq!(doc.content_type, content_type);
-                    assert_eq!(doc.bytes.len(), len);
+                    assert_eq!(doc.bytes.as_slice(), expected.as_bytes());
                     assert_eq!(doc.bytes.capacity(), len);
                     assert_eq!(carried.charged(), total);
                 }
