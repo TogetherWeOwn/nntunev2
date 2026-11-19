@@ -1181,16 +1181,19 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 		resume = phase === 'play rejection' ? () => reject(new Error('native play refused')) : resolve;
 	});
 	const { page, element, media, capture, remount } = restartFixture(() => phase === 'tick' ? pending : Promise.resolve());
-	element.play = () => pending;
+	element.play = vi.fn(() => pending);
 	element.paused = false;
 	capture('play')();
 	media.position = media.duration;
 	element.ended = element.paused = true;
 	const repeat = page.end('one');
 	await Promise.resolve();
+	expect(element.play).toHaveBeenCalledTimes(phase === 'tick' ? 0 : 1);
 	const replacement = remount();
 	replacement.paused = false;
 	capture('play')();
+	// A successful stale play must be fenced by its receipt, not by native pause.
+	if (phase === 'play') element.ended = element.paused = false;
 	resume();
 	await repeat;
 	expect(media.position).toBe(phase === 'tick' ? media.duration : 0);
