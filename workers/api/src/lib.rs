@@ -68,6 +68,8 @@ pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
 pub mod subsonic_snapshot_plan;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging_response;
 pub mod target_identity;
 pub mod taste_signal;
 pub mod vault;

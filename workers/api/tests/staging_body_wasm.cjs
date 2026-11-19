@@ -1,5 +1,7 @@
 'use strict';
 
+require('./staging_response_wasm.cjs');
+
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { collect_staging_test: collect } = require(process.env.STAGING_BODY_WASM_JS);
