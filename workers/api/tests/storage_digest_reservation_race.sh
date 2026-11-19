@@ -161,7 +161,6 @@ DO $$ DECLARE field text; BEGIN
     IF public.digest_ref_fixture(1,false,'new reference') IS DISTINCT FROM false THEN RAISE EXCEPTION 'quarantined attach'; END IF;
 END $$;
 SQL
-
 # Observe the contender blocked in Postgres before letting the holder finish.
 for scenario in '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
   read -r id deleting finish expected tombstone <<<"$scenario"

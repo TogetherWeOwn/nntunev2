@@ -33,10 +33,8 @@ CREATE TABLE IF NOT EXISTS public.storage_validated_digest_references (
     FOREIGN KEY (object_id, environment_id, library_id)
         REFERENCES public.storage_object_intents (object_id, environment_id, library_id)
 );
-CREATE INDEX IF NOT EXISTS storage_validated_digest_reference_object
-    ON public.storage_validated_digest_references (object_id);
+CREATE INDEX IF NOT EXISTS storage_validated_digest_reference_object ON public.storage_validated_digest_references (object_id);
 REVOKE ALL ON public.storage_validated_digest_winners, public.storage_validated_digest_references FROM PUBLIC;
-
 DROP TRIGGER IF EXISTS storage_validated_digest_winner_immutable ON public.storage_validated_digest_winners;
 CREATE TRIGGER storage_validated_digest_winner_immutable
     BEFORE UPDATE OF object_id, environment_id, library_id, plaintext_bytes, plaintext_sha256, root_version_id
@@ -56,10 +54,9 @@ CREATE TRIGGER storage_digest_winner_retirement BEFORE UPDATE OF deleting_at, qu
     ON public.storage_validated_digest_winners FOR EACH ROW
     EXECUTE FUNCTION public.storage_digest_winner_retirement_guard();
 
--- Every future reference, lease, and retention writer must lock this winner
--- before acting, and refuse new live work on a tombstone. READ COMMITTED gives
--- the reference probe a fresh snapshot *after* the lock wait; a fixed snapshot
--- could miss a reference committed by the previous lock holder.
+-- Future reference, lease and retention writers must lock this winner first
+-- and refuse new work on a tombstone. READ COMMITTED gives the reference
+-- probe a fresh snapshot after the lock wait; a fixed snapshot could miss it.
 CREATE OR REPLACE FUNCTION public.lock_storage_digest_winner(
     p_environment UUID, p_library UUID, p_digest BYTEA, p_bytes BIGINT,
     p_object UUID, p_generation UUID, p_root_version UUID
@@ -74,7 +71,6 @@ LANGUAGE sql VOLATILE SET search_path = pg_catalog, public AS $$
       AND NOT w.quarantined AND w.deleting_at IS NULL
     FOR UPDATE OF w;
 $$;
-
 -- Invoker-only. The caller must already authorize this exact reference to
 -- this exact object in this scope. A digest or supplied deadline is not authority.
 CREATE OR REPLACE FUNCTION public.attach_storage_digest_reference(
@@ -97,7 +93,6 @@ BEGIN
     RETURN FOUND;
 EXCEPTION WHEN SQLSTATE 'PDE01' THEN RETURN FALSE;
 END $$;
-
 -- Admission only. No locator is returned or deleted; the tombstone is durable.
 CREATE OR REPLACE FUNCTION public.admit_storage_digest_delete(
     p_environment UUID, p_library UUID, p_digest BYTEA, p_bytes BIGINT,
