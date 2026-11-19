@@ -64,7 +64,7 @@ env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
-  WRANGLER_VERSION: 4.153.0
+  WRANGLER_VERSION: 4.162.0
 
 jobs:
   gate:
@@ -114,7 +114,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -159,7 +159,7 @@ jobs:
       group: ${{ github.workflow }}-staging-api-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -174,10 +174,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Check api staging configuration
         id: config
         working-directory: workers/api
@@ -201,6 +199,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build api with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-api.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true'
@@ -218,6 +228,7 @@ jobs:
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+          STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
@@ -264,6 +275,18 @@ jobs:
           if mirror_id:
               assert mirror_id == mb["staging"], \
                   "HYPERDRIVE_ID_MB must equal the api MB_DB inventory id"
+          # Stream pin: the generated config binds STREAM_SERVICE_STAGING
+          # for the Subsonic `/rest/stream` proxy (STREAM in
+          # src/worker_entry.rs). The var is optional: absent or empty omits
+          # the services block (stream answers Subsonic error 70); a set
+          # value must name the staging stream Worker exactly, so a stray
+          # var can never bind the production Worker from staging (names
+          # only). Binding a Worker that does not exist yet would make
+          # Wrangler reject the whole API deploy.
+          stream_service = os.environ.get("STREAM_SERVICE_STAGING", "")
+          if stream_service:
+              assert stream_service == "nntune-stream-staging", \
+                  "STREAM_SERVICE_STAGING must equal the staging stream Worker name"
           PY
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
@@ -276,8 +299,7 @@ jobs:
           main = "build/worker/shim.mjs"
           compatibility_date = "2026-10-01"
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-api-staging"
@@ -313,6 +335,14 @@ jobs:
           # falls through to the in-handler 404 until the write path lands.
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/api/ingest"
+          zone_name = "nntune.com"
+          # OpenSubsonic API: the Worker authenticates per request
+          # (plaintext `p=` answers error 42; no credential provisioned
+          # yet answers error 0). Playback is proxied over the STREAM
+          # service binding, generated below only when the staging stream
+          # Worker exists (STREAM_SERVICE_STAGING set).
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/rest/*"
           zone_name = "nntune.com"
 
           [env.staging.vars]
@@ -351,6 +381,24 @@ jobs:
             echo "mirror: configured (MB_DB bound)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "mirror: absent (no-enrichment mode)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "${STREAM_SERVICE_STAGING:-}" ]; then
+            # Stream Worker service binding (`STREAM`): the Subsonic
+            # `/rest/stream` mount proxies minted play grants privately to
+            # `GET /play/{track_id}` (see STREAM_SERVICE_BINDING in
+            # src/worker_entry.rs). Only generated once the staging stream
+            # Worker exists (the pinned name passed preflight above): a
+            # binding to a missing Worker would make Wrangler reject the
+            # whole API deploy. Without it, stream answers error 70.
+            cat >> wrangler.toml <<EOF
+
+          [[env.staging.services]]
+          binding = "STREAM"
+          service = "${STREAM_SERVICE_STAGING}"
+          EOF
+            echo "stream: configured (STREAM bound)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stream: absent (Subsonic stream answers error 70)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
@@ -451,7 +499,7 @@ jobs:
       group: ${{ github.workflow }}-staging-mb-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -466,10 +514,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Check mb staging configuration
         id: config
         working-directory: workers/mb
@@ -489,6 +535,18 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build mb with canonical tools
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/mb
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-mb.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-mb.log"
+          git diff --exit-code -- Cargo.lock
       - name: Generate staging wrangler.toml
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/mb
@@ -525,8 +583,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-mb-staging"
@@ -649,7 +706,7 @@ jobs:
       group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
     # Staging-scoped by name only — this lane never reads production
     # secrets or protection rules, and never deploys --env production.
@@ -664,10 +721,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Check ingest staging configuration
         id: config
         working-directory: workers/ingest
@@ -703,6 +758,18 @@ jobs:
               echo "Enable only after search intake closes — runbook step 1."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Prepare canonical Worker tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        run: python3 -I .github/scripts/worker_tools.py install
+      - name: Build ingest with canonical tools
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        working-directory: workers/ingest
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-ingest.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-ingest.log"
+          git diff --exit-code -- Cargo.lock
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
         if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
@@ -759,8 +826,7 @@ jobs:
           compatibility_date = "2026-10-01"
           workers_dev = false
 
-          [build]
-          command = "cargo install -q worker-build --locked && worker-build --release"
+          # Upload the verified prebuilt bundle; no custom build command.
 
           [env.staging]
           name = "nntune-ingest-staging"

@@ -11,6 +11,25 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "support/blocker_observer.rs"]
+mod blocker_observer;
+#[path = "support/commit_ack_fault.rs"]
+mod commit_ack_fault;
+#[path = "support/disposable_accounts.rs"]
+mod disposable_accounts;
+#[path = "support/playback_dispatch.rs"]
+mod playback_dispatch;
+#[path = "support/private_account_fence.rs"]
+mod private_account_fence;
+#[path = "support/private_lease_commit_ack.rs"]
+mod private_lease_commit_ack;
+#[path = "support/private_lease_deletion.rs"]
+mod private_lease_deletion;
+#[path = "support/private_lease_ordering.rs"]
+mod private_lease_ordering;
+#[path = "support/private_lease_safety.rs"]
+mod private_lease_safety;
+
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
 const SIGNING_KEY: &[u8] = b"synthetic-test-key-0123456789abcdef";
 const ATTEMPTS: usize = 3;
@@ -224,17 +243,254 @@ impl Fixture {
     }
 }
 
+async fn lease_connection() -> Client {
+    let db = disposable_accounts::connect().await;
+    db.batch_execute("SET search_path TO pg_temp, public")
+        .await
+        .unwrap();
+    db
+}
+
+#[tokio::test]
+async fn production_lease_connection_seam_and_adapter() {
+    use nntune_api::handlers::Store;
+    use nntune_api::playback::LeaseAcquire::{Acquired, Held};
+    use nntune_api::worker_entry::{
+        acquire_playback_lease_on, session_retry_store_for_postgres_test,
+    };
+
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let user = accounts.id(0);
+    let mut db = lease_connection().await;
+    let tx = db.transaction().await.unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&tx, user, "s1", "t1", "p1", 10, 55, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 1 }
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.playback_leases WHERE user_id=$1",
+            &[&user]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s1", "t1", "p1", 10, 55, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 1 }
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "s2", "t2", "p2", 20, 65, false)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 35
+        }
+    );
+    let row = db.query_one("SELECT session_id, track_id, play_id, epoch, expires_at, updated_at FROM public.playback_leases WHERE user_id=$1", &[&user]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, i64>(5)
+        ),
+        ("s1".into(), "t1".into(), "p1".into(), 1, 55, 10)
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s2", "t2", "p2", 20, 65, true)
+            .await
+            .unwrap(),
+        Acquired { epoch: 2 }
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "s3", "t3", "p3", 65, 100, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 3 }
+    );
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s3", "t4", "p4", 66, 110, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 4 }
+    );
+    assert!(
+        acquire_playback_lease_on(&db, user, "s3", "t4", "p4", u64::MAX, 110, false)
+            .await
+            .is_err()
+    );
+    assert!(
+        acquire_playback_lease_on(&db, user, "", "t4", "p4", 67, 111, true)
+            .await
+            .is_err()
+    );
+    db.execute(
+        "UPDATE public.users SET deleting_at=now() WHERE id=$1",
+        &[&user],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&db, user, "s5", "t5", "p5", 67, 112, true)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 43
+        }
+    );
+    let row = db.query_one("SELECT session_id, track_id, play_id, epoch, expires_at, updated_at FROM public.playback_leases WHERE user_id=$1", &[&user]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, i64>(5)
+        ),
+        ("s3".into(), "t4".into(), "p4".into(), 4, 110, 66)
+    );
+    let deleted_user = accounts.id(1);
+    db.execute(
+        "UPDATE public.users SET deleting_at=now() WHERE id=$1",
+        &[&deleted_user],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        acquire_playback_lease_on(&db, deleted_user, "s1", "t1", "p1", 1, 50, false)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 0
+        }
+    );
+    let store = session_retry_store_for_postgres_test(lease_connection().await);
+    assert!(store
+        .acquire_playback_lease(user, "s1", "t1", "p1", u64::MAX, 110, false)
+        .await
+        .is_err());
+    db.batch_execute("CREATE TEMP TABLE playback_leases (LIKE public.playback_leases); CREATE UNIQUE INDEX ON playback_leases(user_id)")
+        .await
+        .unwrap();
+    db.execute(
+        "INSERT INTO playback_leases VALUES ($1, 's1', 't1', 'p1', -1, 110, 1)",
+        &[&user],
+    )
+    .await
+    .unwrap();
+    assert!(
+        acquire_playback_lease_on(&db, user, "s2", "t2", "p2", 1, 50, false)
+            .await
+            .is_err()
+    );
+    accounts.cleanup().await;
+}
+
+#[tokio::test]
+async fn private_aware_acquisition_commits_and_rolls_back() {
+    use nntune_api::playback::LeaseAcquire::{Acquired, Held};
+    use nntune_api::worker_entry::private_aware_lease_for_postgres_test as acquire;
+
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let user = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let db = &accounts.observer;
+    let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(30), async {
+        let now: i64 = db.query_one("SELECT extract(epoch from statement_timestamp())::bigint", &[]).await.map_err(|e| e.to_string())?.get(0);
+        db.execute("INSERT INTO public.private_sessions(user_id,session_id,expires_at) VALUES ($1,'private',$2),($1,'competitor',$2),($1,'expired',$3),($4,'other',$2)", &[&user, &(now + 300), &(now - 1), &other]).await.map_err(|e| e.to_string())?;
+        for (session, play, expected_private) in [("missing", "a", false), ("expired", "b", false), ("other", "c", false), ("private", "d", true)] {
+            let result = acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, session, "track", play, now as u64, now as u64 + 45, true).await.map_err(|_| "acquire failed")?;
+            if result != (Acquired { epoch: match play { "a" => 1, "b" => 2, "c" => 3, _ => 4 } }, expected_private) { return Err(format!("wrong acquisition: {result:?}")); }
+            let key = format!("play:{user}:track:{play}");
+            let marked: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM public.private_plays WHERE user_id=$1 AND play_key=$2)", &[&user, &key]).await.map_err(|e| e.to_string())?.get(0);
+            if marked != expected_private { return Err("wrong persisted classification".into()); }
+        }
+        let held = acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "competitor", "track", "refused", now as u64 + 1, now as u64 + 46, false).await.map_err(|_| "refusal failed")?;
+        if held != (Held { retry_after_secs: 44 }, false) { return Err(format!("wrong refusal: {held:?}")); }
+        let refused = format!("play:{user}:track:refused");
+        let count: i64 = db.query_one("SELECT count(*) FROM public.private_plays WHERE user_id=$1 AND play_key=$2", &[&user, &refused]).await.map_err(|e| e.to_string())?.get(0);
+        if count != 0 { return Err("refused mark persisted".into()); }
+        let row = db.query_one("SELECT session_id,play_id,epoch FROM public.playback_leases WHERE user_id=$1", &[&user]).await.map_err(|e| e.to_string())?;
+        if (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, i64>(2)) != ("private".into(), "d".into(), 4) { return Err("incumbent changed".into()); }
+        db.execute("UPDATE public.users SET deleting_at=now() WHERE id=$1", &[&user]).await.map_err(|e| e.to_string())?;
+        for id in [&user, &format!("{user}-missing")] {
+            if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, id, "private", "track", "e", now as u64, now as u64 + 45, true).await.is_ok() { return Err("missing/deleting owner accepted".into()); }
+        }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("acquisition test timed out".into()));
+    accounts.cleanup().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
+    use nntune_api::playback::LeaseAcquire::Acquired;
+    use nntune_api::worker_entry::private_aware_lease_for_postgres_test as acquire;
+    let accounts = disposable_accounts::Accounts::new(2).await;
+    let user = accounts.id(0).to_owned();
+    let other = accounts.id(1).to_owned();
+    let db = &accounts.observer;
+    let tag = format!("privacy_fault_{}", user.replace('-', ""));
+    let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(30), async {
+        let now: i64 = db.query_one("SELECT extract(epoch from statement_timestamp())::bigint", &[]).await.map_err(|e| e.to_string())?.get(0);
+        db.execute("INSERT INTO public.private_sessions(user_id,session_id,expires_at) VALUES ($1,'private',$2)", &[&user, &(now + 300)]).await.map_err(|e| e.to_string())?;
+        if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", "incumbent", now as u64, now as u64 + 45, false).await.map_err(|_| "seed failed")? != (Acquired { epoch: 1 }, true) { return Err("wrong seed".into()); }
+        let other_key = format!("play:{other}:track:existing");
+        db.execute("INSERT INTO public.private_plays(user_id,play_key,marked_at) VALUES ($1,$2,$3)", &[&other, &other_key, &now]).await.map_err(|e| e.to_string())?;
+        db.batch_execute(&format!("CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.user_id = '{user}' AND NEW.play_key LIKE '%:mark-error' THEN RAISE EXCEPTION 'synthetic mark failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW EXECUTE FUNCTION public.{tag}()"))
+            .await.map_err(|e| e.to_string())?;
+        // This role can take the account fence but cannot read private_sessions.
+        // Probe both permissions so an earlier failure cannot masquerade as the query fault.
+        db.batch_execute(&format!("CREATE ROLE {tag} NOLOGIN; GRANT USAGE ON SCHEMA public TO {tag}; GRANT SELECT, UPDATE ON public.users TO {tag}"))
+            .await.map_err(|e| e.to_string())?;
+        let restricted = disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?;
+        restricted.batch_execute(&format!("SET ROLE {tag}")).await.map_err(|e| e.to_string())?;
+        restricted.query(nntune_api::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL, &[&user]).await.map_err(|e| e.to_string())?;
+        let error = restricted.query(nntune_api::preference_rows::private_session_active_statement(), &[&user, &"private"]).await.err().ok_or("privacy query unexpectedly allowed")?;
+        if error.code() != Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) { return Err("unexpected privacy query fault".into()); }
+        if acquire(restricted, &user, "private", "track", "query-error", now as u64, now as u64 + 45, true).await.is_ok() { return Err("query error accepted".into()); }
+        for (play, expiry) in [("mark-error", now as u64 + 45), ("lease-overflow", u64::MAX), ("lease-sql-error", 253_402_300_800)] {
+            if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", play, now as u64, expiry, true).await.is_ok() { return Err(format!("{play} error accepted")); }
+        }
+        let row = db.query_one("SELECT session_id,play_id,epoch FROM public.playback_leases WHERE user_id=$1", &[&user]).await.map_err(|e| e.to_string())?;
+        if (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, i64>(2)) != ("private".into(), "incumbent".into(), 1) { return Err("error changed incumbent".into()); }
+        let rows = db.query("SELECT user_id,play_key FROM public.private_plays WHERE user_id=ANY($1) ORDER BY user_id,play_key", &[&vec![&user, &other]]).await.map_err(|e| e.to_string())?;
+        let marks: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+        if marks.len() != 2 || !marks.contains(&(user.clone(), format!("play:{user}:track:incumbent"))) || !marks.contains(&(other.clone(), other_key)) { return Err("error changed retained marks".into()); }
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("fault test timed out".into()));
+    let cleanup = db.batch_execute(&format!("DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}(); DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{tag}') THEN DROP OWNED BY {tag}; DROP ROLE {tag}; END IF; END $$")) .await;
+    accounts.cleanup().await;
+    cleanup.unwrap();
+    result.unwrap();
+}
+
 struct NoExternalIo;
 
 impl Mailer for NoExternalIo {
     async fn send_magic_link(&self, _email: &str, _token: &str) -> Result<(), StoreError> {
-        panic!("refresh must not send mail")
+        panic!("PostgreSQL dispatcher fixture must not send mail")
     }
 }
 
 impl Dialer for NoExternalIo {
     async fn probe(&self, _target: &nntune_api::vault::ValidatedTarget, _tls: bool) -> bool {
-        panic!("refresh must not dial a provider")
+        panic!("PostgreSQL dispatcher fixture must not dial a provider")
     }
 }
 
@@ -243,13 +499,12 @@ impl AsyncDns for NoExternalIo {
         &'a self,
         _host: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<std::net::IpAddr>> + 'a>> {
-        panic!("refresh must not resolve a provider")
+        panic!("PostgreSQL dispatcher fixture must not resolve a provider")
     }
 }
 
-async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response {
-    let store = nntune_api::worker_entry::session_retry_store_for_postgres_test(f.client().await);
-    let cfg = handlers::Config::new(
+fn dispatcher_config() -> handlers::Config {
+    handlers::Config::new(
         "app.example.test",
         "https://app.example.test",
         SIGNING_KEY.to_vec(),
@@ -260,19 +515,35 @@ async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response
         false,
         None,
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn dispatch(
+    store: &(impl handlers::Store + nntune_api::auth::SingleUseStore),
+    cfg: &handlers::Config,
+    now: u64,
+    req: &Request,
+) -> Response {
     let ctx = handlers::Ctx {
-        cfg: &cfg,
-        store: &store,
+        cfg,
+        store,
         mailer: &NoExternalIo,
         dialer: &NoExternalIo,
         dns: &NoExternalIo,
-        now: clock(&f.db).await as u64,
+        now,
         source_ip: "127.0.0.1".into(),
         stripe: &nntune_api::stripe::NoStripeTransport,
     };
-    handlers::handle(
-        &ctx,
+    handlers::handle(&ctx, req).await
+}
+
+async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response {
+    let store = nntune_api::worker_entry::session_retry_store_for_postgres_test(f.client().await);
+    let cfg = dispatcher_config();
+    dispatch(
+        &store,
+        &cfg,
+        clock(&f.db).await as u64,
         &Request {
             method: "POST".into(),
             path: "/v1/session/refresh".into(),

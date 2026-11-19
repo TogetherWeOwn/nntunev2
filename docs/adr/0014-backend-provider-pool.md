@@ -1,10 +1,16 @@
 # ADR 0014: Backend provider account pool
 
-- **Status:** Accepted design; implementation and independent review gates remain.
+- **Status:** Superseded by [ADR 0015](0015-standard-s3-storage-boundary.md)
+  (2026-11-13); retained as historical design, not new provider-pool authority.
 - **Date:** 2026-11-03
 - **Replaces:** the per-user provider model of the BYOP era (one
   `ProviderConfig` in a user's vault, a `providers` row minted per user
   save, a per-user NNTP pool keyed to that account).
+
+- **Amended by:** [ADR 0015](0015-standard-s3-storage-boundary.md) (approved
+  target, 2026-11-13): the storage provider is to own NNTP access, posting,
+  accounts and repair, and NNTune is to hold no NNTP accounts. This record
+  stays as history of the merged design; nothing is migrated or removed yet.
 
 ## Context
 

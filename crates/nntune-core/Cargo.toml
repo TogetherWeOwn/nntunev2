@@ -17,10 +17,14 @@ worker-transport = ["velmora/worker-transport"]
 # TogetherWeOwn/velmora. Pin policy: an immutable git `rev` only (never a
 # branch or tag); a bump is a reviewed PR that moves this rev, the matching
 # nntune-test-nntp rev and every committed lockfile together.
-velmora = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "fe8b840b077027f9792430c5fe9f6fc53ed0012b", default-features = false }
+velmora = { version = "0.1.0", git = "https://github.com/TogetherWeOwn/velmora", rev = "92ecdd0bc18fd1c996c990b6fbb9aee3a1cca78f", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"
+sha2 = "0.11"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+hkdf = "0.13"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

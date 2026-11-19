@@ -555,26 +555,14 @@ async function failAutoAdvance(page: Page): Promise<void> {
 }
 
 test.describe('review regressions', () => {
-	// No retry, native control or shortcut may send history to a backend. The only
-	// allowed request is the intentional private listen lifecycle (exact local
-	// POST /v1/plays/events from real playing events), answered 401 to bound noise.
+	// No retry, native control or shortcut may send history to a backend.
 	const backendCalls = new WeakMap<Page, string[]>();
 	test.beforeEach(async ({ page }) => {
 		const calls: string[] = [];
 		backendCalls.set(page, calls);
-		let localOrigin: string | null = null;
 		await page.route('**/*', async (route) => {
 			const request = route.request();
-			const url = new URL(request.url());
-			localOrigin ??= url.origin; // First request is the local page navigation.
-			if (
-				request.method() === 'POST' &&
-				url.origin === localOrigin &&
-				url.pathname === '/v1/plays/events' &&
-				url.search === ''
-			) {
-				await route.fulfill({ status: 401, contentType: 'application/json', body: '{}' });
-			} else if (['fetch', 'xhr'].includes(request.resourceType()) || request.method() !== 'GET') {
+			if (['fetch', 'xhr'].includes(request.resourceType()) || request.method() !== 'GET') {
 				calls.push(`${request.method()} ${request.url()}`);
 				await route.abort();
 			} else {
@@ -583,7 +571,7 @@ test.describe('review regressions', () => {
 		});
 	});
 	test.afterEach(async ({ page }) => {
-		expect(backendCalls.get(page), 'synthetic player flows make no backend calls besides listen lifecycle events').toEqual([]);
+		expect(backendCalls.get(page), 'synthetic player flows must make zero backend calls').toEqual([]);
 	});
 
 	for (const retry of [

@@ -9,8 +9,19 @@
 //! audio/artwork via the stream worker) plugs in behind the `Library`
 //! seam. Until then the Worker uses `MemStore::empty()`, which holds no
 //! credentials and rejects every auth attempt. Per-client `apiKey`
-//! credentials will resolve against `subsonic_clients`
-//! (`migrations/0023_subsonic_clients.sql`).
+//! credentials resolve through the unmounted async core and the additive
+//! `subsonic_credentials` schema; legacy `subsonic_clients` is never promoted.
+
+// The synthetic ledger artifact selects the pinned wasm System allocator. A
+// second active Rust global allocator in its linked graph is a compiler error.
+// This feature is not the ordinary Worker build or an admission certificate.
+#[cfg(all(
+    feature = "ledger-wasm-test",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+#[global_allocator]
+static LEDGER_ALLOCATOR: std::alloc::System = std::alloc::System;
 
 pub mod account_deletion;
 pub mod admin;
@@ -19,15 +30,24 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+mod billing_owned_socket;
 pub mod billing_reconcile;
+pub mod billing_store_classification;
+pub mod billing_sweep;
+pub mod billing_transaction_sql;
 pub mod catalogue;
+pub mod credential_session_store;
 mod field_envelope;
 pub mod handlers;
+pub mod history_key;
 pub mod ingest_grant;
+pub mod ingest_session_auth;
+pub mod ingest_session_request;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
-pub mod listen_history;
 mod magic_redemption;
 pub mod meter_sink;
 pub mod native_rest;
@@ -35,12 +55,27 @@ pub mod original_source;
 pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
+pub mod preference_rows;
 pub mod random;
 pub mod rate_limit;
 pub mod rotation;
 pub mod session;
 pub mod session_retry_store;
 pub mod stripe;
+pub mod subsonic_auth;
+pub mod subsonic_config;
+pub mod subsonic_dispatch;
+pub mod subsonic_http;
+pub mod subsonic_lifecycle;
+#[cfg(target_arch = "wasm32")]
+pub mod subsonic_request_metadata;
+pub mod subsonic_snapshot_plan;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod subsonic_staging_response;
+pub mod target_identity;
+pub mod taste_signal;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;
@@ -118,6 +153,10 @@ mod logging_tests {
     }
 }
 
+// Test-only real-workerd span probe; absent unless `span-runtime-test` is on.
+#[cfg(all(target_arch = "wasm32", feature = "span-runtime-test"))]
+mod span_runtime_probe;
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
@@ -127,6 +166,40 @@ use nntune_subsonic::{
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
+#[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
+mod ledger_wasm_test {
+    use worker::wasm_bindgen::{self, prelude::*};
+
+    #[wasm_bindgen]
+    pub fn run_ledger_tests() {
+        assert_eq!(std::mem::size_of::<String>(), 12);
+        crate::subsonic_auth::verification_uses_the_carried_charge();
+        nntune_subsonic::construction_budget::tests::rounds_each_allocation_and_fails_closed_at_limit();
+        nntune_subsonic::construction_budget::tests::rejects_alignment_and_arithmetic_overflow_without_changing_charge();
+        nntune_subsonic::construction_budget::tests::exact_vector_reservation_checks_limit_and_overflow();
+        crate::worker_entry::subsonic_pg_page::streamed_projection_enforces_admission();
+        nntune_subsonic::value::charged_values_check_owned_storage_limits();
+        nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
+        nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();
+        nntune_subsonic::staging_browse::member_browse_boundaries();
+        nntune_subsonic::staging_browse::search_boundaries();
+        nntune_subsonic::staging_browse::search_matches_dispatch();
+        crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
+        crate::worker_entry::account_fields_use_the_carried_charge();
+        crate::worker_entry::subsonic_membership::membership_projection_charges_capacity_before_copying();
+    }
+}
+
+// The synthetic Node build exports only the adapter, not the Worker entry
+// whose database transport imports the Cloudflare-only sockets module.
+#[cfg(not(all(
+    target_arch = "wasm32",
+    any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    )
+)))]
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,
@@ -143,6 +216,76 @@ pub async fn main(
         return subsonic_response(&mut req).await;
     }
     worker_entry::dispatch(req, env).await
+}
+
+// This entry exists only in the separately bundled runtime-test Worker.
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[worker::event(fetch)]
+pub async fn billing_owned_test_entry(
+    req: worker::Request,
+    _env: worker::Env,
+    _ctx: worker::Context,
+) -> worker::Result<worker::Response> {
+    if req.method() == worker::Method::Post && req.path() == "/billing-ack-proof" {
+        return match worker_entry::billing_budget::test_commit_ack().await {
+            Ok(pid) => worker::Response::ok(format!("billing-ack-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/owned-write-deadline-proof" {
+        return match worker_entry::billing_budget::test_deadline_after_write().await {
+            Ok(pid) => worker::Response::ok(format!("owned-write-deadline-ok:{pid}")),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-deadline-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_deadline().await {
+            Ok(()) => worker::Response::ok("billing-deadline-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-ack-fixture" {
+        return match worker_entry::billing_deadline_test::setup_ack_fixture().await {
+            Ok(()) => worker::Response::ok("billing-ack-fixture-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-reconcile-ack-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_ack_retry().await {
+            Ok(()) => worker::Response::ok("billing-reconcile-ack-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if req.method() == worker::Method::Post && req.path() == "/billing-cancel-proof" {
+        return match worker_entry::billing_deadline_test::test_reconcile_cancel().await {
+            Ok(()) => worker::Response::ok("billing-cancel-ok"),
+            Err(message) => worker::Response::error(message, 500),
+        };
+    }
+    if !billing_owned_socket::test_empty_guard_drop() {
+        return worker::Response::error("empty guard drop failed", 500);
+    }
+    if let Err(message) = billing_owned_socket::test_drive_owned() {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = billing_owned_socket::test_tracked_socket().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = worker_entry::billing_budget::test_budget().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = worker_entry::billing_budget::test_transaction_bootstrap().await {
+        return worker::Response::error(message, 500);
+    }
+    if let Err(message) = billing_owned_socket::test_worker_timer().await {
+        return worker::Response::error(message, 500);
+    }
+    match worker_entry::billing_budget::test_real_connection().await {
+        Ok((success, timeout)) => {
+            worker::Response::ok(format!("owned-drive-ok:5:{success}:{timeout}"))
+        }
+        Err(message) => worker::Response::error(message, 500),
+    }
 }
 
 /// True when this request targets the Subsonic `/rest/*` surface.
@@ -241,7 +384,9 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
         String::new()
     };
 
-    let app = SubsonicApp::new(MemStore::empty());
+    // Keep the production surface fail-closed until the authenticated async
+    // store and shared playback adapter replace this empty store.
+    let app = SubsonicApp::production(MemStore::empty());
     let res = app.handle(&method, &path, &query, &body);
     respond(&res)
 }
@@ -250,6 +395,7 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
 fn respond(res: &nntune_subsonic::HttpResponse) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", &res.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
     let mut response = Response::from_bytes(res.body.clone())?;
     response = response.with_status(res.status);
     *response.headers_mut() = headers;

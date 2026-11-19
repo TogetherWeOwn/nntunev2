@@ -31,7 +31,8 @@ and system-library requirements remain in `playwright.config.ts`.
 
 ## Bundle budget
 
-CI fails `web-build` when total client JS exceeds **368,640 B (360 KiB)**,
+CI warns in `web-build` (advisory, not a failure; owner 2026-11-16: build
+first, optimise later) when total client JS exceeds **368,640 B (360 KiB)**,
 measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
@@ -46,14 +47,15 @@ Production builds run a build-only Terser compression pass in Vite's
 `renderChunk` hook, alongside the default Oxc minification. This happens before
 chunk content hashes are finalized and supplies a source map for composition.
 It uses safe ES2020 compression, without property mangling or unsafe transforms;
-application features and the raw-byte gate remain unchanged. Verify the result
+application features and the raw-byte report remain unchanged. Verify the result
 in the exact-head Actions `web-build` job, which runs the build and
 `python3 .github/scripts/check_web_bundle_budget.py`; cite its job URL and total.
 
 To update the budget deliberately, in its own PR: use that Actions build,
 confirm the growth is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
 with a comment citing the reason, and update the number in this paragraph.
-Never bump it just to make a red build green. Wasm/script size gates are out
+Never bump it just to hide a warning. A missing or empty build output still
+fails the job. Wasm/script size gates are out
 of scope here (tracked separately as Wasm enforcement). Before adding code
 that spends a visible share of the remaining headroom, follow the per-route
 splitting rules in [`docs/web-code-splitting-plan.md`](../../docs/web-code-splitting-plan.md).

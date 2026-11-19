@@ -98,16 +98,12 @@ impl WorkerOriginalControl {
             loop {
                 // Compute on poll, not construction: a delayed first poll must
                 // not extend the grant. Clamp to the SDK's signed timer range.
-                let remaining = expiry_unix
-                    .saturating_mul(1000)
-                    .saturating_sub(Date::now().as_millis());
+                let remaining =
+                    super::control::grant_delay_ms(expiry_unix, Date::now().as_millis());
                 if remaining == 0 {
                     break;
                 }
-                Delay::from(std::time::Duration::from_millis(
-                    remaining.min(i32::MAX as u64),
-                ))
-                .await;
+                Delay::from(std::time::Duration::from_millis(remaining)).await;
             }
         });
         let control = OriginalRequestControl::new(expiry_unix, timer, now_unix as fn() -> u64);

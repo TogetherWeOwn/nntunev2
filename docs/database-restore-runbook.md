@@ -4,6 +4,26 @@ Staging-first, evidence-recorded procedure for a PlanetScale Postgres
 database restore. Docs only: this runbook authorizes no restore by itself
 and changes no code or migration.
 
+## 2026-11-07 MB lifecycle notice
+
+**MB restore/cutover steps below are unavailable until revalidated for the
+replacement.** The former cluster and its Hyperdrive config were retired;
+`HYPERDRIVE_ID_MB` is unset. Reported PS-5 replacement setup is not a completed
+import or serving mirror. Historical references below to a ~100 GB target and
+a config serving both environments do not describe current topology.
+
+Use the [dated operations inventory](ops.md#planetscale-postgres) and
+[ADR 0007 amendment](adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement).
+Before any MB restore/cutover, revalidate the actual dataset size, backup
+provenance/retention, target, grants and live consumers; retain the one-branch,
+no-extra-replica and ≤$10/month all-in bounds. The generic new-target procedure
+below is not permission to add an MB branch or spend. Validated import/readiness,
+reviewed replacement binding/manifest/contract alignment and separate activation
+acceptance must precede variable wiring, per the
+[enablement runbook](ops.md#operator-runbook-enabling-staging-mb--staging-ingest).
+Do not reuse a retired ID or infer current shared-reader impact. App restore
+authority and the existing security/release gates are unchanged.
+
 ## 0. Scope and authority
 
 - **In scope:** the app database (`nntunev2_staging` on cluster `nntunev2` /
@@ -146,9 +166,17 @@ forward-only (§4).
    `docs/adr/0002-data-model.md` forbids). If the damage was caused by a
    bad migration, include its forward correction in this pass. Blocked
    until the per-database runner/record prerequisite (§2 step 3) lands.
-5. **Vault/KEK pass before writes reopen.** Restored rows may pin older
-   `kek_version` values. Per `docs/security/kek-rotation.md` §5 invariant
-   3 and §7 RESTORE: confirm the KEK versions the restored rows need are
+5. **Verify app envelopes before cutover.** Reconcile read-only counts on the isolated target to the expected forward-converged snapshot.
+   Record matched zero; never infer zero from an empty export. Use approved verifiers to open each envelope at its stored KEK version and seal-time context:
+   `track_sources` ([offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment)),
+   active Subsonic tokens (`subsonic_auth.rs`), and retained admin originals (`ingest_originals`, `admin_ingest.rs`).
+   Record counts and outcomes only (§6); hold on query or export errors, mismatches, or missing or failed verification.
+   **Separately verify serving-key readiness, before or after purge.** Before repointing, use an approved check on the intended Worker build, environment, and key bindings to prove its runtime selects the expected current write version and that the loaded key matches the approved recovery keyring for that version.
+   To prove the match, use the runtime key lookup to open a retained envelope already verified with that recovery key, or, if none uses the current version, a disposable test envelope sealed with that recovery key in isolation. Do not write the test envelope to the restored data or expose key material.
+   Also use the runtime key lookup to open one retained envelope for each retained KEK version. An offline decrypt, a listed secret, or a successful load alone is not serving evidence: legacy mode loads only one version, and versioned mode discovers only `CURRENT ± 8` via `kek_set_from_lookup`.
+   Record only the Worker build ID, environment label, current write version and key-match outcome, and open outcome per retained version (§6). Hold cutover if any check fails or lacks approved evidence, including the current write-key match on an empty restore.
+   **Historical vault pass only.** After purge, mark this pass N/A; never restore purged rows or change shared keys. For a pre-purge vault,
+   confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The
    versioned KEK map (`VAULT_KEK_V<N>` per-version secrets +
@@ -169,8 +197,8 @@ forward-only (§4).
    have landed fixture-proven, but no scheduled trigger, production
    DDL, or Hyperdrive wiring exists yet
    (`docs/security/kek-rotation.md` §7 banner, §8 gate items): a
-   restore that needs rows re-wrapped forward (rather than merely read
-   at their pinned versions) is blocked until they land. Retired key material stays in the operator store until the
+   pre-purge restore requiring forward re-wrap cannot use this fixture-only
+   runner. Retired key material stays in the operator store until the
    retire-after date (latest of re-wrap-complete + one window, oldest
    restorable backup/PITR horizon expiry) — a restore never justifies
    deleting key material early.
@@ -235,8 +263,8 @@ migration files to force convergence.
   applied-migration record, §2 step 3) equals the pre-incident head plus
   any forward corrections; `migrations_gate.py` green on the head
   (repository-side check only — it does not prove database state, §4).
-- KEK re-wrap complete (app database only; blocked until the §3.5
-  re-wrap runner prerequisite lands): `SELECT count(*) FROM
+- Historical vault re-wrap verification (pre-purge app schema only;
+  not applicable after purge, see §3.5): `SELECT count(*) FROM
   provider_vaults WHERE kek_version < <VAULT_KEK_CURRENT>` reads 0 twice
   (two consecutive passes, current = the `VAULT_KEK_CURRENT` write
   version), per the rotation invariant; retire-after date re-recorded
@@ -259,7 +287,9 @@ migration files to force convergence.
 | New restore target name (§3.2) | name only, no URL/secret |
 | Read-only verification queries + outcomes (§3.3) | expressions + outcomes only |
 | Forward-convergence list (migrations re-applied, §3.4) | numbers + manifest head |
-| KEK re-wrap result (counts ×2, §3.5) | |
+| App envelope checks (§3.5) | counts and outcomes |
+| Intended Worker serving-key check (§3.5) | build ID, environment label, current write version and key-match outcome, open outcome per retained version |
+| Historical vault pass (§3.5) | vault counts ×2 or schema basis for N/A |
 | Cutover record (binding repoint/promote, §3.6) | mechanism + time |
 | Health + E2E run URLs (§3.7) | URLs to runs only |
 | Old-target retention + deletion gate (§3.8) | |

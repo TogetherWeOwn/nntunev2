@@ -107,8 +107,25 @@ test.describe('production preflight (exact checked-in block, offline)', () => {
   // env (GitHub injects it); the offline runner binds the same value so the
   // exact block executes with the same inputs it gets in CI.
   const STEP_ENV = {
+    GITHUB_REF: 'refs/heads/main',
+    DEPLOY_MODE: 'promote',
     PRODUCTION_DOMAIN_DEFAULT: 'production-placeholder.example.invalid',
+    UNPROTECTED_ACCEPTED_SHA: '',
   };
+
+  for (const override of [{ GITHUB_REF: 'refs/heads/topic' }, { UNPROTECTED_ACCEPTED_SHA: VALID_SHA }]) {
+    test(`refuses preflight for ${Object.keys(override)[0]} outside its required scope`, () => {
+      const result = runShell(script!, {
+        ...STEP_ENV,
+        ...override,
+        INPUT_SHA: VALID_SHA,
+        PRODUCTION_DEPLOY_ENABLED: 'true',
+        PRODUCTION_DOMAIN: 'example.com',
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.output).toContain('must exist only in the production Environment');
+    });
+  }
 
   test('the preflight block is present and extractable', () => {
     expect(script, 'preflight run block missing').toBeDefined();
@@ -434,9 +451,8 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
 
   // The step shells out to `npx wrangler ... --json`; the offline runner puts
   // a stub npx first on PATH that replays fixture JSON (no network or install).
-  // WRANGLER_VERSION is inherited as environment data, just as in Actions;
-  // the exact checked-in script is executed without source substitutions.
-  async function runSeed(rawOutput: string, version = '4.153.0') {
+  // The exact checked-in script is executed without source substitutions.
+  async function runSeed(rawOutput: string) {
     const bin = mkdtempSync(
       join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'seed-bin-'),
     );
@@ -466,7 +482,6 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
         {
           SEED_FIXTURE: fixture,
           SEED_ARGV: argvFile,
-          WRANGLER_VERSION: version,
           WORKER_NAME: 'nntune-web',
           CLOUDFLARE_API_TOKEN: 'dummy-token',
           CLOUDFLARE_ACCOUNT_ID: 'dummy-account',
@@ -499,11 +514,10 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     expect(script).toContain('--env production');
     expect(script).toContain('--name "$WORKER_NAME"');
     expect(script).toContain('--json');
-    // Keep the version as one shell argument, inherited from workflow env.
-    expect(script).toContain('"wrangler@${WRANGLER_VERSION:?}"');
+    expect(script).toContain('npx wrangler deployments list');
     expect(script).not.toContain('${{');
     expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
-      'WRANGLER_VERSION: 4.153.0',
+      'WRANGLER_VERSION: 4.162.0',
     );
     // Pin the WORKER_NAME the seed step binds, the same way WRANGLER_VERSION
     // is pinned: the step must wire the production worker name, and the
@@ -536,8 +550,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     expect(result.status).toBe(0);
     const args = result.argv.trim().split('\n');
     expect(args).toEqual([
-      '--yes',
-      'wrangler@4.153.0',
+      'wrangler',
       'deployments',
       'list',
       '--env',
@@ -546,12 +559,6 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
       'nntune-web',
       '--json',
     ]);
-  });
-
-  test('seed refuses an empty inherited CLI version before calling npx', async () => {
-    const result = await runSeed(JSON.stringify([singleAt('2026-10-18T00:00:00Z')]), '');
-    expect(result.status).not.toBe(0);
-    expect(result.argv).toBe('');
   });
 
   test('seed accepts a single-version 100% deployment', async () => {

@@ -17,6 +17,14 @@ use nntune_core::original_source::{
 
 use super::OriginalControl;
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub(super) fn grant_delay_ms(expiry_unix: u64, now_ms: u64) -> u64 {
+    expiry_unix
+        .saturating_mul(1000)
+        .saturating_sub(now_ms)
+        .min(i32::MAX as u64)
+}
+
 #[derive(Default)]
 struct RequestWake {
     cancelled: AtomicBool,
@@ -134,6 +142,18 @@ impl<T, N> Drop for OriginalRequestControl<T, N> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn grant_delay_preserves_expiry_and_timer_bounds() {
+        assert_eq!(grant_delay_ms(10, 9_999), 1);
+        assert_eq!(grant_delay_ms(10, 10_000), 0);
+        assert_eq!(grant_delay_ms(10, 10_001), 0);
+        assert_eq!(grant_delay_ms(0, 0), 0);
+        assert_eq!(grant_delay_ms(u64::MAX, 0), i32::MAX as u64);
+        assert_eq!(grant_delay_ms(u64::MAX, u64::MAX - 1), 1);
+        assert_eq!(grant_delay_ms(2_147_484, 0), i32::MAX as u64);
+        assert_eq!(grant_delay_ms(2_147_483, 0), 2_147_483_000);
+    }
 
     #[derive(Default)]
     struct Event {

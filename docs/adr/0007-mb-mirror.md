@@ -5,6 +5,50 @@
   [0012-compliant-youtube-video-and-brainz-data.md](0012-compliant-youtube-video-and-brainz-data.md)
 - **Date:** 2026-10-13
 
+## 2026-11-07 amendment: retirement and conditional bounded replacement
+
+This amendment supersedes conflicting Context, Decision and Consequences text
+below; unchanged licence and cover-art restrictions remain binding.
+
+The former `nntunev2-mb` cluster was retired on 2026-11-06 to stop unused
+recurring cost; its seed was not a completed import. Dependent Hyperdrive
+configuration and the repository MB variable were removed. A still-deployed
+Worker is not an available mirror. App databases and production were unchanged.
+
+The R2-snapshot experiment subsequently failed its interactive latency criterion.
+The owner permitted a bounded replacement: **PS-5, at most $10/month all-in,
+curated CC0 10-table subset, one main branch, no development branch or extra
+replicas**. Reported setup on 2026-11-07 is not a completed import or activated
+read service. Larger allocation requires measured PS-5 failure and a new spend
+decision. See [the dated operations inventory](../ops.md#planetscale-postgres).
+
+This replaces the Container-based initial-import decision: initial load is one
+manual trusted-host ETL → validated COPY operation, with TLS, least privilege,
+native validator source/digest/architecture/ABI provenance, security review and
+exact-source release acceptance. No Containers, unvalidated COPY or host cron
+is authorized. Synthetic-fixture-only reseeding is not a substitute for the
+coordinated full-load handoff; old grants and migration receipts do not prove
+replacement readiness.
+
+Weekly refreshes use CC0 full exports; increase to twice-weekly only for
+demonstrated product need. Weekly automation remains disabled until its
+non-Container runtime and per-table streaming/headroom requirements are
+resolved. The old Container cost estimate is not approval of that runtime.
+The former ≤4-day freshness figure is historical, not a weekly guarantee or
+monitored SLO.
+
+Read scope remains `/v1/mb/*`, not full WS/2 parity. Planned cache measures are
+MBID lookups/listings with dump-id keys and long TTLs, invalidation on dump-pointer
+change, query caching only on a newly verified MB config, and placement near the
+database. Record uncached/cached p95 and cache-hit ratio; this amendment does
+not claim those measures implemented. Track the mirror's first actual invoice
+independently of the app database invoice against the all-in ceiling.
+
+Keep CC0-only and cover-art rights restrictions, security and independent
+review, exact-head Actions, tracked binding inventory and release gates.
+No restoration of retired identifiers, automatic activation, additional
+provisioning or production change is authorized by this record.
+
 ## Context
 
 Library matching needs fast, local MusicBrainz lookups (artist / release /

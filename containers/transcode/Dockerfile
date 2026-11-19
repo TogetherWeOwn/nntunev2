@@ -13,7 +13,7 @@
 # bump that changes encoder bytes only mints new content hashes — old
 # artifact rows orphan and sweep, never corrupt.
 
-FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS server
+FROM rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS server
 WORKDIR /src
 # The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
 # --locked`) and audited by cargo-deny. Copy the full (dockerignored)
@@ -24,7 +24,7 @@ COPY . .
 RUN cargo build --locked --release -p nntune-transcode-server \
  && install -m0755 target/release/nntune-transcode-server /usr/local/bin/nntune-transcode-server
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 # ffmpeg ships the encoder and ffprobe (the self-test's validity oracle).
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/* \

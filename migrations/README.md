@@ -1,18 +1,31 @@
 # Database migrations
 
-Every SQL migration is recorded once in `manifest.toml`, in strictly increasing numeric order. Use the next four-digit number after the current highest number for each new file. The gate requires unique, increasing numbers but does not require existing migration sequences to be gap-free.
+Every SQL migration is recorded once in `manifest.toml`, in strictly increasing numeric order. Numbers belong to the accepted `main` prefix, not to PR reservations. There is one repository-wide sequence across `app` and `mirror`. The gate requires unique, increasing numbers but does not require existing migration sequences to be gap-free.
 (Sources: `migrations/manifest.toml` — one entry per migration, strictly increasing; `.github/scripts/migrations_gate.py` `check_manifest` (`duplicate-entry`, `duplicate-number`, `out-of-order` for non-increasing numbers) and `check_drift` (new numbers must continue `base_max + 1, +2, …`); enforced in CI by the `migrations-gate` job in `.github/workflows/ci.yml`.)
 
 Add a manifest entry for every new migration with its explicit `target` (`app` or `mirror`) and the lowercase SHA-256 checksum of the file contents. The CI migration gate validates the manifest, numbering, targets, and checksums.
 (Sources: `migrations/manifest.toml` — every `[[migration]]` carries `file`, `target` (`app` or `mirror`) and a lowercase-hex `sha256`; `.github/scripts/migrations_gate.py` `check_manifest` (`bad-target`, `checksum` requiring `[0-9a-f]{64}` equal to the file bytes, `unlisted`, `missing-file`).)
 
-Never edit or rename an applied migration. Migrations are forward-only: correct a deployed schema with a new migration, not by changing history.
+## Merge-time numbering — no reservations
+
+This rule applies to every open migration PR; earlier conditional or exclusive number claims do not reserve slots.
+
+- Drafts may use a provisional four-digit number. Before ready, refresh actual `main`, repair the migration branch onto its accepted prefix, and assign `max(main)+1` to the first new migration, followed by consecutive numbers for any others. Preserve the accepted prefix unchanged.
+- Other open PR proposals are neither reservations nor evidence of shared-database application. No per-PR allocation decision or consolidated map of every competing proposal is required to choose the next number.
+- Recheck current `main` before merge. If another migration lands first, mechanically repair the numeric collision/current-prefix delta and revalidate the new exact head through the existing manifest, hash, order, replay, review and CI gates. This is not a blanket rebase requirement for unrelated PRs or unrelated changes on `main`.
+- Before **any filename rename**, obtain authoritative staging applied-migrations evidence, plus evidence for any known shared target, for that specific migration from the existing operational custodian. Unknown is not unapplied. If a specific receipt is missing, request that bounded evidence, not a project-wide survey. Source history, an open PR, or a green manifest check is not live applied-state evidence. This rule authorizes no database operation.
+- Never rename an applied migration. For a confirmed-unapplied provisional migration, change only its filename, manifest filename and referring tests/docs/code; preserve SQL bytes, including header comments, and the checksum. Preserve all genuine existing rename provenance; never manufacture aliases or differing-byte history. Correct an applied schema with a new forward migration, not rewritten history.
+- Distinguish a numeric collision from a real schema dependency. Identify the actual predecessor SQL this change needs. Taking the next number cannot manufacture missing predecessor SQL, permit out-of-order dependencies, or justify copying a withdrawn migration prefix. Resolve only the actual dependency with its existing source owner.
+
+Numbering does not waive independent Security and QA review, exact-head Actions/CodeQL and required checks, provenance, qualification/rollback evidence or applicable exact-head production approval. Catalogue changes also retain the [AGENTS.md Clean-room, YouTube and MetaBrainz guardrails](../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails).
+
+Never edit or rename an applied migration. Migrations are forward-only: correct a deployed schema with a new migration, not by changing history. Accepted `main` migrations are immutable regardless of whether fresh target evidence is available.
 (Source: `.github/scripts/migrations_gate.py` `check_drift` — `applied-edited` and `applied-removed`.)
 
 Applied migrations are recorded in each database's `public.schema_migrations` table (`file`, `sha256`, `applied_at`, `applied_by`), written by `.github/scripts/apply_migration.py` in the same transaction as the apply. The staging deploy gate compares those rows against this manifest, so a migration that was applied but not recorded (or recorded but never applied) fails the deploy.
 (Sources: `.github/scripts/apply_migration.py` `compose` and `DDL`; `.github/scripts/staging_api_schema_gate.py` `load_expected` and `compare`; `docs/ops.md` "Staging migrations".)
 
-A file renumbered on a PR branch after staging already applied it must be renamed byte-identically (filename only — not even the header comment changes) and keeps its original name, with the entry's own sha, in its manifest entry as `renamed_from = [{ file = "…", sha256 = "…" }]`; the database row keeps the name it was applied under and the gate recognises it through this history. Recording `renamed_from` is metadata, never an edit of the applied migration.
+Historical byte-identical PR renames may already carry `renamed_from = [{ file = "…", sha256 = "…" }]`, with the entry's own sha. Preserve that genuine provenance: the database row retains the name it was applied under and the gate recognises it through this history. These aliases are backward-compatibility metadata, not permission for a new rename of an applied migration or evidence that a proposed rename is safe. Never alter the SQL/header bytes or existing applied names/hashes to resolve a number collision.
 (Sources: `.github/scripts/migrations_gate.py` `load_manifest` and the `bad-rename` checks in `check_manifest`; `.github/scripts/migrations_rename_check.py` `check`, run by the `migrations-staging` workflow.)
 
 Replay-safety: `workers/api/tests/run_migration_tests.sh` applies every `migrations/*.sql` in order to an empty database, then re-applies the full set to prove each migration is a clean no-op on replay. Two migrations are excluded from the replay pass: `0006_account_deletion.sql`, which predates the replay check and carries an unconditional `ADD COLUMN`, and `0021_billing_schema.sql`, whose seed names columns that `0026_plan_reseed_no_trial.sql` drops; applied migrations cannot be edited, so both are intentionally excluded.
