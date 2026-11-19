@@ -5484,7 +5484,11 @@ impl Store for PgStore {
             #[cfg(feature = "billing-owned-wasm-test")]
             let (host, port, connection_string) = (
                 "127.0.0.1".to_owned(),
-                if self.trace_id == "worker-cancel-test" { 15433 } else { 5432 },
+                match self.trace_id.as_str() {
+                    "worker-commit-ack-loss-test" => 15432,
+                    "worker-cancel-test" => 15433,
+                    _ => 5432,
+                },
                 "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
             );
             billing_budget::with_owned_connection(
