@@ -335,6 +335,60 @@ mod tests {
     }
 
     #[test]
+    fn persisted_record_checks_multichunk_envelope_geometry() {
+        let identities = [id(11), id(12), id(13), id(14), id(15)];
+        let length = 65_537;
+        let mut builder = DigestEnrollment::new(length, identities, id(16)).unwrap();
+        let header = builder.header().to_bytes();
+        builder.seal_chunk(&vec![42; 65_536]).unwrap();
+        builder.seal_chunk(&[43]).unwrap();
+        let manifest = builder.finish().ok().unwrap();
+        let intent = CandidateIntent {
+            identities,
+            plaintext_len: length,
+            map_id: id(16),
+            header,
+            reservation_generation: 1,
+        };
+        let hashes = candidate_hashes(&intent, &manifest).unwrap();
+        let pages = [CandidatePage {
+            index: 0,
+            chunk_count: 2,
+            first_chunk: 0,
+            entry_count: 2,
+            hash: hashes[0].to_vec(),
+        }];
+        let mut record = CandidateRecord {
+            identities,
+            plaintext_len: length as i64,
+            envelope_bytes: 48 + length as i64 + 2 * 16,
+            map_id: id(16),
+            header: header.to_vec(),
+            chunk_count: 2,
+            page_count: 1,
+            claim_sha256: manifest.plaintext_sha256().to_vec(),
+            reservation_sha256: manifest.plaintext_sha256().to_vec(),
+            reservation_environment: identities[0],
+            reservation_library: identities[1],
+            reservation_object: identities[2],
+            reservation_bytes: length as i64,
+            reservation_generation: 1,
+        };
+        assert!(candidate_record_matches(
+            &intent, &manifest, &record, &pages
+        ));
+        record.envelope_bytes -= 16;
+        assert!(!candidate_record_matches(
+            &intent, &manifest, &record, &pages
+        ));
+        record.envelope_bytes += 16;
+        record.chunk_count = 1;
+        assert!(!candidate_record_matches(
+            &intent, &manifest, &record, &pages
+        ));
+    }
+
+    #[test]
     fn candidate_binds_complete_intent_and_generation() {
         let identities = [id(1), id(2), id(3), id(4), id(5)];
         let mut builder = DigestEnrollment::new(1, identities, id(6)).unwrap();
