@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import worker from './production-maintenance/worker.mjs';
-import { seedMaintenance } from './production-maintenance/seed.mjs';
 
 for (const path of ['/', '/api/build', '/api/health', '/_app/immutable/app.js']) {
   test(`maintenance fails closed on ${path}`, async () => {
@@ -26,58 +25,27 @@ test('maintenance dry-run config has no routes, bindings or public preview', () 
     'compatibility_date = "2026-10-01"', 'workers_dev = false', 'preview_urls = false']);
 });
 
-const code = readFileSync(new URL('./production-maintenance/worker.mjs', import.meta.url));
 const version = '12345678-1234-1234-1234-123456789abc';
-for (const conflict of [false, true]) {
-  test(conflict ? 'a late canonical name conflict leaves the existing deployment intact' :
-    'maintenance uses only the new Worker ID and publishes its 100% version', async () => {
-    const account = 'a'.repeat(32);
-    const id = 'b'.repeat(32);
-    const root = `https://api.cloudflare.com/client/v4/accounts/${account}/workers/workers`;
-    const subdomain = { enabled: false, previews_enabled: false };
-    let created;
-    let live;
-    let calls = 0;
-    const ok = (result) => Response.json({ success: true, errors: [], result });
-    const seed = seedMaintenance({ account, token: 'fixture-token', worker: 'nntune-web', request: async (url, options) => {
-      const data = JSON.parse(options.body);
-      assert.equal(options.redirect, 'error');
-      switch (++calls) {
-        case 1:
-          assert.equal(`${options.method} ${url}`, `POST ${root}`);
-          assert.match(data.name, /^nntune-maint-[0-9a-f]{32}$/);
-          assert.deepEqual(data, { name: data.name, subdomain });
-          created = { ...data, id, deployed_on: null };
-          return ok(created);
-        case 2:
-          assert.equal(`${options.method} ${url}`, `POST ${root}/${id}/versions?deploy=true`);
-          assert.deepEqual(data, { main_module: 'worker.mjs', compatibility_date: '2026-10-01',
-            modules: [{ name: 'worker.mjs', content_type: 'application/javascript+module', content_base64: code.toString('base64') }] });
-          if (conflict) live = { id: 'c'.repeat(32), version: 'existing-production-version' };
-          return ok({ id: version });
-        case 3:
-          assert.equal(`${options.method} ${url}`, `PATCH ${root}/${id}`);
-          assert.deepEqual(data, { name: 'nntune-web', subdomain });
-          if (live) return Response.json({ success: false, errors: [{ code: 10040 }] }, { status: 409 });
-          live = { id, version };
-          return ok({ ...created, ...data });
-        default:
-          assert.fail('unexpected write');
-      }
-    } });
-    if (conflict) {
-      await assert.rejects(seed, /PATCH refused: HTTP 409/);
-      assert.deepEqual(live, { id: 'c'.repeat(32), version: 'existing-production-version' });
-    } else {
-      assert.equal(await seed, version);
-      assert.deepEqual(live, { id, version });
-    }
-    assert.equal(calls, 3);
-  });
-}
-
 const workflow = readFileSync(new URL('../.github/workflows/deploy-production.yml', import.meta.url), 'utf8');
-test('both production modes require the independently accepted SHA before checkout or credential use', () => {
+test('maintenance bootstrap refuses before staging or production access, even with promotion enabled', () => {
+  const preflight = workflow.match(/id: target\n[\s\S]+?        run: \|\n((?: {10}[^\n]*\n)+)/)?.[1];
+  assert.ok(preflight);
+  assert.match(workflow, /staging-evidence:\n    name: staging-evidence\n    needs: \[preflight\]/);
+  assert.match(workflow, /deploy-production:\n    name: deploy-production\n    needs: \[preflight, staging-evidence\]/);
+  assert.doesNotMatch(workflow, /production-maintenance\/seed\.mjs|continue-on-error:/);
+  const result = spawnSync('/bin/bash', ['-c', preflight.replace(/^ {10}/gm, '')], {
+    encoding: 'utf8', timeout: 5_000, env: {
+      PATH: process.env.PATH, GITHUB_OUTPUT: '/dev/stdout', GITHUB_REF: 'refs/heads/main',
+      INPUT_SHA: 'a'.repeat(40), DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
+      UNPROTECTED_ACCEPTED_SHA: '', PRODUCTION_DOMAIN: 'example.com', PRODUCTION_DOMAIN_DEFAULT: 'example.invalid',
+    },
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /Maintenance bootstrap unavailable/);
+  assert.doesNotMatch(result.stdout, /^sha=|^domain=/m);
+});
+
+test('production requires the independently accepted SHA before checkout or credential use', () => {
   const production = workflow.split('\n  deploy-production:\n')[1];
   const match = production.match(/steps:\n      - name: Require the exact Release Manager-accepted SHA\n(.*?)        run: \|\n((?:          [^\n]*\n)+)/s);
   assert.ok(match);
@@ -97,14 +65,11 @@ test('automatic rollback passes the selected maintenance UUID to the locked bina
   const seed = workflow.match(/- name: Require one-time production seed deployment\n[\s\S]+?        run: \|\n((?:          [^\n]*\n)+)/)?.[1];
   assert.ok(seed);
   const fixture = JSON.stringify([{ versions: [{ percentage: 100, version_id: version }] }]);
-  for (const id of [version, '87654321-4321-4321-4321-cba987654321']) {
-    const baseline = spawnSync('/bin/bash', ['-c', `npx() { printf '%s' '${fixture}'; }\n${seed.replace(/^ {10}/gm, '')}`], {
-      encoding: 'utf8', timeout: 5_000,
-      env: { PATH: process.env.PATH, WORKER_NAME: 'nntune-web', DEPLOY_MODE: 'bootstrap-maintenance', SEED_VERSION: id },
-    });
-    assert.equal(baseline.status, id === version ? 0 : 1, baseline.stderr);
-    if (id === version) assert.ok(baseline.stdout.endsWith(`rollback target ${version}\n`));
-  }
+  const baseline = spawnSync('/bin/bash', ['-c', `npx() { printf '%s' '${fixture}'; }\n${seed.replace(/^ {10}/gm, '')}`], {
+    encoding: 'utf8', timeout: 5_000, env: { PATH: process.env.PATH, WORKER_NAME: 'nntune-web' },
+  });
+  assert.equal(baseline.status, 0, baseline.stderr);
+  assert.ok(baseline.stdout.endsWith(`rollback target ${version}\n`));
   const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'locked-wrangler-'));
   try {
     const bin = join(workspace, 'apps/web/node_modules/.bin');

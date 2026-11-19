@@ -57,7 +57,7 @@ on:
         type: string
         default: ""
       mode:
-        description: "Promote the app, or initialize its unbound maintenance rollback target once"
+        description: "Promote the app (bootstrap-maintenance is unavailable)"
         type: choice
         options: [promote, bootstrap-maintenance]
         default: promote
@@ -97,6 +97,7 @@ jobs:
         id: target
         env:
           INPUT_SHA: ${{ inputs.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
           UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
@@ -106,6 +107,13 @@ jobs:
             echo '::error::Dispatch on main; PRODUCTION_ACCEPTED_SHA must exist only in the production Environment'
             exit 1
           fi
+          case "$DEPLOY_MODE" in
+            bootstrap-maintenance)
+              echo '::error::Maintenance bootstrap unavailable: no verified Worker-scoped first-deploy operation that refuses an incumbent. See docs/ops.md.'
+              exit 1;;
+            promote) ;;
+            *) echo '::error::Unknown production deploy mode'; exit 1;;
+          esac
           if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
             echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
             exit 1
@@ -308,14 +316,6 @@ jobs:
             exit 1
           fi
           echo "production credentials present (names only)"
-      - name: Initialize the first-release maintenance rollback target
-        if: inputs.mode == 'bootstrap-maintenance'
-        id: bootstrap
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-        run: node ci/production-maintenance/seed.mjs
       # One-time production seed precondition (see docs/ops.md). The shared
       # gradual-promote action records its rollback target from the latest
       # production deployment and refuses unless that deployment is a single
@@ -328,8 +328,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-          SEED_VERSION: ${{ steps.bootstrap.outputs.version }}
-          DEPLOY_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
@@ -337,8 +335,8 @@ jobs:
               let raw = "";
               process.stdin.on("data", (c) => { raw += c; });
               process.stdin.on("end", () => {
-                const seed = "Require one production version at 100%. For an unprovisioned Worker, " +
-                  "use the guarded bootstrap-maintenance mode. See docs/ops.md production seed precondition.";
+                const seed = "Require one production version at 100%. If unseeded, keep promotion off. " +
+                  "See docs/ops.md production seed precondition.";
                 let parsed;
                 try {
                   parsed = JSON.parse(raw);
@@ -361,10 +359,6 @@ jobs:
                   : undefined;
                 if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
                   console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
-                  process.exit(1);
-                }
-                if (process.env.DEPLOY_MODE === "bootstrap-maintenance" && id !== process.env.SEED_VERSION) {
-                  console.error("::error::Production is not serving the version just seeded; reconcile before promoting");
                   process.exit(1);
                 }
                 console.log("production seed ok: rollback target " + id);
