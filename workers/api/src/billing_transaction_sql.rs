@@ -46,13 +46,21 @@ impl<'a> LookupBinds<'a> {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileProbe {
+    None,
+    WorkerDeadline,
+    ServerWatchdog,
+}
+
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)] // Not reachable from a release reconciliation caller.
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
     user_id: String,
     outcome: crate::billing_reconcile::ReconcileOutcome,
-    _deadline_probe: bool,
+    #[cfg(feature = "billing-owned-wasm-test")] probe: ReconcileProbe,
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
         classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget,
@@ -163,16 +171,18 @@ pub(crate) async fn apply_reconcile_transaction(
                 .await
                 .map_err(|_| StoreError)?;
         }
-        // The deadline probe runs only after all billing writes.
+        // The probes run only after all billing writes and before COMMIT.
         #[cfg(feature = "billing-owned-wasm-test")]
-        if _deadline_probe {
+        if probe != ReconcileProbe::None {
             let written = transaction.query_one(
                 "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
             ).await.map_err(|_| StoreError)?;
             if written.get::<_, i64>(0) != 1 || written.get::<_, i64>(1) != 2 {
                 return Err(StoreError);
             }
-            transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+            if probe == ReconcileProbe::WorkerDeadline {
+                transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+            }
             // Readiness follows acknowledgement of the timeout settings.
             transaction
                 .batch_execute("SELECT pg_advisory_xact_lock(781349053)")

@@ -69,8 +69,8 @@ pub fn error_document(error_code: i64, message: &str) -> Value {
     Value::Map(base_envelope(Some((error_code, message))))
 }
 
-/// Wrap already-charged fields in one exact-capacity envelope, without an
-/// intermediate payload vector or any uncharged Value clones.
+/// Wrap fields already charged on this budget in one exact-capacity envelope,
+/// without an intermediate payload vector or any uncharged Value clones.
 pub fn charged_ok_document<const N: usize>(
     budget: &mut ConstructionBudget,
     payload: [(&str, Value); N],
@@ -78,6 +78,7 @@ pub fn charged_ok_document<const N: usize>(
     charged_document(budget, "ok", payload)
 }
 
+/// Build a failed document, charging the envelope and its error child.
 pub fn charged_error_document(
     budget: &mut ConstructionBudget,
     error_code: i64,
@@ -302,6 +303,81 @@ pub fn render_xml(doc: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn charge_expected_storage(budget: &mut ConstructionBudget, value: &Value) {
+        type Entry = (String, Value);
+        match value {
+            Value::Map(entries) => {
+                budget
+                    .charge(entries.len(), size_of::<Entry>(), align_of::<Entry>())
+                    .unwrap();
+                for (key, child) in entries {
+                    budget.charge(key.len(), 1, 1).unwrap();
+                    charge_expected_storage(budget, child);
+                }
+            }
+            Value::Str(text) => budget.charge(text.len(), 1, 1).unwrap(),
+            Value::Null | Value::Bool(_) | Value::Int(_) => {}
+            Value::List(_) => panic!("unexpected list in envelope fixture"),
+        }
+    }
+
+    fn assert_exact_storage(value: &Value) {
+        match value {
+            Value::Map(entries) => {
+                assert_eq!(entries.capacity(), entries.len());
+                for (key, child) in entries {
+                    assert_eq!(key.capacity(), key.len());
+                    assert_exact_storage(child);
+                }
+            }
+            Value::Str(text) => assert_eq!(text.capacity(), text.len()),
+            _ => {}
+        }
+    }
+
+    fn assert_charged_envelope(
+        expected: Value,
+        build: impl Fn(&mut ConstructionBudget) -> Result<Value, BudgetExceeded>,
+    ) {
+        let mut expected_budget = ConstructionBudget::new(usize::MAX);
+        charge_expected_storage(&mut expected_budget, &expected);
+        let limit = expected_budget.charged();
+
+        let mut short = ConstructionBudget::new(limit - 1);
+        assert_eq!(build(&mut short), Err(BudgetExceeded));
+
+        let mut exact = ConstructionBudget::new(limit);
+        let actual = build(&mut exact).unwrap();
+        assert_eq!(exact.charged(), limit);
+        assert_exact_storage(&actual);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn charged_ok_envelope_matches_ordinary_at_exact_budget() {
+        let title = "Café & tea";
+        let expected = ok_document(vec![
+            ("songCount".into(), Value::Int(1)),
+            ("nowPlayingTitle".into(), Value::str_value(title)),
+        ]);
+        assert_charged_envelope(expected, |budget| {
+            let title = Value::charged_str(budget, title)?;
+            charged_ok_document(
+                budget,
+                [("songCount", Value::Int(1)), ("nowPlayingTitle", title)],
+            )
+        });
+    }
+
+    #[test]
+    fn charged_error_envelope_matches_ordinary_at_exact_budget() {
+        let message = "Piste «Café» introuvable & indisponible.";
+        let expected = error_document(code::NOT_FOUND, message);
+        assert_charged_envelope(expected, |budget| {
+            charged_error_document(budget, code::NOT_FOUND, message)
+        });
+    }
 
     #[test]
     fn ok_envelope_orders_attributes_like_v1() {
