@@ -238,11 +238,9 @@ impl AuthSession for ChargedSession {
         budget: Option<&mut ConstructionBudget>,
     ) -> Result<Option<CredentialRecord>, AuthError> {
         self.calls.push("lookup");
-        assert_eq!(version, Some(2));
-        assert_eq!(
-            self.row.as_ref().unwrap().api_key_hmac.as_deref(),
-            Some(digest)
-        );
+        let row = self.row.as_ref().unwrap();
+        assert_eq!(version, row.pepper_version);
+        assert_eq!(digest, row.api_key_hmac.as_deref().unwrap_or(&row.username));
         budget
             .unwrap()
             .charge(1, 1, 1)
@@ -318,6 +316,50 @@ async fn staged_session_carries_charge_and_waits_for_conditional_completion() {
         }
         if limit == exact {
             assert_eq!(budget.charged(), exact);
+        }
+    }
+}
+
+#[tokio::test]
+async fn staged_session_carries_projection_charge_into_token_verification() {
+    let credentials = token_credentials();
+    let record = token_record();
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    expected.charge(24, 1, 1).unwrap(); // Earlier request allocations.
+    expected.charge(1, 1, 1).unwrap(); // Synthetic projection charge.
+    verify_token(
+        &record,
+        credentials.token.as_deref().unwrap(),
+        credentials.salt.as_deref().unwrap(),
+        &Keks::new(),
+        Some(&mut expected),
+    )
+    .unwrap();
+    let exact = expected.charged();
+    for limit in [exact - 1, exact] {
+        let mut store = ChargedSession {
+            row: Some(token_record()),
+            calls: Vec::new(),
+            committed: true,
+        };
+        let mut budget = ConstructionBudget::new(limit);
+        budget.charge(24, 1, 1).unwrap();
+        let result = authenticate_in(
+            &mut store,
+            &credentials,
+            &keyring(),
+            &Keks::new(),
+            NOW,
+            Some(&mut budget),
+        )
+        .await;
+        if limit == exact {
+            assert_eq!(result.unwrap().user_id(), "user-a");
+            assert_eq!(store.calls, ["lookup", "admit", "finish"]);
+            assert_eq!(budget.charged(), exact);
+        } else {
+            assert_eq!(result.unwrap_err(), AuthError::Unavailable);
+            assert_eq!(store.calls, ["lookup", "admit"]);
         }
     }
 }
