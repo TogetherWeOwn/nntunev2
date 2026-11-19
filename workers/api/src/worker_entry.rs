@@ -751,6 +751,9 @@ impl MirrorBinding {
 #[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
 #[path = "subsonic_membership.rs"]
 pub(crate) mod subsonic_membership;
+#[allow(dead_code)] // Unmounted until the bounded adapter is wired.
+#[path = "subsonic_mirror.rs"]
+pub(crate) mod subsonic_mirror;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
@@ -944,7 +947,7 @@ where
     }
 }
 
-/// Exercise the unwired PgStore method with a disposable connection only.
+/// Exercise the production Store acquisition with a disposable connection.
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn private_aware_lease_for_postgres_test(
@@ -956,7 +959,7 @@ pub async fn private_aware_lease_for_postgres_test(
     now: u64,
     expires_at: u64,
     takeover: bool,
-) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
         env: None,
         trace_id: "postgres-private-lease-test".into(),
@@ -965,7 +968,7 @@ pub async fn private_aware_lease_for_postgres_test(
         test_connect: None,
         test_mirror: None,
     }
-    .acquire_private_aware_lease(
+    .acquire_playback_lease(
         user_id, session_id, track_id, play_id, now, expires_at, takeover,
     )
     .await
@@ -1082,9 +1085,9 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
-    /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
+    /// NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_private_aware_lease(
         &self,
         user_id: &str,
@@ -1094,7 +1097,7 @@ impl PgStore {
         now: u64,
         expires_at: u64,
         takeover: bool,
-    ) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
                 let key = format!("play:{user_id}:{track_id}:{play_id}");
@@ -1168,11 +1171,10 @@ impl PgStore {
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
                     tx.commit().await.map_err(|_| StoreError)?;
-                    Ok((result, private))
                 } else {
                     tx.rollback().await.map_err(|_| StoreError)?;
-                    Ok((result, false))
                 }
+                Ok(result)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4073,15 +4075,8 @@ impl Store for PgStore {
         expires_at: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-        Self::bounded(
-            async {
-                let client = self.connect().await?;
-                acquire_playback_lease_on(
-                    &client, user_id, session_id, track_id, play_id, now, expires_at, takeover,
-                )
-                .await
-            },
-            TOTAL_TIMEOUT_MS,
+        self.acquire_private_aware_lease(
+            user_id, session_id, track_id, play_id, now, expires_at, takeover,
         )
         .await
     }

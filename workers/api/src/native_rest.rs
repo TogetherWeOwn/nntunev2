@@ -607,7 +607,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" {
+            if path == "/v1/me" || path == "/v1/me/private-session" {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one

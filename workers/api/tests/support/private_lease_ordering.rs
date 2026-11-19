@@ -1,4 +1,4 @@
-//! Lock-observed ordering of the unwired acquisition and session writers.
+//! Lock-observed ordering of Store acquisition and session writers.
 use super::{blocker_observer::observe_blocked, disposable_accounts};
 use nntune_api::handlers::{Store, StoreError};
 use nntune_api::playback::LeaseAcquire::Acquired;
@@ -27,7 +27,7 @@ async fn ordering_case(enable: bool, toggle_first: bool) -> Result<(), String> {
             db.execute("INSERT INTO public.private_sessions VALUES ($1,'session',$2)", &[&user, &(now + 300)]).await.map_err(|e| e.to_string())?;
         }
         let seed = acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "session", "track", "seed", now as u64, now as u64 + 45, false).await.map_err(|_| "seed acquisition failed")?;
-        if seed != (Acquired { epoch: 1 }, !enable) { return Err(format!("wrong seed: {seed:?}")); }
+        if seed != (Acquired { epoch: 1 }) { return Err(format!("wrong seed: {seed:?}")); }
 
         let holder = disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?;
         let acq_client = disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?;
@@ -69,7 +69,7 @@ async fn ordering_case(enable: bool, toggle_first: bool) -> Result<(), String> {
         mutation.map_err(|_| "toggle failed")?;
         let outcome = outcome.map_err(|_| "acquisition failed")?;
         let expected_private = if toggle_first { enable } else { !enable };
-        if outcome != (Acquired { epoch: 2 }, expected_private) { return Err(format!("wrong ordering: {outcome:?}")); }
+        if outcome != (Acquired { epoch: 2 }) { return Err(format!("wrong ordering: {outcome:?}")); }
         // Toggle after the grant, then exercise the existing continuation touch.
         if toggle_first {
             let later = catalogue_store_for_postgres_test(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, false, Err(StoreError), Rc::new(Cell::new(0)));
