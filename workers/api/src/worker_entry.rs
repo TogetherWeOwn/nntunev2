@@ -439,7 +439,7 @@ fn allowed_cors_origin<'a>(req_origin: Option<&'a str>, cfg_origin: &str) -> Opt
 /// No match (or no `Origin`) yields no headers at all — never a reflection,
 /// never `*`. A 204 is always the known-path OPTIONS preflight, which
 /// additionally needs the method/header grant.
-fn cors_headers(
+pub(crate) fn cors_headers(
     status: u16,
     req_origin: Option<&str>,
     cfg_origin: &str,
@@ -7864,6 +7864,11 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "unknown");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes?user_id=alice"),
+            "/v1/me/likes"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate
