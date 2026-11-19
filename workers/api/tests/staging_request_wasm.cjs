@@ -47,6 +47,15 @@ test('rejects metadata errors before reading the form', async () => {
   assert.equal(short.bodyUsed, false);
 });
 
+test('passes an admitted declared length to the form collector', async () => {
+  const form = 'u=%C3%A9';
+  const length = Buffer.byteLength(form);
+  assert.equal(await collect(formRequest({ form, declared: String(length) })), exact);
+  const incomplete = formRequest({ form, declared: String(length + 1) });
+  await assert.rejects(collect(incomplete), (e) => e === 'collect:Unreadable');
+  assert.equal(incomplete.bodyUsed, true);
+});
+
 test('applies parameter limits independently to query and form', async () => {
   const sixtyFour = 'x=1&'.repeat(64);
   // Every key is decoded and charged, even though x is not a credential.
