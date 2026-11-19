@@ -171,7 +171,11 @@ forward-only (§4).
    `track_sources` ([offsite drill §4b, step 4](offsite-backup-runbook.md#4b-staging-leg--restore-into-an-isolated-environment)),
    active Subsonic tokens (`subsonic_auth.rs`), and retained admin originals (`ingest_originals`, `admin_ingest.rs`).
    Record counts and outcomes only (§6); hold on query or export errors, mismatches, or missing or failed verification.
-   After purge, mark only the vault pass N/A; never restore purged rows or change shared keys. For a pre-purge vault,
+   **Separately verify serving-key readiness, before or after purge.** Before repointing, use an approved check with the intended Worker build, environment, and key bindings to open a retained envelope for each required KEK version through the runtime key lookup.
+   Record only the Worker build ID, environment label, and pass/fail outcome for each version (§6).
+   An offline decrypt or a listed secret alone is not serving evidence: legacy mode loads only one version, and versioned mode discovers only `CURRENT ± 8` via `kek_set_from_lookup`.
+   Hold cutover if any required version is missing, fails to open, or cannot be verified in the intended configuration.
+   **Historical vault pass only.** After purge, mark this pass N/A; never restore purged rows or change shared keys. For a pre-purge vault,
    confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The
@@ -283,7 +287,9 @@ migration files to force convergence.
 | New restore target name (§3.2) | name only, no URL/secret |
 | Read-only verification queries + outcomes (§3.3) | expressions + outcomes only |
 | Forward-convergence list (migrations re-applied, §3.4) | numbers + manifest head |
-| Active KEK checks and legacy vault disposition (§3.5) | envelope counts/outcomes; vault counts ×2 or schema basis for N/A |
+| App envelope checks (§3.5) | counts and outcomes |
+| Intended Worker serving-key check (§3.5) | build ID, environment label, and outcome per required KEK version |
+| Historical vault pass (§3.5) | vault counts ×2 or schema basis for N/A |
 | Cutover record (binding repoint/promote, §3.6) | mechanism + time |
 | Health + E2E run URLs (§3.7) | URLs to runs only |
 | Old-target retention + deletion gate (§3.8) | |
