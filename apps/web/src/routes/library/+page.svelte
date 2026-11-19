@@ -354,6 +354,7 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
+		onPositionScopeRevoked: () => media.setPositionScope(null),
 		onStateChange: (state, { isCurrent, authoritative }) => {
 			if (!isCurrent()) return;
 			if (authoritative) media.setPositionScope(state.positionScope);
@@ -1651,15 +1652,16 @@
 		refresher.handleLocalAuthTransition();
 	}
 
+	function onPageHide(): void {
+		media.savePosition();
+		recordFindQuery();
+	}
+
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
 		media.restoreRepeat(browserStorage('local'));
 		window.addEventListener('storage', handleAuthTransition);
-		const onPageHide = () => {
-			media.savePosition();
-			recordFindQuery();
-		};
 		window.addEventListener('pagehide', onPageHide);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.

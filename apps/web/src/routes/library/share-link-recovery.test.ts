@@ -5,7 +5,7 @@ import { createQueueShare } from '#lib/player/queueShare.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
-import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
+import { clearRecentFindsAtAuthBoundary, loadRecentFinds, recordRecentFind } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -66,7 +66,7 @@ function pageScript(search: string, tick = () => Promise.resolve(), storage: Pic
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
-		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
+		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary, recordRecentFind,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: (kind: string) => kind === 'local' ? storage : null,
 		invalidateLibraryCache: () => {},
@@ -81,7 +81,7 @@ function pageScript(search: string, tick = () => Promise.resolve(), storage: Pic
 		return {
 			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
-			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
+			attachNativeAudio, onPageHide, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
 			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
@@ -98,7 +98,8 @@ function pageScript(search: string, tick = () => Promise.resolve(), storage: Pic
 		handleLocalAuthTransition: () => void;
 		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
-		attachNativeAudio: (element: EventTarget) => void;
+		attachNativeAudio: (element: EventTarget) => () => void;
+		onPageHide: () => void;
 		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
 			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
 		currentAudio: () => unknown;
@@ -168,6 +169,39 @@ test('the authenticated Library response scopes only audio attached under that a
 		[`nntune:library-position:v1:${first}`, '{"coral":12}'],
 		[`nntune:library-position:v1:${second}`, '{"coral":30}']
 	]);
+});
+
+test('new account headers fence pagehide and detach before and after a refused body', async () => {
+	const writes = vi.fn();
+	const page = pageScript('?track=coral&t=0', undefined, {
+		getItem: () => null, setItem: writes, removeItem: () => {}
+	});
+	const first = 'a'.repeat(64), second = 'b'.repeat(64);
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS, {
+		headers: { 'x-library-position-scope': first }
+	}));
+	await page.refresh();
+	const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+	const detach = page.attachNativeAudio(audio);
+	audio.currentTime = 12;
+	page.onPageHide();
+	expect(writes).toHaveBeenCalledWith(`nntune:library-position:v1:${first}`, '{"coral":12}');
+	writes.mockClear();
+	let startRead!: (controller: ReadableStreamDefaultController<Uint8Array>) => void;
+	const readStarted = new Promise<ReadableStreamDefaultController<Uint8Array>>((resolve) => { startRead = resolve; });
+	const body = new ReadableStream<Uint8Array>({ pull: startRead }, { highWaterMark: 0 });
+	vi.stubGlobal('fetch', async () => new Response(body, { headers: { 'x-library-position-scope': second } }));
+	const refresh = page.refresh();
+	const bodyController = await readStarted;
+	audio.currentTime = 30;
+	page.onPageHide();
+	bodyController.error(new Error('body refused'));
+	await refresh;
+	audio.currentTime = 45;
+	detach();
+	page.attachNativeAudio(Object.assign(new EventTarget(), playableAudio(async () => {}), { currentTime: 23 }));
+	page.onPageHide();
+	expect(writes).not.toHaveBeenCalled();
 });
 
 for (const status of [500, 404]) {

@@ -37,6 +37,8 @@ export interface LibraryRefresherDeps {
 	sessionStorage: () => SnapshotStorage | null;
 	/** Clears every snapshot area and tells other tabs the session ended. */
 	invalidateLibraryCache: () => void;
+	/** Retire position receipts before a replacement response body is read. */
+	onPositionScopeRevoked?: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
 	timeoutMs?: number;
@@ -279,6 +281,15 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
+			const header = response.headers?.get('x-library-position-scope');
+			const scope = header && /^[a-f0-9]{64}$/.test(header) ? header : null;
+			if (!isCurrent()) return;
+			// New or missing account evidence revokes the old scope even if decoding fails.
+			if (state.positionScope !== null && state.positionScope !== scope) {
+				state.positionScope = null;
+				deps.onPositionScopeRevoked?.();
+				if (!isCurrent()) return;
+			}
 			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
 			if (!isCurrent() || controller.signal.aborted) {
 				cancelResponse(response);
@@ -287,7 +298,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
-			const scope = response.headers?.get('x-library-position-scope');
 			if (!isCurrent()) return;
 			authenticatedThisLoad = true;
 			state.items = fresh;
@@ -297,7 +307,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const persistedSnapshot = saveSnapshot(storage, fresh);
 			if (!isCurrent()) return;
 			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
-			state.positionScope = scope && /^[a-f0-9]{64}$/.test(scope) ? scope : null;
+			state.positionScope = scope;
 			authoritative = true;
 		} catch {
 			if (!isCurrent()) return;

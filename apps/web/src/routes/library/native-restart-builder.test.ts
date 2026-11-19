@@ -25,7 +25,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve(), sco
 		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
-		'attachNativeAudio', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'attachNativeAudio', 'announceEnd', 'onPageHide', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
