@@ -47,8 +47,14 @@ function describeRestart(words: string, title: string): string {
 
 // Queued native events belong to the element, not to a receipt or controller.
 const mountedAudio = new WeakSet<HTMLAudioElement>();
+const nativeIsConnected = typeof Node === 'undefined' ? undefined : Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected')?.get;
+const nativeGetAttribute = typeof Element === 'undefined' ? undefined : Element.prototype.getAttribute;
 
-export function createMediaController() {
+function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
+	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
+}
+
+export function createMediaController(matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
@@ -109,9 +115,11 @@ export function createMediaController() {
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
 		try {
-			// Reading connectivity can change the source, and reading the source can detach the node.
+			// Either instance accessor can change what the other last observed. End
+			// with a DOM snapshot that does not call back into those accessors.
 			return isCurrent() && audio.isConnected && isCurrent() &&
-				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent();
+				audio.getAttribute('src') === source && isCurrent() && audio.isConnected && isCurrent() &&
+				matchesNative(audio, source);
 		} catch {
 			return false;
 		}

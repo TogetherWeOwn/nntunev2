@@ -62,8 +62,12 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		}
-		getAttribute = (name: string) => name === 'src' ? track.streamUrl : null;
-		isConnected = true; ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
+		sourceAttribute = track.streamUrl;
+		getAttribute = (name: string) => name === 'src' ? this.sourceAttribute : null;
+		connected = true;
+		get isConnected() { return this.connected; }
+		set isConnected(value: boolean) { this.connected = value; }
+		ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
 		volume = 0.6; muted = false; playbackRate = 1.25;
 		play = () => Promise.resolve();
 		pause() { this.paused = true; }
@@ -87,7 +91,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		createQueueController, createMediaController,
+		createQueueController,
+		createMediaController: () => createMediaController((audio, source) =>
+			audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source),
 		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -869,25 +875,34 @@ test('a newer share received by a jump source getter survives the old gesture', 
 	expect(writes).toEqual([45]);
 });
 
-test('the final connectivity read cannot redirect the jump to a different source', () => {
-	const { page, element, track, writes } = restartFixture();
-	let source = track.streamUrl;
+test.each([
+	['jump', 1], ['jump', 2], ['restart', 2]
+] as const)('%s cannot write if pre-write connectivity read %s changes the source', (gesture, order) => {
+	const { page, element, media, writes } = restartFixture();
 	let targetChecked = false;
-	element.getAttribute = () => source;
+	let connectivityReads = 0;
+	let positionReads = 0;
 	Object.defineProperties(element, {
 		seekable: { get() {
-			targetChecked = true;
+			if (gesture === 'jump') targetChecked = true;
 			return { length: 1, start: () => 0, end: () => 120 };
 		} },
+		currentTime: { get() {
+			// Restart reads the position once for availability, then once for the write.
+			if (gesture === 'restart' && ++positionReads === 2) targetChecked = true;
+			return media.position;
+		}, set(value: number) { writes.push(value); media.position = value; } },
 		isConnected: { get() {
-			if (targetChecked) source = '/test-audio/replacement';
+			if (targetChecked && ++connectivityReads === order) element.sourceAttribute = '/test-audio/replacement';
 			return true;
 		} }
 	});
-	page.jump('forward');
-	expect(source).toBe('/test-audio/replacement');
+	if (gesture === 'restart') page.restart(); else page.jump('forward');
+	expect(element.sourceAttribute).toBe('/test-audio/replacement');
 	expect(writes).toEqual([]);
+	expect(media.position).toBe(30);
 	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
 });
 
 test('a source read that disconnects the element cannot authorize a jump', () => {

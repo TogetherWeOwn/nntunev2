@@ -18,7 +18,7 @@ test('feedback that retires the attempt cannot also bump its live region', async
 
 test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 	'restart suppresses stale work after a same-node reattachment during %s', (phase) => {
-		const media = createMediaController();
+		const media = createMediaController((_audio, source) => source === '/coral');
 		let position = 30;
 		const native = {
 			isConnected: true, getAttribute: () => '/coral', play: vi.fn(), pause: vi.fn(), load: vi.fn(),
@@ -49,7 +49,7 @@ test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 );
 
 test('only the newer restart on an unchanged receipt can seek and publish', () => {
-	const media = createMediaController();
+	const media = createMediaController((_audio, source) => source === '/coral');
 	const seek = vi.fn();
 	const native = {
 		isConnected: true, getAttribute: () => '/coral',
