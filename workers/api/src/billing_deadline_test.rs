@@ -159,7 +159,7 @@ fn test_outcome() -> ReconcileOutcome {
         read_anchor: None,
     }
 }
-// Exercise a late history constraint error and retry using the prototype store.
+// Exercise history refusal, late rollback and replay through the shared store.
 async fn late_fault_and_retry() -> Result<(), &'static str> {
     let store = PgStore {
         env: None,
@@ -202,6 +202,76 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
     let after = fault_snapshot().await.map_err(|_| "replay state invalid")?;
     if before != after {
         return Err("replay changed committed state");
+    }
+    outcome.history[0].stripe_invoice_id = "in_worker_fresh_first".into();
+    outcome.history[1].stripe_invoice_id = "in_worker_fresh_second".into();
+    outcome.history[1].stripe_subscription_id = "sub_worker_other".into();
+    for explicit_stale in [false, true] {
+        outcome.explicit_stale = explicit_stale;
+        if store
+            .store_reconcile_outcome("worker_fault_user", &outcome)
+            .await
+            .is_ok()
+        {
+            return Err("history for a different subscription was accepted");
+        }
+        if fault_snapshot()
+            .await
+            .map_err(|_| "history attribution refusal changed committed state")?
+            != before
+        {
+            return Err("history attribution refusal changed committed state");
+        }
+        transaction_refuses_misattributed_history(outcome.clone()).await?;
+        if fault_snapshot()
+            .await
+            .map_err(|_| "transaction attribution refusal changed committed state")?
+            != before
+        {
+            return Err("transaction attribution refusal changed committed state");
+        }
+    }
+    Ok(())
+}
+
+async fn transaction_refuses_misattributed_history(
+    outcome: ReconcileOutcome,
+) -> Result<(), &'static str> {
+    use crate::billing_transaction_sql::apply_reconcile_transaction;
+
+    let (accepted, transaction_ended) = billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |client| Box::pin(billing_budget::bootstrap_transaction(client)),
+        move |client| {
+            Box::pin(async move {
+                // Assign an XID so we can distinguish explicit rollback from
+                // cleanup on disconnect. Do not route through the store guard.
+                client
+                    .batch_execute("SELECT pg_current_xact_id()")
+                    .await
+                    .map_err(|_| StoreError)?;
+                let accepted =
+                    apply_reconcile_transaction(client, "worker_fault_user".into(), outcome, false)
+                        .await
+                        .is_ok();
+                let row = client
+                    .query_one("SELECT pg_current_xact_id_if_assigned() IS NULL", &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok((accepted, row.get::<_, bool>(0)))
+            })
+        },
+        |_| {},
+    )
+    .await
+    .map_err(|_| "transaction attribution control setup or rollback query failed")?;
+    if accepted {
+        return Err("transaction accepted history for a different subscription");
+    }
+    if !transaction_ended {
+        return Err("transaction attribution refusal did not roll back");
     }
     Ok(())
 }
