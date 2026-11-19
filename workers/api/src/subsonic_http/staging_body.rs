@@ -195,17 +195,22 @@ mod tests {
 
     #[test]
     fn body_capacity_is_charged_before_copy_and_carried_through_eof() {
-        let mut expected = ConstructionBudget::new(usize::MAX);
+        let seeded_budget = |limit| {
+            let mut budget = ConstructionBudget::new(limit);
+            budget.charge(1, 1, 1).unwrap();
+            budget
+        };
+        let mut expected = seeded_budget(usize::MAX);
         expected.charge(STAGING_SOURCE_BYTES, 1, 1).unwrap();
         let limit = expected.charged();
-        let mut short = StagingBody::new(None, ConstructionBudget::new(limit - 1)).unwrap();
+        let mut short = StagingBody::new(None, seeded_budget(limit - 1)).unwrap();
         assert_eq!(
             short.push_external(1, |_| panic!("copied without a charge")),
             Err(StagingBodyError::Capacity)
         );
         assert_eq!(short.finish(None).err(), Some(StagingBodyError::Capacity));
 
-        let mut exact = StagingBody::new(None, ConstructionBudget::new(limit)).unwrap();
+        let mut exact = StagingBody::new(None, seeded_budget(limit)).unwrap();
         exact.push(Ok(b"x=")).unwrap();
         exact.push_external(1, |out| out[0] = b'a').unwrap();
         let (body, ledger) = exact.finish(None).unwrap();
