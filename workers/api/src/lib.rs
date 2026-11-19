@@ -177,6 +177,7 @@ mod ledger_wasm_test {
         nntune_subsonic::construction_budget::tests::rounds_each_allocation_and_fails_closed_at_limit();
         nntune_subsonic::construction_budget::tests::rejects_alignment_and_arithmetic_overflow_without_changing_charge();
         nntune_subsonic::construction_budget::tests::exact_vector_reservation_checks_limit_and_overflow();
+        crate::worker_entry::subsonic_pg_page::streamed_projection_enforces_admission();
         nntune_subsonic::value::charged_values_check_owned_storage_limits();
         nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
         nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();

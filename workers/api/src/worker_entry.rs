@@ -754,6 +754,10 @@ pub(crate) mod subsonic_membership;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
+// Unmounted until the staging membership and mirror readers adopt it.
+#[allow(dead_code)]
+#[path = "subsonic_pg_page.rs"]
+pub(crate) mod subsonic_pg_page;
 
 #[cfg(all(target_arch = "wasm32", feature = "ledger-wasm-test"))]
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
