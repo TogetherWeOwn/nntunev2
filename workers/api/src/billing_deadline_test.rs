@@ -452,6 +452,9 @@ async fn fault_snapshot_with_recovery(recovered: bool) -> Result<FaultSnapshot, 
     .await
 }
 
+#[path = "billing_exact_target_test.rs"]
+mod exact_target;
+
 pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     fixture(true)
         .await
@@ -463,7 +466,8 @@ pub(crate) async fn test_reconcile_deadline() -> Result<(), &'static str> {
     expire_after_writes(&outcome, ReconcileProbe::ServerWatchdog)
         .await
         .map_err(|_| "billing server watchdog did not clean up abandoned writes")?;
-    late_fault_and_retry().await
+    late_fault_and_retry().await?;
+    exact_target::check().await
 }
 
 async fn cancel_in_flight(outcome: ReconcileOutcome) -> Result<(), &'static str> {
