@@ -67,6 +67,8 @@ pub mod subsonic_config;
 pub mod subsonic_dispatch;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
+#[cfg(target_arch = "wasm32")]
+pub mod subsonic_request_metadata;
 pub mod subsonic_snapshot_plan;
 #[cfg(any(test, target_arch = "wasm32"))]
 pub mod subsonic_staging_response;
