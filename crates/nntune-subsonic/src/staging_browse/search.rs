@@ -213,14 +213,13 @@ pub fn search_boundaries() {
             |budget: &mut ConstructionBudget| view.search_document(budget, endpoint, &params);
         let mut probe = ConstructionBudget::new(usize::MAX);
         let actual = build(&mut probe).unwrap();
-        let document = super::field(&actual, "subsonic-response");
         let key = if endpoint == "search2" {
             "searchResult2"
         } else {
             "searchResult3"
         };
-        let Value::List(results) = super::field(super::field(document, key), "song") else {
-            panic!("expected song page")
+        let Value::List(results) = super::field(super::field(&actual, key), "song") else {
+            panic!("expected song page for {endpoint} {query}")
         };
         assert_eq!(results.len(), ids.len());
         assert_eq!(results.capacity(), ids.len());

@@ -14,7 +14,11 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     let Value::Map(fields) = value else {
         panic!("expected map for {key}");
     };
-    &fields.iter().find(|(name, _)| name == key).unwrap().1
+    &fields
+        .iter()
+        .find(|(name, _)| name == key)
+        .unwrap_or_else(|| panic!("missing field {key}"))
+        .1
 }
 
 /// Borrows a member snapshot in browse order. The adapter enforces membership
