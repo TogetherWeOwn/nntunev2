@@ -133,8 +133,9 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
 
         spike = job(text, "spike")
         self.assertIn("persist-credentials: false", spike)
-        for expected in ("spike/measure.sh", "spike/recall.py", "mb-snapshot-spike-results"):
-            self.assertIn(expected, spike)
+        for command in ("bash workers/mb/spike/measure.sh", "python3 workers/mb/spike/recall.py"):
+            self.assertRegex(spike, rf"(?m)^[ \t]+{re.escape(command)}[ \t]+")
+        self.assertRegex(spike, r"(?m)^ {10}name: mb-snapshot-spike-results$")
         for retired in ("stage.sh", "lifecycle.py", "bench.py", "live-archive"):
             self.assertNotIn(retired, text)
 
