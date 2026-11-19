@@ -183,6 +183,7 @@ mod ledger_wasm_test {
         nntune_subsonic::staging_browse::member_browse_boundaries();
         crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();
         crate::worker_entry::account_fields_use_the_carried_charge();
+        crate::worker_entry::subsonic_membership::membership_projection_charges_capacity_before_copying();
     }
 }
 
