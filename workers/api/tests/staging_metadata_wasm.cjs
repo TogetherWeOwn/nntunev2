@@ -47,3 +47,16 @@ test('retains encoded URL bytes and admits form metadata without reading the str
     assert.equal(input.bodyUsed, false);
   }
 });
+
+test('skips form admission for a non-form POST and a GET with a form header', () => {
+  const post = new Request(`${origin}/`, {
+    method: 'POST', body: 'text',
+    headers: { 'content-type': 'text/plain', 'content-length': '4' },
+  });
+  const get = new Request(`${origin}/`, {
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '0' },
+  });
+  assert.equal(admit(post, 100)[3], undefined);
+  assert.equal(admit(get, 100)[3], undefined);
+  assert.equal(post.bodyUsed, false);
+});
