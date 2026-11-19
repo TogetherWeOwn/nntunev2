@@ -319,6 +319,33 @@ test('a synchronous seeking event preserves the share retry; duration clamps it 
 	expect(page.read().pendingShareSeek).toBeNull();
 });
 
+test.each(['clamp', 'restart', 'unknown'] as const)(
+	'a metadata event during the share setter is bounded and respects %s', async (outcome) => {
+		const { page, location, element, media, writes } = restartFixture();
+		media.duration = NaN;
+		Object.defineProperty(element, 'currentTime', {
+			get: () => media.position,
+			set(value: number) {
+				writes.push(value);
+				if (value === 90 && (writes.length === 1 || outcome === 'unknown')) {
+					if (outcome !== 'unknown') media.duration = 60;
+					page.retryShare('durationchange');
+					if (outcome === 'restart') page.restart();
+				}
+				media.position = value;
+			}
+		});
+		location.search = '?track=coral&t=90';
+		page.applyShareLink();
+		await Promise.resolve();
+		const expected = outcome === 'clamp' ? 60 : outcome === 'restart' ? 0 : 90;
+		expect(writes).toEqual([90, expected]);
+		expect(media.position).toBe(expected);
+		if (outcome === 'unknown') expect(page.read().pendingShareSeek).not.toBeNull();
+		else expect(page.read().pendingShareSeek).toBeNull();
+	}
+);
+
 test.each(['reattach', 'auth', 'route', 'query', 'source'] as const)(
 	'a metadata duration read cannot write after the share receipt loses %s', async (boundary) => {
 		const { page, location, element, writes, remount } = restartFixture();

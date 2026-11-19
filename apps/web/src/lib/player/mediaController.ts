@@ -61,7 +61,7 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 	let destroyed = false;
 	let positionIntent = 0;
 	const pendingShare = createPendingShareSeek();
-	let applyingShare: number | undefined;
+	let applyingShare: { revision: number; retry: boolean } | undefined;
 	let positioning = false;
 	let nextPosition: (() => void) | undefined;
 
@@ -150,10 +150,22 @@ export function createMediaController(matchesNative = matchesNativeSource) {
 	}
 
 	function retryShare(audio: HTMLAudioElement | undefined, revision: number): void {
-		if (!audio || !pendingShare.current || pendingShare.revision !== revision || applyingShare === revision || nextPosition) return;
+		if (!audio || !pendingShare.current || pendingShare.revision !== revision || nextPosition) return;
+		if (applyingShare?.revision === revision) {
+			applyingShare.retry = true;
+			return;
+		}
 		runPosition(() => {
-			applyingShare = revision;
-			try { pendingShare.apply(audio, revision); } finally { applyingShare = undefined; }
+			const attempt = { revision, retry: false };
+			applyingShare = attempt;
+			try {
+				pendingShare.apply(audio, revision);
+				// Coalesce callbacks into one follow-up after the native call unwinds.
+				// The existing receipt still gates the write and newer positions go first.
+				if (attempt.retry && !nextPosition) pendingShare.apply(audio, revision);
+			} finally {
+				applyingShare = undefined;
+			}
 		});
 	}
 
