@@ -111,3 +111,77 @@ exec 3>&-
 wait "$holder"
 wait "$contender"
 [[ "$(<"$dir/contender")" == $'1\nt' ]] || { printf 'rollback contender did not win an unexpired lease\n' >&2; exit 1; }
+
+# Synthetic eligibility only: the application does not have a publication writer.
+psql_run <<'SQL'
+INSERT INTO public.storage_digest_map_intents (map_id, object_id, environment_id, library_id, plaintext_bytes)
+SELECT gen_random_uuid(), object_id, environment_id, library_id, plaintext_bytes FROM public.storage_object_intents WHERE object_id::text LIKE '21000000-%';
+INSERT INTO public.storage_object_envelope_intents
+SELECT object_id, '51000000-0000-4000-8000-000000000001', decode('4e4e544d454430310002','hex')
+    || uuid_send('51000000-0000-4000-8000-000000000001') || uuid_send(environment_id) || uuid_send(library_id)
+    || uuid_send(object_id) || uuid_send(generation_id) || uuid_send(provider_configuration_version_id)
+    || int8send(plaintext_bytes) || int8send(envelope_bytes) || header_tag || decode(repeat('00',60),'hex')
+FROM public.storage_object_intents WHERE object_id::text LIKE '21000000-%';
+INSERT INTO public.storage_validated_digest_winners
+    (object_id, environment_id, library_id, plaintext_bytes, plaintext_sha256, root_version_id, retain_until)
+SELECT c.*, e.root_version_id, '-infinity' FROM public.storage_plaintext_digest_claim_intents c
+JOIN public.storage_object_envelope_intents e USING (object_id)
+WHERE c.object_id::text LIKE '21000000-%' AND right(c.object_id::text,2) IN ('01','09','10','11','12');
+CREATE FUNCTION public.digest_ref_fixture(n int, deleting bool, fault text DEFAULT '') RETURNS bool LANGUAGE sql AS $$
+SELECT CASE WHEN deleting THEN public.admit_storage_digest_delete(c.environment_id,c.library_id,c.plaintext_sha256,c.plaintext_bytes,c.object_id,i.generation_id,e.root_version_id)
+ELSE public.attach_storage_digest_reference(
+    CASE WHEN fault='environment' THEN gen_random_uuid() ELSE c.environment_id END,
+    CASE WHEN fault='library' THEN gen_random_uuid() ELSE c.library_id END,
+    CASE WHEN fault='digest' THEN decode(repeat('00',32),'hex') ELSE c.plaintext_sha256 END,
+    c.plaintext_bytes + (fault='size')::int, c.object_id,
+    CASE WHEN fault='generation' THEN gen_random_uuid() ELSE i.generation_id END,
+    CASE WHEN fault='revision' THEN gen_random_uuid() ELSE e.root_version_id END,
+    CASE WHEN fault='new reference' THEN gen_random_uuid() ELSE c.object_id END,
+    CASE WHEN fault='expired' THEN '-infinity'::timestamptz ELSE clock_timestamp() + interval '1 minute' END)
+END FROM public.storage_plaintext_digest_claim_intents c JOIN public.storage_object_intents i USING (object_id)
+JOIN public.storage_object_envelope_intents e USING (object_id) WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid $$;
+DO $$ DECLARE field text; BEGIN
+    FOREACH field IN ARRAY ARRAY['environment','library','digest','size','generation','revision','expired'] LOOP
+        IF public.digest_ref_fixture(1,false,field) IS DISTINCT FROM false THEN RAISE EXCEPTION 'attach accepted %', field; END IF;
+    END LOOP;
+    IF public.digest_ref_fixture(2,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'unvalidated attach'; END IF;
+    FOREACH field IN ARRAY ARRAY['retain_until','read_until','upload_until','delete_until'] LOOP
+        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''infinity'' WHERE right(object_id::text,2) = ''01''', field);
+        IF public.digest_ref_fixture(1,true) IS DISTINCT FROM false THEN RAISE EXCEPTION 'delete bypassed %', field; END IF;
+        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''-infinity'' WHERE right(object_id::text,2) = ''01''', field);
+    END LOOP;
+    INSERT INTO public.storage_validated_digest_winners SELECT e.object_id,w.environment_id,w.library_id,w.plaintext_bytes,w.plaintext_sha256,e.root_version_id,false,w.retain_until
+    FROM public.storage_validated_digest_winners w, public.storage_object_envelope_intents e
+    WHERE right(w.object_id::text,2)='01' AND e.object_id='21000000-0000-4000-8000-000000000002' ON CONFLICT DO NOTHING;
+    IF FOUND THEN RAISE EXCEPTION 'duplicate scoped winner'; END IF;
+    IF EXISTS (SELECT FROM public.storage_validated_digest_references) THEN RAISE EXCEPTION 'refusal wrote a reference'; END IF;
+    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM true THEN RAISE EXCEPTION 'valid attach refused'; END IF;
+    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'duplicate attach'; END IF;
+    UPDATE public.storage_validated_digest_winners SET quarantined=true WHERE right(object_id::text,2)='01';
+    IF public.digest_ref_fixture(1,false,'new reference') IS DISTINCT FROM false THEN RAISE EXCEPTION 'quarantined attach'; END IF;
+END $$;
+SQL
+
+# Observe the contender blocked in Postgres before letting the holder finish.
+for scenario in '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
+  read -r id deleting finish expected tombstone <<<"$scenario"
+  mkfifo "$dir/ref-$id"; exec 3<>"$dir/ref-$id"
+  psql_run -At <"$dir/ref-$id" >"$dir/ref-holder" & holder=$!
+  printf "BEGIN; SELECT public.digest_ref_fixture(%s,%s);\n\\! touch '%s/ready-%s'\n" "$id" "$deleting" "$dir" "$id" >&3
+  for _ in {1..100}; do [[ -e "$dir/ready-$id" ]] && break; sleep 0.1; done
+  [[ -e "$dir/ready-$id" ]] || exit 1
+  PGAPPNAME=digest_ref_contender psql_run -Atc "SELECT public.digest_ref_fixture($id, NOT $deleting)" >"$dir/ref-contender" & contender=$!
+  blocked=0
+  for _ in {1..100}; do
+    if [[ "$(psql_run -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name='digest_ref_contender' AND wait_event_type='Lock'")" == 1 ]]; then blocked=1; break; fi
+    sleep 0.1
+  done
+  [[ "$blocked" == 1 ]] || { printf 'reference contender did not block: %s\n' "$scenario" >&2; exit 1; }
+  printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
+  wait "$holder"; wait "$contender"
+  [[ "$(<"$dir/ref-holder")" == t && "$(<"$dir/ref-contender")" == "$expected" ]] || exit 1
+  object="$(printf '21000000-0000-4000-8000-%012d' "$id")"
+  [[ "$(psql_run -Atc "SELECT (deleting_at IS NOT NULL) = $tombstone AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id=w.object_id) <> $tombstone FROM public.storage_validated_digest_winners w WHERE object_id='$object'")" == t ]] || exit 1
+  printf 'reference/delete lock case passed: delete-first=%s holder=%s contender=%s\n' "$deleting" "$finish" "$expected"
+done
+psql_run -c 'DROP FUNCTION public.digest_ref_fixture(int, bool, text)'
