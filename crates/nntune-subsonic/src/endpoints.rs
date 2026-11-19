@@ -7,6 +7,7 @@
 //! real lifecycle (create → get → update → delete).
 
 use crate::auth::Identity;
+use crate::construction_budget::{BudgetExceeded, ConstructionBudget};
 use crate::envelope::code;
 use crate::library::{
     Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, NOW,
@@ -35,6 +36,32 @@ impl Params {
         Params { pairs }
     }
 
+    /// Parse preflighted sources in query-first order without copying a merged
+    /// string. Charge the pair storage and each decoded buffer before reserve.
+    pub fn parse_charged(
+        query: &str,
+        form: Option<&str>,
+        budget: &mut ConstructionBudget,
+    ) -> Result<Self, BudgetExceeded> {
+        let parts = [Some(query), form]
+            .into_iter()
+            .flatten()
+            .flat_map(|source| source.split('&'))
+            .filter(|part| !part.is_empty());
+        let count = parts
+            .clone()
+            .try_fold(0usize, |count, _| count.checked_add(1))
+            .ok_or(BudgetExceeded)?;
+        let mut pairs = budget.allocate_exact(count)?;
+        for part in parts {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            let key = decode_charged(k, budget)?;
+            let value = decode_charged(v, budget)?;
+            pairs.push((key, value));
+        }
+        Ok(Self { pairs })
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.pairs
             .iter()
@@ -55,8 +82,38 @@ pub(crate) fn decode(s: &str) -> String {
     // Percent-decode over raw bytes, then UTF-8 (lossy): multi-byte UTF-8
     // stays intact (`Bj%C3%B6rk` -> `Björk`) and a stray `%` never panics
     // (byte indexing is always safe; `&str` slicing is not).
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(s.len());
+    decode_bytes(s.as_bytes(), &mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_charged(s: &str, budget: &mut ConstructionBudget) -> Result<String, BudgetExceeded> {
+    let mut bytes = budget.allocate_exact(s.len())?;
+    decode_bytes(s.as_bytes(), &mut bytes);
+    let bytes = match String::from_utf8(bytes) {
+        Ok(text) => return Ok(text),
+        Err(error) => error.into_bytes(),
+    };
+    // The invalid buffer and the lossy replacement coexist until conversion
+    // finishes. Count exactly what will be written, with no temporary String.
+    let len = bytes
+        .utf8_chunks()
+        .try_fold(0usize, |len, chunk| {
+            let len = len.checked_add(chunk.valid().len())?;
+            len.checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })
+        })
+        .ok_or(BudgetExceeded)?;
+    let mut text = budget.allocate_exact(len)?;
+    for chunk in bytes.utf8_chunks() {
+        text.extend_from_slice(chunk.valid().as_bytes());
+        if !chunk.invalid().is_empty() {
+            text.extend_from_slice("\u{fffd}".as_bytes());
+        }
+    }
+    String::from_utf8(text).map_err(|_| BudgetExceeded)
+}
+
+fn decode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
@@ -80,7 +137,47 @@ pub(crate) fn decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+#[cfg_attr(test, test)]
+#[doc(hidden)]
+pub fn charged_params_preserve_order_and_lossy_decoding() {
+    let query = "&&i%64=%C3%A9&id=%ff%ee%80a&";
+    let form = Some("id=last&stray=%G1+%&empty");
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    expected
+        .charge(
+            5,
+            std::mem::size_of::<(String, String)>(),
+            std::mem::align_of::<(String, String)>(),
+        )
+        .unwrap();
+    for capacity in [4, 6, 2, 10, 7, 2, 4, 5, 5, 5, 0] {
+        expected.charge(capacity, 1, 1).unwrap();
+    }
+    let limit = expected.charged();
+    let mut strict = ConstructionBudget::new(limit - 1);
+    assert!(matches!(
+        Params::parse_charged(query, form, &mut strict),
+        Err(BudgetExceeded)
+    ));
+    let mut budget = ConstructionBudget::new(limit);
+    let parsed = Params::parse_charged(query, form, &mut budget).unwrap();
+    let legacy = Params::parse("&&i%64=%C3%A9&id=%ff%ee%80a&&id=last&stray=%G1+%&empty");
+    assert_eq!(parsed.pairs, legacy.pairs);
+    assert_eq!(parsed.get("id"), Some("é"));
+    assert_eq!(parsed.pairs.capacity(), 5);
+    assert_eq!(parsed.pairs[0].1.capacity(), 6);
+    assert_eq!(parsed.pairs[1].1.capacity(), 7);
+    assert_eq!(budget.charged(), limit);
+
+    let mut exhausted = ConstructionBudget::new(usize::MAX);
+    exhausted.charge(usize::MAX - 31, 1, 1).unwrap();
+    assert!(matches!(
+        Params::parse_charged(query, form, &mut exhausted),
+        Err(BudgetExceeded)
+    ));
 }
 
 fn hex_val(b: u8) -> Option<u8> {
