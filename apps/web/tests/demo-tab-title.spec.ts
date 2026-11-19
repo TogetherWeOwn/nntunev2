@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { isListenContextRequest } from './fixtures/listen-context.js';
 
 /**
  * Acceptance: the demo player tab shows the now-playing track (browser half).
@@ -303,10 +304,14 @@ test('TT-B-11 title-only transitions move no focus and change no DOM (GREEN cont
 });
 
 test('TT-B-12 title flows make zero network calls and add zero storage keys (GREEN control)', async ({
-	page
+	page, baseURL
 }) => {
 	const calls: { method: string; url: string; resourceType: string }[] = [];
+	await page.route('**/v1/plays/events/context', (route) =>
+		isListenContextRequest(route.request(), baseURL) ? route.fulfill({ status: 401 }) : route.fallback()
+	);
 	page.on('request', (request) => {
+		if (isListenContextRequest(request, baseURL)) return;
 		calls.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() });
 	});
 	await openPlayer(page);
