@@ -60,21 +60,14 @@ impl<'a> MemberBrowse<'a> {
                     "getAlbum" => match album() {
                         Some(album) => {
                             let songs = self.album_songs(budget, album)?;
-                            let (count, entries) = (songs.len() as i64, Value::List(songs));
-                            let [id, name, artist, artist_id, cover, count, duration, created] =
-                                album_fields(budget, album, count)?;
+                            let [id, name, artist, artist_id, art, count, duration, created] =
+                                album_fields(budget, album, songs.len() as i64)?;
+                            let song = ("song", Value::List(songs));
                             let payload = Value::charged_map(
                                 budget,
                                 [
-                                    id,
-                                    name,
-                                    artist,
-                                    artist_id,
-                                    cover,
-                                    count,
-                                    duration,
-                                    created,
-                                    ("song", entries),
+                                    id, name, artist, artist_id, art, count, duration, created,
+                                    song,
                                 ],
                             )?;
                             charged_ok_document(budget, [("album", payload)])?
@@ -201,21 +194,17 @@ impl<'a> MemberBrowse<'a> {
                 [("name", label), ("artist", Value::List(artists))],
             )?);
         }
-        let articles = Value::charged_str(budget, IGNORED_ARTICLES)?;
-        let index = Value::List(index);
+        let articles = (
+            "ignoredArticles",
+            Value::charged_str(budget, IGNORED_ARTICLES)?,
+        );
+        let index = ("index", Value::List(index));
         if endpoint == "getIndexes" {
-            let payload = Value::charged_map(
-                budget,
-                [
-                    ("lastModified", Value::Int(self.now_millis)),
-                    ("ignoredArticles", articles),
-                    ("index", index),
-                ],
-            )?;
+            let modified = ("lastModified", Value::Int(self.now_millis));
+            let payload = Value::charged_map(budget, [modified, articles, index])?;
             charged_ok_document(budget, [("indexes", payload)])
         } else {
-            let payload =
-                Value::charged_map(budget, [("ignoredArticles", articles), ("index", index)])?;
+            let payload = Value::charged_map(budget, [articles, index])?;
             charged_ok_document(budget, [("artists", payload)])
         }
     }
@@ -352,7 +341,6 @@ pub fn member_browse_boundaries() {
             })
         };
         let mut probe = ConstructionBudget::new(8 * 1024 * 1024);
-        probe.charge(8, 1, 1).unwrap();
         let actual = build(&mut probe).unwrap().unwrap();
         let expected = match handle_endpoint(&mut ordinary, &id, name, &params, false) {
             EndpointResult::Doc(payload) => ok_document(payload),
@@ -361,37 +349,50 @@ pub fn member_browse_boundaries() {
         };
         assert_eq!(actual, expected, "{name} {query}");
         let mut exact = ConstructionBudget::new(probe.charged());
-        exact.charge(8, 1, 1).unwrap();
         assert_eq!(build(&mut exact).unwrap(), Some(actual));
         let mut short = ConstructionBudget::new(probe.charged() - 1);
-        short.charge(8, 1, 1).unwrap();
         assert_eq!(build(&mut short), Err(BudgetExceeded));
     }
-    let first = songs[0].clone();
-    let second = Song {
-        disc: 2,
-        track: 1,
-        ..first.clone()
-    };
-    let repeats = [first, second];
+    let mut repeats = [songs[0].clone(), songs[0].clone()];
+    repeats[1].disc = 2;
+    repeats[1].track = 1;
     let view = MemberBrowse {
         songs: &repeats,
         ..view
     };
     let mut budget = ConstructionBudget::new(8 * 1024 * 1024);
     let occurrences = view.album_songs(&mut budget, &albums[0]).unwrap();
-    assert_eq!(occurrences.len(), 2);
-    assert_eq!(occurrences.capacity(), 2);
+    assert_eq!((occurrences.len(), occurrences.capacity()), (2, 2));
+    type Entry = (String, Value);
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    expected
+        .charge(2, size_of::<Value>(), align_of::<Value>())
+        .unwrap();
     for (occurrence, disc) in occurrences.iter().zip([1, 2]) {
         let Value::Map(fields) = occurrence else {
             panic!("expected song")
         };
         assert_eq!(fields.len(), fields.capacity());
+        expected
+            .charge(fields.len(), size_of::<Entry>(), align_of::<Entry>())
+            .unwrap();
+        for (key, value) in fields {
+            expected.charge(key.len(), 1, 1).unwrap();
+            let Value::Str(text) = value else { continue };
+            if !text.is_empty() {
+                expected.charge(text.len(), 1, 1).unwrap();
+            }
+        }
         assert_eq!(fields[0].1, Value::Str("so-1".into()));
         assert!(fields
             .iter()
             .any(|(key, value)| key == "discNumber" && *value == Value::Int(disc)));
     }
+    assert_eq!(budget.charged(), expected.charged());
+    let params = Params::parse("id=so-1");
+    let declined = view.document(&mut budget, "getSong", &params, |_| None);
+    let not_found = error_document(code::NOT_FOUND, "Song not found.");
+    assert_eq!(declined.unwrap(), Some(not_found));
     assert_eq!(index_key("The ßeta"), [b'S', b'S', 0]);
     assert_eq!(index_key("Les Æthers"), [b'#', 0, 0]);
 }
