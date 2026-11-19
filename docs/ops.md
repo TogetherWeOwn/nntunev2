@@ -532,8 +532,9 @@ renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 A confirmed-unapplied byte-identical renumber needs a source-only record
 in the trusted checker, pinned to the repository, PR, reviewed Git parent,
 paths, digest and target. Both passes require exact Git lineage and an
-unchanged accepted prefix. Trigger a fresh PR event after the checker
-lands; rerunning a prior event uses its old base. If the destination slot
+unchanged accepted prefix; neither accepts a new applied alias for the
+recorded identity, even in a different PR. Trigger a fresh PR event after
+the checker lands; rerunning a prior event uses its old base. If the slot
 changes, reconcile the new path with the checker owner before retrying.
 
 The secretless PR gate loads its checker and its stdlib-only

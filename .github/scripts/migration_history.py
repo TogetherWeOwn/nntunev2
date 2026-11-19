@@ -519,7 +519,7 @@ class UnappliedRename:
 
 
 def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit=None,
-           unapplied=None):
+           unapplied=None, unapplied_aliases=()):
     """Return Git-derived edges by final entry; validate all claimed provenance.
 
     Common-baseline metadata was verified when introduced and is immutable.
@@ -551,18 +551,17 @@ def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit
             raise HistoryError("source rename evidence is forged, missing, unreachable or belongs to another entry")
         if (events or claimed - old_events or aliases - old_aliases) and len(roots) != 1:
             raise HistoryError("ambiguous independent Git lineages at merge")
-        for alias in aliases - old_aliases:
+        new_aliases = aliases - old_aliases
+        if new_aliases.intersection(unapplied_aliases):
+            raise HistoryError("confirmed-unapplied identity must not become an applied alias")
+        for alias in new_aliases:
             if not any(e[2] == "migrations/" + alias[0] and e[4] == alias[1] for e in events):
                 raise HistoryError("new applied alias lacks genuine byte-identical historical provenance")
         unapplied_edge = None
-        if unapplied:
-            old_name = unapplied.old_path.removeprefix("migrations/")
-            if (old_name, unapplied.sha256) in aliases:
-                raise HistoryError("confirmed-unapplied name must not become an applied alias")
-            if path == unapplied.new_path and name not in previous:
-                unapplied_edge = unapplied.verify(history, entries, entry, events)
-                if audit is not None:
-                    audit["unapplied_rename"] = dict(zip(EDGE_KEYS, unapplied_edge))
+        if unapplied and path == unapplied.new_path and name not in previous:
+            unapplied_edge = unapplied.verify(history, entries, entry, events)
+            if audit is not None:
+                audit["unapplied_rename"] = dict(zip(EDGE_KEYS, unapplied_edge))
         for event in events:
             if event in owners and owners[event] != name:
                 raise HistoryError("rename edge resolves to multiple current entries")

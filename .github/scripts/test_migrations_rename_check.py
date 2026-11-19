@@ -912,17 +912,27 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(outcomes["effective"]["outcome"], "failed")
         self.assertIn("changes the accepted migration prefix", outcomes["diagnostic"])
 
-    def test_unapplied_rename_rejects_forgery_alias_and_prefix_edits(self):
+    def test_workflow_rejects_unapplied_alias_independently_of_pr_authority(self):
+        entries, _, pin = self.unapplied_restack()
+        entries[1]["renamed_from"] = [{"file": "0001_purge.sql", "sha256": pin.sha256}]
+        head, _ = self.source_witness(entries)
+        pages = [[{"filename": "migrations/manifest.toml", "status": "modified"},
+                  {"filename": pin.new_path, "status": "added"}]]
+        live = {"base": {"sha": self.base}, "head": {"sha": head}, "changed_files": 2}
+        for recorded_pr in (1, 2):
+            with self.subTest(recorded_pr=recorded_pr):
+                key = (1, "example/project", recorded_pr, "main", "feature")
+                result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("must not become an applied alias", result.stderr)
+
+    def test_unapplied_rename_rejects_forgery_and_prefix_edits(self):
         entries, head, pin = self.unapplied_restack()
         entries[1]["source_rename_history"] = [dict(zip(history.EDGE_KEYS,
             (self.base, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256)))]
         with self.assertRaisesRegex(history.HistoryError, "evidence is forged"):
             history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
         entries[1].pop("source_rename_history")
-        entries[1]["renamed_from"] = [{"file": "0001_purge.sql", "sha256": pin.sha256}]
-        with self.assertRaisesRegex(history.HistoryError, "must not become an applied alias"):
-            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
-        entries[1].pop("renamed_from")
         entries[0]["target"] = "mirror"
         with self.assertRaisesRegex(history.HistoryError, "changes the accepted migration prefix"):
             history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)

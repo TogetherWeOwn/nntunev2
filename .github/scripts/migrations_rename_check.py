@@ -33,13 +33,16 @@ REVIEWED_UNAPPLIED = {
 }
 
 
-def reviewed_unapplied(expected):
+def unapplied_policy(expected):
     base, head = expected["base"], expected["head"]
     repo = base["repo"]
-    if repo != head["repo"]:
-        return None
-    return REVIEWED_UNAPPLIED.get(
-        (repo["id"], repo["full_name"], expected["number"], base["ref"], head["ref"]))
+    identity = repo["id"], repo["full_name"]
+    # Deny new aliases for known-unapplied identities even when this PR
+    # (or a fork) is not authorized to use their source-only record.
+    aliases = {(record.old_path.removeprefix("migrations/"), record.sha256)
+               for key, record in REVIEWED_UNAPPLIED.items() if key[:2] == identity}
+    record = REVIEWED_UNAPPLIED.get((*identity, expected["number"], base["ref"], head["ref"]))
+    return {"unapplied": record if repo == head["repo"] else None, "unapplied_aliases": aliases}
 
 
 def main(argv=None):
@@ -68,14 +71,14 @@ def main(argv=None):
                                                     files_text, metadata_text, expected, budget)
             for name, base in (("event", args.base_sha), ("effective", effective)):
                 outcomes[name].update(base=base, head=args.head_sha)
-            unapplied = reviewed_unapplied(expected)
+            policy = unapplied_policy(expected)
             # Never let B1 absorb an event-range edge or the original baseline.
             active_pass = "event"
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text,
-                           budget=budget, audit=outcomes["event"], unapplied=unapplied)
+                           budget=budget, audit=outcomes["event"], **policy)
             active_pass = "effective"
             verify(args.root, effective, args.head_sha, manifest_text, coverage,
-                   budget=budget, audit=outcomes["effective"], unapplied=unapplied)
+                   budget=budget, audit=outcomes["effective"], **policy)
             budget.remaining(1)
             active_pass = None
         else:
