@@ -6,9 +6,20 @@
 
 use nntune_core::digest_enrollment::OriginManifest;
 
-const STORE_SQL: &str = "SELECT public.store_storage_digest_candidate(
+const STORE_SQL: &str = "WITH locked_reservation AS MATERIALIZED (
+    SELECT r.object_id FROM public.storage_digest_reservations AS r
+    JOIN public.storage_plaintext_digest_claim_intents AS c
+      ON (c.object_id, c.environment_id, c.library_id, c.plaintext_bytes, c.plaintext_sha256)
+       = (r.object_id, r.environment_id, r.library_id, r.plaintext_bytes, r.plaintext_sha256)
+    WHERE r.environment_id = $1::text::uuid AND r.library_id = $2::text::uuid
+      AND r.object_id = $3::text::uuid AND r.plaintext_bytes = $7
+      AND r.plaintext_sha256 = $11
+    FOR UPDATE OF r
+)
+SELECT public.store_storage_digest_candidate(
     i.environment_id, i.library_id, i.object_id, $6::text::uuid, $9, $10)
 FROM public.storage_object_intents AS i
+JOIN locked_reservation AS r ON r.object_id = i.object_id
 WHERE i.environment_id = $1::text::uuid AND i.library_id = $2::text::uuid
   AND i.object_id = $3::text::uuid AND i.generation_id = $4::text::uuid
   AND i.provider_configuration_version_id = $5::text::uuid
@@ -21,8 +32,9 @@ fn uuid(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A single statement matches the immutable DB intent and invokes the fenced
-/// candidate function.
+/// A single statement locks the digest-keyed reservation, matches the immutable
+/// DB intent, and invokes the fenced candidate function. This lock is not an
+/// authoritative reconciliation fence or proof of key custody.
 ///
 /// Pass a dedicated, freshly connected client in autocommit mode, with no open
 /// transaction and no other statements using the connection. Only under this
@@ -62,6 +74,7 @@ async fn store_with_deadline<D: std::future::Future<Output = ()>>(
     let map = uuid(&intent.map_id);
     let length = i64::try_from(intent.plaintext_len).map_err(|_| CandidateError::Identity)?;
     let header = intent.header.to_vec();
+    let digest = manifest.plaintext_sha256().to_vec();
     let generation = intent.reservation_generation;
     crate::library::with_db_deadline(
         async move {
@@ -79,6 +92,7 @@ async fn store_with_deadline<D: std::future::Future<Output = ()>>(
                         &header,
                         &generation,
                         &hashes,
+                        &digest,
                     ],
                 )
                 .await
@@ -164,9 +178,9 @@ mod tests {
             "INSERT INTO public.storage_environments VALUES ('{0}');
              INSERT INTO public.storage_library_namespaces VALUES ('{1}', '{0}', NULL);
              INSERT INTO public.storage_object_intents VALUES ('{2}', '{3}', '{0}', '{1}', '{4}', 1, 65, decode('{5}', 'hex'));
-             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('ab',32),'hex') FROM public.storage_object_intents WHERE object_id = '{2}';
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode('{6}','hex') FROM public.storage_object_intents WHERE object_id = '{2}';
              SELECT public.reserve_storage_digest('{2}', 3600);",
-            ids[0], ids[1], ids[2], ids[3], ids[4], hex::encode(header)
+            ids[0], ids[1], ids[2], ids[3], ids[4], hex::encode(header), hex::encode(manifest.plaintext_sha256())
         )).await.unwrap();
 
         // A manifest mismatch must be rejected before persistence.
@@ -249,7 +263,7 @@ mod tests {
         let other_strings = other_ids.map(|value| uuid(&value));
         let mut provider_origin = DigestEnrollment::new(1, other_ids, id(30)).unwrap();
         let provider_header = provider_origin.header().to_bytes();
-        provider_origin.seal_chunk(&[42]).unwrap();
+        provider_origin.seal_chunk(&[43]).unwrap();
         let provider_manifest = provider_origin.finish().ok().unwrap();
         let provider_intent = CandidateIntent {
             identities: other_ids,
@@ -259,8 +273,8 @@ mod tests {
         };
         db.batch_execute(&format!(
             "INSERT INTO public.storage_object_intents VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', 1, 65, decode('{5}', 'hex'));
-             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('cd',32),'hex') FROM public.storage_object_intents WHERE object_id = '{0}';",
-            other_strings[2], other_strings[3], ids[0], ids[1], ids[4], hex::encode(provider_header)
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode('{6}','hex') FROM public.storage_object_intents WHERE object_id = '{0}';",
+            other_strings[2], other_strings[3], ids[0], ids[1], ids[4], hex::encode(provider_header), hex::encode(provider_manifest.plaintext_sha256())
         )).await.unwrap();
         let provider_generation: i64 = db
             .query_one(
@@ -282,6 +296,48 @@ mod tests {
             Err(CandidateError::MissingOrFenced)
         );
         assert_no_candidate(&db, &other_strings[2], &uuid(&provider_intent.map_id)).await;
+
+        // All other identities match, but the persisted assertion is not the
+        // digest produced from the sealer's plaintext.
+        let mismatch_ids = [id(37), id(38), id(39), id(40), id(41)];
+        let mismatch_strings = mismatch_ids.map(|value| uuid(&value));
+        let mut mismatch_builder = DigestEnrollment::new(1, mismatch_ids, id(42)).unwrap();
+        let mismatch_header = mismatch_builder.header().to_bytes();
+        mismatch_builder.seal_chunk(&[42]).unwrap();
+        let mismatch_manifest = mismatch_builder.finish().ok().unwrap();
+        let mismatch_intent = CandidateIntent {
+            identities: mismatch_ids,
+            plaintext_len: 1,
+            map_id: id(42),
+            header: mismatch_header,
+            reservation_generation: 1,
+        };
+        db.batch_execute(&format!(
+            "INSERT INTO public.storage_environments VALUES ('{0}');
+             INSERT INTO public.storage_library_namespaces VALUES ('{1}', '{0}', NULL);
+             INSERT INTO public.storage_object_intents VALUES ('{2}', '{3}', '{0}', '{1}', '{4}', 1, 65, decode('{5}', 'hex'));
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('ab',32),'hex') FROM public.storage_object_intents WHERE object_id = '{2}';
+             SELECT public.reserve_storage_digest('{2}', 3600);",
+            mismatch_strings[0], mismatch_strings[1], mismatch_strings[2], mismatch_strings[3], mismatch_strings[4], hex::encode(mismatch_header)
+        )).await.unwrap();
+        let mismatch_row = db.query_one(
+            "SELECT plaintext_sha256, generation FROM public.storage_digest_reservations WHERE object_id = $1::text::uuid",
+            &[&mismatch_strings[2]],
+        ).await.unwrap();
+        let asserted_digest: Vec<u8> = mismatch_row.get(0);
+        assert_ne!(asserted_digest, mismatch_manifest.plaintext_sha256());
+        assert_eq!(mismatch_row.get::<_, i64>(1), 1);
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &mismatch_intent,
+                &mismatch_manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::MissingOrFenced)
+        );
+        assert_no_candidate(&db, &mismatch_strings[2], &uuid(&mismatch_intent.map_id)).await;
 
         intent.reservation_generation = 2;
         assert_eq!(
@@ -330,6 +386,50 @@ mod tests {
         );
         assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
         intent.reservation_generation = 2;
+
+        // Hold an uncommitted successor on the same digest key. The actual
+        // adapter must wait on that row rather than writing beside it.
+        let locker = connect(&url).await;
+        locker.batch_execute("BEGIN").await.unwrap();
+        locker.execute("UPDATE public.storage_digest_reservations SET expires_at = clock_timestamp() - interval '1 second' WHERE object_id = $1::text::uuid", &[&ids[2]]).await.unwrap();
+        let successor: i64 = locker
+            .query_one(
+                "SELECT public.reserve_storage_digest($1::text::uuid, 3600)",
+                &[&ids[2]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(successor, 3);
+        let waiting_writer = connect(&url).await;
+        waiting_writer
+            .batch_execute("SET lock_timeout = '250ms'")
+            .await
+            .unwrap();
+        assert_eq!(
+            store_with_deadline(waiting_writer, &intent, &manifest, std::future::pending()).await,
+            Err(CandidateError::UnknownCommit)
+        );
+        assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
+        locker.batch_execute("COMMIT").await.unwrap();
+        let committed = db.query_one(
+            "SELECT generation, expires_at > clock_timestamp() FROM public.storage_digest_reservations WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid AND object_id = $3::text::uuid AND plaintext_bytes = $4 AND plaintext_sha256 = $5",
+            &[&ids[0], &ids[1], &ids[2], &1_i64, &manifest.plaintext_sha256().to_vec()],
+        ).await.unwrap();
+        assert_eq!(committed.get::<_, i64>(0), successor);
+        assert!(committed.get::<_, bool>(1));
+        assert_eq!(
+            store_with_deadline(
+                connect(&url).await,
+                &intent,
+                &manifest,
+                std::future::pending()
+            )
+            .await,
+            Err(CandidateError::Permanent)
+        );
+        assert_no_candidate(&db, &ids[2], &uuid(&intent.map_id)).await;
+        intent.reservation_generation = successor;
         assert_eq!(
             store_with_deadline(
                 connect(&url).await,
@@ -414,9 +514,9 @@ mod tests {
             "INSERT INTO public.storage_environments VALUES ('{0}');
              INSERT INTO public.storage_library_namespaces VALUES ('{1}', '{0}', NULL);
              INSERT INTO public.storage_object_intents VALUES ('{2}', '{3}', '{0}', '{1}', '{4}', {5}, {6}, decode('{7}', 'hex'));
-             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode(repeat('cd',32),'hex') FROM public.storage_object_intents WHERE object_id = '{2}';",
+             INSERT INTO public.storage_plaintext_digest_claim_intents SELECT object_id, environment_id, library_id, plaintext_bytes, decode('{8}','hex') FROM public.storage_object_intents WHERE object_id = '{2}';",
             multi_uuids[0], multi_uuids[1], multi_uuids[2], multi_uuids[3], multi_uuids[4],
-            length, length + 48 + 257 * 16, hex::encode(multi_header)
+            length, length + 48 + 257 * 16, hex::encode(multi_header), hex::encode(multi_manifest.plaintext_sha256())
         )).await.unwrap();
         let generation: i64 = db
             .query_one(
