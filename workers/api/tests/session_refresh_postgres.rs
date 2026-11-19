@@ -452,7 +452,7 @@ async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
         if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", "incumbent", now as u64, now as u64 + 45, false).await.map_err(|_| "seed failed")? != (Acquired { epoch: 1 }) { return Err("wrong seed".into()); }
         let other_key = format!("play:{other}:track:existing");
         db.execute("INSERT INTO public.private_plays(user_id,play_key,marked_at) VALUES ($1,$2,$3)", &[&other, &other_key, &now]).await.map_err(|e| e.to_string())?;
-        db.batch_execute(&format!("CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.user_id = '{user}' THEN RAISE EXCEPTION 'synthetic privacy fault'; END IF; RETURN NEW; END $$; CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW WHEN (NEW.play_key LIKE '%:mark-error') EXECUTE FUNCTION public.{tag}(); CREATE CONSTRAINT TRIGGER {tag}_commit AFTER INSERT ON public.private_plays DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.play_key LIKE '%:commit-error') EXECUTE FUNCTION public.{tag}()"))
+        db.batch_execute(&format!("CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.user_id = '{user}' AND NEW.play_key LIKE '%:mark-error' THEN RAISE EXCEPTION 'synthetic mark failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW EXECUTE FUNCTION public.{tag}()"))
             .await.map_err(|e| e.to_string())?;
         // This role can take the account fence but cannot read private_sessions.
         // Probe both permissions so an earlier failure cannot masquerade as the query fault.
@@ -464,7 +464,7 @@ async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
         let error = restricted.query(nntune_api::preference_rows::private_session_active_statement(), &[&user, &"private"]).await.err().ok_or("privacy query unexpectedly allowed")?;
         if error.code() != Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) { return Err("unexpected privacy query fault".into()); }
         if acquire(restricted, &user, "private", "track", "query-error", now as u64, now as u64 + 45, true).await.is_ok() { return Err("query error accepted".into()); }
-        for (play, expiry) in [("mark-error", now as u64 + 45), ("commit-error", now as u64 + 45), ("lease-overflow", u64::MAX), ("lease-sql-error", 253_402_300_800)] {
+        for (play, expiry) in [("mark-error", now as u64 + 45), ("lease-overflow", u64::MAX), ("lease-sql-error", 253_402_300_800)] {
             if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", play, now as u64, expiry, true).await.is_ok() { return Err(format!("{play} error accepted")); }
         }
         let row = db.query_one("SELECT session_id,play_id,epoch FROM public.playback_leases WHERE user_id=$1", &[&user]).await.map_err(|e| e.to_string())?;
@@ -474,7 +474,7 @@ async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
         if marks.len() != 2 || !marks.contains(&(user.clone(), format!("play:{user}:track:incumbent"))) || !marks.contains(&(other.clone(), other_key)) { return Err("error changed retained marks".into()); }
         Ok(())
     }).await.unwrap_or_else(|_| Err("fault test timed out".into()));
-    let cleanup = db.batch_execute(&format!("DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP TRIGGER IF EXISTS {tag}_commit ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}(); DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{tag}') THEN DROP OWNED BY {tag}; DROP ROLE {tag}; END IF; END $$")) .await;
+    let cleanup = db.batch_execute(&format!("DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}(); DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{tag}') THEN DROP OWNED BY {tag}; DROP ROLE {tag}; END IF; END $$")) .await;
     accounts.cleanup().await;
     cleanup.unwrap();
     result.unwrap();

@@ -1951,6 +1951,9 @@ where
             200,
             serde_json::json!({"session_id": session_id, "private_until": private_until}),
         ),
+        Err(_) if matches!(ctx.store.account_deleting(owner).await, Ok(true)) => {
+            account_deleting_response()
+        }
         Err(_) => unavailable(),
     }
 }
@@ -8070,6 +8073,7 @@ mod tests {
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
         fail_deleting_probe: RefCell<bool>,
+        mark_deleting_after_next_probe: std::cell::Cell<bool>,
         /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
@@ -10113,7 +10117,11 @@ mod tests {
             if *self.fail_deleting_probe.borrow() {
                 return Err(StoreError);
             }
-            Ok(self.deleting_users.borrow().contains(user_id))
+            let deleting = self.deleting_users.borrow().contains(user_id);
+            if self.mark_deleting_after_next_probe.take() {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            Ok(deleting)
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
             // Mirror the production EXISTS probe: credential, any
@@ -16582,8 +16590,19 @@ mod tests {
         *h.store.fail_deleting_probe.borrow_mut() = false;
         *h.store.fail_private_session_write.borrow_mut() = true;
         check(&req, 503, 2);
-        req.body = br#"{"session_id":"new","enabled":true}"#.to_vec();
+        let enable = br#"{"session_id":"new","enabled":true}"#;
+        req.body = enable.to_vec();
         check(&req, 503, 3);
+        *h.store.fail_private_session_write.borrow_mut() = false;
+        for (index, body) in [enable.as_slice(), br#"{"session_id":"s","enabled":false}"#]
+            .into_iter()
+            .enumerate()
+        {
+            req.body = body.to_vec();
+            h.store.mark_deleting_after_next_probe.set(true);
+            check(&req, 409, 4 + index);
+            h.store.deleting_users.borrow_mut().clear();
+        }
     }
 
     #[test]

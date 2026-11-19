@@ -6,9 +6,8 @@
 //! Builder contract: PgStore::bounded(operation, timeout_ms) races one store
 //! operation against the shared with_deadline helper, expiring to the opaque
 //! StoreError. Every `Store for PgStore` method and `SingleUseStore::claim`
-//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS, directly
-//! or through a helper that owns the whole operation. The async block
-//! contains that method's connects — self.connect(), the
+//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
+//! async block contains that method's connects — self.connect(), the
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).

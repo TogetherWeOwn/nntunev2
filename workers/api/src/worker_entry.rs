@@ -957,11 +957,18 @@ pub async fn private_aware_lease_for_postgres_test(
     expires_at: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-    session_retry_store_for_postgres_test(client)
-        .acquire_playback_lease(
-            user_id, session_id, track_id, play_id, now, expires_at, takeover,
-        )
-        .await
+    PgStore {
+        env: None,
+        trace_id: "postgres-private-lease-test".into(),
+        mirror_binding: MirrorBinding::Configured,
+        test_client: std::cell::RefCell::new(Some(client)),
+        test_connect: None,
+        test_mirror: None,
+    }
+    .acquire_playback_lease(
+        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+    )
+    .await
 }
 
 /// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
