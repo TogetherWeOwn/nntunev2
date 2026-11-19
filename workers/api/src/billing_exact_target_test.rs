@@ -216,11 +216,21 @@ pub(super) async fn check() -> Result<(), &'static str> {
 
     // This pass read absence before the slot release. Another commit has now
     // created the target; a delayed pass without proof must retry, not append.
-    let mut delayed = outcome;
+    let mut delayed = outcome.clone();
     delayed.history[0].stripe_invoice_id = "in_worker_provenance".into();
     delayed.row.cancel_at_period_end = true;
     for status in ["active", "trialing", "canceled"] {
         let before = state(TARGET, Some(status)).await?;
+        if store
+            .store_reconcile_owned(USER.into(), outcome.clone(), ReconcileProbe::None)
+            .await
+            .is_ok()
+        {
+            return Err("unchanged absence fold accepted for an existing target");
+        }
+        if state(TARGET, None).await? != before || state(HOLDER, None).await? != released {
+            return Err("unchanged absence fold mutated committed subscription or history");
+        }
         for paid_end in [None, Some(END - 1), Some(END), Some(END + 1)] {
             delayed.row.paid_through_unix = paid_end;
             delayed.row.paid_invoice_id = match paid_end {
