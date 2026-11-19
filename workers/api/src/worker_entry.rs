@@ -748,6 +748,9 @@ impl MirrorBinding {
     }
 }
 
+#[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
+#[path = "subsonic_membership.rs"]
+pub(crate) mod subsonic_membership;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 

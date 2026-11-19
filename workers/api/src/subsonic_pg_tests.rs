@@ -46,6 +46,75 @@ async fn database() -> Client {
 }
 
 #[tokio::test]
+async fn staging_membership_admits_only_complete_owner_scoped_pages() {
+    use super::super::subsonic_membership::read_membership;
+    use nntune_subsonic::construction_budget::ConstructionBudget;
+    const SHARED: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const RECORDING: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const TRANSFER: i32 = 6 * 36;
+    let mut client = database().await;
+    client
+        .batch_execute(
+            "CREATE TEMP TABLE library (user_id text, release_mbid text, recording_mbids text[])",
+        )
+        .await
+        .unwrap();
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    let empty = read_membership(&mut client, &mut budget, USER, 0, 0)
+        .await
+        .unwrap();
+    assert!(empty.releases.is_empty() && empty.pairs.is_empty());
+    client
+        .execute(
+            "INSERT INTO library VALUES ($1, upper($2), ARRAY[$4]), (NULL, $3, ARRAY[$4]), \
+         ('other', $4, ARRAY[$2]), ($1, repeat('é', 512), '{}')",
+            &[&USER, &ID, &SHARED, &RECORDING],
+        )
+        .await
+        .unwrap();
+    for (cap, remaining) in [(2, TRANSFER), (3, TRANSFER - 1)] {
+        let mut budget = ConstructionBudget::new(8 * 1024);
+        assert!(
+            read_membership(&mut client, &mut budget, USER, cap, remaining)
+                .await
+                .is_err()
+        );
+    }
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    let membership = read_membership(&mut client, &mut budget, USER, 3, TRANSFER)
+        .await
+        .unwrap();
+    assert_eq!(membership.remaining_text_bytes, 0);
+    assert_eq!(membership.releases.as_slice(), [ID, SHARED]);
+    assert_eq!(membership.pairs.len(), 2);
+    for (pair, release) in membership.pairs.iter().zip([ID, SHARED]) {
+        assert_eq!((pair.0.as_str(), pair.1.as_str()), (release, RECORDING));
+    }
+    client.batch_execute("UPDATE library SET release_mbid = release_mbid || 'x' WHERE octet_length(release_mbid) = 1024").await.unwrap();
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    assert!(read_membership(&mut client, &mut budget, USER, 3, TRANSFER)
+        .await
+        .is_err());
+    client
+        .execute(
+            "DELETE FROM library WHERE octet_length(release_mbid) > 1024",
+            &[],
+        )
+        .await
+        .unwrap();
+    client.execute(
+        "UPDATE library SET recording_mbids = array_append(recording_mbids, $2) WHERE user_id = $1",
+        &[&USER, &ID],
+    ).await.unwrap();
+    let mut budget = ConstructionBudget::new(8 * 1024);
+    assert!(
+        read_membership(&mut client, &mut budget, USER, 2, TRANSFER + 72)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn exact_lookup_completion_and_reindex_are_committed() {
     let mut client = database().await;
     assert!(lookup(&mut client, Some(2), &"a".repeat(64))
