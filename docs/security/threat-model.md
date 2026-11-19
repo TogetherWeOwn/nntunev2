@@ -209,7 +209,8 @@ isolation, migrations, or workflow permissions. This docs-only refresh records
 requirements; it does not implement or prove them. The slice-1 vault core
 (`provider_vaults` + envelope code) merged before the gate existed; its
 retroactive items are the `kek-rotation.md` §8 follow-ups (follow-up migration,
-`kek_by_version`, re-wrap job, staging drill, retire-after, §10 drill). A CISO
+`kek_by_version`, re-wrap job, staging drill, retire-after). The §10 drill
+was part of the historical vault design, not an active incident procedure. A CISO
 verdict is required on each applicable implementation PR before merge. Normal
 flow never waits on CISO — ONLY these paths do. The verdict checks, at the
 exact implementation PR head:
@@ -229,9 +230,13 @@ exact implementation PR head:
    revoke); grant mint/verify honors the §5 TTL cap (clamp at issue,
    `TtlTooLong` at verify); media playback uses a §5 transport (header player
    or grant cookie, never signed query strings).
-8. KEK retire honors backup/PITR retention (`kek-rotation.md` §5, retire-after
-   date); a KEK-exposure response follows the `kek-rotation.md` §10
-   compromise path, never routine rotation alone.
+8. KEK retirement honors backup/PITR retention (`kek-rotation.md` §5,
+   retire-after date). Report suspected or confirmed exposure privately via
+   [SECURITY.md](../../SECURITY.md) and use only separately authorized
+   containment for active consumers. Record any unavailable containment
+   procedure as an open gap in the private incident record. Neither routine
+   rotation nor the historical vault design (`kek-rotation.md` §10) is active
+   compromise containment.
 
 ## 9. Findings index
 

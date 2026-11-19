@@ -8,7 +8,7 @@ import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
 import { createQueueController } from '#lib/player/queueController.js';
 import { createMediaController } from '#lib/player/mediaController.js';
-import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
+import { describeJump } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -62,8 +62,12 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		}
-		getAttribute = (name: string) => name === 'src' ? track.streamUrl : null;
-		isConnected = true; ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
+		sourceAttribute = track.streamUrl;
+		getAttribute = (name: string) => name === 'src' ? this.sourceAttribute : null;
+		connected = true;
+		get isConnected() { return this.connected; }
+		set isConnected(value: boolean) { this.connected = value; }
+		ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
 		volume = 0.6; muted = false; playbackRate = 1.25;
 		play = () => Promise.resolve();
 		pause() { this.paused = true; }
@@ -85,9 +89,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
+		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
 		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		createQueueController, createMediaController, streamUrl: track.streamUrl,
+		createQueueController,
+		createMediaController: () => createMediaController((audio, source) =>
+			audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source),
 		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -259,7 +265,8 @@ test.each([false, true])('restart with a queue edit during assignment (newer jum
 	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral', 'pine']);
 	expect(media.position).toBe(newerJump ? 10 : 0);
 	expect(page.read().jumpStatus).toBe(newerJump ? 'Forward 10 seconds, now at 0:10.' : '');
-	expect(read).not.toHaveBeenCalled();
+	// If queued, only the newer jump reads its starting position and readback.
+	expect(read).toHaveBeenCalledTimes(newerJump ? 2 : 0);
 	expect(page.read().restartStatusVersion).toBe(0);
 });
 
@@ -837,6 +844,159 @@ test('a refused jump still supersedes a pending share seek for the source', () =
 	media.refuse = false;
 	page.applyPendingShareSeek();
 	expect(media.position).toBe(30);
+});
+
+test('a deferred Back cancels an older share before a metadata retry', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	let firstRead = true;
+	Object.defineProperty(element, 'duration', { get() {
+		if (firstRead) {
+			firstRead = false;
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+			page.jump('back');
+			element.dispatchEvent(new Event('loadedmetadata'));
+		}
+		return media.duration;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([20]);
+	expect(media.position).toBe(20);
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 0:20.');
+});
+
+test.each(['account', 'queue', 'attachment'] as const)(
+	'jump cannot write after a native getter revokes its %s receipt', (boundary) => {
+		const { page, element, writes, remount } = restartFixture();
+		Object.defineProperty(element, 'seekable', { get() {
+			if (boundary === 'account') page.resetAuth();
+			if (boundary === 'queue') page.replaceQueue({ ...page.read().queue });
+			if (boundary === 'attachment') remount();
+			return { length: 1, start: () => 0, end: () => 120 };
+		} });
+		page.jump('forward');
+		expect(writes).toEqual([]);
+		expect(page.read().jumpStatus).toBe('');
+	}
+);
+
+test('a newer share received by a jump source getter survives the old gesture', async () => {
+	const { page, element, location, writes, track } = restartFixture();
+	element.getAttribute = () => {
+		element.getAttribute = () => track.streamUrl;
+		location.search = '?track=coral&t=45';
+		page.applyShareLink();
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(writes).toEqual([]);
+	await Promise.resolve();
+	expect(writes).toEqual([45]);
+});
+
+test.each([
+	['jump', 1], ['jump', 2], ['restart', 2]
+] as const)('%s cannot write if pre-write connectivity read %s changes the source', (gesture, order) => {
+	const { page, element, media, writes } = restartFixture();
+	let targetChecked = false;
+	let connectivityReads = 0;
+	let positionReads = 0;
+	Object.defineProperties(element, {
+		seekable: { get() {
+			if (gesture === 'jump') targetChecked = true;
+			return { length: 1, start: () => 0, end: () => 120 };
+		} },
+		currentTime: { get() {
+			// Restart reads the position once for availability, then once for the write.
+			if (gesture === 'restart' && ++positionReads === 2) targetChecked = true;
+			return media.position;
+		}, set(value: number) { writes.push(value); media.position = value; } },
+		isConnected: { get() {
+			if (targetChecked && ++connectivityReads === order) element.sourceAttribute = '/test-audio/replacement';
+			return true;
+		} }
+	});
+	if (gesture === 'restart') page.restart(); else page.jump('forward');
+	expect(element.sourceAttribute).toBe('/test-audio/replacement');
+	expect(writes).toEqual([]);
+	expect(media.position).toBe(30);
+	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a source read that disconnects the element cannot authorize a jump', () => {
+	const { page, element, track, writes } = restartFixture();
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (targetChecked) element.isConnected = false;
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(element.isConnected).toBe(false);
+	expect(writes).toEqual([]);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test.each(['before', 'after'])('unreadable source %s assignment retires feedback only if the jump wrote', (order) => {
+	const { page, element, media, track, writes } = restartFixture();
+	page.jump('forward');
+	const priorStatus = 'Forward 10 seconds, now at 0:40.';
+	expect(page.read().jumpStatus).toBe(priorStatus);
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (order === 'before' ? targetChecked : media.position === 50) throw new Error('unreadable source');
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(writes).toEqual(order === 'before' ? [40] : [40, 50]);
+	expect(page.read().jumpStatus).toBe(order === 'before' ? priorStatus : '');
+});
+
+test.each(['before', 'after'])('a restart called %s the jump setter stores its value wins', (order) => {
+	const { page, element, media, writes } = restartFixture();
+	Object.defineProperty(element, 'currentTime', {
+		get: () => media.position,
+		set: (seconds: number) => {
+			writes.push(seconds);
+			if (seconds !== 0 && order === 'before') page.restart();
+			media.position = seconds;
+			page.seeking();
+			if (seconds !== 0 && order === 'after') page.restart();
+		}
+	});
+	page.jump('forward');
+	expect(writes).toEqual([40, 0]);
+	expect(media.position).toBe(0);
+	expect(page.read().restartStatus).toBe('Restarted Coral Night.');
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a new share supersedes a restart deferred by the jump setter', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	Object.defineProperty(element, 'currentTime', { get: () => media.position, set(seconds: number) {
+		writes.push(seconds);
+		if (seconds === 40) {
+			page.restart();
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+		}
+		media.position = seconds;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([40, 45]);
+	expect(media.position).toBe(45);
+	expect(page.read().restartStatusVersion).toBe(0);
+	expect(page.read().jumpStatus).toBe('');
 });
 
 test('restart clears an earlier jump position readout', () => {
