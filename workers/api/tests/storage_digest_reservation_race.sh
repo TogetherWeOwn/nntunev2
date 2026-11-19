@@ -113,30 +113,8 @@ wait "$contender"
 [[ "$(<"$dir/contender")" == $'1\nt' ]] || { printf 'rollback contender did not win an unexpired lease\n' >&2; exit 1; }
 
 psql_run -f "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/storage_digest_reference.sql"
-psql_run <<'SQL'
-DO $$ DECLARE field text; BEGIN
-    FOREACH field IN ARRAY ARRAY['environment','library','digest','size','generation','revision','expired'] LOOP
-        IF public.digest_ref_fixture(1,false,field) IS DISTINCT FROM false THEN RAISE EXCEPTION 'attach accepted %', field; END IF;
-    END LOOP;
-    IF public.digest_ref_fixture(2,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'unvalidated attach'; END IF;
-    FOREACH field IN ARRAY ARRAY['retain_until','read_until','upload_until','delete_until'] LOOP
-        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''infinity'' WHERE right(object_id::text,2) = ''01''', field);
-        IF public.digest_ref_fixture(1,true) IS DISTINCT FROM false THEN RAISE EXCEPTION 'delete bypassed %', field; END IF;
-        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''-infinity'' WHERE right(object_id::text,2) = ''01''', field);
-    END LOOP;
-    INSERT INTO public.storage_validated_digest_winners SELECT e.object_id,w.environment_id,w.library_id,w.plaintext_bytes,w.plaintext_sha256,e.root_version_id,false,w.retain_until
-    FROM public.storage_validated_digest_winners w, public.storage_object_envelope_intents e
-    WHERE right(w.object_id::text,2)='01' AND e.object_id='21000000-0000-4000-8000-000000000002' ON CONFLICT DO NOTHING;
-    IF FOUND THEN RAISE EXCEPTION 'duplicate scoped winner'; END IF;
-    IF EXISTS (SELECT FROM public.storage_validated_digest_references) THEN RAISE EXCEPTION 'refusal wrote a reference'; END IF;
-    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM true THEN RAISE EXCEPTION 'valid attach refused'; END IF;
-    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'duplicate attach'; END IF;
-    UPDATE public.storage_validated_digest_winners SET quarantined=true WHERE right(object_id::text,2)='01';
-    IF public.digest_ref_fixture(1,false,'new reference') IS DISTINCT FROM false THEN RAISE EXCEPTION 'quarantined attach'; END IF;
-END $$;
-SQL
-# First, different winners share a reference key. Then test both winner lock orders.
-for scenario in '11 false ROLLBACK f - 12' '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
+# First test reference-key waits with expired and valid authorization, then both winner lock orders.
+for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
   read -r id deleting finish expected tombstone other <<<"$scenario"
   mkfifo "$dir/ref-$scenario"; exec 3<>"$dir/ref-$scenario"
   PGAPPNAME=digest_ref_holder psql_run -At <"$dir/ref-$scenario" >"$dir/ref-holder" & holder=$!
@@ -146,7 +124,8 @@ for scenario in '11 false ROLLBACK f - 12' '9 false COMMIT f false' '10 true COM
   object="$(printf '21000000-0000-4000-8000-%012d' "$id")"
   deadline=infinity; query="SELECT public.digest_ref_fixture($id, NOT $deleting)"
   if [[ -n "$other" ]]; then
-    deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '8 seconds'")"
+    duration='1 minute'; [[ "$expected" != f ]] || duration='8 seconds'
+    deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '$duration'")"
     query="SELECT public.digest_ref_fixture($other, false, '', '$object', '$deadline')"
   fi
   PGAPPNAME=digest_ref_contender psql_run -Atc "$query" >"$dir/ref-contender" & contender=$!
@@ -156,13 +135,17 @@ for scenario in '11 false ROLLBACK f - 12' '9 false COMMIT f false' '10 true COM
     sleep 0.1
   done
   [[ "$blocked" == 1 ]] || { printf 'reference contender did not block before deadline: %s\n' "$scenario" >&2; exit 1; }
-  if [[ -n "$other" ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
+  if [[ -n "$other" && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
   [[ "$(<"$dir/ref-holder")" == t && "$(<"$dir/ref-contender")" == "$expected" ]] || { printf 'unexpected reference race result: %s\n' "$scenario" >&2; exit 1; }
   if [[ -n "$other" ]]; then
-    [[ "$(psql_run -Atc "SELECT count(*) FROM public.storage_validated_digest_references WHERE reference_id='$object'")" == 0 ]] || exit 1
-    printf 'reference-key lock case passed: authorization expired before holder rollback; contender refused and no reference committed\n'
+    target=none
+    if [[ "$expected" == t ]]; then target="$(printf '21000000-0000-4000-8000-%012d' "$other")"; fi
+    [[ "$(psql_run -Atc "SELECT coalesce(string_agg(object_id::text, ','), 'none') FROM public.storage_validated_digest_references WHERE reference_id='$object'")" == "$target" ]] || exit 1
+    # Remove the verified synthetic reference so the winner-lock cases can reuse the objects.
+    psql_run -c "DELETE FROM public.storage_validated_digest_references WHERE reference_id='$object'"
+    printf 'reference-key lock case passed: holder rolled back; contender=%s committed reference target=%s\n' "$expected" "$target"
   else
     [[ "$(psql_run -Atc "SELECT (deleting_at IS NOT NULL) = $tombstone AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id=w.object_id) <> $tombstone FROM public.storage_validated_digest_winners w WHERE object_id='$object'")" == t ]] || exit 1
     printf 'reference/delete lock case passed: delete-first=%s holder=%s contender=%s\n' "$deleting" "$finish" "$expected"

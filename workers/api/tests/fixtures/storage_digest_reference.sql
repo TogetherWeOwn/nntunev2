@@ -26,3 +26,24 @@ ELSE public.attach_storage_digest_reference(
     CASE WHEN fault='expired' THEN '-infinity'::timestamptz ELSE deadline END)
 END FROM public.storage_plaintext_digest_claim_intents c JOIN public.storage_object_intents i USING (object_id)
 JOIN public.storage_object_envelope_intents e USING (object_id) WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid $$;
+
+DO $$ DECLARE field text; BEGIN
+    FOREACH field IN ARRAY ARRAY['environment','library','digest','size','generation','revision','expired'] LOOP
+        IF public.digest_ref_fixture(1,false,field) IS DISTINCT FROM false THEN RAISE EXCEPTION 'attach accepted %', field; END IF;
+    END LOOP;
+    IF public.digest_ref_fixture(2,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'unvalidated attach'; END IF;
+    FOREACH field IN ARRAY ARRAY['retain_until','read_until','upload_until','delete_until'] LOOP
+        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''infinity'' WHERE right(object_id::text,2) = ''01''', field);
+        IF public.digest_ref_fixture(1,true) IS DISTINCT FROM false THEN RAISE EXCEPTION 'delete bypassed %', field; END IF;
+        EXECUTE format('UPDATE public.storage_validated_digest_winners SET %I = ''-infinity'' WHERE right(object_id::text,2) = ''01''', field);
+    END LOOP;
+    INSERT INTO public.storage_validated_digest_winners SELECT e.object_id,w.environment_id,w.library_id,w.plaintext_bytes,w.plaintext_sha256,e.root_version_id,false,w.retain_until
+    FROM public.storage_validated_digest_winners w, public.storage_object_envelope_intents e
+    WHERE right(w.object_id::text,2)='01' AND e.object_id='21000000-0000-4000-8000-000000000002' ON CONFLICT DO NOTHING;
+    IF FOUND THEN RAISE EXCEPTION 'duplicate scoped winner'; END IF;
+    IF EXISTS (SELECT FROM public.storage_validated_digest_references) THEN RAISE EXCEPTION 'refusal wrote a reference'; END IF;
+    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM true THEN RAISE EXCEPTION 'valid attach refused'; END IF;
+    IF public.digest_ref_fixture(1,false) IS DISTINCT FROM false THEN RAISE EXCEPTION 'duplicate attach'; END IF;
+    UPDATE public.storage_validated_digest_winners SET quarantined=true WHERE right(object_id::text,2)='01';
+    IF public.digest_ref_fixture(1,false,'new reference') IS DISTINCT FROM false THEN RAISE EXCEPTION 'quarantined attach'; END IF;
+END $$;
