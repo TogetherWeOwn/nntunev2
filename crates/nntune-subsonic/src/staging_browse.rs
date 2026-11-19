@@ -4,6 +4,19 @@ use crate::envelope::{charged_error_document, charged_ok_document, code};
 use crate::library::{Album, Artist, Song};
 use crate::value::Value;
 
+mod search;
+
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+pub use search::{search_boundaries, search_matches_dispatch};
+
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
+    let Value::Map(fields) = value else {
+        panic!("expected map for {key}");
+    };
+    &fields.iter().find(|(name, _)| name == key).unwrap().1
+}
+
 /// Borrows a member snapshot in browse order. The adapter enforces membership
 /// and keeps raw occurrence provenance for direct recording-ID resolution.
 pub struct MemberBrowse<'a> {
@@ -23,6 +36,8 @@ impl<'a> MemberBrowse<'a> {
                 | "getAlbum"
                 | "getSong"
                 | "getMusicDirectory"
+                | "search2"
+                | "search3"
         )
     }
 
@@ -38,6 +53,7 @@ impl<'a> MemberBrowse<'a> {
         }
         let doc = match name {
             "getArtists" | "getIndexes" => self.index_document(budget, name)?,
+            "search2" | "search3" => self.search_document(budget, name, params)?,
             _ => {
                 let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {
                     return charged_error_document(
