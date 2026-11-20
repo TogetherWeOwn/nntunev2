@@ -3309,6 +3309,37 @@ impl Store for PgStore {
         .await
     }
 
+    async fn import_like(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .query_typed_opt(
+                        crate::preference_rows::import_like_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.import_like"))?
+                    .ok_or(StoreError)?
+                    .try_get(0)
+                    .map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn taste_get(
         &self,
         user_id: &str,
@@ -6704,9 +6735,9 @@ where
 
 /// Collect one request body with an explicit byte cap. The default-cap
 /// wrapper below is the single source of truth for API routes
-/// (`handlers::MAX_BODY_BYTES`); route-specific limits use
-/// `handlers::max_body_bytes` so collection and dispatch stay on the
-/// same bound. Rules (in terms of `cap_bytes`):
+/// (`handlers::MAX_BODY_BYTES`); per-route overrides
+/// pass their own cap so the collection seam and the in-handler gate
+/// stay on the same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
 ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 ///   stream is not polled at all.
@@ -7225,7 +7256,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    // The in-handler gate re-checks this per-route bound as defense in depth.
+    // Per-route collection bound: the in-handler gate re-checks the
+    // same bound as defense in depth, so the two cannot drift apart.
     let collected = collect_body_with_cap(
         declared_len,
         source,
