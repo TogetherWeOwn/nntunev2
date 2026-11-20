@@ -76,3 +76,31 @@ test('an accepted replacement clears only its own browse-copy feedback', () => {
 		clearMiniPlayerHint();
 	}
 });
+
+test.each([
+	['success', { status: 'Copied link for Coral.', fallbackUrl: null }],
+	['manual fallback', { status: '', fallbackUrl: 'https://example.test/library?track=coral' }]
+] as const)('auth reset retires a browse-copy receipt for %s on that player only', (_, outcome) => {
+	const initial = createQueue([]);
+	const effects = { flush: async () => {} };
+	const player = createPlayerController(initial, effects);
+	const other = createPlayerController(initial, effects);
+	const old = player.browseCopy.invalidate();
+	const otherReceipt = other.browseCopy.invalidate();
+	const empty = { status: '', fallbackUrl: null };
+	player.browseCopy.settle(old, outcome.status, outcome.fallbackUrl);
+	other.browseCopy.settle(otherReceipt, 'Copied another link.', null);
+
+	player.resetAtAuthBoundary();
+	expect(player.browseCopy.feedback).toEqual(empty);
+	expect(other.browseCopy.feedback).toEqual({ status: 'Copied another link.', fallbackUrl: null });
+	player.browseCopy.settle(old, outcome.status, outcome.fallbackUrl);
+	expect(player.browseCopy.feedback).toEqual(empty);
+	other.browseCopy.settle(otherReceipt, outcome.status, outcome.fallbackUrl);
+	expect(other.browseCopy.feedback).toEqual(outcome);
+	expect(player.browseCopy.feedback).toEqual(empty);
+
+	const fresh = player.browseCopy.invalidate();
+	player.browseCopy.settle(fresh, outcome.status, outcome.fallbackUrl);
+	expect(player.browseCopy.feedback).toEqual(outcome);
+});

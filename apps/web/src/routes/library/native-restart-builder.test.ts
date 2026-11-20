@@ -529,14 +529,20 @@ test('selecting another track with the same resolved source retires the native h
 });
 
 test('auth retirement increments the render revision and cancels pending share work', async () => {
-	const { page, media, location, writes, remount, capture } = restartFixture();
+	const { page, media, location, writes, remount, capture, observeInvalidateBrowseCopy } = restartFixture();
 	media.duration = Number.NaN;
 	location.search = '?track=coral&t=45';
 	page.applyShareLink();
 	const metadata = capture('loadedmetadata');
 	const before = page.read();
 	expect(before.pendingShareSeek).not.toBeNull();
+	const invalidate = vi.fn(() => {
+		expect(page.read().pendingShareSeek).toBeNull();
+		expect(page.currentAudio()).toBeUndefined();
+	});
+	observeInvalidateBrowseCopy(invalidate);
 	page.resetAuth();
+	expect(invalidate).toHaveBeenCalledTimes(1);
 	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
 	expect(page.read().attachmentVersion).toBe(before.attachmentVersion + 1);
 	expect(page.read().pendingShareSeek).toBeNull();
