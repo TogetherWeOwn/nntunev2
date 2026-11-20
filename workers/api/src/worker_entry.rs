@@ -7594,10 +7594,9 @@ mod tests {
                 if delta < 0 {
                     assert_snapshot_refusal(snapshot.unwrap_err());
                 } else {
-                    assert_eq!(
-                        snapshot.unwrap(),
-                        crate::subsonic_dispatch::build_snapshot(&[], &[], tracks)
-                    );
+                    let actual = snapshot.unwrap();
+                    let expected = crate::subsonic_dispatch::build_snapshot(&[], &[], tracks);
+                    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
                 }
             }
         }
@@ -7642,7 +7641,8 @@ mod tests {
             construct_production_subsonic_snapshot(&[], &[], tracks, "", PRODUCTION_SNAPSHOT_LIMITS)
                 .unwrap()
         };
-        assert_eq!(snapshot(&[]), (vec![], vec![], vec![]));
+        let (artists, albums, songs) = snapshot(&[]);
+        assert!(artists.is_empty() && albums.is_empty() && songs.is_empty());
 
         let track = snapshot_track();
         let duplicate = crate::catalogue::TrackDbRow {
@@ -7664,10 +7664,8 @@ mod tests {
             [("recording", 1, 2), ("other", 1, 3), ("recording", 2, 2),]
         );
         assert!(ProductionStore::resolve_song_occurrence(&tracks, &songs, "recording").is_none());
-        assert_eq!(
-            ProductionStore::resolve_song_occurrence(&tracks, &songs, "other"),
-            Some(&songs[1])
-        );
+        let resolved = ProductionStore::resolve_song_occurrence(&tracks, &songs, "other").unwrap();
+        assert!(std::ptr::eq(resolved, &songs[1]));
     }
 
     #[test]
