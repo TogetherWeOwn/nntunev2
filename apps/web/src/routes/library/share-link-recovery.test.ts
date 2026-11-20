@@ -84,9 +84,11 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
-			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
+			endSession: handleLocalAuthTransition, dispose: refresher.dispose,
 			setAudio: media.attach,
 			currentAudio: () => media.audio,
+			attachmentVersion: () => media.attachmentVersion,
+			authGeneration: () => queueExportAuthGeneration,
 			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
 			playIds: () => playLibraryIds(['coral']),
 			feedback: () => [player.queueAnnouncement.text, player.queueAnnouncement.version],
@@ -102,6 +104,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
 			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
 		currentAudio: () => unknown;
+		attachmentVersion: () => number;
+		authGeneration: () => number;
 		playTop: () => Promise<void>;
 		playIds: () => Promise<void>;
 		feedback: () => [string, number];
@@ -276,8 +280,16 @@ for (const status of [200, 401, 403]) {
 		await page.refresh();
 		page.selectTrack('coral');
 		const old = page.source('coral');
+		const generation = page.authGeneration();
+		vi.stubGlobal('fetch', async () => new Response(null, { status: 500 }));
+		await page.refresh();
+		expect(page.authGeneration()).toBe(generation);
+		expect(page.read().queue.tracks).toHaveLength(1);
+		expect(old?.isCurrent()).toBe(true);
+
 		vi.stubGlobal('fetch', async () => new Response(status === 200 ? '[]' : null, { status }));
 		await page.refresh();
+		expect(page.authGeneration()).toBe(generation + Number(status !== 200));
 		expect(page.read().queue.tracks).toEqual([]);
 		expect(page.source('coral')).toBeNull();
 		serve([{ ...ITEMS[0], streamUrl: undefined }]);
@@ -323,15 +335,17 @@ test('queue publication exposes new evidence before a reentrant auth boundary', 
 		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
 		expect(page.source('kelp')).toBeNull();
 		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
-		const pause = vi.fn(() => {
-			expect(page.currentAudio()).toBeUndefined();
-			// Queue retirement alone would pause after the refresher changed state.
-			expect(page.requiresSignIn()).toBe(false);
-			expect(page.read().queue).toBe(queue);
-		});
+		const pause = vi.fn(() => ({
+			audio: page.currentAudio(), source: page.source('coral'),
+			requiresSignIn: page.requiresSignIn(), queue: page.read().queue
+		}));
 		page.setAudio(Object.assign(new EventTarget(), { currentTime: 0, duration: 60, paused: false, pause }));
+		const version = page.attachmentVersion();
 		page.handleLocalAuthTransition();
 		expect(pause).toHaveBeenCalledOnce();
+		// The player purges before the refresher; the nested store delivery comes last.
+		expect(pause.mock.results[0]?.value).toEqual({ audio: undefined, source: null, requiresSignIn: false, queue });
+		expect(page.attachmentVersion()).toBe(version + 1);
 		expect(page.currentAudio()).toBeUndefined();
 		expect(page.requiresSignIn()).toBe(true);
 	});

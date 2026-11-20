@@ -316,7 +316,7 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
 			if (!isCurrent()) return;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
@@ -346,16 +346,15 @@
 				recentFindsInitialized = false;
 				recentFindsAnnouncement = '';
 			}
-			if (state.loading || state.items.length === 0) {
+			if (!authBoundary && (state.loading || state.items.length === 0)) {
 				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
-			if (authoritative) {
+			if (authoritative && !authBoundary) {
 				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
-					if (state.loadError && state.items.length === 0) player.announceQueue('');
 				});
 			}
 			// Queue publication can reenter the route and revoke this receipt.
@@ -594,7 +593,8 @@
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
-		player.resetAtAuthBoundary();
+		if (queueController.snapshot.tracks.length) queueConfirmGeneration += 1;
+		player.purgeAtAuthBoundary();
 		queueShare.reset();
 		shareInvalid = false;
 	}
@@ -1378,12 +1378,10 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		// The refresher's auth reset clears queue membership and evidence together.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			resetShareAtAuthBoundary();
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
-			// Queue and source evidence are cleared by the refresher notification.
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
@@ -1410,7 +1408,6 @@
 		resetShareAtAuthBoundary();
 		clearFavoritesExportFeedback();
 		releaseFavoritesDownload();
-		// Queue and source evidence are cleared by the refresher notification.
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));

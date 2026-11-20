@@ -18,6 +18,8 @@ export function createPlayerController(
 	const queue = createQueueController(initial);
 	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
 	let destroyed = false;
+	let accountGeneration = 0;
+	let awaitingLibrary = false;
 	let browseCopyGeneration = 0;
 	let browseCopyFeedback = $state.raw<Readonly<{ status: string; fallbackUrl: string | null }>>({ status: '', fallbackUrl: null });
 	const browseCopy = {
@@ -29,14 +31,14 @@ export function createPlayerController(
 			return generation;
 		},
 		settle(generation: number, status: string, fallbackUrl: string | null): void {
-			if (!destroyed && generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
+			if (!destroyed && !queue.purging && generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
 		}
 	};
 	const media = createMediaController(queue, { ...effects, browseCopy, commit: replaceQueue, announce: announceQueue }, matchesNative);
 
 	// Keyed messages can announce identical text again without replacing the live region.
 	function announceQueue(text: string, replay = false): void {
-		if (destroyed || (text === queueAnnouncement.text && !replay)) return;
+		if (destroyed || queue.purging || (text === queueAnnouncement.text && !replay)) return;
 		queueAnnouncement = { text, version: queueAnnouncement.version + Number(replay) };
 	}
 
@@ -49,12 +51,18 @@ export function createPlayerController(
 		media.reset();
 	}
 
-	function resetAtAuthBoundary(): void {
-		if (destroyed) return;
-		media.clearShareSeek();
-		retireNativeHost();
-		media.clearSeekFeedback();
-		browseCopy.invalidate();
+	function purgeAtAuthBoundary(): void {
+		if (destroyed || queue.purging) return;
+		accountGeneration += 1;
+		// Svelte can deliver nested queue notifications after the purge returns.
+		// Don't accept new queue entries until fresh Library evidence arrives.
+		awaitingLibrary = true;
+		queue.purgeAtAuthBoundary(() => {
+			browseCopy.invalidate();
+			if (queueAnnouncement.text) queueAnnouncement = { ...queueAnnouncement, text: '' };
+			mediaRevision += 1;
+			media.purgeAtAuthBoundary(clearMiniPlayerHint);
+		});
 	}
 
 	function destroy(): void {
@@ -67,7 +75,8 @@ export function createPlayerController(
 	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
-		if ((library && !library.isCurrent()) || destroyed) return false;
+		if ((library && !library.isCurrent()) || destroyed || queue.purging ||
+			(!library && awaitingLibrary && next.tracks.length > 0)) return false;
 		const receipt = queue.begin(next, kind, !!library);
 		let version = media.attachmentVersion;
 		// A callback can reset media without publishing a queue write (e.g. auth reset).
@@ -114,11 +123,15 @@ export function createPlayerController(
 		items: Parameters<typeof queue.prepareLibrary>[0], isCurrent: () => boolean,
 		beforeCommit?: (queueChanged: boolean) => void
 	): boolean {
-		if (!isCurrent() || destroyed) return false;
+		const generation = accountGeneration;
+		const ownsSnapshot = () => !queue.purging && isCurrent() && !destroyed && generation === accountGeneration;
+		if (!ownsSnapshot()) return false;
 		const { next, sources } = queue.prepareLibrary(items);
-		// The caller's UI work runs inline; the guarded commit rechecks the receipt afterward.
+		// The caller's UI work runs inline; the guarded commit rechecks both receipts afterward.
 		beforeCommit?.(next !== queue.snapshot);
-		return commitQueue(next, 'replace', { sources, isCurrent });
+		if (!commitQueue(next, 'replace', { sources, isCurrent: ownsSnapshot })) return false;
+		if (sources.size) awaitingLibrary = false;
+		return true;
 	}
 
 	function replaceQueue(next: QueueState): boolean {
@@ -129,6 +142,6 @@ export function createPlayerController(
 		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
 		commitQueue: (next: QueueState, kind: QueueCommitKind) => commitQueue(next, kind),
-		reconcileLibrary, replaceQueue, resetAtAuthBoundary, destroy
+		reconcileLibrary, replaceQueue, purgeAtAuthBoundary, destroy
 	};
 }
