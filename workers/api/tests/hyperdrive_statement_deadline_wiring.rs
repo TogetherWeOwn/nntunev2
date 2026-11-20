@@ -266,12 +266,8 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
     let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
-    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
-    let store = store.replacen(
-        function_body(prototype, "asyncfnstore_reconcile_outcome("),
-        "{}",
-        1,
-    );
+    let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
+    let store = store.replacen(function_body(store, &prototype), "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
