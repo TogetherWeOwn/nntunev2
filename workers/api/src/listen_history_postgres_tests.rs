@@ -28,6 +28,129 @@ fn event(playback_number: u8, event: ListenEvent) -> ListenEventBody {
     }
 }
 
+fn grant_play_id(number: u8) -> String {
+    crate::b64::encode(&[
+        0x40, 0xc3, 0x25, 0xc0, 0x2c, 0xee, 0x48, 0x9d, 0xa8, 0xb6, 0xfb, 0xe9, 0x37, 0x15, 0x56,
+        number,
+    ])
+}
+
+async fn seed_owner(client: &Client, owner: &str) {
+    client
+        .execute(
+            "INSERT INTO public.users (id,email,created_at) VALUES ($1,$2,1000)",
+            &[&owner, &format!("{owner}@example.test")],
+        )
+        .await
+        .unwrap();
+}
+
+async fn seed_lease(client: &Client, owner: &str, number: u8) {
+    client
+        .execute(
+            "INSERT INTO public.playback_leases (user_id,session_id,track_id,play_id,epoch,expires_at,updated_at)
+             VALUES ($1,'tab','catalogue-42',$2,1,1045,1000)
+             ON CONFLICT (user_id) DO UPDATE SET play_id = EXCLUDED.play_id",
+            &[&owner, &grant_play_id(number)],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn history_uses_the_grant_privacy_decision() {
+    use crate::playback::LeaseAcquire;
+    use crate::worker_entry::private_aware_lease_for_postgres_test;
+    use ListenEvent::{Complete, Skip, Start};
+    use WriteOutcome::{Conflict, Written};
+
+    let mut client = connect().await;
+    let owner = format!("listen-privacy-{:x}", rand::random::<u64>());
+    seed_owner(&client, &owner).await;
+    let owner = owner.as_str();
+    let connection = &client;
+    let set_private = |on| async move {
+        if on {
+            connection
+                .execute(
+                    "INSERT INTO public.private_sessions (user_id,session_id,expires_at)
+                 VALUES ($1,'tab',EXTRACT(EPOCH FROM now())::bigint + 300)",
+                    &[&owner],
+                )
+                .await
+                .unwrap();
+        } else {
+            connection
+                .execute(
+                    "DELETE FROM public.private_sessions WHERE user_id = $1",
+                    &[&owner],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let acquire = |number| async move {
+        let result = private_aware_lease_for_postgres_test(
+            connect().await,
+            owner,
+            "tab",
+            "catalogue-42",
+            &grant_play_id(number),
+            1000,
+            1045,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            LeaseAcquire::Acquired {
+                epoch: u64::from(number)
+            }
+        );
+    };
+    let mut writer = connect().await;
+    assert_eq!(write(&mut writer, owner, event(1, Start)).await, Conflict);
+    set_private(true).await;
+    acquire(1).await;
+    assert_eq!(write(&mut writer, owner, event(1, Start)).await, Conflict);
+    set_private(false).await;
+    for phase in [Start, Skip, Complete] {
+        assert_eq!(write(&mut writer, owner, event(1, phase)).await, Conflict);
+    }
+    assert!(export(&client, owner, None).await.unwrap().is_empty());
+
+    acquire(2).await;
+    assert_eq!(write(&mut writer, owner, event(2, Start)).await, Written);
+    set_private(true).await;
+    acquire(3).await;
+    assert_eq!(write(&mut writer, owner, event(2, Start)).await, Written);
+    assert_eq!(write(&mut writer, owner, event(2, Complete)).await, Written);
+    assert_eq!(write(&mut writer, owner, event(3, Start)).await, Conflict);
+    let rows = export(&client, owner, None).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.event).collect::<Vec<_>>(),
+        [Complete, Start]
+    );
+    assert!(rows
+        .iter()
+        .all(|row| row.playback_id == event(2, Start).playback_id));
+    let lease = client
+        .query_one(
+            "SELECT play_id, epoch, expires_at FROM public.playback_leases WHERE user_id = $1",
+            &[&owner],
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.get::<_, &str>(0), grant_play_id(3));
+    assert_eq!(lease.get::<_, i64>(1), 3);
+    assert_eq!(lease.get::<_, i64>(2), 1045);
+    client
+        .execute("DELETE FROM public.users WHERE id = $1", &[&owner])
+        .await
+        .unwrap();
+}
+
 async fn pid(client: &Client) -> i32 {
     let row = client
         .query_one("SELECT pg_backend_pid()", &[])
@@ -50,15 +173,10 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let suffix = rand::random::<u64>();
     let owner = format!("listen-{suffix:x}-owner");
     let other = format!("listen-{suffix:x}-other");
-    for id in [&owner, &other] {
-        clearer
-            .execute(
-                "INSERT INTO public.users (id,email,created_at) VALUES ($1,$2,1000)",
-                &[id, &format!("{id}@example.test")],
-            )
-            .await
-            .unwrap();
-    }
+    seed_owner(&clearer, &owner).await;
+    seed_owner(&clearer, &other).await;
+    seed_lease(&clearer, &owner, 1).await;
+    seed_lease(&clearer, &other, 2).await;
     assert_eq!(write(&mut writer, &owner, event(1, Start)).await, Written);
     let before = export(&clearer, &owner, None).await.unwrap();
     assert_eq!(write(&mut writer, &other, event(2, Start)).await, Written);
@@ -94,6 +212,7 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let (mut writer, result) = terminal.await.unwrap();
     assert_eq!(result, Conflict);
     assert!(export(&clearer, &owner, None).await.unwrap().is_empty());
+    seed_lease(&clearer, &owner, 3).await;
     for phase in [Start, Complete] {
         assert_eq!(write(&mut writer, &owner, event(3, phase)).await, Written);
     }
