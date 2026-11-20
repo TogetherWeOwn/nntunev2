@@ -37,6 +37,7 @@ const routeProof = JSON.stringify({ worker_id: workerId, sha, checked_at: checke
 test('only exact-main bootstrap uses the protected production job after staging admission', (t) => {
   const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
   assert.ok(preflight);
+  assert.match(preflight[1], /^ {10}DEPLOY_MODE: \$\{\{ inputs\.mode \}\}$/m);
   assert.doesNotMatch(preflight[1], /secrets\./);
   const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
   assert.match(staging, /needs: \[preflight\][\s\S]*?environment:\n      name: staging\n      deployment: false/);
@@ -50,8 +51,9 @@ test('only exact-main bootstrap uses the protected production job after staging 
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
-  const gate = job.match(/ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}\n        run: \|\n((?: {10}[^\n]*\n)+)      - uses: actions\/checkout@/);
+  const gate = job.match(/steps:\n      - name: Require the exact Release Manager-accepted SHA\n        env:\n(?: {10}[^\n]*\n)*? {10}ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}\n        run: \|\n((?: {10}[^\n]*\n)+)      - uses: actions\/checkout@/);
   assert.ok(gate);
+  assert.match(job.slice(gate.index + gate[0].length), /\n      - name: Seed only the pinned, empty maintenance Worker\n        env:\n(?: {10}[^\n]*\n)+        run: node ci\/production-maintenance\/seed\.mjs\n/);
   for (const [accepted, attempt] of [[sha, '1'], ['c'.repeat(40), '1'], [sha, '2']]) {
     const env = { DEPLOY_SHA: sha, ACCEPTED_SHA: accepted, GITHUB_RUN_ATTEMPT: attempt };
     assert.equal(spawnSync('/bin/bash', ['-c', gate[1]], { env, timeout: 5_000 }).status,
@@ -115,7 +117,7 @@ function cloudflareFixture(overrides = {}) {
     assert.equal(options.headers.Authorization, 'Bearer fixture-only');
     assert.equal(options.redirect, 'error');
     const entries = written ? [{ versions: [{ version_id: version, percentage: 100 }] }] : [];
-    const list = (result, count) => ({ result, result_info: { page: 1, count, total_count: count, total_pages: 1 } });
+    const list = (result, count) => ({ result, result_info: { page: 1, count, total_count: count } });
     let envelope;
     if (options.method === 'POST') {
       assert.equal(path, `${pinned}/versions?deploy=true`);
@@ -160,6 +162,7 @@ test('incumbent, exposed or uncertain Worker never reaches a write', async () =>
     [{ worker: { subdomain: { enabled: true, previews_enabled: false } } }, /unexposed/],
     [{ worker: { subdomain: { enabled: false } } }, /unexposed/],
     [{ deployments: { result: { deployments: [{}] } } }, /exactly 0 deployments/],
+    [{ deployments: { result_info: { page: 1, count: 0, total_pages: 0 } } }, /exactly 0 deployments/],
     [{ versions: { result_info: { page: 1, count: 0, total_count: 1 } } }, /exactly 0 versions/],
     [{ settings: { bindings: [{ type: 'secret_text' }] } }, /not confirmed empty/],
     [{ settings: { bindings: null } }, /not confirmed empty/],
@@ -179,10 +182,11 @@ test('missing, stale, mismatched or nonempty route proof refuses before Cloudfla
   assert.deepEqual(calls, []);
 });
 
-test('wrong allocation or version fails readback without retry or deletion', async () => {
-  for (const [id, percentage] of [[version, 99], ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100]]) {
-    const { calls, run } = cloudflareFixture({ readback: { result: { deployments: [{ versions: [{ version_id: id, percentage }] }] } } });
-    await assert.rejects(run(), /exactly the new seed version at 100%/);
+test('wrong allocation, version or page count fails readback without retry or deletion', async () => {
+  for (const [version_id, percentage, total_pages] of [[version, 99, 1], ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, 1], [version, 100, 2]]) {
+    const { calls, run } = cloudflareFixture({ readback: { result_info: { page: 1, count: 1, total_count: 1, total_pages },
+      result: { deployments: [{ versions: [{ version_id, percentage }] }] } } });
+    await assert.rejects(run(), total_pages === 1 ? /exactly the new seed version at 100%/ : /complete first page/);
     assert.deepEqual(calls.map(([method]) => method), ['GET', 'GET', 'GET', 'GET', 'POST', 'GET']);
   }
 });

@@ -1114,6 +1114,11 @@ writes automatically, and an observer success alone is not verified recovery.
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
 Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
+Cloudflare documents [empty Worker creation](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/),
+but [version upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
+and [deployment creation](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+do not document a deploy-only-if-undeployed condition. Actions serialization
+cannot stop a concurrent provider write between the empty read and deployment.
 
 1. **Release Manager:** Accept the exact launch SHA after M1, staging
    admission, Security → QA, exact-head CI and migration ledger review.
@@ -1121,7 +1126,7 @@ Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
    Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
 2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
    The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
-   Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes; Cloudflare does not provide a conditional deploy.
+   Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes.
 3. **Release Manager:** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`; Actions reruns are refused.
    Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
    One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.

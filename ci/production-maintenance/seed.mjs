@@ -25,8 +25,9 @@ function requireRouteProof(raw, worker, sha, now) {
 
 function requireCompletePage(response, items, count, label) {
   const info = response.result_info;
+  const pages = info?.total_pages;
   if (!Array.isArray(items) || items.length !== count || info?.page !== 1 || info.count !== count ||
-      info.total_count !== count || (info.total_pages !== 1 && !(count === 0 && info.total_pages === 0))) {
+      info.total_count !== count || (pages !== undefined && pages !== 1 && !(count === 0 && pages === 0))) {
     throw new Error(`Expected exactly ${count} ${label} on a complete first page`);
   }
 }
