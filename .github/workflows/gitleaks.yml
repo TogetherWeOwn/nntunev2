@@ -6,7 +6,7 @@ name: gitleaks
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
   # Merge queue validation: `gitleaks` is a required check, so it
   # must report on merge_group. Queue runs take the merged-policy branch
   # below (event is not pull_request), which is the correct policy for the
