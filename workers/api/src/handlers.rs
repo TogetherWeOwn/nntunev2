@@ -2108,8 +2108,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_unlike_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -7892,6 +7890,10 @@ where
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
         ("PUT", path) => match crate::native_rest::like_track_target(path) {
             Some(target) => me_like_track(ctx, req, target).await,
+            None => not_found(),
+        },
+        ("DELETE", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_unlike_track(ctx, req, target).await,
             None => not_found(),
         },
         _ => not_found(),
@@ -16075,7 +16077,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_unlike_preserves_other_signals_and_fails_closed() {
+    fn unlike_handler_preserves_other_signals_and_fails_closed() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
         let h = harness();
@@ -17150,7 +17152,7 @@ mod tests {
         assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
 
         req.authorization = None;
-        for method in ["GET", "HEAD", "POST", "PATCH", "DELETE", "put"] {
+        for method in ["GET", "HEAD", "POST", "PATCH", "put", "delete"] {
             assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
             req.method = method.into();
             assert_not_found(call(&req));
@@ -17163,15 +17165,127 @@ mod tests {
             if origin == Some(ORIGIN) {
                 assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
                 assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
-                assert!(cors.iter().any(|(name, methods)| {
-                    *name == "access-control-allow-methods"
-                        && methods.split(", ").any(|m| m == "PUT")
-                }));
+                for method in ["PUT", "DELETE"] {
+                    assert!(cors.iter().any(|(name, methods)| {
+                        *name == "access-control-allow-methods"
+                            && methods.split(", ").any(|m| m == method)
+                    }));
+                }
             } else {
                 assert!(cors.is_empty());
             }
         }
         assert_eq!(*h.store.taste_rows.borrow(), saved);
+    }
+
+    #[test]
+    fn dispatched_track_unlike_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        for (user, other_track) in [("alice", "Hidden"), ("bob", "Private")] {
+            h.store.catalogue_library.borrow_mut().insert(
+                user.into(),
+                vec![
+                    unmatched_library_row("Job_A"),
+                    unmatched_library_row(other_track),
+                ],
+            );
+            block_on(h.store.taste_upsert(user, Track, "Job_A", Love, None, NOW)).unwrap();
+        }
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Hidden", Hide, None, NOW),
+        )
+        .unwrap();
+        let mut expected = h.store.taste_rows.borrow().clone();
+        let path = "/v1/me/likes/track/Job_A";
+        assert_eq!(
+            scope_for_operation("DELETE", path),
+            RouteDecision::SessionOnly
+        );
+        let mut req = Request {
+            method: "DELETE".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+        req.authorization = None;
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+        assert!(expected
+            .remove(&("alice".into(), "track".into(), "Job_A".into()))
+            .is_some());
+        for _ in 0..2 {
+            let resp = call(&req);
+            assert_eq!(
+                (resp.status, resp.body.as_str()),
+                (200, r#"{"liked":false,"target_id":"Job_A"}"#)
+            );
+            assert_eq!(*h.store.taste_rows.borrow(), expected);
+        }
+        req.path = "/v1/me/likes/track/Hidden".into();
+        let resp = call(&req);
+        assert_eq!(
+            (resp.status, resp.body.as_str()),
+            (200, r#"{"liked":false,"target_id":"Hidden"}"#)
+        );
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+
+        req.path = path.into();
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Job_A", Love, None, NOW),
+        )
+        .unwrap();
+        let before_delete = h.store.taste_rows.borrow().clone();
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req);
+        assert_eq!((raced.status, raced.body), (503, unavailable().body));
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        assert_eq!(*h.store.taste_rows.borrow(), before_delete);
     }
 
     #[test]
@@ -17185,8 +17299,10 @@ mod tests {
             "/v1/me/likes/import",
             "/v1/me/likes/track",
             "/v1/me/likes/track/",
+            "/v1/me/likes/track//example",
             "/v1/me/likes/track/example/",
             "/v1/me/likes/track/example/nested",
+            "/v1/me/likes/release/example",
             "/v1/me/taste/",
             "/v1/me/taste/track/example",
             "/v1/me/tastes",
