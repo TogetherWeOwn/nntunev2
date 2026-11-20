@@ -19,9 +19,23 @@ test('queue commits publish only display metadata and skip same-object Library r
 	seen.mockClear(); // Skip the store's initial delivery.
 	try {
 		expect(player.replaceQueue(next)).toBe(true);
-		const library = player.queue.prepareLibrary(next.tracks);
-		expect(library.next).toBe(next);
-		expect(player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true })).toBe(true);
+		expect(player.reconcileLibrary(next.tracks, () => true)).toBe(true);
+		const previous = player.queue.sourceForQueuedPlay('selected');
+		expect(previous?.streamUrl).toBe('/test-audio/selected');
+		const versions = () => [player.mediaRevision, player.media.attachmentVersion, player.queue.revision];
+		const before = versions();
+		expect(player.reconcileLibrary([
+			next.tracks[0],
+			{ id: 'selected', streamUrl: '/test-audio/z-first' },
+			{ id: 'selected', streamUrl: '/test-audio/a-second' }
+		], () => true)).toBe(true);
+		expect(player.queue.snapshot).toBe(next);
+		expect(versions()).toEqual(before);
+		expect(previous?.isCurrent()).toBe(false);
+		expect(player.queue.hasLibrarySource('selected', '/test-audio/selected')).toBe(false);
+		expect(player.queue.sourceForQueuedPlay('selected')?.streamUrl).toBe('/test-audio/z-first');
+		expect(player.queue.sourceForQueuedPlay('selected', '/test-audio/a-second')?.streamUrl).toBe('/test-audio/a-second');
+		expect(player.queue.sourceForQueuedPlay('selected', '/test-audio/selected')?.streamUrl).toBe('/test-audio/selected');
 		expect(seen.mock.calls).toStrictEqual([[{ trackId: 'selected', title: 'selected', artist: null }]]);
 		expect(seen.mock.results[0].value).toBe(next);
 
@@ -32,6 +46,42 @@ test('queue commits publish only display metadata and skip same-object Library r
 		stop();
 		clearMiniPlayerHint();
 	}
+});
+
+test('an authoritative empty snapshot clears queue and all Library evidence', () => {
+	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const player = createPlayerController(initial, { flush: async () => {} });
+	expect(player.reconcileLibrary([...initial.tracks, { id: 'reef', streamUrl: '/reef' }], () => true)).toBe(true);
+	const previous = player.queue.sourceForQueuedPlay('reef');
+	expect(previous?.streamUrl).toBe('/reef');
+
+	try {
+		expect(player.reconcileLibrary([], () => true)).toBe(true);
+		expect(player.queue.snapshot).toEqual(createQueue([]));
+		expect(player.queue.sourceForQueuedPlay('coral')).toBeNull();
+		expect(player.queue.sourceForQueuedPlay('reef')).toBeNull();
+		expect(previous?.isCurrent()).toBe(false);
+	} finally {
+		clearMiniPlayerHint();
+	}
+});
+
+test.each([false, true])('a receipt superseded in the before-commit hook cannot publish (queue changed: %s)', (queueChanged) => {
+	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const player = createPlayerController(initial, { flush: async () => {} });
+	expect(player.reconcileLibrary(initial.tracks, () => true)).toBe(true);
+	let current = true;
+	const staleItems = queueChanged ? [] : [{ id: 'coral', streamUrl: '/stale' }];
+	expect(player.reconcileLibrary(staleItems, () => current, (changed) => {
+		expect(changed).toBe(queueChanged);
+		expect(player.queue.snapshot).toBe(initial);
+		expect(player.queue.sourceForQueuedPlay('coral')?.streamUrl).toBe('/coral');
+		current = false;
+		expect(player.reconcileLibrary([{ id: 'coral', streamUrl: '/fresh' }], () => true)).toBe(true);
+	})).toBe(false);
+	expect(player.queue.snapshot).toBe(initial);
+	expect(player.queue.sourceForQueuedPlay('coral')?.streamUrl).toBe('/fresh');
+	expect(player.queue.hasLibrarySource('coral', '/stale')).toBe(false);
 });
 
 test('queue feedback preserves replay keys across refresh and replacement', () => {
@@ -47,9 +97,8 @@ test('queue feedback preserves replay keys across refresh and replacement', () =
 	player.announceQueue('Order updated.');
 	expect(player.queueAnnouncement).toEqual({ text: 'Order updated.', version: 2 });
 
-	const library = player.queue.prepareLibrary([]);
-	expect(library.next).toBe(initial);
-	expect(player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true })).toBe(true);
+	expect(player.reconcileLibrary([], () => true)).toBe(true);
+	expect(player.queue.snapshot).toBe(initial);
 	expect(player.queueAnnouncement).toEqual({ text: 'Order updated.', version: 2 });
 	expect(player.replaceQueue(createQueue([]))).toBe(true);
 	expect(player.queueAnnouncement).toEqual({ text: '', version: 2 });
@@ -67,7 +116,13 @@ test('an accepted replacement clears only its own browse-copy feedback', () => {
 	}
 
 	try {
-		expect(player.commitQueue(empty, 'replace', { sources: new Map(), isCurrent: () => false })).toBe(false);
+		expect(player.reconcileLibrary(initial.tracks, () => true)).toBe(true);
+		const previous = player.queue.sourceForQueuedPlay('coral');
+		const beforeCommit = vi.fn();
+		expect(player.reconcileLibrary([], () => false, beforeCommit)).toBe(false);
+		expect(beforeCommit).not.toHaveBeenCalled();
+		expect(player.queue.snapshot).toBe(initial);
+		expect(previous?.isCurrent()).toBe(true);
 		expect(player.browseCopy.feedback.status).toBe('Copied link for Coral.');
 		expect(player.replaceQueue(empty)).toBe(true);
 		expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });

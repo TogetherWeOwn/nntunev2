@@ -56,8 +56,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	};
 	return new Function(...Object.keys(bindings), `
 		${compiled}
-		const { next, sources: evidence } = queueController.prepareLibrary([...items, ...queue.tracks]);
-		player.commitQueue(next, 'replace', { sources: evidence, isCurrent: () => true });
+		player.reconcileLibrary([...items, ...queue.tracks], () => true);
 		player.announceQueue('Previous outcome');
 		queueController.subscribe((value) => { queue = value; });
 		return {

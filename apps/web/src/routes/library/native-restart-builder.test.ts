@@ -115,8 +115,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const favoritesExport = { destroy() {} }, refresher = { dispose() {} };
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
-		const library = queueController.prepareLibrary(items);
-		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.reconcileLibrary(items, () => true);
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
@@ -124,11 +123,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
 			resetAuth: resetShareAtAuthBoundary,
 			copyTrackLink, copyQueueLink: queueShare.copy,
-			refreshLibrary: () => {
-				const { next, sources } = queueController.prepareLibrary(items);
-				if (next !== queue) throw new Error('Expected a same-object refresh');
-				player.commitQueue(next, 'replace', { sources, isCurrent: () => true });
-			},
+			refreshLibrary: () => player.reconcileLibrary(items, () => true, (queueChanged) => {
+				if (queueChanged) throw new Error('Expected a same-object refresh');
+			}),
 			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
