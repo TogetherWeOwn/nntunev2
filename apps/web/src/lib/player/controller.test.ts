@@ -159,3 +159,87 @@ test.each([
 	player.browseCopy.settle(fresh, outcome.status, outcome.fallbackUrl);
 	expect(player.browseCopy.feedback).toEqual(outcome);
 });
+
+test('final teardown retires all receipts before native pause and leaves a fresh player alone', async () => {
+	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const flush = vi.fn(() => promise);
+	const player = createPlayerController(initial, { flush });
+	const fresh = createPlayerController(initial, { flush: async () => {} });
+	const makeAudio = () => Object.assign(new EventTarget(), {
+		paused: false, ended: false, isConnected: true, getAttribute: () => '/coral',
+		play: vi.fn(async () => {}), pause: vi.fn(), currentTime: 0, duration: 120
+	});
+	const oldAudio = makeAudio();
+	const listen = vi.spyOn(oldAudio, 'addEventListener');
+	const detach = player.media.attach(oldAudio as unknown as HTMLAudioElement);
+	const [event, listener, options] = listen.mock.calls[0]!;
+	const signal = (options as AddEventListenerOptions).signal;
+	const deliverOldPlay = () => (listener as EventListener)({ type: event, currentTarget: oldAudio } as unknown as Event);
+
+	try {
+		expect(player.reconcileLibrary(initial.tracks, () => true)).toBe(true);
+		const source = player.queue.sourceForQueuedPlay('coral')!;
+		const playing = player.media.playSelected(initial, 0, source);
+		expect(flush).toHaveBeenCalledOnce();
+		const snapshot = player.queue.snapshot;
+		const operation = player.queue.begin(snapshot, 'replace');
+		const playback = player.queue.revision;
+		const target = { trackId: 'coral', seconds: 45 };
+		const retry = player.media.captureShareSeek(player.media.beginShareInput(), target, () => true)!;
+		expect(player.media.pendingShareSeek).toMatchObject(target);
+		const copy = player.browseCopy.invalidate();
+		player.browseCopy.settle(copy, 'Earlier copy', null);
+		const oldAttachment = player.media.attachment!;
+		const announcement = player.queueAnnouncement;
+		const empty = createQueue([]);
+
+		const freshAudio = makeAudio();
+		oldAudio.pause.mockImplementationOnce(() => {
+			expect(player.queue.isCurrentOperation(operation)).toBe(false);
+			expect(player.queue.isCurrent(playback)).toBe(false);
+			expect(source.isCurrent()).toBe(false);
+			expect(player.media.pendingShareSeek).toBeNull();
+			expect(player.media.attachment).toBeUndefined();
+			expect(signal?.aborted).toBe(true);
+			expect(player.browseCopy.generation).not.toBe(copy);
+			player.queue.publish(empty, operation);
+			player.browseCopy.settle(copy, 'Stale copy', null);
+			retry();
+			deliverOldPlay();
+			player.destroy();
+			expect(player.replaceQueue(empty)).toBe(false);
+			expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });
+			fresh.media.attach(freshAudio as unknown as HTMLAudioElement);
+		});
+		player.destroy();
+		const receipts = () => [player.queue.revision, player.media.attachmentVersion, player.browseCopy.generation];
+		const retired = receipts();
+		const freshCopy = fresh.browseCopy.invalidate();
+		const freshRetry = fresh.media.captureShareSeek(fresh.media.beginShareInput(), target, () => true)!;
+		player.destroy();
+		detach();
+		deliverOldPlay();
+		retry();
+		resolve();
+		await playing;
+
+		expect(receipts()).toEqual(retired);
+		expect(player.queue.snapshot).toBe(snapshot);
+		expect(player.queueAnnouncement).toBe(announcement);
+		expect(oldAttachment.playing).toBe(false);
+		expect(oldAudio.currentTime).toBe(0);
+		expect(oldAudio.play).not.toHaveBeenCalled();
+		expect(oldAudio.pause).toHaveBeenCalledOnce();
+		expect(fresh.media.audio).toBe(freshAudio);
+		expect(freshAudio.pause).not.toHaveBeenCalled();
+		freshAudio.dispatchEvent(new Event('playing'));
+		expect(fresh.media.attachment?.playing).toBe(true);
+		freshRetry();
+		expect(freshAudio.currentTime).toBe(45);
+		fresh.browseCopy.settle(freshCopy, 'Fresh copy', null);
+		expect(fresh.browseCopy.feedback.status).toBe('Fresh copy');
+	} finally {
+		clearMiniPlayerHint();
+	}
+});

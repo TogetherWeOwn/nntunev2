@@ -1422,6 +1422,14 @@
 		refresher.handleLocalAuthTransition();
 	}
 
+	let disposeRoute: (() => void) | undefined;
+	// Register before template effects so the child's native detach cannot pause first.
+	$effect.pre(() => () => {
+		const dispose = disposeRoute;
+		disposeRoute = undefined;
+		dispose?.();
+	});
+
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
@@ -1432,19 +1440,16 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
-		void refresh();
-		return () => {
+		disposeRoute = () => {
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
-			queueController.destroy();
 			queueShare.dispose();
-			media.destroy();
+			player.destroy();
 			favoritesExport.destroy();
-			player.browseCopy.invalidate();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
 			// state: leaving the library empties the queue's visible hint
@@ -1456,6 +1461,7 @@
 			window.removeEventListener('storage', handleAuthTransition);
 			window.removeEventListener('pagehide', recordFindQuery);
 		};
+		void refresh();
 	});
 </script>
 
