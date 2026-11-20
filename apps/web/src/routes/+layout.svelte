@@ -470,29 +470,34 @@
 			{/if}
 		</div>
 	</div>
-	<AppPlayer>
-		<div class="nt-body">
-			<div class="nt-rail" data-testid="shell-rail">
-				<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
-					<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
-						Home
-					</a>
-					<a href="/search" aria-current={primaryDestination === 'search' ? 'page' : undefined}>
-						Search
-					</a>
-					<a href="/library" aria-current={primaryDestination === 'library' ? 'page' : undefined}>
-						Your Library
-					</a>
-				</nav>
-				<div class="nt-chips" role="group" aria-label="Library views">
-					<a href="/library">All</a>
-					<a href="/library/liked">Liked</a>
-					<a href="/library/recent">Recent</a>
-				</div>
+{/if}
+
+{#snippet appBody()}
+	<div class="nt-body">
+		<div class="nt-rail" data-testid="shell-rail">
+			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
+				<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
+					Home
+				</a>
+				<a href="/search" aria-current={primaryDestination === 'search' ? 'page' : undefined}>
+					Search
+				</a>
+				<a href="/library" aria-current={primaryDestination === 'library' ? 'page' : undefined}>
+					Your Library
+				</a>
+			</nav>
+			<div class="nt-chips" role="group" aria-label="Library views">
+				<a href="/library">All</a>
+				<a href="/library/liked">Liked</a>
+				<a href="/library/recent">Recent</a>
 			</div>
-			{@render children()}
 		</div>
-	</AppPlayer>
+		{@render children()}
+	</div>
+{/snippet}
+
+{#if !isPublicRoute}
+	<AppPlayer children={appBody} />
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}

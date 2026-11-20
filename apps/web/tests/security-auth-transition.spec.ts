@@ -376,8 +376,9 @@ for (const paused of [false, true]) {
 	});
 }
 
-for (const signal of ['local', 'cross-tab']) {
-	test(`${signal} sign-out purges the native player while Library is absent`, async ({ page }) => {
+for (const signal of ['local', 'cross-tab', 401, 403] as const) {
+	const trigger = typeof signal === 'number' ? `Library HTTP ${signal}` : `${signal} sign-out`;
+	test(`${trigger} purges the native player while Library is absent`, async ({ page }) => {
 		await servePlaybackLibrary(page);
 		const endpoint = '/v1/session/logout';
 		if (signal === 'local') {
@@ -388,10 +389,17 @@ for (const signal of ['local', 'cross-tab']) {
 			await page.goto('/library');
 		}
 		const audio = await startNativePlayback(page);
+		if (typeof signal === 'number') {
+			await page.route('**/api/library', (route) => route.fulfill({ status: signal }), { times: 1 });
+		}
 		await openHome(page);
-		await expect(page.getByTestId('library-now-playing')).toContainText(playbackFixture.title);
-		if (signal === 'local') await release(page, endpoint, 200, { ok: true });
-		else await actorLogout(page);
+		if (typeof signal === 'number') {
+			await expect(page.getByText(signal === 401 ? 'Sign in to see your library.' : 'You do not have access to this library.')).toBeVisible();
+		} else {
+			await expect(page.getByTestId('library-now-playing')).toContainText(playbackFixture.title);
+			if (signal === 'local') await release(page, endpoint, 200, { ok: true });
+			else await actorLogout(page);
+		}
 
 		await expect(page).toHaveURL(/\/home$/);
 		await expect(page.getByTestId('audio-player')).toHaveCount(0);

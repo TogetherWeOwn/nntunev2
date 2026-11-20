@@ -301,9 +301,11 @@
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
-		invalidateLibraryCache: () => {
+		onAccessRefused: () => {
 			resetShareAtAuthBoundary();
 			player.purgeAtAuthBoundary();
+		},
+		invalidateLibraryCache: () => {
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
 			favorites = [];

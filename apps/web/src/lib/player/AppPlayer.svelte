@@ -9,6 +9,7 @@
 	import { onMount, tick, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
+	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
@@ -30,9 +31,11 @@
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
 		};
 		window.addEventListener('storage', onStorage);
+		window.addEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
 		return () => {
 			offAuth();
 			window.removeEventListener('storage', onStorage);
+			window.removeEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
 		};
 	});
 

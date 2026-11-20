@@ -50,7 +50,8 @@ const test = base.extend<{ mountedLibrary: Page }, { libraryOrigin: string }>({
 			publicDir: false,
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
-				'$app/navigation': `${fixtureRoot}navigation.ts`
+				'$app/navigation': `${fixtureRoot}navigation.ts`,
+				'../../../src/routes/library/+page.svelte': `${webRoot}tests/fixtures/LibraryPlayerHarness.svelte`
 			} },
 			plugins: [{
 				name: 'acceptance-library-title-input', enforce: 'pre',

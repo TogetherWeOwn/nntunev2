@@ -10,6 +10,7 @@ import {
 } from './cache.js';
 
 export const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
+export const LIBRARY_ACCESS_REFUSED_EVENT = 'nntune:library-access-refused';
 
 /** Largest library JSON body retained in memory (1 MiB, counted in UTF-8 bytes). */
 export const LIBRARY_BODY_MAX_BYTES = 1_048_576;
@@ -37,6 +38,8 @@ export interface LibraryRefresherDeps {
 	sessionStorage: () => SnapshotStorage | null;
 	/** Clears every snapshot area and tells other tabs the session ended. */
 	invalidateLibraryCache: () => void;
+	/** Override the same-tab refusal signal when the route owns its local cleanup. */
+	onAccessRefused?: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
 	timeoutMs?: number;
@@ -274,6 +277,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					: 'You do not have access to this library.';
 				authoritative = true;
 				authBoundary = true;
+				if (deps.onAccessRefused) deps.onAccessRefused();
+				else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
 				deps.invalidateLibraryCache();
 				return;
 			}
