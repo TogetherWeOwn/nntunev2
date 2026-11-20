@@ -56,6 +56,7 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 			publicDir: false,
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
+				'$app/env/public': `${webRoot}tests/fixtures/library-public-env.ts`,
 				'$app/navigation': decodeURIComponent(new URL('./fixtures/library-now-playing/navigation.ts', import.meta.url).pathname)
 			} },
 			plugins: [{

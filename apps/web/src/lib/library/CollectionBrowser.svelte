@@ -34,7 +34,6 @@
 			request.abort();
 		}
 	}
-
 	$effect(() => {
 		if (accessRevoked) {
 			rows = [];
@@ -65,7 +64,6 @@
 			</select>
 		</label>
 	</div>
-
 	{#if status === 'loading'}
 		<p role="status">Loading your collections…</p>
 	{:else if status === 'sign-in'}
@@ -97,7 +95,6 @@
 		{/if}
 	{/if}
 </section>
-
 <style>
 	.nt-collection-toolbar {
 		display: flex;
