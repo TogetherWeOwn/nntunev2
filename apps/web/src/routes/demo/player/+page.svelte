@@ -834,6 +834,7 @@
 		const advanced = nextTrack(queue);
 		if (advanced === queue) {
 			// End of the queue: really stop, so status and playback agree.
+			listenHistory.finish(audioEl);
 			playback.pause();
 			status = 'ended';
 			return;

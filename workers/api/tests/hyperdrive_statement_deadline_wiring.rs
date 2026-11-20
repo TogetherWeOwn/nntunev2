@@ -626,6 +626,37 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
 }
 
 #[test]
+fn listen_history_statements_run_unnamed_through_query_typed() {
+    let source: String = include_str!("../src/listen_history.rs")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for name in [
+        "owner_is_deleting",
+        "record",
+        "clear_in_transaction",
+        "export",
+    ] {
+        let body = function_body(&source, &format!("asyncfn{name}("));
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must use unnamed statements"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(!body.contains(named), "{name} must not use {named}");
+        }
+    }
+}
+
+#[test]
 fn seam_delegates_to_the_shared_helper_with_the_opaque_error() {
     let source = production();
     let pgstore = source
