@@ -66,10 +66,7 @@ pub fn admit_metadata(
         .into_iter()
         .find(|method| is_ascii_literal(&raw_method, method))
         .ok_or(InputError::UnsupportedMethod)?;
-    let raw_url = property::<JsString>(request.as_ref(), "url")?;
-    let constructor = property::<Function>(js_sys::global().as_ref(), "URL")?;
-    let url = Reflect::construct(&constructor, &Array::of1(raw_url.as_ref()))
-        .map_err(|_| InputError::Unreadable)?;
+    let url = request_url(request)?;
     let path = property::<JsString>(&url, "pathname")?;
     let query = property::<JsString>(&url, "search")?;
     let query_start = u32::from(query.length() != 0); // omit the leading '?'
@@ -119,13 +116,20 @@ pub fn admit_metadata(
     })
 }
 
-fn property<T: JsCast>(object: &JsValue, key: &str) -> Result<T, InputError> {
+pub(crate) fn request_url(request: &web_sys::Request) -> Result<JsValue, InputError> {
+    let raw_url = property::<JsString>(request.as_ref(), "url")?;
+    let constructor = property::<Function>(js_sys::global().as_ref(), "URL")?;
+    Reflect::construct(&constructor, &Array::of1(raw_url.as_ref()))
+        .map_err(|_| InputError::Unreadable)
+}
+
+pub(crate) fn property<T: JsCast>(object: &JsValue, key: &str) -> Result<T, InputError> {
     Reflect::get(object, &JsValue::from_str(key))
         .and_then(JsCast::dyn_into)
         .map_err(|_| InputError::Unreadable)
 }
 
-fn is_ascii_literal(value: &JsString, literal: &str) -> bool {
+pub(crate) fn is_ascii_literal(value: &JsString, literal: &str) -> bool {
     // `JsString == &str` in the pinned js-sys copies the JS value into Rust.
     value.length() as usize == literal.len() && value.starts_with(literal, 0)
 }

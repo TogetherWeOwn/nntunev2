@@ -2,10 +2,38 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { staging_dispatch_test: dispatch } = require(process.env.STAGING_BODY_WASM_JS);
+const { staging_dispatch_test: dispatch, staging_measurement_admits: admits } = require(process.env.STAGING_BODY_WASM_JS);
 
 const request = (path) => new Request(`https://example.test/rest/${path}`);
 const neverOpen = () => assert.fail('app connector must not run');
+
+test('only the exact armed staging deployment admits the QA runner', () => {
+  const sha = 'abcd'.repeat(10);
+  const env = {
+    RP_ID: 'example.test', BUILD_SHA: sha, QA_CODE_SEAM: '1', QA_AUTH_TOKEN: 'fixture',
+    SUBSONIC_MEASUREMENT_STAGE: 'staging', SUBSONIC_MEASUREMENT_ENABLE: '1',
+    SUBSONIC_MEASUREMENT_LEASE: `v1:${sha}:1000:2200:fixture-user`,
+    SUBSONIC_MEASUREMENT_FIXTURE: 'small',
+  };
+  const url = 'https://example.test/rest/ping';
+  const req = (target = url, bearer = 'Bearer fixture') => new Request(target, {
+    headers: { authorization: bearer, 'x-forwarded-host': 'example.test' },
+  });
+  for (const [now, expected] of [[1000, true], [2199, true], [2200, false]])
+    assert.equal(admits(req(), env, now), expected);
+  assert.equal(admits(req(url, 'Bearer wrongxx'), env, 1000), false);
+  assert.equal(admits(new Request(url), env, 1000), false);
+  for (const target of ['http://example.test/rest/ping', 'https://other.example.test/rest/ping',
+    'https://example.test:444/rest/ping', 'https://example.test/restless']) {
+    assert.equal(admits(req(target), env, 1000), false);
+  }
+  assert.equal(admits(req(), {}, 1000), false);
+  for (const overrides of [{ SUBSONIC_MEASUREMENT_STAGE: 'production' }, { QA_CODE_SEAM: '0' },
+    { SUBSONIC_MEASUREMENT_ENABLE: '0' }, { SUBSONIC_MEASUREMENT_LEASE: undefined },
+    { BUILD_SHA: 'f'.repeat(40) }, { SUBSONIC_MEASUREMENT_FIXTURE: 'unknown' }]) {
+    assert.equal(admits(req(), { ...env, ...overrides }, 1000), false);
+  }
+});
 
 async function refusal(response, status, retry = null) {
   assert.equal(response.status, status);

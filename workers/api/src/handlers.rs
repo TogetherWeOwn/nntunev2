@@ -2489,7 +2489,7 @@ fn is_example_test_mailbox(email: &str) -> bool {
 
 /// Constant-time bearer comparison for the seam route. Length mismatch
 /// rejects without comparing (only the length leaks, never content).
-fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
+pub(crate) fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
     match presented {
         Some(candidate) => {
             let a = candidate.as_bytes();

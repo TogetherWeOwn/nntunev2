@@ -192,6 +192,9 @@ mod ledger_wasm_test {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod subsonic_measurement;
+
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
 #[cfg(not(all(
@@ -204,14 +207,16 @@ mod ledger_wasm_test {
 )))]
 #[worker::event(fetch)]
 pub async fn main(
-    req: worker::Request,
+    req: worker::web_sys::Request,
     env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
-    // The Subsonic `/rest/*` surface (wasm32 only) adapts to the
-    // transport-free `nntune-subsonic` dispatcher. Every other path keeps
-    // `worker_entry::dispatch` behavior; the path peek only borrows, so an
-    // unclaimed request still moves into dispatch untouched.
+    // Admit measurement on the raw request before the SDK copies its URL.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(response) = subsonic_measurement::mount(&req, &env).await {
+        return response;
+    }
+    let req = worker::Request::from(req);
     #[cfg(target_arch = "wasm32")]
     if is_subsonic_request(&req) {
         let mut req = req;

@@ -194,7 +194,7 @@ fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
     })
 }
 
-fn config_from_env(env: &Env) -> Option<Config> {
+pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     // Runtime fail-closed gate for the Hyperdrive caching finding: auth
     // reads are plain SELECTs through the HYPERDRIVE binding, so a
     // caching-enabled config would serve stale sessions/credentials for

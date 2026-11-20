@@ -7,8 +7,7 @@ created in (and dropped from) the service, migrated from migrations/manifest.tom
 Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
 inserted auth_challenges row back), marker-based magic admission and signup
 reaping, plus non-/rest and /rest routing controls.
-/rest is asserted against the inert main baseline; the two observed tables
-must not gain rows. This is NOT Subsonic activation proof. Missing prerequisites fail.
+/rest is checked inert and armed with synthetic credentials, not live staging.
 By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
 into the same disposable database and /rest must stay inert against it (--no-fixture skips;
 --mirror-fixture also applies the mirror-target migrations and seeds mb_* rows).
@@ -71,7 +70,7 @@ def conn_string(s, db):
     return f"postgresql://{s['user']}:{pw}@{s['host']}:{s['port']}/{db}?sslmode=disable"
 
 
-def wrangler_toml(conn, sha, mirror=False):
+def wrangler_toml(conn, sha, mirror=False, *, vars_block="", binding="HYPERDRIVE"):
     check(re.fullmatch(r"[0-9a-f]{40}", sha), "build sha must be 40 lowercase hex")
     check('"' not in conn and "\\" not in conn and '"' not in str(BUNDLE), "unsupported characters")
     return f'''name = "nntune-api-routing-smoke"
@@ -85,9 +84,9 @@ BUILD_SHA = "{sha}"
 INVITES_REQUIRED = "1"
 # Local stand-in only: the real Hyperdrive cache gate is not exercised here.
 HYPERDRIVE_CACHING_DISABLED = "1"
-
+{vars_block}
 [[hyperdrive]]
-binding = "HYPERDRIVE"
+binding = "{binding}"
 id = "00000000000000000000000000000000"
 localConnectionString = "{conn}"
 ''' + (f'''
@@ -316,6 +315,33 @@ def smoke(base, s, db, fx=None, mirror=False):
         fixture_inert(base, q, fx, mirror)
 
 
+def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
+    now = int(time.time())
+    for enabled in (1, 0):
+        extra = f'''QA_CODE_SEAM = "1"
+SUBSONIC_MEASUREMENT_STAGE = "staging"
+SUBSONIC_MEASUREMENT_ENABLE = "{enabled}"
+SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active"
+SUBSONIC_MEASUREMENT_FIXTURE = "small"
+'''
+        (tmp / f"measurement-{enabled}.toml").write_text(wrangler_toml(
+            conn_string(s, db), sha, vars_block=extra, binding="SUBSONIC_MEASUREMENT_DB"))
+    script = Path(__file__).with_name("subsonic_measurement_fetch.cjs")
+    proc = subprocess.Popen([shutil.which("node"), "--unhandled-rejections=strict", str(script), str(wrangler), ORIGIN],
+                            cwd=tmp, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        output, _ = proc.communicate(json.dumps([fx.keys[k] for k in ("active", "grace")]), timeout=150)
+        check(proc.returncode == 0, "measurement Fetch failed:\n" + redact(output)[-4000:])
+    finally:
+        process_group.shutdown_process_group(proc)
+    used = psql(s, db, "SELECT user_id FROM subsonic_credentials WHERE last_used_at IS NOT NULL ORDER BY user_id",
+                tuples=True)
+    check(used.splitlines() == ["ci-fixture-active", "ci-fixture-grace"],
+          "both armed requests must authenticate against the disposable app database")
+    print("ok: armed Fetch serves the fixture only for the lease principal; disabled Fetch is inert", flush=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--wrangler")
@@ -381,7 +407,14 @@ def main(argv=None):
             check(st == 200, f"/healthz answered {st} {b[:160]!r}\n" + tail())
             break
         smoke(base, s, db, fx, args.mirror_fixture)
-    except Failure as err:
+        if fx:
+            runner = b64(secrets.token_bytes(32))
+            secrets_out.append(runner)
+            measurement = tmp / "measurement"
+            measurement.mkdir()
+            (measurement / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={runner}\n")
+            measurement_fetch(measurement, wrangler, {**env, "QA_AUTH_TOKEN": runner}, s, db, sha, fx, redact)
+    except (Failure, subprocess.TimeoutExpired) as err:
         print(f"FAIL: {redact(str(err))}", file=sys.stderr)
         failed = True
     finally:
