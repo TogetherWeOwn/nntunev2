@@ -7,8 +7,7 @@ created in (and dropped from) the service, migrated from migrations/manifest.tom
 Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
 inserted auth_challenges row back), marker-based magic admission and signup
 reaping, plus non-/rest and /rest routing controls.
-/rest is checked both inert and, with synthetic credentials, armed through the
-local Worker Fetch entry. This is not live staging proof. Missing prerequisites fail.
+/rest is checked inert and armed with synthetic credentials, not live staging.
 By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
 into the same disposable database and /rest must stay inert against it (--no-fixture skips;
 --mirror-fixture also applies the mirror-target migrations and seeds mb_* rows).
@@ -317,7 +316,6 @@ def smoke(base, s, db, fx=None, mirror=False):
 
 
 def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
-    # Keep the dedicated binding as the only DB binding in both profiles.
     now = int(time.time())
     for enabled in (1, 0):
         extra = f'''QA_CODE_SEAM = "1"
