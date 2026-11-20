@@ -931,8 +931,9 @@ class GitFixture(unittest.TestCase):
         entries = self.entries()
         manifest_path.write_text(manifest(entries))
         head = self.commit("renumber the same bytes a second time")
-        second = history.UnappliedRename(reviewed, self.base, first.new_path,
-                                         "migrations/0003_purge.sql", first.sha256, "app", head)
+        second_without_merge = history.UnappliedRename(
+            reviewed, self.base, first.new_path, "migrations/0003_purge.sql", first.sha256, "app")
+        second = replace(second_without_merge, reviewed_merge=head)
         key = (1, "example/project", 1, "main", "feature")
         policy = {key: (first, second)}
         # Carrying the second pin must not broaden or invalidate the first edge.
@@ -964,6 +965,7 @@ class GitFixture(unittest.TestCase):
                 ((second,), "lacks the exact reviewed edge chain"),
                 ((replace(first, reviewed_head=reviewed), second), "differs from reviewed paths"),
                 ((first, replace(second, reviewed_head=first_merge)), "differs from reviewed paths"),
+                ((first, second_without_merge), "requires an exact reviewed merge pin"),
                 ((first, replace(second, reviewed_merge=reviewed)), "differs from exact reviewed merge"),
                 ((first, replace(second, accepted_base=first.accepted_base)), "differs from exact reviewed merge")):
             with self.subTest(pins=pins):

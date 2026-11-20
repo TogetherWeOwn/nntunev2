@@ -515,6 +515,9 @@ def verify_unapplied_chain(history, entries, entry, pins, events):
         raise HistoryError("unapplied rename lacks the exact reviewed edge chain")
     prior = None
     for pin, event in zip(pins, events):
+        # Only the legacy first edge may use an ancestry-only pin.
+        if prior is not None and pin.reviewed_merge is None:
+            raise HistoryError("unapplied rename after the first edge requires an exact reviewed merge pin")
         pin.verify(history, entry, event)
         parent, _, old, _, _, _ = event
         # A merge between renames is fine only if it carries the earlier edge
