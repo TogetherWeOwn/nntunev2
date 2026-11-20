@@ -179,7 +179,7 @@ describe('library repeat hooks are declared in the library markup', () => {
 		const authority = sources['../player/mediaController.ts'] ?? '';
 		expect(routeSource()).toMatch(/return media\.attach\(audio,/);
 		expect(routeSource()).not.toMatch(/\b(?:naturalEndPolicy|handleEnded)\b/);
-		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source\)/);
+		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source, matches\)/);
 		expect(authority).toMatch(/const result = naturalEndPolicy\(base, \{/);
 	});
 
