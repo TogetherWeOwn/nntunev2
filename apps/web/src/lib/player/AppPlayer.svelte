@@ -1,10 +1,16 @@
+<script module lang="ts">
+	import { createContext } from 'svelte';
+	import { createPlayerController } from './controller.svelte.js';
+
+	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController>>();
+</script>
+
 <script lang="ts">
 	import { onMount, tick, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
-	import { createPlayerController, setAppPlayer } from './controller.svelte.js';
 	import NativePlayer from './NativePlayer.svelte';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 
