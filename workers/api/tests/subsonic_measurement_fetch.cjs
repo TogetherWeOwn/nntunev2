@@ -106,7 +106,9 @@ async function main() {
   try {
     const config = readFileSync('measurement-1.toml', 'utf8').replace(
       /^localConnectionString = .*$/m,
-      `localConnectionString = "postgresql://fixture@127.0.0.1:${peer.address().port}/fixture?sslmode=disable"`,
+      // The local Hyperdrive binding requires a password field even though
+      // the silent peer never requests authentication.
+      `localConnectionString = "postgresql://fixture:unused@127.0.0.1:${peer.address().port}/fixture?sslmode=disable"`,
     );
     writeFileSync('measurement-stalled.toml', config);
     const worker = await start('stalled');
@@ -116,7 +118,8 @@ async function main() {
       assert.equal(response.status, 503);
       assert.equal(response.headers.get('retry-after'), '1');
       assert.equal(response.headers.get('cache-control'), 'private, no-store');
-      assert.equal(await response.text(), fixedCapacity);
+      assert.equal(response.headers.get('content-type'), 'application/xml');
+      assert.equal(await response.text(), '<subsonic-response status="failed" version="1.16.1"><error code="0" message="Service unavailable."/></subsonic-response>');
       const elapsed = performance.now() - started;
       // Allow the two-second close reserve and runner jitter, but not the
       // eight-second operation deadline.
