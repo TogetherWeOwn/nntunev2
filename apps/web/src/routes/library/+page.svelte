@@ -788,7 +788,7 @@
 	function editFavorites(
 		update: (latest: readonly string[]) => readonly string[],
 		applied?: (before: readonly string[], after: readonly string[]) => void,
-		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection }
+		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> }
 	): void {
 		const session = browserStorage('session');
 		const key = favoritesKey(session);
@@ -817,21 +817,25 @@
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
 				const visible = new Set(durable);
-				// Anchor an explicit visit-only move to the row it crossed; keep other
-				// visit-only IDs before their next surviving durable neighbor.
 				const moved = placement && !baseline.has(placement.id) && !visible.has(placement.id)
 					&& visible.has(placement.crossed) ? placement : undefined;
 				const beforeNeighbor = new Map<string, string[]>();
 				let pending: string[] = [];
-				for (const id of optimistic) {
+				// Rebase the pre-move overlay before assigning the moved ID a visible slot.
+				for (const id of moved ? before : optimistic) {
 					if (visible.has(id)) {
 						if (pending.length) beforeNeighbor.set(id, pending);
 						pending = [];
-					} else if (!baseline.has(id) && id !== moved?.id) pending.push(id);
+					} else if (!baseline.has(id)) pending.push(id);
 				}
 				const reconciled = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
-				if (moved) reconciled.splice(reconciled.indexOf(moved.crossed) + (moved.direction === 'down' ? 1 : 0), 0, moved.id);
-				favorites = reconciled;
+				if (moved) {
+					// Reorder only the loaded slots, leaving hidden IDs in place.
+					const order = reconciled.filter((id) => moved.loaded.has(id) && id !== moved.id);
+					order.splice(order.indexOf(moved.crossed) + Number(moved.direction === 'down'), 0, moved.id);
+					let slot = 0;
+					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
+				} else favorites = reconciled;
 			}
 			favoriteBaseline = committed;
 		});
@@ -928,7 +932,7 @@
 			if (position !== -1 && position !== visible(before).indexOf(id)) {
 				favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position + 1} of ${ids.length}`;
 			}
-		}, { id, crossed, direction });
+		}, { id, crossed, direction, loaded });
 	}
 
 	function moveFavoriteLabel(track: LibraryItem, direction: FavoriteMoveDirection): string {

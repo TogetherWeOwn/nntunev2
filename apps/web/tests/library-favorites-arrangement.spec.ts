@@ -288,24 +288,28 @@ test('a retired move reconciles durable favorites without dropping a visit-only 
 	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
 });
 
-test('a visit-only favorite retains its moved position after peer additions and reorders', async ({ page }) => {
-	await open(page, ['arr-z']);
+test('a visit-only move honors peer reorders without displacing hidden favorite slots', async ({ page }) => {
+	await open(page, ['arr-z', 'hidden']);
 	await faultStorage(page, 'write');
 	await star(page, 'arr-a').click();
 	await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
-	expect(await stored(page)).toEqual(['arr-z']);
+	expect(await stored(page)).toEqual(['arr-z', 'hidden']);
 	const peer = await page.context().newPage();
-	await open(peer, ['arr-z']);
+	await open(peer, ['arr-z', 'hidden']);
 	await star(peer, 'arr-m').click();
-	await expect.poll(() => stored(peer)).toEqual(['arr-z', 'arr-m']);
+	await expect.poll(() => stored(peer)).toEqual(['arr-z', 'hidden', 'arr-m']);
 	await activate(page, 'Alpha Song', 'up');
 	await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
-	expect(await stored(page)).toEqual(['arr-z', 'arr-m']);
+	expect(await stored(page)).toEqual(['arr-z', 'hidden', 'arr-m']);
 	await activate(peer, 'Mike Song', 'up');
-	await expect.poll(() => stored(peer)).toEqual(['arr-m', 'arr-z']);
+	await expect.poll(() => stored(peer)).toEqual(['arr-m', 'hidden', 'arr-z']);
 	await activate(page, 'Alpha Song', 'down');
 	await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
-	expect(await stored(page)).toEqual(['arr-m', 'arr-z']);
+	const expanded = [...ITEMS, { id: 'hidden', title: 'Hidden Song', artist: '' }];
+	await page.route('**/api/library', (route) => route.fulfill({ json: expanded }));
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expectIds(page, ['arr-m', 'arr-z', 'hidden', 'arr-a']);
+	expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-z']);
 });
 
 async function holdFavorites(page: Page): Promise<() => Promise<void>> {
