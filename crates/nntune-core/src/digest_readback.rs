@@ -7,6 +7,7 @@
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
 use crate::media::FileKey;
+use crate::media_envelope::{enrolled_scheme2_key, EnvelopeContext};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, future::Future, ops::AsyncFnMut};
 
@@ -207,6 +208,46 @@ pub async fn verify_pinned_readback<'a, B: ReadbackBody>(
     verify_readback(manifest, key, identities, media, pages, open, ()).await
 }
 
+struct EnrolledEnvelope<'a> {
+    authorized_root: &'a [u8; 32],
+    context: &'a EnvelopeContext,
+    trusted_record: &'a [u8; 230],
+    retained_record: &'a [u8],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnrolledReadbackError {
+    Envelope,
+    Body(BodyReadbackError),
+}
+
+/// The inputs must come from one independently authorized custody and locator
+/// snapshot. No caller-supplied file key or fallback is accepted on this path.
+/// Success authorizes neither publication nor reuse.
+#[allow(dead_code)] // Not mounted; a concrete validator and trusted snapshot are still required.
+async fn verify_enrolled_readback<'a, B: ReadbackBody>(
+    manifest: &OriginManifest,
+    envelope: EnrolledEnvelope<'_>,
+    media: ReadbackPin<'a>,
+    pages: &[(u32, ReadbackPin<'a>)],
+    open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
+    validation: impl MediaValidation,
+) -> Result<(), EnrolledReadbackError> {
+    let key = enrolled_scheme2_key(
+        envelope.authorized_root,
+        envelope.context,
+        envelope.trusted_record,
+        envelope.retained_record,
+        manifest,
+    )
+    .map_err(|_| EnrolledReadbackError::Envelope)?;
+    let [_, environment, library, object, generation, provider] = envelope.context.identities;
+    let identities = [environment, library, object, generation, provider];
+    verify_readback(manifest, &key, &identities, media, pages, open, validation)
+        .await
+        .map_err(EnrolledReadbackError::Body)
+}
+
 async fn verify_readback<'a, B: ReadbackBody>(
     manifest: &OriginManifest,
     key: &FileKey,
@@ -337,6 +378,83 @@ mod tests {
             validation,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_requires_the_exact_authenticated_envelope() {
+        struct ExactMedia<'a>(&'a [u8]);
+
+        impl MediaValidation for ExactMedia<'_> {
+            fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
+                self.0 = self.0.strip_prefix(plaintext).ok_or(())?;
+                Ok(())
+            }
+
+            fn finish(self) -> Result<(), ()> {
+                self.0.is_empty().then_some(()).ok_or(())
+            }
+        }
+
+        let plaintext = b"synthetic media";
+        let f = fixture(plaintext);
+        let mut media_bytes = f.header.to_vec();
+        media_bytes.extend_from_slice(&f.chunks[0]);
+        let context = EnvelopeContext {
+            identities: [id(9), id(1), id(1), id(1), id(1), id(1)],
+            plaintext_len: plaintext.len() as u64,
+            header: f.header,
+        };
+        let root = [2; 32];
+        let record =
+            crate::media_envelope::wrap_scheme2(&root, &context, f.key.expose_secret()).unwrap();
+        let mut altered = record;
+        altered[229] ^= 1;
+        for (root, trusted, retained, accepted) in [
+            (&root, &record, &record, true),
+            (&root, &record, &altered, false),
+            (&root, &altered, &altered, false),
+            (&[3; 32], &record, &record, false),
+        ] {
+            let mut opens = 0;
+            let result = verify_enrolled_readback(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: root,
+                    context: &context,
+                    trusted_record: trusted,
+                    retained_record: retained,
+                },
+                pin("media"),
+                &[(0, pin("page"))],
+                async |request: ReadbackPin<'_>| {
+                    let bytes = match request.object_key {
+                        "media" => media_bytes.as_slice(),
+                        "page" => f.pages[0].as_slice(),
+                        _ => panic!("unexpected synthetic request"),
+                    };
+                    opens += 1;
+                    Ok(ReadbackResponse {
+                        configuration: request.configuration,
+                        object_key: request.object_key.into(),
+                        version: Some("original".into()),
+                        status: 200,
+                        content_length: Some(bytes.len() as u64),
+                        has_content_range: false,
+                        has_content_encoding: false,
+                        body: Body(bytes, false),
+                    })
+                },
+                ExactMedia(plaintext),
+            )
+            .await;
+            if accepted {
+                assert_eq!(result, Ok(()));
+                assert_eq!(opens, 2);
+            } else {
+                assert_eq!(result, Err(EnrolledReadbackError::Envelope));
+                assert_eq!(opens, 0);
+            }
+        }
     }
 
     #[tokio::test]
