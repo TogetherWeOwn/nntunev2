@@ -46,7 +46,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
+		items: ITEMS, favorites, queue, announcement,
 		addTrack, resolveStreamUrl, displayArtist, displayTitle,
 		createQueue: () => queue, createPlayerController,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
@@ -55,11 +55,12 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		${compiled}
 		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
 		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.announceQueue(announcement);
 		queueController.subscribe((value) => { queue = value; });
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
 			replaceQueue, commitQueue, subscribe: queueController.subscribe,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;

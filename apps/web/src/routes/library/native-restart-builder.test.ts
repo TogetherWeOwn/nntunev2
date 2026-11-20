@@ -22,7 +22,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback',
 		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
-		'resetShareAtAuthBoundary', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -99,8 +99,6 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '';
-		let queueAnnouncementVersion = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
 		const onMount = (callback) => { cleanup = callback(); };
@@ -129,7 +127,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			nativeIntent: () => ({ playing: media.attachment?.playing }),
 			end: (mode) => { onRepeatChange({ currentTarget: { value: mode } }); return capture('ended')(); },
 			refresh: () => capture('timeupdate')(),
-			read: () => ({ ...get(media.seekFeedback), pendingShareSeek: media.pendingShareSeek, queue, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ ...get(media.seekFeedback), pendingShareSeek: media.pendingShareSeek, queue, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion,
+				queueAnnouncement: player.queueAnnouncement.text, queueAnnouncementVersion: player.queueAnnouncement.version })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -1437,11 +1436,13 @@ test('route selection drives native repeat, and cleanup retires only its own pla
 	expect(target.play).toHaveBeenCalledOnce();
 	expect(selected.writes).toEqual([0]);
 	expect(selected.page.read().queueAnnouncement).toBe('Playing Pine Morning.');
+	expect(selected.page.read().queueAnnouncementVersion).toBe(1);
 	expect(currentTrack(leaving.page.read().queue)?.id).toBe(leaving.track.id);
 	expect(leaving.page.currentAudio()).toBeUndefined();
 	expect(leaving.element.play).not.toHaveBeenCalled();
 	expect(leaving.writes).toEqual([]);
 	expect(leaving.page.read().queueAnnouncement).toBe('');
+	expect(leaving.page.read().queueAnnouncementVersion).toBe(0);
 });
 
 test.each(['pause', 'auth', 'edit'] as const)('queue wrap is fenced by %s during the native flush', async (boundary) => {

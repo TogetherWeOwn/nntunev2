@@ -5,7 +5,7 @@ import { createQueue } from './queue.js';
 
 test('queue commits publish only display metadata and skip same-object Library refreshes', () => {
 	const player = createPlayerController(createQueue([]), {
-		flush: async () => {}, clearShareFeedback: () => {}, announce: () => {}, clearQueueAnnouncement: () => {}
+		flush: async () => {}, clearShareFeedback: () => {}
 	});
 	const next = {
 		tracks: [
@@ -32,4 +32,26 @@ test('queue commits publish only display metadata and skip same-object Library r
 		stop();
 		clearMiniPlayerHint();
 	}
+});
+
+test('queue feedback preserves replay keys across refresh and replacement', () => {
+	const initial = createQueue([]);
+	const effects = { flush: async () => {}, clearShareFeedback: () => {} };
+	const player = createPlayerController(initial, effects);
+	const other = createPlayerController(initial, effects);
+	const text = 'Queue cleared.';
+
+	player.announceQueue(text, true);
+	expect(player.queueAnnouncement).toEqual({ text, version: 1 });
+	player.announceQueue(text, true);
+	player.announceQueue('Order updated.');
+	expect(player.queueAnnouncement).toEqual({ text: 'Order updated.', version: 2 });
+
+	const library = player.queue.prepareLibrary([]);
+	expect(library.next).toBe(initial);
+	expect(player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true })).toBe(true);
+	expect(player.queueAnnouncement).toEqual({ text: 'Order updated.', version: 2 });
+	expect(player.replaceQueue(createQueue([]))).toBe(true);
+	expect(player.queueAnnouncement).toEqual({ text: '', version: 2 });
+	expect(other.queueAnnouncement).toEqual({ text: '', version: 0 });
 });
