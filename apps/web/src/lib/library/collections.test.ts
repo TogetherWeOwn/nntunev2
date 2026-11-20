@@ -4,20 +4,22 @@ import { COLLECTION_LIMIT, displayCollections, loadCollections } from './collect
 const id = 'abcdef00-0000-4000-8000-000000000001';
 const path = `/v1/releases/${id}/art`;
 const release = { mbid: id, title: 'Café Radio', artist: 'North', art_url: path, release_type: 'Album' };
-const single = { ...release, mbid: id.replace(/1$/, '3'), release_type: 'Single' };
+const single = { ...release, mbid: id.replace(/1$/, '3'), title: '', release_type: 'Single' };
+const unnamed = id.replace(/1$/, '4');
 
 function clientFor(albums: unknown, artists: unknown = []) {
 	return { get: vi.fn(async (url: string) => url === '/v1/releases' ? albums : artists) };
 }
 
 describe('member collections', () => {
-	it('loads selected types, keeping album and artist IDs separate', async () => {
-		const client = clientFor([release, single], [{ mbid: id, name: 'North', art_url: path }]);
+	it('loads selected types and keeps browsing when catalogue names are blank', async () => {
+		const client = clientFor([release, single], [{ mbid: id, name: 'North', art_url: path }, { mbid: unnamed, name: ' ' }]);
 		expect(await loadCollections(client, 'artists')).toEqual([
-			{ id, kind: 'Artist', title: 'North', creator: '', artPath: null }
+			{ id, kind: 'Artist', title: 'North', creator: '', artPath: null },
+			{ id: unnamed, kind: 'Artist', title: 'Unknown artist', creator: '', artPath: null }
 		]);
 		expect(client.get.mock.calls).toEqual([['/v1/artists']]);
-		expect((await loadCollections(client, 'all')).map((row) => row.kind)).toEqual(['Album', 'Artist']);
+		expect((await loadCollections(client, 'all')).map((row) => row.kind)).toEqual(['Album', 'Artist', 'Artist']);
 	});
 
 	it('accepts only the exact matching release art path', async () => {
