@@ -420,6 +420,9 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
     outcome.row.cancel_at_period_end = true;
     outcome.history.truncate(1);
     outcome.history[0].stripe_invoice_id = "in_worker_parent_cycle".into();
+    // Distinct values catch a period start / payment timestamp swap.
+    outcome.history[0].paid_at_unix += 10;
+    let expected_history = outcome.history[0].clone();
 
     let phase = Rc::new(Cell::new("parent cycle: connect disposable deleter"));
     let diagnostic = phase.clone();
@@ -476,7 +479,8 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
         move |deleter| {
             Box::pin(async move {
                 phase.set("parent cycle: snapshot and lock parent");
-                let before = parent_cycle_snapshot(deleter).await?;
+                let before = parent_cycle_snapshot(deleter, &expected_history).await?;
+                let deadlocks_before = parent_cycle_deadlocks(deleter).await?;
                 deleter
                     .batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
                     .await
@@ -526,8 +530,20 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
                 if deleted? == committed {
                     return Err(StoreError);
                 }
+                // The hosted smoke gives this pair a fresh database. With both
+                // waits observed, a successful cascade and one server-counted
+                // deadlock identify the Worker as the victim, not a lock timeout.
+                phase.set("parent cycle: PostgreSQL did not report exactly one deadlock");
+                let deadlocks_after = wait_parent_cycle(|| async {
+                    let count = parent_cycle_deadlocks(deleter).await?;
+                    Ok((count != deadlocks_before).then_some(count))
+                })
+                .await?;
+                if deadlocks_after != deadlocks_before + 1 {
+                    return Err(StoreError);
+                }
                 phase.set("parent cycle: partial write, changed history or retained lock");
-                let after = parent_cycle_snapshot(deleter).await?;
+                let after = parent_cycle_snapshot(deleter, &expected_history).await?;
                 let locks: bool = deleter.query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid IN ($1, $2) AND relation = 'public.subscriptions'::regclass)",
                 &[&parent, &worker],
@@ -566,8 +582,19 @@ async fn wait_parent_cycle<T, F: std::future::Future<Output = Result<Option<T>, 
     Err(StoreError)
 }
 
+async fn parent_cycle_deadlocks(db: &tokio_postgres::Client) -> Result<i64, StoreError> {
+    db.query_one(
+        "SELECT deadlocks FROM pg_catalog.pg_stat_database WHERE datname = current_database()",
+        &[],
+    )
+    .await
+    .and_then(|row| row.try_get(0))
+    .map_err(|_| StoreError)
+}
+
 async fn parent_cycle_snapshot(
     db: &tokio_postgres::Client,
+    expected_history: &PaidInvoiceRow,
 ) -> Result<(String, String, bool, Option<bool>), StoreError> {
     let row = db.query_one(
         "SELECT (SELECT jsonb_agg(to_jsonb(s) - 'cancel_at_period_end' ORDER BY stripe_subscription_id)::text
@@ -577,8 +604,15 @@ async fn parent_cycle_snapshot(
                 (SELECT cancel_at_period_end FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'),
                 (SELECT user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'
                      AND plan_id = 'plus' AND amount_cents = 800 AND currency = 'usd'
+                     AND period_start = to_timestamp($1::bigint)
+                     AND period_end = to_timestamp($2::bigint)
+                     AND paid_at = to_timestamp($3::bigint)
                   FROM public.paid_invoice_history WHERE stripe_invoice_id = 'in_worker_parent_cycle')",
-        &[],
+        &[
+            &expected_history.period_start_unix,
+            &expected_history.period_end_unix,
+            &expected_history.paid_at_unix,
+        ],
     ).await.map_err(|_| StoreError)?;
     (|| {
         Ok((
