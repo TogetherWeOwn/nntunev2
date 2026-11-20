@@ -5,6 +5,8 @@ use tokio_postgres::{types::Type, Client, IsolationLevel, Transaction};
 
 use crate::handlers::StoreError;
 
+pub const EVENTS_PATH: &str = "/v1/plays/events";
+pub const EVENTS_PER_MINUTE: u64 = 120;
 pub const EXPORT_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,6 +51,15 @@ pub struct ListenEventBody {
     pub playback_id: String,
     pub track_id: String,
     pub event: ListenEvent,
+}
+
+impl ListenEventBody {
+    pub fn valid(&self) -> bool {
+        valid_playback_id(&self.playback_id)
+            && !self.track_id.is_empty()
+            && self.track_id.len() <= 128
+            && !self.track_id.chars().any(char::is_control)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

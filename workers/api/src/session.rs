@@ -224,11 +224,36 @@ impl<'a> SessionKeys<'a> {
     }
 }
 
-fn sign(secret: &[u8], payload_b64: &str) -> Result<Vec<u8>, SessionError> {
+fn sign(secret: &[u8], message: &str) -> Result<Vec<u8>, SessionError> {
     check_secret_len(secret)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| SessionError::Invalid)?;
-    mac.update(payload_b64.as_bytes());
+    mac.update(message.as_bytes());
     Ok(mac.finalize().into_bytes().to_vec())
+}
+
+/// Correlate browser history with an already authenticated session. This is
+/// not a credential. Cookie refresh keeps the row id; a new login does not.
+pub fn listen_context(secret: &[u8], claims: &SessionClaims) -> Result<String, SessionError> {
+    // The prefix contains a colon, which cannot occur in a session token's
+    // base64url signing input. Do not share the tag with other purposes.
+    let tag = sign(
+        secret,
+        &format!("nntune:listen-context:v1:{}", claims.session_id),
+    )?;
+    Ok(crate::b64::encode(&tag))
+}
+
+/// Must be called with the claims from full cookie and row verification.
+pub fn verify_listen_context(
+    secret: &[u8],
+    claims: &SessionClaims,
+    presented: Option<&str>,
+) -> bool {
+    let Some(presented) = presented.filter(|value| value.len() == 43) else {
+        return false;
+    };
+    listen_context(secret, claims)
+        .is_ok_and(|expected| bool::from(expected.as_bytes().ct_eq(presented.as_bytes())))
 }
 
 /// Issue a new session token for `user_id` valid for `ttl_secs` from `now`.
@@ -876,6 +901,29 @@ mod tests {
         // token fails the row check under the primary alone.
         let steady = SessionKeys::single(primary);
         assert!(verify_stored_session(&steady, &old_token, now + 180, &record).is_err());
+    }
+
+    #[test]
+    fn history_context_matches_only_the_authenticated_session() {
+        let secret = b"synthetic-secret-00000000000000000000";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000;
+        let token = issue_session(secret, "listener-a", now, 3600).unwrap();
+        let claims = verify_session(secret, &token, now).unwrap();
+        let context = listen_context(secret, &claims).unwrap();
+        assert_ne!(context, claims.session_id);
+        assert!(verify_listen_context(secret, &claims, Some(&context)));
+        assert!(!verify_listen_context(secret, &claims, None));
+        assert!(!verify_listen_context(secret, &claims, Some(&token)));
+
+        let refreshed = rotate_session(&keys, &token, now + 60, 3600).unwrap();
+        let refreshed = verify_session(secret, &refreshed, now + 60).unwrap();
+        assert!(verify_listen_context(secret, &refreshed, Some(&context)));
+        for user in ["listener-a", "listener-b"] {
+            let other = issue_session(secret, user, now, 3600).unwrap();
+            let other = verify_session(secret, &other, now).unwrap();
+            assert!(!verify_listen_context(secret, &other, Some(&context)));
+        }
     }
 
     #[test]
