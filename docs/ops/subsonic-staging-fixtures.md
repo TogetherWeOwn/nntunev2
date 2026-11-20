@@ -50,11 +50,18 @@ renderer rejects over-cap output before allocating the response body.
 Slots count starts, not distinct case IDs or retries. The allowlist does not
 count starts, schedule pairs, provision the auth binding or authorize live use.
 
+Rehearse the pinned schedule with `python3 -I scripts/subsonic-staging-runner.py
+--simulate`. It uses virtual time, synthetic telemetry and an in-memory
+restore/readback. It has no target, credential inputs, network transport or
+provider calls. A successful rehearsal is not evidence of a staging deployment,
+real overlap, connection drain, a working rollback, or permission to arm.
+
 ### Charge triplet
 
-Use one unchanged authenticated `GET /rest/getArtists?f=json` request (with
-its Subsonic authentication parameters) across all three selectors. Each maps
-to `small`. Write `P` for the cumulative ledger at the end of authenticated
+Use one unchanged authenticated `POST /rest/getArtists` across all three
+selectors, putting `f=json` and Subsonic authentication parameters in the
+URL-encoded form body, not the URL. Each maps to `small`. Write `P` for the
+cumulative ledger at the end of authenticated
 parameter parsing. It includes request collection, credential decode, real
 auth and dispatch parameter allocations. That prefix varies with the
 credential shape; it is not refunded, reset or assumed to be fixture data.

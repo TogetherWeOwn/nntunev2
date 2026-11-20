@@ -21,8 +21,10 @@ async function main() {
     try {
       const fetchCase = (endpoint, params, requestHeaders) => {
         const url = new URL(`/rest/${endpoint}`, origin);
-        url.search = new URLSearchParams(params);
-        return worker.fetch(url.href, { headers: requestHeaders, signal: AbortSignal.timeout(15_000) });
+        return worker.fetch(url.href, {
+          method: 'POST', body: new URLSearchParams(params), headers: requestHeaders,
+          redirect: 'error', signal: AbortSignal.timeout(15_000),
+        });
       };
       for (const [key, code] of enabled ? [[matching, null], [other, 50]] : [[matching, 44]]) {
         const response = await fetchCase('getAlbum.view', { f: 'json', apiKey: key, id: release }, headers);
