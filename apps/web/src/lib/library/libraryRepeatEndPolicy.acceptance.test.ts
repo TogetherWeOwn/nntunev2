@@ -177,7 +177,7 @@ describe('library repeat hooks are declared in the library markup', () => {
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {
 		const authority = sources['../player/mediaController.ts'] ?? '';
-		expect(routeSource()).toMatch(/return media\.attach\(audio,/);
+		expect(routeSource().match(/\bmedia\.attach\(audio,/g)).toHaveLength(1);
 		expect(routeSource()).not.toMatch(/\b(?:naturalEndPolicy|handleEnded)\b/);
 		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source\)/);
 		expect(authority).toMatch(/const result = naturalEndPolicy\(base, \{/);
