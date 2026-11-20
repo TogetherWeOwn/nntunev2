@@ -106,8 +106,19 @@ impl StagingBody {
         let Some(stream) = request.body() else {
             return self.finish(query);
         };
+        struct ReaderGuard<'a>(&'a web_sys::ReadableStreamDefaultReader, bool);
+        impl Drop for ReaderGuard<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    // Observe rejection without awaiting a potentially stuck source.
+                    drop(JsFuture::from(self.0.cancel()));
+                }
+                self.0.release_lock();
+            }
+        }
         let reader = web_sys::ReadableStreamDefaultReader::new(&stream)
             .map_err(|_| StagingBodyError::Unreadable)?;
+        let mut guard = ReaderGuard(&reader, false);
         let result = async {
             loop {
                 let item = JsFuture::from(reader.read())
@@ -129,7 +140,8 @@ impl StagingBody {
             }
         }
         .await;
-        reader.release_lock();
+        guard.1 = result.is_ok();
+        drop(guard);
         result?;
         self.finish(query)
     }

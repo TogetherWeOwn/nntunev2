@@ -355,6 +355,8 @@ jobs:
           # Worker also holds the QA_AUTH_TOKEN secret. Never set in
           # deploy-production.yml.
           QA_CODE_SEAM = "1"
+          # Identifies this deployment; no measurement enable, lease, or DB binding.
+          SUBSONIC_MEASUREMENT_STAGE = "staging"
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the

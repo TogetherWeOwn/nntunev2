@@ -1,4 +1,4 @@
-//! Authenticated dispatch for the unmounted staging construction scope.
+//! Authenticated dispatch for the staging construction scope.
 
 use std::future::Future;
 
@@ -40,7 +40,7 @@ pub struct StagingDispatch {
 pub enum StagingApp<'a, K> {
     Postgres {
         client: Client,
-        peppers: &'a IndexKeyring<'a>,
+        peppers: IndexKeyring<'a>,
         keks: &'a K,
         now_seconds: u64,
     },
@@ -63,7 +63,7 @@ pub enum CatalogueSource<C> {
     IsolatedMirror(C),
 }
 
-/// Unmounted. The caller must first verify staging arming and app/mirror
+/// The caller must first verify staging arming and app/mirror
 /// isolation. Source selection runs only after real auth, before account,
 /// fixture, membership or mirror reads. `None` denies access.
 pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
