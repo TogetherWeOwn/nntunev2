@@ -1,5 +1,4 @@
-//! Inert S3 request contract for the SHA-256 COMPOSITE profile. Transport
-//! checksums do not authenticate media or authorize publication.
+//! Inert S3 contract. Transport checksums do not authenticate media or authorize publication.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::media::{ciphertext_size, Header, HEADER_SIZE, PLAIN_CHUNK_SIZE, TAG_SIZE};
@@ -90,8 +89,7 @@ impl<'a> Plan<'a> {
     }
 }
 
-/// Byte partitioner over H || ciphertext-and-tag chunks. The caller supplies
-/// ordered origin chunks; no chunk digest or map entry is read by this layer.
+/// Partitions the wire header and ordered ciphertext-and-tag chunks, without map access.
 pub struct Partition<'a> {
     plan: Plan<'a>,
     remaining: u64,
@@ -160,17 +158,16 @@ impl<'a> UploadPart<'a> {
         if etag.trim().is_empty() || etag.len() > 1024 {
             return Err(MultipartError::PartReceipt);
         }
-        if self.checksum != checksum {
-            return Err(MultipartError::Checksum);
-        }
-        Ok(UploadedPart {
-            plan: self.plan,
-            number: self.number,
-            len: self.body.len(),
-            etag,
-            digest: self.digest,
-            checksum: self.checksum.clone(),
-        })
+        (self.checksum == checksum)
+            .then(|| UploadedPart {
+                plan: self.plan,
+                number: self.number,
+                len: self.body.len(),
+                etag,
+                digest: self.digest,
+                checksum: self.checksum.clone(),
+            })
+            .ok_or(MultipartError::Checksum)
     }
 }
 
@@ -202,17 +199,17 @@ impl<'a> Completion<'a> {
             .map(|p| (p.number, p.etag.as_str(), p.checksum.as_str()))
     }
 
-    /// Require a complete XML success response and its exact composite checksum,
-    /// with the part-count suffix. Even HTTP 200 can carry an S3 Error body.
+    /// Verify a declaration-free receipt with the exact composite checksum and part-count suffix.
     pub fn verify_reply(&self, status: u16, body: &[u8]) -> Result<()> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
-        use quick_xml::events::Event::{DocType, Empty, Eof, Start};
+        use quick_xml::events::Event::{Decl, DocType, Empty, Eof, Start};
         use quick_xml::name::PrefixDeclaration::{Default, Named};
         use MultipartError::{Checksum, CompletionBody, EmbeddedError};
         const SUCCESS: &str = "CompleteMultipartUploadResult";
         const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+        const SHA256: &str = "ChecksumSHA256";
         if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
             return Err(CompletionBody);
         }
@@ -221,7 +218,7 @@ impl<'a> Completion<'a> {
         loop {
             let tag = match tokens.read_event().map_err(|_| CompletionBody)? {
                 Start(tag) | Empty(tag) => tag,
-                DocType(_) => return Err(CompletionBody),
+                Decl(_) | DocType(_) => return Err(CompletionBody),
                 Eof => break,
                 _ => continue,
             };
@@ -240,32 +237,34 @@ impl<'a> Completion<'a> {
             .override_encoding(Some(Encoding::Utf8))
             .allow_multiple_root_elements(false)
             .create_reader(body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body));
-        let (mut depth, mut root_ns, mut in_checksum, mut matched) = (0, None, false, false);
+        let mut next = || reader.next().map_err(|_| CompletionBody);
+        let (mut depth, mut root_ns, mut matched, mut typed) = (0, None, false, false);
         loop {
-            match reader.next().map_err(|_| CompletionBody)? {
+            match next()? {
                 StartElement { name, .. } => {
                     match (depth, name.local_name.as_str(), name.namespace.as_deref()) {
                         (_, "Error", _) => return Err(EmbeddedError),
                         (0, SUCCESS, None | Some(S3_NS)) => root_ns = name.namespace,
-                        (1, "ChecksumSHA256", ns) if !matched && ns == root_ns.as_deref() => {
-                            in_checksum = true;
+                        (1, field @ (SHA256 | "ChecksumType"), n) if n == root_ns.as_deref() => {
+                            let (seen, want, error) = match field {
+                                SHA256 => (&mut matched, self.checksum.as_str(), Checksum),
+                                _ => (&mut typed, "COMPOSITE", CompletionBody),
+                            };
+                            let valid = !*seen && matches!(next()?, Characters(s) if s == want);
+                            if !valid || !matches!(next()?, EndElement { .. }) {
+                                return Err(error);
+                            }
+                            *seen = true;
+                            continue;
                         }
-                        (1, "Location" | "Bucket" | "Key" | "ETag" | "ChecksumType", _) => {}
+                        (1, "Location" | "Bucket" | "Key" | "ETag", _) => {}
                         _ => return Err(CompletionBody),
                     }
                     depth += 1;
                 }
-                Characters(text) if in_checksum && !matched && text == self.checksum => {
-                    matched = true
-                }
-                Characters(_) | Whitespace(_) if in_checksum => return Err(Checksum),
                 Characters(_) if depth == 2 => {}
                 StartDocument { .. } | Whitespace(_) => {}
-                EndElement { .. } if in_checksum && !matched => return Err(Checksum),
-                EndElement { .. } => {
-                    in_checksum = false;
-                    depth -= 1;
-                }
+                EndElement { .. } => depth -= 1,
                 EndDocument => return matched.then_some(()).ok_or(Checksum),
                 _ => return Err(CompletionBody),
             }

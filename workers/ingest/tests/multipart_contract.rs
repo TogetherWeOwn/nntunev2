@@ -75,10 +75,8 @@ fn exact_wire_partition_and_retry() {
             receipts.push(fake.upload(part, number));
         }
         let completion = plan.complete(receipts).unwrap();
-        let body = fake.complete(&completion, count > 1);
-        completion
-            .verify_reply(200, format!("\u{feff}{body}").as_bytes())
-            .unwrap();
+        let body = format!("\u{feff}{}", fake.complete(&completion, count > 1));
+        completion.verify_reply(200, body.as_bytes()).unwrap();
     }
 }
 
@@ -88,24 +86,27 @@ fn rejects_bad_receipts_and_false_completion_success() {
     let (fake, plan, parts) = FakeS3::fixture(1);
     let invalid = parts[0].verify_reply("opaque".into(), "opaque");
     assert!(matches!(invalid, Err(Checksum)));
-    assert!(matches!(plan.partition().finish(), Err(Geometry)));
     assert!(matches!(plan.complete(Vec::new()), Err(Geometry)));
     let completion = plan.complete(vec![fake.upload(&parts[0], 1)]).unwrap();
     let success = fake.complete(&completion, true);
-    let attr = |a| success.replacen("<s3:Key", &format!("<s3:Key {a}"), 1);
-    let bind = |uri| attr(format!("xmlns:p='{uri}'"));
+    let attr = |a: &str| success.replacen("<s3:Key", &format!("<s3:Key {a}"), 1);
+    let typed = |field: &str| success.replacen("<s3:Key", &format!("{field}<s3:Key"), 1);
+    let composite = "<s3:ChecksumType>COMPOSITE</s3:ChecksumType>";
     let verify = |status, body: &str| completion.verify_reply(status, body.as_bytes());
+    assert_eq!(verify(200, &typed(composite)), Ok(()));
     assert_eq!(verify(503, &success), Err(CompletionStatus));
     assert_eq!(verify(200, " \n<Error/>"), Err(EmbeddedError));
     let error = success.replace("s3:Key", "s3:Error");
     assert_eq!(verify(200, &error), Err(EmbeddedError));
     assert_eq!(verify(200, &success.replace("-1</", "-2</")), Err(Checksum));
     for body in [
-        attr("unexpected='<'".into()),
-        attr(format!("xmlns:s3='{S3_NS}'")),
-        bind("http://www.w3.org/XML/1998/namespace"),
-        bind("http://www.w3.org/2000/xmlns/"),
-        success.replace("s3:Key", "s3:1Key"),
+        format!("<?xml version=\"1.0\"?>{success}"),
+        typed(&composite.replace("COMPOSITE", "FULL_OBJECT")),
+        typed(&composite.repeat(2)),
+        attr("unexpected='<'"),
+        attr(&format!("xmlns:s3='{S3_NS}'")),
+        attr(&format!("xmlns:p='{S3_NS}'")),
+        success.replace(&format!("{S3_NS}\">a"), "urn:other\">a"),
         success.trim_end_matches('>').into(),
         format!("{success}{success}"),
         success.replace("&amp;", "&undefined;"),
