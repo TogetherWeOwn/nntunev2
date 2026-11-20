@@ -74,6 +74,29 @@ job is not evidence. This is point-in-time database telemetry, not lease or
 `/rest` readiness, and cannot be reused to admit a future load window. The job
 does not deploy a Worker, change bindings or send application traffic.
 
+### In-window telemetry policy (offline)
+
+The offline policy checks staging DB pressure and staging health for the pinned
+serving version while clients run, just before each start and at load close.
+Collectors must validate the identity and source timestamp first, then map it
+onto the runner's monotonic timeline; receipt time cannot make an old signal
+fresh. DB and health samples must be inside the window and at most three seconds
+old. Keep room for two measurement sessions in total, and wait for independent
+DB drain before a new group. Only a scheduled overlapping pair can use the
+second slot before drain. A violated threshold or missing signal stops admission
+for the rest of the window, with a fixed classification.
+
+Resource-event evidence must cover the pinned version continuously from window
+open, not just contain the most recent event. An empty or sampled response is
+not proof of zero events. If the provider only supplies delayed resource events,
+select delayed mode before the window and record the lack of real-time coverage.
+It does not waive DB or health checks, and any reported resource exceedance or
+termination still stops admission. Reconciliation needs clean coverage through
+client termination within two minutes of load close (three seconds in live
+mode), without extending the five-minute job deadline or holding up restore.
+This policy has no collectors or live entrypoint; it does not prove provider
+coverage or cleanup.
+
 ### Charge triplet
 
 Use the same `POST /rest/getArtists` with form-encoded `f=json` and credentials
