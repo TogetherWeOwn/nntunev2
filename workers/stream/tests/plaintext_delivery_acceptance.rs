@@ -8,17 +8,20 @@ use nntune_stream::range::{plan_encrypted_range, RangeOutcome};
 
 const FILE_BYTES: u64 = 65_539;
 
+fn verified_view(part: &Result<OpenPart, RangeError>) -> Result<&[u8], &RangeError> {
+    part.as_ref().map(OpenPart::as_slice)
+}
+
 // Fake response adapter: true acknowledges the entire offered slice. Fetching,
 // authenticating or dropping a part is not an acknowledgment.
-fn deliver(
+fn deliver<'e>(
     sink: &mut impl DeliveredSink,
     play_id: &str,
     start: u64,
-    part: Result<Option<OpenPart>, RangeError>,
+    part: Result<&[u8], &'e RangeError>,
     write: impl FnOnce(&[u8]) -> bool,
-) -> Result<(), RangeError> {
-    let Some(part) = part? else { return Ok(()) };
-    let bytes = part.as_slice();
+) -> Result<(), &'e RangeError> {
+    let bytes = part?;
     if !bytes.is_empty() && write(bytes) {
         sink.delivered(DeliveredInterval {
             user_id: "user-1".into(),
@@ -66,14 +69,12 @@ fn meters_only_accepted_trimmed_plaintext_per_play() {
     };
     let cursor = || DigestRange::new(&manifest, &key, range.start, range.end + 1).unwrap();
     let open = |reader: &mut DigestRange<'_>, index, bytes| {
-        reader
-            .open_next(
-                index,
-                &page,
-                bytes,
-                (index == 0).then_some(header.as_slice()),
-            )
-            .map(Some)
+        reader.open_next(
+            index,
+            &page,
+            bytes,
+            (index == 0).then_some(header.as_slice()),
+        )
     };
     let reject_offer =
         |_: &[u8]| -> bool { panic!("empty or unverified offer reached the writer") };
@@ -85,22 +86,29 @@ fn meters_only_accepted_trimmed_plaintext_per_play() {
     };
     let mut sink = VecDeliveredSink::default();
 
-    deliver(&mut sink, "empty", range.start, Ok(None), reject_offer).unwrap();
+    deliver(&mut sink, "empty", range.start, Ok(&[]), reject_offer).unwrap();
     let fetched = fetch(0);
     assert_eq!(fetched, fetch(0)); // Repeated ciphertext fetch, with no delivery.
     let aborted = open(&mut cursor(), 0, fetched);
-    deliver(&mut sink, "aborted", range.start, aborted, |_| false).unwrap();
+    let refuse = |bytes: &[u8]| {
+        assert_eq!(bytes, &[11]);
+        false
+    };
+    let aborted = verified_view(&aborted);
+    deliver(&mut sink, "aborted", range.start, aborted, refuse).unwrap();
     assert!(sink.0.is_empty());
 
     let mut reader = cursor();
     let first = open(&mut reader, 0, fetch(0));
+    let first = verified_view(&first);
     deliver(&mut sink, "play-1", range.start, first, accept(&[11])).unwrap();
     let mut damaged = fetch(1);
     *damaged.last_mut().unwrap() ^= 1;
     let failed = open(&mut reader, 1, damaged);
+    let failed = verified_view(&failed);
     assert_eq!(
         deliver(&mut sink, "play-1", 65_536, failed, reject_offer),
-        Err(RangeError::DigestMismatch),
+        Err(&RangeError::DigestMismatch),
     );
     assert_eq!(reader.next_indices(), None);
     assert_eq!(sink.0.len(), 1);
@@ -114,6 +122,7 @@ fn meters_only_accepted_trimmed_plaintext_per_play() {
             [(0, range.start, &[11][..]), (1, 65_536, &[22, 33, 44][..])]
         {
             let part = open(&mut reader, index, fetch(index));
+            let part = verified_view(&part);
             deliver(&mut sink, play_id, start, part, accept(expected)).unwrap();
         }
         assert_eq!(reader.next_indices(), None);
@@ -136,9 +145,11 @@ fn meters_only_accepted_trimmed_plaintext_per_play() {
         assert!(meter.record(&interval, 1));
     }
     assert!(intervals.next().is_none());
-    let windows = meter.pending_windows();
+    let mut windows = meter.pending_windows();
     assert_eq!(windows.len(), 2);
-    for window in windows {
+    windows.sort_unstable_by(|a, b| a.play_id.cmp(&b.play_id));
+    for (window, play_id) in windows.iter().zip(["play-1", "play-2"]) {
+        assert_eq!(window.play_id, play_id);
         assert_eq!(window.union_bytes, 4);
         assert_eq!(window.file_bytes, Some(FILE_BYTES));
     }
