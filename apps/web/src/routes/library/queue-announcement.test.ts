@@ -94,7 +94,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare, createPlayerController,
-		createPageListenHistory: () => ({ attach: () => () => {} }),
 		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,

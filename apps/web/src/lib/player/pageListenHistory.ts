@@ -1,4 +1,4 @@
-import { PUBLIC_API_BASE_URL, PUBLIC_LISTEN_HISTORY_ENABLED } from '$app/env/public';
+import { PUBLIC_API_BASE_URL } from '$app/env/public';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { openListenContext } from './listenContext.js';
@@ -13,7 +13,6 @@ export function createPageListenHistory() {
 
 	return {
 		mount(): () => void {
-			if (!PUBLIC_LISTEN_HISTORY_ENABLED) return () => {};
 			const context = openListenContext(PUBLIC_API_BASE_URL);
 			const scopedSender = createListenEventSender({ baseUrl: PUBLIC_API_BASE_URL, context });
 			sender = scopedSender;
@@ -62,11 +61,16 @@ export function createPageListenHistory() {
 		finish(audio: HTMLAudioElement | undefined): void {
 			if (audio) observers.get(audio)?.finish();
 		},
-		attach(audio: HTMLAudioElement, trackId: string | undefined): () => void {
+		attach(
+			audio: HTMLAudioElement,
+			trackId: string | undefined,
+			grantPlayId: () => string | undefined
+		): () => void {
 			if (trackId) {
 				try {
 					const observer = observeListenEvents(audio, {
 						trackId,
+						grantPlayId,
 						canStart: () => !pageHidden,
 						sender: { send: (event) => sender?.send(event) }
 					});

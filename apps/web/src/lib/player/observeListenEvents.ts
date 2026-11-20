@@ -10,7 +10,8 @@ export interface ListenObserverOptions {
 	/** Track attached to this keyed media element. */
 	trackId: string;
 	sender: Pick<ListenEventSender, 'send'>;
-	newId?: () => string;
+	/** Play ID from the current grant for this exact source, never the track metadata. */
+	grantPlayId: () => string | undefined;
 	canStart?: () => boolean;
 }
 
@@ -21,21 +22,19 @@ export interface ListenObserver {
 	dispose(): void;
 }
 
-/** RFC 4122 v4 id; `randomUUID` is absent in insecure contexts. */
-export function newPlaybackId(): string {
-	if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-	const b = crypto.getRandomValues(new Uint8Array(16));
-	b[6] = (b[6] & 0x0f) | 0x40;
-	b[8] = (b[8] & 0x3f) | 0x80;
-	const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+/** Reformat the canonical unpadded base64url grant ID without changing its bits. */
+function playbackIdFromGrant(id: string | undefined): string | undefined {
+	if (id === undefined || !/^[A-Za-z0-9_-]{21}[AQgw]$/.test(id)) return;
+	const bytes = atob(id.replace(/-/g, '+').replace(/_/g, '/'));
+	const h = Array.from(bytes, (byte) => byte.charCodeAt(0).toString(16).padStart(2, '0')).join('');
 	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 /**
  * Observe one audio element. `start` fires on the first actual `playing`
  * of a playback; resume after pause or buffering is the same playback.
- * `complete` fires on natural end (a repeat restart then gets a fresh
- * playback id). `skip` fires when a started playback is abandoned: source
+ * `complete` fires on natural end. A repeat needs a new grant play ID.
+ * `skip` fires when a started playback is abandoned: source
  * emptied, media error, explicit stop or observer disposal. A playback that
  * never started (failed load) emits nothing.
  *
@@ -49,9 +48,10 @@ export function newPlaybackId(): string {
  */
 export function observeListenEvents(
 	element: ListenAudioLike,
-	{ trackId, sender, newId = newPlaybackId, canStart }: ListenObserverOptions
+	{ trackId, sender, grantPlayId, canStart }: ListenObserverOptions
 ): ListenObserver {
 	let active: string | undefined;
+	let lastStarted: string | undefined;
 	let endedSeen = false;
 
 	function emit(playback_id: string, track_id: string, event: ListenEvent['event']): void {
@@ -92,8 +92,10 @@ export function observeListenEvents(
 	const onPlaying = safe(() => {
 		endedSeen = false;
 		if (active || canStart?.() === false) return;
-		active = newId();
-		emit(active, trackId, 'start');
+		const id = playbackIdFromGrant(grantPlayId());
+		if (!id || id === lastStarted) return;
+		active = lastStarted = id;
+		emit(id, trackId, 'start');
 	});
 	const sampleEnded = safe(() => {
 		if (element.ended === true) endedSeen = true;

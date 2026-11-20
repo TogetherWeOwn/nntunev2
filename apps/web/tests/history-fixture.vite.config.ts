@@ -3,7 +3,24 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig, mergeConfig, normalizePath } from 'vite';
 import appConfig from '../vite.config';
 
-const target = normalizePath(fileURLToPath(new URL('../src/routes/demo/player/+page.svelte', import.meta.url)));
+const route = (name: string) => normalizePath(fileURLToPath(new URL(`../src/routes/${name}/+page.svelte`, import.meta.url)));
+const demo = route('demo/player');
+const library = route('library');
+
+function splice(code: string, anchor: string, replacement: string): string {
+	if (code.split(anchor).length !== 2) throw new Error(`history fixture: missing or ambiguous anchor: ${anchor}`);
+	return code.replace(anchor, () => replacement);
+}
+
+// Only the fixture build mounts the adapter. Production pages do not have
+// an issued play identity yet, and these simulated grants are not staging proof.
+const fixtureTransport = `<script lang="ts">
+	import { createPageListenHistory } from '#lib/player/pageListenHistory.js';
+	const listenHistory = createPageListenHistory();
+	function fixtureGrantId() {
+		const bytes = crypto.getRandomValues(new Uint8Array(16));
+		return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+	}`;
 const anchor = '\t\trefreshRecent();\n\t\ttry {\n\t\t\tqueue = restoreQueue';
 const injection = `
 		const fixtureStore = recentStore;
@@ -31,7 +48,7 @@ const teardown = `			fixtureActive = false;
 `;
 
 export default defineConfig(async (env) => {
-	let matched = false;
+	const matched = new Set<string>();
 	return mergeConfig(await appConfig(env), {
 		plugins: [{
 			name: 'acceptance-history-live-store',
@@ -52,16 +69,33 @@ export default defineConfig(async (env) => {
 				});
 			},
 			transform(code, id) {
-				if (normalizePath(id) !== target) return;
+				const target = normalizePath(id);
+				if (target !== demo && target !== library) return;
+				matched.add(target);
+				code = splice(code, '<script lang="ts">', fixtureTransport);
+				code = splice(code, '\tonMount(() => {\n', '\tonMount(() => {\n\t\tconst stopHistory = listenHistory.mount();\n');
+				if (target === library) {
+					code = splice(code, '\t\treturn media.attach(audio, {', '\t\tconst detach = media.attach(audio, {');
+					const endAttach = '\t\t});\n\t}\n\n\tfunction announceEnd';
+					code = splice(code, endAttach, `		});
+		const stop = listenHistory.attach(audio, queueCurrentTrack(queueController.snapshot)?.id, fixtureGrantId);
+		return () => { stop(); detach(); };
+	}
+
+	function announceEnd`);
+					return splice(code, '\t\t\tmedia.destroy();', '\t\t\tstopHistory();\n\t\t\tmedia.destroy();');
+				}
+				const observe = '\t\tconst stopObserving = playback.observe(node);';
+				code = splice(code, observe, `${observe}\n\t\tconst stop = listenHistory.attach(node, trackId, fixtureGrantId);`);
+				code = splice(code, '\t\t\t\tstopObserving();', '\t\t\t\tstop();\n\t\t\t\tstopObserving();');
+				const finalNext = '\t\t\t// End of the queue: really stop, so status and playback agree.';
+				code = splice(code, finalNext, `${finalNext}\n\t\t\tlistenHistory.finish(audioEl);`);
 				const cleanup = '\t\t\t// A copy settling after teardown must not resurrect state.';
-				if (code.split(anchor).length !== 2 || code.split(cleanup).length !== 2)
-					throw new Error('history fixture: route anchors missing or ambiguous');
-				matched = true;
-				return code.replace(anchor, `\t\trefreshRecent();\n${injection}\t\ttry {\n\t\t\tqueue = restoreQueue`)
-					.replace(cleanup, teardown + cleanup);
+				return splice(splice(code, anchor, `\t\trefreshRecent();\n${injection}\t\ttry {\n\t\t\tqueue = restoreQueue`),
+					cleanup, `\t\t\tstopHistory();\n${teardown}${cleanup}`);
 			},
 			buildEnd(error) {
-				if (!error && !matched) throw new Error('history fixture: demo route not transformed');
+				if (!error && matched.size !== 2) throw new Error('history fixture: player routes not transformed');
 			}
 		}]
 	});

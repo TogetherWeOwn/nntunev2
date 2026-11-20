@@ -37,7 +37,9 @@ Identical retries do not add rows or refresh timestamps. Terminals and retries
 can refer to an accepted start after the lease changes. Ineligible or
 conflicting observations, including a terminal without a matching start,
 return 422. Delivery is best effort; a missing terminal is not evidence that
-a listen completed. There is no official video embed producer in this build.
+a listen completed. The demo and library pages do not send observations:
+neither obtains a grant-backed source in this build. There is no official
+video embed producer.
 
 ## Export and clear
 
