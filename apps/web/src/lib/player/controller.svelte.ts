@@ -5,7 +5,7 @@ import { createMediaController, type MediaSelection } from './mediaController.js
 import { currentTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
-type PlayerEffects = Pick<MediaSelection, 'flush' | 'clearShareFeedback'>;
+type PlayerEffects = Pick<MediaSelection, 'flush'>;
 
 type LibraryCommit = {
 	sources: LibrarySources;
@@ -17,7 +17,21 @@ export function createPlayerController(
 ) {
 	const queue = createQueueController(initial);
 	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
-	const media = createMediaController(queue, { ...effects, commit: replaceQueue, announce: announceQueue }, matchesNative);
+	let browseCopyGeneration = 0;
+	let browseCopyFeedback = $state.raw<Readonly<{ status: string; fallbackUrl: string | null }>>({ status: '', fallbackUrl: null });
+	const browseCopy = {
+		get feedback() { return browseCopyFeedback; },
+		get generation() { return browseCopyGeneration; },
+		invalidate(): number {
+			const generation = ++browseCopyGeneration;
+			browseCopyFeedback = { status: '', fallbackUrl: null };
+			return generation;
+		},
+		settle(generation: number, status: string, fallbackUrl: string | null): void {
+			if (generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
+		}
+	};
+	const media = createMediaController(queue, { ...effects, browseCopy, commit: replaceQueue, announce: announceQueue }, matchesNative);
 
 	// Keyed messages can announce identical text again without replacing the live region.
 	function announceQueue(text: string, replay = false): void {
@@ -56,7 +70,7 @@ export function createPlayerController(
 		const trackChanged = before?.id !== after?.id;
 		const rawSourceChanged = trackChanged || before?.streamUrl !== after?.streamUrl;
 		if (rawSourceChanged && (kind === 'replace' || kind === 'select')) {
-			if (kind === 'replace') effects.clearShareFeedback();
+			if (kind === 'replace') browseCopy.invalidate();
 			if (!isCurrent()) return false;
 			media.clearShareSeek();
 			if (!isCurrent()) return false;
@@ -89,7 +103,7 @@ export function createPlayerController(
 	}
 
 	return {
-		queue, media, get mediaRevision() { return mediaRevision; },
+		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
 		commitQueue, replaceQueue, resetAtAuthBoundary
 	};
