@@ -73,6 +73,7 @@ async fn expire_after_writes(
         work_deadline_observer: Some(expired.clone()),
         cancel_token_observer: None,
     };
+    let server_watchdog = matches!(probe, ReconcileProbe::ServerWatchdog);
     let mut operation =
         Box::pin(store.store_reconcile_owned("worker_fault_user".into(), outcome.clone(), probe));
     let observe = billing_budget::with_owned_connection(
@@ -110,7 +111,7 @@ async fn expire_after_writes(
         Either::Left(_) => return Err(StoreError),
         Either::Right((result, _)) => result?,
     };
-    if probe == ReconcileProbe::ServerWatchdog {
+    if server_watchdog {
         // Keep the socket owner alive but stop polling its driver and timers.
         // No client close, COMMIT or CancelRequest can explain this cleanup.
         wait_for_transaction_cleanup(pid, 140).await?;
@@ -574,7 +575,9 @@ pub(crate) async fn test_reconcile_after_parent_delete(commit: bool) -> Result<(
             {
                 return Err(StoreError);
             }
-            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::None));
+            let stale_refused = Rc::new(Cell::new(false));
+            let probe = ReconcileProbe::ObserveStaleRefusal(stale_refused.clone());
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, probe));
             phase.set("parent-first delete: Worker table lock did not wait on the exact writer");
             let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
                 let row = writer.query_opt(
@@ -593,6 +596,10 @@ pub(crate) async fn test_reconcile_after_parent_delete(commit: bool) -> Result<(
                 .await.map_err(|_| StoreError)?;
             phase.set("parent-first delete: wrong result for nonempty stale outcome");
             if reconcile.await.is_ok() == commit {
+                return Err(StoreError);
+            }
+            phase.set("parent-first delete: wrong classifier refusal for nonempty stale outcome");
+            if stale_refused.get() != commit {
                 return Err(StoreError);
             }
 
