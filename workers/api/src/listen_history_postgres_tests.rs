@@ -113,6 +113,9 @@ async fn clear_and_terminal_write_share_owner_fence() {
             .collect::<Vec<_>>(),
         [(Complete, 1000), (Start, 1000)]
     );
+    let cursor = ExportCursor::parse(Some(&rows[0].cursor())).unwrap();
+    let after_completion = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
+    assert_eq!(after_completion, rows[1..]);
 
     for number in 4..=104 {
         assert_eq!(

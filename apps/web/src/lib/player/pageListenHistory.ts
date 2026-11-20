@@ -3,12 +3,13 @@ import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { openListenContext } from './listenContext.js';
 import { createListenEventSender, type ListenEventSender } from './listenEventSender.js';
-import { observeListenEvents } from './observeListenEvents.js';
+import { observeListenEvents, type ListenObserver } from './observeListenEvents.js';
 
 /** One context per mounted player page, independent of its keyed audio elements. */
 export function createPageListenHistory() {
 	let sender: ListenEventSender | undefined;
-	const observers = new Set<() => void>();
+	let pageHidden = false;
+	const observers = new Map<HTMLAudioElement, ListenObserver>();
 
 	return {
 		mount(): () => void {
@@ -25,9 +26,29 @@ export function createPageListenHistory() {
 			const onStorage = (event: StorageEvent) => {
 				if (event.key === LIBRARY_AUTH_TRANSITION_KEY) drop();
 			};
+			const onPageHide = (event: PageTransitionEvent) => {
+				pageHidden = true;
+				if (event.persisted) {
+					// End the listen, but keep the observers and original auth scope for restoration.
+					for (const observer of observers.values()) observer.finish();
+				} else {
+					stop();
+				}
+			};
+			const onPageShow = (event: PageTransitionEvent) => {
+				if (event.persisted) pageHidden = false;
+			};
 			window.addEventListener('storage', onStorage);
-			return () => {
-				for (const dispose of observers) dispose();
+			window.addEventListener('pagehide', onPageHide);
+			window.addEventListener('pageshow', onPageShow);
+			let stopped = false;
+			function stop() {
+				if (stopped) return;
+				stopped = true;
+				window.removeEventListener('pagehide', onPageHide);
+				window.removeEventListener('pageshow', onPageShow);
+				for (const observer of observers.values()) observer.dispose();
+				observers.clear();
 				context.drop();
 				if (sender === scopedSender) sender = undefined;
 				// Navigation may send the terminal. An auth reset still aborts that drain.
@@ -35,21 +56,25 @@ export function createPageListenHistory() {
 					unsubscribe();
 					window.removeEventListener('storage', onStorage);
 				});
-			};
+			}
+			return stop;
+		},
+		finish(audio: HTMLAudioElement | undefined): void {
+			if (audio) observers.get(audio)?.finish();
 		},
 		attach(audio: HTMLAudioElement, trackId: string | undefined): () => void {
 			if (trackId) {
 				try {
 					const observer = observeListenEvents(audio, {
 						trackId,
+						canStart: () => !pageHidden,
 						sender: { send: (event) => sender?.send(event) }
 					});
-					const dispose = () => {
-						observers.delete(dispose);
+					observers.set(audio, observer);
+					return () => {
+						observers.delete(audio);
 						observer.dispose();
 					};
-					observers.add(dispose);
-					return dispose;
 				} catch {
 					// Observation must not prevent the element from attaching.
 				}

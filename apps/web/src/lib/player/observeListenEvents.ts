@@ -11,9 +11,12 @@ export interface ListenObserverOptions {
 	trackId: string;
 	sender: Pick<ListenEventSender, 'send'>;
 	newId?: () => string;
+	canStart?: () => boolean;
 }
 
 export interface ListenObserver {
+	/** End the current listen without releasing the audio element. */
+	finish(): void;
 	/** Release listeners; a started playback ends (complete if the media ended, else skip). */
 	dispose(): void;
 }
@@ -33,8 +36,8 @@ export function newPlaybackId(): string {
  * of a playback; resume after pause or buffering is the same playback.
  * `complete` fires on natural end (a repeat restart then gets a fresh
  * playback id). `skip` fires when a started playback is abandoned: source
- * emptied, element released or the observer disposed. A playback that never
- * started (failed load) emits nothing.
+ * emptied, media error, explicit stop or observer disposal. A playback that
+ * never started (failed load) emits nothing.
  *
  * Page `onended` handlers can swap the source and tear this element down
  * before our own `ended` listener runs (microtasks run between listeners).
@@ -46,7 +49,7 @@ export function newPlaybackId(): string {
  */
 export function observeListenEvents(
 	element: ListenAudioLike,
-	{ trackId, sender, newId = newPlaybackId }: ListenObserverOptions
+	{ trackId, sender, newId = newPlaybackId, canStart }: ListenObserverOptions
 ): ListenObserver {
 	let active: string | undefined;
 	let endedSeen = false;
@@ -88,7 +91,7 @@ export function observeListenEvents(
 
 	const onPlaying = safe(() => {
 		endedSeen = false;
-		if (active) return;
+		if (active || canStart?.() === false) return;
 		active = newId();
 		emit(active, trackId, 'start');
 	});
@@ -99,18 +102,20 @@ export function observeListenEvents(
 		endedSeen = false;
 	});
 	const onEnded = safe(() => finish('complete'));
-	const onEmptied = safe(finishAbandoned);
+	const finishCurrent = safe(finishAbandoned);
 	const listeners: [string, () => void][] = [
 		['playing', onPlaying],
 		['pause', sampleEnded],
 		['timeupdate', sampleEnded],
 		['seeking', onSeeking],
 		['ended', onEnded],
-		['emptied', onEmptied]
+		['emptied', finishCurrent],
+		['error', safe(() => finish('skip'))]
 	];
 	for (const [name, listener] of listeners) element.addEventListener(name, listener);
 	let disposed = false;
 	return {
+		finish: finishCurrent,
 		dispose: safe(() => {
 			if (disposed) return;
 			disposed = true;

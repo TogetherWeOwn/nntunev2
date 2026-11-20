@@ -1,15 +1,17 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { contextPath, eventsPath, watchListenContext } from '../fixtures/listen-context.js';
 
-test('demo records actual playback and keeps playing when history is refused', async ({ page }) => {
-	const context = 'a'.repeat(43);
-	const bodies: { playback_id: string; track_id: string; event: string; context: string }[] = [];
+const context = 'a'.repeat(43);
+type Body = { playback_id: string; track_id: string; event: string; context: string };
+
+async function mountDemo(page: Page, refuseThirdTrack = false) {
+	const bodies: Body[] = [];
 	await watchListenContext(page);
 	await page.route(contextPath, (route) => route.fulfill({ json: { context } }));
 	await page.route(eventsPath, (route) => {
-		const body = route.request().postDataJSON() as (typeof bodies)[number];
+		const body = route.request().postDataJSON() as Body;
 		bodies.push(body);
-		const status = body.track_id === 'third-light' && body.event === 'start' ? 401 : 200;
+		const status = refuseThirdTrack && body.track_id === 'third-light' && body.event === 'start' ? 401 : 200;
 		return route.fulfill({ status, json: {} });
 	});
 	// Double the media events and keep the media request pending, not empty.
@@ -23,6 +25,16 @@ test('demo records actual playback and keeps playing when history is refused', a
 	});
 	await page.goto('/demo/player');
 	await expect(page.locator('html')).toHaveAttribute('data-history-context-read', 'true');
+	return bodies;
+}
+
+function startResponse(page: Page) {
+	return page.waitForResponse((response) => response.url().endsWith('/v1/plays/events') &&
+		response.ok() && response.request().postDataJSON()?.event === 'start');
+}
+
+test('demo records actual playback and keeps playing when history is refused', async ({ page }) => {
+	const bodies = await mountDemo(page, true);
 	await page.getByTestId('queue-select-demo-track').click();
 	await expect.poll(() => bodies[0]).toEqual({
 		playback_id: expect.stringMatching(/^[0-9a-f-]{36}$/), track_id: 'demo-track', event: 'start', context
@@ -36,4 +48,60 @@ test('demo records actual playback and keeps playing when history is refused', a
 	await refused;
 	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
 	await expect(page.getByTestId('player-error')).toHaveCount(0);
+});
+
+test('reloading the document finishes the started listen', async ({ page }) => {
+	const bodies = await mountDemo(page);
+	const started = startResponse(page);
+	await page.getByTestId('queue-select-demo-track').click();
+	await started;
+	await page.reload({ waitUntil: 'domcontentloaded' });
+	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
+});
+
+test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {
+	const bodies = await mountDemo(page);
+	const started = startResponse(page);
+	await page.getByTestId('queue-select-demo-track').click();
+	await started;
+	const persistedEvent = (type: 'pagehide' | 'pageshow') =>
+		page.evaluate((type) => window.dispatchEvent(new PageTransitionEvent(type, { persisted: true })), type);
+	const playing = () => page.getByTestId('demo-audio').evaluate((el) => el.dispatchEvent(new Event('playing')));
+	await persistedEvent('pagehide');
+	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
+	await playing(); // Ignore queued media events while the page is hidden.
+	await persistedEvent('pageshow');
+	const restored = startResponse(page);
+	await playing();
+	await restored;
+	expect(bodies[2]).toEqual({ ...bodies[0], playback_id: expect.any(String) });
+	expect(bodies[2].playback_id).not.toBe(bodies[0].playback_id);
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+		key: 'nntune.library.auth-transition.v1'
+	})));
+	await persistedEvent('pagehide');
+	await persistedEvent('pageshow');
+	await page.getByTestId('demo-audio').evaluate((el) => el.dispatchEvent(new Event('playing')));
+	await page.reload({ waitUntil: 'domcontentloaded' });
+	expect(bodies.map((body) => body.event)).toEqual(['start', 'skip', 'start']);
+});
+
+test('pause keeps the listen but Next at the queue end abandons it', async ({ page }) => {
+	const bodies = await mountDemo(page);
+	const started = startResponse(page);
+	await page.getByTestId('queue-select-third-light').click();
+	await started;
+	const toggle = () => page.keyboard.press('k');
+	const status = page.getByTestId('player-status');
+	await toggle();
+	await expect(status).toHaveText('Status: paused');
+	await toggle();
+	await expect(status).toHaveText('Status: playing');
+	await page.getByTestId('player-next').click();
+	await expect(status).toHaveText('Status: ended');
+	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
+	await toggle();
+	await expect.poll(() => bodies.map((body) => body.event)).toEqual(['start', 'skip', 'start']);
+	expect(bodies[2].track_id).toBe(bodies[0].track_id);
+	expect(bodies[2].playback_id).not.toBe(bodies[0].playback_id);
 });
