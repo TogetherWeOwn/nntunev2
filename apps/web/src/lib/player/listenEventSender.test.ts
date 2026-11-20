@@ -37,6 +37,18 @@ describe('createListenEventSender', () => {
 		]);
 	});
 
+	it('dispatches a ready terminal before returning to the pagehide callback', async () => {
+		vi.useFakeTimers();
+		const fetchFn = vi.fn<typeof fetch>(async () => ok());
+		const sender = createListenEventSender({ context, baseUrl: '', fetchFn });
+		sender.send(ev('start'));
+		await vi.advanceTimersByTimeAsync(0);
+		sender.send(ev('skip'));
+		expect(fetchFn).toHaveBeenLastCalledWith('/v1/plays/events', expect.objectContaining({
+			keepalive: true, body: JSON.stringify({ ...ev('skip'), context: context.current() })
+		}));
+	});
+
 	it('keeps the start context on retries and the terminal, without a reset signal', async () => {
 		vi.useFakeTimers();
 		const first = 'a'.repeat(43);
@@ -112,6 +124,36 @@ describe('createListenEventSender', () => {
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 
+	it('aborts the active fetch on an auth reset even while closing', async () => {
+		let requestSignal: AbortSignal | null | undefined;
+		const fetchFn: typeof fetch = async (_url, init) => {
+			requestSignal = init?.signal;
+			return new Promise((_resolve, reject) => {
+				requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason));
+			});
+		};
+		const sender = createListenEventSender({ context, baseUrl: '', fetchFn });
+		sender.send(ev('start'));
+		sender.send(ev('skip'));
+		await vi.waitFor(() => expect(requestSignal?.aborted).toBe(false));
+		const closing = sender.close();
+		sender.dispose();
+		expect(requestSignal?.aborted).toBe(true);
+		await closing;
+	});
+
+	it('does not wait for scheduled retries after the page closes', async () => {
+		vi.useFakeTimers();
+		const fetchFn = vi.fn(async () => new Response('', { status: 503 }));
+		const sender = createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [500] });
+		sender.send(ev('start'));
+		sender.send(ev('skip'));
+		await vi.advanceTimersByTimeAsync(0);
+		await sender.close();
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+	});
+
 	it('rejects control characters in track ids', () => {
 		for (const id of ['a\nb', 'a\u0000', '\u007f', 'x\u0085y', '']) {
 			expect(isValidTrackId(id)).toBe(false);
@@ -123,7 +165,7 @@ describe('createListenEventSender', () => {
 		vi.useFakeTimers();
 		const fetchFn = vi
 			.fn()
-			.mockResolvedValueOnce(new Response('', { status: 429, headers: { 'retry-after': '60' } }))
+			.mockResolvedValueOnce(new Response('', { status: 429, headers: { 'retry-after': '120' } }))
 			.mockResolvedValue(ok());
 		createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1] }).send(ev('start'));
 		await vi.advanceTimersByTimeAsync(30_000);
