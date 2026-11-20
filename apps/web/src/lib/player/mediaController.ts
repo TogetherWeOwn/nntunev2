@@ -8,7 +8,6 @@ import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
 type NativeObservations = {
-	source: () => string | null;
 	seeking: (audio: HTMLAudioElement) => void;
 	position: (audio: HTMLAudioElement) => void;
 };
@@ -259,7 +258,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		});
 	}
 
-	async function handleEnded(attachment: MediaAttachment, source: string): Promise<void> {
+	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
 		if (!naturalEnd) return;
 		const { commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
 		const { audio } = attachment;
@@ -269,7 +268,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		let revision = queue.revision;
 		const ownsEnd = () => !destroyed && generation === endGeneration && intent === positionIntent &&
 			queue.isCurrent(revision);
-		const ownsOrigin = () => ownsEnd() && current === attachment;
+		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
 		const result = naturalEndPolicy(base, {
 			repeat: get(repeat), radioActive: false, continueRadio: false, sleepComplete: false,
@@ -358,16 +357,20 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			current = receipt;
 			previous?.listeners.abort();
 			if (observations) {
+				const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
 				const observe = (event: Event) => {
+					if (current !== receipt || event.currentTarget !== audio) return;
 					const shareRevision = pendingShare.revision;
 					const intent = positionIntent;
-					if (current !== receipt || event.currentTarget !== audio || !audio.isConnected) return;
-					const source = observations.source();
-					if (!source || audio.getAttribute('src') !== source || current !== receipt) return;
+					const source = selectedSource();
+					if (!source) return;
+					// Same-source queue edits leave this attachment and its events current.
+					const matches = () => matchesSource(audio, source, () => current === receipt && selectedSource() === source);
+					if (!matches()) return;
 					switch (event.type) {
 						case 'play':
 						case 'playing':
-							if (!audio.paused && !audio.ended) receipt.playing = true;
+							if (!audio.paused && !audio.ended && matches()) receipt.playing = true;
 							return;
 						case 'pause':
 							// Native completion pauses before `ended`; retain that intent.
@@ -376,18 +379,19 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 						case 'error':
 							if (audio.error === null) return;
 							break;
-						case 'ended': return handleEnded(receipt, source);
+						case 'ended': return handleEnded(receipt, source, matches);
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
-							if (current === receipt && positionIntent === intent) observations.seeking(audio);
+							if (matches() && positionIntent === intent) observations.seeking(audio);
 							return;
 						case 'loadedmetadata':
 						case 'durationchange':
 							retryShare(audio, shareRevision);
-							if (current !== receipt) return;
+							if (!matches()) return;
 							// fall through to refresh position availability
 						default: return observations.position(audio);
 					}
+					if (!matches()) return;
 					receipt.playing = false;
 					endGeneration += 1;
 				};

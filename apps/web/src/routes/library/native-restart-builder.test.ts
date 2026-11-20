@@ -60,7 +60,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		}
-		sourceAttribute = track.streamUrl;
+		sourceAttribute: string | null = track.streamUrl;
 		getAttribute = (name: string) => name === 'src' ? this.sourceAttribute : null;
 		connected = true;
 		get isConnected() { return this.connected; }
@@ -78,14 +78,17 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
+	let onClearFeedback = () => {};
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
 		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
-			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end, (audio, source) =>
-				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), {
+				...end,
+				clearShareFeedback: () => { onClearFeedback(); end.clearShareFeedback(); }
+			}, (audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
 			return player;
@@ -176,7 +179,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		page.attach(next);
 		return element = next;
 	};
-	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
+	return {
+		page, media, writes, location, track, element, capture, remount,
+		observeClear: (callback: () => void) => { onClear = callback; },
+		observeClearFeedback: (callback: () => void) => { onClearFeedback = callback; }
+	};
 }
 
 test('restart reads mutable availability once per gesture', () => {
@@ -526,6 +533,54 @@ test('auth retirement increments the render revision and cancels pending share w
 	replacement.dispatchEvent(new Event('loadedmetadata'));
 	await Promise.resolve();
 	expect(writes).toEqual([]);
+});
+
+test.each(['wrong target', 'disconnected', 'absent source', 'wrong source', 'source swapped during read', 'unreadable source'] as const)(
+	'native events ignore a %s even while the attachment receipt is active', (boundary) => {
+		const { page, element, media, track, capture } = restartFixture();
+		const readSource = element.getAttribute;
+		const target = boundary === 'wrong target' ? new EventTarget() : element;
+		if (boundary === 'disconnected') element.connected = false;
+		if (boundary === 'absent source') element.sourceAttribute = null;
+		if (boundary === 'wrong source') element.sourceAttribute = '/test-audio/other';
+		if (boundary === 'source swapped during read') {
+			element.getAttribute = () => {
+				element.sourceAttribute = '/test-audio/other';
+				return track.streamUrl;
+			};
+		}
+		if (boundary === 'unreadable source') element.getAttribute = () => { throw new Error('unreadable source'); };
+		element.paused = false;
+		media.duration = NaN;
+		capture('playing')(target);
+		capture('timeupdate')(target);
+		expect(page.nativeIntent().playing).toBe(false);
+		expect(page.read().restartCanSeek).toBe(true);
+
+		element.connected = true;
+		element.sourceAttribute = track.streamUrl;
+		element.getAttribute = readSource;
+		element.dispatchEvent(new Event('playing'));
+		element.dispatchEvent(new Event('timeupdate'));
+		expect(page.nativeIntent().playing).toBe(true);
+		expect(page.read().restartCanSeek).toBe(false);
+	}
+);
+
+test('metadata cannot refresh availability after a share retry changes the native source', async () => {
+	const { page, element, location, capture, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	Object.defineProperty(element, 'duration', { get() {
+		element.sourceAttribute = '/test-audio/other';
+		return NaN;
+	} });
+	capture('loadedmetadata')();
+	await Promise.resolve();
+	expect(element.sourceAttribute).toBe('/test-audio/other');
+	expect(writes).toEqual([]);
+	expect(page.read().restartCanSeek).toBe(true);
 });
 
 test('queued and captured events from a retired node cannot change its same-source replacement', async () => {
@@ -1256,9 +1311,10 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 
 const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
 
-test.each(['none', 'callback', 'publication'] as const)('native ended uses the queue transaction with reset at %s', async (boundary) => {
+test.each(['none', 'callback reset', 'callback source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
 	const flush = vi.fn(async () => {});
-	const { page, element, remount, observeClear, writes } = restartFixture(flush);
+	const { page, element, remount, observeClear, observeClearFeedback, writes } = restartFixture(flush);
+	element.play = vi.fn(async () => {});
 	page.replaceQueue(addTrack(page.read().queue, pine));
 	const before = page.read();
 	let publications = 0;
@@ -1268,10 +1324,12 @@ test.each(['none', 'callback', 'publication'] as const)('native ended uses the q
 		expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
 		expect(page.currentAudio()).toBeUndefined();
 		expect(readMiniPlayerHint()?.trackId).toBe('coral');
-		if (boundary === 'publication') page.resetAuth();
+		if (boundary === 'publication reset') page.resetAuth();
 	});
-	if (boundary === 'callback') {
+	if (boundary === 'callback reset') {
 		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
+	} else if (boundary === 'callback source change') {
+		observeClearFeedback(() => { element.sourceAttribute = '/test-audio/other'; });
 	}
 
 	element.paused = false;
@@ -1280,17 +1338,25 @@ test.each(['none', 'callback', 'publication'] as const)('native ended uses the q
 	element.dispatchEvent(new Event('pause'));
 	element.dispatchEvent(new Event('ended'));
 	stop();
+	if (boundary === 'callback source change') {
+		expect(element.getAttribute('src')).toBe('/test-audio/other');
+		expect(element.isConnected).toBe(true);
+		expect(page.currentAudio()).toBe(element);
+		expect(page.read().attachmentVersion).toBe(before.attachmentVersion);
+		expect(page.read().playEpoch).toBe(before.playEpoch);
+	}
 	const target = remount(pine.streamUrl);
 	target.play = vi.fn(async () => { target.paused = false; });
 	await Promise.resolve(); // Native flush.
 	await Promise.resolve(); // Native play result.
 
-	const advanced = boundary !== 'callback';
+	const advanced = boundary === 'none' || boundary === 'publication reset';
 	const played = boundary === 'none';
 	expect(publications).toBe(Number(advanced));
 	expect(currentTrack(page.read().queue)?.id).toBe(advanced ? 'pine' : 'coral');
 	expect(readMiniPlayerHint()?.trackId).toBe(played ? 'pine' : 'coral');
 	expect(flush).toHaveBeenCalledTimes(Number(played));
+	expect(element.play).not.toHaveBeenCalled();
 	expect(target.play).toHaveBeenCalledTimes(Number(played));
 	expect(writes).toEqual(played ? [0] : []);
 	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
