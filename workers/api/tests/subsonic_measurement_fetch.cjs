@@ -19,10 +19,14 @@ async function main() {
         origin: { secure: true, hostname: new URL(origin).hostname } },
     });
     try {
-      const fetchCase = (endpoint, params, requestHeaders) => {
+      const fetchCase = (endpoint, params, headers, method = 'POST') => {
         const url = new URL(`/rest/${endpoint}`, origin);
-        url.search = new URLSearchParams(params);
-        return worker.fetch(url.href, { headers: requestHeaders, signal: AbortSignal.timeout(15_000) });
+        const form = new URLSearchParams(params);
+        if (method === 'GET') url.search = form; // Disposable CI credentials only.
+        return worker.fetch(url.href, {
+          method, body: method === 'POST' ? form : undefined, headers,
+          redirect: 'error', signal: AbortSignal.timeout(15_000),
+        });
       };
       for (const [key, code] of enabled ? [[matching, null], [other, 50]] : [[matching, 44]]) {
         const response = await fetchCase('getAlbum.view', { f: 'json', apiKey: key, id: release }, headers);
@@ -47,9 +51,19 @@ async function main() {
       const empty = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select('empty'));
       assert.equal(empty.status, 200);
       assert.deepEqual((await empty.json())['subsonic-response'].artists.index, []);
+      for (const [endpoint, params] of [
+        ['getAlbum.view', { f: 'json', id: release }],
+        ['getArtists', { f: 'jsonp', callback: 'fixture.cb' }],
+      ]) {
+        const rejected = await fetchCase(endpoint, { ...params, apiKey: matching }, select('charge-exact'));
+        assert.equal(rejected.status, 503, `${endpoint} ${params.f}`);
+        assert.equal(rejected.headers.get('retry-after'), null);
+        assert.equal(await rejected.text(), fixedCapacity);
+      }
       let complete;
-      for (const [id, status] of [['small', 200], ['charge-below', 200], ['charge-exact', 200], ['charge-over', 503]]) {
-        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id));
+      const cases = [['small', 200], ['charge-below', 200], ['charge-exact', 200], ['charge-over', 503]];
+      for (const [method, id, status] of ['POST', 'GET'].flatMap((method) => cases.map((c) => [method, ...c]))) {
+        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id), method);
         assert.equal(response.status, status, id);
         assert.equal(response.headers.get('retry-after'), status === 503 ? '1' : null, id);
         assert.equal(response.headers.get('cache-control'), 'private, no-store', id);
