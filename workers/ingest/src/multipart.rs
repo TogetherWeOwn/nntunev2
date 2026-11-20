@@ -20,6 +20,8 @@ pub enum MultipartError {
     Checksum,
 }
 
+type Result<T> = std::result::Result<T, MultipartError>;
+
 /// Opaque provider identity supplied by the caller; not an authorization check.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UploadTarget<'a> {
@@ -37,11 +39,7 @@ pub struct Plan<'a> {
 }
 
 impl<'a> Plan<'a> {
-    pub fn new(
-        target: UploadTarget<'a>,
-        header: Header,
-        plaintext_len: u64,
-    ) -> Result<Self, MultipartError> {
+    pub fn new(target: UploadTarget<'a>, header: Header, plaintext_len: u64) -> Result<Self> {
         if !(1..=MAX_NEW_PLAINTEXT).contains(&plaintext_len) {
             return Err(MultipartError::Geometry);
         }
@@ -68,7 +66,7 @@ impl<'a> Plan<'a> {
         remaining.min(PART_BYTES as u64) as usize
     }
 
-    pub fn complete(self, parts: Vec<UploadedPart<'a>>) -> Result<Completion<'a>, MultipartError> {
+    pub fn complete(self, parts: Vec<UploadedPart<'a>>) -> Result<Completion<'a>> {
         let count = self.ciphertext_len.div_ceil(PART_BYTES as u64) as usize;
         if parts.len() != count {
             return Err(MultipartError::Geometry);
@@ -102,7 +100,7 @@ pub struct Partition<'a> {
 }
 
 impl<'a> Partition<'a> {
-    pub fn push(&mut self, chunk: &SealedChunk) -> Result<Option<UploadPart<'a>>, MultipartError> {
+    pub fn push(&mut self, chunk: &SealedChunk) -> Result<Option<UploadPart<'a>>> {
         let plain = self.remaining.min(PLAIN_CHUNK_SIZE);
         if plain == 0
             || chunk.final_chunk != (plain == self.remaining)
@@ -124,7 +122,7 @@ impl<'a> Partition<'a> {
         Ok(Some(part))
     }
 
-    pub fn finish(self) -> Result<Option<UploadPart<'a>>, MultipartError> {
+    pub fn finish(self) -> Result<Option<UploadPart<'a>>> {
         if self.remaining != 0 {
             return Err(MultipartError::Geometry);
         }
@@ -158,11 +156,7 @@ impl<'a> UploadPart<'a> {
         (self.plan.target, self.number, &self.body, &self.checksum)
     }
 
-    pub fn verify_reply(
-        &self,
-        etag: String,
-        checksum: &str,
-    ) -> Result<UploadedPart<'a>, MultipartError> {
+    pub fn verify_reply(&self, etag: String, checksum: &str) -> Result<UploadedPart<'a>> {
         if etag.trim().is_empty() || etag.len() > 1024 {
             return Err(MultipartError::PartReceipt);
         }
@@ -210,46 +204,53 @@ impl<'a> Completion<'a> {
 
     /// Require a complete XML success response and its exact composite checksum,
     /// with the part-count suffix. Even HTTP 200 can carry an S3 Error body.
-    pub fn verify_reply(&self, status: u16, body: &[u8]) -> Result<(), MultipartError> {
+    pub fn verify_reply(&self, status: u16, body: &[u8]) -> Result<()> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
-        use quick_xml::events::Event::{Empty, Eof, Start};
+        use quick_xml::events::Event::{DocType, Empty, Eof, Start};
+        use quick_xml::name::PrefixDeclaration::{Default, Named};
         use MultipartError::{Checksum, CompletionBody, EmbeddedError};
+        const SUCCESS: &str = "CompleteMultipartUploadResult";
         const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
-        let dtd = b"<!DOCTYPE";
-        if body.len() > MAX_COMPLETION_BODY || body.windows(dtd.len()).any(|bytes| bytes == dtd) {
+        if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
             return Err(CompletionBody);
         }
-        // Check raw attributes before namespace resolution can discard duplicates.
+        // Allow only the element's own S3 namespace declaration, before resolution.
         let mut tokens = quick_xml::Reader::from_reader(body);
         loop {
-            match tokens.read_event().map_err(|_| CompletionBody)? {
-                Start(tag) | Empty(tag) if tag.attributes().any(|attr| attr.is_err()) => {
-                    return Err(CompletionBody)
-                }
+            let tag = match tokens.read_event().map_err(|_| CompletionBody)? {
+                Start(tag) | Empty(tag) => tag,
+                DocType(_) => return Err(CompletionBody),
                 Eof => break,
-                _ => {}
+                _ => continue,
+            };
+            let prefix = tag.name().prefix();
+            let binding = prefix.map_or(Default, |p| Named(p.into_inner()));
+            if matches!(binding, Named("" | "xml" | "xmlns"))
+                || tag.attributes().any(|attr| match attr {
+                    Ok(a) => a.value != S3_NS || a.key.as_namespace_binding() != Some(binding),
+                    Err(_) => true,
+                })
+            {
+                return Err(CompletionBody);
             }
         }
-        let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
-        let reader = ParserConfig::new()
+        let mut reader = ParserConfig::new()
             .override_encoding(Some(Encoding::Utf8))
             .allow_multiple_root_elements(false)
-            .create_reader(body);
+            .create_reader(body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body));
         let (mut depth, mut root_ns, mut in_checksum, mut matched) = (0, None, false, false);
-        for event in reader {
-            match event.map_err(|_| CompletionBody)? {
+        loop {
+            match reader.next().map_err(|_| CompletionBody)? {
                 StartElement { name, .. } => {
                     match (depth, name.local_name.as_str(), name.namespace.as_deref()) {
                         (_, "Error", _) => return Err(EmbeddedError),
-                        (0, "CompleteMultipartUploadResult", None | Some(S3_NS)) => {
-                            root_ns = name.namespace;
-                        }
+                        (0, SUCCESS, None | Some(S3_NS)) => root_ns = name.namespace,
                         (1, "ChecksumSHA256", ns) if !matched && ns == root_ns.as_deref() => {
                             in_checksum = true;
                         }
-                        (1, field, _) if field != "ChecksumSHA256" => {}
+                        (1, "Location" | "Bucket" | "Key" | "ETag" | "ChecksumType", _) => {}
                         _ => return Err(CompletionBody),
                     }
                     depth += 1;
@@ -269,6 +270,5 @@ impl<'a> Completion<'a> {
                 _ => return Err(CompletionBody),
             }
         }
-        Err(CompletionBody)
     }
 }
