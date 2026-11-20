@@ -2054,6 +2054,13 @@ where
                 ..resp
             };
         }
+        Err(resp) if resp.status == 500 => {
+            let error = crate::api_error::ApiError::internal_error("unexpected error");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
         Err(resp) => return resp,
     };
     match ctx.store.history_list(&claims.user_id).await {
@@ -8490,6 +8497,15 @@ mod tests {
             json!({"items":[item("foreign".into(), NOW + 200)]})
         );
         req.cookie = Some(alice);
+
+        *store.fail_session_lookup.borrow_mut() = true;
+        let (status, body) = call(&req);
+        assert_eq!(status, 500);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"code": "internal_error", "message": "unexpected error", "retryable": true})
+        );
+        *store.fail_session_lookup.borrow_mut() = false;
 
         *store.fail_history_read.borrow_mut() = true;
         assert_eq!(call(&req), (503, unavailable().body));
