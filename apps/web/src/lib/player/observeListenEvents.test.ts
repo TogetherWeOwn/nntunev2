@@ -31,6 +31,10 @@ it('skips a started listen once on media error, but not a failed initial load', 
 	expect(bodies()).toEqual([]);
 	fire('playing');
 	fire('error');
+	expect(bodies()).toEqual([
+		{ playback_id: playback, track_id: 'track', event: 'start' },
+		{ playback_id: playback, track_id: 'track', event: 'skip' }
+	]);
 	fire('error');
 	fire('emptied');
 	fire('playing'); // The ended grant cannot start another listen.
