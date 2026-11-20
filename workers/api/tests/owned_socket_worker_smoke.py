@@ -450,6 +450,21 @@ def main():
                         )
                     finally:
                         admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-parent-first-delete-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-parent-first-delete-ok",
+                            f"Parent-first delete {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: dormant store classified after preceding parent DELETE {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
                 for cycle, writer in (
                     ("parent", "parent cascade"),
                     ("row-update", "raw row-lock UPDATE"),
