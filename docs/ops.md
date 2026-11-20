@@ -1115,9 +1115,10 @@ The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
 Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
 
-1. **Release Manager:** After M1, staging admission, Security → QA, exact-head CI and migration ledger review, accept the seed and exact `main` SHA.
-   Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
-   Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; inherited Cloudflare secrets cause preflight to refuse.
+1. **Release Manager:** Accept the exact launch SHA after M1, staging
+   admission, Security → QA, exact-head CI and migration ledger review.
+   Accept the seed explicitly. Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+   Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
 2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
    The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
    Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes; Cloudflare does not provide a conditional deploy.

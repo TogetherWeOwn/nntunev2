@@ -103,7 +103,6 @@ jobs:
           UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
           UNPROTECTED_WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
           UNPROTECTED_ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
-          UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ] || [ -n "$UNPROTECTED_ACCEPTED_SHA" ]; then
@@ -128,15 +127,12 @@ jobs:
           esac
           [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
             { echo '::error::Application promotion is disabled; only bootstrap-maintenance is supported'; exit 1; }
-          if [ "$INPUT_SHA" != "${GITHUB_SHA:-}" ]; then
-            echo '::error::Bootstrap SHA must match the dispatched main commit'
-            exit 1
-          fi
-          if [ "${UNPROTECTED_CF_CONFIG:-}" != false ] || [ -n "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ]; then
-            echo '::error::Bootstrap Worker ID, route proof and Cloudflare credentials must exist only in the production Environment'
-            exit 1
-          fi
-          printf 'sha=%s\ndomain=%s\n' "$INPUT_SHA" "$domain" >> "$GITHUB_OUTPUT"
+          [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
+            { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
+          [ -z "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ] ||
+            { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
+          echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+          echo "domain=$domain" >> "$GITHUB_OUTPUT"
 
   staging-evidence:
     name: staging-evidence
@@ -160,8 +156,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          # Check inheritance from outside production without passing secret values to this runner.
+          UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
+          [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
+            { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -484,11 +484,9 @@ jobs:
           ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
         run: |
           set -euo pipefail
-          # A partial rerun can reuse the successful unprotected preflight.
-          if [ "$GITHUB_RUN_ATTEMPT" != 1 ] || [ -z "$ACCEPTED_SHA" ] || [ "$DEPLOY_SHA" != "$ACCEPTED_SHA" ]; then
-            echo '::error::Use a fresh dispatch whose SHA matches PRODUCTION_ACCEPTED_SHA in the production Environment'
-            exit 1
-          fi
+          # A partial rerun can reuse successful preflight and staging admission.
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && -n "$ACCEPTED_SHA" && "$DEPLOY_SHA" == "$ACCEPTED_SHA" ]] ||
+            { echo '::error::Use a fresh dispatch whose SHA matches PRODUCTION_ACCEPTED_SHA in the production Environment'; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.preflight.outputs.sha }}
