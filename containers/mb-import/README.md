@@ -28,7 +28,7 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
 `release` with
 `artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
-`recording` with `medium`/`track`, `work` with `work_type`, `label` with
+`recording` with `recording_alias`/`medium`/`track`, `work` with `work_type`, `label` with
 `label_type`) plus the relationship files (`url`, `link_type`, `link`,
 `link_attribute_type`, `link_attribute`, `l_artist_url`, `l_recording_url`,
 `l_recording_recording`, `l_recording_work`, `release_label`, `isrc`) listed in
@@ -49,6 +49,13 @@ locale (empty for NULL), sort name, primary-for-locale (`t` or `f`), and dump
 timestamp. Keys use the COPY-decoded name and locale. Each key keeps one
 source row's COPY text: primary wins, then the greatest raw sort name, then
 the lowest alias ID. Missing artists and malformed primary flags refuse ETL.
+
+`mbdump-recording_alias.tsv` uses the same columns and tie-break, with a
+lowercase recording MBID instead of an artist MBID. It is sorted by MBID,
+decoded alias name, and decoded locale. It includes aliases for recordings
+with no track, and refuses malformed projected fields or missing recordings.
+An empty `recording_alias` input produces an empty sidecar; disk-bounded
+mode writes the same TSV content under `.tsv.gz`.
 
 The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
 (`\N` for an untyped work), and dump timestamp, ordered by upstream work ID.

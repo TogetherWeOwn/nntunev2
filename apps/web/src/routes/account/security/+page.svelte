@@ -24,9 +24,10 @@
 	 * stays behind its own liveness guard.
 	 */
 	function crossAuthBoundary() {
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		return purge;
 	}
 
 	function redirectToLogin() {
@@ -49,7 +50,7 @@
 			if (error instanceof ApiError && error.status === 401) {
 				// Qualifying 401: this session is confirmed gone. Cross the
 				// boundary even when abandoned; navigation stays live-only.
-				crossAuthBoundary();
+				await crossAuthBoundary();
 				redirectToLogin();
 				return;
 			}
@@ -61,7 +62,7 @@
 			if (!alive) busy = null;
 		}
 		// Fulfilled success is qualifying live or abandoned.
-		crossAuthBoundary();
+		await crossAuthBoundary();
 		redirectToLogin();
 	}
 
@@ -97,7 +98,7 @@
 			if (!alive) busy = null;
 		}
 		// Fulfilled success is qualifying live or abandoned.
-		crossAuthBoundary();
+		await crossAuthBoundary();
 		redirectToLogin();
 	}
 </script>
