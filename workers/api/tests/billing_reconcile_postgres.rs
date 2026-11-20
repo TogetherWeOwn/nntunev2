@@ -947,6 +947,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
     let mut stale = a.clone();
+    stale.read_plan = Some(expected.plan.clone());
+    stale.read_anchor = expected.anchor.clone();
     stale.row.paid_through_unix = Some(50);
     stale.row.status = "incomplete_expired".into();
     stale.row.stripe_customer_id = "cus_stale".into();
@@ -954,6 +956,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     stale.row.stripe_price_id = "price_stale".into();
     stale.row.current_period_end_unix = Some(50);
     stale.row.cancel_at_period_end = true;
+    b.read_plan = Some(expected_b.plan.clone());
     for _ in 0..2 {
         fx.put("u1", &stale).await;
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
@@ -964,6 +967,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     let mut advanced = a.clone();
     advanced.row.plan_id = "pro".into();
     for end in [150, 200] {
+        advanced.read_plan = Some(expected.plan.clone());
+        advanced.read_anchor = expected.anchor.clone();
         advanced.row.paid_through_unix = Some(end);
         advanced.row.paid_invoice_id = Some(format!("in_{end}"));
         fx.put("u1", &advanced).await;
@@ -973,7 +978,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     }
     fx.put("u1", &b).await;
-    fx.put("u1", &a).await;
+    stale.row = a.row.clone();
+    fx.put("u1", &stale).await;
     assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
     assert_eq!(fx.history_rows("sub_test_1").await, 0);
@@ -1624,21 +1630,34 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     fx.add_user("u2").await;
     let schema = fx.schema.clone();
     // Non-explicit guarded upsert: exact RETURNING, then an equal-end replay.
-    let first = fx
-        .fold(
-            "u1",
-            &remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]),
-        )
-        .await;
+    let snapshot = remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]);
+    let first = fx.fold_target("u1", &snapshot).await;
+    let mut terminal = snapshot.clone();
+    terminal.subscription.status = "canceled".into();
+    let mut without_read = fx.fold_target("u1", &terminal).await;
+    assert!(!without_read.explicit_stale && without_read.read_plan.is_none());
+    // The terminal fold itself emits no history. Supply a fresh, attributed
+    // item so a mistaken history-only success is also observable.
+    let mut late_history = first.history[0].clone();
+    late_history.stripe_invoice_id = "inv_late_terminal".into();
+    without_read.history.push(late_history);
     assert!(!first.explicit_stale);
     assert!(matches!(
         run(&mut fx.db, &schema, "u1", &first).await,
         Ok(Class::Wrote)
     ));
     let stored = fx.snap("sub_a").await.unwrap();
-    assert_eq!(fx.history_rows("sub_a").await, 2);
+    for _ in 0..2 {
+        assert!(
+            matches!(run(&mut fx.db, &schema, "u1", &without_read).await,
+            Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "missing exact-target read provenance")
+        );
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+        assert_eq!(fx.history_rows("sub_a").await, 2);
+    }
+    let replay = fx.fold_target("u1", &snapshot).await;
     assert!(matches!(
-        run(&mut fx.db, &schema, "u1", &first).await,
+        run(&mut fx.db, &schema, "u1", &replay).await,
         Ok(Class::Wrote)
     ));
     assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
@@ -1722,5 +1741,15 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     assert!(fx.snap("sub_r").await.is_none());
     assert_eq!(fx.history_rows("sub_r").await, 0);
     assert_eq!(fx.snap("sub_a").await, Some(stored));
+
+    let mut retry = fx.fold_target("u1", &terminal).await;
+    assert!(retry.read_plan.is_some());
+    retry.history = without_read.history;
+    fx.put("u1", &retry).await;
+    let canceled = fx.snap("sub_a").await.unwrap();
+    assert_eq!(canceled.status, "canceled");
+    fx.put("u1", &retry).await;
+    assert_eq!(fx.snap("sub_a").await, Some(canceled));
+    assert_eq!(fx.history_rows("sub_a").await, 4);
     fx.cleanup().await;
 }

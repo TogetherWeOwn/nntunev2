@@ -238,6 +238,19 @@ pub(super) async fn check() -> Result<(), &'static str> {
     {
         return Err("new terminal commit changed holder, coverage, or history attribution");
     }
+    let mut delayed = terminal.clone();
+    delayed.history[0].stripe_invoice_id = "in_worker_delayed_terminal".into();
+    for _ in 0..2 {
+        if store
+            .store_reconcile_owned(USER.into(), delayed.clone(), ReconcileProbe::None)
+            .await
+            .is_ok()
+            || state(TERMINAL, None).await? != terminal_committed
+            || state(HOLDER, None).await? != holder
+        {
+            return Err("terminal fold without read proof was not refused without writes");
+        }
+    }
     let mut replay = fold(TERMINAL, Some(row), &terminal_listing)?;
     replay.history = terminal.history;
     store

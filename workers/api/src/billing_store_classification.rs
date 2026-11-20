@@ -81,6 +81,18 @@ pub fn classify_explicit_stale(target: &Target, history_empty: bool) -> Result<A
     }
 }
 
+/// A non-stale absence fold cannot write an owned row that appeared before
+/// the lock, even when the paid-end predicate would suppress the update.
+pub fn validate_read_provenance(
+    outcome: &ReconcileOutcome,
+    owned_target_exists: bool,
+) -> Result<(), Refused> {
+    if owned_target_exists && !outcome.explicit_stale && outcome.read_plan.is_none() {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
 /// Only a slot-reserving fold with exact-target read provenance can commit
 /// history for a write suppressed by a different subscription's live slot.
 pub fn has_slot_suppression_proof(outcome: &ReconcileOutcome) -> bool {
