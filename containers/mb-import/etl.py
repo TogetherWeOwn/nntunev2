@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import io
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from pathlib import Path
 # extract must use the schema revision matching these pinned declarations.
 ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME = 1, 2, 3, 4
 ARTIST_TYPE_ID, ARTIST_AREA_ID = 11, 12
+ALIAS_ID, ALIAS_ARTIST_ID, ALIAS_NAME, ALIAS_LOCALE, ALIAS_SORT_NAME, ALIAS_PRIMARY = 1, 2, 3, 4, 8, 15
 ARTIST_TYPE_LOOKUP_ID, ARTIST_TYPE_NAME = 1, 2
 AREA_ID = 1
 ISO_AREA_ID, ISO_CODE = 1, 2
@@ -46,6 +48,7 @@ ISRC_RECORDING_ID, ISRC_CODE = 2, 3
 
 FIELD_COUNTS = {
     "artist": 19,
+    "artist_alias": 16,
     "artist_type": 6,
     "area": 14,
     "iso_3166_1": 2,
@@ -252,6 +255,51 @@ def insert_select(db: sqlite3.Connection, query: str, output_path: Path, updated
     return count
 
 
+COPY_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|[bfnrtv\\])?")
+COPY_NAMED = {b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r",
+              b"t": b"\t", b"v": b"\v", b"\\": b"\\"}
+
+
+def decode_copy_text(text: str) -> str:
+    def unescape(match):
+        token = match[1]
+        if token is None:
+            raise ValueError("invalid COPY escape")
+        if token in COPY_NAMED:
+            return COPY_NAMED[token]
+        return bytes([int(token[1:], 16) if token.startswith(b"x") else int(token, 8)])
+
+    # Numeric escapes represent bytes, not code points. Decode only after
+    # assembling all bytes, including any literal UTF-8 in the field.
+    decoded = COPY_ESCAPE.sub(unescape, text.encode("utf-8"))
+    if b"\0" in decoded:
+        raise ValueError("NUL in COPY text")
+    return decoded.decode("utf-8")
+
+
+def load_artist_aliases(db: sqlite3.Connection, path: Path) -> int:
+    def aliases():
+        for line_number, row in enumerate(rows(path, FIELD_COUNTS["artist_alias"]), 1):
+            context = f"artist_alias row {line_number}"
+            alias_id = required_int(get(row, ALIAS_ID), context)
+            artist = required_int(get(row, ALIAS_ARTIST_ID), context)
+            name = get(row, ALIAS_NAME)
+            locale = value(get(row, ALIAS_LOCALE)) or ""
+            sort_name = get(row, ALIAS_SORT_NAME)
+            primary = get(row, ALIAS_PRIMARY)
+            if primary not in ("t", "f"):
+                raise ValueError(f"{context}: invalid primary_for_locale")
+            if name == NULL or sort_name == NULL:
+                raise ValueError(f"{context}: name and sort_name must not be NULL")
+            try:
+                name_key, locale_key = decode_copy_text(name), decode_copy_text(locale)
+            except ValueError as exc:
+                raise ValueError(f"{context}: invalid COPY text in name or locale") from exc
+            yield alias_id, artist, name, locale, sort_name, primary, name_key, locale_key
+
+    return db.executemany("INSERT INTO artist_alias VALUES (?,?,?,?,?,?,?,?)", aliases()).rowcount
+
+
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>", file=sys.stderr)
@@ -275,6 +323,11 @@ def main() -> int:
             try:
                 db.executescript("""
                     CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
+                    CREATE TABLE artist_alias (
+                        id INTEGER PRIMARY KEY, artist INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
                     CREATE TABLE artist_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE area (id INTEGER PRIMARY KEY);
                     CREATE TABLE iso_3166_1 (area INTEGER PRIMARY KEY, code TEXT);
@@ -317,6 +370,7 @@ def main() -> int:
                 counts["area"] = load(db, dump_dir / "area", FIELD_COUNTS["area"], (AREA_ID,), "area", "id", as_ints("area.id", (0,)))
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
                 counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
+                counts["artist_alias"] = load_artist_aliases(db, dump_dir / "artist_alias")
                 counts["artist_credit_name"] = load(
                     db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],
                     (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE),
@@ -449,6 +503,9 @@ def main() -> int:
                 bad_country_area = db.execute("SELECT i.area FROM iso_3166_1 i LEFT JOIN area a ON a.id=i.area WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_country_area:
                     raise ValueError(f"iso_3166_1 references missing area {bad_country_area[0]}")
+                bad_alias = db.execute("SELECT al.artist FROM artist_alias al LEFT JOIN artist a ON a.id=al.artist WHERE a.id IS NULL LIMIT 1").fetchone()
+                if bad_alias:
+                    raise ValueError(f"artist_alias references missing artist {bad_alias[0]}")
                 bad_credit_artist = db.execute("SELECT c.credit,c.artist FROM artist_credit_name c LEFT JOIN artist a ON a.id=c.artist WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_credit_artist:
                     raise ValueError(f"artist credit {bad_credit_artist[0]} references missing artist {bad_credit_artist[1]}")
@@ -509,6 +566,21 @@ def main() -> int:
                     ORDER BY a.id
                 """
                 artist_count = insert_select(db, artist_query, output_dir / curated_name("artist"), updated_at)
+                # Pick a whole raw COPY row for each decoded key. Prefer a
+                # primary alias, then the greatest raw sort name; alias ID
+                # breaks ties independently of dump order or escape spelling.
+                artist_alias_query = """
+                    WITH ranked AS (
+                        SELECT a.gid,al.*,ROW_NUMBER() OVER (
+                            PARTITION BY a.gid,al.name_key,al.locale_key
+                            ORDER BY al.primary_flag DESC,al.sort_name DESC,al.id
+                        ) AS rank
+                        FROM artist_alias al JOIN artist a ON a.id=al.artist
+                    )
+                    SELECT gid,name,locale,sort_name,primary_flag FROM ranked
+                    WHERE rank=1 ORDER BY gid,name_key,locale_key
+                """
+                artist_alias_count = insert_select(db, artist_alias_query, output_dir / curated_name("artist_alias"), updated_at)
                 release_group_query = """
                     SELECT g.gid,g.name,a.gid,pt.name
                     FROM release_group g
@@ -677,6 +749,7 @@ def main() -> int:
                 # Deduplicated projections: only the empty-output guard
                 # applies (dedup legitimately shrinks the row count).
                 for table, input_count, output_count in (
+                    ("artist_alias", counts["artist_alias"], artist_alias_count),
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
                     ("recording_music_video", counts["l_recording_recording"], music_video_count),
@@ -705,7 +778,7 @@ def main() -> int:
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)
