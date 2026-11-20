@@ -96,7 +96,8 @@ ADR 0006; default issuance is `library:read` only:
 for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
 `/v1/releases`, `/v1/tracks`, `/v1/search`, and read operations on
 `/v1/playlists` require `library:read`; playlist create/edit/delete require
-`playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
+`playlists:write`; grant requests on `POST /v1/plays` check `plays:write` for
+presented bearers but still require cookie authentication (see below);
 playback on `/v1/stream` requires `stream:read`; ingest submission requires
 `ingest:submit`. Every other operation, including an unlisted method on a
 listed route, is denied to bearer keys and must use session auth. In
@@ -140,9 +141,11 @@ dispatch, even alongside a valid session cookie and Origin: cookies never
 rescue an invalid bearer. With no bearer presented, the existing session
 issuance, heartbeat, entitlement and lease rules are unchanged.
 
-Native bearer play-event handling and grant issuance remain separate
-product/implementation work. This clarification changes neither the scope
-map nor authorization and does not claim either capability is delivered.
+Native bearer play-event recording remains separate implementation work.
+`POST /v1/plays/export` and `DELETE /v1/plays/events` require a cookie session
+and exact Origin, and reject any `Authorization` header. See [Listen
+history](../listen-history.md) for retention and the fresh-session requirement
+for clear.
 
 ### Issuance, expiry, revocation
 
