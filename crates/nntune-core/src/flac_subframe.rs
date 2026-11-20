@@ -164,6 +164,10 @@ mod tests {
         assert_eq!(rest, [0xff]);
 
         let mut bits = BitInput::default();
+        let mut count = 13;
+        assert_eq!(bits.unary(&mut [0x35].as_slice(), &mut count, 14), Err(()));
+
+        let mut bits = BitInput::default();
         let mut count = u32::MAX - 1;
         assert_eq!(
             bits.unary(&mut [0x20].as_slice(), &mut count, u32::MAX),
