@@ -1,0 +1,10 @@
+1	31	71	 QZ-1 	\N
+2	30	71	\N	\N
+3	30	71		\N
+4	30	\N	Not an edge	\N
+5	30	72	Café\tDisc\\N	\N
+6	30	72	Caf\303\251\x09Disc\134N	\N
+7	30	72	Café\tDisc\\N	\N
+8	30	71	\\N	\N
+9	30	71	 QZ-1 	\N
+10	30	71	 qz-1 	\N

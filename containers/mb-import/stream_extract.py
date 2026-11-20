@@ -34,7 +34,7 @@ REQUIRED_TABLES = (
     "release_unknown_country", "recording", "medium", "track", "url",
     "link_type", "link", "link_attribute_type", "link_attribute",
     "l_artist_url", "l_recording_url", "l_recording_recording", "l_recording_work",
-    "isrc", "work", "work_type",
+    "isrc", "work", "work_type", "label", "label_type", "release_label",
 )
 META_FILES = ("TIMESTAMP", "SCHEMA_SEQUENCE", "REPLICATION_SEQUENCE")
 CHUNK = 1 << 20
