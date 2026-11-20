@@ -1746,6 +1746,7 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     assert!(retry.read_plan.is_some());
     retry.history = without_read.history;
     fx.put("u1", &retry).await;
+    assert_eq!(fx.history_rows("sub_a").await, 4);
     let canceled = fx.snap("sub_a").await.unwrap();
     assert_eq!(canceled.status, "canceled");
     fx.put("u1", &retry).await;
