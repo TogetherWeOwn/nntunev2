@@ -650,7 +650,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" || like_track_target(path).is_some() {
+            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {
