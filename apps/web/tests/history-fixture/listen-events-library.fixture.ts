@@ -81,6 +81,22 @@ test('library records a terminal against the start for the same audio element', 
 	expect(bodies[3].playback_id).toBe(bodies[2].playback_id);
 });
 
+test('leaving the library records one skip for the started playback', async ({ page }) => {
+	const bodies: Body[] = [];
+	await page.route(contextPath, (route) => route.fulfill({ json: { context: original } }));
+	await page.route(eventsPath, (route) => {
+		bodies.push(route.request().postDataJSON() as Body);
+		return route.fulfill({ json: {} });
+	});
+	await mountLibrary(page);
+	await playing(page);
+	await expect.poll(() => bodies.map((b) => b.event)).toEqual(['start']);
+	await page.getByRole('link', { name: 'NNTune', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect.poll(() => bodies.map((b) => b.event)).toEqual(['start', 'skip']);
+	expect(bodies[1]).toEqual({ ...bodies[0], event: 'skip' });
+});
+
 test('library keeps a pending start bound when no auth notification arrives', async ({ page }) => {
 	let activeContext = original;
 	let contextLoads = 0;
