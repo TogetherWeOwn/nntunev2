@@ -33,6 +33,64 @@ class SeekableAudio extends EventTarget {
 	set currentTime(value: number) { this.position = value; }
 }
 
+test('share capture refuses a different selection or a blank stream', () => {
+	const queue = createQueueController(coral);
+	const media = createMedia(queue);
+	const intent = media.beginShareInput();
+	const routeIsCurrent = () => true;
+	expect(media.captureShareSeek(intent, { trackId: 'kelp', seconds: 45 }, routeIsCurrent)).toBeUndefined();
+	const noStream = createQueue([{ ...coral.tracks[0]!, streamUrl: '  ' }]);
+	queue.publish(noStream, queue.begin(noStream, 'replace'));
+	expect(media.captureShareSeek(intent, { trackId: 'coral', seconds: 45 }, routeIsCurrent)).toBeUndefined();
+	expect(media.pendingShareSeek).toBeNull();
+});
+
+test.each([
+	['same ID and source', 'coral', '/coral', true],
+	['same ID, different source', 'coral', '/new-coral', false],
+	['different ID, same source', 'kelp', '/coral', false]
+] as const)('native share retry rechecks the selection after a queue edit: %s', (_case, id, streamUrl, writes) => {
+	const queue = createQueueController(coral);
+	const media = createMedia(queue, undefined, (_audio, source) => source === '/coral');
+	const native = new SeekableAudio();
+	const seek = vi.spyOn(native, 'currentTime', 'set');
+	media.attach(native as unknown as HTMLAudioElement);
+	const target = { trackId: 'coral', seconds: 45 };
+	media.captureShareSeek(media.beginShareInput(), target, () => true);
+	const pending = media.pendingShareSeek;
+	expect(pending).toMatchObject({ ...target, streamUrl: '/coral' });
+
+	// Let metadata start on the original node; change the selection during its read.
+	vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => {
+		const next = createQueue([{ id, streamUrl, title: 'Updated metadata', artist: '' }]);
+		queue.publish(next, queue.begin(next, 'replace'));
+		return 120;
+	});
+	native.dispatchEvent(new Event('loadedmetadata'));
+	if (writes) expect(seek).toHaveBeenCalledExactlyOnceWith(45);
+	else expect(seek).not.toHaveBeenCalled();
+	expect(media.pendingShareSeek).toBe(writes ? null : pending);
+});
+
+test('a stale share tick and an in-flight native event cannot apply a newer receipt', () => {
+	const media = createMediaController((_audio, source) => source === '/coral', coral);
+	const native = new SeekableAudio();
+	const seek = vi.spyOn(native, 'currentTime', 'set');
+	media.attach(native as unknown as HTMLAudioElement);
+	const capture = (seconds: number) => media.captureShareSeek(media.beginShareInput(), { trackId: 'coral', seconds }, () => true);
+	const staleTick = capture(45);
+	expect(staleTick).toBeDefined();
+	vi.spyOn(native, 'getAttribute').mockImplementationOnce(() => { capture(60); return '/coral'; });
+	native.dispatchEvent(new Event('loadedmetadata'));
+	staleTick?.();
+	expect(seek).not.toHaveBeenCalled();
+	expect(media.pendingShareSeek).toMatchObject({ seconds: 60, streamUrl: '/coral' });
+
+	native.dispatchEvent(new Event('durationchange'));
+	expect(seek).toHaveBeenCalledExactlyOnceWith(60);
+	expect(media.pendingShareSeek).toBeNull();
+});
+
 test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 	'restart suppresses stale work after a replacement attachment during %s', (phase) => {
 		const media = createMediaController((_audio, source) => source === '/coral', coral);
