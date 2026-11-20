@@ -26,8 +26,8 @@ Run `DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>` before
 `import.sh <mbdump-dir>/curated`. The input directory must contain the official,
 headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
-`release` with `release_alias` and
-`artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
+`release` with `release_alias` and `artist_credit_name`/`release_country`/`release_unknown_country`,
+`release_group` with `release_group_alias` and `release_group_primary_type`,
 `recording` with `recording_alias`/`medium`/`track`, `work` with `work_type`, `label` with
 `label_type`) plus the relationship files (`url`, `link_type`, `link`,
 `link_attribute_type`, `link_attribute`, `l_artist_url`, `l_recording_url`,
@@ -63,6 +63,16 @@ the exact release MBID in `mbdump-release.tsv`. The 16-column CC0
 Rows sort by release MBID, decoded alias name, and decoded locale. Malformed
 projected fields or missing releases refuse publication; an empty input
 produces an empty sidecar. Disk-bounded mode emits the same rows as `.tsv.gz`.
+
+`mbdump-release_group_alias.tsv` uses the same columns and tie-break, but
+keys aliases by the exact group MBID from `mbdump-release_group.tsv`, not a
+release MBID. The required CC0 `release_group_alias` input has 16 COPY fields:
+ID, parent, name, locale, sort name, and primary flag are at positions 1, 2,
+3, 4, 8, and 15, respectively. Rows sort by group MBID, decoded name, and
+decoded locale. Groups without aliases produce no sidecar rows; an empty
+input produces an empty sidecar. Dangling group references or malformed
+projected fields refuse publication. Disk-bounded mode emits the same TSV
+content under `.tsv.gz`.
 
 The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
 (`\N` for an untyped work), and dump timestamp, ordered by upstream work ID.
