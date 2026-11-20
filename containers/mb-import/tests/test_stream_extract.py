@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -73,7 +74,9 @@ class StreamExtractTest(unittest.TestCase):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing required tables", result.stderr.decode())
-        self.assertIn("track", json.loads((out / "dump-meta.json").read_text())["missing"])
+        missing = json.loads((out / "dump-meta.json").read_text())["missing"]
+        self.assertIn("track", missing)
+        self.assertIn("artist_alias", missing)
 
 
 class DuplicateMemberTest(unittest.TestCase):
@@ -130,6 +133,74 @@ class EtlDiskBoundedModeTest(unittest.TestCase):
             outputs.append(path.read_bytes())
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(gzip.decompress(outputs[0]), b"row\n")
+
+
+class ArtistAliasProjectionTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        source = ROOT / "tests" / "fixtures" / "mbdump"
+        self.raw = shutil.copytree(source, self.tmp / "raw")
+        self.aliases = self.raw / "artist_alias"
+        self.curated = self.raw / "curated"
+        self.output = "mbdump-artist_alias.tsv"
+
+    def run_etl(self, directory, **mode):
+        env = dict(os.environ, DUMP_TS="2025-02-03T04:05:06Z",
+                   MB_ETL_CONSUME_INPUTS="0", MB_ETL_GZIP_OUTPUT="0")
+        env.update(mode)
+        return subprocess.run([sys.executable, str(ROOT / "etl.py"), str(directory)],
+                              env=env, capture_output=True, text=True, check=False)
+
+    def test_streamed_aliases_match_plain_after_reordering(self):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        # The winner must come from the same source row, even with reversed ties.
+        members["mbdump/artist_alias"] = b"".join(reversed(self.aliases.read_bytes().splitlines(keepends=True)))
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertTrue((packed / "artist_alias.gz").is_file())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse((packed / "artist_alias.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()),
+                         (self.curated / self.output).read_bytes())
+
+    def test_empty_alias_table_emits_empty_sidecar(self):
+        self.aliases.write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_alias_errors_and_changed_output_preserve_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        original = self.aliases.read_bytes()
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (original.replace(rb"Caf\303\xA9", rb"Caf\303"), "invalid COPY text in name or locale"),
+            (original.replace(b"11\t10\t", b"11\t999\t", 1), "artist_alias references missing artist 999"),
+            (original.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (original.replace(b"\tt\tf\n", b"\t\\N\tf\n", 1), "invalid primary_for_locale"),
+            (original.replace(b"Jazz", b"Updated"), "already has different curated output"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    self.aliases.unlink()
+                else:
+                    self.aliases.write_bytes(changed)
+                refused = self.run_etl(self.raw)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
 
 
 if __name__ == "__main__":
