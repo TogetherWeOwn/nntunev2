@@ -52,6 +52,7 @@ export function createPlayerController(
 		media.clearShareSeek();
 		retireNativeHost();
 		media.clearSeekFeedback();
+		browseCopy.invalidate();
 	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {

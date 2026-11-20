@@ -594,7 +594,6 @@
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		player.resetAtAuthBoundary();
-		player.browseCopy.invalidate();
 		queueShare.reset();
 		shareInvalid = false;
 	}
