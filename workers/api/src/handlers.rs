@@ -954,6 +954,18 @@ pub trait Store {
         async { Err(StoreError) }
     }
 
+    fn export_listen_events(
+        &self,
+        _owner: &str,
+        _before: Option<&crate::listen_history::ExportCursor>,
+    ) -> impl Future<Output = Result<Vec<crate::listen_history::ListenRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+
+    fn clear_listen_events(&self, _owner: &str) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+
     /// The user's `playback_leases` row, if any. Default `Err` fails
     /// closed like [`Store::live_subscription`].
     fn playback_lease(
@@ -7602,6 +7614,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plays/heartbeat"
             | crate::listen_history::EVENTS_PATH
             | listen_history_handlers::CONTEXT_PATH
+            | listen_history_handlers::EXPORT_PATH
             | "/v1/credentials"
             | "/v1/subsonic-credentials"
             | "/v1/plans"
@@ -7825,6 +7838,12 @@ where
         }
         ("POST", crate::listen_history::EVENTS_PATH) => {
             listen_history_handlers::write(ctx, req, bearer_user.as_deref()).await
+        }
+        ("POST", listen_history_handlers::EXPORT_PATH) => {
+            listen_history_handlers::export(ctx, req).await
+        }
+        ("DELETE", crate::listen_history::EVENTS_PATH) => {
+            listen_history_handlers::clear(ctx, req).await
         }
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
@@ -8057,6 +8076,7 @@ mod tests {
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
         listen_writes: RefCell<Vec<(String, crate::listen_history::ListenEventBody)>>,
+        listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
@@ -9057,6 +9077,36 @@ mod tests {
                 .borrow_mut()
                 .push((owner.to_string(), event.clone()));
             Ok(crate::listen_history::WriteOutcome::Written)
+        }
+
+        async fn export_listen_events(
+            &self,
+            owner: &str,
+            before: Option<&crate::listen_history::ExportCursor>,
+        ) -> Result<Vec<crate::listen_history::ListenRow>, StoreError> {
+            use crate::listen_history::{ExportCursor, EXPORT_PAGE_SIZE};
+            let rows = self.listen_rows.borrow();
+            let mut owned = rows.iter().rev().filter(|(id, _)| id == owner);
+            if before.is_some_and(|before| {
+                !owned.any(|(_, row)| {
+                    ExportCursor::parse(Some(&row.cursor()))
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(before)
+                })
+            }) {
+                return Ok(Vec::new());
+            }
+            Ok(owned
+                .take(EXPORT_PAGE_SIZE + 1)
+                .map(|(_, row)| row.clone())
+                .collect())
+        }
+
+        async fn clear_listen_events(&self, owner: &str) -> Result<(), StoreError> {
+            self.listen_rows.borrow_mut().retain(|(id, _)| id != owner);
+            Ok(())
         }
 
         async fn playback_lease(
