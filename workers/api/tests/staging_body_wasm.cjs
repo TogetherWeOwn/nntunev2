@@ -5,7 +5,10 @@ require('./staging_response_wasm.cjs');
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { collect_staging_test: collect } = require(process.env.STAGING_BODY_WASM_JS);
+const {
+  collect_staging_test: collect,
+  collect_staging_timeout_test: collectWithDeadline,
+} = require(process.env.STAGING_BODY_WASM_JS);
 const bytes = (s) => new TextEncoder().encode(s);
 const request = (stream) => new Request('https://example.test/', {
   method: 'POST', body: stream, duplex: 'half',
@@ -33,6 +36,27 @@ test('rejects oversized chunks and cumulative input', async () => {
   await assert.rejects(collect(request(chunks(bytes('x=' + 'a'.repeat(8191))))), (e) => e === 'TooLarge');
   await assert.rejects(collect(request(chunks(bytes('x='), bytes('a'.repeat(8190)), bytes('z')))), (e) => e === 'TooLarge');
   await assert.rejects(collect(request(chunks(bytes('x=1'))), 8193), (e) => e === 'TooLarge');
+});
+
+test('an oversized chunk cancels the open source and releases its reader lock', async () => {
+  let cancelled = 0;
+  const req = request(new ReadableStream({
+    start(controller) { controller.enqueue(bytes('x=' + 'a'.repeat(8191))); },
+    cancel() { cancelled++; throw new Error('test cancellation rejection'); },
+  }));
+  await assert.rejects(collect(req), (e) => e === 'TooLarge');
+  assert.equal(cancelled, 1);
+  assert.equal(req.body.locked, false);
+});
+
+test('request deadline cancels a blocked form reader and releases its lock', { timeout: 5000 }, async () => {
+  let cancelled = 0;
+  const req = request(new ReadableStream({
+    cancel() { cancelled++; return new Promise(() => {}); },
+  }));
+  await assert.rejects(collectWithDeadline(req), (e) => e === 'Deadline');
+  assert.equal(cancelled, 1);
+  assert.equal(req.body.locked, false);
 });
 
 test('rejects short declarations, stream errors and non-byte chunks', async () => {

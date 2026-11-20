@@ -5,7 +5,6 @@ const { test } = require('node:test');
 const {
   staging_dispatch_test: dispatch,
   staging_measurement_admits: admits,
-  staging_measurement_body_timeout: bodyTimeout,
 } = require(process.env.STAGING_BODY_WASM_JS);
 
 const request = (path) => new Request(`https://example.test/rest/${path}`);
@@ -38,18 +37,6 @@ test('only the exact armed staging deployment admits the QA runner', () => {
     { BUILD_SHA: 'f'.repeat(40) }, { SUBSONIC_MEASUREMENT_FIXTURE: 'unknown' }]) {
     assert.equal(admits(req(), { ...env, ...overrides }, 1000), false);
   }
-});
-
-test('request deadline cancels a blocked form reader and releases its lock', { timeout: 5000 }, async () => {
-  let cancelled = 0;
-  const source = new ReadableStream({ cancel() { cancelled++; } });
-  const req = new Request('https://example.test/rest/ping', {
-    method: 'POST', body: source, duplex: 'half',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-  });
-  assert.equal(await bodyTimeout(req), 503);
-  assert.equal(cancelled, 1);
-  assert.equal(req.body.locked, false);
 });
 
 async function refusal(response, status, retry = null) {

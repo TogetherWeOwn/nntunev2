@@ -62,4 +62,5 @@ pub mod media_layout;
 pub mod origin_sealer;
 
 pub mod original_source;
+pub mod s3_locator;
 pub mod transcode;

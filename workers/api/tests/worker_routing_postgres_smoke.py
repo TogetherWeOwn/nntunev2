@@ -222,9 +222,13 @@ def fixture_inert(base, q, fx, mirror):
 
 def legacy_vault_cutover(base, q):
     """Exercise both production queries via HTTP on the disposable Worker DB."""
-    # Hide the retired relation in this fixture so even a redundant read fails.
+    check(q("""
+        SELECT to_regclass('public.provider_vaults') IS NULL
+           AND to_regclass('public.vault_test_leases') IS NULL
+           AND to_regclass('public.providers') IS NULL
+           AND to_regclass('public.user_cache_grants') IS NULL;
+    """) == "t", "legacy provider relations still exist in the migrated Worker database")
     q("""
-        ALTER TABLE provider_vaults RENAME TO smoke_retired_provider_vaults;
         INSERT INTO users (id, email, created_at, legacy_vault_established) VALUES
             ('smoke-marker', 'marker@example.test', 1, true),
             ('smoke-stale', 'stale@example.test', 1, false);
@@ -268,27 +272,7 @@ def legacy_vault_cutover(base, q):
           "cleanup must remove the stale signup's expired challenge")
     finish("smoke-marker", 200)
 
-    # Only test admission for owners: their foreign keys still restrict deletion.
-    # A grant needs a provider owned by the same user, so test both owner states.
-    q("""
-        INSERT INTO users (id, email, created_at) VALUES
-            ('smoke-provider', 'provider@example.test', 1),
-            ('smoke-grant', 'grant@example.test', 1);
-        INSERT INTO providers (user_id, label, encrypted_creds, creds_envelope_version, creds_kek_version,
-                               creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
-                               creds_payload_format, created_at, last_verified_at)
-        SELECT id, 'synthetic', decode('00', 'hex'), 2, 1,
-               decode(repeat('00', 12), 'hex'), decode(repeat('00', 48), 'hex'),
-               decode(repeat('00', 12), 'hex'), 1, 1, 1
-        FROM users WHERE id IN ('smoke-provider', 'smoke-grant');
-        INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at)
-        VALUES (repeat('0', 64), 1, 'synthetic', 'synthetic', 1);
-        INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
-        SELECT user_id, repeat('0', 64), id, 1 FROM providers WHERE user_id = 'smoke-grant';
-    """)
-    finish("smoke-provider", 401)
-    finish("smoke-grant", 401)
-    print("ok: PostgreSQL marker-only admission and reaping, stale cleanup, provider/grant denial", flush=True)
+    print("ok: PostgreSQL marker-only admission and reaping, stale cleanup after provider purge", flush=True)
 
 
 def smoke(base, s, db, fx=None, mirror=False):

@@ -4,7 +4,7 @@ import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, s
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createPlayerController } from '#lib/player/controller.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -33,7 +33,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
 		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'mediaRevision'
+		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'commitQueue', 'replaceQueue', 'queueController', 'media'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)

@@ -195,6 +195,21 @@ mod wasm_test {
         }
         Ok(body)
     }
+
+    #[wasm_bindgen]
+    pub async fn collect_staging_timeout_test(
+        request: worker::web_sys::Request,
+    ) -> Result<(), JsValue> {
+        crate::worker_entry::with_deadline(
+            async {
+                collect_staging_test(request, None, None).await?;
+                Ok(())
+            },
+            50,
+            JsValue::from_str("Deadline"),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

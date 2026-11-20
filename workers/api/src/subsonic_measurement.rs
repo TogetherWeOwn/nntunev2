@@ -116,19 +116,4 @@ mod wasm_test {
                 && authorized_runner(&request, &env).is_some()
         })
     }
-
-    #[wasm_bindgen]
-    pub async fn staging_measurement_body_timeout(request: web_sys::Request) -> u16 {
-        use crate::subsonic_staging::StagingInput;
-        within_request(
-            async {
-                assert!(StagingInput::collect(&request).await.is_ok());
-                Response::ok("collected")
-            },
-            50,
-        )
-        .await
-        .unwrap()
-        .status_code()
-    }
 }

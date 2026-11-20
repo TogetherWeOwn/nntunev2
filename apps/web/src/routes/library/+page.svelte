@@ -4,7 +4,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
-	import { createPlayerController } from '#lib/player/controller.js';
+	import { createPlayerController } from '#lib/player/controller.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -155,7 +155,6 @@
 			restartStatus = '';
 			jumpStatus = '';
 		},
-		bumpMediaKey: () => { mediaRevision += 1; },
 		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
 		syncMiniPlayerHint
 	});
@@ -255,12 +254,9 @@
 	 */
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
-	// A source round trip before Svelte flushes must not revive a retired node.
-	let mediaRevision = $state(0);
 
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
 		return media.attach(audio, {
-			source: () => shareAlive ? resolveStreamUrl(queueCurrentTrack(queueController.snapshot)) : null,
 			seeking: handleSeeking,
 			position: refreshRestartAvailability
 		});
@@ -668,9 +664,7 @@
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
-		media.clearShareSeek();
-		mediaRevision += 1;
-		media.reset();
+		player.resetAtAuthBoundary();
 		clearShareFeedback();
 		queueShare.reset();
 		restartCanSeek = false;
@@ -804,16 +798,16 @@
 		if (!shareAlive || !current) return;
 		const source = resolveStreamUrl(current);
 		if (!source) return;
-		const revision = mediaRevision;
+		const revision = player.mediaRevision;
 		const queueRevision = queueController.revision;
 		const jumpVersion = jumpStatusVersion;
 		media.restart(source, current.title?.trim() ? current.title : current.id, {
 			trackId: current.id,
-			isCurrent: () => shareAlive && revision === mediaRevision && queueController.isCurrent(queueRevision) &&
+			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision) &&
 				jumpVersion === jumpStatusVersion,
 			available: restartIsAvailable,
 			assigned: () => {
-				if (shareAlive && revision === mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
+				if (shareAlive && revision === player.mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
 			},
 			publish: (message, available) => {
 				if (!available) restartCanSeek = false;
@@ -834,13 +828,13 @@
 		if (!shareAlive) return;
 		const source = resolveStreamUrl(current);
 		const queueRevision = queueController.revision;
-		const revision = mediaRevision;
+		const revision = player.mediaRevision;
 		const jumpVersion = jumpStatusVersion;
 		media.jump(source, direction, {
 			trackId: current?.id,
-			isCurrent: () => shareAlive && queueController.isCurrent(queueRevision),
+			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision),
 			assigned: () => {
-				if (!shareAlive || revision !== mediaRevision || jumpVersion !== jumpStatusVersion) return;
+				if (!shareAlive || revision !== player.mediaRevision || jumpVersion !== jumpStatusVersion) return;
 				jumpStatus = '';
 			},
 			publish: (outcome) => {
@@ -2147,7 +2141,7 @@
 	{/if}
 	{#if streamUrl}
 		<NativePlayer
-			{currentTrack} {mediaRevision} {streamUrl} {attachNativeAudio}
+			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			{restartCanSeek} {restartStatus} {restartStatusVersion} {restartCurrentTrack}
 			{jumpStatus} {jumpStatusVersion} {jumpRelative}
 		/>

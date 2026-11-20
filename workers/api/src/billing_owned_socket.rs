@@ -78,6 +78,9 @@ impl SocketGuard {
 
     /// Wait for the active socket's close acknowledgement. STARTTLS replaces
     /// the original handle; it does not open a second physical connection.
+    /// The caller must stop socket work first and bound this wait. Acknowledgement
+    /// does not establish backend teardown.
+    #[cfg_attr(not(feature = "billing-owned-wasm-test"), allow(dead_code))]
     pub(crate) async fn close_confirmed(&self) -> Result<(), JsValue> {
         let active = self.0.borrow().sockets.last().cloned();
         if let Some(socket) = active {
@@ -280,13 +283,19 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
 
     let fixture = socket_fixture(true);
     let owner = SocketGuard::default();
-    let upgraded = owner.tls().connect(tracked(&owner, &fixture)).await;
-    assert!(upgraded.is_ok());
+    let upgraded = owner
+        .tls()
+        .connect(tracked(&owner, &fixture))
+        .await
+        .map_err(|_| "tracked upgrade failed")?;
     drop(upgraded);
     owner
         .close_confirmed()
         .await
         .map_err(|_| "close not confirmed")?;
+    if count(&fixture, "closedAcknowledgements") != 1.0 {
+        return Err("active socket close did not await acknowledgement");
+    }
     drop(owner);
     if count(&fixture, "replacementCloses") != 1.0 || count(&fixture, "originalCloses") != 0.0 {
         return Err("confirmed active socket close repeated on drop");

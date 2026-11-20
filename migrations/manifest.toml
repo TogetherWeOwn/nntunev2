@@ -265,3 +265,8 @@ sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"
 file = "0052_storage_digest_reference_admission.sql"
 target = "app"
 sha256 = "16a26d5f322ee3b651d44519b0d07adfff7f1e4adc47d14c8f83757fa9eb8676"
+
+[[migration]]
+file = "0053_purge_legacy_provider_credentials.sql"
+target = "app"
+sha256 = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"

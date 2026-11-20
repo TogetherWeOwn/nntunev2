@@ -875,14 +875,14 @@ class GitFixture(unittest.TestCase):
         live = {"base": {"sha": effective}, "head": {"sha": head}, "changed_files": 2}
         pages = [[{"filename": "migrations/manifest.toml", "status": "modified"},
                   {"filename": pin.new_path, "status": "added"}]]
-        result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+        result = self.run_workflow(pages, live, reviewed_unapplied={key: (pin,)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
         for name, base in (("event", self.base), ("effective", effective)):
             self.assertEqual(outcomes[name]["base"], base)
             self.assertEqual(outcomes[name]["outcome"], "verified")
-            self.assertEqual(outcomes[name]["unapplied_rename"], dict(zip(history.EDGE_KEYS,
-                (pin.reviewed_head, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256))))
+            self.assertEqual(outcomes[name]["unapplied_renames"], [dict(zip(history.EDGE_KEYS,
+                (pin.reviewed_head, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256)))])
         expected = staging.load_expected(self.root / "migrations/manifest.toml")
         rows = [(e["file"], e["sha256"]) for e in entries]
         self.assertTrue(staging.compare(expected, rows))
@@ -890,10 +890,10 @@ class GitFixture(unittest.TestCase):
 
         for label, records, diagnostic in (
                 ("no trusted record", {}, "lacks renamed_from"),
-                ("wrong repository ID", {(2, *key[1:]): pin}, "lacks renamed_from"),
-                ("wrong PR", {(1, "example/project", 2, "main", "feature"): pin}, "lacks renamed_from"),
-                ("wrong digest", {key: replace(pin, sha256="0" * 64)}, "differs from reviewed"),
-                ("wrong reviewed head", {key: replace(pin, reviewed_head=self.base)}, "differs from reviewed")):
+                ("wrong repository ID", {(2, *key[1:]): (pin,)}, "lacks renamed_from"),
+                ("wrong PR", {(1, "example/project", 2, "main", "feature"): (pin,)}, "lacks renamed_from"),
+                ("wrong digest", {key: (replace(pin, sha256="0" * 64),)}, "differs from reviewed"),
+                ("wrong reviewed head", {key: (replace(pin, reviewed_head=self.base),)}, "differs from reviewed")):
             with self.subTest(label=label):
                 result = self.run_workflow(pages, live, reviewed_unapplied=records)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -905,12 +905,102 @@ class GitFixture(unittest.TestCase):
         advanced = self.commit("fill the approved number on main")
         self.git("checkout", "--detach", head)
         live["base"]["sha"] = advanced
-        result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+        result = self.run_workflow(pages, live, reviewed_unapplied={key: (pin,)})
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
         self.assertEqual(outcomes["event"]["outcome"], "verified")
         self.assertEqual(outcomes["effective"]["outcome"], "failed")
         self.assertIn("changes the accepted migration prefix", outcomes["diagnostic"])
+
+    def test_workflow_reviewed_unapplied_chain_is_exact_and_source_only(self):
+        _, first_merge, first = self.unapplied_restack()
+        self.git("checkout", "main")
+        (self.root / "README.md").write_text("intervening accepted change\n")
+        self.commit("advance main")
+        self.git("checkout", "restack")
+        self.git("merge", "--no-ff", "main", "-m", "carry the first rename forward")
+        reviewed = self.git("rev-parse", "HEAD")
+        self.git("checkout", "main")
+        self.write("0002_other.sql", BODY + b"-- accepted second slot\n")
+        manifest_path = self.root / "migrations/manifest.toml"
+        manifest_path.write_text(manifest(self.entries()))
+        self.base = self.commit("accept the second slot")
+        self.git("checkout", "-qb", "second-restack")
+        self.git("merge", "-s", "ours", "--no-commit", "--no-ff", reviewed)
+        self.write("0003_purge.sql")
+        entries = self.entries()
+        manifest_path.write_text(manifest(entries))
+        head = self.commit("renumber the same bytes a second time")
+        second_without_merge = history.UnappliedRename(
+            reviewed, self.base, first.new_path, "migrations/0003_purge.sql", first.sha256, "app")
+        second = replace(second_without_merge, reviewed_merge=head)
+        key = (1, "example/project", 1, "main", "feature")
+        policy = {key: (first, second)}
+        # Carrying the second pin must not broaden or invalidate the first edge.
+        edges = history.verify(self.root, first.accepted_base, first_merge,
+                               self.git("show", f"{first_merge}:migrations/manifest.toml"),
+                               unapplied=policy[key])
+        self.assertEqual(len(edges["0002_purge.sql"]), 1)
+
+        self.git("checkout", "main")
+        (self.root / "README.md").write_text("effective base moves again\n")
+        effective = self.commit("advance effective base")
+        self.git("checkout", "--detach", head)
+        pages = [[{"filename": "migrations/manifest.toml", "status": "modified"},
+                  {"filename": second.new_path, "status": "added"}]]
+        live = {"base": {"sha": effective}, "head": {"sha": head}, "changed_files": 2}
+        expected = [dict(zip(history.EDGE_KEYS, (pin.reviewed_head, child, pin.old_path,
+                                                 pin.new_path, pin.sha256, pin.sha256)))
+                    for pin, child in ((first, first_merge), (second, head))]
+        result = self.run_workflow(pages, live, reviewed_unapplied=policy)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        for name, base in (("event", self.base), ("effective", effective)):
+            self.assertEqual(outcomes[name]["outcome"], "verified")
+            self.assertEqual(outcomes[name]["base"], base)
+            self.assertEqual(outcomes[name]["unapplied_renames"], expected)
+
+        for pins, diagnostic in (
+                ((first,), "lacks renamed_from"),
+                ((second,), "lacks the exact reviewed edge chain"),
+                ((replace(first, reviewed_head=reviewed), second), "differs from reviewed paths"),
+                ((first, replace(second, reviewed_head=first_merge)), "differs from reviewed paths"),
+                ((first, second_without_merge), "requires an exact reviewed merge pin"),
+                ((first, replace(second, reviewed_merge=reviewed)), "differs from exact reviewed merge"),
+                ((first, replace(second, accepted_base=first.accepted_base)), "differs from exact reviewed merge")):
+            with self.subTest(pins=pins):
+                result = self.run_workflow(pages, live, reviewed_unapplied={key: pins})
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
+        self.git("checkout", "main")
+        self.write("0003_other.sql", BODY + b"-- accepted third slot\n")
+        manifest_path.write_text(manifest(self.entries()))
+        live["base"]["sha"] = self.commit("advance accepted prefix")
+        self.git("checkout", "--detach", head)
+        result = self.run_workflow(pages, live, reviewed_unapplied=policy)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "verified")
+        self.assertEqual(outcomes["effective"]["outcome"], "failed")
+        self.assertIn("changes the accepted migration prefix", outcomes["diagnostic"])
+
+        live["base"]["sha"] = effective
+        for pin in (first, second):
+            alias = (pin.old_path.removeprefix("migrations/"), pin.sha256)
+            expected_rows = staging.load_expected(manifest_path)
+            rows = [(e["file"], e["sha256"]) for e in entries]
+            self.assertTrue(staging.compare(expected_rows, rows))
+            self.assertFalse(staging.compare(expected_rows, rows[:-1] + [alias]))
+            entries[-1]["renamed_from"] = [{"file": alias[0], "sha256": alias[1]}]
+            live["head"]["sha"], _ = self.source_witness(entries)
+            wrong_pr = (*key[:2], 2, *key[3:])
+            for policy_key in (key, wrong_pr):
+                with self.subTest(alias=alias, policy_key=policy_key):
+                    result = self.run_workflow(pages, live, reviewed_unapplied={policy_key: policy[key]})
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("must not become an applied alias", result.stderr)
+            self.git("checkout", "--detach", head)
 
     def test_workflow_rejects_unapplied_alias_independently_of_pr_authority(self):
         entries, _, pin = self.unapplied_restack()
@@ -922,7 +1012,7 @@ class GitFixture(unittest.TestCase):
         for recorded_pr in (1, 2):
             with self.subTest(recorded_pr=recorded_pr):
                 key = (1, "example/project", recorded_pr, "main", "feature")
-                result = self.run_workflow(pages, live, reviewed_unapplied={key: pin})
+                result = self.run_workflow(pages, live, reviewed_unapplied={key: (pin,)})
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("must not become an applied alias", result.stderr)
 
@@ -931,20 +1021,20 @@ class GitFixture(unittest.TestCase):
         entries[1]["source_rename_history"] = [dict(zip(history.EDGE_KEYS,
             (self.base, head, pin.old_path, pin.new_path, pin.sha256, pin.sha256)))]
         with self.assertRaisesRegex(history.HistoryError, "evidence is forged"):
-            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=(pin,))
         entries[1].pop("source_rename_history")
         entries[0]["target"] = "mirror"
         with self.assertRaisesRegex(history.HistoryError, "changes the accepted migration prefix"):
-            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=(pin,))
         self.write("0001_storage.sql", BODY + b"-- modified accepted SQL\n")
         altered = self.commit("change an accepted migration after restack")
         with self.assertRaisesRegex(history.HistoryError, "changes the accepted migration prefix"):
-            history.verify(self.root, self.base, altered, manifest(self.entries()), unapplied=pin)
+            history.verify(self.root, self.base, altered, manifest(self.entries()), unapplied=(pin,))
 
     def test_unapplied_rename_rejects_ambiguous_blob_matches(self):
         entries, head, pin = self.unapplied_restack(duplicate=True)
-        with self.assertRaisesRegex(history.HistoryError, "unique byte-identical|single exact"):
-            history.verify(self.root, self.base, head, manifest(entries), unapplied=pin)
+        with self.assertRaisesRegex(history.HistoryError, "unique byte-identical|exact reviewed edge chain"):
+            history.verify(self.root, self.base, head, manifest(entries), unapplied=(pin,))
 
     def test_workflow_original_range_cannot_be_hidden_by_effective_base(self):
         self.write("0001_old.sql")

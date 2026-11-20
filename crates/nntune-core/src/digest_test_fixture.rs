@@ -21,7 +21,11 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) fn fixture(plaintext: &[u8]) -> Fixture {
-    let mut builder = DigestEnrollment::new(plaintext.len() as u64, [id(1); 5], id(2)).unwrap();
+    fixture_with_identities(plaintext, [id(1); 5])
+}
+
+pub(crate) fn fixture_with_identities(plaintext: &[u8], identities: [[u8; 16]; 5]) -> Fixture {
+    let mut builder = DigestEnrollment::new(plaintext.len() as u64, identities, id(2)).unwrap();
     let key = FileKey::from_bytes(*builder.key().expose_secret());
     let header = builder.header().to_bytes();
     let mut chunks = Vec::new();

@@ -19,7 +19,15 @@ export function socketFixture(acknowledged) {
     calls.replacementCloses++;
     return acknowledged ? Promise.resolve() : rejectedClose();
   });
-  if (acknowledged) replacement.closed = Promise.resolve();
+  if (acknowledged) {
+    calls.closedAcknowledgements = 0;
+    Object.defineProperty(replacement, "closed", {
+      get: () => new Promise((resolve) => setTimeout(() => {
+        calls.closedAcknowledgements++;
+        resolve();
+      }, 0)),
+    });
+  }
   const original = socket(() => { calls.originalCloses++; return rejectedClose(); });
   original.startTls = () => { calls.upgrades++; return replacement; };
   return { original, replacement, calls };
