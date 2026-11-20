@@ -36,6 +36,14 @@ For staging, apply only through the [protected single-file staging migration pro
 
 The drops are one-way. A rollback must use a post-cutover build that works without the old tables, or a forward fix; redeploying an earlier Worker cannot restore credential data. An emergency restore requires separate approval, a verified protected pre-change restore point, and ledger/data reconciliation. The database purge does not erase retained backups or WAL and does not change the keys or encrypted data used by other features.
 
+### Subsonic measurement auth boundary
+
+`0056` creates empty, ungranted views for the isolated staging auth origin. It does not create a login, enroll a fixture, reconfigure Hyperdrive, or enable measurement. Production must not enroll a fixture or grant access to these views.
+
+On isolated staging only, the operator can enroll the one QA-created owner ID and its corresponding API-key credential ID in `subsonic_measurement.fixture`. Never grant the origin login access to that table or to the base tables. With no inherited app roles, grant the login `USAGE` on `subsonic_measurement`, `SELECT, UPDATE (id)` on its `users` view (`UPDATE` on the computed column permits `FOR SHARE` but cannot write it), and `SELECT, UPDATE (attempt_count, attempt_window, last_used_at, pepper_version, api_key_hmac)` on its `subsonic_credentials` view. No other write grants are needed. Point that login's search path at `pg_catalog, subsonic_measurement, pg_temp` and read it back through the intended origin before use; do not give it a `public` fallback. Verify the effective privileges and that the role sees only the enrolled auth pair. These views do not cover catalogue or membership reads.
+
+Removing the enrollment closes access to both rows in fresh transactions. To undo provisioning, also revoke the view/schema grants and remove the dedicated origin and login. Leave the tracked migration intact.
+
 `search_path` convention: every new migration is self-contained under any role or runner `search_path`.
 
 The first statement of every new migration numbered above `0030` is exactly `SET search_path = public, pg_catalog;` (`public` first so new objects land there; no `$user`, no other writable schema). Leading comments and blank lines may precede it; nothing executable may. The CI migration gate enforces this for files new against the base ref (`missing-search-path`).
