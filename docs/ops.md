@@ -978,6 +978,20 @@ retrospective publication audit. No lifecycle-script exemption is granted.
 Retain the exact-head Actions job link and build-log artifact with review
 evidence; a skipped staging lane is not deployment evidence.
 
+For the staging API, keep `redact_query_string = true` under
+`[env.staging.observability]` in the deploy workflow's generated TOML. The
+upload check also reads the pinned Wrangler CLI's `--outfile` multipart body
+and requires `observability.redact_query_string` to be the boolean `true`
+in the `metadata` part for both mirror states. It never prints or publishes
+that body. This catches a CLI that accepts the TOML but drops the setting on
+upload. It does not prove Cloudflare applied the setting: before any real
+Subsonic credentials are provisioned, read back staging's deployed Worker
+observability settings and confirm that a `GET /healthz` request with a
+synthetic query marker produces an invocation log with the query string
+removed. Keep raw request URLs and query strings out of application log
+fields independently of this platform setting, per the
+[logging standard](logging-standard.md).
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
