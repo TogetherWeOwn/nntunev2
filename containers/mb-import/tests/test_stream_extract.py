@@ -79,6 +79,7 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("track", missing)
         self.assertIn("artist_alias", missing)
         self.assertIn("recording_alias", missing)
+        self.assertIn("release_alias", missing)
         self.assertIn("work", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
@@ -318,6 +319,72 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)
                 self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+
+
+class ReleaseAliasProjectionTest(ProjectionTestCase):
+    output = "mbdump-release_alias.tsv"
+
+    def assert_plain_and_streamed_output(self, expected):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+        release_mbids = {row.split(b"\t", 1)[0] for row in
+                         (self.curated / "mbdump-release.tsv").read_bytes().splitlines()}
+        self.assertEqual({row.split(b"\t", 1)[0] for row in expected.splitlines()},
+                         release_mbids if expected else set())
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        key = "mbdump/release_alias"
+        members[key] = b"".join(reversed(members[key].splitlines(keepends=True)))
+        members["mbdump/release_tag"] = b"not part of the CC0 core projection\n"
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertEqual(gzip.decompress((packed / "release_alias.gz").read_bytes()), members[key])
+        self.assertFalse((packed / "release_tag.gz").exists())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse((packed / "release_alias.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        # English tests primary preference and preserves two distinct names;
+        # French tests raw sort-name order, then lowest ID for tied rows.
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+
+    def test_empty_release_alias_table_emits_empty_sidecar(self):
+        (self.raw / "release_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_release_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        alias_file = self.raw / "release_alias"
+        aliases = alias_file.read_bytes()
+        release_file = self.raw / "release"
+        releases = release_file.read_bytes()
+        for path, changed, error in (
+            (alias_file, b"broken\n", "expected 16 fields"),
+            (alias_file, aliases + aliases.splitlines(keepends=True)[0], "UNIQUE constraint failed: release_alias.id"),
+            (alias_file, aliases.replace(b"810\t30\t", b"810\t+30\t", 1), "invalid release (expected"),
+            (alias_file, aliases.replace(b"810\t30\t", b"810\t999\t", 1), "release_alias references missing release 999"),
+            (alias_file, aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (alias_file, aliases.replace(rb"\303\x89dition", rb"\303dition", 1), "invalid COPY text in name or locale"),
+            (alias_file, aliases.replace(rb"Edition\tBox", rb"Edition\377", 1), "invalid COPY text in sort_name"),
+            (release_file, releases.replace(b"BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB", b"bad-mbid"), "release_alias: invalid release MBID"),
+        ):
+            with self.subTest(error=error):
+                path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases if path == alias_file else releases)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
 class WorkProjectionTest(ProjectionTestCase):
