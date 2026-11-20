@@ -57,11 +57,13 @@ with no lookup row refuses publication; an empty `work` file produces an
 empty sidecar. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
 The sidecar `mbdump-recording_work.tsv` contains recording MBID, work MBID,
-link-type name (raw COPY text), and dump timestamp. It writes one row per
-unique recording/work/type triple in that order (`.tsv.gz` in disk-bounded
-mode). Missing references or malformed projection fields refuse publication;
-an empty `l_recording_work` file produces an empty sidecar. Its links are
-resolved separately from the URL and music-video allowlist.
+link-type name (raw COPY text), and dump timestamp. It sorts and deduplicates
+by recording MBID, work MBID, and the decoded type name, not the escaped TSV
+bytes. When multiple COPY spellings share a key, it writes the smallest raw
+spelling (`.tsv.gz` in disk-bounded mode). Missing references or malformed
+projection fields refuse publication; an empty `l_recording_work` file
+produces an empty sidecar. Its links are resolved separately from the URL and
+music-video allowlist.
 
 `import.sh` still loads only its existing ten files; no database table or read
 route consumes the sidecars yet. To regenerate an older snapshot with the
