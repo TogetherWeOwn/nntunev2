@@ -28,12 +28,12 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
 `release` with
 `artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
-`recording` with `medium`/`track`, `work` with `work_type`) plus the
-relationship files (`url`, `link_type`, `link`, `link_attribute_type`,
-`link_attribute`, `l_artist_url`, `l_recording_url`, `l_recording_recording`,
-`l_recording_work`, `isrc`) listed in `etl.py`. The ETL writes the ten curated
-import files and the release-credit, artist-alias, work and recording-work
-sidecars into an immutable snapshot and atomically swaps
+`recording` with `medium`/`track`, `work` with `work_type`, `label` with
+`label_type`) plus the relationship files (`url`, `link_type`, `link`,
+`link_attribute_type`, `link_attribute`, `l_artist_url`, `l_recording_url`,
+`l_recording_recording`, `l_recording_work`, `release_label`, `isrc`) listed in
+`etl.py`. The ETL writes the ten curated import files and the sidecars below
+into an immutable snapshot and atomically swaps
 `<mbdump-dir>/curated` to point to it; previous snapshots
 are retained. It uses the image's Python 3 and a temporary, disk-backed SQLite
 projection (no external database). `stream_extract.py` admits the same required
@@ -64,6 +64,16 @@ spelling (`.tsv.gz` in disk-bounded mode). Missing references or malformed
 projection fields refuse publication; an empty `l_recording_work` file
 produces an empty sidecar. Its links are resolved separately from the URL and
 music-video allowlist.
+
+`mbdump-label.tsv` contains label MBID, name, label code, label-type name,
+and dump timestamp, ordered by upstream label ID. An absent code or type is
+`\N`. `mbdump-release_label.tsv` contains release MBID, label MBID, catalogue
+number, and dump timestamp. Rows without a label do not produce edges. For
+real labels, a missing catalogue number becomes empty text. Edges are sorted
+and deduplicated by release MBID, label MBID, and COPY-decoded number, then
+re-escaped without changing case or whitespace. Both sidecars use `.tsv.gz`
+in disk-bounded mode. Malformed fields and dangling references used by these
+projections refuse publication, even if other edges are valid.
 
 `import.sh` still loads only its existing ten files; no database table or read
 route consumes the sidecars yet. To regenerate an older snapshot with the
