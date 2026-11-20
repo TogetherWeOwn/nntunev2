@@ -12,7 +12,7 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createPlayerController } from '#lib/player/controller.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import { survivingInteractionIds } from './interactionSelection.js';
 import { restartIsAvailable } from './restartAvailability.js';
@@ -255,12 +255,14 @@ test('same-queue evidence replacement revokes an explicit Play waiting for flush
 	await page.refresh();
 	page.selectTrack('coral');
 	const play = vi.fn(async () => {});
-	page.setAudio(playableAudio(play));
+	const audio = playableAudio(play);
+	page.setAudio(audio);
 	const pending = page.playQueuedTrack('coral');
 	expect(tick).toHaveBeenCalledOnce();
 	const queue = page.read().queue;
 	await page.refresh();
 	expect(page.read().queue).toBe(queue);
+	expect(page.currentAudio()).toBe(audio);
 	flush();
 	await pending;
 	expect(play).not.toHaveBeenCalled();

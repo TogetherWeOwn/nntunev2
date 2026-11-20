@@ -66,6 +66,7 @@ pub mod stripe;
 pub mod subsonic_auth;
 pub mod subsonic_config;
 pub mod subsonic_dispatch;
+pub mod subsonic_experiment_gate;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
 #[cfg(target_arch = "wasm32")]
@@ -183,6 +184,7 @@ mod ledger_wasm_test {
         nntune_subsonic::staging_endpoints::basic_documents_match_dispatch_and_charge_exact_capacity();
         nntune_subsonic::endpoints::charged_params_preserve_order_and_lossy_decoding();
         nntune_subsonic::staging_browse::member_browse_boundaries();
+        nntune_subsonic::staging_browse::album_list_boundaries();
         nntune_subsonic::staging_browse::search_boundaries();
         nntune_subsonic::staging_browse::search_matches_dispatch();
         crate::subsonic_http::staging_decode_charges_encoded_capacity_and_keeps_errors();

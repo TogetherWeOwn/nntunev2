@@ -3,9 +3,9 @@ import ts from 'typescript';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createPlayerController } from '#lib/player/controller.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { describeJump } from '#lib/player/relativeJump.js';
 import { restartIsAvailable } from './restartAvailability.js';
 
@@ -20,7 +20,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'commitQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'syncMiniPlayerHint',
 		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
@@ -32,7 +32,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
 		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const bindingsInRoute = new Set(['player', 'queueController', 'media']);
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
 	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
@@ -93,7 +93,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
-		let items = [track], queue = createQueue(items), mediaRevision = 0;
+		let items = [track], queue = createQueue(items);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
@@ -114,7 +114,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
 		const library = queueController.prepareLibrary(items);
-		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
+		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
@@ -129,7 +129,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			nativeIntent: () => ({ playing: media.attachment?.playing }),
 			end: (mode) => { onRepeatChange({ currentTarget: { value: mode } }); return capture('ended')(); },
 			refresh: () => capture('timeupdate')(),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: media.pendingShareSeek, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: media.pendingShareSeek, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -163,6 +163,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			jumpStatus: string;
 			playEpoch: number;
 			mediaRevision: number;
+			attachmentVersion: number;
 			queueAnnouncement: string;
 			queueAnnouncementVersion: number;
 		};
@@ -478,15 +479,53 @@ test('a new URL for the same ID retires the attachment before queue publication'
 	const original = page.read().queue;
 	const next = createQueue(original.tracks.map((track) => ({ ...track, streamUrl: '/test-audio/new' })));
 	const observed: unknown[] = [];
-	const unsubscribe = page.subscribe(() => observed.push(page.currentAudio()));
+	const unsubscribe = page.subscribe(() => observed.push([page.read().mediaRevision, page.currentAudio()]));
 	page.replaceQueue(next);
 	page.replaceQueue(original);
-	expect(observed).toEqual([element, undefined, undefined]);
+	expect(observed).toEqual([[0, element], [1, undefined], [2, undefined]]);
 	expect(page.read().mediaRevision).toBe(2);
 	const replacement = remount();
+	const mounted = page.read();
+	expect(mounted.mediaRevision).toBe(2);
 	page.detach();
 	expect(page.currentAudio()).toBe(replacement);
+	expect(page.read()).toEqual(mounted);
 	unsubscribe();
+});
+
+test('selecting another track with the same resolved source retires the native host', () => {
+	const { page, element, track } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, {
+		...track, id: 'alternate', artist: '', streamUrl: ` ${track.streamUrl} `
+	}));
+	const before = page.read();
+	element.paused = false;
+	page.select(1);
+	expect(currentTrack(page.read().queue)?.id).toBe('alternate');
+	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+	expect(page.currentAudio()).toBeUndefined();
+	expect(element.paused).toBe(true);
+});
+
+test('auth retirement increments the render revision and cancels pending share work', async () => {
+	const { page, media, location, writes, remount, capture } = restartFixture();
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	const metadata = capture('loadedmetadata');
+	const before = page.read();
+	expect(before.pendingShareSeek).not.toBeNull();
+	page.resetAuth();
+	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+	expect(page.read().attachmentVersion).toBe(before.attachmentVersion + 1);
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(page.currentAudio()).toBeUndefined();
+	const replacement = remount();
+	media.duration = 120;
+	metadata();
+	replacement.dispatchEvent(new Event('loadedmetadata'));
+	await Promise.resolve();
+	expect(writes).toEqual([]);
 });
 
 test('queued and captured events from a retired node cannot change its same-source replacement', async () => {
@@ -705,6 +744,22 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(plays).toBe(0);
 	expect(page.read().queueAnnouncement).toBe(edited.queueAnnouncement);
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
+});
+
+test('auth retirement before the first attachment cannot hand deferred Play to the next node', async () => {
+	let resume!: () => void;
+	const { page, remount } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
+	page.detach();
+	const attempt = page.playQueued('coral');
+	expect(resume).toBeTypeOf('function');
+	page.resetAuth();
+	const replacement = remount();
+	replacement.play = vi.fn(async () => {});
+	const before = page.read();
+	resume();
+	await attempt;
+	expect(replacement.play).not.toHaveBeenCalled();
+	expect(page.read()).toEqual(before);
 });
 
 test('native play access cannot start an attempt retired by a queue edit', async () => {
@@ -1200,6 +1255,68 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 });
 
 const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
+
+test.each(['none', 'callback', 'publication'] as const)('native ended uses the queue transaction with reset at %s', async (boundary) => {
+	const flush = vi.fn(async () => {});
+	const { page, element, remount, observeClear, writes } = restartFixture(flush);
+	page.replaceQueue(addTrack(page.read().queue, pine));
+	const before = page.read();
+	let publications = 0;
+	const stop = page.subscribe((next) => {
+		if (currentTrack(next) !== pine) return;
+		publications += 1;
+		expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+		expect(page.currentAudio()).toBeUndefined();
+		expect(readMiniPlayerHint()?.trackId).toBe('coral');
+		if (boundary === 'publication') page.resetAuth();
+	});
+	if (boundary === 'callback') {
+		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
+	}
+
+	element.paused = false;
+	element.dispatchEvent(new Event('play'));
+	element.ended = element.paused = true;
+	element.dispatchEvent(new Event('pause'));
+	element.dispatchEvent(new Event('ended'));
+	stop();
+	const target = remount(pine.streamUrl);
+	target.play = vi.fn(async () => { target.paused = false; });
+	await Promise.resolve(); // Native flush.
+	await Promise.resolve(); // Native play result.
+
+	const advanced = boundary !== 'callback';
+	const played = boundary === 'none';
+	expect(publications).toBe(Number(advanced));
+	expect(currentTrack(page.read().queue)?.id).toBe(advanced ? 'pine' : 'coral');
+	expect(readMiniPlayerHint()?.trackId).toBe(played ? 'pine' : 'coral');
+	expect(flush).toHaveBeenCalledTimes(Number(played));
+	expect(target.play).toHaveBeenCalledTimes(Number(played));
+	expect(writes).toEqual(played ? [0] : []);
+	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
+});
+
+test.each(['publication', 'hint'] as const)('a reset during queued Play %s retires the Play attempt', async (boundary) => {
+	const flush = vi.fn(async () => {});
+	const { page, remount } = restartFixture(flush);
+	page.replaceQueue(selectTrack(addTrack(page.read().queue, pine), 1));
+	remount(pine.streamUrl);
+	const revision = page.read().mediaRevision;
+	const stop = boundary === 'publication'
+		? page.subscribe((next) => { if (currentTrack(next)?.id === 'coral') page.resetAuth(); })
+		: onMiniPlayerHint((hint) => { if (hint?.trackId === 'coral') page.resetAuth(); });
+	const attempt = page.playQueued('coral');
+	stop();
+	const target = remount();
+	target.play = vi.fn(async () => {});
+	await attempt;
+	expect(page.read().mediaRevision).toBe(revision + 2);
+	expect(currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(readMiniPlayerHint()?.trackId).toBe(boundary === 'publication' ? 'pine' : 'coral');
+	expect(flush).not.toHaveBeenCalled();
+	expect(target.play).not.toHaveBeenCalled();
+	expect(page.read().queueAnnouncement).toBe('');
+});
 
 function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restartFixture>): void {
 	element.paused = false;
