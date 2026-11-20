@@ -5127,10 +5127,11 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Keep the session-path probe unnamed through Hyperdrive.
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
-                        &[&user_id],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -7869,6 +7870,11 @@ mod tests {
             "/v1/me/likes"
         );
         assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/taste?user_id=bob"),
+            "/v1/me/taste"
+        );
+        assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate
