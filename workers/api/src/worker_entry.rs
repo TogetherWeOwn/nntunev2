@@ -1509,12 +1509,7 @@ impl PgStore {
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         if self.webhook_ack_control() {
-            return with_deadline(
-                billing_webhook_ack_test::connect(),
-                TOTAL_TIMEOUT_MS,
-                StoreError,
-            )
-            .await;
+            return Self::bounded(billing_webhook_ack_test::connect(), TOTAL_TIMEOUT_MS).await;
         }
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
