@@ -4,11 +4,11 @@ import { contextPath, eventsPath, watchListenContext } from '../fixtures/listen-
 const context = 'a'.repeat(43);
 type Body = { playback_id: string; track_id: string; event: string; context: string };
 
-async function mountDemo(page: Page, refuseThirdTrack = false) {
+async function mountDemo(page: Page, { refuseThirdTrack = false, realDelivery = false } = {}) {
 	const bodies: Body[] = [];
 	await watchListenContext(page);
 	await page.route(contextPath, (route) => route.fulfill({ json: { context } }));
-	await page.route(eventsPath, (route) => {
+	if (!realDelivery) await page.route(eventsPath, (route) => {
 		const body = route.request().postDataJSON() as Body;
 		bodies.push(body);
 		const status = refuseThirdTrack && body.track_id === 'third-light' && body.event === 'start' ? 401 : 200;
@@ -34,7 +34,7 @@ function startResponse(page: Page) {
 }
 
 test('demo records actual playback and keeps playing when history is refused', async ({ page }) => {
-	const bodies = await mountDemo(page, true);
+	const bodies = await mountDemo(page, { refuseThirdTrack: true });
 	await page.getByTestId('queue-select-demo-track').click();
 	await expect.poll(() => bodies[0]).toEqual({
 		playback_id: expect.stringMatching(/^[0-9a-f-]{36}$/), track_id: 'demo-track', event: 'start', context
@@ -50,13 +50,15 @@ test('demo records actual playback and keeps playing when history is refused', a
 	await expect(page.getByTestId('player-error')).toHaveCount(0);
 });
 
-test('reloading the document finishes the started listen', async ({ page }) => {
-	const bodies = await mountDemo(page);
+test('reloading the document finishes the started listen', async ({ page, request }) => {
+	await mountDemo(page, { realDelivery: true });
 	const started = startResponse(page);
 	await page.getByTestId('queue-select-demo-track').click();
-	await started;
+	const body: Body = (await started).request().postDataJSON();
 	await page.reload({ waitUntil: 'domcontentloaded' });
-	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
+	await expect.poll(async () => {
+		return (await request.get('/v1/plays/events', { params: { playback_id: body.playback_id } })).json();
+	}).toEqual([body, { ...body, event: 'skip' }]);
 });
 
 test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {

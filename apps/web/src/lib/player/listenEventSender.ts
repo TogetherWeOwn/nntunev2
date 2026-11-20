@@ -66,7 +66,7 @@ export function createListenEventSender({
 }: ListenEventSenderOptions): ListenEventSender {
 	const url = `${baseUrl.replace(/\/+$/, '')}/v1/plays/events`;
 	// Ordered chain and immutable binding for each playback.
-	const chains = new Map<string, { tail: Promise<void>; accepted: boolean; binding: string }>();
+	const chains = new Map<string, { tail?: Promise<void>; accepted: boolean; binding: string }>();
 	const controller = new AbortController();
 	const retries = new AbortController();
 	const { signal } = controller;
@@ -131,25 +131,24 @@ export function createListenEventSender({
 					if (event.event !== 'start' || chains.size >= MAX_PENDING_PLAYBACKS) return;
 					const binding = context.current();
 					if (!binding) return;
-					chain = { tail: Promise.resolve(), accepted: false, binding };
+					chain = { accepted: false, binding };
 					chains.set(event.playback_id, chain);
 				}
 				const owner = chain;
 				const isStart = event.event === 'start';
-				const next: Promise<void> = owner.tail
-					.then(async () => {
-						if (!isStart && !owner.accepted) return;
-						const ok = await attempt(event, owner.binding);
-						if (isStart) owner.accepted = ok;
-					})
+				const send = async () => {
+					if (!isStart && !owner.accepted) return;
+					const ok = await attempt(event, owner.binding);
+					if (isStart) owner.accepted = ok;
+				};
+				// Dispatch ready keepalive fetches before pagehide returns.
+				const next: Promise<void> = (owner.tail ? owner.tail.then(send) : send())
 					.catch(() => {})
 					.then(() => {
-						// Forget the playback once nothing more can follow: after its
-						// terminal, or when the start was never accepted.
 						if (chains.get(event.playback_id) !== owner) return;
-						if (!isStart ? owner.tail === next : !owner.accepted) {
-							chains.delete(event.playback_id);
-						}
+						if (isStart && !owner.accepted) chains.delete(event.playback_id);
+						else if (owner.tail === next && isStart) delete owner.tail;
+						else if (owner.tail === next) chains.delete(event.playback_id);
 					});
 				owner.tail = next;
 			} catch {

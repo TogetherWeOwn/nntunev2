@@ -37,6 +37,18 @@ describe('createListenEventSender', () => {
 		]);
 	});
 
+	it('dispatches a ready terminal before returning to the pagehide callback', async () => {
+		vi.useFakeTimers();
+		const fetchFn = vi.fn<typeof fetch>(async () => ok());
+		const sender = createListenEventSender({ context, baseUrl: '', fetchFn });
+		sender.send(ev('start'));
+		await vi.advanceTimersByTimeAsync(0);
+		sender.send(ev('skip'));
+		expect(fetchFn).toHaveBeenLastCalledWith('/v1/plays/events', expect.objectContaining({
+			keepalive: true, body: JSON.stringify({ ...ev('skip'), context: context.current() })
+		}));
+	});
+
 	it('keeps the start context on retries and the terminal, without a reset signal', async () => {
 		vi.useFakeTimers();
 		const first = 'a'.repeat(43);
