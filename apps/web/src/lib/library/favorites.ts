@@ -91,9 +91,11 @@ export function retireStoredFavorites(
 		const raw = local.getItem(key);
 		if (raw === null) return true;
 		const stored: unknown = JSON.parse(raw);
-		if (!Array.isArray(stored) || favoritesKey(session) !== key) return false;
-		const confirmed = new Set<unknown>(ids);
-		const remaining = stored.filter((id: unknown) => !confirmed.has(id));
+		if (!Array.isArray(stored) || !stored.every(isStoredId) || favoritesKey(session) !== key) {
+			return false;
+		}
+		const confirmed = new Set(ids);
+		const remaining = stored.filter((id) => !confirmed.has(id));
 		if (remaining.length !== stored.length) local.setItem(key, JSON.stringify(remaining));
 		return true;
 	} catch {

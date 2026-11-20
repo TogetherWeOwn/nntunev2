@@ -67,6 +67,14 @@ describe('favorites persistence feedback', () => {
 		expect(local.getItem(key)).toBe('{}');
 	});
 
+	it.each(['[ "A", null ]', '[ "A", "" ]'])('preserves mixed stored lists verbatim: %s', (raw) => {
+		const { session, local, key } = fixture();
+		local.setItem(key, raw);
+		const retired = retireStoredFavorites(session, local, key, ['A']);
+		expect(local.getItem(key)).toBe(raw);
+		expect(retired).toBe(false);
+	});
+
 	it('respects legitimate empty, missing and corrupt stored lists instead of memory', () => {
 		const { session, local, key } = fixture();
 		for (const raw of [null, '[]', '{bad json', '{}']) {
