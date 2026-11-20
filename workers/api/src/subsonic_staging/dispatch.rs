@@ -208,9 +208,14 @@ impl StagingConstruction {
         let (format, refusal) = request_format(&params)?;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
         if let Some(headroom) = context.construction_headroom {
-            if self.method() != "GET" || name != "getArtists" || !matches!(format, Format::Json) {
+            if !matches!(&catalogue, CatalogueSource::Synthetic(_))
+                || name != "getArtists"
+                || !matches!(format, Format::Json)
+            {
                 return Err(reject(StagingRejection::Unavailable));
             }
+            // The admitted GET and form POST paths have already charged their
+            // request-specific prefixes; the fixture caps the same suffix.
             self.input.budget.restrict_remaining(headroom);
         }
         let budget = &mut self.input.budget;
