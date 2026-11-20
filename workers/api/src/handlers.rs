@@ -944,6 +944,16 @@ pub trait Store {
             Err(StoreError)
         }
     }
+    /// Persist client-reported history; unrelated to metering and leases.
+    fn record_listen_event(
+        &self,
+        _owner: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+
     /// The user's `playback_leases` row, if any. Default `Err` fails
     /// closed like [`Store::live_subscription`].
     fn playback_lease(
@@ -4728,6 +4738,9 @@ where
     }
 }
 
+#[path = "listen_history_handlers.rs"]
+mod listen_history_handlers;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -7591,6 +7604,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/revoke-all"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
+            | crate::listen_history::EVENTS_PATH
+            | listen_history_handlers::CONTEXT_PATH
             | "/v1/credentials"
             | "/v1/subsonic-credentials"
             | "/v1/plans"
@@ -7809,6 +7824,12 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        ("POST", listen_history_handlers::CONTEXT_PATH) => {
+            listen_history_handlers::context(ctx, req).await
+        }
+        ("POST", crate::listen_history::EVENTS_PATH) => {
+            listen_history_handlers::write(ctx, req, bearer_user.as_deref()).await
+        }
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
         // map denies this path to bearer credentials, so the gate
@@ -7952,6 +7973,8 @@ mod tests {
             .join("\n")
     }
 
+    include!("listen_history_handler_tests.rs");
+
     const NOW: u64 = 1_700_000_000;
     const ORIGIN: &str = "https://example.com";
 
@@ -8029,6 +8052,7 @@ mod tests {
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_writes: RefCell<Vec<(String, crate::listen_history::ListenEventBody)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
@@ -9019,6 +9043,18 @@ mod tests {
                 .copied()
                 .unwrap_or(0))
         }
+        async fn record_listen_event(
+            &self,
+            owner: &str,
+            event: &crate::listen_history::ListenEventBody,
+            _now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            self.listen_writes
+                .borrow_mut()
+                .push((owner.to_string(), event.clone()));
+            Ok(crate::listen_history::WriteOutcome::Written)
+        }
+
         async fn playback_lease(
             &self,
             user_id: &str,
