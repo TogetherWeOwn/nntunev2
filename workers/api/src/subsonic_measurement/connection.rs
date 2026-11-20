@@ -18,6 +18,27 @@ static DB_BUSY: AtomicBool = AtomicBool::new(false);
 type Driver = Connection<TrackedSocket, worker::Socket>;
 type NoMirror = fn() -> Ready<Result<Client, StagingRejection>>;
 
+async fn connect_auth(
+    socket: &SocketGuard,
+    pg_config: &tokio_postgres::Config,
+    open: impl FnOnce() -> std::io::Result<TrackedSocket>,
+) -> Result<(Client, Driver), StagingRejection> {
+    // One budget from the first socket operation through authenticated startup.
+    with_deadline(
+        async {
+            let tracked = open().map_err(|_| Unavailable)?;
+            tracked.opened().await.map_err(|_| Unavailable)?;
+            pg_config
+                .connect_raw(tracked, socket.tls())
+                .await
+                .map_err(|_| Unavailable)
+        },
+        2_000,
+        BusyOrCapacity,
+    )
+    .await
+}
+
 pub(super) async fn respond(
     request: &web_sys::Request,
     env: &Env,
@@ -59,13 +80,9 @@ pub(super) async fn respond(
                     acquired.set(true);
                     let pg_config: tokio_postgres::Config =
                         db.connection_string().parse().map_err(|_| Unavailable)?;
-                    let host = db.host();
-                    let tracked = socket.open(&host, db.port()).map_err(|_| Unavailable)?;
-                    tracked.opened().await.map_err(|_| Unavailable)?;
-                    let (client, connection) = pg_config
-                        .connect_raw(tracked, socket.tls())
-                        .await
-                        .map_err(|_| Unavailable)?;
+                    let (client, connection) =
+                        connect_auth(&socket, &pg_config, || socket.open(&db.host(), db.port()))
+                            .await?;
                     driver.replace(Some(Box::pin(connection)));
                     Ok(StagingApp::Postgres {
                         client,
@@ -100,4 +117,47 @@ pub(super) async fn respond(
         DB_BUSY.store(false, Ordering::Release);
     }
     response
+}
+
+#[cfg(feature = "billing-owned-wasm-test")]
+pub(crate) async fn test_connect_deadline() -> Result<(), &'static str> {
+    use crate::billing_owned_socket::stalled_startup_fixture;
+    use tokio_postgres::config::SslMode;
+    use worker::js_sys::Reflect;
+
+    let mut config = tokio_postgres::Config::new();
+    config.user("fixture").ssl_mode(SslMode::Disable);
+    for stall_open in [true, false] {
+        let socket = SocketGuard::default();
+        let fixture = stalled_startup_fixture(stall_open);
+        let attempt = connect_auth(&socket, &config, || {
+            socket.track_fixture(fixture.get(0).unchecked_into())
+        });
+        // Fail if the connector gets no timer, or gives the handshake a fresh
+        // 2 seconds after the fixture spends 1 second waiting for open.
+        if !matches!(
+            with_deadline(attempt, 2_600, Unavailable).await,
+            Err(BusyOrCapacity)
+        ) {
+            return Err("Subsonic startup did not expire without a client or driver");
+        }
+        socket
+            .close_confirmed()
+            .await
+            .map_err(|_| "Subsonic fixture close failed")?;
+        let calls = fixture.get(1);
+        let count = |name| {
+            Reflect::get(&calls, &JsValue::from_str(name))
+                .ok()
+                .and_then(|v| v.as_f64())
+        };
+        let startup_io = if stall_open { 0.0 } else { 1.0 };
+        if count("writes") != Some(startup_io)
+            || count("reads") != Some(startup_io)
+            || count("closes") != Some(1.0)
+        {
+            return Err("Subsonic startup did not stop at the stalled phase");
+        }
+    }
+    Ok(())
 }
