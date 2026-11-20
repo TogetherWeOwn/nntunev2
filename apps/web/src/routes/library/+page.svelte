@@ -86,6 +86,7 @@
 		type Track
 	} from '#lib/player/queue.js';
 
+	let { data }: { data?: { collectionsApiBase: string } } = $props();
 	type Density = 'comfortable' | 'compact';
 	const DENSITY_KEY = 'nntune:density:v1';
 	let density = $state<Density>('comfortable');
@@ -1497,7 +1498,7 @@
 		{/each}
 	</div>
 	{#if collectionFilter !== 'tracks'}
-		<CollectionBrowser filter={collectionFilter} />
+		<CollectionBrowser filter={collectionFilter} baseUrl={data?.collectionsApiBase ?? ''} />
 	{/if}
 
 	{#if shareInvalid}

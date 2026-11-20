@@ -1,12 +1,11 @@
 <script lang="ts">
-	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '../api/client.js';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { ARTWORK_PLACEHOLDER_SRC } from '../player/artwork.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from './cache.js';
 	import { COLLECTION_LIMIT, displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
 
-	let { filter }: { filter: CollectionFilter } = $props();
+	let { filter, baseUrl }: { filter: CollectionFilter; baseUrl: string } = $props();
 	let query = $state('');
 	let sort = $state<CollectionSort>('catalogue');
 	let reverse = $state(false);
@@ -23,17 +22,15 @@
 		rows = [];
 		status = 'loading';
 		try {
-			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
+			const client = new ApiClient({ baseUrl, signal: request.signal });
 			const result = await loadCollections(client, selected);
-			if (!request.signal.aborted) {
-				rows = result;
-				status = 'ready';
-			}
+			if (request.signal.aborted) return;
+			rows = result;
+			status = 'ready';
 		} catch (error) {
-			if (!request.signal.aborted) {
-				status = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
-				request.abort();
-			}
+			if (request.signal.aborted) return;
+			status = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
+			request.abort();
 		}
 	}
 

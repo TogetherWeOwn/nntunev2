@@ -162,8 +162,8 @@ test('LORD-01 keyboard: default, both modes, Original restoration and reload res
 		await expect(ordering(page).getByRole('option', { name: label, exact: true })).toHaveCount(1);
 	}
 
-	// Reach the selector by Tab, not a synthetic focus-only interaction.
-	for (let tabs = 0; tabs < 20 && !(await ordering(page).evaluate(
+	// Reach the selector by Tab, including the four Library type controls.
+	for (let tabs = 0; tabs < 24 && !(await ordering(page).evaluate(
 		(element) => element === document.activeElement
 	)); tabs += 1) await page.keyboard.press('Tab');
 	await expect(ordering(page)).toBeFocused();

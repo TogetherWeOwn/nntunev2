@@ -6,4 +6,7 @@
  * rendering a blank list.
  */
 
+import { PUBLIC_API_BASE_URL } from '$app/env/public';
+
 export const ssr = false;
+export const load = () => ({ collectionsApiBase: PUBLIC_API_BASE_URL });
