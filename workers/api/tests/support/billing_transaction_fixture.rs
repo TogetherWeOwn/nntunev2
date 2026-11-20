@@ -3,8 +3,8 @@
 
 use nntune_api::billing_reconcile::{insert_paid_invoice_history_statement, ReconcileOutcome};
 use nntune_api::billing_store_classification::{
-    classify_explicit_stale, classify_target, classify_write, validate_history_target, Accepted,
-    Identity, ObservedTarget,
+    classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
+    validate_history_target, validate_read_provenance, Accepted, Identity, ObservedTarget, Target,
 };
 use nntune_api::billing_transaction_sql::{LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION};
 use tokio_postgres::types::{ToSql, Type};
@@ -14,6 +14,7 @@ use tokio_postgres::Client;
 pub enum Class {
     Wrote,
     OwnStale,
+    LiveSlotSuppressed,
     AbsentEmpty,
 }
 
@@ -37,8 +38,13 @@ pub fn fixed_sql(schema: &str) -> [String; 3] {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     );
-    [LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION].map(|sql| {
-        assert_eq!(sql.matches("public.subscriptions").count(), 1);
+    [
+        (LOCK_SUBSCRIPTIONS, 1),
+        (LOOKUP_TARGET, 2),
+        (WRITE_SUBSCRIPTION, 2),
+    ]
+    .map(|(sql, count)| {
+        assert_eq!(sql.matches("public.subscriptions").count(), count);
         let out = sql.replace("public.subscriptions", &format!("{schema}.subscriptions"));
         assert!(!out.contains("public."));
         out
@@ -96,6 +102,7 @@ pub async fn run(
             Ok(ObservedTarget {
                 identity: Identity { user_id: row.try_get(0)?, subscription_id: row.try_get(1)? },
                 predicate_stale: row.try_get(2)?,
+                other_live_holder: row.try_get(3)?,
             })
         })
         .collect::<Result<Vec<_>, tokio_postgres::Error>>()
@@ -107,6 +114,8 @@ pub async fn run(
         classify_explicit_stale(&target, o.history.is_empty())
             .map_err(|_| "absent row with history rejected")?
     } else {
+        validate_read_provenance(o, matches!(&target, Target::Owned { .. }))
+            .map_err(|_| "missing exact-target read provenance")?;
         let types = [Type::TEXT; 7]
             .into_iter()
             .chain([
@@ -144,12 +153,13 @@ pub async fn run(
         let returned = rows.iter().map(|row| {
             Ok(Identity { user_id: row.try_get(0)?, subscription_id: row.try_get(1)? })
         }).collect::<Result<Vec<_>, tokio_postgres::Error>>().map_err(e)?;
-        classify_write(&requested, &target, &returned).map_err(|_| "unrecognized write result")?
+        classify_write(&requested, &target, &returned, has_slot_suppression_proof(o)).map_err(|_| "unrecognized write result")?
     };
     let class = match accepted {
         Accepted::AppliedOwned => Class::Wrote,
         Accepted::StaleOwned | Accepted::PredicateStaleOwned => Class::OwnStale,
         Accepted::StaleAbsentEmpty => Class::AbsentEmpty,
+        Accepted::LiveSlotSuppressedOwned => Class::LiveSlotSuppressed,
     };
     let history = tx
         .prepare_typed(

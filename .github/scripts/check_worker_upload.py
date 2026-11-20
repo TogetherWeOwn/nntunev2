@@ -215,7 +215,10 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     assert_no_build(config, label)
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
-        bound = [h["binding"] for h in config["env"]["staging"]["hyperdrive"]]
+        staging = config["env"]["staging"]
+        check(staging.get("observability", {}).get("redact_query_string") is True,
+              f"{label}: staging API invocation query strings must be redacted")
+        bound = [h["binding"] for h in staging["hyperdrive"]]
         if mirror:
             check(bound == ["HYPERDRIVE", "MB_DB"] and "mirror: configured" in summary,
                   f"{label}: expected MB_DB bound, got {bound}")

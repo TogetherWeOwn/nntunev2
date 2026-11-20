@@ -286,14 +286,18 @@ fn qualify_line(
 /// Fold a reconciliation snapshot without borrowing state from another subscription.
 #[allow(dead_code)] // The release caller stays on the legacy fold until activation.
 pub(crate) fn reconcile_exact_target(
+    requested_id: &str,
     mut local: ReconcileInput,
     remote: &RemoteSubscription,
     now_unix: i64,
-) -> ReconcileOutcome {
+) -> Option<ReconcileOutcome> {
+    if remote.subscription.id != requested_id {
+        return None;
+    }
     local.live = local
         .live
-        .filter(|row| row.stripe_subscription_id == remote.subscription.id);
-    reconcile_subscription(&local, remote, now_unix)
+        .filter(|row| row.stripe_subscription_id == requested_id);
+    Some(reconcile_subscription(&local, remote, now_unix))
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -2074,6 +2078,39 @@ mod tests {
                 );
                 assert_eq!(outcome.row.grace_until_unix, None);
                 assert!(outcome.history.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_fields_never_use_replacement_subscription_proof() {
+        let mut foreign = anchored("plus", NOW + 100, "in_replacement");
+        let row = foreign.live.as_mut().expect("row");
+        row.stripe_subscription_id = "sub_replacement".to_string();
+        row.grace_until_unix = Some(NOW + 200);
+        let mut absent = foreign.clone();
+        absent.live = None;
+        for status in [
+            "canceled",
+            "incomplete_expired",
+            "unpaid",
+            "paused",
+            "active",
+            "past_due",
+            "trialing",
+        ] {
+            for price in [PRICE_PLUS, "price_unknown"] {
+                let remote = RemoteSubscription {
+                    subscription: subscription(status, price),
+                    invoices: vec![paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 50, NOW)],
+                };
+                assert_eq!(
+                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW)
+                        .expect("requested target"),
+                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW)
+                        .expect("requested target"),
+                    "foreign row affected {status} / {price}"
+                );
             }
         }
     }

@@ -194,7 +194,7 @@ fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
     })
 }
 
-fn config_from_env(env: &Env) -> Option<Config> {
+pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     // Runtime fail-closed gate for the Hyperdrive caching finding: auth
     // reads are plain SELECTs through the HYPERDRIVE binding, so a
     // caching-enabled config would serve stale sessions/credentials for
@@ -3303,6 +3303,37 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 taste_row_from_row(&rows[0])
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn import_like(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .query_typed_opt(
+                        crate::preference_rows::import_like_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.import_like"))?
+                    .ok_or(StoreError)?
+                    .try_get(0)
+                    .map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -6704,7 +6735,7 @@ where
 
 /// Collect one request body with an explicit byte cap. The default-cap
 /// wrapper below is the single source of truth for API routes
-/// (`handlers::MAX_BODY_BYTES`); per-route overrides (the NZB intake)
+/// (`handlers::MAX_BODY_BYTES`); per-route overrides
 /// pass their own cap so the collection seam and the in-handler gate
 /// stay on the same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
@@ -7225,8 +7256,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    // Per-route collection bound (the NZB intake accepts documents; API
-    // routes keep the pinned default): the in-handler gate re-checks the
+    // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
     let collected = collect_body_with_cap(
         declared_len,
@@ -7871,6 +7901,11 @@ mod tests {
             served_display_path("/v1/me/likes?user_id=alice"),
             "/v1/me/likes"
         );
+        assert_eq!(
+            served_display_path("/v1/me/likes/import?user_id=alice"),
+            "/v1/me/likes/import"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/import/alice"), "unknown");
         assert_eq!(
             served_display_path("/v1/me/likes/track/Job_A?user_id=alice"),
             "/v1/me/likes/track/{target_id}"

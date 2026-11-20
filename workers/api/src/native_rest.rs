@@ -584,6 +584,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/me/likes/import"
             {
                 return SessionOnly;
             }
@@ -616,8 +617,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me"
-                || path == "/v1/me/private-session"
+            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
                 || like_track_target(path).is_some()
             {
                 return SessionOnly;
@@ -651,7 +651,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" || like_track_target(path).is_some() {
+            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {
