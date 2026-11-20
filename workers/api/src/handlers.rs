@@ -46,8 +46,7 @@ use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
-/// Request bodies above this size reject before routing (not an oracle:
-/// size only, same for every route).
+/// Default request-body cap, checked before routing.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Intake-route body cap: `POST /api/ingest` carries an NZB document, not
 /// API JSON, so it gets its own bound. The value parities the NZB intake
@@ -59,17 +58,15 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route and the admin NZB
-/// upload route accept document uploads, every other route takes
-/// API-sized bodies. Both the entry's collection gate and the pre-routing
-/// size check call this, so the two caps cannot drift apart.
+/// Per-route body bounds shared by the entry's collection gate and the
+/// pre-routing size check.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
-    if method == "POST" && path == "/api/ingest" {
-        INGEST_BODY_LIMIT_BYTES
-    } else if method == "POST" && path == "/v1/admin/ingest" {
-        admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
-    } else {
-        MAX_BODY_BYTES
+    match (method, path) {
+        ("POST", "/api/ingest") => INGEST_BODY_LIMIT_BYTES,
+        ("POST", "/v1/admin/ingest") => admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES,
+        // A compact batch of 500 maximum-length track IDs exceeds 32 KiB.
+        ("POST", "/v1/me/likes/import") => 320 * 1024,
+        _ => MAX_BODY_BYTES,
     }
 }
 /// Magic links issuable per email inside the link TTL window.
@@ -2150,8 +2147,7 @@ where
     }
 }
 
-// Adapted from PR #982. Activation, including the route-specific body cap, is separate.
-#[allow(dead_code)]
+// Adapted from PR #982.
 async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -7589,6 +7585,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/usage"
             | "/v1/me/subscription"
             | "/v1/me/likes"
+            | "/v1/me/likes/import"
             | "/v1/me/taste"
             | "/v1/me/private-session"
             | "/v1/library"
@@ -7785,6 +7782,7 @@ where
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
         ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
         ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
@@ -16793,14 +16791,16 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_rejects_bad_structure_and_auth_before_writing() {
-        let h = harness();
+    fn dispatched_likes_import_rejects_bad_structure_and_auth_before_writing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = peppered_harness();
         let mut req = likes_import_request(&h);
         h.store
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job")]);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let valid = r#"{"kind":"track","target_id":"Job"}"#;
         for body in [
             "{",
@@ -16836,21 +16836,79 @@ mod tests {
             assert_eq!(call(&req).status, 401);
         }
         req.origin = Some(ORIGIN.into());
-        req.authorization = Some("Bearer ntk_test".into());
-        assert_eq!(call(&req).status, 404);
-        req.cookie = None;
-        assert_eq!(call(&req).status, 404);
-        req.authorization = None;
+        let cookie = req.cookie.take().unwrap();
         assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let lookups = *h.store.native_credential_lookups.borrow();
+        req.authorization = Some(format!("Bearer {key}"));
+        assert_eq!(
+            scope_for_operation("POST", &req.path),
+            RouteDecision::SessionOnly
+        );
+        for session in [None, Some(cookie)] {
+            req.cookie = session;
+            let denied = call(&req);
+            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        }
+        req.authorization = None;
+        for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "post"] {
+            req.method = method.into();
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            assert_eq!(max_body_bytes(method, &req.path), MAX_BODY_BYTES);
+            assert_eq!(call(&req).status, 404, "{method}");
+        }
+
+        req.method = "OPTIONS".into();
+        req.cookie = None;
+        req.body.clear();
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            let preflight = call(&req);
+            assert_eq!((preflight.status, preflight.body.as_str()), (204, ""));
+            let cors = crate::worker_entry::cors_headers(preflight.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, methods)| {
+                    *name == "access-control-allow-methods"
+                        && methods.split(", ").any(|m| m == "POST")
+                }));
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
         assert!(h.store.taste_rows.borrow().is_empty());
         assert_eq!(h.store.taste_write_attempts.get(), 0);
     }
 
     #[test]
-    fn unwired_likes_import_bounds_batch_and_rejection_echo() {
+    fn dispatched_likes_import_bounds_batch_and_rejection_echo() {
+        use crate::worker_entry::{
+            collect_body_with_cap, BodyChunkStream, BodyReadError, BodySource, CollectedBody,
+        };
+        use std::task::{Context, Poll};
+
+        struct OneChunk(Option<Vec<u8>>);
+        impl BodyChunkStream for OneChunk {
+            fn poll_next_chunk(
+                &mut self,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+                Poll::Ready(self.0.take().map(Ok))
+            }
+        }
+
         let h = harness();
         let mut req = likes_import_request(&h);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         req.body = br#"{"items":[]}"#.to_vec();
         assert_import(call(&req), 0, 0, &[]);
         let targets: Vec<_> = (0..500)
@@ -16868,7 +16926,35 @@ mod tests {
         assert_eq!(h.store.taste_write_attempts.get(), 0);
         items.pop();
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert!(req.body.len() > 32 * 1024);
+        let cap = max_body_bytes(&req.method, &req.path);
+        assert_eq!(cap, 320 * 1024);
+        assert!(req.body.len() > MAX_BODY_BYTES && req.body.len() < cap);
+        let collect = |declared, body| {
+            block_on(collect_body_with_cap(
+                declared,
+                BodySource::Stream(OneChunk(Some(body))),
+                cap,
+            ))
+        };
+        req.body.resize(cap + 1, b' ');
+        for declared in [None, Some(cap + 1)] {
+            assert_eq!(
+                collect(declared, req.body.clone()),
+                CollectedBody::Oversized
+            );
+        }
+        let oversized = call(&req);
+        assert_eq!(
+            (oversized.status, oversized.body),
+            (400, invalid_request().body)
+        );
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+
+        req.body.truncate(cap);
+        let CollectedBody::Complete(body) = collect(None, req.body) else {
+            panic!("valid batch at the byte cap was not collected");
+        };
+        req.body = body;
         assert_import(call(&req), 500, 0, &[]);
         let saved = h.store.taste_rows.borrow().clone();
         assert_eq!(saved.len(), 500);
@@ -16887,7 +16973,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_resolves_members_and_replays_per_owner() {
+    fn dispatched_likes_import_resolves_members_and_replays_per_owner() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::Snooze;
         let h = harness();
@@ -16926,10 +17012,10 @@ mod tests {
         ]
         .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert_import(block_on(me_likes_import(&h.ctx(), &req)), 4, 1, &rejected);
+        assert_import(block_on(handle(&h.ctx(), &req)), 4, 1, &rejected);
         let mut later = h.ctx();
         later.now += 60;
-        assert_import(block_on(me_likes_import(&later, &req)), 0, 5, &rejected);
+        assert_import(block_on(handle(&later, &req)), 0, 5, &rejected);
         let get = |owner, kind, id| block_on(h.store.taste_get(owner, kind, id)).unwrap();
         for (kind, id) in [
             (Track, job),
@@ -16947,7 +17033,7 @@ mod tests {
         req.cookie = Some(magic_login(&h, "bob@example.com"));
         req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
         assert_import(
-            block_on(me_likes_import(&later, &req)),
+            block_on(handle(&later, &req)),
             2,
             0,
             &[serde_json::json!({"target_id": job, "reason": "not_member"})],
@@ -16968,7 +17054,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_fails_closed_and_retries_partial_writes() {
+    fn dispatched_likes_import_fails_closed_and_retries_partial_writes() {
         use PreferenceFailure::{Member, Read, Write};
         for fault in [
             (Member, "Second"),
@@ -16993,7 +17079,7 @@ mod tests {
             };
             req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
             h.store.preference_failure.set(Some(fault));
-            let failed = block_on(me_likes_import(&h.ctx(), &req));
+            let failed = block_on(handle(&h.ctx(), &req));
             assert_eq!((failed.status, failed.body), (503, unavailable().body));
             let key = ("alice".into(), "track".into(), "First".into());
             let saved = h.store.taste_rows.borrow().clone();
@@ -17002,16 +17088,16 @@ mod tests {
             h.store.preference_failure.set(None);
             let mut later = h.ctx();
             later.now += 1;
-            assert_import(block_on(me_likes_import(&later, &req)), 2, 1, &[]);
+            assert_import(block_on(handle(&later, &req)), 2, 1, &[]);
             let recovered = h.store.taste_rows.borrow().clone();
             assert_eq!(recovered.len(), 3);
             assert!(recovered.values().all(|row| row.signal == "love"));
             assert_eq!(recovered[&key].created_at, saved[&key].created_at);
             let writes = h.store.taste_write_attempts.get();
             h.store.delete_before_taste_write.replace(true);
-            let raced = block_on(me_likes_import(&later, &req));
+            let raced = block_on(handle(&later, &req));
             assert_eq!((raced.status, raced.body), (503, unavailable().body));
-            let deleting = block_on(me_likes_import(&later, &req));
+            let deleting = block_on(handle(&later, &req));
             assert_eq!(
                 (deleting.status, deleting.body),
                 (409, account_deleting_response().body)
@@ -17461,7 +17547,8 @@ mod tests {
         for path in [
             "/v1/me/likes/",
             "/v1/me/likes-extra",
-            "/v1/me/likes/import",
+            "/v1/me/likes/import/",
+            "/v1/me/likes/import/extra",
             "/v1/me/likes/track",
             "/v1/me/likes/track/",
             "/v1/me/likes/track//example",

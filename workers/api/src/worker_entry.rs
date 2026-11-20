@@ -6704,9 +6704,9 @@ where
 
 /// Collect one request body with an explicit byte cap. The default-cap
 /// wrapper below is the single source of truth for API routes
-/// (`handlers::MAX_BODY_BYTES`); per-route overrides (the NZB intake)
-/// pass their own cap so the collection seam and the in-handler gate
-/// stay on the same bound. Rules (in terms of `cap_bytes`):
+/// (`handlers::MAX_BODY_BYTES`); route-specific limits use
+/// `handlers::max_body_bytes` so collection and dispatch stay on the
+/// same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
 ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 ///   stream is not polled at all.
@@ -7225,9 +7225,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    // Per-route collection bound (the NZB intake accepts documents; API
-    // routes keep the pinned default): the in-handler gate re-checks the
-    // same bound as defense in depth, so the two cannot drift apart.
+    // The in-handler gate re-checks this per-route bound as defense in depth.
     let collected = collect_body_with_cap(
         declared_len,
         source,
@@ -7871,6 +7869,11 @@ mod tests {
             served_display_path("/v1/me/likes?user_id=alice"),
             "/v1/me/likes"
         );
+        assert_eq!(
+            served_display_path("/v1/me/likes/import?user_id=alice"),
+            "/v1/me/likes/import"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/import/alice"), "unknown");
         assert_eq!(
             served_display_path("/v1/me/likes/track/Job_A?user_id=alice"),
             "/v1/me/likes/track/{target_id}"
