@@ -88,6 +88,35 @@ check_purge_upgrade() {
     -f "$purge_check" -c 'ROLLBACK;'
 }
 
+check_invite_window_contention() (
+  local writer_pid scheduler_out scheduler_in window_id output
+  local overlapping='INSERT INTO public.invite_windows (starts_at, ends_at) VALUES (700, 800);'
+  coproc SCHEDULER { psql_run -At; }
+  writer_pid=$SCHEDULER_PID
+  scheduler_out=${SCHEDULER[0]}
+  scheduler_in=${SCHEDULER[1]}
+  printf "BEGIN; SET LOCAL idle_in_transaction_session_timeout = '30s';\nINSERT INTO public.invite_windows (starts_at, ends_at) VALUES (650, 750) RETURNING id;\n" >&"$scheduler_in"
+  read -r -t 10 -u "$scheduler_out" window_id
+  [[ "$window_id" =~ ^[0-9]+$ ]]
+  # An overlapping writer must wait for the uncommitted schedule, then
+  # receive an exclusion violation once the first schedule commits.
+  if output=$(psql_run -1 -v VERBOSITY=verbose -c "SET LOCAL lock_timeout = '2s';" -c "$overlapping" 2>&1); then
+    printf 'overlapping window unexpectedly committed concurrently\n' >&2
+    return 1
+  fi
+  printf 'uncommitted invite window: %s\n' "$output"
+  [[ "$output" == *'55P03:'* ]]
+  printf 'COMMIT;\n\\q\n' >&"$scheduler_in"
+  wait "$writer_pid"
+  if output=$(psql_run -v VERBOSITY=verbose -c "$overlapping" 2>&1); then
+    printf 'overlapping window unexpectedly committed on retry\n' >&2
+    return 1
+  fi
+  printf 'committed invite window: %s\n' "$output"
+  [[ "$output" == *'23P01:'*'invite_windows_no_overlap'* ]]
+  psql_run -c "DELETE FROM public.invite_windows WHERE id = $window_id;"
+)
+
 replay=()
 declare -A historical_test=()
 for f in "${migrations[@]}"; do
@@ -105,8 +134,16 @@ for f in "${migrations[@]}"; do
   else
     replay+=("$f")
   fi
+  if [[ "${f##*/}" == 0057_invite_windows.sql ]]; then
+    echo 'test (upgrade/replay): invite_windows_upgrade.sql'
+    psql_run -v migration="$f" -f "$root/workers/api/tests/fixtures/invite_windows_upgrade.sql"
+  fi
   echo "migrate: ${f#"$root"/}"
   psql_run -f "$f"
+  if [[ "${f##*/}" == 0057_invite_windows.sql ]]; then
+    echo 'test (concurrent schedules): invite_windows'
+    check_invite_window_contention
+  fi
 done
 replay_migrations "${replay[@]}"
 for f in "${tests[@]}"; do
