@@ -7547,26 +7547,34 @@ mod tests {
             .1
             .split_once("\n}\n")
             .expect("production mount must have a closing brace");
-        let mount: String = mount.split_ascii_whitespace().collect();
+        let (before_store, before_dispatch) = mount
+            .split_once("ProductionStore::new(")
+            .expect("dispatch store");
+        assert!(!before_store.contains("app.handle("));
+        assert!(before_dispatch.contains("app.handle("));
+        assert!(!mount.contains("build_snapshot("));
+
+        // Compare the entire account-to-store span, not a substring that could be commented out.
+        let construction: String = before_store
+            .split_once("\n    let account = UserAccount {")
+            .expect("account setup")
+            .1
+            .split_ascii_whitespace()
+            .collect();
         let checked: String = r#"
+            email, is_admin, is_manager: role == "manager",
+            };
             let (artists, albums, songs) = match construct_production_subsonic_snapshot(
                 &artist_rows, &release_rows, &track_rows, &merged, PRODUCTION_SNAPSHOT_LIMITS,
             ) {
                 Ok(snapshot) => snapshot,
                 Err(response) => return respond_document(&response),
             };
+            let app = SubsonicApp::production(core::
         "#
         .split_ascii_whitespace()
         .collect();
-        let refusal = mount
-            .find(checked.as_str())
-            .expect("mount must use production snapshot limits and return the refusal response");
-        let store = mount.find("ProductionStore::new(").expect("dispatch store");
-        let dispatch = mount.find("app.handle(").expect("Subsonic dispatch");
-        assert!(
-            refusal + checked.len() <= store && store < dispatch,
-            "mount must return a snapshot refusal before building the store or dispatching"
-        );
+        assert_eq!(construction, checked);
     }
 
     #[test]
