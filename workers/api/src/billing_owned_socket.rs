@@ -75,6 +75,23 @@ impl SocketGuard {
     pub(crate) fn tls(&self) -> TrackedTls {
         TrackedTls(self.0.clone())
     }
+
+    /// Wait for the active socket's close acknowledgement. STARTTLS replaces
+    /// the original handle; it does not open a second physical connection.
+    /// The caller must stop socket work first and bound this wait. Acknowledgement
+    /// does not establish backend teardown.
+    #[cfg_attr(not(feature = "billing-owned-wasm-test"), allow(dead_code))]
+    pub(crate) async fn close_confirmed(&self) -> Result<(), JsValue> {
+        let active = self.0.borrow().sockets.last().cloned();
+        if let Some(socket) = active {
+            worker::wasm_bindgen_futures::JsFuture::from(socket.close()?).await?;
+            worker::wasm_bindgen_futures::JsFuture::from(socket.closed()?).await?;
+        }
+        let mut registry = self.0.borrow_mut();
+        registry.closed = true;
+        registry.sockets.clear();
+        Ok(())
+    }
 }
 
 /// The raw handle and its I/O wrapper are created together and cannot be mixed.
@@ -153,7 +170,7 @@ impl TlsConnect<TrackedSocket> for TrackedTls {
 #[wasm_bindgen(module = "/src/billing_socket_test.js")]
 extern "C" {
     #[wasm_bindgen(js_name = socketFixture)]
-    fn socket_fixture() -> JsValue;
+    fn socket_fixture(acknowledged: bool) -> JsValue;
 }
 
 // Synthetic JS handles verify registry ownership, not Worker network or TLS behavior.
@@ -177,7 +194,7 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
         }
     }
 
-    let fixture = socket_fixture();
+    let fixture = socket_fixture(false);
     let owner = SocketGuard::default();
     let other = SocketGuard::default();
     if other.tls().connect(tracked(&owner, &fixture)).await.is_ok()
@@ -190,7 +207,7 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
         return Err("foreign socket was not closed by its owner");
     }
 
-    let fixture = socket_fixture();
+    let fixture = socket_fixture(false);
     let owner = SocketGuard::default();
     let registry = owner.0.clone();
     let upgraded = owner
@@ -211,7 +228,7 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
     {
         return Err("guard did not close both registered handles");
     }
-    let fixture = socket_fixture();
+    let fixture = socket_fixture(false);
     let owner = SocketGuard::default();
     let socket = tracked(&owner, &fixture);
     let task = drive_owned(
@@ -231,7 +248,7 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
 
     // Exercise a real Worker timer cancelling an owned future. The handle is
     // still synthetic; this does not establish network teardown or TLS trust.
-    let fixture = socket_fixture();
+    let fixture = socket_fixture(false);
     let owner = SocketGuard::default();
     let socket = tracked(&owner, &fixture);
     let result = drive_owned(
@@ -252,7 +269,7 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
         return Err("Worker timer did not close the owned synthetic socket");
     }
 
-    let fixture = socket_fixture();
+    let fixture = socket_fixture(false);
     let owner = SocketGuard::default();
     owner.0.borrow_mut().closed = true;
     let raw: worker_sys::Socket = property(&fixture, "original").unchecked_into();
@@ -262,6 +279,26 @@ pub(crate) async fn test_tracked_socket() -> Result<(), &'static str> {
     drop(owner);
     if count(&fixture, "originalCloses") != 1.0 {
         return Err("rejected handle was closed twice");
+    }
+
+    let fixture = socket_fixture(true);
+    let owner = SocketGuard::default();
+    let upgraded = owner
+        .tls()
+        .connect(tracked(&owner, &fixture))
+        .await
+        .map_err(|_| "tracked upgrade failed")?;
+    drop(upgraded);
+    owner
+        .close_confirmed()
+        .await
+        .map_err(|_| "close not confirmed")?;
+    if count(&fixture, "closedAcknowledgements") != 1.0 {
+        return Err("active socket close did not await acknowledgement");
+    }
+    drop(owner);
+    if count(&fixture, "replacementCloses") != 1.0 || count(&fixture, "originalCloses") != 0.0 {
+        return Err("confirmed active socket close repeated on drop");
     }
     Ok(())
 }
