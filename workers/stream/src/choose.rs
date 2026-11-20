@@ -12,7 +12,9 @@
 //! production callers; the only permitted production reference is the
 //! out-of-line `pub mod choose;` export.
 
-/// One candidate row mirroring `track_media(format, bitrate, content_hash)`.
+use nntune_core::s3_locator::S3MediaMetadata;
+
+/// One internal candidate row with the current `track_media` fields.
 ///
 /// Plain data supplied by the caller in candidate order; the chooser scans
 /// the slice and never reorders it.
@@ -24,6 +26,8 @@ pub struct MediaRow<'a> {
     pub bitrate: i32,
     /// Content hash of the published artifact.
     pub content_hash: &'a str,
+    /// Pre-staged private metadata. Artifact choice does not consult it.
+    pub encrypted_s3: Option<&'a S3MediaMetadata>,
 }
 
 /// Stream profile requested by the caller.
