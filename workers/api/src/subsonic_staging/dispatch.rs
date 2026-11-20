@@ -269,7 +269,6 @@ fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), Docu
 mod wasm_test {
     use super::*;
     use crate::handlers::Config;
-    use crate::subsonic_dispatch::snapshot_order::order_work;
     use worker::wasm_bindgen::{self, prelude::*};
     use worker::{js_sys, wasm_bindgen_futures::JsFuture};
 
@@ -283,7 +282,7 @@ mod wasm_test {
         type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
-            order_work: order_work(2, 2, 4, 2).unwrap(),
+            order_work: SyntheticCatalogue::SNAPSHOT_WORK,
         };
         let fixture = if small {
             SyntheticCatalogue::Small

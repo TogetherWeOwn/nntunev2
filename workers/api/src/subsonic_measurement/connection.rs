@@ -9,7 +9,6 @@ use tokio_postgres::{Client, Connection};
 
 use super::*;
 use crate::billing_owned_socket::{SocketGuard, TrackedSocket};
-use crate::subsonic_dispatch::snapshot_order::order_work;
 use crate::subsonic_staging::{respond_staging, CatalogueSource, StagingApp, StagingDispatch};
 use crate::worker_entry::config_from_env;
 
@@ -29,11 +28,10 @@ pub(super) async fn respond(
     let socket = SocketGuard::default();
     let driver = RefCell::new(None::<Pin<Box<Driver>>>);
     let acquired = Cell::new(false);
-    let phase = Cell::new("admission");
     let config = OnceCell::new();
     let context = StagingDispatch {
         now_millis: now_ms as i64,
-        order_work: order_work(1, 1, 1, 1).expect("single-row fixture order work"),
+        order_work: SyntheticCatalogue::SNAPSHOT_WORK,
     };
     let response = {
         let operation = within_request(
@@ -41,7 +39,6 @@ pub(super) async fn respond(
                 request,
                 context,
                 || async {
-                    phase.set("configuration");
                     let cfg = config
                         .get_or_init(|| config_from_env(env))
                         .as_ref()
@@ -59,7 +56,6 @@ pub(super) async fn respond(
                         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                         .map_err(|_| BusyOrCapacity)?;
                     acquired.set(true);
-                    phase.set("connect");
                     let pg_config: tokio_postgres::Config =
                         db.connection_string().parse().map_err(|_| Unavailable)?;
                     let host = db.host();
@@ -70,7 +66,6 @@ pub(super) async fn respond(
                         .await
                         .map_err(|_| Unavailable)?;
                     driver.replace(Some(Box::pin(connection)));
-                    phase.set("authenticate");
                     Ok(StagingApp::Postgres {
                         client,
                         peppers,
@@ -79,7 +74,6 @@ pub(super) async fn respond(
                     })
                 },
                 |principal| {
-                    phase.set("dispatch");
                     lease
                         .allows_principal(principal.user_id())
                         .then_some(CatalogueSource::<NoMirror>::Synthetic(fixture))
@@ -98,13 +92,9 @@ pub(super) async fn respond(
         }
     };
     drop(driver);
-    if matches!(&response, Ok(response) if response.status_code() == 503) {
-        worker::console_warn!("api.subsonic.measurement.{}", phase.get());
-    }
     if acquired.get() {
         let close = async { socket.close_confirmed().await.map_err(|_| Unavailable) };
         if with_deadline(close, 2_000, Unavailable).await.is_err() {
-            worker::console_warn!("api.subsonic.measurement.close");
             return reject(Unavailable);
         }
         DB_BUSY.store(false, Ordering::Release);
