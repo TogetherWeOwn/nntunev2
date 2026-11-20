@@ -96,8 +96,10 @@ check_invite_window_contention() (
   scheduler_out=${SCHEDULER[0]}
   scheduler_in=${SCHEDULER[1]}
   printf "BEGIN; SET LOCAL idle_in_transaction_session_timeout = '30s';\nINSERT INTO public.invite_windows (starts_at, ends_at) VALUES (650, 750) RETURNING id;\n" >&"$scheduler_in"
-  read -r -t 10 -u "$scheduler_out" window_id
-  [[ "$window_id" =~ ^[0-9]+$ ]]
+  if ! read -r -t 10 -u "$scheduler_out" window_id || [[ ! "$window_id" =~ ^[0-9]+$ ]]; then
+    printf 'invite window writer did not return an id\n' >&2
+    return 1
+  fi
   # An overlapping writer must wait for the uncommitted schedule, then
   # receive an exclusion violation once the first schedule commits.
   if output=$(psql_run -1 -v VERBOSITY=verbose -c "SET LOCAL lock_timeout = '2s';" -c "$overlapping" 2>&1); then
