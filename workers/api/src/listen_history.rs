@@ -100,7 +100,6 @@ impl ExportCursor {
 
 // Lock acquisition and history access must be separate statements at READ
 // COMMITTED, so the history snapshot starts after the owner lock is granted.
-// Use an unnamed statement through Hyperdrive, as for the history queries.
 async fn owner_is_deleting(tx: &Transaction<'_>, owner: &str) -> Result<Option<bool>, StoreError> {
     tx.query_typed(
         "SELECT deleting_at IS NOT NULL FROM public.users WHERE id = $1 FOR NO KEY UPDATE",
