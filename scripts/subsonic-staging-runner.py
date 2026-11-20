@@ -7,13 +7,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
 MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix.json"
 MATRIX_DIGEST = "18a076d2fc86f2a7dadf5efd2e1a1200c741b821379afeb158c4dac06ce80abb"
 MATRIX_LIMIT = 32 * 1024
 STAGING_ORIGIN = "https://staging.nntune.com"
 FORM_LIMIT = 8 * 1024
+ENCODED_API_KEY_LIMIT = 1024  # MAX_CREDENTIAL_VALUE_BYTES in subsonic_http.rs
 REJECTION_LIMIT = 1024
 TICK_MS = 50
 
@@ -75,7 +76,9 @@ def prepare_requests(path, bearer, api_key):
         "credential-shape",
     )
     require(
-        isinstance(api_key, str) and re.fullmatch(r"[!-~]{32,512}", api_key),
+        isinstance(api_key, str)
+        and re.fullmatch(r"[!-~]{32,512}", api_key)
+        and len(quote_plus(api_key)) <= ENCODED_API_KEY_LIMIT,
         "credential-shape",
     )
     return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
@@ -135,7 +138,10 @@ def classify_fixed_rejection(
         and len(body) == expected.get("body_bytes", len(wanted_body)),
         "response-mismatch",
     )
-    return {"oracle": oracle, "http_status": status, "body_bytes": len(body)}
+    sample = {"oracle": oracle, "http_status": status}
+    if "body_bytes" in expected:
+        sample["body_bytes"] = len(body)
+    return sample
 
 
 class StagingModel:

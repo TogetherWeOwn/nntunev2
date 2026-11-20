@@ -81,6 +81,14 @@ class RequestContractTests(unittest.TestCase):
             with self.assertRaisesRegex(runner["Stop"], "^unreviewed-matrix$"):
                 prepare(tampered, self.bearer, self.api_key)
 
+    def test_api_key_respects_worker_encoded_value_limit(self):
+        prepare = runner["prepare_requests"]
+        key = "+" * 341 + "a"  # 1024 encoded bytes, not including the field name.
+        post = next(prepare(matrix, self.bearer, key))
+        self.assertEqual(parse_qs(post.body.decode("ascii"))["apiKey"], [key])
+        with self.assertRaisesRegex(runner["Stop"], "^credential-shape$"):
+            prepare(matrix, self.bearer, key + "a")
+
     def test_fixed_rejections_require_exact_application_response(self):
         classify = runner["classify_fixed_rejection"]
         slots = runner["load_matrix"](matrix)["slots"]
@@ -109,14 +117,7 @@ class RequestContractTests(unittest.TestCase):
             slot = slots[number - 1]
             args = [status, body, f"application/{fmt}", "private, no-store", retry]
             with self.subTest(slot=number):
-                self.assertEqual(
-                    classify(slot, *args),
-                    {
-                        "oracle": slot["expected"]["oracle"],
-                        "http_status": status,
-                        "body_bytes": len(body),
-                    },
-                )
+                self.assertEqual(classify(slot, *args), slot["expected"])
                 for i, replacement in enumerate(
                     (302, b"x" * len(body), "text/javascript", "public", "2")
                 ):
