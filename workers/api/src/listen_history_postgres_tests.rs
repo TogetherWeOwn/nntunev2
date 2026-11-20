@@ -182,7 +182,8 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let before = export(&clearer, &owner, None).await.unwrap();
     assert_eq!(write(&mut writer, &other, event(2, Start)).await, Written);
     assert_eq!(export(&clearer, &owner, None).await.unwrap(), before);
-    let other_cursor = export(&clearer, &other, None).await.unwrap()[0].cursor();
+    let other_rows = export(&clearer, &other, None).await.unwrap();
+    let other_cursor = other_rows[0].cursor();
     let cursor = ExportCursor::parse(Some(&other_cursor)).unwrap();
     let foreign_page = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
     assert!(foreign_page.is_empty());
@@ -213,17 +214,50 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let (mut writer, result) = terminal.await.unwrap();
     assert_eq!(result, Conflict);
     assert!(export(&clearer, &owner, None).await.unwrap().is_empty());
+    assert_eq!(export(&clearer, &other, None).await.unwrap(), other_rows);
     seed_lease(&clearer, &owner, 3).await;
     for phase in [Start, Complete] {
-        assert_eq!(write(&mut writer, &owner, event(3, phase)).await, Written);
+        let body = event(3, phase);
+        assert_eq!(write(&mut writer, &owner, body.clone()).await, Written);
+        assert_eq!(
+            record(&mut writer, &owner, &body, 2000).await.unwrap(),
+            Written
+        );
     }
-    let rows = export(&clearer, &owner, None).await.unwrap();
-    let cursor = ExportCursor::parse(Some(&rows[0].cursor())).unwrap();
     assert_eq!(
-        export(&clearer, &owner, cursor.as_ref()).await.unwrap(),
-        rows[1..]
+        write(&mut writer, &owner, event(3, ListenEvent::Skip)).await,
+        Conflict
+    );
+    let replayed_rows = export(&clearer, &owner, None).await.unwrap();
+    assert_eq!(
+        replayed_rows
+            .iter()
+            .map(|row| (row.event, row.recorded_at))
+            .collect::<Vec<_>>(),
+        [(Complete, 1000), (Start, 1000)]
     );
 
+    for number in 4..=104 {
+        seed_lease(&clearer, &owner, number).await;
+        assert_eq!(
+            write(&mut writer, &owner, event(number, Start)).await,
+            Written
+        );
+    }
+    let rows = export(&clearer, &owner, None).await.unwrap();
+    assert_eq!(rows.len(), EXPORT_PAGE_SIZE + 1);
+    let cursor = ExportCursor::parse(Some(&rows[EXPORT_PAGE_SIZE - 1].cursor())).unwrap();
+    let rest = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
+    assert_eq!(
+        rows[EXPORT_PAGE_SIZE].playback_id,
+        event(4, Start).playback_id
+    );
+    assert_eq!(
+        rest,
+        [&rows[EXPORT_PAGE_SIZE..], &replayed_rows[..]].concat()
+    );
+
+    seed_lease(&clearer, &owner, 105).await;
     clearer
         .execute(
             "UPDATE public.users SET deleting_at = now() WHERE id = $1",
@@ -231,10 +265,13 @@ async fn clear_and_terminal_write_share_owner_fence() {
         )
         .await
         .unwrap();
-    let result = write(&mut writer, &owner, event(4, Start)).await;
+    let result = write(&mut writer, &owner, event(105, Start)).await;
     assert_eq!(result, AccountDeleting);
-    let cleanup = "DELETE FROM public.users WHERE id IN ($1, $2)";
-    clearer.execute(cleanup, &[&owner, &other]).await.unwrap();
+    let cleanup = "DELETE FROM public.users WHERE id = $1";
+    clearer.execute(cleanup, &[&owner]).await.unwrap();
+    assert!(export(&clearer, &owner, None).await.unwrap().is_empty());
+    assert_eq!(export(&clearer, &other, None).await.unwrap(), other_rows);
+    clearer.execute(cleanup, &[&other]).await.unwrap();
 }
 
 async fn first_admission_requires_each_lease_predicate() {
