@@ -77,6 +77,7 @@ class StreamExtractTest(unittest.TestCase):
         missing = json.loads((out / "dump-meta.json").read_text())["missing"]
         self.assertIn("track", missing)
         self.assertIn("artist_alias", missing)
+        self.assertIn("recording_alias", missing)
         self.assertIn("work", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
@@ -206,6 +207,72 @@ class ArtistAliasProjectionTest(ProjectionTestCase):
                 else:
                     self.aliases.write_bytes(changed)
                 refused = self.run_etl(self.raw)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+
+
+class RecordingAliasProjectionTest(ProjectionTestCase):
+    output = "mbdump-recording_alias.tsv"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        key = "mbdump/recording_alias"
+        members[key] = b"".join(reversed(members[key].splitlines(keepends=True)))
+        members["mbdump/recording_tag"] = b"not part of the CC0 core projection\n"
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertTrue((packed / "recording_alias.gz").is_file())
+        self.assertFalse((packed / "recording_tag.gz").exists())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse((packed / "recording_alias.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
+
+    def test_empty_recording_alias_table_emits_empty_sidecar(self):
+        (self.raw / "recording_alias").write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_recording_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        aliases = (self.raw / "recording_alias").read_bytes()
+        recordings = (self.raw / "recording").read_bytes()
+        for table, changed, error in (
+            ("recording_alias", None, "missing input file:"),
+            ("recording_alias", b"broken\n", "expected 16 fields"),
+            ("recording_alias", aliases + aliases.splitlines(keepends=True)[0], "UNIQUE constraint failed"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"2147483648\t50\t", 1), "invalid id"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"710\t+50\t", 1), "invalid recording"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"710\t999\t", 1), "references missing recording 999"),
+            ("recording_alias", aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            ("recording_alias", aliases.replace(rb"\303\x89cho", rb"\303cho"), "invalid COPY text in name or locale"),
+            ("recording_alias", aliases.replace(b"\ten\t", b"\t\\000\t", 1), "invalid COPY text in name or locale"),
+            ("recording_alias", aliases.replace(rb"Echo\tMix", rb"Echo\377", 1), "invalid COPY text in sort_name"),
+            ("recording_alias", aliases.replace(rb"Echo\tMix", rb"\N", 1), "sort_name must not be NULL"),
+            ("recording", recordings.replace(b"\n51\t", b"\n+51\t"), "references invalid recording id 51"),
+            ("recording", recordings.replace(b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", b"bad-mbid"), "invalid recording MBID"),
+        ):
+            with self.subTest(table=table, error=error):
+                path = self.raw / table
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases if table == "recording_alias" else recordings)
                 self.assertEqual(refused.returncode, 1, refused.stdout)
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)
