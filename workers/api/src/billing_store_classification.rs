@@ -81,11 +81,15 @@ pub fn classify_explicit_stale(target: &Target, history_empty: bool) -> Result<A
     }
 }
 
-/// Only a nonterminal fold with exact-target read provenance can commit
+/// Only a slot-reserving fold with exact-target read provenance can commit
 /// history for a write suppressed by a different subscription's live slot.
 pub fn has_slot_suppression_proof(outcome: &ReconcileOutcome) -> bool {
+    // Match uq_subscriptions_live_slot and the conflict UPDATE guard.
     outcome.read_plan.is_some()
-        && !crate::billing_reconcile::is_terminal_status(&outcome.row.status)
+        && matches!(
+            outcome.row.status.as_str(),
+            "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+        )
 }
 
 /// Classify checked RETURNING rows for a non-explicit write, before history.

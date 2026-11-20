@@ -2,7 +2,7 @@
 use super::{billing_budget, MirrorBinding, PgStore, ReconcileProbe, StoreError, CONNECTION};
 use crate::billing_reconcile::{
     reconcile_exact_target, reconcile_live_select_statement, reconcile_target_select_statement,
-    LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
+    FailClosedReason, LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
 };
 use serde_json::json;
 
@@ -450,6 +450,27 @@ async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'stat
         .map_err(|_| "old target suppression replay failed")?;
     if state(TERMINAL, None).await? != suppressed || state(TARGET, None).await? != holder {
         return Err("old target suppression replay changed committed state");
+    }
+
+    let unknown = remote(TERMINAL, "si_worker_terminal", "trialing", &[]);
+    let observed = reconcile_exact_target(input(suppressed.row.clone()), &unknown, NOW);
+    if observed.explicit_stale
+        || observed.read_plan.as_deref() != Some("free")
+        || observed.fail_closed != Some(FailClosedReason::UnknownStatus)
+    {
+        return Err("unknown status did not produce a fresh fail-closed fold with its own proof");
+    }
+    store
+        .store_reconcile_owned(USER.into(), observed, ReconcileProbe::None)
+        .await
+        .map_err(|_| "unknown status update beside a live holder failed")?;
+    let recorded = state(TERMINAL, None).await?;
+    if recorded.row.as_ref().map(|row| row.status.as_str()) != Some("trialing")
+        || recorded.history != suppressed.history
+        || state(TARGET, None).await? != holder
+        || live_subscription_id().await? != TARGET
+    {
+        return Err("unknown status was not recorded verbatim or changed the live slot or history");
     }
 
     let released = state(TARGET, Some("canceled")).await?;

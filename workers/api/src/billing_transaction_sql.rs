@@ -232,7 +232,7 @@ mod tests {
             "INSERT INTO subscriptions ",
             "INSERT INTO public.subscriptions ",
             1,
-        ) + " AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status IN ('canceled', 'incomplete_expired') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
+        ) + " AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
         assert_eq!(WRITE_SUBSCRIPTION.trim(), expected);
 
         // Pin the insert bind order and the three additional fold inputs.
