@@ -35,6 +35,7 @@ use crate::worker_entry::{
 pub struct StagingDispatch {
     pub now_millis: i64,
     pub order_work: OrderWork,
+    pub construction_headroom: Option<usize>,
 }
 
 impl StagingDispatch {
@@ -206,6 +207,12 @@ impl StagingConstruction {
         let params = self.dispatch_params()?;
         let (format, refusal) = request_format(&params)?;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
+        if let Some(headroom) = context.construction_headroom {
+            if self.method() != "GET" || name != "getArtists" || !matches!(format, Format::Json) {
+                return Err(reject(StagingRejection::Unavailable));
+            }
+            self.input.budget.restrict_remaining(headroom);
+        }
         let budget = &mut self.input.budget;
         let doc = if MemberBrowse::supports(name) {
             let (artists, releases, tracks) = match catalogue {
@@ -292,6 +299,7 @@ mod wasm_test {
         let context = StagingDispatch {
             now_millis: 0,
             order_work: StagingDispatch::FIXTURE_ORDER_WORK,
+            construction_headroom: None,
         };
         let fixture = SyntheticCatalogue::from_trusted_id(fixture_id.as_deref().unwrap_or("empty"))
             .ok_or(JsValue::NULL)?;

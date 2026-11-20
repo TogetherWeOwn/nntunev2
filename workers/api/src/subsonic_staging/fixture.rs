@@ -30,8 +30,8 @@ const ARTIST_FIELDS: [&str; 3] = [ARTIST, NAME, NAME];
 const ESCAPE_REPETITIONS: usize = 8;
 
 impl SyntheticCatalogue {
-    /// Only the deployment configuration may select a recipe; no request
-    /// parameters, external catalogue or DB values enter this generator.
+    /// Only a trusted preset may select a recipe. No request parameters,
+    /// external catalogue or DB values enter this generator.
     pub fn from_trusted_id(id: &str) -> Option<Self> {
         let (releases, tracks, padded_title_bytes) = match id {
             "empty" => (0, 0, None),

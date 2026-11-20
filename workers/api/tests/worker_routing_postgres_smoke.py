@@ -321,8 +321,7 @@ def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
         extra = f'''QA_CODE_SEAM = "1"
 SUBSONIC_MEASUREMENT_STAGE = "staging"
 SUBSONIC_MEASUREMENT_ENABLE = "{enabled}"
-SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active"
-SUBSONIC_MEASUREMENT_FIXTURE = "small"
+SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small,empty,charge-below,charge-exact,charge-over"
 '''
         (tmp / f"measurement-{enabled}.toml").write_text(wrangler_toml(
             conn_string(s, db), sha, vars_block=extra, binding="SUBSONIC_MEASUREMENT_DB"))
@@ -339,7 +338,7 @@ SUBSONIC_MEASUREMENT_FIXTURE = "small"
                 tuples=True)
     check(used.splitlines() == ["ci-fixture-active", "ci-fixture-grace"],
           "both armed requests must authenticate against the disposable app database")
-    print("ok: armed Fetch serves the fixture only for the lease principal; disabled Fetch is inert", flush=True)
+    print("ok: release Fetch verifies lease cases, auth, inert defaults and the 4025/4024/4023 charge triplet", flush=True)
 
 
 def main(argv=None):

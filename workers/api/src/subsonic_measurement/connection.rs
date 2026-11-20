@@ -22,7 +22,7 @@ pub(super) async fn respond(
     request: &web_sys::Request,
     env: &Env,
     lease: Lease<'_>,
-    fixture: SyntheticCatalogue,
+    case: schedule::Case,
     now_ms: u64,
 ) -> WorkerResult<Response> {
     let socket = SocketGuard::default();
@@ -32,6 +32,7 @@ pub(super) async fn respond(
     let context = StagingDispatch {
         now_millis: now_ms as i64,
         order_work: StagingDispatch::FIXTURE_ORDER_WORK,
+        construction_headroom: case.headroom(),
     };
     let response = {
         let operation = within_request(
@@ -74,9 +75,8 @@ pub(super) async fn respond(
                     })
                 },
                 |principal| {
-                    lease
-                        .allows_principal(principal.user_id())
-                        .then_some(CatalogueSource::<NoMirror>::Synthetic(fixture))
+                    lease.allows_principal(principal.user_id()).then_some(())?;
+                    case.catalogue().map(CatalogueSource::<NoMirror>::Synthetic)
                 },
             ),
             8_000, // Reserve the last two seconds of the request for close.
