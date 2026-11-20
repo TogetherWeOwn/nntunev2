@@ -69,10 +69,9 @@ attachment state in the private deployment record. Never record secret values.
    remain untouched. If a separately approved Tail attachment is active, its
    authorized executor restores/removes only that attachment under its own
    recorded rollback contract; this lane does not manage producer settings.
-2. For an existing known-good version with the same DO migration lineage, use
-   pinned Wrangler 4.159.0:
-   `wrangler rollback "$LAST_KNOWN_GOOD_VERSION" --name nntune-alerts-staging`.
-   Select the recorded version explicitly; never rely on implicit "previous".
+2. Admit the recorded version on `nntune-alerts-staging` only through the same
+   [staging Worker custody](ops.md#staging-worker-custody) checks as deployment.
+   An off-CI token or an implicit "previous" version is not a fallback.
    [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
    prohibit crossing a DO lifecycle migration. No new migration, Worker deletion,
    namespace deletion or durable-history deletion is an undo step here.
@@ -128,7 +127,7 @@ Until the deployed service exposes and verifies its build identity, neither a wo
 
 ## Rollback and verification boundaries
 
-Staging is the first verification target. The current web rollback procedure is to rerun all jobs for the last known-good successful staging deployment as documented in [`docs/ops.md`](ops.md#staging-promotion-checklist); confirm `staging-web` succeeds and verify staging health. The rerun also redeploys the api Worker when `staging-api` is configured, but that is not verified api rollback; it does not deploy or roll back the ingest, stream, MB, repair or transcode Workers, and does not prove the serving SHA. Establish and test each Worker rollback separately before relying on it.
+Staging is the first verification target. Follow [staging Worker custody](ops.md#staging-worker-custody) and verify each affected Worker's serving identity and health. A historical deploy rerun can redeploy web, api, MB and ingest when configured; it is not an admitted rollback or evidence for any Worker's serving version. Establish and test each Worker rollback separately before relying on it.
 
 Production monitoring is passive. No production deploy, synthetic write, data migration, secret change, or alert-suppression change is authorized by this runbook. Do not manufacture production incidents to test alert delivery.
 

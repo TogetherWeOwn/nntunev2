@@ -1236,21 +1236,51 @@ environment exists on this repo.
   creation, and no resize, split, role change, or credential rotation as part
   of promotion. Staging serves `nntunev2_staging` through its runtime roles;
   the prod binding stays reserved.
-- [ ] Rollback pointer recorded: record the last good staging SHA and its
-  successful push-triggered `deploy.yml` run, with `staging-web` conclusion
-  `success` (not `skipped`), before promoting. To accept rollback evidence,
-  also require the rollback rerun's `staging-web` job conclusion to be `success`
-  (not `skipped`); overall workflow success and staging health alone are
-  insufficient. To roll back `apps/web`, open that Actions run and choose
-  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
-  `staging-web` is push-only and will be skipped. Verify the rerun's
-  `staging-web` success and staging health. The rerun also redeploys the api,
-  mb and ingest Workers through `staging-api`, `staging-mb` and
-  `staging-ingest` when those lanes are configured; that is not verified
-  Worker rollback, and each Worker needs its own rollback evidence.
-  Staging rollback is
-  a redeploy, never a data restore; retain the UNDO blocks and consolidation
-  receipt for infrastructure-specific rollback.
+- [ ] Rollback pointer recorded: for each affected staging Worker, retain the
+  last reviewed known-good version, source SHA, successful deployment run/attempt,
+  and effective binding inventory before promoting. A historical run is provenance,
+  not authorization to rerun it. Use only a verified rollback through the same
+  [staging Worker custody](#staging-worker-custody) checks, then verify each affected
+  Worker's serving identity and health. Staging rollback is a Worker redeploy, not a
+  data restore; retain the UNDO blocks and consolidation receipt for infrastructure
+  rollback. Production rollback instructions are unchanged.
+
+## Staging Worker custody
+
+This is an admission contract, not evidence that custody has been installed.
+Keep the existing push lanes in `deploy.yml` (web, api, mb, ingest) and
+`deploy-alerts-staging.yml` (alerts), with one authorized deploy credential holder.
+Neither a repository or branch-level policy nor a secret moved to `staging`
+proves that only those jobs and those reviewed artifacts can use the credential.
+Cloudflare [Worker roles](https://developers.cloudflare.com/workers/authorization/workers/)
+can limit Worker names but do not limit which same-account resources those Workers
+can bind.
+
+- Independently bind admission to the trusted workflow revision, main push,
+  job/run/attempt, fixed staging account and Worker, and reviewed final request.
+  Build inputs cannot choose the account, target, approval or credential. Verify
+  the exact outgoing operation, code, settings, bindings, routes and triggers,
+  including generated settings and existing settings retained by the provider.
+  The [offline comparison](../ci/staging_worker_submission.py) checks only the
+  fixed lane target and the body digest; it does not authenticate the caller,
+  prove binding reach, send a request or grant deploy authority.
+- Before cutover, reconcile the deploy and observation consumers, revoke access
+  outside the single holder and verify discarded credential paths are unusable.
+  Admission must exclude arbitrary jobs, old refs and reruns, alternate/reusable
+  workflows and off-CI callers. Check the current and rollback-capable versions
+  for each target, following service bindings, Tail and other invocation paths
+  to their effective destinations. A manifest or green deploy alone is not proof.
+- Rollback must use the same custody and review boundary, pinned to the exact
+  known-good version on the fixed Worker with safe direct and reachable bindings
+  and compatible schema/DO lineage. Do not select an implicit previous version,
+  rerun a historical push, use an off-CI deploy token or restore a broader grant.
+  If the custodian cannot prove this path, keep rollback/cutover on hold and
+  preserve the known-good version; escalate through the existing release lane.
+  Keep existing MB/ingest activation holds, health, schema and exact-head evidence
+  gates. No always-on staging cost: account for Containers, Durable Object alarms,
+  scheduled Workers, Stream inputs and database compute; retain pipeline-owned
+  readiness, a bounded use window and cleanup/expiry, including on failure and
+  cancellation. Leave production, CI fixture and Access credentials separate.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1426,9 +1456,7 @@ deploys either Worker — until every step below clears, in order:
    corresponding `absent_in` entries from
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
-8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
-   re-run the known-good push's `deploy.yml` run (**Re-run all jobs**;
-   never `workflow_dispatch` on an old SHA — the lanes are push-only and
-   would skip) and retain the per-Worker evidence in the table above. A
-   rerun redeploys every configured lane; that is not verified per-Worker
-   rollback unless each Worker's own outcome evidence is recorded.
+8. **Rollback is a redeploy, never a data restore.** Preserve the last
+   reviewed known-good version and the per-Worker evidence above. Follow
+   [staging Worker custody](#staging-worker-custody); a historical push rerun
+   can redeploy other configured lanes and is not an admitted rollback.
