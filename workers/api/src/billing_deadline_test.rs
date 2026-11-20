@@ -425,7 +425,7 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
         |_| Box::pin(async { Ok(()) }),
         move |db| Box::pin(async move {
             phase.set("parent delete: snapshot and hold the Worker before COMMIT");
-            let before = parent_delete_snapshot(db).await?;
+            let before = parent_delete_snapshot(db, None).await?;
             if before.0.is_none() || before.1.is_none() || before.2.is_none() {
                 return Err(StoreError);
             }
@@ -485,7 +485,7 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
             };
 
             phase.set("parent delete: plain read did not preserve the committed snapshot while waiting");
-            if parent_delete_snapshot(db).await? != before {
+            if parent_delete_snapshot(db, None).await? != before {
                 return Err(StoreError);
             }
             let released: bool = db.query_one("SELECT pg_advisory_unlock($1)", &[&PARENT_CASCADE_GATE])
@@ -498,7 +498,7 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
             reconciled?;
             deleted?;
             phase.set("parent delete: partial cascade, changed rollback snapshot or retained lock");
-            let after = parent_delete_snapshot(db).await?;
+            let after = parent_delete_snapshot(db, None).await?;
             let locked: bool = db.query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid IN ($1, $2)
                    AND relation IN ('public.users'::regclass, 'public.subscriptions'::regclass,
@@ -515,15 +515,125 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
 
 async fn parent_delete_snapshot(
     db: &tokio_postgres::Client,
+    omit_invoice: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, Option<String>), StoreError> {
     let row = db.query_one(
         "SELECT (SELECT jsonb_agg(to_jsonb(u) ORDER BY id)::text FROM public.users u),
                 (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)::text FROM public.subscriptions s),
-                (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text FROM public.paid_invoice_history h)",
-        &[],
+                (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text
+                   FROM public.paid_invoice_history h WHERE stripe_invoice_id IS DISTINCT FROM $1::text)",
+        &[&omit_invoice],
     ).await.map_err(|_| StoreError)?;
     let snapshot = || Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?));
     snapshot().map_err(|_: tokio_postgres::Error| StoreError)
+}
+
+// A preceding parent DELETE already holds the subscription table via its FK cascade.
+// The same nonempty stale outcome must classify differently once that writer finishes.
+pub(crate) async fn test_reconcile_after_parent_delete(commit: bool) -> Result<(), &'static str> {
+    use futures_util::future::{select, Either};
+    use std::{cell::Cell, rc::Rc};
+
+    setup_ack_fixture().await?;
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-after-parent-delete-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let user = "worker_fault_user";
+    store
+        .store_reconcile_owned(user.into(), test_outcome(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "parent-first delete: seed through dormant store failed")?;
+    let mut outcome = test_outcome();
+    let invoice = "in_worker_parent_first";
+    outcome.explicit_stale = true;
+    outcome.history.truncate(1);
+    outcome.history[0].stripe_invoice_id = invoice.into();
+    let mut empty = outcome.clone();
+    empty.history.clear();
+
+    let phase = Rc::new(Cell::new("parent-first delete: connect raw writer"));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |writer| Box::pin(async move {
+            phase.set("parent-first delete: parent, subscription or original history not seeded");
+            let before = parent_delete_snapshot(writer, None).await?;
+            if before.0.is_none() || before.1.is_none() || before.2.is_none() {
+                return Err(StoreError);
+            }
+            phase.set("parent-first delete: raw transaction did not cascade");
+            writer.batch_execute("BEGIN").await.map_err(|_| StoreError)?;
+            if writer.execute("DELETE FROM public.users WHERE id = $1", &[&user])
+                .await.map_err(|_| StoreError)? != 1
+                || parent_delete_snapshot(writer, None).await? != (None, None, None)
+            {
+                return Err(StoreError);
+            }
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::None));
+            phase.set("parent-first delete: Worker table lock did not wait on the exact writer");
+            let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
+                let row = writer.query_opt(
+                    "SELECT l.pid FROM pg_catalog.pg_locks l
+                     WHERE l.relation = 'public.subscriptions'::regclass AND NOT l.granted
+                       AND l.mode = 'ShareRowExclusiveLock'
+                       AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid))", &[],
+                ).await.map_err(|_| StoreError)?;
+                Ok(row.map(|row| row.get::<_, i32>(0)))
+            }))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((worker, _)) => worker?,
+            };
+            phase.set("parent-first delete: preceding writer did not finish");
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" })
+                .await.map_err(|_| StoreError)?;
+            phase.set("parent-first delete: wrong result for nonempty stale outcome");
+            if reconcile.await.is_ok() == commit {
+                return Err(StoreError);
+            }
+
+            phase.set("parent-first delete: Worker retained billing locks");
+            let locked: bool = writer.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid = $1
+                   AND relation IN ('public.users'::regclass, 'public.subscriptions'::regclass,
+                                    'public.paid_invoice_history'::regclass))", &[&worker],
+            ).await.map_err(|_| StoreError)?.get(0);
+            if locked {
+                return Err(StoreError);
+            }
+            if commit {
+                phase.set("parent-first delete: committed cascade or absent/empty no-op changed durable rows");
+                if parent_delete_snapshot(writer, None).await? != (None, None, None) {
+                    return Err(StoreError);
+                }
+                store.store_reconcile_owned(user.into(), empty, ReconcileProbe::None).await?;
+                if parent_delete_snapshot(writer, None).await? != (None, None, None) {
+                    return Err(StoreError);
+                }
+            } else {
+                phase.set("parent-first delete: restored rows or new invoice attribution differed");
+                let new_invoice = writer.query_opt(
+                    "SELECT user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'
+                            AND plan_id = 'plus' AND amount_cents = 800 AND currency = 'usd'
+                            AND period_start = to_timestamp(1786032000)
+                            AND period_end = to_timestamp(1786032100)
+                            AND paid_at = to_timestamp(1786032000)
+                     FROM public.paid_invoice_history WHERE stripe_invoice_id = $1", &[&invoice],
+                ).await.map_err(|_| StoreError)?;
+                if parent_delete_snapshot(writer, Some(invoice)).await? != before
+                    || new_invoice.map(|row| row.get::<_, bool>(0)) != Some(true)
+                {
+                    return Err(StoreError);
+                }
+            }
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
 }
 
 // The raw transaction first holds a row lock that is compatible with table
