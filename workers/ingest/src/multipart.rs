@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
+pub mod resume_checkpoint;
 
 pub const PART_BYTES: usize = 5_244_160;
 pub const MAX_COMPLETION_BODY: usize = 16 * 1024;
