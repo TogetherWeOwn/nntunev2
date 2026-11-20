@@ -206,6 +206,15 @@ impl Fx {
         reconcile_subscription(&input, remote, T + P + 1)
     }
 
+    async fn fold_target(&self, user: &str, remote: &RemoteSubscription) -> ReconcileOutcome {
+        let input = ReconcileInput {
+            stripe_customer_id: Some(CUS.into()),
+            live: self.select(user, Some(&remote.subscription.id)).await,
+            bindings: bindings(),
+        };
+        reconcile_subscription(&input, remote, T + P + 1)
+    }
+
     async fn try_put(
         &mut self,
         user: &str,
@@ -764,6 +773,122 @@ async fn target_selector_reads_archived_rows_without_changing_live_selection() {
         fx.add_user(&user).await;
         fx.raw(&user, &format!("live_{i}"), status, None).await;
         assert_eq!(fx.live(&user).await.unwrap().status, *status);
+    }
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn target_fold_before_slot_release_does_not_borrow_live_proof() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let holder = fx.seed_active("u1", "sub_a").await;
+    let mut target = remote("sub_b", &[invoice("sub_b", 1)]);
+    target.subscription.items.as_mut().unwrap().data[0].id = "si_b".into();
+    let outcome = fx.fold_target("u1", &target).await;
+    assert_eq!(outcome.row.stripe_item_id, "si_b");
+    assert_eq!(outcome.row.stripe_price_id, PRICE);
+    assert_eq!(outcome.row.status, "active");
+    assert_eq!(outcome.row.grace_until_unix, None);
+    assert_eq!(outcome.row.plan_id, "plus");
+    assert_eq!(outcome.row.paid_through_unix, Some(T + P));
+    assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("inv_sub_b_1"));
+    assert_eq!(outcome.read_anchor, None);
+    assert_eq!(outcome.read_plan, None);
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_a");
+    assert_eq!(fx.snap("sub_a").await, Some(holder));
+    fx.db
+        .execute(
+            "UPDATE subscriptions SET status = 'canceled' WHERE stripe_subscription_id = 'sub_a'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let canceled = fx.snap("sub_a").await.unwrap();
+    fx.put("u1", &outcome).await;
+    assert_eq!(fx.snap("sub_a").await, Some(canceled));
+    let stored = fx.snap("sub_b").await.unwrap();
+    assert_eq!(
+        (
+            stored.item.as_str(),
+            stored.price.as_str(),
+            stored.plan.as_str(),
+            stored.status.as_str()
+        ),
+        ("si_b", PRICE, "plus", "active")
+    );
+    assert_eq!(
+        (stored.paid_through, stored.anchor.as_deref(), stored.grace),
+        (Some(T + P), Some("inv_sub_b_1"), None)
+    );
+    assert_eq!(fx.history_rows("sub_b").await, 1);
+    let history = fx.db.query_one(
+        "SELECT user_id, stripe_invoice_id, plan_id, EXTRACT(EPOCH FROM period_start)::bigint, EXTRACT(EPOCH FROM period_end)::bigint, amount_cents, currency, EXTRACT(EPOCH FROM paid_at)::bigint FROM paid_invoice_history WHERE stripe_subscription_id = $1",
+        &[&"sub_b"],
+    ).await.unwrap();
+    assert_eq!(
+        (
+            history.get::<_, String>(0),
+            history.get::<_, String>(1),
+            history.get::<_, String>(2)
+        ),
+        ("u1".into(), "inv_sub_b_1".into(), "plus".into())
+    );
+    assert_eq!(
+        (
+            history.get::<_, i64>(3),
+            history.get::<_, i64>(4),
+            history.get::<_, i64>(5),
+            history.get::<_, String>(6),
+            history.get::<_, i64>(7)
+        ),
+        (T, T + P, 800, "usd".into(), T)
+    );
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_b");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence() {
+    let mut fx = Fx::new().await;
+    for status in ["active", "past_due"] {
+        let user = format!("u_{status}");
+        let sub = format!("sub_{status}");
+        fx.add_user(&user).await;
+        fx.seed_active(&user, &sub).await;
+        fx.db
+            .execute(
+                "UPDATE subscriptions SET status = 'trialing' WHERE stripe_subscription_id = $1",
+                &[&sub],
+            )
+            .await
+            .unwrap();
+        let archived = fx.snap(&sub).await.unwrap();
+        let mut missing = remote(&sub, &[]);
+        missing.subscription.status = status.into();
+        let stale = fx.fold_target(&user, &missing).await;
+        assert!(stale.explicit_stale);
+        assert_eq!(stale.read_anchor, archived.anchor);
+        fx.put(&user, &stale).await;
+        assert_eq!(fx.snap(&sub).await, Some(archived.clone()));
+        assert_eq!(fx.history_rows(&sub).await, 2);
+        assert!(fx.live(&user).await.is_none());
+
+        let mut fresh = remote(&sub, &[invoice(&sub, 1), invoice(&sub, 2)]);
+        fresh.subscription.status = status.into();
+        let outcome = fx.fold_target(&user, &fresh).await;
+        assert_eq!(outcome.read_anchor, archived.anchor);
+        fx.put(&user, &outcome).await;
+        let recovered = fx.snap(&sub).await.unwrap();
+        assert_eq!(recovered.status, status);
+        assert_eq!(
+            (recovered.plan.as_str(), recovered.paid_through),
+            ("plus", Some(T + 2 * P))
+        );
+        assert_eq!(recovered.anchor, archived.anchor);
+        assert_eq!(recovered.grace, outcome.row.grace_until_unix);
+        assert_eq!(recovered.grace.is_some(), status == "past_due");
+        assert_eq!(fx.history_rows(&sub).await, 2);
+        assert_eq!(fx.live(&user).await.unwrap().stripe_subscription_id, sub);
     }
     fx.cleanup().await;
 }

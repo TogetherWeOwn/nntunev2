@@ -2,7 +2,7 @@
 use super::{billing_budget, MirrorBinding, PgStore, ReconcileProbe, StoreError, CONNECTION};
 use crate::billing_reconcile::{
     reconcile_exact_target, reconcile_live_select_statement, reconcile_target_select_statement,
-    FailClosedReason, LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
+    FailClosedReason, LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
 };
 use serde_json::json;
 
@@ -114,6 +114,15 @@ fn input(row: Option<LiveRow>) -> ReconcileInput {
     }
 }
 
+fn fold(
+    requested_id: &str,
+    row: Option<LiveRow>,
+    remote: &RemoteSubscription,
+) -> Result<ReconcileOutcome, &'static str> {
+    reconcile_exact_target(requested_id, input(row), remote, NOW)
+        .ok_or("provider returned the wrong subscription")
+}
+
 pub(super) async fn check() -> Result<(), &'static str> {
     let store = PgStore {
         env: None,
@@ -128,7 +137,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
             return Err("archived target was not selected");
         };
         let mut listing = remote(HOLDER, "si_worker_fault", status, &[]);
-        let stale = reconcile_exact_target(input(Some(row.clone())), &listing, NOW);
+        let stale = fold(HOLDER, Some(row.clone()), &listing)?;
         if !stale.explicit_stale || stale.read_anchor.as_deref() != Some("in_worker_second") {
             return Err("missing archive anchor did not produce an explicit stale fold");
         }
@@ -150,7 +159,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
             ],
         )
         .invoices;
-        let fresh = reconcile_exact_target(input(Some(row)), &listing, NOW);
+        let fresh = fold(HOLDER, Some(row), &listing)?;
         if fresh.explicit_stale
             || fresh.fail_closed.is_some()
             || fresh.read_anchor.as_deref() != Some("in_worker_second")
@@ -181,7 +190,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
     let holder = state(HOLDER, None).await?;
     // A genuine new terminal target is not an existing-target suppression.
     let terminal_listing = remote(TERMINAL, "si_worker_terminal", "canceled", &[]);
-    let mut terminal = reconcile_exact_target(input(holder.row.clone()), &terminal_listing, NOW);
+    let mut terminal = fold(TERMINAL, holder.row.clone(), &terminal_listing)?;
     let terminal_absent = state(TERMINAL, None).await?;
     if terminal_absent.row.is_some()
         || terminal_absent.subscription.is_some()
@@ -202,7 +211,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
         "active",
         &[("in_worker_terminal", "usd")],
     );
-    terminal.history = reconcile_exact_target(input(None), &confirmed, NOW).history;
+    terminal.history = fold(TERMINAL, None, &confirmed)?.history;
     store
         .store_reconcile_owned(USER.into(), terminal.clone(), ReconcileProbe::None)
         .await
@@ -229,7 +238,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
     {
         return Err("new terminal commit changed holder, coverage, or history attribution");
     }
-    let mut replay = reconcile_exact_target(input(Some(row)), &terminal_listing, NOW);
+    let mut replay = fold(TERMINAL, Some(row), &terminal_listing)?;
     replay.history = terminal.history;
     store
         .store_reconcile_owned(USER.into(), replay, ReconcileProbe::None)
@@ -249,11 +258,14 @@ pub(super) async fn check() -> Result<(), &'static str> {
         "active",
         &[("in_worker_exact", "usd")],
     );
-    let outcome = reconcile_exact_target(input(absent.row.clone()), &listing, NOW);
+    if fold(HOLDER, holder.row.clone(), &listing).is_ok() {
+        return Err("fold accepted a provider subscription different from the requested target");
+    }
+    let outcome = fold(TARGET, absent.row.clone(), &listing)?;
     if absent.subscription.is_some()
         || absent.history_count != 0
         || holder.row.is_none()
-        || outcome != reconcile_exact_target(input(holder.row.clone()), &listing, NOW)
+        || outcome != fold(TARGET, holder.row.clone(), &listing)?
         || outcome.explicit_stale
         || outcome.fail_closed.is_some()
         || outcome.read_anchor.is_some()
@@ -349,7 +361,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
         "active",
         &[("in_worker_exact", "usd"), ("in_worker_provenance", "usd")],
     );
-    let fresh = reconcile_exact_target(input(before.row), &listing, NOW);
+    let fresh = fold(TARGET, before.row, &listing)?;
     if fresh.explicit_stale
         || fresh.read_plan.as_deref() != Some("plus")
         || fresh.read_anchor.as_deref() != Some("in_worker_exact")
@@ -385,7 +397,7 @@ async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'stat
     let holder = state(TARGET, None).await?;
     let old = state(TERMINAL, None).await?;
     let terminal = remote(TERMINAL, "si_worker_terminal", "incomplete_expired", &[]);
-    let close = reconcile_exact_target(input(old.row.clone()), &terminal, NOW);
+    let close = fold(TERMINAL, old.row.clone(), &terminal)?;
     store
         .store_reconcile_owned(USER.into(), close, ReconcileProbe::None)
         .await
@@ -404,7 +416,7 @@ async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'stat
         "active",
         &[("in_worker_terminal_recovery", "usd")],
     );
-    let delayed = reconcile_exact_target(input(holder.row.clone()), &listing, NOW);
+    let delayed = fold(TERMINAL, holder.row.clone(), &listing)?;
     if delayed.read_plan.is_some()
         || delayed.read_anchor.is_some()
         || store
@@ -417,7 +429,7 @@ async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'stat
         return Err("replacement-only read did not refuse the old target without writes");
     }
 
-    let fresh = reconcile_exact_target(input(archived.row.clone()), &listing, NOW);
+    let fresh = fold(TERMINAL, archived.row.clone(), &listing)?;
     if fresh.explicit_stale
         || fresh.fail_closed.is_some()
         || fresh.read_plan.as_deref() != Some("free")
@@ -453,7 +465,7 @@ async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'stat
     }
 
     let unknown = remote(TERMINAL, "si_worker_terminal", "trialing", &[]);
-    let observed = reconcile_exact_target(input(suppressed.row.clone()), &unknown, NOW);
+    let observed = fold(TERMINAL, suppressed.row.clone(), &unknown)?;
     if observed.explicit_stale
         || observed.read_plan.as_deref() != Some("free")
         || observed.fail_closed != Some(FailClosedReason::UnknownStatus)
