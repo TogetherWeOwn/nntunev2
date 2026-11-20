@@ -1,13 +1,13 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
+import { get } from 'svelte/store';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
-import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
-import { describeJump } from '#lib/player/relativeJump.js';
-import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -20,28 +20,28 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'syncMiniPlayerHint',
-		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
+		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
-		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
-		'attachNativeAudio', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
-	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
-		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media']);
+	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
+		ts.isCallExpression(node.expression) && ['$effect.pre', 'onMount'].includes(node.expression.expression.getText(parsed)));
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
-	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
-	const handlers = [...declarations, ...controllers, mount].map((node) => node.getText(parsed)).join('\n');
+	if (lifecycle.length !== 2 || controllers.length !== bindingsInRoute.size) throw new Error('Missing route lifecycle or player authority');
+	const handlers = [...declarations, ...controllers, ...lifecycle].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const track = { id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' };
-	const location = { search: '' };
+	const location = { search: '', origin: 'https://example.test' };
+	const clipboard = { writeText: vi.fn(async (_url: string) => {}) };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
 	class NativeAudio extends EventTarget {
@@ -60,7 +60,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		}
-		sourceAttribute = track.streamUrl;
+		sourceAttribute: string | null = track.streamUrl;
 		getAttribute = (name: string) => name === 'src' ? this.sourceAttribute : null;
 		connected = true;
 		get isConnected() { return this.connected; }
@@ -78,14 +78,25 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
+	let onInvalidateBrowseCopy = () => {};
+	const routeCleanup: string[] = [];
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
-		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
+		selectQueueIndex: selectTrack, removeTrack,
+		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
+		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
+		$state: { raw: <T>(value: T) => value },
+		routeCleanup,
+		clearMiniPlayerHint: () => { routeCleanup.push('hint'); clearMiniPlayerHint(); },
+		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
+			const share = createQueueShare(...args);
+			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
+		},
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
-			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end, (audio, source) =>
-				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end,
+				(audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const invalidate = player.browseCopy.invalidate;
+			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
 			return player;
@@ -96,44 +107,56 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let items = [track], queue = createQueue(items);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
-		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
+		let shareInvalid = false;
 		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
-		let queueAnnouncementVersion = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
-		const onMount = (callback) => { cleanup = callback(); };
+		const $effect = { pre: (callback) => { cleanup = callback(); } };
+		const onMount = (callback) => { callback(); };
 		const readStoredDensity = () => 'comfortable';
-		const handleAuthTransition = () => {}, recordFindQuery = () => {};
-		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
+		const handleAuthTransition = () => {}, recordFindQuery = () => routeCleanup.push('query');
+		const subscribeLocalAuthTransition = () => () => routeCleanup.push('local-auth'), handleLocalAuthTransition = () => {};
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
-		const endTrackDrag = () => {}, document = { title: '' };
+		const endTrackDrag = () => routeCleanup.push('drag'), document = { title: '' };
 		let queueExportAuthGeneration = 0;
-		const queueShare = { dispose() {}, reset() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
-		window.addEventListener = () => {}; window.removeEventListener = () => {};
+		const favoritesExport = { destroy: () => routeCleanup.push('export') };
+		const refresher = { dispose: () => routeCleanup.push('refresh') };
+		window.addEventListener = () => {};
+		window.removeEventListener = (type) => routeCleanup.push(type);
 		${compiled}
-		const library = queueController.prepareLibrary(items);
-		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.reconcileLibrary(items, () => true);
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
-			detach: attachNativeAudio(element),
-			restart: restartCurrentTrack, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: jumpRelative,
+			detach: media.attach(element),
+			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
 			resetAuth: resetShareAtAuthBoundary,
+			copyTrackLink, copyQueueLink: queueShare.copy,
+			refreshLibrary: () => player.reconcileLibrary(items, () => true, (queueChanged) => {
+				if (queueChanged) throw new Error('Expected a same-object refresh');
+			}),
+			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
-			subscribe: queueController.subscribe, attach: attachNativeAudio, currentAudio: () => media.audio,
+			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,
 			nativeIntent: () => ({ playing: media.attachment?.playing }),
 			end: (mode) => { onRepeatChange({ currentTarget: { value: mode } }); return capture('ended')(); },
 			refresh: () => capture('timeupdate')(),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: media.pendingShareSeek, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ ...get(media.seekFeedback), pendingShareSeek: media.pendingShareSeek, queue, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion,
+				queueAnnouncement: player.queueAnnouncement.text, queueAnnouncementVersion: player.queueAnnouncement.version })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
 		resetAuth: () => void;
+		copyTrackLink: (id: string) => Promise<void>;
+		copyQueueLink: (id: string) => Promise<void>;
+		refreshLibrary: () => void;
+		readCopy: () => {
+			browse: { status: string; fallbackUrl: string | null };
+			queue: { status: string; fallbackUrl: string | null; forQueue: ReturnType<typeof createQueue> | null };
+		};
 		applyShareLink: () => void;
 		retryShare: (type?: 'loadedmetadata' | 'durationchange') => void;
 		jump: (direction: 'back' | 'forward') => void;
@@ -176,7 +199,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		page.attach(next);
 		return element = next;
 	};
-	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
+	return {
+		page, media, writes, location, track, element, capture, remount, clipboard, routeCleanup,
+		observeClear: (callback: () => void) => { onClear = callback; },
+		observeInvalidateBrowseCopy: (callback: () => void) => { onInvalidateBrowseCopy = callback; }
+	};
 }
 
 test('restart reads mutable availability once per gesture', () => {
@@ -508,14 +535,20 @@ test('selecting another track with the same resolved source retires the native h
 });
 
 test('auth retirement increments the render revision and cancels pending share work', async () => {
-	const { page, media, location, writes, remount, capture } = restartFixture();
+	const { page, media, location, writes, remount, capture, observeInvalidateBrowseCopy } = restartFixture();
 	media.duration = Number.NaN;
 	location.search = '?track=coral&t=45';
 	page.applyShareLink();
 	const metadata = capture('loadedmetadata');
 	const before = page.read();
 	expect(before.pendingShareSeek).not.toBeNull();
+	const invalidate = vi.fn(() => {
+		expect(page.read().pendingShareSeek).toBeNull();
+		expect(page.currentAudio()).toBeUndefined();
+	});
+	observeInvalidateBrowseCopy(invalidate);
 	page.resetAuth();
+	expect(invalidate).toHaveBeenCalledTimes(1);
 	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
 	expect(page.read().attachmentVersion).toBe(before.attachmentVersion + 1);
 	expect(page.read().pendingShareSeek).toBeNull();
@@ -526,6 +559,54 @@ test('auth retirement increments the render revision and cancels pending share w
 	replacement.dispatchEvent(new Event('loadedmetadata'));
 	await Promise.resolve();
 	expect(writes).toEqual([]);
+});
+
+test.each(['wrong target', 'disconnected', 'absent source', 'wrong source', 'source swapped during read', 'unreadable source'] as const)(
+	'native events ignore a %s even while the attachment receipt is active', (boundary) => {
+		const { page, element, media, track, capture } = restartFixture();
+		const readSource = element.getAttribute;
+		const target = boundary === 'wrong target' ? new EventTarget() : element;
+		if (boundary === 'disconnected') element.connected = false;
+		if (boundary === 'absent source') element.sourceAttribute = null;
+		if (boundary === 'wrong source') element.sourceAttribute = '/test-audio/other';
+		if (boundary === 'source swapped during read') {
+			element.getAttribute = () => {
+				element.sourceAttribute = '/test-audio/other';
+				return track.streamUrl;
+			};
+		}
+		if (boundary === 'unreadable source') element.getAttribute = () => { throw new Error('unreadable source'); };
+		element.paused = false;
+		media.duration = NaN;
+		capture('playing')(target);
+		capture('timeupdate')(target);
+		expect(page.nativeIntent().playing).toBe(false);
+		expect(page.read().restartCanSeek).toBe(true);
+
+		element.connected = true;
+		element.sourceAttribute = track.streamUrl;
+		element.getAttribute = readSource;
+		element.dispatchEvent(new Event('playing'));
+		element.dispatchEvent(new Event('timeupdate'));
+		expect(page.nativeIntent().playing).toBe(true);
+		expect(page.read().restartCanSeek).toBe(false);
+	}
+);
+
+test('metadata cannot refresh availability after a share retry changes the native source', async () => {
+	const { page, element, location, capture, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	Object.defineProperty(element, 'duration', { get() {
+		element.sourceAttribute = '/test-audio/other';
+		return NaN;
+	} });
+	capture('loadedmetadata')();
+	await Promise.resolve();
+	expect(element.sourceAttribute).toBe('/test-audio/other');
+	expect(writes).toEqual([]);
+	expect(page.read().restartCanSeek).toBe(true);
 });
 
 test('queued and captured events from a retired node cannot change its same-source replacement', async () => {
@@ -580,10 +661,18 @@ test('a reentrant subscription cannot publish an older operation hint', () => {
 	const unsubscribe = page.subscribe((value) => {
 		if (value === pine) page.replaceQueue(oak);
 	});
-	page.replaceQueue(pine);
-	expect(page.read().queue).toBe(oak);
-	expect(readMiniPlayerHint()?.trackId).toBe('oak');
-	unsubscribe();
+	const hints = vi.fn();
+	const stopHints = onMiniPlayerHint(hints);
+	hints.mockClear();
+	try {
+		page.replaceQueue(pine);
+		expect(page.read().queue).toBe(oak);
+		expect(readMiniPlayerHint()?.trackId).toBe('oak');
+		expect(hints).toHaveBeenCalledExactlyOnceWith({ trackId: 'oak', title: 'Oak', artist: null });
+	} finally {
+		stopHints();
+		unsubscribe();
+	}
 });
 
 test('reentrant replacement during share append prevents the older navigation', async () => {
@@ -807,6 +896,36 @@ test('a late rejection cannot report against a replacement attachment at the sam
 	expect(page.read()).toEqual(before);
 });
 
+test('Library cleanup fences queue copy before pausing and disposes the route once', async () => {
+	const { page, element, track, clipboard, routeCleanup } = restartFixture();
+	page.replaceQueue(createQueue([{ ...track, artist: '' }]));
+	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+	let finish!: () => void;
+	const pending = new Promise<void>((resolve) => { finish = resolve; });
+	clipboard.writeText.mockReturnValue(pending);
+	const copies = [page.copyTrackLink(track.id), page.copyQueueLink(track.id)];
+	expect(clipboard.writeText).toHaveBeenCalledTimes(2);
+	const before = page.readCopy();
+	element.paused = false;
+	const pause = vi.spyOn(element, 'pause').mockImplementation(() => {
+		expect(routeCleanup).toEqual(['drag', 'share']);
+		expect(page.currentAudio()).toBeUndefined();
+		expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+		page.cleanup();
+		page.detach();
+		element.paused = true;
+	});
+
+	page.cleanup();
+	page.cleanup();
+	finish();
+	await Promise.all(copies);
+	expect(pause).toHaveBeenCalledOnce();
+	expect(page.readCopy()).toEqual(before);
+	expect(readMiniPlayerHint()).toBeNull();
+	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'hint', 'query', 'local-auth', 'storage', 'pagehide']);
+});
+
 test('route cleanup fences an explicit play waiting for tick', async () => {
 	let resume!: () => void;
 	const { page, element } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
@@ -934,13 +1053,25 @@ test('removing the current queue row clears its jump readout', () => {
 });
 
 test('native seeking clears a previous jump readout but not the jump seek itself', () => {
-	const { page, media } = restartFixture();
+	const { page, element, media } = restartFixture();
 	page.jump('forward');
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 	media.position = 90;
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('');
+	page.jump('back');
+	vi.spyOn(element, 'currentTime', 'get').mockImplementationOnce(() => { page.jump('back'); return 90; });
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 1:10.');
+});
+
+test('native availability reads cannot overwrite the replacement attachment', () => {
+	const { page, element, remount } = restartFixture();
+	vi.spyOn(element, 'duration', 'get').mockImplementationOnce(() => { remount(); page.refresh(); return NaN; });
+	page.refresh();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(page.read().restartCanSeek).toBe(true);
 });
 
 test('repeated seeks at the jump target retain an accurate readout', () => {
@@ -1256,9 +1387,10 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 
 const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
 
-test.each(['none', 'callback', 'publication'] as const)('native ended uses the queue transaction with reset at %s', async (boundary) => {
+test.each(['none', 'callback reset', 'invalidation source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
 	const flush = vi.fn(async () => {});
-	const { page, element, remount, observeClear, writes } = restartFixture(flush);
+	const { page, element, remount, observeClear, observeInvalidateBrowseCopy, writes } = restartFixture(flush);
+	element.play = vi.fn(async () => {});
 	page.replaceQueue(addTrack(page.read().queue, pine));
 	const before = page.read();
 	let publications = 0;
@@ -1268,10 +1400,12 @@ test.each(['none', 'callback', 'publication'] as const)('native ended uses the q
 		expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
 		expect(page.currentAudio()).toBeUndefined();
 		expect(readMiniPlayerHint()?.trackId).toBe('coral');
-		if (boundary === 'publication') page.resetAuth();
+		if (boundary === 'publication reset') page.resetAuth();
 	});
-	if (boundary === 'callback') {
+	if (boundary === 'callback reset') {
 		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
+	} else if (boundary === 'invalidation source change') {
+		observeInvalidateBrowseCopy(() => { element.sourceAttribute = '/test-audio/other'; });
 	}
 
 	element.paused = false;
@@ -1280,17 +1414,25 @@ test.each(['none', 'callback', 'publication'] as const)('native ended uses the q
 	element.dispatchEvent(new Event('pause'));
 	element.dispatchEvent(new Event('ended'));
 	stop();
+	if (boundary === 'invalidation source change') {
+		expect(element.getAttribute('src')).toBe('/test-audio/other');
+		expect(element.isConnected).toBe(true);
+		expect(page.currentAudio()).toBe(element);
+		expect(page.read().attachmentVersion).toBe(before.attachmentVersion);
+		expect(page.read().playEpoch).toBe(before.playEpoch);
+	}
 	const target = remount(pine.streamUrl);
 	target.play = vi.fn(async () => { target.paused = false; });
 	await Promise.resolve(); // Native flush.
 	await Promise.resolve(); // Native play result.
 
-	const advanced = boundary !== 'callback';
+	const advanced = boundary === 'none' || boundary === 'publication reset';
 	const played = boundary === 'none';
 	expect(publications).toBe(Number(advanced));
 	expect(currentTrack(page.read().queue)?.id).toBe(advanced ? 'pine' : 'coral');
 	expect(readMiniPlayerHint()?.trackId).toBe(played ? 'pine' : 'coral');
 	expect(flush).toHaveBeenCalledTimes(Number(played));
+	expect(element.play).not.toHaveBeenCalled();
 	expect(target.play).toHaveBeenCalledTimes(Number(played));
 	expect(writes).toEqual(played ? [0] : []);
 	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
@@ -1326,6 +1468,52 @@ function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restart
 	capture('pause')(); // The browser's completion pause is not a manual pause.
 }
 
+for (const refuses of [false, true]) {
+	test.each(['replace', 'repeat', 'stop', 'ignore', 'append', 'refresh'] as const)(
+		`browse copy ${refuses ? 'refusal' : 'success'} after %s only settles on a live receipt`, async (action) => {
+			let releaseFlush!: () => void;
+			const flush = new Promise<void>((resolve) => { releaseFlush = resolve; });
+			const fixture = restartFixture(() => flush);
+			const { page, element, track, clipboard, writes } = fixture;
+			const before = page.read().queue;
+			await page.copyQueueLink(track.id);
+			const queueFeedback = page.readCopy().queue;
+			expect(queueFeedback).toEqual({ status: 'Copied link for Coral Night.', fallbackUrl: null, forQueue: before });
+
+			let finish!: () => void;
+			clipboard.writeText.mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+				finish = refuses ? () => reject(new Error('clipboard refused')) : resolve;
+			}));
+			const copy = page.copyTrackLink(track.id);
+			const url = 'https://example.test/library?track=coral&t=30';
+			expect(clipboard.writeText).toHaveBeenLastCalledWith(url);
+			if (action === 'replace') page.replaceQueue(createQueue([pine]));
+			if (action === 'append') page.replaceQueue(addTrack(before, pine));
+			if (action === 'refresh') page.refreshLibrary();
+			if (action === 'repeat' || action === 'stop') signalNaturalEnd(fixture);
+			element.play = async () => { element.ended = element.paused = false; };
+			const end = action === 'repeat' || action === 'ignore' ? page.end('one') :
+				action === 'stop' ? page.end('off') : undefined;
+			// Settle against the accepted boundary without waiting for the native flush.
+			finish();
+			await copy;
+			const retired = action === 'replace' || action === 'repeat';
+			expect(page.readCopy().browse).toEqual({
+				status: retired || refuses ? '' : 'Copied link for Coral Night.',
+				fallbackUrl: !retired && refuses ? url : null
+			});
+			releaseFlush();
+			await end;
+			if (action === 'repeat') {
+				expect(page.read().queue).toBe(before);
+				expect(page.readCopy().queue).toBe(queueFeedback);
+				expect(writes).toEqual([0]);
+				expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
+			}
+		}
+	);
+}
+
 test('route selection drives native repeat, and cleanup retires only its own player', async () => {
 	let flush!: () => void;
 	const pending = new Promise<void>((resolve) => { flush = resolve; });
@@ -1354,11 +1542,13 @@ test('route selection drives native repeat, and cleanup retires only its own pla
 	expect(target.play).toHaveBeenCalledOnce();
 	expect(selected.writes).toEqual([0]);
 	expect(selected.page.read().queueAnnouncement).toBe('Playing Pine Morning.');
+	expect(selected.page.read().queueAnnouncementVersion).toBe(1);
 	expect(currentTrack(leaving.page.read().queue)?.id).toBe(leaving.track.id);
 	expect(leaving.page.currentAudio()).toBeUndefined();
 	expect(leaving.element.play).not.toHaveBeenCalled();
 	expect(leaving.writes).toEqual([]);
 	expect(leaving.page.read().queueAnnouncement).toBe('');
+	expect(leaving.page.read().queueAnnouncementVersion).toBe(0);
 });
 
 test.each(['pause', 'auth', 'edit'] as const)('queue wrap is fenced by %s during the native flush', async (boundary) => {

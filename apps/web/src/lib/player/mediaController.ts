@@ -1,51 +1,25 @@
 import { get, writable } from 'svelte/store';
+import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
-import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode, type Track } from './queue.js';
+import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
-import { jumpMedia, type JumpDirection, type JumpOutcome } from './relativeJump.js';
-import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
+import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
+import { createPendingShareSeek } from './pendingShareSeek.js';
+import { restartIsAvailable } from './restartAvailability.js';
+import type { ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
-type NativeObservations = {
-	source: () => string | null;
-	seeking: (audio: HTMLAudioElement) => void;
-	position: (audio: HTMLAudioElement) => void;
-};
-
 type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent'>;
 
-export type NaturalEndSelection = {
+export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
 	flush: () => Promise<void>;
-	clearShareFeedback: () => void;
-	clearJumpFeedback: () => void;
-	announce: (track?: Track) => void;
+	browseCopy: { invalidate: () => void };
+	announce: (message: string, replay?: boolean) => void;
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
-
-type PlaySelection = {
-	commit: (queue: QueueState) => boolean;
-	flush: () => Promise<void>;
-	announce: (message: string) => void;
-	bumpAnnouncement: () => void;
-};
-
-type JumpSelection = {
-	trackId?: string;
-	isCurrent: () => boolean;
-	assigned: () => void;
-	publish: (outcome: JumpOutcome) => void;
-};
-
-type RestartSelection = {
-	trackId: string;
-	isCurrent: () => boolean;
-	available: (audio: HTMLAudioElement, matches: () => boolean) => boolean;
-	assigned: () => void;
-	publish: (message: string, available: boolean) => void;
-};
 
 function describeRestart(words: string, title: string): string {
 	const suffix = ` ${title}.`;
@@ -66,11 +40,14 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
 }
 
-export function createMediaController(queue: QueueAuthority, naturalEnd?: NaturalEndSelection, matchesNative = matchesNativeSource) {
+export function createMediaController(queue: QueueAuthority, selection?: MediaSelection, matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	const repeat = writable<RepeatMode>('off');
+	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
+		jumpStatus: '', jumpStatusVersion: 0 });
+	let lastJumpTarget: number | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
 	const pendingShare = createPendingShareSeek();
@@ -80,6 +57,30 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
+	}
+
+	function clearJumpFeedback(): void {
+		const feedback = get(seekFeedback);
+		if (feedback.jumpStatus) seekFeedback.set({ ...feedback, jumpStatus: '' });
+	}
+
+	function clearSeekFeedback(): void {
+		lastJumpTarget = undefined;
+		seekFeedback.update((feedback) => ({ ...feedback, restartCanSeek: false, restartStatus: '', jumpStatus: '' }));
+	}
+
+	function observeSeeking(audio: HTMLAudioElement, matches: () => boolean): void {
+		if (!matches()) return;
+		const target = lastJumpTarget;
+		// Keep the jump's own queued event, even after a newer no-write outcome.
+		if (target !== undefined) {
+			try {
+				if (Math.abs(audio.currentTime - target) <= 0.05) return;
+			} catch { /* An unreadable position cannot confirm the jump target. */ }
+		}
+		if (!matches() || lastJumpTarget !== target) return;
+		lastJumpTarget = undefined;
+		clearJumpFeedback();
 	}
 
 	function reset(): void {
@@ -92,14 +93,15 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 	}
 
 	async function playSelected(
-		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, deps: PlaySelection
+		base: QueueState, index: number, source: QueuedPlaySource, suffix = ''
 	): Promise<void> {
+		if (!selection) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
 		const { streamUrl } = source;
 		const tracks = [...base.tracks];
 		tracks[index] = { ...target, streamUrl };
-		if (!deps.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
+		if (!selection.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
 
 		const receipt = queue.revoke();
 		let attachment = current;
@@ -109,7 +111,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
-			await deps.flush();
+			await selection.flush();
 			// A source change retires the old node before commit. In that case
 			// flush can admit one attachment, but not a reset or replacement while waiting.
 			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
@@ -130,8 +132,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			}
 		}
 		if (!isCurrent()) return;
-		deps.announce(suffix ? `${lead} ${suffix}` : lead);
-		if (isCurrent()) deps.bumpAnnouncement();
+		selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -183,51 +184,69 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		});
 	}
 
-	function captureShareSeek(intent: number, target: ShareSeekTarget, selected: () => boolean) {
-		if (!selected() || destroyed || intent !== positionIntent) return;
+	function captureShareSeek(intent: number, { trackId, seconds }: ShareTarget, routeIsCurrent: () => boolean) {
+		if (!routeIsCurrent() || destroyed || intent !== positionIntent) return;
+		const track = currentTrack(queue.snapshot);
+		if (track?.id !== trackId) return;
+		const streamUrl = resolveStreamUrl(track);
+		if (!streamUrl) return;
 		// Before the keyed node mounts, only the first upcoming attachment can inherit this seek.
 		const version = current ? attachmentVersion : attachmentVersion + 1;
-		const revision = pendingShare.set(target, (audio) => ({
-			isCurrent: () => matchesSource(audio, target.streamUrl, () =>
-				selected() && current?.audio === audio && attachmentVersion === version && positionIntent === intent)
+		const revision = pendingShare.set({ trackId, streamUrl, seconds }, (audio) => ({
+			isCurrent: () => matchesSource(audio, streamUrl, () => {
+				if (!routeIsCurrent() || destroyed || current?.audio !== audio ||
+					attachmentVersion !== version || positionIntent !== intent) return false;
+				// Other queue edits need not revoke a seek for this track and source.
+				const selected = currentTrack(queue.snapshot);
+				return selected?.id === trackId && resolveStreamUrl(selected) === streamUrl;
+			})
 		}));
+		clearJumpFeedback();
 		return () => retryShare(current?.audio, revision);
 	}
 
-	function jump(source: string, direction: JumpDirection, deps: JumpSelection): void {
+	function jump(direction: JumpDirection): void {
 		if (destroyed) return;
+		const track = currentTrack(queue.snapshot);
+		const source = resolveStreamUrl(track);
 		const attachment = current;
 		const audio = attachment?.audio;
+		const version = attachmentVersion;
+		const queueRevision = queue.revision;
 		const intent = ++positionIntent;
 		// Cancel on acceptance, even if the native seek is deferred or refused.
-		if (deps.trackId !== undefined) pendingShare.supersede(deps.trackId, source);
+		if (track) pendingShare.supersede(track.id, source);
 		const revision = pendingShare.revision;
-		const isCurrent = () => deps.isCurrent() && !destroyed && current === attachment &&
+		const isCurrent = () => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
 			positionIntent === intent && pendingShare.revision === revision;
 		runPosition(() => {
-			if (!audio || !source || !matchesSource(audio, source, isCurrent)) {
-				if (isCurrent()) deps.publish({ kind: 'unavailable' });
-				return;
-			}
-			const matches = () => matchesSource(audio, source, isCurrent);
-			if (!matches()) return;
-			const outcome = jumpMedia(audio, direction, matches, () => {
-				if (current === attachment) deps.assigned();
-			});
-			if (matches()) deps.publish(outcome);
+			const matches = () => !!audio && !!source && matchesSource(audio, source, isCurrent);
+			const outcome = audio && matches() ? jumpMedia(audio, direction, matches, () => {
+				if (current === attachment) clearJumpFeedback();
+			}) : undefined;
+			if (outcome ? !matches() : !isCurrent()) return;
+			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
+			seekFeedback.update((feedback) => ({
+				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }),
+				jumpStatusVersion: feedback.jumpStatusVersion + 1
+			}));
 		});
 	}
 
-	function restart(source: string, title: string, deps: RestartSelection): void {
-		if (destroyed) return;
+	function restart(): void {
+		const track = currentTrack(queue.snapshot);
+		const source = resolveStreamUrl(track);
+		if (destroyed || !track || !source) return;
+		const title = track.title?.trim() ? track.title : track.id;
 		const attachment = current;
+		const queueRevision = queue.revision;
 		const intent = ++positionIntent;
 		// Supersede before any native read, including an unavailable or refused seek.
-		pendingShare.supersede(deps.trackId, source);
+		pendingShare.supersede(track.id, source);
 		if (!attachment) return;
 		const { audio } = attachment;
 		const revision = pendingShare.revision;
-		const isCurrent = () => deps.isCurrent() && current === attachment &&
+		const isCurrent = () => queue.isCurrent(queueRevision) && current === attachment &&
 			positionIntent === intent && pendingShare.revision === revision;
 		const matches = () => matchesSource(audio, source, isCurrent);
 		runPosition(() => {
@@ -236,7 +255,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			let words = 'Could not restart';
 			let available = false;
 			try {
-				available = deps.available(audio, matches);
+				available = restartIsAvailable(audio, matches);
 				if (available && matches()) {
 					const position = audio.currentTime;
 					if (Number.isFinite(position) && matches()) {
@@ -244,7 +263,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 						if (atStart) words = 'Already at the start of';
 						audio.currentTime = 0;
 						// Queue edits can revoke readback without retiring the old position feedback.
-						if (current === attachment) deps.assigned();
+						if (current === attachment) clearJumpFeedback();
 						if (!atStart) {
 							if (!matches()) return;
 							const readback = audio.currentTime;
@@ -255,13 +274,16 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			} catch {
 				// Unreadable positions and refused assignments cannot prove a restart.
 			}
-			if (matches()) deps.publish(describeRestart(words, title), available);
+			if (matches()) seekFeedback.update((feedback) => ({
+				...feedback, restartCanSeek: available && feedback.restartCanSeek,
+				restartStatus: describeRestart(words, title), restartStatusVersion: feedback.restartStatusVersion + 1
+			}));
 		});
 	}
 
-	async function handleEnded(attachment: MediaAttachment, source: string): Promise<void> {
-		if (!naturalEnd) return;
-		const { commit, flush, clearShareFeedback, clearJumpFeedback, announce } = naturalEnd;
+	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
+		if (!selection) return;
+		const { commit, flush, browseCopy, announce } = selection;
 		const { audio } = attachment;
 		const intent = positionIntent;
 		const version = attachmentVersion;
@@ -269,7 +291,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		let revision = queue.revision;
 		const ownsEnd = () => !destroyed && generation === endGeneration && intent === positionIntent &&
 			queue.isCurrent(revision);
-		const ownsOrigin = () => ownsEnd() && current === attachment;
+		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
 		const result = naturalEndPolicy(base, {
 			repeat: get(repeat), radioActive: false, continueRadio: false, sleepComplete: false,
@@ -278,7 +300,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		if (result.action === 'ignore' || !ownsOrigin()) return;
 		attachment.playing = false;
 		generation = ++endGeneration;
-		announce();
+		announce('');
 		if (result.action !== 'play') return;
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
@@ -286,7 +308,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		const { volume, muted, playbackRate } = audio;
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
-		clearShareFeedback();
+		browseCopy.invalidate();
 		if (!ownsOrigin()) return;
 		pendingShare.clear();
 		if (!commit(result.queue) || queue.snapshot !== result.queue || !track || !streamUrl) return;
@@ -317,7 +339,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			// A captured play promise can fulfill before the queued pause event runs.
 			if (!matches() || target.paused || target.ended || target.error !== null) return;
 			replay.playing = true;
-			announce(track);
+			announce(`Playing ${shortTitle(displayTitle(track))}.`, true);
 		} catch {
 			// Autoplay can be refused; native controls remain available, no success claim.
 			if (matches()) replay.playing = false;
@@ -326,6 +348,8 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 
 	return {
 		repeat: { subscribe: repeat.subscribe },
+		seekFeedback: { subscribe: seekFeedback.subscribe },
+		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
 			let value: string | null | undefined;
 			try { value = storage?.getItem(REPEAT_KEY); } catch { /* Storage is optional. */ }
@@ -346,9 +370,9 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		get attachmentVersion() { return attachmentVersion; },
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
-		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {
+		attach(audio: HTMLAudioElement): () => void {
 			if (destroyed) return () => {};
-			if (observations && mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
+			if (mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
 			if (previous) pendingShare.clear();
@@ -357,17 +381,22 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			const receipt = { audio, playing: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
-			if (observations) {
+			function listenForNativeEvents(): void {
+				const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
 				const observe = (event: Event) => {
+					if (current !== receipt || event.currentTarget !== audio) return;
 					const shareRevision = pendingShare.revision;
 					const intent = positionIntent;
-					if (current !== receipt || event.currentTarget !== audio || !audio.isConnected) return;
-					const source = observations.source();
-					if (!source || audio.getAttribute('src') !== source || current !== receipt) return;
+					const source = selectedSource();
+					if (!source) return;
+					// Same-source queue edits leave this attachment and its events current.
+					const matches = (generation?: number) => matchesSource(audio, source, () =>
+						current === receipt && selectedSource() === source && (generation === undefined || positionIntent === generation));
+					if (!matches()) return;
 					switch (event.type) {
 						case 'play':
 						case 'playing':
-							if (!audio.paused && !audio.ended) receipt.playing = true;
+							if (!audio.paused && !audio.ended && matches()) receipt.playing = true;
 							return;
 						case 'pause':
 							// Native completion pauses before `ended`; retain that intent.
@@ -376,18 +405,25 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 						case 'error':
 							if (audio.error === null) return;
 							break;
-						case 'ended': return handleEnded(receipt, source);
+						case 'ended': return handleEnded(receipt, source, matches);
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
-							if (current === receipt && positionIntent === intent) observations.seeking(audio);
-							return;
+							return observeSeeking(audio, () => matches(intent));
 						case 'loadedmetadata':
 						case 'durationchange':
 							retryShare(audio, shareRevision);
-							if (current !== receipt) return;
+							if (!matches()) return;
 							// fall through to refresh position availability
-						default: return observations.position(audio);
+						default: {
+							const observedIntent = positionIntent;
+							const restartCanSeek = restartIsAvailable(audio, () => matches(observedIntent));
+							if (!matches(observedIntent)) return;
+							const feedback = get(seekFeedback);
+							if (restartCanSeek !== feedback.restartCanSeek) seekFeedback.set({ ...feedback, restartCanSeek });
+							return;
+						}
 					}
+					if (!matches()) return;
 					receipt.playing = false;
 					endGeneration += 1;
 				};
@@ -396,7 +432,9 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
 				}
 			}
-			if (previous?.audio !== audio) pause(previous?.audio);
+			lastJumpTarget = undefined;
+			listenForNativeEvents();
+			pause(previous?.audio);
 			return () => {
 				if (current === receipt) reset();
 			};

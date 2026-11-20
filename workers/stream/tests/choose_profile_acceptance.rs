@@ -35,6 +35,7 @@ fn row<'a>(format: &'a str, bitrate: i32, content_hash: &'a str) -> MediaRow<'a>
         format,
         bitrate,
         content_hash,
+        encrypted_s3: None,
     }
 }
 

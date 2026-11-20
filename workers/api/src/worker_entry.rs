@@ -44,6 +44,9 @@ mod billing_cancel_control;
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[path = "billing_deadline_test.rs"]
 pub(crate) mod billing_deadline_test;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_webhook_ack_test.rs"]
+pub(crate) mod billing_webhook_ack_test;
 
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -194,7 +197,7 @@ fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
     })
 }
 
-fn config_from_env(env: &Env) -> Option<Config> {
+pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     // Runtime fail-closed gate for the Hyperdrive caching finding: auth
     // reads are plain SELECTs through the HYPERDRIVE binding, so a
     // caching-enabled config would serve stale sessions/credentials for
@@ -1009,11 +1012,15 @@ impl PgStore {
                 let target = (
                     "127.0.0.1".to_owned(),
                     match self.trace_id.as_str() {
-                        "worker-commit-ack-loss-test" => 15432,
+                        "worker-commit-ack-loss-test" | "worker-webhook-ack-test" => 15432,
                         "worker-cancel-test" => 15433,
                         _ => 5432,
                     },
-                    "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+                    if self.trace_id == billing_deadline_test::RESTRICTED_HISTORY_TRACE {
+                        "host=127.0.0.1 user=billing_history_fixture password=ci-throwaway dbname=nntune_billing_ack sslmode=disable"
+                    } else {
+                        "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test"
+                    }.to_owned(),
                 );
                 #[cfg(not(feature = "billing-owned-wasm-test"))]
                 let target = {
@@ -1504,6 +1511,10 @@ impl PgStore {
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        if self.webhook_ack_control() {
+            return Self::bounded(billing_webhook_ack_test::connect(), TOTAL_TIMEOUT_MS).await;
+        }
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
             return Ok(client);
@@ -2977,6 +2988,15 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    fn webhook_ack_control(&self) -> bool {
+        self.env.is_none()
+            && matches!(
+                self.trace_id.as_str(),
+                "worker-webhook-ack-test" | "worker-webhook-retry-test"
+            )
+    }
+
     async fn mark_private_play(
         &self,
         user_id: &str,
@@ -3303,6 +3323,37 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 taste_row_from_row(&rows[0])
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn import_like(
+        &self,
+        user_id: &str,
+        kind: crate::target_identity::TargetKind,
+        target: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .query_typed_opt(
+                        crate::preference_rows::import_like_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&kind.as_str(), Type::TEXT),
+                            (&target, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.import_like"))?
+                    .ok_or(StoreError)?
+                    .try_get(0)
+                    .map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5221,6 +5272,14 @@ impl Store for PgStore {
                     })
                     .transpose()?
                     .flatten();
+                // A live-row lookup can return the same row after COMMIT.
+                // Require the exact selector in this control even in that case.
+                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+                if self.webhook_ack_control()
+                    && target_subscription_id != Some(billing_webhook_ack_test::SUBSCRIPTION)
+                {
+                    return Err(failed());
+                }
                 let live_rows = match target_subscription_id {
                     Some(target) => {
                         client
@@ -6342,6 +6401,8 @@ impl Mailer for WebhookMailer {
 // here logs header values or response bodies.
 struct WorkerStripeTransport {
     secret_key: Option<String>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    webhook_script: Option<billing_webhook_ack_test::StripeScript>,
 }
 
 impl WorkerStripeTransport {
@@ -6350,6 +6411,10 @@ impl WorkerStripeTransport {
         T: serde::de::DeserializeOwned,
     {
         use crate::stripe::{StripeError, STRIPE_API_BASE, STRIPE_API_VERSION};
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        if let Some(script) = &self.webhook_script {
+            return script.send(req);
+        }
         let key = self
             .secret_key
             .as_deref()
@@ -6704,7 +6769,7 @@ where
 
 /// Collect one request body with an explicit byte cap. The default-cap
 /// wrapper below is the single source of truth for API routes
-/// (`handlers::MAX_BODY_BYTES`); per-route overrides (the NZB intake)
+/// (`handlers::MAX_BODY_BYTES`); per-route overrides
 /// pass their own cap so the collection seam and the in-handler gate
 /// stay on the same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
@@ -6875,6 +6940,8 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if crate::native_rest::like_track_target(bare).is_some() {
+        "/v1/me/likes/track/{target_id}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -7223,8 +7290,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    // Per-route collection bound (the NZB intake accepts documents; API
-    // routes keep the pinned default): the in-handler gate re-checks the
+    // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
     let collected = collect_body_with_cap(
         declared_len,
@@ -7280,6 +7346,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // same config before any Stripe call).
     let stripe = WorkerStripeTransport {
         secret_key: config.stripe_secret_key.clone(),
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        webhook_script: None,
     };
     let ctx = handlers::Ctx {
         cfg: &config,
@@ -7869,12 +7937,35 @@ mod tests {
             served_display_path("/v1/me/likes?user_id=alice"),
             "/v1/me/likes"
         );
-        assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes/import?user_id=alice"),
+            "/v1/me/likes/import"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/import/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes/track/Job_A?user_id=alice"),
+            "/v1/me/likes/track/{target_id}"
+        );
+        for path in [
+            "/v1/me/likes/track",
+            "/v1/me/likes/track/",
+            "/v1/me/likes/track//Job_A",
+            "/v1/me/likes/track/Job_A/",
+            "/v1/me/likes/track/Job_A/nested",
+            "/v1/me/likes/release/Job_A",
+        ] {
+            assert_eq!(served_display_path(path), "unknown", "{path}");
+        }
         assert_eq!(
             served_display_path("/v1/me/taste?user_id=bob"),
             "/v1/me/taste"
         );
         assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/history?user_id=bob&cursor=Play_A"),
+            "/v1/me/history"
+        );
+        assert_eq!(served_display_path("/v1/me/history/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

@@ -62,7 +62,7 @@ async fn snapshot(observer: &Client) -> (Value, Value) {
 
 #[tokio::test]
 #[ignore = "requires the dedicated api-migrations fixture database"]
-async fn dormant_store_refuses_absent_history_and_replays_when_owned() {
+async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     let (mut observer, connection) = tokio_postgres::connect(CONNECTION, NoTls).await.unwrap();
     let driver = tokio::spawn(connection);
     let setup = observer.transaction().await.unwrap();

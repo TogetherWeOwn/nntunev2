@@ -46,8 +46,7 @@ use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
-/// Request bodies above this size reject before routing (not an oracle:
-/// size only, same for every route).
+/// Default request-body cap, checked before routing.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Intake-route body cap: `POST /api/ingest` carries an NZB document, not
 /// API JSON, so it gets its own bound. The value parities the NZB intake
@@ -59,8 +58,7 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route and the admin NZB
-/// upload route accept document uploads, every other route takes
+/// Per-route request-body bounds for NZB uploads, likes import, and default
 /// API-sized bodies. Both the entry's collection gate and the pre-routing
 /// size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
@@ -68,6 +66,9 @@ pub fn max_body_bytes(method: &str, path: &str) -> usize {
         INGEST_BODY_LIMIT_BYTES
     } else if method == "POST" && path == "/v1/admin/ingest" {
         admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/me/likes/import" {
+        // A compact batch of 500 maximum-length track IDs exceeds 32 KiB.
+        320 * 1024
     } else {
         MAX_BODY_BYTES
     }
@@ -671,6 +672,11 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    fn webhook_ack_control(&self) -> bool {
+        false
+    }
+
     /// Standalone private-play mark, adapted from PR #982's preserved patch;
     /// not authority to issue a grant. Activation must instead atomically
     /// fence, refresh privacy, mark, acquire the lease and conditionally
@@ -1642,6 +1648,17 @@ pub trait Store {
     ) -> impl Future<Output = Result<crate::preference_rows::TasteDbRow, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Add or convert a resolved like under the deletion fence. Return false only
+    /// when it was already a love at write time; that replay leaves the row untouched.
+    fn import_like(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Delete only love, or any signal respectively. Missing accounts fail closed.
     fn like_delete(
         &self,
@@ -2025,9 +2042,6 @@ where
     }
 }
 
-// Adapted from the history reader in PR #982. Keep unregistered until
-// private classification is atomic with new-play acquisition.
-#[allow(dead_code)]
 async fn me_history_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2037,6 +2051,21 @@ where
 {
     let (claims, _) = match preference_authenticate(ctx, req, false).await {
         Ok(pair) => pair,
+        // Keep the preference contract's envelope without changing legacy session routes.
+        Err(resp) if resp.status == 401 => {
+            let error = crate::api_error::ApiError::unauthorized("authentication required");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
+        Err(resp) if resp.status == 500 => {
+            let error = crate::api_error::ApiError::internal_error("unexpected error");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
         Err(resp) => return resp,
     };
     match ctx.store.history_list(&claims.user_id).await {
@@ -2058,8 +2087,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -2110,8 +2137,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_unlike_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -2154,8 +2179,7 @@ where
     }
 }
 
-// Adapted from PR #982. Activation, including the route-specific body cap, is separate.
-#[allow(dead_code)]
+// Adapted from PR #982.
 async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2164,7 +2188,6 @@ where
     N: AsyncDns,
 {
     use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
-    use crate::taste_signal::TasteSignal::Love;
     use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
     use std::{fmt, marker::PhantomData};
 
@@ -2247,22 +2270,10 @@ where
             }
             Err(_) => return unavailable(),
         };
-        let Ok(prior) = ctx.store.taste_get(owner, kind, &target).await else {
-            return unavailable();
-        };
-        // Even a replay goes through the deletion-fenced writer.
-        if ctx
-            .store
-            .taste_upsert(owner, kind, &target, Love, None, ctx.now)
-            .await
-            .is_err()
-        {
-            return unavailable();
-        }
-        if prior.is_some_and(|row| row.signal == Love.as_str()) {
-            already += 1;
-        } else {
-            added += 1;
+        match ctx.store.import_like(owner, kind, &target, ctx.now).await {
+            Ok(true) => added += 1,
+            Ok(false) => already += 1,
+            Err(_) => return unavailable(),
         }
     }
     json_response(
@@ -2271,8 +2282,6 @@ where
     )
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2359,8 +2368,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_taste_clear<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2497,7 +2504,7 @@ fn is_example_test_mailbox(email: &str) -> bool {
 
 /// Constant-time bearer comparison for the seam route. Length mismatch
 /// rejects without comparing (only the length leaks, never content).
-fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
+pub(crate) fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
     match presented {
         Some(candidate) => {
             let a = candidate.as_bytes();
@@ -6658,9 +6665,16 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| ())?;
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    let exact = ctx.store.webhook_ack_control();
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
+    let exact = false;
+    if exact && subscription.id != subscription_id {
+        return Err(());
+    }
     let input = ctx
         .store
-        .load_reconcile_input(user_id, None)
+        .load_reconcile_input(user_id, exact.then_some(subscription_id))
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -6712,14 +6726,17 @@ where
         }
         invoices.push(invoice);
     }
-    let outcome = crate::billing_reconcile::reconcile_subscription(
-        &input,
-        &crate::billing_reconcile::RemoteSubscription {
-            subscription,
-            invoices,
-        },
-        billing_now_i64(ctx.now),
-    );
+    let remote = crate::billing_reconcile::RemoteSubscription {
+        subscription,
+        invoices,
+    };
+    let now = billing_now_i64(ctx.now);
+    let outcome = if exact {
+        crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
+            .ok_or(())?
+    } else {
+        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
+    };
     ctx.store
         .store_reconcile_outcome(user_id, &outcome)
         .await
@@ -7597,7 +7614,9 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/usage"
             | "/v1/me/subscription"
             | "/v1/me/likes"
+            | "/v1/me/likes/import"
             | "/v1/me/taste"
+            | "/v1/me/history"
             | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
@@ -7793,7 +7812,11 @@ where
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
+        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
+        ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
+        ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
         ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
@@ -7892,6 +7915,14 @@ where
         // paths, the single-segment revoke id, and the scope-map-served
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
+        ("PUT", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_like_track(ctx, req, target).await,
+            None => not_found(),
+        },
+        ("DELETE", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_unlike_track(ctx, req, target).await,
+            None => not_found(),
+        },
         _ => not_found(),
     }
 }
@@ -7999,7 +8030,6 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PreferenceFailure {
         Member,
-        Read,
         Write,
     }
 
@@ -8254,6 +8284,34 @@ mod tests {
     }
 
     impl FakeStore {
+        fn check_taste_write(
+            &self,
+            user_id: &str,
+            target: &str,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            self.taste_write_attempts
+                .set(self.taste_write_attempts.get() + 1);
+            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
+                return Err(StoreError);
+            }
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !(1..=128).contains(&user_id.chars().count())
+                || !(1..=512).contains(&target.chars().count())
+                || user_id.contains('\0')
+                || target.contains('\0')
+                || now > 253_402_300_799
+            {
+                return Err(StoreError);
+            }
+            Ok(())
+        }
+
         fn delete_preference(
             &self,
             user_id: &str,
@@ -8339,7 +8397,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_history_lists_only_public_metered_plays_and_fails_closed() {
+    fn dispatched_history_lists_only_public_metered_plays_and_fails_closed() {
         use serde_json::{json, Value};
 
         let h = play_harness();
@@ -8350,18 +8408,26 @@ mod tests {
         let bob = magic_login(&h, "bob@example.com");
         let mut req = Request {
             method: "GET".into(),
-            path: "/v1/me/history?user_id=bob".into(),
-            cookie: Some(alice.clone()),
+            path: "/v1/me/history".into(),
+            cookie: None,
             origin: None,
             authorization: None,
             stripe_signature: None,
-            body: br#"{"user_id":"bob"}"#.to_vec(),
+            body: br#"{"user_id":"bob","cursor":"p20"}"#.to_vec(),
         };
         let call = |req: &Request| {
-            let resp = block_on(me_history_list(&h.ctx(), req));
+            let resp = block_on(handle(&h.ctx(), req));
             assert!(resp.set_cookie.is_none() && resp.extra_headers.is_empty());
             (resp.status, resp.body)
         };
+        let unauthorized = || {
+            (
+                401,
+                crate::api_error::ApiError::unauthorized("authentication required").body_json(),
+            )
+        };
+        assert_eq!(call(&req), unauthorized());
+        req.cookie = Some(alice.clone());
         let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
         seed_entitled(&h, "alice", "plus", 100);
         assert!(shared_play_call(&h, "alice", &claims.session_id, "track", None).is_ok());
@@ -8447,6 +8513,15 @@ mod tests {
         );
         req.cookie = Some(alice);
 
+        *store.fail_session_lookup.borrow_mut() = true;
+        let (status, body) = call(&req);
+        assert_eq!(status, 500);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"code": "internal_error", "message": "unexpected error", "retryable": true})
+        );
+        *store.fail_session_lookup.borrow_mut() = false;
+
         *store.fail_history_read.borrow_mut() = true;
         assert_eq!(call(&req), (503, unavailable().body));
         store.deleting_users.borrow_mut().insert("alice".into());
@@ -8459,7 +8534,7 @@ mod tests {
         // Model an erased user and cascaded session while retaining ledger fixtures.
         store.users.borrow_mut().remove("alice");
         store.sessions.borrow_mut().remove(&claims.session_id);
-        assert_eq!(call(&req), (401, generic_auth().body));
+        assert_eq!(call(&req), unauthorized());
         assert_eq!(snapshot(), before);
     }
 
@@ -9790,24 +9865,8 @@ mod tests {
             now: u64,
         ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
             use crate::taste_signal::TasteSignal;
-            const MAX_TIME: u64 = 253_402_300_799;
-            self.taste_write_attempts
-                .set(self.taste_write_attempts.get() + 1);
-            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
-                return Err(StoreError);
-            }
-            if self.delete_before_taste_write.replace(false) {
-                self.deleting_users.borrow_mut().insert(user_id.into());
-            }
-            if *self.fail_taste_write.borrow()
-                || !self.users.borrow().contains_key(user_id)
-                || self.deleting_users.borrow().contains(user_id)
-                || !(1..=128).contains(&user_id.chars().count())
-                || !(1..=512).contains(&target.chars().count())
-                || user_id.contains('\0')
-                || target.contains('\0')
-                || now > MAX_TIME
-                || snooze_until.is_some_and(|t| t > MAX_TIME)
+            self.check_taste_write(user_id, target, now)?;
+            if snooze_until.is_some_and(|t| t > 253_402_300_799)
                 || (signal == TasteSignal::Snooze) != snooze_until.is_some()
             {
                 return Err(StoreError);
@@ -9832,15 +9891,39 @@ mod tests {
             rows.insert(key, row.clone());
             Ok(row)
         }
+        async fn import_like(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            self.check_taste_write(user_id, target, now)?;
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows.get(&key).is_some_and(|row| row.signal == "love") {
+                return Ok(false);
+            }
+            rows.insert(
+                key,
+                crate::preference_rows::TasteDbRow {
+                    kind: kind.as_str().into(),
+                    target_id: target.into(),
+                    signal: "love".into(),
+                    snooze_until: None,
+                    created_at: now as i64,
+                    updated_at: now as i64,
+                },
+            );
+            Ok(true)
+        }
         async fn taste_get(
             &self,
             user_id: &str,
             kind: crate::target_identity::TargetKind,
             target: &str,
         ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
-            if *self.fail_taste_read.borrow()
-                || self.preference_failure.get() == Some((PreferenceFailure::Read, target))
-            {
+            if *self.fail_taste_read.borrow() {
                 return Err(StoreError);
             }
             Ok(self
@@ -10366,6 +10449,7 @@ mod tests {
                     // Explicit stale ignores the numeric suppression predicate.
                     Target::Owned {
                         predicate_stale: false,
+                        other_live_holder: false,
                     }
                 } else {
                     Target::Absent
@@ -15551,7 +15635,7 @@ mod tests {
         for path in [
             "/v1/me/likes/",
             "/v1/me/taste/",
-            "/v1/me/history",
+            "/v1/me/history/",
             "/v1/me/private-session/",
         ] {
             assert_eq!(
@@ -15607,7 +15691,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatched_likes_requires_a_cookie_and_maps_only_the_exact_get() {
+    fn dispatched_likes_and_history_require_a_cookie_and_map_only_exact_gets() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         let h = peppered_harness();
         seed_user(&h, "alice", "alice@example.com");
@@ -15619,36 +15703,42 @@ mod tests {
         );
         assert_eq!(minted.status, 201);
         let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
-        let mut req = Request {
-            method: "GET".into(),
-            path: "/v1/me/likes".into(),
-            cookie: None,
-            origin: Some(ORIGIN.into()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
         let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
-        assert_eq!(
-            scope_for_operation("GET", &req.path),
-            RouteDecision::SessionOnly
-        );
-        assert_eq!(call(&req).status, 401);
-        req.authorization = Some(format!("Bearer {secret}"));
-        assert_not_found(call(&req));
-        req.cookie = Some(cookie);
-        assert_not_found(call(&req));
-        req.authorization = None;
-        for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE"] {
-            req.method = method.into();
-            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+        for path in ["/v1/me/likes", "/v1/me/history"] {
+            let mut req = Request {
+                method: "GET".into(),
+                path: path.into(),
+                cookie: None,
+                origin: Some(ORIGIN.into()),
+                authorization: None,
+                stripe_signature: None,
+                body: Vec::new(),
+            };
+            assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+            assert_eq!(call(&req).status, 401);
+            req.authorization = Some(format!("Bearer {secret}"));
             assert_not_found(call(&req));
+            req.cookie = Some(cookie.clone());
+            assert_not_found(call(&req));
+            req.authorization = None;
+            for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE"] {
+                req.method = method.into();
+                assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+                assert_not_found(call(&req));
+            }
         }
-        for origin in [Some(ORIGIN), Some("https://other.example"), None] {
-            let resp = h.call_full("OPTIONS", &req.path, None, None, origin);
+        let cases = [
+            ("/v1/me/likes", "GET"),
+            ("/v1/me/history", "GET"),
+            ("/v1/me/likes/import", "POST"),
+        ];
+        for (path, method, origin) in cases.into_iter().flat_map(|(path, method)| {
+            [Some(ORIGIN), Some("https://other.example"), None].map(|origin| (path, method, origin))
+        }) {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
             assert_eq!(resp.status, 204);
             assert!(resp.body.is_empty() && resp.set_cookie.is_none());
             let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
@@ -15657,7 +15747,7 @@ mod tests {
                 assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
                 assert!(cors.iter().any(|(name, methods)| {
                     *name == "access-control-allow-methods"
-                        && methods.split(", ").any(|m| m == "GET")
+                        && methods.split(", ").any(|m| m == method)
                 }));
             } else {
                 assert!(cors.is_empty());
@@ -16073,7 +16163,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_unlike_preserves_other_signals_and_fails_closed() {
+    fn unlike_handler_preserves_other_signals_and_fails_closed() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
         let h = harness();
@@ -16235,7 +16325,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_replaces_and_replays_with_server_time() {
+    fn taste_put_handler_replaces_and_replays_with_server_time() {
         use serde_json::json;
         let h = harness();
         let stored = |owner: &str| {
@@ -16293,7 +16383,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_resolves_only_visible_kind_specific_targets() {
+    fn taste_put_handler_resolves_only_visible_kind_specific_targets() {
         use serde_json::json;
         let h = harness();
         let req = taste_put_request(&h, "alice");
@@ -16361,7 +16451,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_rejects_invalid_bodies_and_fails_closed() {
+    fn taste_put_handler_rejects_invalid_bodies_and_fails_closed() {
         let h = harness();
         let mut req = taste_put_request(&h, "alice");
         h.store
@@ -16428,7 +16518,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_clear_checks_owner_membership_and_fails_closed() {
+    fn taste_clear_handler_checks_owner_membership_and_fails_closed() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
         let h = harness();
@@ -16790,14 +16880,16 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_rejects_bad_structure_and_auth_before_writing() {
-        let h = harness();
+    fn dispatched_likes_import_rejects_bad_structure_and_auth_before_writing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = peppered_harness();
         let mut req = likes_import_request(&h);
         h.store
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job")]);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let valid = r#"{"kind":"track","target_id":"Job"}"#;
         for body in [
             "{",
@@ -16833,21 +16925,73 @@ mod tests {
             assert_eq!(call(&req).status, 401);
         }
         req.origin = Some(ORIGIN.into());
-        req.authorization = Some("Bearer ntk_test".into());
-        assert_eq!(call(&req).status, 404);
-        req.cookie = None;
-        assert_eq!(call(&req).status, 404);
-        req.authorization = None;
+        let cookie = req.cookie.take().unwrap();
         assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let lookups = *h.store.native_credential_lookups.borrow();
+        req.authorization = Some(format!("Bearer {key}"));
+        assert_eq!(
+            scope_for_operation("POST", &req.path),
+            RouteDecision::SessionOnly
+        );
+        for session in [None, Some(cookie)] {
+            req.cookie = session;
+            let denied = call(&req);
+            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        }
+        req.authorization = None;
+        for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "post"] {
+            req.method = method.into();
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            assert_eq!(max_body_bytes(method, &req.path), MAX_BODY_BYTES);
+            assert_eq!(call(&req).status, 404, "{method}");
+        }
+
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
         assert!(h.store.taste_rows.borrow().is_empty());
         assert_eq!(h.store.taste_write_attempts.get(), 0);
     }
 
+    fn collect_import_body(
+        req: &Request,
+        declared_len: Option<usize>,
+        body: Vec<u8>,
+    ) -> crate::worker_entry::CollectedBody {
+        use crate::worker_entry::{
+            collect_body_with_cap, BodyChunkStream, BodyReadError, BodySource,
+        };
+
+        struct OneChunk(Option<Vec<u8>>);
+        impl BodyChunkStream for OneChunk {
+            fn poll_next_chunk(
+                &mut self,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+                Poll::Ready(self.0.take().map(Ok))
+            }
+        }
+
+        block_on(collect_body_with_cap(
+            declared_len,
+            BodySource::Stream(OneChunk(Some(body))),
+            max_body_bytes(&req.method, &req.path),
+        ))
+    }
+
     #[test]
-    fn unwired_likes_import_bounds_batch_and_rejection_echo() {
+    fn dispatched_likes_import_bounds_batch_and_rejection_echo() {
+        use crate::worker_entry::CollectedBody;
+
         let h = harness();
         let mut req = likes_import_request(&h);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         req.body = br#"{"items":[]}"#.to_vec();
         assert_import(call(&req), 0, 0, &[]);
         let targets: Vec<_> = (0..500)
@@ -16865,7 +17009,28 @@ mod tests {
         assert_eq!(h.store.taste_write_attempts.get(), 0);
         items.pop();
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert!(req.body.len() > 32 * 1024);
+        let cap = max_body_bytes(&req.method, &req.path);
+        assert_eq!(cap, 320 * 1024);
+        assert!(req.body.len() > MAX_BODY_BYTES && req.body.len() < cap);
+        req.body.resize(cap + 1, b' ');
+        for declared in [None, Some(cap + 1)] {
+            assert_eq!(
+                collect_import_body(&req, declared, req.body.clone()),
+                CollectedBody::Oversized
+            );
+        }
+        let oversized = call(&req);
+        assert_eq!(
+            (oversized.status, oversized.body),
+            (400, invalid_request().body)
+        );
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+
+        req.body.truncate(cap);
+        assert_eq!(
+            collect_import_body(&req, None, req.body.clone()),
+            CollectedBody::Complete(req.body.clone())
+        );
         assert_import(call(&req), 500, 0, &[]);
         let saved = h.store.taste_rows.borrow().clone();
         assert_eq!(saved.len(), 500);
@@ -16884,7 +17049,66 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_resolves_members_and_replays_per_owner() {
+    fn dispatched_likes_import_collects_ordinary_batch_without_displacing_taste() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::Hide;
+        use crate::worker_entry::CollectedBody;
+
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        let targets: Vec<_> = (0..500)
+            .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            targets.iter().map(|id| unmatched_library_row(id)).collect(),
+        );
+        let items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert!(bytes.len() > MAX_BODY_BYTES);
+        let mut taste = Request {
+            method: "PUT".into(),
+            path: "/v1/me/taste".into(),
+            ..req.clone()
+        };
+        let collect = |req: &Request, declared| {
+            assert_eq!(
+                collect_import_body(&taste, declared, bytes.clone()),
+                CollectedBody::Oversized
+            );
+            match collect_import_body(req, declared, bytes.clone()) {
+                CollectedBody::Complete(body) => body,
+                other => {
+                    panic!("batch with declared length {declared:?} was not collected: {other:?}")
+                }
+            }
+        };
+        req.body = collect(&req, Some(bytes.len()));
+        assert_import(block_on(handle(&h.ctx(), &req)), 500, 0, &[]);
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Unrelated", Hide, None, NOW + 1),
+        )
+        .unwrap();
+        let saved = h.store.taste_rows.borrow().clone();
+
+        req.body = collect(&req, None);
+        let mut later = h.ctx();
+        later.now += 2;
+        assert_import(block_on(handle(&later, &req)), 0, 500, &[]);
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+        taste.method = "GET".into();
+        let response = block_on(handle(&later, &taste));
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let listed = json["items"].as_array().unwrap();
+        assert_eq!(listed.len(), 500);
+        assert_eq!(listed[0]["target_id"], "Unrelated");
+        assert_eq!(listed[0]["signal"], "hide");
+    }
+
+    #[test]
+    fn dispatched_likes_import_resolves_members_and_replays_per_owner() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::Snooze;
         let h = harness();
@@ -16923,10 +17147,10 @@ mod tests {
         ]
         .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert_import(block_on(me_likes_import(&h.ctx(), &req)), 4, 1, &rejected);
+        assert_import(block_on(handle(&h.ctx(), &req)), 4, 1, &rejected);
         let mut later = h.ctx();
         later.now += 60;
-        assert_import(block_on(me_likes_import(&later, &req)), 0, 5, &rejected);
+        assert_import(block_on(handle(&later, &req)), 0, 5, &rejected);
         let get = |owner, kind, id| block_on(h.store.taste_get(owner, kind, id)).unwrap();
         for (kind, id) in [
             (Track, job),
@@ -16944,7 +17168,7 @@ mod tests {
         req.cookie = Some(magic_login(&h, "bob@example.com"));
         req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
         assert_import(
-            block_on(me_likes_import(&later, &req)),
+            block_on(handle(&later, &req)),
             2,
             0,
             &[serde_json::json!({"target_id": job, "reason": "not_member"})],
@@ -16965,14 +17189,9 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_fails_closed_and_retries_partial_writes() {
-        use PreferenceFailure::{Member, Read, Write};
-        for fault in [
-            (Member, "Second"),
-            (Member, CAT_RELEASE),
-            (Read, "Second"),
-            (Write, "Second"),
-        ] {
+    fn dispatched_likes_import_fails_closed_and_retries_partial_writes() {
+        use PreferenceFailure::{Member, Write};
+        for fault in [(Member, "Second"), (Member, CAT_RELEASE), (Write, "Second")] {
             let h = harness();
             let mut req = likes_import_request(&h);
             h.store.catalogue_library.borrow_mut().insert(
@@ -16990,7 +17209,7 @@ mod tests {
             };
             req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
             h.store.preference_failure.set(Some(fault));
-            let failed = block_on(me_likes_import(&h.ctx(), &req));
+            let failed = block_on(handle(&h.ctx(), &req));
             assert_eq!((failed.status, failed.body), (503, unavailable().body));
             let key = ("alice".into(), "track".into(), "First".into());
             let saved = h.store.taste_rows.borrow().clone();
@@ -16999,16 +17218,16 @@ mod tests {
             h.store.preference_failure.set(None);
             let mut later = h.ctx();
             later.now += 1;
-            assert_import(block_on(me_likes_import(&later, &req)), 2, 1, &[]);
+            assert_import(block_on(handle(&later, &req)), 2, 1, &[]);
             let recovered = h.store.taste_rows.borrow().clone();
             assert_eq!(recovered.len(), 3);
             assert!(recovered.values().all(|row| row.signal == "love"));
             assert_eq!(recovered[&key].created_at, saved[&key].created_at);
             let writes = h.store.taste_write_attempts.get();
             h.store.delete_before_taste_write.replace(true);
-            let raced = block_on(me_likes_import(&later, &req));
+            let raced = block_on(handle(&later, &req));
             assert_eq!((raced.status, raced.body), (503, unavailable().body));
-            let deleting = block_on(me_likes_import(&later, &req));
+            let deleting = block_on(handle(&later, &req));
             assert_eq!(
                 (deleting.status, deleting.body),
                 (409, account_deleting_response().body)
@@ -17019,11 +17238,15 @@ mod tests {
     }
 
     #[test]
-    fn taste_list_dispatch_has_exact_session_only_routing() {
+    fn taste_dispatch_has_exact_session_only_routing() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         let h = peppered_harness();
-        seed_user(&h, "alice", "alice@example.com");
-        let cookie = magic_login(&h, "alice@example.com");
+        let mut req = taste_put_request(&h, "alice");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let cookie = req.cookie.take().unwrap();
         let minted = mint_call(
             &h,
             &cookie,
@@ -17031,40 +17254,419 @@ mod tests {
         );
         assert_eq!(minted.status, 201, "{}", minted.body);
         let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
-        let mut req = Request {
-            method: "GET".into(),
-            path: "/v1/me/taste".into(),
-            cookie: None,
-            origin: Some(ORIGIN.into()),
-            authorization: Some(format!("Bearer {key}")),
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let path = req.path.as_str();
-        assert!(is_known_path(path));
-        assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+        req.authorization = Some(format!("Bearer {key}"));
+        assert!(is_known_path(&req.path));
         let before = *h.store.native_credential_lookups.borrow();
-        for session in [None, Some(cookie.clone())] {
-            req.cookie = session;
-            let denied = block_on(handle(&h.ctx(), &req));
-            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        for method in ["PUT", "GET", "DELETE"] {
+            req.method = method.into();
+            if method == "DELETE" {
+                req.body = br#"{"kind":"track","target_id":"Job_A"}"#.to_vec();
+            }
+            assert_eq!(
+                scope_for_operation(method, &req.path),
+                RouteDecision::SessionOnly
+            );
+            for session in [None, Some(cookie.clone())] {
+                req.cookie = session;
+                let denied = block_on(handle(&h.ctx(), &req));
+                assert_eq!((denied.status, denied.body), (404, not_found().body));
+            }
         }
         assert_eq!(*h.store.native_credential_lookups.borrow(), before);
+        assert!(h.store.taste_rows.borrow().is_empty());
         req.method = "OPTIONS".into();
         req.cookie = None;
+        req.body.clear();
         for origin in [Some(ORIGIN), None, Some("https://other.example")] {
             req.origin = origin.map(str::to_string);
             let response = block_on(handle(&h.ctx(), &req));
-            let control = h.call_full("OPTIONS", "/v1/me/private-session", None, None, origin);
-            assert_eq!(response.status, 204);
-            assert_eq!(response.status, control.status);
-            assert_eq!(response.body, control.body);
+            assert_eq!((response.status, response.body.as_str()), (204, ""));
+            let cors = crate::worker_entry::cors_headers(response.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                for method in ["PUT", "DELETE"] {
+                    assert!(cors.iter().any(|(name, methods)| {
+                        *name == "access-control-allow-methods"
+                            && methods.split(", ").any(|m| m == method)
+                    }));
+                }
+            } else {
+                assert!(cors.is_empty());
+            }
         }
-        for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE", "get"] {
+        for method in ["HEAD", "POST", "PATCH", "get", "put", "delete"] {
             assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
             let denied = h.call_full(method, &req.path, None, Some(cookie.clone()), Some(ORIGIN));
             assert_eq!(denied.status, 404, "{method}");
         }
+    }
+
+    #[test]
+    fn dispatched_taste_put_persists_and_replaces_only_the_session_owners_signal() {
+        use serde_json::json;
+
+        let h = harness();
+        let mut alice = taste_put_request(&h, "alice");
+        let bob = taste_put_request(&h, "bob");
+        h.store.catalogue_library.borrow_mut().insert(
+            "bob".into(),
+            vec![
+                unmatched_library_row("Job_A"),
+                unmatched_library_row("Private"),
+            ],
+        );
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let read = |req: &Request| h.call_full("GET", &req.path, None, req.cookie.clone(), None);
+        assert_eq!(call(&bob).status, 200);
+        let bob_before = read(&bob);
+        assert_eq!(bob_before.status, 200);
+        let before = h.store.taste_rows.borrow().clone();
+
+        let valid = alice.body.clone();
+        for target in ["bad/path", "Private", "Absent"] {
+            alice.body = json!({"kind":"track", "target_id":target, "signal":"hide"})
+                .to_string()
+                .into_bytes();
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (404, not_found().body),
+                "{target}"
+            );
+        }
+        alice.body = vec![b' '; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&alice).status, 400);
+        alice.body = valid;
+        for origin in [None, Some("https://other.example")] {
+            alice.origin = origin.map(str::to_string);
+            assert_eq!(call(&alice).status, 401);
+        }
+        alice.origin = Some(ORIGIN.into());
+        let cookie = alice.cookie.take();
+        assert_eq!(call(&alice).status, 401);
+        alice.cookie = cookie;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+
+        for (offset, signal) in [(1, "hide"), (2, "love"), (3, "love")] {
+            let mut expected = json!({"kind":"track", "target_id":"Job_A", "signal":signal});
+            alice.body = expected.to_string().into_bytes();
+            expected["until"] = json!(null);
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            let written = block_on(handle(&ctx, &alice));
+            assert_eq!((written.status, written.body), (200, expected.to_string()));
+            expected["updated_at"] = json!(ctx.now);
+            let fetched = read(&alice);
+            assert_eq!(
+                (fetched.status, fetched.body),
+                (200, json!({"items":[expected]}).to_string())
+            );
+        }
+        let likes = h.call_full("GET", "/v1/me/likes", None, alice.cookie.clone(), None);
+        assert_eq!(
+            (likes.status, likes.body),
+            (
+                200,
+                json!({"items":[{"kind":"track", "target_id":"Job_A", "created_at":NOW + 2}]})
+                    .to_string()
+            )
+        );
+        let bob_after = read(&bob);
+        assert_eq!((bob_after.status, bob_after.body), (200, bob_before.body));
+    }
+
+    #[test]
+    fn dispatched_taste_clear_removes_only_the_session_owners_signal() {
+        use serde_json::json;
+
+        let h = harness();
+        let mut alice = taste_put_request(&h, "alice");
+        let bob = taste_put_request(&h, "bob");
+        h.store.catalogue_library.borrow_mut().extend([
+            ("alice".into(), vec![unmatched_library_row("Job_A")]),
+            (
+                "bob".into(),
+                vec![
+                    unmatched_library_row("Job_A"),
+                    unmatched_library_row("Private"),
+                ],
+            ),
+        ]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let read = |req: &Request| h.call_full("GET", &req.path, None, req.cookie.clone(), None);
+        alice.body = br#"{"kind":"track","target_id":"Job_A","signal":"hide"}"#.to_vec();
+        assert_eq!(call(&alice).status, 200);
+        assert_eq!(call(&bob).status, 200);
+        let before = h.store.taste_rows.borrow().clone();
+
+        alice.method = "DELETE".into();
+        for target in ["bad/path", "Private", "Absent"] {
+            alice.body = json!({"kind":"track", "target_id":target})
+                .to_string()
+                .into_bytes();
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (404, not_found().body),
+                "{target}"
+            );
+        }
+        alice.body = vec![b' '; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&alice).status, 400);
+        alice.body = br#"{"kind":"track","target_id":"Job_A"}"#.to_vec();
+        for origin in [None, Some("https://other.example")] {
+            alice.origin = origin.map(str::to_string);
+            assert_eq!(call(&alice).status, 401);
+        }
+        alice.origin = Some(ORIGIN.into());
+        let cookie = alice.cookie.take();
+        assert_eq!(call(&alice).status, 401);
+        alice.cookie = cookie;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+
+        for cleared in [true, false] {
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (200, json!({"cleared":cleared}).to_string())
+            );
+            let fetched = read(&alice);
+            assert_eq!(
+                (fetched.status, fetched.body.as_str()),
+                (200, r#"{"items":[]}"#)
+            );
+            let bob_after = read(&bob);
+            assert_eq!(
+                (bob_after.status, bob_after.body),
+                (
+                    200,
+                    json!({"items":[{"kind":"track", "target_id":"Job_A", "signal":"love", "until":null, "updated_at":NOW}]})
+                        .to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn dispatched_track_like_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        for (user, email, track) in [
+            ("alice", "alice@example.com", "Job_A"),
+            ("bob", "bob@example.com", "Private"),
+        ] {
+            seed_user(&h, user, email);
+            h.store
+                .catalogue_library
+                .borrow_mut()
+                .insert(user.into(), vec![unmatched_library_row(track)]);
+        }
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let path = "/v1/me/likes/track/Job_A";
+        let mut req = Request {
+            method: "PUT".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        assert_eq!(scope_for_operation("PUT", path), RouteDecision::SessionOnly);
+        let first = call(&req);
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap(),
+            json!({"target_id": "Job_A", "liked_at": NOW})
+        );
+        let mut later = h.ctx();
+        later.now += 100;
+        let replay = block_on(handle(&later, &req));
+        assert_eq!((replay.status, replay.body), (200, first.body));
+        let saved = h.store.taste_rows.borrow().clone();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key(&("alice".into(), "track".into(), "Job_A".into())));
+
+        req.cookie = Some(bob);
+        assert_not_found(call(&req));
+        req.cookie = Some(alice.clone());
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+
+        req.authorization = None;
+        for method in ["GET", "HEAD", "POST", "PATCH", "put", "delete"] {
+            assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+            req.method = method.into();
+            assert_not_found(call(&req));
+        }
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
+            assert_eq!(resp.status, 204);
+            assert!(resp.body.is_empty() && resp.set_cookie.is_none());
+            let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                for method in ["PUT", "DELETE"] {
+                    assert!(cors.iter().any(|(name, methods)| {
+                        *name == "access-control-allow-methods"
+                            && methods.split(", ").any(|m| m == method)
+                    }));
+                }
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+    }
+
+    #[test]
+    fn dispatched_track_unlike_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        for (user, other_track) in [("alice", "Hidden"), ("bob", "Private")] {
+            h.store.catalogue_library.borrow_mut().insert(
+                user.into(),
+                vec![
+                    unmatched_library_row("Job_A"),
+                    unmatched_library_row(other_track),
+                ],
+            );
+            block_on(h.store.taste_upsert(user, Track, "Job_A", Love, None, NOW)).unwrap();
+        }
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Hidden", Hide, None, NOW),
+        )
+        .unwrap();
+        let mut expected = h.store.taste_rows.borrow().clone();
+        let path = "/v1/me/likes/track/Job_A";
+        assert_eq!(
+            scope_for_operation("DELETE", path),
+            RouteDecision::SessionOnly
+        );
+        let mut req = Request {
+            method: "DELETE".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+        req.authorization = None;
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+        assert!(expected
+            .remove(&("alice".into(), "track".into(), "Job_A".into()))
+            .is_some());
+        for _ in 0..2 {
+            let resp = call(&req);
+            assert_eq!(
+                (resp.status, resp.body.as_str()),
+                (200, r#"{"liked":false,"target_id":"Job_A"}"#)
+            );
+            assert_eq!(*h.store.taste_rows.borrow(), expected);
+        }
+        req.path = "/v1/me/likes/track/Hidden".into();
+        let resp = call(&req);
+        assert_eq!(
+            (resp.status, resp.body.as_str()),
+            (200, r#"{"liked":false,"target_id":"Hidden"}"#)
+        );
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+
+        req.path = path.into();
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Job_A", Love, None, NOW),
+        )
+        .unwrap();
+        let before_delete = h.store.taste_rows.borrow().clone();
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req);
+        assert_eq!((raced.status, raced.body), (503, unavailable().body));
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        assert_eq!(*h.store.taste_rows.borrow(), before_delete);
     }
 
     #[test]
@@ -17075,12 +17677,19 @@ mod tests {
         for path in [
             "/v1/me/likes/",
             "/v1/me/likes-extra",
-            "/v1/me/likes/import",
-            "/v1/me/likes/track/example",
+            "/v1/me/likes/import/",
+            "/v1/me/likes/import/extra",
+            "/v1/me/likes/track",
+            "/v1/me/likes/track/",
+            "/v1/me/likes/track//example",
+            "/v1/me/likes/track/example/",
+            "/v1/me/likes/track/example/nested",
+            "/v1/me/likes/release/example",
             "/v1/me/taste/",
             "/v1/me/taste/track/example",
             "/v1/me/tastes",
-            "/v1/me/history",
+            "/v1/me/history/",
+            "/v1/me/history/extra",
             "/v1/me/private-session/",
             "/v1/me/private-session/extra",
         ] {

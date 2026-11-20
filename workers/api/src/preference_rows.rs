@@ -20,6 +20,12 @@ pub fn taste_upsert_statement() -> &'static str {
     "INSERT INTO public.account_taste (user_id, kind, target_id, signal, snooze_until, created_at, updated_at) SELECT $1, $2, $3, $4, $5, $6, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, kind, target_id) DO UPDATE SET signal = EXCLUDED.signal, snooze_until = EXCLUDED.snooze_until, created_at = CASE WHEN EXCLUDED.signal = 'love' AND account_taste.signal <> 'love' THEN EXCLUDED.created_at ELSE account_taste.created_at END, updated_at = EXCLUDED.updated_at RETURNING kind, target_id, signal, snooze_until, created_at, updated_at"
 }
 
+/// Report whether the fenced import inserted or converted a row. The conflict
+/// predicate sees the locked row, and replay updates neither timestamp.
+pub fn import_like_statement() -> &'static str {
+    "WITH writer_fence AS MATERIALIZED (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE), added AS (INSERT INTO public.account_taste AS taste (user_id, kind, target_id, signal, snooze_until, created_at, updated_at) SELECT id, $2, $3, 'love', NULL, $4, $4 FROM writer_fence ON CONFLICT (user_id, kind, target_id) DO UPDATE SET signal = EXCLUDED.signal, snooze_until = NULL, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at WHERE taste.signal <> 'love' RETURNING 1) SELECT EXISTS (SELECT 1 FROM added) FROM writer_fence"
+}
+
 /// Delete an exact row while holding the same account fence as the writer.
 /// The final row distinguishes an absent account from an absent preference.
 pub fn taste_delete_statement() -> &'static str {

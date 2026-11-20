@@ -38,13 +38,13 @@ function snapshotWith(items: unknown[]): string {
 
 describe('catalogue occurrence identity', () => {
 	it.each([
-		['home', '{#each preview as item (libraryItemKey(item))}'],
-		['search', '{#each results as item (libraryItemKey(item))}'],
-		['library/liked', '{#each liked as item (libraryItemKey(item))}'],
-		['library', '{#each tracks as track (libraryItemKey(track))}'],
-		['library', '{#each favoriteTracks as track, index (libraryItemKey(track))}']
-	])('wires the shared occurrence key into the %s list', (route, each) => {
-		const source = readFileSync(new URL(`../../routes/${route}/+page.svelte`, import.meta.url), 'utf8');
+		['home/+page.svelte', '{#each preview as item (libraryItemKey(item))}'],
+		['search/+page.svelte', '{#each results as item (libraryItemKey(item))}'],
+		['library/liked/+page.svelte', '{#each liked as item (libraryItemKey(item))}'],
+		['library/TrackRows.svelte', '{#each tracks as track (libraryItemKey(track))}'],
+		['library/+page.svelte', '{#each favoriteTracks as track, index (libraryItemKey(track))}']
+	])('wires the shared occurrence key into the %s list', (file, each) => {
+		const source = readFileSync(new URL(`../../routes/${file}`, import.meta.url), 'utf8');
 		expect(source).toContain(each);
 	});
 	it('preserves repeated recordings within and across jobs without changing stream ids', () => {

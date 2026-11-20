@@ -4,6 +4,8 @@
 //! multiple ranges, unparseable units) falls back to `200 OK` full-body per
 //! RFC 9110 §14.2. An unsatisfiable range resolves to `416`.
 
+use nntune_core::digest_geometry::{DigestGeometry, RangeGeometry};
+
 /// A resolved inclusive byte range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {
@@ -115,6 +117,25 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
     }
 }
 
+/// Plan a request against the trusted plaintext length of an enrolled object.
+/// No route calls this planner. It does not fetch, authenticate, or release bytes.
+pub fn plan_encrypted_range(
+    header: Option<&str>,
+    geometry: DigestGeometry,
+) -> (RangeOutcome, Option<RangeGeometry>) {
+    let len = geometry.plaintext_len();
+    let outcome = parse(header, len);
+    let plan = match outcome {
+        RangeOutcome::Full => geometry.range(0, len),
+        RangeOutcome::Partial(range) => range
+            .end
+            .checked_add(1)
+            .and_then(|end| geometry.range(range.start, end)),
+        RangeOutcome::Unsatisfiable => None,
+    };
+    (outcome, plan)
+}
+
 /// Value for the `Content-Range` header of a `206` response.
 pub fn content_range_value(range: ByteRange, len: u64) -> String {
     format!("bytes {}-{}/{}", range.start, range.end, len)
@@ -123,6 +144,42 @@ pub fn content_range_value(range: ByteRange, len: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_planning_uses_plaintext_range_semantics() {
+        let geometry = DigestGeometry::new(65_537).unwrap();
+        for (header, start, end, ciphertext) in [
+            ("bytes=0-0", 0, 0, 48..65_600),
+            ("bytes=65536-65536", 65_536, 65_536, 65_600..65_617),
+            ("bytes=65535-", 65_535, 65_536, 48..65_617),
+            ("bytes=-2", 65_535, 65_536, 48..65_617),
+            ("bytes=-99999", 0, 65_536, 48..65_617),
+            (
+                "bytes=65536-18446744073709551615",
+                65_536,
+                65_536,
+                65_600..65_617,
+            ),
+        ] {
+            let (outcome, plan) = plan_encrypted_range(Some(header), geometry);
+            assert_eq!(outcome, RangeOutcome::Partial(ByteRange { start, end }));
+            assert_eq!(plan.unwrap().ciphertext_span(), Some(ciphertext));
+        }
+        for header in ["bytes=65537-", "bytes=65537-65538", "bytes=-0"] {
+            assert_eq!(
+                plan_encrypted_range(Some(header), geometry),
+                (RangeOutcome::Unsatisfiable, None)
+            );
+        }
+        let empty = DigestGeometry::new(0).unwrap();
+        let (outcome, plan) = plan_encrypted_range(None, empty);
+        assert_eq!(outcome, RangeOutcome::Full);
+        assert_eq!(plan.unwrap().ciphertext_span(), Some(48..64));
+        assert_eq!(
+            plan_encrypted_range(Some("bytes=-1"), empty),
+            (RangeOutcome::Unsatisfiable, None)
+        );
+    }
 
     #[test]
     fn missing_or_garbage_header_serves_full_body() {

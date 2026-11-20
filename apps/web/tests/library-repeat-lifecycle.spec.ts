@@ -263,6 +263,40 @@ test('pending automatic play is silent and auth teardown pauses its connected na
 	await expectNoErrors(page, errors);
 });
 
+test('Library navigation disposes the route before the native attachment can pause', async ({ page }) => {
+	await openLibrary(page);
+	await enqueue(page, ['lib-coral']);
+	await playCurrent(page);
+	const audio = await page.getByTestId('audio-player').elementHandle();
+	await audio!.evaluate((element: HTMLMediaElement) => {
+		const pause = element.pause.bind(element);
+		element.pause = () => {
+			element.dataset.dragAtPause = document.documentElement.dataset.trackDragging ?? 'none';
+			pause();
+		};
+	});
+	const row = page.locator('[data-testid="library-item"][data-id="lib-coral"]');
+	await row.evaluate((element) => element.dispatchEvent(new DragEvent('dragstart', {
+		bubbles: true, dataTransfer: new DataTransfer()
+	})));
+	await expect(page.locator('html')).toHaveAttribute('data-track-dragging', 'library');
+
+	await page.evaluate(() => {
+		const link = document.createElement('a');
+		link.href = '/';
+		document.body.append(link);
+		link.click();
+		link.remove();
+	});
+	await expect(page).toHaveURL(new URL('/', page.url()).href);
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	// Inspect the retained element in the same document. A native detach that
+	// pauses first sees the route's still-active drag instead of 'none'.
+	expect(await audio!.evaluate((element: HTMLMediaElement) => ({
+		paused: element.paused, dragAtPause: element.dataset.dragAtPause
+	}))).toEqual({ paused: true, dragAtPause: 'none' });
+});
+
 test('rejected automatic play never announces Playing or escapes as an unhandled rejection', async ({ page }) => {
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));

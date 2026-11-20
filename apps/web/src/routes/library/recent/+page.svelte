@@ -1,4 +1,5 @@
 <script lang="ts">
+	import RecentPlays from '#lib/library/RecentPlays.svelte';
 	import { browserStorage } from '#lib/library/cache.js';
 	import {
 		loadRecentFinds,
@@ -45,14 +46,19 @@
 	<h1 tabindex="-1" bind:this={heading}>Recent</h1>
 	<p><a href="/library">Back to Your Library</a></p>
 
-	{#if queries.length === 0}
-		<p>No recent searches yet. Searches you run in Your Library appear here.</p>
-	{:else}
-		<ul>
-			{#each queries as query (query)}
-				<li><a href={`/search?q=${encodeURIComponent(query)}`}>{query}</a></li>
-			{/each}
-		</ul>
-		<button type="button" onclick={clearAll}>Clear recent searches</button>
-	{/if}
+	<RecentPlays />
+
+	<section aria-labelledby="recent-searches-heading">
+		<h2 id="recent-searches-heading">Recent searches</h2>
+		{#if queries.length === 0}
+			<p>No recent searches yet. Searches you run in Your Library appear here.</p>
+		{:else}
+			<ul>
+				{#each queries as query (query)}
+					<li><a href={`/search?q=${encodeURIComponent(query)}`}>{query}</a></li>
+				{/each}
+			</ul>
+			<button type="button" onclick={clearAll}>Clear recent searches</button>
+		{/if}
+	</section>
 </main>

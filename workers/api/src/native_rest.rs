@@ -448,6 +448,12 @@ pub enum RouteDecision {
     Deny,
 }
 
+/// Match the route shape; the handler validates the target's identity.
+pub(crate) fn like_track_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/me/likes/track/")
+        .filter(|target| !target.is_empty() && !target.contains('/'))
+}
+
 /// The exhaustive default-deny map (ADR 0010). Methods match exact
 /// uppercase (`"get"` fails closed); paths match the listed collection
 /// roots plus subpaths. The HTTP layer passes the path without the query
@@ -491,7 +497,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Session-only reads (never reachable by bearer).
             if matches!(
                 path,
-                "/v1/me" | "/v1/indexers" | "/v1/me/likes" | "/v1/me/taste"
+                "/v1/me" | "/v1/indexers" | "/v1/me/likes" | "/v1/me/taste" | "/v1/me/history"
             ) {
                 return SessionOnly;
             }
@@ -578,6 +584,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/me/likes/import"
             {
                 return SessionOnly;
             }
@@ -610,7 +617,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" || path == "/v1/me/private-session" {
+            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
+                || like_track_target(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one
@@ -642,7 +651,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" {
+            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {

@@ -8,6 +8,13 @@ export function displayTitle(track: Pick<LibraryItem, 'id' | 'title'>): string {
 	return track.id;
 }
 
+export function shortTitle(title: string): string {
+	// Count code points, not UTF-16 units: slicing between a surrogate pair
+	// would announce a lone surrogate before the ellipsis.
+	const points = Array.from(title);
+	return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
+}
+
 export function displayArtist(track: Pick<LibraryItem, 'id' | 'artist'>): string | null {
 	const artist = track.artist;
 	return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
