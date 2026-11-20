@@ -363,7 +363,8 @@ def validate_recording_work_row(row):
 def label_type_values(values, line_number):
     context = f"label_type row {line_number}"
     row_id, name = values
-    validate_copy_name(name, context)
+    if len(validate_copy_name(name, context)) > 255:
+        raise ValueError(f"{context}: name exceeds 255 characters")
     return positive_key(row_id, context, "id"), name
 
 
@@ -384,7 +385,7 @@ def label_values(values, line_number):
 def release_label_values(values, line_number):
     context = f"release_label row {line_number}"
     row_id, release_id, label_id, catalog_number = values
-    positive_key(row_id, context, "id")
+    row_id = positive_key(row_id, context, "id")
     release_id = positive_key(release_id, context, "release")
     if label_id is not None:
         label_id = positive_key(label_id, context, "label")
@@ -392,7 +393,9 @@ def release_label_values(values, line_number):
         number_key = decode_copy_text(catalog_number or "")
     except ValueError as exc:
         raise ValueError(f"{context}: invalid COPY text in catalogue number") from exc
-    return release_id, label_id, number_key
+    if len(number_key) > 255:
+        raise ValueError(f"{context}: catalogue number exceeds 255 characters")
+    return row_id, release_id, label_id, number_key
 
 
 COPY_ENCODE = str.maketrans({raw.decode(): "\\" + escape.decode() for escape, raw in COPY_NAMED.items()})
@@ -478,7 +481,7 @@ def main() -> int:
                     CREATE TABLE work (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type_id INTEGER);
                     CREATE TABLE label_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE label (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, code INTEGER, type_id INTEGER);
-                    CREATE TABLE release_label (release INTEGER NOT NULL, label INTEGER, number_key TEXT NOT NULL);
+                    CREATE TABLE release_label (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, label INTEGER, number_key TEXT NOT NULL);
                 """)
 
                 counts = {}
@@ -507,7 +510,7 @@ def main() -> int:
                 load(
                     db, dump_dir / "release_label", FIELD_COUNTS["release_label"],
                     (RELEASE_LABEL_ID, RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO),
-                    "release_label", "release,label,number_key", release_label_values,
+                    "release_label", "id,release,label,number_key", release_label_values,
                 )
                 counts["artist_credit_name"] = load(
                     db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],

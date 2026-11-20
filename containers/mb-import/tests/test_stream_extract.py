@@ -421,6 +421,12 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
 
 class LabelProjectionTest(ProjectionTestCase):
     def test_labels_and_decoded_edges_match_streamed_gzip(self):
+        # 255 decoded characters, but more than 255 COPY bytes.
+        boundary = "é" * 254 + r"\t"
+        types = self.raw / "label_type"
+        types.write_bytes(types.read_bytes().replace(rb"Original\tProduction", boundary.encode()))
+        edges = self.raw / "release_label"
+        edges.write_bytes(edges.read_bytes() + f"11\t30\t71\t{boundary}\t\\N\n".encode())
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
         ts = "2025-02-03T04:05:06Z"
@@ -429,7 +435,7 @@ class LabelProjectionTest(ProjectionTestCase):
         first = "55555555-5555-4555-8555-555555555555"
         second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         expected_labels = (
-            f"{quartz}\tQuartz\\tRecords\t12345\tOriginal\\tProduction\t{ts}\n"
+            f"{quartz}\tQuartz\\tRecords\t12345\t{boundary}\t{ts}\n"
             f"{untyped}\tUntyped Label\t\\N\t\\N\t{ts}\n"
         )
         expected_edges = (
@@ -438,6 +444,7 @@ class LabelProjectionTest(ProjectionTestCase):
             f"{first}\t{quartz}\t QZ-1 \t{ts}\n"
             f"{first}\t{quartz}\t qz-1 \t{ts}\n"
             f"{first}\t{quartz}\t\\\\N\t{ts}\n"
+            f"{first}\t{quartz}\t{boundary}\t{ts}\n"
             f"{second}\t{quartz}\t QZ-1 \t{ts}\n"
         )
         self.assertEqual((self.curated / "mbdump-label.tsv").read_bytes(), expected_labels.encode())
@@ -482,6 +489,7 @@ class LabelProjectionTest(ProjectionTestCase):
         types = (self.raw / "label_type").read_bytes()
         edges = (self.raw / "release_label").read_bytes()
         releases = (self.raw / "release").read_bytes()
+        too_long = "é".encode() * 255 + rb"\t"
         for table, changed, error in (
             ("label_type", None, "missing input file:"),
             ("label", b"broken\n", "expected 16 fields"),
@@ -492,6 +500,9 @@ class LabelProjectionTest(ProjectionTestCase):
             ("label", labels.replace(b"62626262-6262-4626-8626-626262626262", b"bad"), "invalid label MBID"),
             ("label", labels.replace(b"Untyped Label", rb"\N"), "name must not be NULL"),
             ("label_type", types.replace(rb"Original\tProduction", rb"\000"), "invalid COPY text in name"),
+            ("label_type", types.replace(rb"Original\tProduction", too_long), "name exceeds 255 characters"),
+            ("release_label", edges + b"1\t31\t71\tDifferent number\t\\N\n", "UNIQUE constraint failed: release_label.id"),
+            ("release_label", edges + b"11\t30\t71\t" + too_long + b"\t\\N\n", "catalogue number exceeds 255 characters"),
             ("release_label", edges + b"11\t999\t\\N\t\\N\t\\N\n", "references missing release 999"),
             ("release_label", edges + b"11\t30\t999\t\\N\t\\N\n", "references missing label 999"),
             ("release_label", edges + b"11\t\\N\t71\t\\N\t\\N\n", "invalid release"),
