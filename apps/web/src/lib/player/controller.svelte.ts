@@ -4,7 +4,6 @@ import { currentTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
 type PlayerEffects = Omit<NaturalEndSelection, 'commit'> & {
-	clearRestartFeedback: () => void;
 	clearQueueAnnouncement: () => void;
 	syncMiniPlayerHint: (next: QueueState) => void;
 };
@@ -32,6 +31,7 @@ export function createPlayerController(
 	function resetAtAuthBoundary(): void {
 		media.clearShareSeek();
 		retireNativeHost();
+		media.clearSeekFeedback();
 	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
@@ -56,7 +56,7 @@ export function createPlayerController(
 			if (!isCurrent()) return false;
 		}
 		if (rawSourceChanged && (kind === 'replace' || kind === 'remove' || kind === 'select')) {
-			effects.clearRestartFeedback();
+			media.clearSeekFeedback();
 			if (!isCurrent()) return false;
 		}
 		if (trackChanged || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
