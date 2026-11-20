@@ -1,9 +1,12 @@
+import { createContext } from 'svelte';
 import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
 import { createMediaController, type MediaSelection } from './mediaController.js';
 import { currentTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
+
+export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController>>();
 
 type PlayerEffects = Pick<MediaSelection, 'flush'>;
 
