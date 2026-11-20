@@ -50,6 +50,7 @@ def connection_env(env):
     try:
         url = urlsplit(env.get("PLANETSCALE_OBSERVER_URL_STAGING", ""))
         query = parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
+        login = unquote(url.username or "", errors="strict")
         password = unquote(url.password or "", errors="strict")
         host = url.hostname or ""
         port = 5432 if url.port is None else url.port
@@ -57,7 +58,7 @@ def connection_env(env):
             url.scheme not in ("postgres", "postgresql")
             or not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", host)
             or not 1 <= port <= 65535
-            or unquote(url.username or "") != ROLE
+            or not re.fullmatch(rf"{ROLE}\.[a-z0-9-]+", login)
             or unquote(url.path) != f"/{DATABASE}"
             or not password
             or "\0" in password
@@ -75,7 +76,7 @@ def connection_env(env):
         "PGHOST": host,
         "PGPORT": str(port),
         "PGDATABASE": DATABASE,
-        "PGUSER": ROLE,
+        "PGUSER": login,
         "PGPASSWORD": password,
         "PGPASSFILE": "/dev/null",
         "PGSSLMODE": "verify-full",

@@ -16,7 +16,7 @@ require_preflight = OBSERVER["require_preflight"]
 UnsafeSample = OBSERVER["UnsafeSample"]
 
 SECRET = "PLANETSCALE_OBSERVER_URL_STAGING"
-URL = "postgresql://nntune_staging_observer:synthetic%21@db.example.test/postgres?sslmode=verify-full&sslrootcert=system"
+URL = "postgresql://nntune_staging_observer.examplebranch:synthetic%21@db.example.test/postgres?sslmode=verify-full&sslrootcert=system"
 ENV = {
     SECRET: URL,
     "PGSERVICE": "wrong",
@@ -57,6 +57,7 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(child["PGCONNECT_TIMEOUT"], "2")
         self.assertIn("statement_timeout=1000", child["PGOPTIONS"])
         self.assertIn("lock_timeout=1000", child["PGOPTIONS"])
+        self.assertEqual(child["PGUSER"], "nntune_staging_observer.examplebranch")
         self.assertEqual(child["PGPASSWORD"], "synthetic!")
 
     def test_invalid_config_never_connects(self):
