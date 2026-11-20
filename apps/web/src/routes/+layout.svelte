@@ -7,7 +7,7 @@
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
-	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { invalidateLibraryCache, resumeFavoritesPurges } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		notifyLocalAuthTransition,
@@ -315,6 +315,7 @@
 		const offPanel = onRightPanel((panel) => {
 			rightSnippet = panel;
 		});
+		resumeFavoritesPurges();
 		const offAuth = subscribeLocalAuthTransition(clearShellAtAuthBoundary);
 		const onStorage = (event: StorageEvent): void => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clearShellAtAuthBoundary();
@@ -351,24 +352,21 @@
 			try {
 				await client.logout();
 			} catch (error) {
-				if (!(error instanceof ApiError) || error.status !== 401) {
-					pushToast('Could not sign out. Please try again.');
-					return;
-				}
+				if (!(error instanceof ApiError) || error.status !== 401) throw error;
 				// A 401 means the session is already gone: cross the boundary
 				// exactly like a successful sign-out.
 			}
 		} catch {
 			pushToast('Could not sign out. Please try again.');
-			return;
-		} finally {
 			signingOut = false;
+			return;
 		}
 		clearMiniPlayerHint();
 		clearToasts();
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		await purge;
 		window.location.href = '/login';
 	}
 

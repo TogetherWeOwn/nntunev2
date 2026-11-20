@@ -65,13 +65,14 @@
 		try {
 			const result = await client.finishMagicLink(token);
 			if (!mounted) return;
-			invalidateLibraryCache();
+			const purge = invalidateLibraryCache();
 			// Show which account this is on the next screen, before any
 			// provider credential is typed.
 			if (typeof result.email === 'string' && result.email.length > 0) {
 				stashSignedInEmail(result.email);
 			}
-			window.location.href = '/library';
+			await purge;
+			if (mounted) window.location.href = '/library';
 		} catch (error) {
 			if (!mounted) return;
 			if (error instanceof ApiError && error.paywall) {
