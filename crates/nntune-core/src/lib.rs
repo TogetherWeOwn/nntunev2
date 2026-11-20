@@ -57,6 +57,8 @@ pub mod digest_readback;
 #[cfg(test)]
 mod digest_test_fixture;
 pub mod digest_verifier;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_preamble;
 pub mod media_envelope;
 pub mod media_layout;
 pub mod origin_sealer;
