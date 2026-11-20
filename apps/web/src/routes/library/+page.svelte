@@ -814,10 +814,18 @@
 			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
 				const baseline = new Set(favoriteBaseline);
 				const visit = new Set(optimistic);
-				favorites = [...new Set([
-					...committed.filter((id) => !baseline.has(id) || visit.has(id)),
-					...optimistic.filter((id) => !baseline.has(id))
-				])];
+				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
+				const visible = new Set(durable);
+				// Keep visit-only IDs before their next surviving durable neighbor.
+				const beforeNeighbor = new Map<string, string[]>();
+				let pending: string[] = [];
+				for (const id of optimistic) {
+					if (visible.has(id)) {
+						if (pending.length) beforeNeighbor.set(id, pending);
+						pending = [];
+					} else if (!baseline.has(id)) pending.push(id);
+				}
+				favorites = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
 			}
 			favoriteBaseline = committed;
 		});
@@ -886,7 +894,8 @@
 		const item = button instanceof HTMLElement ? button.closest('[data-testid="favorite-item"]') : null;
 		function recoverFocus(): void {
 			const active = document.activeElement;
-			if (!(active instanceof HTMLButtonElement) || !item?.contains(active) || !active.matches('.nt-favorite-move')) return;
+			if (!(active instanceof HTMLButtonElement) || !item?.contains(active)) return;
+			if (active !== button && !active.matches('.nt-favorite-move')) return;
 			void tick().then(() => {
 				// Only recover focus lost to this render, not focus the user moved elsewhere.
 				if (document.activeElement !== document.body && document.activeElement !== active) return;
