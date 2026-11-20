@@ -79,6 +79,7 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("artist_alias", missing)
         self.assertIn("work", missing)
         self.assertIn("work_type", missing)
+        self.assertIn("l_recording_work", missing)
 
 
 class DuplicateMemberTest(unittest.TestCase):
@@ -225,13 +226,13 @@ class WorkProjectionTest(ProjectionTestCase):
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         members["mbdump/work"] = b"".join(reversed(members["mbdump/work"].splitlines(keepends=True)))
-        for table in ("work_alias", "l_recording_work"):
+        for table in ("work_alias", "l_artist_work"):
             members[f"mbdump/{table}"] = b"not admitted\n"
         packed = self.tmp / "packed"
         extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
                                  input=tar_bytes(members), capture_output=True, check=False)
         self.assertEqual(extract.returncode, 0, extract.stderr)
-        for table in ("work_alias", "l_recording_work"):
+        for table in ("work_alias", "l_artist_work"):
             self.assertFalse((packed / f"{table}.gz").exists())
         gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
         self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
@@ -282,6 +283,109 @@ class WorkProjectionTest(ProjectionTestCase):
                 mode = {} if error.startswith("already has") else {"DUMP_TS": "2025-02-04T04:05:06Z"}
                 refused = self.run_etl(self.raw, **mode)
                 path.write_bytes(work if table == "work" else lookup)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
+class RecordingWorkProjectionTest(ProjectionTestCase):
+    output = "mbdump-recording_work.tsv"
+
+    def setUp(self):
+        super().setUp()
+        self.edges = self.raw / "l_recording_work"
+        timestamp = b"2025-01-01 00:00:00+00"
+        with (self.raw / "link_type").open("ab") as types:
+            types.write(b"513\t\\N\t0\taaaaaaaa-0006-4006-8006-000000000006\trecording\twork\tperformance"
+                        b"\tPerformance\tPerformance\tPerformance\tPerformance\t" + timestamp + b"\tf\tt\t0\t0\n")
+            types.write(b"514\t\\N\t0\taaaaaaaa-0007-4007-8007-000000000007\trecording\twork\tmedley"
+                        b"\tMedley\tMedley\tMedley\tMedley\t" + timestamp + b"\tf\tt\t0\t0\n")
+        with (self.raw / "link").open("ab") as links:
+            for prefix in (b"216\t513", b"217\t513", b"218\t514"):
+                links.write(prefix + b"\t\\N" * 6 + b"\t0\t" + timestamp + b"\tf\n")
+        self.edges.write_bytes(b"".join(
+            prefix + b"\t0\t" + timestamp + b"\t0\t\\N\t\\N\n" for prefix in (
+                b"401\t216\t51\t80", b"402\t217\t50\t80", b"403\t218\t50\t80",
+                b"404\t216\t50\t80", b"405\t216\t50\t81",
+            )
+        ))
+        # Referencing 216 above must not admit it to either existing slice.
+        for table, fields in (("l_recording_url", b"50\t999"), ("l_recording_recording", b"50\t999")):
+            with (self.raw / table).open("ab") as relations:
+                relations.write(b"499\t216\t" + fields + b"\t0\t" + timestamp + b"\t0\t\\N\t\\N\n")
+
+    def run_streamed_etl(self):
+        packed = self.tmp / "packed"
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertTrue((packed / "l_recording_work.gz").is_file())
+        result = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((packed / "l_recording_work.gz").exists())
+        return gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes())
+
+    def test_directed_typed_triples_are_deduplicated_and_match_streamed_gzip(self):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        expected = (
+            b"88888888-8888-4888-8888-888888888888\t10101010-1010-4010-8010-101010101010\tperformance\t2025-02-03T04:05:06Z\n"
+            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tmedley\t2025-02-03T04:05:06Z\n"
+            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
+            b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
+        )
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+        for name in ("mbdump-recording_url.tsv", "mbdump-recording_music_video.tsv"):
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
+        self.edges.write_bytes(b"".join(reversed(self.edges.read_bytes().splitlines(keepends=True))))
+        self.assertEqual(self.run_streamed_etl(), expected)
+
+    def test_empty_table_emits_empty_sidecar_in_both_modes(self):
+        self.edges.write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+        self.assertEqual(self.run_streamed_etl(), b"")
+
+    def test_invalid_references_and_fields_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        edges = self.edges.read_bytes()
+        links = (self.raw / "link").read_bytes()
+        types = (self.raw / "link_type").read_bytes()
+        recordings = (self.raw / "recording").read_bytes()
+        for table, changed, error in (
+            (self.edges.name, None, "missing input file:"),
+            (self.edges.name, b"broken\n", "expected 9 fields"),
+            (self.edges.name, edges.replace(b"401\t216", b"401\t999"), "references missing link 999"),
+            (self.edges.name, edges.replace(b"401\t216\t51", b"401\t216\t999"), "references missing recording 999"),
+            (self.edges.name, edges.replace(b"401\t216\t51\t80", b"401\t216\t51\t999"), "references missing work 999"),
+            (self.edges.name, edges.replace(b"401\t216", b"401\t\\N"), "invalid link"),
+            (self.edges.name, edges.replace(b"401\t216\t51", b"401\t216\t+51"), "invalid recording"),
+            (self.edges.name, edges.replace(b"401\t216\t51\t80", b"401\t216\t51\t2147483648"), "invalid work"),
+            ("link", links.replace(b"216\t513", b"216\t999"), "references missing link_type 999"),
+            ("link", links.replace(b"216\t513", b"216\t+513"), "invalid link_type"),
+            ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: recording_work_link.id"),
+            ("link_type", types.replace(b"\tperformance\t", b"\t\t"), "name must not be empty"),
+            ("link_type", types.replace(b"\tperformance\t", b"\t\\q\t"), "invalid COPY text in name"),
+            ("recording", recordings.replace(b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", b"bad"), "invalid recording MBID"),
+            (self.edges.name, b"", "already has different curated output"),
+        ):
+            with self.subTest(table=table, error=error):
+                path = self.raw / table
+                original = path.read_bytes()
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                mode = {} if error.startswith("already has") else {"DUMP_TS": "2025-02-04T04:05:06Z"}
+                refused = self.run_etl(self.raw, **mode)
+                path.write_bytes(original)
                 self.assertEqual(refused.returncode, 1, refused.stdout)
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)
