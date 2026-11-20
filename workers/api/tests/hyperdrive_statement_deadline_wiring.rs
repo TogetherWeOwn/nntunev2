@@ -318,6 +318,16 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
                 format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
                 "{name} must delegate its entire operation to the bounded helper"
             );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
+            );
         } else {
             assert_bounded(piece, name);
         }
@@ -397,6 +407,21 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
     assert!(
         !source.contains("release_rate_limit_slot"),
         "the compensating helper is deleted, not just unused"
+    );
+}
+
+#[test]
+fn account_deleting_probe_runs_unnamed_with_a_text_owner() {
+    let source = production();
+    let probe = function_body(&source, "asyncfnaccount_deleting(");
+    let queries = calls(probe, ".query_typed_opt");
+    assert_eq!(queries.len(), 1, "the pooled probe must run unnamed");
+    assert_eq!(
+        queries[0].args.as_slice(),
+        [
+            "crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL",
+            "&[(&user_id,Type::TEXT)]",
+        ]
     );
 }
 

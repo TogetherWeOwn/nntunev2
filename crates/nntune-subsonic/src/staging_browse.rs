@@ -4,8 +4,11 @@ use crate::envelope::{charged_error_document, charged_ok_document, code};
 use crate::library::{Album, Artist, Song};
 use crate::value::Value;
 
+mod album_list;
 mod search;
 
+#[cfg(any(test, feature = "ledger-wasm-test"))]
+pub use album_list::album_list_boundaries;
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 pub use search::{search_boundaries, search_matches_dispatch};
 
@@ -40,6 +43,8 @@ impl<'a> MemberBrowse<'a> {
                 | "getAlbum"
                 | "getSong"
                 | "getMusicDirectory"
+                | "getAlbumList"
+                | "getAlbumList2"
                 | "search2"
                 | "search3"
         )
@@ -57,6 +62,7 @@ impl<'a> MemberBrowse<'a> {
         }
         let doc = match name {
             "getArtists" | "getIndexes" => self.index_document(budget, name)?,
+            "getAlbumList" | "getAlbumList2" => self.album_list_document(budget, name, params)?,
             "search2" | "search3" => self.search_document(budget, name, params)?,
             _ => {
                 let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {

@@ -439,7 +439,7 @@ fn allowed_cors_origin<'a>(req_origin: Option<&'a str>, cfg_origin: &str) -> Opt
 /// No match (or no `Origin`) yields no headers at all — never a reflection,
 /// never `*`. A 204 is always the known-path OPTIONS preflight, which
 /// additionally needs the method/header grant.
-fn cors_headers(
+pub(crate) fn cors_headers(
     status: u16,
     req_origin: Option<&str>,
     cfg_origin: &str,
@@ -751,6 +751,9 @@ impl MirrorBinding {
 #[allow(dead_code)] // Unmounted; the bounded mirror consumer follows separately.
 #[path = "subsonic_membership.rs"]
 pub(crate) mod subsonic_membership;
+#[allow(dead_code)] // Unmounted until the bounded adapter is wired.
+#[path = "subsonic_mirror.rs"]
+pub(crate) mod subsonic_mirror;
 #[path = "subsonic_pg.rs"]
 mod subsonic_pg;
 pub use subsonic_pg::{load_staging_credential, mutate_staging_credential};
@@ -944,7 +947,7 @@ where
     }
 }
 
-/// Exercise the unwired PgStore method with a disposable connection only.
+/// Exercise the production Store acquisition with a disposable connection.
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn private_aware_lease_for_postgres_test(
@@ -956,7 +959,7 @@ pub async fn private_aware_lease_for_postgres_test(
     now: u64,
     expires_at: u64,
     takeover: bool,
-) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
         env: None,
         trace_id: "postgres-private-lease-test".into(),
@@ -965,7 +968,7 @@ pub async fn private_aware_lease_for_postgres_test(
         test_connect: None,
         test_mirror: None,
     }
-    .acquire_private_aware_lease(
+    .acquire_playback_lease(
         user_id, session_id, track_id, play_id, now, expires_at, takeover,
     )
     .await
@@ -1051,9 +1054,40 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
-    /// Unwired NEW-play acquisition. The account lock serializes privacy toggles,
+    // Native acceptance injects connection acquisition only. This entry is not
+    // wired to Store; its client stays inside the budgeted operation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
+    async fn store_reconcile_owned(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+        crate::billing_store_classification::validate_history_target(&outcome)
+            .map_err(|_| failed())?;
+        billing_budget::BillingBudget::run(|budget| async move {
+            let mut client = budget.connect(|| self.connect()).await?;
+            budget
+                .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
+                .await?;
+            budget
+                .work(|| {
+                    crate::billing_transaction_sql::apply_reconcile_transaction(
+                        &mut client,
+                        user_id,
+                        outcome,
+                    )
+                })
+                .await
+        })
+        .await
+        .map_err(|_| failed())
+    }
+
+    /// NEW-play acquisition. The account lock serializes privacy toggles,
     /// including when the session has no privacy row yet.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_private_aware_lease(
         &self,
         user_id: &str,
@@ -1063,7 +1097,7 @@ impl PgStore {
         now: u64,
         expires_at: u64,
         takeover: bool,
-    ) -> Result<(crate::playback::LeaseAcquire, bool), StoreError> {
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
             async {
                 let key = format!("play:{user_id}:{track_id}:{play_id}");
@@ -1137,11 +1171,10 @@ impl PgStore {
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
                     tx.commit().await.map_err(|_| StoreError)?;
-                    Ok((result, private))
                 } else {
                     tx.rollback().await.map_err(|_| StoreError)?;
-                    Ok((result, false))
                 }
+                Ok(result)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4061,15 +4094,8 @@ impl Store for PgStore {
         expires_at: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-        Self::bounded(
-            async {
-                let client = self.connect().await?;
-                acquire_playback_lease_on(
-                    &client, user_id, session_id, track_id, play_id, now, expires_at, takeover,
-                )
-                .await
-            },
-            TOTAL_TIMEOUT_MS,
+        self.acquire_private_aware_lease(
+            user_id, session_id, track_id, play_id, now, expires_at, takeover,
         )
         .await
     }
@@ -5120,10 +5146,11 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Keep the session-path probe unnamed through Hyperdrive.
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
-                        &[&user_id],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -7353,6 +7380,10 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
 }
 
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[path = "billing_store_postgres_test.rs"]
+mod billing_store_postgres_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7853,6 +7884,16 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "unknown");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes?user_id=alice"),
+            "/v1/me/likes"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/taste?user_id=bob"),
+            "/v1/me/taste"
+        );
+        assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

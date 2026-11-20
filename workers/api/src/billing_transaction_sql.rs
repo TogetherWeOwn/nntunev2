@@ -54,16 +54,14 @@ pub(crate) enum ReconcileProbe {
     ServerWatchdog,
 }
 
-#[cfg(target_arch = "wasm32")]
-#[allow(dead_code)] // Not reachable from a release reconciliation caller.
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
     user_id: String,
     outcome: crate::billing_reconcile::ReconcileOutcome,
-    #[cfg(feature = "billing-owned-wasm-test")] probe: ReconcileProbe,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
-        classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget,
+        classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
     use tokio_postgres::types::Type;
@@ -111,6 +109,12 @@ pub(crate) async fn apply_reconcile_transaction(
         if outcome.explicit_stale {
             classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| StoreError)?;
         } else {
+            // The table exclusion keeps this observation valid through DML. An
+            // absence fold cannot update a row that appeared before the lock,
+            // even if the paid-end predicate would otherwise suppress the write.
+            if matches!(&target, Target::Owned { .. }) && outcome.read_plan.is_none() {
+                return Err(StoreError);
+            }
             let written = transaction
                 .query_typed(
                     crate::billing_transaction_sql::WRITE_SUBSCRIPTION,
@@ -166,7 +170,7 @@ pub(crate) async fn apply_reconcile_transaction(
                 .map_err(|_| StoreError)?;
         }
         // The probes run only after all billing writes and before COMMIT.
-        #[cfg(feature = "billing-owned-wasm-test")]
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         if probe != ReconcileProbe::None {
             let written = transaction.query_one(
                 "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],

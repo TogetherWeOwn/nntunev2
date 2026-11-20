@@ -129,14 +129,22 @@ impl ProductionStore {
     /// Resolve a legacy recording ID only when its raw member occurrence is
     /// unique and has supported positions. This does not authorize playback.
     pub fn resolve_song(&self, id: &str) -> Option<Song> {
-        let mut tracks = self.tracks.iter().filter(|t| t.recording_mbid == id);
+        Self::resolve_song_occurrence(&self.tracks, &self.songs, id).cloned()
+    }
+
+    pub(crate) fn resolve_song_occurrence<'a>(
+        tracks: &[TrackDbRow],
+        songs: &'a [Song],
+        id: &str,
+    ) -> Option<&'a Song> {
+        let mut tracks = tracks.iter().filter(|t| t.recording_mbid == id);
         let track = tracks.next()?;
         if tracks.next().is_some() {
             return None;
         }
         let disc = track.medium_no.filter(|n| *n > 0)?;
         let position = track.track_no.filter(|n| *n > 0)?;
-        let mut songs = self.songs.iter().filter(|song| song.id == id);
+        let mut songs = songs.iter().filter(|song| song.id == id);
         let song = songs.next()?;
         if songs.next().is_some()
             || song.album_id != track.release_mbid
@@ -145,7 +153,7 @@ impl ProductionStore {
         {
             return None;
         }
-        Some(song.clone())
+        Some(song)
     }
 }
 

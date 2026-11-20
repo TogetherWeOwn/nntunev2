@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import type { QueueCommitKind, QueuedPlaySource } from '#lib/player/queueController.js';
+	import type { QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
-	import { createPlayerController } from '#lib/player/controller.js';
+	import { createPlayerController } from '#lib/player/controller.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -59,7 +59,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
-	import NativeAudio from '#lib/player/NativeAudio.svelte';
+	import NativePlayer from '#lib/player/NativePlayer.svelte';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
@@ -146,12 +146,20 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	const player = createPlayerController(createQueue([]), {
-		commit: replaceQueue,
 		flush: () => tick(),
 		clearShareFeedback,
 		clearJumpFeedback: () => { jumpStatus = ''; },
-		announce: (track) => announceEnd(track)
+		announce: (track) => announceEnd(track),
+		clearRestartFeedback: () => {
+			restartCanSeek = false;
+			restartStatus = '';
+			jumpStatus = '';
+		},
+		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
+		syncMiniPlayerHint
 	});
+	const commitQueue = player.commitQueue;
+	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
 	const media = player.media;
 	const queue = $derived($queueController);
@@ -246,8 +254,6 @@
 	 */
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
-	// A source round trip before Svelte flushes must not revive a retired node.
-	let mediaRevision = $state(0);
 
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
 		return media.attach(audio, {
@@ -636,56 +642,6 @@
 			.join('\u0001');
 	}
 
-	/** Reset restart and jump feedback when an edit changes the current source. */
-	function resetRestartOnSourceChange(
-		before: Track | null | undefined,
-		after: Track | null | undefined
-	): void {
-		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
-			restartCanSeek = false;
-			restartStatus = '';
-			jumpStatus = '';
-		}
-	}
-
-	function commitQueue(
-		next: QueueState,
-		kind: QueueCommitKind,
-		library?: Pick<ReturnType<typeof queueController.prepareLibrary>, 'sources'> & { isCurrent: () => boolean }
-	): boolean {
-		if (library && !library.isCurrent()) return false;
-		const receipt = queueController.begin(next, kind, !!library);
-		if (library && next === queueController.snapshot) {
-			queueController.publish(next, receipt, library.sources);
-			return true;
-		}
-		const before = queueCurrentTrack(queueController.snapshot);
-		const after = queueCurrentTrack(next);
-		if ((kind === 'replace' || kind === 'select') &&
-			(before?.id !== after?.id || before?.streamUrl !== after?.streamUrl)) {
-			if (kind === 'replace') clearShareFeedback();
-			media.clearShareSeek();
-			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		}
-		if (kind === 'replace' || kind === 'remove' || kind === 'select') {
-			resetRestartOnSourceChange(before, after);
-		}
-		if (before?.id !== after?.id || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
-			mediaRevision += 1;
-			media.reset();
-			if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		}
-		if (kind === 'replace') queueAnnouncement = '';
-		queueController.publish(next, receipt, library?.sources);
-		if (!queueController.isCurrentOperation(receipt) || (library && !library.isCurrent())) return false;
-		syncMiniPlayerHint(next);
-		return queueController.isCurrentOperation(receipt);
-	}
-
-	function replaceQueue(next: QueueState): boolean {
-		return commitQueue(next, 'replace');
-	}
-
 	/** Mirror the current selection into the metadata-only mobile hint. */
 	function syncMiniPlayerHint(next: QueueState): void {
 		const current = queueCurrentTrack(next);
@@ -709,9 +665,7 @@
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
-		media.clearShareSeek();
-		mediaRevision += 1;
-		media.reset();
+		player.resetAtAuthBoundary();
 		clearShareFeedback();
 		queueShare.reset();
 		restartCanSeek = false;
@@ -845,16 +799,16 @@
 		if (!shareAlive || !current) return;
 		const source = resolveStreamUrl(current);
 		if (!source) return;
-		const revision = mediaRevision;
+		const revision = player.mediaRevision;
 		const queueRevision = queueController.revision;
 		const jumpVersion = jumpStatusVersion;
 		media.restart(source, current.title?.trim() ? current.title : current.id, {
 			trackId: current.id,
-			isCurrent: () => shareAlive && revision === mediaRevision && queueController.isCurrent(queueRevision) &&
+			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision) &&
 				jumpVersion === jumpStatusVersion,
 			available: restartIsAvailable,
 			assigned: () => {
-				if (shareAlive && revision === mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
+				if (shareAlive && revision === player.mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
 			},
 			publish: (message, available) => {
 				if (!available) restartCanSeek = false;
@@ -875,13 +829,13 @@
 		if (!shareAlive) return;
 		const source = resolveStreamUrl(current);
 		const queueRevision = queueController.revision;
-		const revision = mediaRevision;
+		const revision = player.mediaRevision;
 		const jumpVersion = jumpStatusVersion;
 		media.jump(source, direction, {
 			trackId: current?.id,
-			isCurrent: () => shareAlive && queueController.isCurrent(queueRevision),
+			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision),
 			assigned: () => {
-				if (!shareAlive || revision !== mediaRevision || jumpVersion !== jumpStatusVersion) return;
+				if (!shareAlive || revision !== player.mediaRevision || jumpVersion !== jumpStatusVersion) return;
 				jumpStatus = '';
 			},
 			publish: (outcome) => {
@@ -2187,52 +2141,11 @@
 		</div>
 	{/if}
 	{#if streamUrl}
-		<section aria-label="Player">
-			<h2>Now playing</h2>
-			{#if currentTrack}
-				<p class="nt-player-identity" data-testid="library-now-playing">
-					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
-				</p>
-			{/if}
-			<div class="nt-library-player-controls">
-				<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
-				<button
-					class="nt-button nt-library-restart"
-					type="button"
-					data-testid="library-restart"
-					disabled={!restartCanSeek}
-					aria-describedby={restartCanSeek ? undefined : 'library-restart-hint'}
-					onclick={restartCurrentTrack}
-				>
-					Restart current track
-				</button>
-			</div>
-			{#if !restartCanSeek}
-				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
-			{/if}
-			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
-			<div class="nt-player-jump">
-				<button
-					class="nt-button nt-button--ghost"
-					type="button"
-					data-testid="player-seek-back"
-					aria-label="Back 10 seconds"
-					onclick={() => jumpRelative('back')}
-				>
-					Back 10 s
-				</button>
-				<button
-					class="nt-button nt-button--ghost"
-					type="button"
-					data-testid="player-seek-forward"
-					aria-label="Forward 10 seconds"
-					onclick={() => jumpRelative('forward')}
-				>
-					Forward 10 s
-				</button>
-			</div>
-			<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
-		</section>
+		<NativePlayer
+			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
+			{restartCanSeek} {restartStatus} {restartStatusVersion} {restartCurrentTrack}
+			{jumpStatus} {jumpStatusVersion} {jumpRelative}
+		/>
 	{/if}
 </main>
 
@@ -2429,35 +2342,6 @@
 		flex-basis: 100%;
 		margin: 0;
 		color: var(--nt-fg-muted);
-	}
-	.nt-player-identity {
-		overflow-wrap: anywhere;
-	}
-	.nt-library-player-controls {
-		display: flex;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: var(--nt-space-2) var(--nt-space-3);
-	}
-	.nt-library-restart {
-		flex: 0 0 auto;
-		min-height: 2.75rem;
-		border: 0;
-		cursor: pointer;
-		font: inherit;
-	}
-	.nt-library-restart:disabled {
-		cursor: default;
-		opacity: 0.5;
-	}
-	.nt-player-jump {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--nt-space-2) var(--nt-space-3);
-		margin-block: var(--nt-space-2);
-	}
-	.nt-player-jump button {
-		min-height: 2.75rem;
 	}
 	.nt-library-order {
 		display: flex;

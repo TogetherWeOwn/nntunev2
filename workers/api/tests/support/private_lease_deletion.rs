@@ -53,7 +53,7 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
             )
             .await
             .map_err(|_| "seed failed")?
-                != (Acquired { epoch: 1 }, true)
+                != (Acquired { epoch: 1 })
             {
                 return Err("incorrect seed".into());
             }
@@ -102,7 +102,7 @@ async fn acquisition_is_account_scoped_and_loses_to_deletion() {
         )
         .await
         .map_err(|_| "independent acquisition failed")?;
-        if unrelated != (Acquired { epoch: 2 }, true) {
+        if unrelated != (Acquired { epoch: 2 }) {
             return Err(format!("incorrect independent acquisition: {unrelated:?}"));
         }
         holder

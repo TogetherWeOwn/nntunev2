@@ -1,4 +1,4 @@
-//! The disabled route stays disabled; drive the prepared PgStore transaction.
+//! Drive COMMIT faults through the production Store acquisition.
 use super::commit_ack_fault::{CommitAckFault, CommitOutcome};
 use super::disposable_accounts::{self, Accounts};
 use nntune_api::playback::LeaseAcquire::Acquired;
@@ -39,7 +39,7 @@ async fn unacknowledged_acquisition_returns_error_but_commits_private_replacemen
         )
         .await
         .map_err(|_| "could not seed incumbent")?;
-        if initial != (Acquired { epoch: 1 }, false) {
+        if initial != (Acquired { epoch: 1 }) {
             return Err("wrong incumbent".into());
         }
         let result = acquire(

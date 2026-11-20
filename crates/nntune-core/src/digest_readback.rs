@@ -7,6 +7,7 @@
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
 use crate::media::FileKey;
+use crate::media_envelope::{enrolled_scheme2_key, EnvelopeContext};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, future::Future, ops::AsyncFnMut};
 
@@ -16,6 +17,24 @@ pub enum ReadbackError {
     Incomplete,
     Failed,
     PlaintextDigest,
+    MediaValidation,
+}
+
+// Private to this module: a decoder may inspect authenticated frames, but
+// must not expose plaintext or commit any result while verification is pending.
+trait MediaValidation {
+    fn push(&mut self, plaintext: &[u8]) -> Result<(), ()>;
+    fn finish(self) -> Result<(), ()>;
+}
+
+impl MediaValidation for () {
+    fn push(&mut self, _: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 /// Authenticates each frame before hashing plaintext and releases no plaintext.
@@ -47,6 +66,17 @@ impl<'a> DigestReadback<'a> {
         sealed: Vec<u8>,
         wire_header: Option<&[u8]>,
     ) -> Result<(), ReadbackError> {
+        self.push_validating(index, page, sealed, wire_header, &mut ())
+    }
+
+    fn push_validating(
+        &mut self,
+        index: u32,
+        page: &[u8],
+        sealed: Vec<u8>,
+        wire_header: Option<&[u8]>,
+        validation: &mut impl MediaValidation,
+    ) -> Result<(), ReadbackError> {
         let mut hash = self.hash.take().ok_or(ReadbackError::Failed)?;
         if (index == 0) != wire_header.is_some() {
             return Err(ReadbackError::Frame(RangeError::Header));
@@ -55,7 +85,11 @@ impl<'a> DigestReadback<'a> {
             .range
             .open_next(index, page, sealed, wire_header)
             .map_err(ReadbackError::Frame)?;
-        hash.update(part.as_slice());
+        let plaintext = part.as_slice();
+        hash.update(plaintext);
+        validation
+            .push(plaintext)
+            .map_err(|()| ReadbackError::MediaValidation)?;
         self.hash = Some(hash);
         Ok(())
     }
@@ -169,7 +203,59 @@ pub async fn verify_pinned_readback<'a, B: ReadbackBody>(
     identities: &[[u8; 16]; 5],
     media: ReadbackPin<'a>,
     pages: &[(u32, ReadbackPin<'a>)],
+    open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
+) -> Result<(), BodyReadbackError> {
+    verify_readback(manifest, key, identities, media, pages, open, ()).await
+}
+
+struct EnrolledEnvelope<'a> {
+    authorized_root: &'a [u8; 32],
+    context: &'a EnvelopeContext,
+    trusted_record: &'a [u8; 230],
+    retained_record: &'a [u8],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnrolledReadbackError {
+    Envelope,
+    Body(BodyReadbackError),
+}
+
+/// The inputs must come from one independently authorized custody and locator
+/// snapshot. No caller-supplied file key or fallback is accepted on this path.
+/// Success authorizes neither publication nor reuse.
+#[allow(dead_code)] // Not mounted; a concrete validator and trusted snapshot are still required.
+async fn verify_enrolled_readback<'a, B: ReadbackBody>(
+    manifest: &OriginManifest,
+    envelope: EnrolledEnvelope<'_>,
+    media: ReadbackPin<'a>,
+    pages: &[(u32, ReadbackPin<'a>)],
+    open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
+    validation: impl MediaValidation,
+) -> Result<(), EnrolledReadbackError> {
+    let key = enrolled_scheme2_key(
+        envelope.authorized_root,
+        envelope.context,
+        envelope.trusted_record,
+        envelope.retained_record,
+        manifest,
+    )
+    .map_err(|_| EnrolledReadbackError::Envelope)?;
+    let [_, environment, library, object, generation, provider] = envelope.context.identities;
+    let identities = [environment, library, object, generation, provider];
+    verify_readback(manifest, &key, &identities, media, pages, open, validation)
+        .await
+        .map_err(EnrolledReadbackError::Body)
+}
+
+async fn verify_readback<'a, B: ReadbackBody>(
+    manifest: &OriginManifest,
+    key: &FileKey,
+    identities: &[[u8; 16]; 5],
+    media: ReadbackPin<'a>,
+    pages: &[(u32, ReadbackPin<'a>)],
     mut open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
+    mut validation: impl MediaValidation,
 ) -> Result<(), BodyReadbackError> {
     let geometry = manifest.geometry();
     let indices = pages.iter().map(|&(index, _)| index);
@@ -210,17 +296,21 @@ pub async fn verify_pinned_readback<'a, B: ReadbackBody>(
             let mut sealed = vec![0; len as usize];
             read_exact(&mut media, &mut sealed).await?;
             readback
-                .push(
+                .push_validating(
                     chunk,
                     &bytes,
                     sealed,
                     (chunk == 0).then_some(header.as_slice()),
+                    &mut validation,
                 )
                 .map_err(BodyReadbackError::Content)?;
         }
     }
     require_eof(&mut media).await?;
-    readback.finish().map_err(BodyReadbackError::Content)
+    readback.finish().map_err(BodyReadbackError::Content)?;
+    validation
+        .finish()
+        .map_err(|()| BodyReadbackError::Content(ReadbackError::MediaValidation))
 }
 
 #[cfg(test)]
@@ -252,7 +342,16 @@ mod tests {
     }
 
     async fn bodies(f: &Fixture, media: Body<'_>, page: Body<'_>) -> Result<(), BodyReadbackError> {
-        verify_pinned_readback(
+        validate_bodies(f, media, page, ()).await
+    }
+
+    async fn validate_bodies(
+        f: &Fixture,
+        media: Body<'_>,
+        page: Body<'_>,
+        validation: impl MediaValidation,
+    ) -> Result<(), BodyReadbackError> {
+        verify_readback(
             &f.manifest,
             &f.key,
             &[id(1); 5],
@@ -276,8 +375,175 @@ mod tests {
                     body: Body(body.0, body.1),
                 })
             },
+            validation,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_requires_the_exact_authenticated_envelope() {
+        struct ExactMedia<'a>(&'a [u8]);
+
+        impl MediaValidation for ExactMedia<'_> {
+            fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
+                self.0 = self.0.strip_prefix(plaintext).ok_or(())?;
+                Ok(())
+            }
+
+            fn finish(self) -> Result<(), ()> {
+                self.0.is_empty().then_some(()).ok_or(())
+            }
+        }
+
+        let plaintext = b"synthetic media";
+        let f = fixture(plaintext);
+        let mut media_bytes = f.header.to_vec();
+        media_bytes.extend_from_slice(&f.chunks[0]);
+        let context = EnvelopeContext {
+            identities: [id(9), id(1), id(1), id(1), id(1), id(1)],
+            plaintext_len: plaintext.len() as u64,
+            header: f.header,
+        };
+        let root = [2; 32];
+        let record =
+            crate::media_envelope::wrap_scheme2(&root, &context, f.key.expose_secret()).unwrap();
+        let mut altered = record;
+        altered[229] ^= 1;
+        for (root, trusted, retained, accepted) in [
+            (&root, &record, &record, true),
+            (&root, &record, &altered, false),
+            (&root, &altered, &altered, false),
+            (&[3; 32], &record, &record, false),
+        ] {
+            let mut opens = 0;
+            let result = verify_enrolled_readback(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: root,
+                    context: &context,
+                    trusted_record: trusted,
+                    retained_record: retained,
+                },
+                pin("media"),
+                &[(0, pin("page"))],
+                async |request: ReadbackPin<'_>| {
+                    let bytes = match request.object_key {
+                        "media" => media_bytes.as_slice(),
+                        "page" => f.pages[0].as_slice(),
+                        _ => panic!("unexpected synthetic request"),
+                    };
+                    opens += 1;
+                    Ok(ReadbackResponse {
+                        configuration: request.configuration,
+                        object_key: request.object_key.into(),
+                        version: Some("original".into()),
+                        status: 200,
+                        content_length: Some(bytes.len() as u64),
+                        has_content_range: false,
+                        has_content_encoding: false,
+                        body: Body(bytes, false),
+                    })
+                },
+                ExactMedia(plaintext),
+            )
+            .await;
+            if accepted {
+                assert_eq!(result, Ok(()));
+                assert_eq!(opens, 2);
+            } else {
+                assert_eq!(result, Err(EnrolledReadbackError::Envelope));
+                assert_eq!(opens, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_observes_only_authenticated_frames_and_finishes_after_eof() {
+        struct Probe<'a> {
+            remaining: &'a [u8],
+            chunks: usize,
+            finished: bool,
+            refuse_chunk: bool,
+            refuse_finish: bool,
+        }
+
+        impl MediaValidation for &mut Probe<'_> {
+            fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
+                let (expected, rest) = self.remaining.split_at(plaintext.len());
+                assert_eq!(plaintext, expected);
+                self.remaining = rest;
+                self.chunks += 1;
+                if self.refuse_chunk {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn finish(self) -> Result<(), ()> {
+                assert!(self.remaining.is_empty());
+                self.finished = true;
+                if self.refuse_finish {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut plaintext = vec![5; 65_537];
+        plaintext[65_536] = 8;
+        let f = fixture(&plaintext);
+        let mut media = f.header.to_vec();
+        media.extend(f.chunks.iter().flatten().copied());
+        let mut corrupt = media.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut trailing = media.clone();
+        trailing.push(0);
+        let invalid = BodyReadbackError::Content(ReadbackError::MediaValidation);
+        for (wire, refuse_chunk, refuse_finish, chunks, finished, outcome) in [
+            (&media, false, false, 2, true, Ok(())),
+            (
+                &media,
+                true,
+                false,
+                1,
+                false,
+                Err(BodyReadbackError::Content(ReadbackError::MediaValidation)),
+            ),
+            (&media, false, true, 2, true, Err(invalid)),
+            (
+                &trailing,
+                false,
+                false,
+                2,
+                false,
+                Err(BodyReadbackError::Trailing),
+            ),
+            (
+                &corrupt,
+                false,
+                false,
+                1,
+                false,
+                Err(BodyReadbackError::Content(ReadbackError::Frame(
+                    RangeError::DigestMismatch,
+                ))),
+            ),
+        ] {
+            let mut probe = Probe {
+                remaining: &plaintext,
+                chunks: 0,
+                finished: false,
+                refuse_chunk,
+                refuse_finish,
+            };
+            assert_eq!(
+                validate_bodies(&f, Body(wire, false), Body(&f.pages[0], false), &mut probe).await,
+                outcome
+            );
+            assert_eq!((probe.chunks, probe.finished), (chunks, finished));
+        }
     }
 
     #[tokio::test]
